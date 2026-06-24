@@ -1,48 +1,37 @@
--- query 10
-cnt
-1000
-
--- query 11
 Explain String
-TABLE STATS ref=0 table=iceberg_opt.db_sqlt_e3d14c5b14187b79.probe_1m rows=1000000 confidence=Exact source=IcebergManifest
-TABLE STATS ref=1 table=iceberg_opt.db_sqlt_e3d14c5b14187b79.build_fallback_risky rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-9:PROJECT [count(*) AS cnt] (rows=1 cost={cpu=0.0100 memory=0.1600 network=0 total=0.3250}) stats={rows=1 conf=estimated}
-  8:HASH AGGREGATE (GLOBAL) (rows=1 cost={cpu=2.4000 memory=8 network=0 total=17.2000}) stats={rows=1 conf=estimated}
+15:PROJECT [count(*) AS cnt] (rows=1 cost={cpu=0.0100 memory=0.1600 network=0 total=0.3250}) stats={rows=1 conf=estimated}
+  14:HASH AGGREGATE (GLOBAL) (rows=1 cost={cpu=2.4000 memory=8 network=0 total=17.2000}) stats={rows=1 conf=estimated}
     aggregations: count()
-    7:GATHER (rows=1 cost={cpu=16777216 memory=0.4000 network=8 total=8388620.8000}) stats={rows=1 conf=estimated}
+    13:GATHER (rows=1 cost={cpu=16777216 memory=0.4000 network=8 total=8388620.8000}) stats={rows=1 conf=estimated}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 7
+    EXCHANGE ID: 13
     PARTITION: UNPARTITIONED
-6:HASH AGGREGATE (LOCAL) (rows=1 cost={cpu=19398855.1500 memory=8 network=0 total=9699443.5750}) stats={rows=1 conf=estimated}
+12:HASH AGGREGATE (LOCAL) (rows=1 cost={cpu=8000000 memory=8 network=0 total=4000016}) stats={rows=1 conf=estimated}
   aggregations: count()
-  5:HASH JOIN (PARTITIONED, INNER, eq: [p.k = b.k]) (rows=900000 cost={cpu=39698610.3000 memory=13438 network=0 total=19876181.1500}) colstats={col#1[min=1 max=1000000 ndv=900000 null_frac=0], col#2[min=-inf max=+inf ndv=? null_frac=0], col#3[min=-inf max=+inf ndv=? null_frac=0], col#4[min=1 max=1000 ndv=? null_frac=0], col#5[min=-inf max=+inf ndv=? null_frac=0], col#6[min=-inf max=+inf ndv=? null_frac=0], col#7[min=-inf max=+inf ndv=? null_frac=0]} stats={rows=900000 conf=fallback}
-    build runtime filters:
-    - filter_id = 0, build_expr = (b.k)
-    2:HASH EXCHANGE (rows=900000 cost={cpu=16777216 memory=968110.5150 network=19362210.3000 total=39368144.4800}) colstats={col#1[min=1 max=1000000 ndv=900000 null_frac=0], col#2[min=-inf max=+inf ndv=? null_frac=0], col#3[min=-inf max=+inf ndv=? null_frac=0]} stats={rows=900000 conf=estimated}
-    4:HASH EXCHANGE (rows=900 cost={cpu=16777216 memory=971.7750 network=19435.5000 total=8419704.8000}) colstats={col#4[min=1 max=1000 ndv=? null_frac=0], col#5[min=-inf max=+inf ndv=? null_frac=0], col#6[min=-inf max=+inf ndv=? null_frac=0], col#7[min=-inf max=+inf ndv=? null_frac=0]} stats={rows=900 conf=estimated}
+  11:HASH JOIN (PARTITIONED, INNER, eq: [p.k = b.k]) (rows=1000000 cost={cpu=117000000 memory=888888888.8889 network=0 total=1836277777.7778}) colstats={col#3[min=1 max=1000000 ndv=1000000 null_frac=0], col#4[min=1 max=100000000 ndv=1000000 null_frac=0]} stats={rows=1000000 conf=estimated}
+    5:HASH EXCHANGE (rows=1000000 cost={cpu=16777216 memory=400000 network=8000000 total=21188608}) colstats={col#3[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000 conf=estimated}
+    10:HASH EXCHANGE (rows=100000000 cost={cpu=16777216 memory=40000000 network=800000000 total=1288388608}) colstats={col#4[min=1 max=100000000 ndv=100000000 null_frac=0]} stats={rows=100000000 conf=estimated}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 4
+    EXCHANGE ID: 10
     PARTITION: HASH_PARTITIONED (k)
-3:SCAN db_sqlt_e3d14c5b14187b79.build_fallback_risky (alias=b) (rows=900 cost={cpu=4767.3000 memory=0 network=0 total=2383.6500}) colstats={col#4[min=1 max=1000 ndv=? null_frac=0], col#5[min=-inf max=+inf ndv=? null_frac=0], col#6[min=-inf max=+inf ndv=? null_frac=0], col#7[min=-inf max=+inf ndv=? null_frac=0]} stats={rows=900 conf=estimated}
-     TABLE: db_sqlt_e3d14c5b14187b79.build_fallback_risky
-     columns: k
-     predicates: b.k IS NOT NULL
+9:PROJECT [k] (rows=100000000 cost={cpu=1000000 memory=16000000 network=0 total=32500000}) colstats={col#4[min=1 max=100000000 ndv=100000000 null_frac=0]} stats={rows=100000000 conf=estimated}
+  8:PROJECT [generate_series AS k] (rows=100000000 cost={cpu=1000000 memory=16000000 network=0 total=32500000}) colstats={col#2[min=1 max=100000000 ndv=100000000 null_frac=0]} stats={rows=100000000 conf=estimated}
+    7:GENERATE_SERIES(1, 100000000, 1) (rows=100000000 cost={cpu=2000000 memory=0 network=0 total=1000000}) colstats={col#2[min=1 max=100000000 ndv=100000000 null_frac=0]} stats={rows=100000000}
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 2
+    EXCHANGE ID: 5
     PARTITION: HASH_PARTITIONED (k)
-1:SCAN db_sqlt_e3d14c5b14187b79.probe_1m (alias=p) (rows=900000 cost={cpu=4962210.3000 memory=0 network=0 total=2481105.1500}) colstats={col#1[min=1 max=1000000 ndv=900000 null_frac=0], col#2[min=-inf max=+inf ndv=? null_frac=0], col#3[min=-inf max=+inf ndv=? null_frac=0]} stats={rows=900000 conf=estimated}
-     TABLE: db_sqlt_e3d14c5b14187b79.probe_1m
-     columns: k
-     predicates: p.k IS NOT NULL
+4:PROJECT [k] (rows=1000000 cost={cpu=10000 memory=160000 network=0 total=325000}) colstats={col#3[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000 conf=estimated}
+  3:PROJECT [generate_series AS k] (rows=1000000 cost={cpu=10000 memory=160000 network=0 total=325000}) colstats={col#1[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000 conf=estimated}
+    2:GENERATE_SERIES(1, 1000000, 1) (rows=1000000 cost={cpu=20000 memory=0 network=0 total=10000}) colstats={col#1[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000}

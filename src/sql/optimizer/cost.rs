@@ -242,8 +242,20 @@ impl Default for ClusterResourceProfile {
             effective_backend_count: backends,
             per_node_build_memory_budget_bytes: per_node,
             query_mem_limit_bytes: DEFAULT_QUERY_MEM_LIMIT_BYTES,
-            cluster_broadcast_network_budget_bytes: per_node * backends,
+            cluster_broadcast_network_budget_bytes: per_node,
         }
+    }
+}
+
+impl ClusterResourceProfile {
+    pub(crate) fn apply_query_mem_limit_bytes(&mut self, query_mem_limit_bytes: f64) {
+        let query_mem_limit_bytes =
+            normalized_positive_bytes(query_mem_limit_bytes, DEFAULT_QUERY_MEM_LIMIT_BYTES);
+        let per_node =
+            finite_non_negative_cost(query_mem_limit_bytes * BUILD_HASH_TABLE_MEM_FRACTION);
+        self.query_mem_limit_bytes = query_mem_limit_bytes;
+        self.per_node_build_memory_budget_bytes = per_node;
+        self.cluster_broadcast_network_budget_bytes = per_node;
     }
 }
 
@@ -303,11 +315,22 @@ impl CostOptions {
     pub(crate) fn apply_profile(&mut self, mut profile: ClusterResourceProfile) {
         let backends = normalized_effective_backend_count(profile.effective_backend_count);
         profile.effective_backend_count = backends;
-        profile.cluster_broadcast_network_budget_bytes = finite_non_negative_cost(
-            profile.per_node_build_memory_budget_bytes * profile.effective_backend_count,
-        );
+        profile.query_mem_limit_bytes =
+            normalized_positive_bytes(profile.query_mem_limit_bytes, DEFAULT_QUERY_MEM_LIMIT_BYTES);
+        profile.per_node_build_memory_budget_bytes =
+            finite_non_negative_cost(profile.per_node_build_memory_budget_bytes);
+        profile.cluster_broadcast_network_budget_bytes =
+            finite_non_negative_cost(profile.per_node_build_memory_budget_bytes);
         self.backend_factor = backends;
         self.profile = profile;
+    }
+}
+
+fn normalized_positive_bytes(value: f64, default_value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        finite_non_negative_cost(value)
+    } else {
+        default_value
     }
 }
 
@@ -482,9 +505,9 @@ pub(crate) fn broadcast_is_feasible(
 
     // LAYER 1 (per-node memory): NO backend divisor — full build per node.
     let risk_adj_build_bytes = finite_non_negative_cost(ht_bytes * risk_mult);
-    // LAYER 2 (cluster network): spec's conservative cluster network floor.
-    // This intentionally charges raw bytes * backend count * risk. It is not
-    // the cost-model fanout term, which uses (backends - 1).
+    // LAYER 2 (cluster network): charge raw bytes * backend count * risk against
+    // a fixed cluster-wide budget. The budget intentionally does not scale with
+    // backend count; otherwise fanout cancels out and the network floor is dead.
     let risk_adj_fanout_bytes = finite_non_negative_cost(raw * backends * risk_mult);
 
     let mem_ok = risk_adj_build_bytes <= options.profile.per_node_build_memory_budget_bytes;
@@ -807,7 +830,7 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
     } else if is_shuffle {
         finite_non_negative_cost(build_hash / backends)
     } else {
-        build_size
+        build_hash
     };
     let network_cost = if is_broadcast {
         finite_non_negative_cost(build_size * fanout)
@@ -1461,8 +1484,6 @@ mod tests {
         let mut profile = ClusterResourceProfile::default();
         profile.effective_backend_count = 3.0;
         profile.per_node_build_memory_budget_bytes = 256.0 * 1024.0 * 1024.0;
-        profile.cluster_broadcast_network_budget_bytes =
-            profile.per_node_build_memory_budget_bytes * 3.0;
         options.apply_profile(profile);
 
         let required = PhysicalPropertySet::any();
@@ -1689,8 +1710,6 @@ mod tests {
         let mut profile = ClusterResourceProfile::default();
         profile.effective_backend_count = 30.0;
         profile.per_node_build_memory_budget_bytes = 1024.0 * 1024.0 * 1024.0;
-        profile.cluster_broadcast_network_budget_bytes =
-            profile.per_node_build_memory_budget_bytes * profile.effective_backend_count;
         o.apply_profile(profile);
 
         let mut build = stats(3_000_000.0, 2048.0);
@@ -1703,6 +1722,37 @@ mod tests {
         assert_eq!(
             feas.reject_reason,
             Some(BroadcastRejectReason::PerNodeMemory)
+        );
+    }
+
+    #[test]
+    fn cluster_network_floor_can_reject_when_per_node_memory_fits() {
+        let mut o = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 10.0;
+        profile.per_node_build_memory_budget_bytes = 1024.0 * 1024.0 * 1024.0;
+        o.apply_profile(profile);
+
+        let mut build = stats(1_000_000.0, 200.0);
+        build.row_count_confidence = Confidence::Exact;
+        let probe = stats(100_000.0, 64.0);
+
+        let feas = broadcast_is_feasible(&probe, &build, &o);
+
+        assert!(
+            feas.risk_adj_build_bytes <= o.profile.per_node_build_memory_budget_bytes,
+            "test shape must fit per-node memory: {:?}",
+            feas
+        );
+        assert!(
+            feas.risk_adj_fanout_bytes > o.profile.cluster_broadcast_network_budget_bytes,
+            "test shape must exceed cluster network budget: {:?}",
+            feas
+        );
+        assert!(!feas.feasible);
+        assert_eq!(
+            feas.reject_reason,
+            Some(BroadcastRejectReason::ClusterNetwork)
         );
     }
 
@@ -1731,8 +1781,6 @@ mod tests {
         let mut profile = ClusterResourceProfile::default();
         profile.effective_backend_count = 3.0;
         profile.per_node_build_memory_budget_bytes = 256.0 * 1024.0 * 1024.0;
-        profile.cluster_broadcast_network_budget_bytes =
-            profile.per_node_build_memory_budget_bytes * 3.0;
         o.apply_profile(profile);
 
         let mut build = stats(1_000.0, 4.0);
@@ -1751,8 +1799,6 @@ mod tests {
         let mut profile = ClusterResourceProfile::default();
         profile.effective_backend_count = 3.0;
         profile.per_node_build_memory_budget_bytes = 32.0 * 1024.0 * 1024.0 * 1024.0;
-        profile.cluster_broadcast_network_budget_bytes =
-            profile.per_node_build_memory_budget_bytes * 3.0;
         o.apply_profile(profile);
 
         let probe = stats(10_000_000.0, 8.0);
@@ -2399,6 +2445,39 @@ mod tests {
     }
 
     #[test]
+    fn colocate_memory_uses_build_hash_table_bytes() {
+        let probe = stats(1_000_000.0, 64.0);
+        let build = stats(10_000.0, 4.0);
+        let own = stats(100_000.0, 68.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Colocate,
+        });
+        let options = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::any()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let child_stats = [&probe, &build];
+        let input = broadcast_input(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &required,
+            &PropertyAlternativeKind::Default,
+            &options,
+        );
+
+        let estimate = compute_cost_estimate(&input);
+        let hash_table_bytes = estimated_build_hash_table_bytes(&build, &options);
+
+        assert_eq!(estimate.memory_cost, hash_table_bytes);
+        assert_eq!(estimate.network_cost, 0.0);
+    }
+
+    #[test]
     fn single_node_broadcast_and_shuffle_network_are_zero() {
         let mut options = CostOptions::default();
         let mut profile = ClusterResourceProfile::default();
@@ -2453,8 +2532,6 @@ mod tests {
         let mut profile = ClusterResourceProfile::default();
         profile.effective_backend_count = 10.0;
         profile.per_node_build_memory_budget_bytes = 256.0 * 1024.0 * 1024.0;
-        profile.cluster_broadcast_network_budget_bytes =
-            profile.per_node_build_memory_budget_bytes * 10.0;
         options.apply_profile(profile);
 
         // Tuned so the pre-1.6 broadcast formula (payload * N for both memory
@@ -3277,7 +3354,7 @@ mod tests {
         );
         assert_eq!(
             opts.profile.cluster_broadcast_network_budget_bytes,
-            opts.profile.per_node_build_memory_budget_bytes * opts.profile.effective_backend_count
+            opts.profile.per_node_build_memory_budget_bytes
         );
     }
 

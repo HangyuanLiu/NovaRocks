@@ -1,22 +1,16 @@
 -- @tags=optimizer,bc1,distribution
 CREATE DATABASE IF NOT EXISTS ${case_db};
 USE ${case_db};
-CREATE TABLE probe_1m (k INT);
-CREATE TABLE build_fallback_risky (k INT, pad VARCHAR(250));
-INSERT INTO probe_1m
-    SELECT generate_series FROM TABLE(generate_series(1, 1000000));
-INSERT INTO build_fallback_risky
-    SELECT generate_series, repeat('w', 250) FROM TABLE(generate_series(1, 1000));
-ANALYZE TABLE probe_1m;
--- build_fallback_risky is intentionally not explicitly analyzed; the scan keeps
--- estimated/unknown column stats, and the join stays fallback under this shape.
 SET cbo_broadcast_backend_count = 3;
-SET cbo_broadcast_node_mem_budget_bytes = 65536;
--- @explain_contains=HASH JOIN (PARTITIONED
--- @explain_not_contains=BROADCAST, INNER
-SELECT COUNT(*) AS cnt
-FROM probe_1m p JOIN build_fallback_risky b ON p.k = b.k;
-
+SET disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
 EXPLAIN COSTS
+WITH probe_1m AS (
+    SELECT generate_series AS k
+    FROM TABLE(generate_series(1, 1000000))
+),
+build_fallback_risky AS (
+    SELECT generate_series AS k
+    FROM TABLE(generate_series(1, 100000000))
+)
 SELECT COUNT(*) AS cnt
 FROM probe_1m p JOIN build_fallback_risky b ON p.k = b.k;

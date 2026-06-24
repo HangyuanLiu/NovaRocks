@@ -13,6 +13,7 @@ ANALYZE TABLE build_500k;
 SET cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_contains=HASH JOIN (BROADCAST
 -- @explain_contains=bcast_verdict=feasible
+-- @explain_not_contains=PARTITIONED, INNER
 SELECT COUNT(p.pad1) AS cnt
 FROM probe_5m_wide p JOIN build_500k b ON p.k = b.k;
 

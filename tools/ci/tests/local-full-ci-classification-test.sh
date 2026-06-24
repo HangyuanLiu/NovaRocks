@@ -61,3 +61,25 @@ if (
 fi
 
 grep -q "UNEXPECTED_PASS" "$run_dir/summary.md"
+
+targeted_suites="$(ci_tier_suites targeted "$REPO_ROOT/tools/ci/suites/stable-sql-suites.txt")"
+grep -qx "optimizer-dist" <<<"$targeted_suites"
+
+SQL_CLUSTER_MODE="all-in-one"
+SQL_CLUSTER_SIZE="1"
+if [ "$(ci_suite_cluster_mode optimizer-dist)" != "cross-process" ]; then
+  echo "optimizer-dist must force cross-process cluster mode" >&2
+  exit 1
+fi
+if [ "$(ci_suite_cluster_size optimizer-dist)" != "3" ]; then
+  echo "optimizer-dist must force a 3-BE cluster" >&2
+  exit 1
+fi
+if [ "$(ci_suite_cluster_mode optimizer)" != "all-in-one" ]; then
+  echo "ordinary suites should keep the global cluster mode" >&2
+  exit 1
+fi
+if [ "$(ci_suite_cluster_size optimizer)" != "1" ]; then
+  echo "ordinary suites should keep the global cluster size" >&2
+  exit 1
+fi

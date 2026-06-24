@@ -208,6 +208,9 @@ impl OptimizerOptions {
         // BC-1: cluster/resource profile overrides. Precedence: explicit
         // session SET > engine live-registry snapshot > profile default.
         let mut profile = opts.cost_options.profile.clone();
+        profile.apply_query_mem_limit_bytes(
+            crate::common::config::optimizer_query_mem_limit_bytes() as f64,
+        );
         if let Some(v) = settings
             .cbo_broadcast_backend_count
             .or(settings.effective_backend_count)
@@ -217,10 +220,6 @@ impl OptimizerOptions {
         if let Some(v) = settings.cbo_broadcast_node_mem_budget_bytes {
             profile.per_node_build_memory_budget_bytes = v;
         }
-        // Re-derive the LAYER 2 network budget from the possibly overridden
-        // per-node budget and backend count.
-        profile.cluster_broadcast_network_budget_bytes =
-            profile.per_node_build_memory_budget_bytes * profile.effective_backend_count;
         opts.cost_options.apply_profile(profile);
         opts
     }
@@ -229,6 +228,14 @@ impl OptimizerOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ConfigResetGuard;
+
+    impl Drop for ConfigResetGuard {
+        fn drop(&mut self) {
+            crate::common::app_config::install_default_for_test();
+        }
+    }
 
     #[test]
     fn default_enables_all_rules() {
@@ -377,12 +384,12 @@ mod tests {
             opts.cost_options.profile.per_node_build_memory_budget_bytes,
             256.0 * 1024.0 * 1024.0
         );
-        // LAYER 2 network budget re-derives from per-node * backends.
+        // LAYER 2 network budget is cluster-wide, not per-backend.
         assert_eq!(
             opts.cost_options
                 .profile
                 .cluster_broadcast_network_budget_bytes,
-            256.0 * 1024.0 * 1024.0 * 16.0
+            256.0 * 1024.0 * 1024.0
         );
     }
 
@@ -408,7 +415,7 @@ mod tests {
             opts.cost_options
                 .profile
                 .cluster_broadcast_network_budget_bytes,
-            default_per_node * 11.0
+            default_per_node
         );
     }
 
@@ -420,6 +427,31 @@ mod tests {
         settings.effective_backend_count = Some(3.0);
         let opts = OptimizerOptions::from_session(&settings);
         assert_eq!(opts.cost_options.profile.effective_backend_count, 7.0);
+    }
+
+    #[test]
+    fn from_session_uses_runtime_query_mem_limit_for_default_broadcast_budget() {
+        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
+        cfg.runtime.optimizer_query_mem_limit_bytes = 512 * 1024 * 1024;
+        crate::common::app_config::install_preloaded_config(cfg);
+        let _reset = ConfigResetGuard;
+
+        let opts = OptimizerOptions::from_session(&SessionOptimizerSettings::default());
+
+        assert_eq!(
+            opts.cost_options.profile.query_mem_limit_bytes,
+            512.0 * 1024.0 * 1024.0
+        );
+        assert_eq!(
+            opts.cost_options.profile.per_node_build_memory_budget_bytes,
+            256.0 * 1024.0 * 1024.0
+        );
+        assert_eq!(
+            opts.cost_options
+                .profile
+                .cluster_broadcast_network_budget_bytes,
+            256.0 * 1024.0 * 1024.0
+        );
     }
 
     #[test]

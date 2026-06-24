@@ -84,7 +84,6 @@ pub(crate) fn exchange_io_max_inflight_bytes() -> usize {
         .unwrap_or(64 * 1024 * 1024)
 }
 
-#[allow(dead_code)]
 pub(crate) fn optimizer_query_mem_limit_bytes() -> u64 {
     novarocks_app_config()
         .ok()

@@ -15,4 +15,13 @@ SET cbo_broadcast_node_mem_budget_bytes = 268435456;
 SELECT COUNT(*) AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;
 
 EXPLAIN COSTS
-SELECT COUNT(*) AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;
+WITH p AS (
+    SELECT generate_series AS k
+    FROM TABLE(generate_series(1, 1000))
+),
+b AS (
+    SELECT generate_series AS k
+    FROM TABLE(generate_series(1, 10))
+)
+SELECT COUNT(*) AS cnt
+FROM p JOIN b ON p.k = b.k;
