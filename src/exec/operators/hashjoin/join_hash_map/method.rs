@@ -652,6 +652,9 @@ fn collect_direct_int_stats(
         if array.data_type() != data_type {
             return Err("direct integer join key type mismatch".to_string());
         }
+        // Use observed Arrow nulls for the M2 fast path. This is stricter than
+        // trusting planner metadata and keeps the fast path correct for computed
+        // build-key expressions.
         if array.null_count() > 0 {
             not_null = false;
         }
@@ -758,6 +761,16 @@ mod tests {
 
     fn int32_chunk(values: Vec<Option<i32>>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]));
+        let array = Arc::new(Int32Array::from(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[KEY_SLOT_ID])
+                .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn int32_not_null_chunk(values: Vec<i32>) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values)) as ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
         let chunk_schema =
@@ -1015,6 +1028,53 @@ mod tests {
                 not_null: true,
             }
         );
+    }
+
+    #[test]
+    fn direct_map_records_not_null_fast_path_for_non_nullable_build_keys() {
+        let build = int32_not_null_chunk(vec![7, 8, 7]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+
+        assert_eq!(
+            map.method_kind(),
+            JoinHashMapMethodKind::DirectInt {
+                min: 7,
+                len: 2,
+                not_null: true,
+            }
+        );
+    }
+
+    #[test]
+    fn direct_map_nullable_probe_null_still_misses() {
+        let build = int32_not_null_chunk(vec![7, 8, 7]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
+        let probe = int32_chunk(vec![None, Some(8)]);
+        let (group_ids, selection) = map
+            .lookup_selection(&arena, &[probe_key], &probe)
+            .expect("lookup");
+
+        assert!(group_ids[0].is_none());
+        assert!(group_ids[1].is_some());
+        assert_eq!(selection.probe, vec![1]);
+        assert_eq!(selection.build, vec![1]);
     }
 
     #[test]
