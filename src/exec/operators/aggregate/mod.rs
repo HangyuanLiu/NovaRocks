@@ -324,7 +324,11 @@ impl AggregateProcessorOperator {
                 Ok(arr) => arr,
                 Err(_) => continue,
             };
-            let filter = match RuntimeMinMaxFilter::from_array(spec.build_type, &column_array) {
+            let filter = match RuntimeMinMaxFilter::from_array_one_sided(
+                spec.build_type,
+                &column_array,
+                spec.is_asc,
+            ) {
                 Ok(f) => f,
                 Err(_) => continue,
             };

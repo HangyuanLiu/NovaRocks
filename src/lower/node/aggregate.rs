@@ -195,12 +195,28 @@ pub(crate) fn lower_aggregate_node(
                 continue;
             }
 
+            // StarRocks always sets is_asc/is_nulls_first alongside limit for a
+            // TOPN_FILTER (RuntimeFilterDescription.toThrift). A missing value
+            // means a malformed descriptor; skip the filter rather than guessing
+            // a direction — a wrong is_asc flips the active side and would prune
+            // the wrong boundary group. Skipping only forgoes pruning; results
+            // stay correct.
+            let (Some(is_asc), Some(is_nulls_first)) = (desc.is_asc, desc.is_nulls_first) else {
+                warn!(
+                    "topn runtime filter {} missing is_asc/is_nulls_first, skipping",
+                    filter_id
+                );
+                continue;
+            };
+
             topn_rf_specs.push(TopNRuntimeFilterSpec {
                 filter_id,
                 expr_order,
                 build_type,
                 probe_column_name,
                 limit: limit as usize,
+                is_asc,
+                is_nulls_first,
             });
         }
     }

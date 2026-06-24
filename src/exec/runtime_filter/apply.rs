@@ -21,7 +21,7 @@
 //! - Builds row-selection masks and returns filtered chunks for probe-side pruning.
 //!
 //! Key exported interfaces:
-//! - Functions: `filter_chunk_by_memberships`, `filter_chunk_by_in_filters`, `filter_chunk_by_in_filters_with_exprs`, `filter_chunk_by_membership_filters`.
+//! - Functions: `filter_chunk_by_in_filters`, `filter_chunk_by_in_filters_with_exprs`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -33,60 +33,10 @@ use std::sync::Arc;
 use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::hash_table::key_builder::{build_group_key_hashes, build_group_key_views};
 
-use super::{
-    RuntimeFilterMembership, RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter,
-};
-
-/// Apply membership filters to a chunk and return the filtered chunk.
-pub(crate) fn filter_chunk_by_memberships(
-    filters: &[RuntimeFilterMembership],
-    chunk: Chunk,
-    slot_id: SlotId,
-) -> Result<Option<Chunk>, String> {
-    if filters.is_empty() {
-        return Ok(Some(chunk));
-    }
-    if chunk.is_empty() {
-        return Ok(Some(chunk));
-    }
-    if !chunk.slot_id_to_index().contains_key(&slot_id) {
-        return Ok(Some(chunk));
-    }
-    let array = chunk.column_by_slot_id(slot_id)?;
-    let arrays = [array];
-    let views = build_group_key_views(&arrays)?;
-    let len = chunk.len();
-    let mut keep = vec![false; len];
-    for filter in filters {
-        let hashes = build_group_key_hashes(&views, len, filter.hash_seed())?;
-        for row in 0..len {
-            if keep[row] {
-                continue;
-            }
-            if super::row_has_null(&views, row) {
-                continue;
-            }
-            if filter.contains_hash(hashes[row]) {
-                keep[row] = true;
-            }
-        }
-    }
-    if keep.iter().all(|v| *v) {
-        return Ok(Some(chunk));
-    }
-    if keep.iter().all(|v| !*v) {
-        return Ok(None);
-    }
-
-    let mask = BooleanArray::from(keep);
-    let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
-    Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
-}
+use super::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 
 /// Apply IN filters to a chunk and return the filtered chunk.
 pub(crate) fn filter_chunk_by_in_filters(
@@ -170,26 +120,6 @@ pub(crate) fn filter_chunk_by_in_filters_with_exprs(
     Ok(current)
 }
 
-#[allow(dead_code)]
-/// Apply membership-filter wrappers to a chunk and return the filtered chunk.
-pub(crate) fn filter_chunk_by_membership_filters(
-    filters: &[Arc<RuntimeMembershipFilter>],
-    chunk: Chunk,
-) -> Result<Option<Chunk>, String> {
-    if filters.is_empty() {
-        return Ok(Some(chunk));
-    }
-    let mut current = Some(chunk);
-    for filter in filters {
-        let filter = filter.as_ref();
-        let Some(chunk) = current else {
-            return Ok(None);
-        };
-        current = filter.filter_chunk(chunk)?;
-    }
-    Ok(current)
-}
-
 /// Apply membership filters with expression mappings and return the filtered chunk.
 pub(crate) fn filter_chunk_by_membership_filters_with_exprs(
     arena: &ExprArena,
@@ -251,10 +181,6 @@ pub(crate) fn filter_chunk_by_min_max_filters_with_exprs(
         };
         let Some(expr_id) = exprs.get(filter_id) else {
             // No expression mapping for this filter_id — skip it.
-            eprintln!(
-                "[min_max_filter] skipping filter_id={} — no expr mapping",
-                filter_id
-            );
             current = Some(chunk);
             continue;
         };
@@ -263,10 +189,6 @@ pub(crate) fn filter_chunk_by_min_max_filters_with_exprs(
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("slot id") && msg.contains("not found in chunk") {
-                    eprintln!(
-                        "[min_max_filter] skipping filter_id={} — probe column not in chunk: {}",
-                        filter_id, msg
-                    );
                     current = Some(chunk);
                     continue;
                 }
@@ -278,26 +200,13 @@ pub(crate) fn filter_chunk_by_min_max_filters_with_exprs(
         // has_null=false, check_null=true  → null rows are excluded
         filter.apply_to_array(&array, false, true, &mut keep)?;
         if keep.iter().all(|v| *v) {
-            eprintln!(
-                "[min_max_filter] filter_id={} kept all {} rows",
-                filter_id, len
-            );
             current = Some(chunk);
             continue;
         }
         if keep.iter().all(|v| !*v) {
-            eprintln!(
-                "[min_max_filter] filter_id={} pruned all {} rows",
-                filter_id, len
-            );
             current = None;
             continue;
         }
-        let kept = keep.iter().filter(|v| **v).count();
-        eprintln!(
-            "[min_max_filter] filter_id={} kept {}/{} rows",
-            filter_id, kept, len
-        );
         let mask = BooleanArray::from(keep);
         let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
         current = Some(Chunk::new_like(filtered_batch, &chunk));

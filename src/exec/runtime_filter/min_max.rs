@@ -348,6 +348,31 @@ impl RuntimeMinMaxFilter {
         Self::from_arrays(ltype, std::slice::from_ref(array))
     }
 
+    /// Build a ONE-SIDED min/max filter for a TopN runtime filter.
+    /// For ASC (`is_asc == true`) only the upper bound is active (prune `col > max`);
+    /// the lower bound is left at full-range so it never prunes the smallest keys.
+    /// For DESC only the lower bound is active. Mirrors StarRocks
+    /// `agg_runtime_filter_builder.cpp` (ASC tightens `_max`, DESC tightens `_min`).
+    pub(crate) fn from_array_one_sided(
+        ltype: TPrimitiveType,
+        array: &ArrayRef,
+        is_asc: bool,
+    ) -> Result<Self, String> {
+        let data = Self::from_array(ltype, array)?;
+        if !data.has_min_max {
+            // No values (empty column) → a filter that prunes nothing.
+            return Self::full_range(ltype);
+        }
+        let full = Self::full_range(ltype)?;
+        if is_asc {
+            // active upper bound = data.max; lower bound = full-range (never prunes)
+            Ok(Self::new(ltype, true, full.min, data.max))
+        } else {
+            // active lower bound = data.min; upper bound = full-range
+            Ok(Self::new(ltype, true, data.min, full.max))
+        }
+    }
+
     /// Converts this filter to a pair of storage-layer `MinMaxPredicate` values.
     ///
     /// Returns `[Ge(min), Le(max)]` so the scan operator can push the range down to storage.
@@ -1094,6 +1119,8 @@ fn is_decimal_type(ltype: &TPrimitiveType) -> bool {
 mod tests {
     use std::sync::Arc;
 
+    use arrow::array::Int32Array;
+
     use super::{MinMaxValue, RuntimeMinMaxFilter};
     use crate::common::largeint;
     use crate::common::min_max_predicate::MinMaxPredicateValue;
@@ -1192,5 +1219,42 @@ mod tests {
             .apply_to_array(&wrong_width, false, true, &mut keep)
             .unwrap_err();
         assert!(err.contains("FixedSizeBinary(16)"));
+    }
+
+    #[test]
+    fn topn_min_max_asc_is_one_sided_upper_bound() {
+        // top groups seen so far = {5,6,7,8,9} (does NOT yet include small keys 0..4)
+        let groups: arrow::array::ArrayRef = Arc::new(Int32Array::from(vec![5, 6, 7, 8, 9]));
+        let f =
+            RuntimeMinMaxFilter::from_array_one_sided(TPrimitiveType::INT, &groups, true).unwrap();
+        let scan: arrow::array::ArrayRef =
+            Arc::new(Int32Array::from((0..=12).collect::<Vec<i32>>()));
+        let mut keep = vec![true; 13];
+        f.apply_to_array(&scan, false, false, &mut keep).unwrap();
+        // ASC: only upper bound (max=9) active; the lower bound must NOT prune small keys
+        for k in 0..=9 {
+            assert!(keep[k as usize], "ASC must keep small key {k}");
+        }
+        for k in 10..=12 {
+            assert!(!keep[k as usize], "ASC must prune {k} > max");
+        }
+    }
+
+    #[test]
+    fn topn_min_max_desc_is_one_sided_lower_bound() {
+        let groups: arrow::array::ArrayRef = Arc::new(Int32Array::from(vec![5, 6, 7, 8, 9]));
+        let f =
+            RuntimeMinMaxFilter::from_array_one_sided(TPrimitiveType::INT, &groups, false).unwrap();
+        let scan: arrow::array::ArrayRef =
+            Arc::new(Int32Array::from((0..=12).collect::<Vec<i32>>()));
+        let mut keep = vec![true; 13];
+        f.apply_to_array(&scan, false, false, &mut keep).unwrap();
+        // DESC: only lower bound (min=5) active
+        for k in 0..=4 {
+            assert!(!keep[k as usize], "DESC must prune {k} < min");
+        }
+        for k in 5..=12 {
+            assert!(keep[k as usize], "DESC must keep {k} >= min");
+        }
     }
 }

@@ -75,6 +75,11 @@ pub struct TopNRuntimeFilterSpec {
     pub probe_column_name: String,
     /// TopN limit — filter is only published when group count >= limit.
     pub limit: usize,
+    /// Sort direction of the TopN (from FE). true = ASC ⇒ upper-bound-only filter.
+    pub is_asc: bool,
+    /// Null ordering of the TopN (from FE); reserved for future null handling.
+    #[allow(dead_code)]
+    pub is_nulls_first: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

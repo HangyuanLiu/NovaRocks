@@ -21,7 +21,7 @@
 //! - Tracks filter availability and probe eligibility metadata per expression.
 //!
 //! Key exported interfaces:
-//! - Types: `LocalRuntimeFilterSet`, `RuntimeFilterMembership`.
+//! - Types: `LocalRuntimeFilterSet`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -33,7 +33,6 @@ use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::compute::filter_record_batch;
 use hashbrown::HashSet;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::hash_table::key_builder::{
@@ -41,20 +40,11 @@ use crate::exec::hash_table::key_builder::{
 };
 use crate::exec::node::join::JoinRuntimeFilterSpec;
 
-use super::apply;
-
 #[derive(Clone, Debug)]
 /// Local registry containing runtime membership filters keyed by expression id.
 pub(crate) struct LocalRuntimeFilterSet {
     hash_seed: u64,
     filters: Vec<LocalRuntimeFilter>,
-}
-
-#[derive(Clone, Debug)]
-/// Probe-side runtime filter membership metadata for one expression.
-pub(crate) struct RuntimeFilterMembership {
-    hash_seed: u64,
-    hashes: HashSet<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -184,24 +174,5 @@ impl LocalRuntimeFilterSet {
         let mask = BooleanArray::from(keep);
         let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
-    }
-}
-
-impl RuntimeFilterMembership {
-    pub(in crate::exec::runtime_filter) fn hash_seed(&self) -> u64 {
-        self.hash_seed
-    }
-
-    pub(in crate::exec::runtime_filter) fn contains_hash(&self, hash: u64) -> bool {
-        self.hashes.contains(&hash)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn filter_chunk_by_slot(
-        &self,
-        chunk: Chunk,
-        slot_id: SlotId,
-    ) -> Result<Option<Chunk>, String> {
-        apply::filter_chunk_by_memberships(std::slice::from_ref(self), chunk, slot_id)
     }
 }
