@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Write};
 use arrow::datatypes::DataType;
 
 use crate::partitions;
-use crate::runtime::profile_correlate::ActualMetrics;
+use crate::runtime::profile_correlate::{ActualMetrics, DistributedProfileSummary};
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::codegen::scalar_materialize::materialize;
@@ -32,21 +32,23 @@ use crate::sql::planner::plan::{
 use crate::sql::planner::{DistributedPlan, DistributedPlanNode, PlanFragment, PlanNodeStats};
 
 pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
-    explain_distributed_plan_inner(dp, level, None)
+    explain_distributed_plan_inner(dp, level, None, None)
 }
 
 pub(crate) fn explain_distributed_plan_analyze(
     dp: &DistributedPlan,
     level: ExplainLevel,
     actuals: &HashMap<i32, ActualMetrics>,
+    per_fragment: Option<&HashMap<i32, DistributedProfileSummary>>,
 ) -> Vec<String> {
-    explain_distributed_plan_inner(dp, level, Some(actuals))
+    explain_distributed_plan_inner(dp, level, Some(actuals), per_fragment)
 }
 
 fn explain_distributed_plan_inner(
     dp: &DistributedPlan,
     level: ExplainLevel,
     actuals: Option<&HashMap<i32, ActualMetrics>>,
+    per_fragment: Option<&HashMap<i32, DistributedProfileSummary>>,
 ) -> Vec<String> {
     let mut out = Vec::new();
     let fragments = explain_fragment_order(dp);
@@ -55,6 +57,22 @@ fn explain_distributed_plan_inner(
     for (display_id, fragment) in fragments.iter().enumerate() {
         if detailed {
             out.push(format!("PLAN FRAGMENT {display_id}"));
+            if let Some(per_fragment) = per_fragment {
+                // Key by the fragment's root (output) node id — the same id the profile collector
+                // derives from the `execute_fragment (plan_node_id=N)` tree root. Unique per
+                // fragment and never a cross-fragment-shared exchange id.
+                if let Some(s) = per_fragment.get(&fragment.root.node_id) {
+                    out.push(format!(
+                        "  Profile: active={} blocked={} dep_wait={} exch_wait={} net={} scan_io={}",
+                        fmt_time_ns(s.operator_active_time_ns),
+                        fmt_time_ns(s.driver_blocked_time_ns),
+                        fmt_time_ns(s.dependency_wait_time_ns),
+                        fmt_time_ns(s.exchange_wait_time_ns),
+                        fmt_time_ns(s.network_time_ns),
+                        fmt_time_ns(s.scan_io_time_ns),
+                    ));
+                }
+            }
             out.push(format!(
                 "  OUTPUT EXPRS: {}",
                 format_output_exprs(fragment.output_exprs.as_deref())
@@ -1347,9 +1365,9 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use super::explain_distributed_plan_analyze;
+    use super::{explain_distributed_plan_analyze, explain_fragment_order};
     use crate::exec::node::sort::SortTopNType;
-    use crate::runtime::profile_correlate::ActualMetrics;
+    use crate::runtime::profile_correlate::{ActualMetrics, DistributedProfileSummary};
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
@@ -1598,7 +1616,7 @@ mod tests {
         );
 
         let text =
-            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals).join("\n");
+            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals, None).join("\n");
 
         assert!(
             text.contains("3:HASH AGGREGATE (SINGLE, group by: [t.k]) stats={rows=3 conf=fallback} act={rows=7 time=2.3ms peak=4.0MB}"),
@@ -1616,6 +1634,44 @@ mod tests {
             !text.contains("2:PROJECT [t.k AS k] stats={rows=3 conf=fallback} act="),
             "nodes absent from the actuals map must not print act=:\n{text}"
         );
+    }
+
+    #[test]
+    fn analyze_renders_per_fragment_profile_under_fragment_header() {
+        let dp = build_distributed_plan(&aggregate_count_plan(project_plan(scan_plan())))
+            .expect("build DistributedPlan");
+        let actuals = HashMap::new();
+        // Key the per-fragment map by the first fragment's root node id, the same key the renderer
+        // applies (`fragment.root.node_id`) — so the test never hardcodes node ids.
+        let frags = explain_fragment_order(&dp);
+        let rep = frags[0].root.node_id;
+        let mut per_fragment = HashMap::new();
+        per_fragment.insert(
+            rep,
+            DistributedProfileSummary {
+                operator_active_time_ns: 44_800_000_000,
+                driver_blocked_time_ns: 120_000_000,
+                ..DistributedProfileSummary::default()
+            },
+        );
+
+        let text = explain_distributed_plan_analyze(
+            &dp,
+            ExplainLevel::Analyze,
+            &actuals,
+            Some(&per_fragment),
+        )
+        .join("\n");
+
+        assert!(text.contains("PLAN FRAGMENT 0"), "{text}");
+        assert!(
+            text.contains("Profile: active=44.8s blocked=120.0ms"),
+            "{text}"
+        );
+        // Without the per-fragment map, no Profile line is rendered.
+        let plain =
+            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals, None).join("\n");
+        assert!(!plain.contains("Profile: active="), "{plain}");
     }
 
     #[test]
@@ -1638,7 +1694,7 @@ mod tests {
         );
 
         let text =
-            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals).join("\n");
+            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals, None).join("\n");
 
         assert!(
             text.contains(
@@ -1670,7 +1726,7 @@ mod tests {
         );
 
         let text =
-            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals).join("\n");
+            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals, None).join("\n");
 
         assert!(
             text.contains("min=0ns"),
@@ -1690,7 +1746,7 @@ mod tests {
 
         assert_eq!(
             explain_distributed_plan(&dp, ExplainLevel::Analyze),
-            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals)
+            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals, None)
         );
     }
 
