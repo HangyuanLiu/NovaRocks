@@ -1626,7 +1626,7 @@ mod cascaded_derivation_tests {
                 column_stats: HashMap::new(),
             },
         );
-        // Small enough for the default broadcast gate.
+        // Small enough for the default broadcast feasibility budgets.
         ts.insert(
             "small".to_string(),
             TableStatistics {
