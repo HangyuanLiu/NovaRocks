@@ -19,6 +19,7 @@
 //! This module owns the join-facing hash map abstraction and dispatches between
 //! the existing chained hash table and specialized join-owned lookup methods.
 
+use std::mem;
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
@@ -109,10 +110,13 @@ pub(crate) struct DirectIntJoinHashMap {
     len: usize,
     first: Vec<u32>,
     next: Vec<u32>,
+    group_rows: Vec<Vec<u32>>,
     row_count: usize,
     indexed_rows: usize,
     not_null: bool,
     runtime_filter_hash_seed: u64,
+    mem_tracker: Option<Arc<MemTracker>>,
+    accounted_bytes: i64,
 }
 
 struct DirectIntStats {
@@ -166,7 +170,7 @@ impl JoinHashMap {
     pub(crate) fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
         match self {
             Self::Chained(map) => map.table.set_mem_tracker(tracker),
-            Self::DirectInt(_) => {}
+            Self::DirectInt(map) => map.set_mem_tracker(tracker),
         }
     }
 
@@ -233,9 +237,7 @@ impl JoinHashMap {
     pub(crate) fn group_build_rows(&self, group_id: usize) -> Result<&[u32], String> {
         match self {
             Self::Chained(map) => map.table.group_build_rows(group_id),
-            Self::DirectInt(_) => {
-                Err("direct integer join hash map does not expose grouped rows".to_string())
-            }
+            Self::DirectInt(map) => map.group_build_rows(group_id),
         }
     }
 }
@@ -383,12 +385,16 @@ impl DirectIntJoinHashMap {
             len,
             first: vec![ROW_NONE; len],
             next: vec![ROW_NONE; stats.row_count],
+            group_rows: Vec::new(),
             row_count: stats.row_count,
             indexed_rows: stats.indexed_rows,
             not_null: stats.not_null,
             runtime_filter_hash_seed: fallback_hash_seed(key_types, null_safe_eq)?,
+            mem_tracker: None,
+            accounted_bytes: 0,
         };
         map.fill_from_batches(batches)?;
+        map.build_group_rows()?;
         Ok(Some(map))
     }
 
@@ -424,6 +430,22 @@ impl DirectIntJoinHashMap {
         if base_row != self.row_count {
             return Err("direct integer join row count mismatch".to_string());
         }
+        Ok(())
+    }
+
+    fn build_group_rows(&mut self) -> Result<(), String> {
+        let mut group_rows = Vec::with_capacity(self.len);
+        for bucket in 0..self.len {
+            let mut rows = Vec::new();
+            let mut row = self.first[bucket];
+            while row != ROW_NONE {
+                rows.push(row);
+                row = self.next_row(row)?;
+            }
+            group_rows.push(rows);
+        }
+        self.group_rows = group_rows;
+        self.refresh_accounting();
         Ok(())
     }
 
@@ -501,6 +523,67 @@ impl DirectIntJoinHashMap {
             .copied()
             .ok_or_else(|| "direct integer join row id out of bounds".to_string())
     }
+
+    fn group_build_rows(&self, group_id: usize) -> Result<&[u32], String> {
+        self.group_rows
+            .get(group_id)
+            .map(|rows| rows.as_slice())
+            .ok_or_else(|| "direct integer join group id out of bounds".to_string())
+    }
+
+    fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        if let Some(current) = self.mem_tracker.as_ref() {
+            if Arc::ptr_eq(current, &tracker) {
+                return;
+            }
+            current.release(self.accounted_bytes);
+        }
+        let bytes = self.tracked_bytes();
+        tracker.consume(bytes);
+        self.mem_tracker = Some(tracker);
+        self.accounted_bytes = bytes;
+    }
+
+    fn refresh_accounting(&mut self) {
+        let Some(tracker) = self.mem_tracker.as_ref() else {
+            return;
+        };
+        let bytes = self.tracked_bytes();
+        let delta = bytes - self.accounted_bytes;
+        if delta > 0 {
+            tracker.consume(delta);
+        } else if delta < 0 {
+            tracker.release(-delta);
+        }
+        self.accounted_bytes = bytes;
+    }
+
+    fn tracked_bytes(&self) -> i64 {
+        fn vec_bytes<T>(v: &Vec<T>) -> i64 {
+            let bytes = v.capacity().saturating_mul(mem::size_of::<T>());
+            i64::try_from(bytes).unwrap_or(i64::MAX)
+        }
+
+        let inner_bytes = self
+            .group_rows
+            .iter()
+            .fold(0i64, |acc, rows| acc.saturating_add(vec_bytes(rows)));
+        vec_bytes(&self.first)
+            .saturating_add(vec_bytes(&self.next))
+            .saturating_add(vec_bytes(&self.group_rows))
+            .saturating_add(inner_bytes)
+    }
+}
+
+impl Drop for DirectIntJoinHashMap {
+    fn drop(&mut self) {
+        if let Some(tracker) = self.mem_tracker.as_ref()
+            && self.accounted_bytes > 0
+        {
+            tracker.release(self.accounted_bytes);
+            self.accounted_bytes = 0;
+        }
+    }
 }
 
 fn collect_direct_int_stats(
@@ -511,7 +594,7 @@ fn collect_direct_int_stats(
     let mut max = i64::MIN;
     let mut row_count = 0usize;
     let mut indexed_rows = 0usize;
-    let not_null = false;
+    let mut not_null = true;
     for batch in batches {
         if batch.arrays().len() != 1 {
             return Err("direct integer join requires one build key".to_string());
@@ -529,6 +612,9 @@ fn collect_direct_int_stats(
         }
         if array.data_type() != data_type {
             return Err("direct integer join key type mismatch".to_string());
+        }
+        if array.null_count() > 0 {
+            not_null = false;
         }
         let next_row_count = row_count
             .checked_add(batch.num_rows())
@@ -616,6 +702,7 @@ fn build_nulls(views: &[GroupKeyArrayView<'_>], len: usize, null_safe_eq: &[bool
 
 #[cfg(test)]
 mod tests {
+    use std::mem;
     use std::sync::Arc;
 
     use arrow::array::{ArrayRef, Int32Array};
@@ -626,6 +713,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::runtime::mem_tracker::MemTracker;
 
     const KEY_SLOT_ID: SlotId = SlotId(1);
 
@@ -707,7 +795,7 @@ mod tests {
             JoinHashMapMethodKind::DirectInt {
                 min: 100,
                 len: 4,
-                not_null: false,
+                not_null: true,
             }
         );
 
@@ -750,5 +838,72 @@ mod tests {
 
         assert_eq!(selection.probe, vec![0, 0]);
         assert_eq!(selection.build, vec![2, 0]);
+    }
+
+    #[test]
+    fn direct_map_group_build_rows_matches_returned_group_id() {
+        let build = int32_chunk(vec![Some(10), None, Some(10)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
+        let probe = int32_chunk(vec![Some(10)]);
+        let group_ids = map
+            .lookup_group_ids(&arena, &[probe_key], &probe)
+            .expect("lookup");
+        let group_id = group_ids[0].expect("group id");
+
+        assert_eq!(map.group_build_rows(group_id).expect("group rows"), &[2, 0]);
+    }
+
+    #[test]
+    fn direct_map_set_mem_tracker_accounts_direct_allocations() {
+        let root = MemTracker::new_root("direct-map-test");
+        {
+            let build = int32_chunk(vec![Some(100), Some(101), Some(100), Some(103)]);
+            let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+            let mut map = JoinHashMap::build_from_key_batches(
+                vec![DataType::Int32],
+                vec![false],
+                &[batch],
+                JoinHashMapBuildOptions::default(),
+            )
+            .expect("map");
+
+            map.set_mem_tracker(Arc::clone(&root));
+
+            let min_expected = ((4 + build.len()) * mem::size_of::<u32>()) as i64;
+            assert!(root.current() >= min_expected);
+        }
+        assert_eq!(root.current(), 0);
+    }
+
+    #[test]
+    fn direct_map_records_not_null_when_build_keys_have_no_nulls() {
+        let build = int32_chunk(vec![Some(7), Some(8), Some(7)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+
+        assert_eq!(
+            map.method_kind(),
+            JoinHashMapMethodKind::DirectInt {
+                min: 7,
+                len: 2,
+                not_null: true,
+            }
+        );
     }
 }
