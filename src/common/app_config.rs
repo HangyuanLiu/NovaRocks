@@ -631,6 +631,11 @@ pub struct RuntimeConfig {
     pub exchange_io_threads: usize,
     #[serde(default = "default_exchange_io_max_inflight_bytes")]
     pub exchange_io_max_inflight_bytes: usize,
+    #[serde(default = "default_optimizer_query_mem_limit_bytes")]
+    pub optimizer_query_mem_limit_bytes: u64,
+    /// `0` means derive the backend count from the live BE registry (the normal path).
+    #[serde(default = "default_optimizer_effective_backend_count")]
+    pub optimizer_effective_backend_count: u64,
     #[serde(default = "default_local_exchange_buffer_mem_limit_per_driver")]
     pub local_exchange_buffer_mem_limit_per_driver: usize,
     #[serde(default = "default_local_exchange_max_buffered_rows")]
@@ -848,6 +853,14 @@ fn default_exchange_io_max_inflight_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+fn default_optimizer_query_mem_limit_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+
+fn default_optimizer_effective_backend_count() -> u64 {
+    0
+}
+
 fn default_local_exchange_buffer_mem_limit_per_driver() -> usize {
     128 * 1024 * 1024
 }
@@ -1023,6 +1036,8 @@ impl Default for RuntimeConfig {
             exchange_max_transmit_batched_bytes: default_exchange_max_transmit_batched_bytes(),
             exchange_io_threads: default_exchange_io_threads(),
             exchange_io_max_inflight_bytes: default_exchange_io_max_inflight_bytes(),
+            optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),
+            optimizer_effective_backend_count: default_optimizer_effective_backend_count(),
             local_exchange_buffer_mem_limit_per_driver:
                 default_local_exchange_buffer_mem_limit_per_driver(),
             local_exchange_max_buffered_rows: default_local_exchange_max_buffered_rows(),

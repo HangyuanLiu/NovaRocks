@@ -510,8 +510,10 @@ fn format_hash_join_node(
             )
         })
         .collect::<Vec<_>>();
+    let bcast_v = bcast_verbose_suffix(&node.stats.broadcast_decision, level);
+    let bcast_c = bcast_costs_suffix(&node.stats.broadcast_decision, level);
     out.push(format!(
-        "{pad}{}HASH JOIN ({dist}, {join_str}, eq: [{}]){costs_suffix}{stats_suffix}",
+        "{pad}{}HASH JOIN ({dist}, {join_str}, eq: [{}]){costs_suffix}{bcast_c}{bcast_v}{stats_suffix}",
         node_prefix(node),
         eq.join(", ")
     ));
@@ -943,6 +945,34 @@ fn fmt_bytes(bytes: i64) -> String {
     }
 }
 
+fn fmt_bytes_f64(bytes: f64) -> String {
+    const PB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0;
+
+    if !bytes.is_finite() || bytes.abs() >= PB {
+        return format!("{}B", fmt_f64(bytes));
+    }
+    let abs = bytes.abs();
+    if abs < 1024.0 {
+        format_scaled_bytes(bytes, "B")
+    } else if abs < 1024.0 * 1024.0 {
+        format_scaled_bytes(bytes / 1024.0, "KB")
+    } else if abs < 1024.0 * 1024.0 * 1024.0 {
+        format_scaled_bytes(bytes / (1024.0 * 1024.0), "MB")
+    } else if abs < 1024.0 * 1024.0 * 1024.0 * 1024.0 {
+        format_scaled_bytes(bytes / (1024.0 * 1024.0 * 1024.0), "GB")
+    } else {
+        format_scaled_bytes(bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0), "TB")
+    }
+}
+
+fn format_scaled_bytes(value: f64, unit: &str) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}{unit}")
+    } else {
+        format!("{value:.1}{unit}")
+    }
+}
+
 fn is_detailed(level: ExplainLevel) -> bool {
     matches!(
         level,
@@ -968,6 +998,64 @@ fn costs_suffix(stats: &PlanNodeStats, level: ExplainLevel) -> String {
     } else {
         String::new()
     }
+}
+
+fn bcast_verbose_suffix(
+    decision: &Option<crate::sql::optimizer::cost::BroadcastDecision>,
+    level: ExplainLevel,
+) -> String {
+    let d = match decision {
+        Some(d) => d,
+        None => return String::new(),
+    };
+    if !matches!(level, ExplainLevel::Verbose | ExplainLevel::Analyze) {
+        return String::new();
+    }
+    let verdict = if d.feasible { "feasible" } else { "infeasible" };
+    let forced = if d.forced { " bcast_forced=true" } else { "" };
+    format!(" bcast_verdict={verdict}{forced}")
+}
+
+fn bcast_costs_suffix(
+    decision: &Option<crate::sql::optimizer::cost::BroadcastDecision>,
+    level: ExplainLevel,
+) -> String {
+    use crate::sql::optimizer::cost::BroadcastRejectReason;
+
+    let d = match decision {
+        Some(d) => d,
+        None => return String::new(),
+    };
+    if !matches!(level, ExplainLevel::Costs) {
+        return String::new();
+    }
+    let breakdown = format!(
+        " bcast={{build={} ht={} be={} fanout={} budget={} risk_mult={:.1}x}}",
+        fmt_bytes_f64(d.build_bytes),
+        fmt_bytes_f64(d.hash_table_bytes),
+        fmt_f64(d.effective_backend_count),
+        fmt_bytes_f64(d.risk_adj_fanout_bytes),
+        fmt_bytes_f64(d.per_node_budget_bytes),
+        d.risk_multiplier,
+    );
+    let reject = match d.reject_reason {
+        Some(BroadcastRejectReason::PerNodeMemory) => format!(
+            " bcast_reject=\"risk_adj_build {} > node_budget {}\"",
+            fmt_bytes_f64(d.hash_table_bytes * d.risk_multiplier),
+            fmt_bytes_f64(d.per_node_budget_bytes),
+        ),
+        Some(BroadcastRejectReason::ClusterNetwork) => format!(
+            " bcast_reject=\"risk_adj_fanout {} > network_budget {}\"",
+            fmt_bytes_f64(d.risk_adj_fanout_bytes),
+            fmt_bytes_f64(d.cluster_network_budget_bytes),
+        ),
+        Some(BroadcastRejectReason::UninformativeSize) => {
+            " bcast_reject=\"build size unknown (fallback default stats) -> partitioned\""
+                .to_string()
+        }
+        None => String::new(),
+    };
+    format!("{breakdown}{reject}")
 }
 
 fn format_cost_estimate(cost: &crate::sql::optimizer::statistics::CostEstimate) -> String {
@@ -1545,6 +1633,162 @@ mod tests {
         assert!(
             !text.contains("9223372036854775807"),
             "huge finite values must not saturate through i64 formatting"
+        );
+    }
+
+    fn decision(
+        feasible: bool,
+        forced: bool,
+        reject: Option<crate::sql::optimizer::cost::BroadcastRejectReason>,
+    ) -> crate::sql::optimizer::cost::BroadcastDecision {
+        crate::sql::optimizer::cost::BroadcastDecision {
+            feasible,
+            forced,
+            build_bytes: 16.0 * 1024.0 * 1024.0,
+            hash_table_bytes: 53_300_000.0,
+            effective_backend_count: 10.0,
+            risk_adj_fanout_bytes: 144.0 * 1024.0 * 1024.0,
+            per_node_budget_bytes: 256.0 * 1024.0 * 1024.0,
+            cluster_network_budget_bytes: 2560.0 * 1024.0 * 1024.0,
+            risk_multiplier: 1.0,
+            reject_reason: reject,
+        }
+    }
+
+    #[test]
+    fn verbose_shows_verdict_token_normal_and_costs_do_not() {
+        let d = decision(true, false, None);
+        assert_eq!(
+            super::bcast_verbose_suffix(&Some(d), ExplainLevel::Verbose),
+            " bcast_verdict=feasible"
+        );
+        assert_eq!(
+            super::bcast_verbose_suffix(&Some(d), ExplainLevel::Analyze),
+            " bcast_verdict=feasible"
+        );
+        assert_eq!(
+            super::bcast_verbose_suffix(&Some(d), ExplainLevel::Normal),
+            ""
+        );
+        assert_eq!(
+            super::bcast_verbose_suffix(&Some(d), ExplainLevel::Costs),
+            ""
+        );
+    }
+
+    #[test]
+    fn forced_infeasible_shows_forced_token() {
+        let d = decision(
+            false,
+            true,
+            Some(crate::sql::optimizer::cost::BroadcastRejectReason::PerNodeMemory),
+        );
+        let s = super::bcast_verbose_suffix(&Some(d), ExplainLevel::Verbose);
+        assert!(s.contains("bcast_verdict=infeasible"));
+        assert!(s.contains("bcast_forced=true"));
+    }
+
+    #[test]
+    fn costs_shows_breakdown_verbose_does_not() {
+        let d = decision(true, false, None);
+        assert!(super::bcast_costs_suffix(&Some(d), ExplainLevel::Costs).contains("bcast={build="));
+        assert_eq!(
+            super::bcast_costs_suffix(&Some(d), ExplainLevel::Verbose),
+            ""
+        );
+        assert_eq!(
+            super::bcast_costs_suffix(&Some(d), ExplainLevel::Analyze),
+            ""
+        );
+    }
+
+    #[test]
+    fn costs_reject_reason_rendered() {
+        let d = decision(
+            false,
+            false,
+            Some(crate::sql::optimizer::cost::BroadcastRejectReason::PerNodeMemory),
+        );
+        let s = super::bcast_costs_suffix(&Some(d), ExplainLevel::Costs);
+        assert!(s.contains("bcast_reject=\"risk_adj_build"));
+    }
+
+    #[test]
+    fn costs_reject_reason_covers_network_and_uninformative_size() {
+        let network = decision(
+            false,
+            false,
+            Some(crate::sql::optimizer::cost::BroadcastRejectReason::ClusterNetwork),
+        );
+        let network_text = super::bcast_costs_suffix(&Some(network), ExplainLevel::Costs);
+        assert!(network_text.contains("bcast_reject=\"risk_adj_fanout"));
+        assert!(network_text.contains("network_budget"));
+
+        let unknown = decision(
+            false,
+            false,
+            Some(crate::sql::optimizer::cost::BroadcastRejectReason::UninformativeSize),
+        );
+        let unknown_text = super::bcast_costs_suffix(&Some(unknown), ExplainLevel::Costs);
+        assert!(unknown_text.contains("build size unknown"));
+    }
+
+    #[test]
+    fn costs_byte_formatting_keeps_huge_and_nonfinite_values_visible() {
+        let mut huge = decision(
+            false,
+            false,
+            Some(crate::sql::optimizer::cost::BroadcastRejectReason::PerNodeMemory),
+        );
+        huge.hash_table_bytes = 1.0e300;
+        huge.risk_multiplier = 4.0;
+        huge.per_node_budget_bytes = f64::INFINITY;
+        let huge_text = super::bcast_costs_suffix(&Some(huge), ExplainLevel::Costs);
+        assert!(huge_text.contains("1.0000e300B"));
+        assert!(huge_text.contains("+infB"));
+        assert!(!huge_text.contains("9223372036854775807"));
+
+        let mut fractional = decision(true, false, None);
+        fractional.build_bytes = 1536.0;
+        let fractional_text = super::bcast_costs_suffix(&Some(fractional), ExplainLevel::Costs);
+        assert!(fractional_text.contains("build=1.5KB"));
+    }
+
+    #[test]
+    fn hash_join_line_places_broadcast_tokens_at_the_expected_levels() {
+        let dp = build_distributed_plan(&test_support::inner_join_two_scans())
+            .expect("build DistributedPlan");
+
+        let normal = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+        assert!(!normal.contains("bcast_"));
+        assert!(!normal.contains(" bcast={"));
+
+        let verbose = explain_distributed_plan(&dp, ExplainLevel::Verbose).join("\n");
+        let verbose_line = verbose
+            .lines()
+            .find(|line| line.contains("HASH JOIN"))
+            .expect("verbose hash join line");
+        assert!(verbose_line.contains("bcast_verdict="));
+        assert!(!verbose_line.contains(" bcast={"));
+        assert!(
+            verbose_line.find("bcast_verdict").expect("verdict")
+                < verbose_line.find("stats={").expect("stats"),
+            "verdict should render before stats trailer: {verbose_line}"
+        );
+
+        let costs = explain_distributed_plan(&dp, ExplainLevel::Costs).join("\n");
+        let costs_line = costs
+            .lines()
+            .find(|line| line.contains("HASH JOIN"))
+            .expect("costs hash join line");
+        assert!(costs_line.contains("cost={"));
+        assert!(costs_line.contains(" bcast={"));
+        assert!(!costs_line.contains("bcast_verdict"));
+        assert!(
+            costs_line.find("cost={").expect("cost") < costs_line.find(" bcast={").expect("bcast")
+                && costs_line.find(" bcast={").expect("bcast")
+                    < costs_line.find("stats={").expect("stats"),
+            "Costs HASH JOIN line should render cost, bcast, then stats: {costs_line}"
         );
     }
 

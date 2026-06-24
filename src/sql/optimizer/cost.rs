@@ -210,18 +210,70 @@ pub(crate) fn compute_cost(
     }
 }
 
+/// Default per-query planning-time memory budget (StarRocks maxExecMemByte analog).
+const DEFAULT_QUERY_MEM_LIMIT_BYTES: f64 = 2.0 * 1024.0 * 1024.0 * 1024.0;
+/// Fraction of the per-query budget a single broadcast build hash table may use.
+const BUILD_HASH_TABLE_MEM_FRACTION: f64 = 0.5;
+/// CI distributed baseline backend count (1 FE + 3 BE). NOT a standalone assumption.
+const DEFAULT_EFFECTIVE_BACKEND_COUNT: f64 = 3.0;
+
+/// Cluster/resource snapshot the cost kernel uses to normalize broadcast risk
+/// into real resource units. All `f64` to match `CostOptions` (hot-path, no cast).
+/// Populated at the engine boundary from the live BE registry; the cost formulas
+/// must NEVER read a global registry directly (keeps cost free of hidden state).
+#[derive(Clone, Debug)]
+pub(crate) struct ClusterResourceProfile {
+    /// Real BE count (live BE registry snapshot); clamped `>= 1.0` at use sites.
+    /// Replaces the hardcoded `backend_factor=3.0`. CI baseline = 3.
+    pub effective_backend_count: f64,
+    /// LAYER 1 per-node OOM floor denominator.
+    pub per_node_build_memory_budget_bytes: f64,
+    /// Planning-time per-query memory limit (StarRocks maxExecMemByte analog).
+    pub query_mem_limit_bytes: f64,
+    /// LAYER 2 cluster-wide broadcast network floor (finite default, NOT INF).
+    pub cluster_broadcast_network_budget_bytes: f64,
+}
+
+impl Default for ClusterResourceProfile {
+    fn default() -> Self {
+        let backends = DEFAULT_EFFECTIVE_BACKEND_COUNT;
+        let per_node = DEFAULT_QUERY_MEM_LIMIT_BYTES * BUILD_HASH_TABLE_MEM_FRACTION;
+        Self {
+            effective_backend_count: backends,
+            per_node_build_memory_budget_bytes: per_node,
+            query_mem_limit_bytes: DEFAULT_QUERY_MEM_LIMIT_BYTES,
+            cluster_broadcast_network_budget_bytes: per_node,
+        }
+    }
+}
+
+impl ClusterResourceProfile {
+    pub(crate) fn apply_query_mem_limit_bytes(&mut self, query_mem_limit_bytes: f64) {
+        let query_mem_limit_bytes =
+            normalized_positive_bytes(query_mem_limit_bytes, DEFAULT_QUERY_MEM_LIMIT_BYTES);
+        let per_node =
+            finite_non_negative_cost(query_mem_limit_bytes * BUILD_HASH_TABLE_MEM_FRACTION);
+        self.query_mem_limit_bytes = query_mem_limit_bytes;
+        self.per_node_build_memory_budget_bytes = per_node;
+        self.cluster_broadcast_network_budget_bytes = per_node;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CostOptions {
     pub cpu_weight: f64,
     pub memory_weight: f64,
     pub network_weight: f64,
     pub backend_factor: f64,
-    pub broadcast_row_limit: f64,
-    pub broadcast_byte_limit: f64,
-    pub broadcast_right_table_scale_factor: f64,
-    pub fallback_broadcast_row_limit: f64,
-    pub network_cost: f64,
-    pub memory_cost_weight: f64,
+    /// Cluster/resource snapshot used by broadcast feasibility and hash-join
+    /// costing. `backend_factor` remains a cached projection for older callers.
+    pub profile: ClusterResourceProfile,
+    pub hash_table_per_row_overhead_bytes: f64,
+    pub hash_table_load_factor: f64,
+    pub risk_multiplier_fallback: f64,
+    pub risk_multiplier_estimated: f64,
+    pub risk_multiplier_exact: f64,
+    pub risk_multiplier_measured: f64,
     pub predicate_cost_factor: f64,
     pub projection_cost_factor: f64,
     pub hash_cost_factor: f64,
@@ -229,7 +281,6 @@ pub(crate) struct CostOptions {
     pub topn_cost_factor: f64,
     pub aggregate_cost_factor: f64,
     pub exchange_startup_cost: f64,
-    pub fallback_cpu_factor: f64,
 }
 
 impl Default for CostOptions {
@@ -239,12 +290,13 @@ impl Default for CostOptions {
             memory_weight: DEFAULT_MEMORY_COST_WEIGHT,
             network_weight: DEFAULT_NETWORK_COST_WEIGHT,
             backend_factor: 3.0,
-            broadcast_row_limit: 15_000_000.0,
-            broadcast_byte_limit: 512.0 * 1024.0 * 1024.0,
-            broadcast_right_table_scale_factor: 10.0,
-            fallback_broadcast_row_limit: 500_000.0,
-            network_cost: NETWORK_COST,
-            memory_cost_weight: 0.25,
+            profile: ClusterResourceProfile::default(),
+            hash_table_per_row_overhead_bytes: 16.0,
+            hash_table_load_factor: 0.75,
+            risk_multiplier_fallback: 4.0,
+            risk_multiplier_estimated: 2.0,
+            risk_multiplier_exact: 1.0,
+            risk_multiplier_measured: 1.0,
             predicate_cost_factor: 0.02,
             projection_cost_factor: 0.01,
             hash_cost_factor: 1.0,
@@ -252,8 +304,41 @@ impl Default for CostOptions {
             topn_cost_factor: 1.0,
             aggregate_cost_factor: 1.0,
             exchange_startup_cost: DISTRIBUTION_STARTUP_COST,
-            fallback_cpu_factor: 0.01,
         }
+    }
+}
+
+impl CostOptions {
+    /// Install a profile and refresh the cached `backend_factor` projection.
+    /// `backend_factor` is always the normalized effective backend count, so
+    /// existing `options.backend_factor` call sites need no change.
+    pub(crate) fn apply_profile(&mut self, mut profile: ClusterResourceProfile) {
+        let backends = normalized_effective_backend_count(profile.effective_backend_count);
+        profile.effective_backend_count = backends;
+        profile.query_mem_limit_bytes =
+            normalized_positive_bytes(profile.query_mem_limit_bytes, DEFAULT_QUERY_MEM_LIMIT_BYTES);
+        profile.per_node_build_memory_budget_bytes =
+            finite_non_negative_cost(profile.per_node_build_memory_budget_bytes);
+        profile.cluster_broadcast_network_budget_bytes =
+            finite_non_negative_cost(profile.per_node_build_memory_budget_bytes);
+        self.backend_factor = backends;
+        self.profile = profile;
+    }
+}
+
+fn normalized_positive_bytes(value: f64, default_value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        finite_non_negative_cost(value)
+    } else {
+        default_value
+    }
+}
+
+fn normalized_effective_backend_count(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value.max(1.0)
+    } else {
+        1.0
     }
 }
 
@@ -306,6 +391,240 @@ fn cost_row_width(stats: &Statistics) -> f64 {
 
 fn safe_compute_size(stats: &Statistics) -> f64 {
     finite_non_negative_cost(cost_row_count(stats) * cost_row_width(stats))
+}
+
+/// Degenerate "build size unknown" detector. Triggers on the magnitude axis
+/// (non-finite/<=0/overflow) AND on NovaRocks' real fabricated-default
+/// fingerprint (Fallback confidence + empty column_statistics), because the
+/// fallback constructors and CTE/scan missing-stats paths replace truly unknown
+/// tables with a finite default magnitude + Fallback confidence. Without the
+/// fingerprint arm the magnitude-only check is dead code. Trino: unknown ->
+/// partitioned.
+pub(crate) fn build_size_is_uninformative(build_stats: &Statistics) -> bool {
+    let rows = build_stats.output_row_count;
+    if !rows.is_finite() || rows <= 0.0 || safe_compute_size(build_stats) >= MAX_FINITE_COST {
+        return true;
+    }
+    build_stats.row_count_confidence == crate::sql::optimizer::statistics::Confidence::Fallback
+        && build_stats.column_statistics.is_empty()
+}
+
+/// Estimated per-node memory of the broadcast build hash table. This feeds the
+/// LAYER 1 floor and the hash-join memory dimension; network terms use raw
+/// build bytes.
+/// `payload / load_factor + rows * per_row_overhead`. The per-row term (16B =
+/// 4x Vec<u32> in JoinHashTable) is what makes a narrow build correctly
+/// expensive, dissolving the old narrow-build exception.
+pub(crate) fn estimated_build_hash_table_bytes(
+    build_stats: &Statistics,
+    options: &CostOptions,
+) -> f64 {
+    let payload = safe_compute_size(build_stats);
+    let rows = cost_row_count(build_stats);
+    let load_factor = if options.hash_table_load_factor.is_nan() {
+        0.75
+    } else {
+        options.hash_table_load_factor.clamp(0.5, 1.0)
+    };
+    let per_row = options.hash_table_per_row_overhead_bytes.max(0.0);
+    finite_non_negative_cost(payload / load_factor + rows * per_row)
+}
+
+/// Dimensionless inflation factor applied to the estimated build hash-table
+/// bytes BEFORE the LAYER 1 feasibility check. Feasibility-only — it does NOT
+/// enter LAYER 2 cost (that would double-count and degrade into a soft gate).
+/// Anchored at Exact=1.0, monotone non-increasing as confidence rises.
+pub(crate) fn confidence_risk_multiplier(
+    confidence: crate::sql::optimizer::statistics::Confidence,
+    options: &CostOptions,
+) -> f64 {
+    use crate::sql::optimizer::statistics::Confidence;
+    let multiplier = match confidence {
+        Confidence::Fallback => options.risk_multiplier_fallback,
+        Confidence::Estimated => options.risk_multiplier_estimated,
+        Confidence::Exact => options.risk_multiplier_exact,
+        Confidence::Measured => options.risk_multiplier_measured,
+    };
+    if multiplier.is_finite() && multiplier > 0.0 {
+        multiplier
+    } else {
+        1.0
+    }
+}
+
+#[allow(dead_code)] // BC-1 Phase 1 staged until search.rs consumes broadcast feasibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BroadcastRejectReason {
+    /// `risk_adj_build_bytes` exceeds the per-node memory budget (LAYER 1).
+    PerNodeMemory,
+    /// `risk_adj_fanout_bytes` exceeds the cluster network budget (LAYER 2).
+    ClusterNetwork,
+    /// Build size unknown (fabricated default stats) -> partitioned.
+    UninformativeSize,
+}
+
+#[allow(dead_code)] // BC-1 Phase 1 staged until search.rs consumes broadcast feasibility.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BroadcastFeasibility {
+    pub(crate) feasible: bool,
+    pub(crate) build_bytes: f64,
+    pub(crate) hash_table_bytes: f64,
+    pub(crate) effective_backend_count: f64,
+    pub(crate) risk_multiplier: f64,
+    pub(crate) risk_adj_build_bytes: f64,
+    pub(crate) risk_adj_fanout_bytes: f64,
+    pub(crate) reject_reason: Option<BroadcastRejectReason>,
+}
+
+/// LAYER 1 hard feasibility floor. Per-node memory floor NEVER divides by the
+/// backend count (broadcast materializes the full build on every node) plus a
+/// cluster network fanout floor. Confidence enters only here, never in cost.
+#[allow(dead_code)] // BC-1 Phase 1 staged until search.rs consumes broadcast feasibility.
+pub(crate) fn broadcast_is_feasible(
+    _probe_stats: &Statistics,
+    build_stats: &Statistics,
+    options: &CostOptions,
+) -> BroadcastFeasibility {
+    let backends = normalized_effective_backend_count(options.profile.effective_backend_count);
+    let raw = safe_compute_size(build_stats);
+    let risk_mult = confidence_risk_multiplier(build_stats.row_count_confidence, options);
+    let ht_bytes = estimated_build_hash_table_bytes(build_stats, options);
+
+    if build_size_is_uninformative(build_stats) {
+        return BroadcastFeasibility {
+            feasible: false,
+            build_bytes: raw,
+            hash_table_bytes: ht_bytes,
+            effective_backend_count: backends,
+            risk_multiplier: risk_mult,
+            risk_adj_build_bytes: finite_non_negative_cost(ht_bytes * risk_mult),
+            risk_adj_fanout_bytes: finite_non_negative_cost(raw * backends * risk_mult),
+            reject_reason: Some(BroadcastRejectReason::UninformativeSize),
+        };
+    }
+
+    // LAYER 1 (per-node memory): NO backend divisor — full build per node.
+    let risk_adj_build_bytes = finite_non_negative_cost(ht_bytes * risk_mult);
+    // LAYER 2 (cluster network): charge raw bytes * backend count * risk against
+    // a fixed cluster-wide budget. The budget intentionally does not scale with
+    // backend count; otherwise fanout cancels out and the network floor is dead.
+    let risk_adj_fanout_bytes = finite_non_negative_cost(raw * backends * risk_mult);
+
+    let mem_ok = risk_adj_build_bytes <= options.profile.per_node_build_memory_budget_bytes;
+    let net_ok = risk_adj_fanout_bytes <= options.profile.cluster_broadcast_network_budget_bytes;
+
+    let reject_reason = if !mem_ok {
+        Some(BroadcastRejectReason::PerNodeMemory)
+    } else if !net_ok {
+        Some(BroadcastRejectReason::ClusterNetwork)
+    } else {
+        None
+    };
+
+    BroadcastFeasibility {
+        feasible: mem_ok && net_ok,
+        build_bytes: raw,
+        hash_table_bytes: ht_bytes,
+        effective_backend_count: backends,
+        risk_multiplier: risk_mult,
+        risk_adj_build_bytes,
+        risk_adj_fanout_bytes,
+        reject_reason,
+    }
+}
+
+/// EXPLAIN-facing broadcast decision. Single source of truth: produced only by
+/// `broadcast_decision`. None for non-hash-join / non-broadcast / no-build nodes.
+#[allow(dead_code)] // BC-1 Phase 2 staged until distributed_build consumes broadcast decisions.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BroadcastDecision {
+    pub feasible: bool,
+    pub forced: bool,
+    pub build_bytes: f64,
+    pub hash_table_bytes: f64,
+    pub effective_backend_count: f64,
+    pub risk_adj_fanout_bytes: f64,
+    pub per_node_budget_bytes: f64,
+    pub cluster_network_budget_bytes: f64,
+    pub risk_multiplier: f64,
+    pub reject_reason: Option<BroadcastRejectReason>,
+}
+
+/// Produce the broadcast decision for EXPLAIN. Only fires for a hash join with
+/// a build child under the BroadcastJoin alternative (or Default+Broadcast).
+#[allow(dead_code)] // BC-1 Phase 2 staged until distributed_build consumes broadcast decisions.
+pub(crate) fn broadcast_decision(input: &CostInput<'_>) -> Option<BroadcastDecision> {
+    let join = match input.op {
+        Operator::PhysicalHashJoin(join) => join,
+        _ => return None,
+    };
+    let is_broadcast = match input.alt_kind {
+        PropertyAlternativeKind::BroadcastJoin => true,
+        PropertyAlternativeKind::ShuffleJoin => false,
+        PropertyAlternativeKind::Default => {
+            matches!(join.distribution, JoinDistribution::Broadcast)
+        }
+    };
+    if !is_broadcast {
+        return None;
+    }
+
+    let build_stats = input.child_stats.get(1).copied()?;
+    let probe_stats = input.child_stats.first().copied().unwrap_or(build_stats);
+    let feas = broadcast_is_feasible(probe_stats, build_stats, input.options);
+    let forced = broadcast_decision_is_forced(join, input);
+
+    Some(BroadcastDecision {
+        feasible: feas.feasible,
+        forced,
+        build_bytes: feas.build_bytes,
+        hash_table_bytes: feas.hash_table_bytes,
+        effective_backend_count: feas.effective_backend_count,
+        risk_adj_fanout_bytes: feas.risk_adj_fanout_bytes,
+        per_node_budget_bytes: input.options.profile.per_node_build_memory_budget_bytes,
+        cluster_network_budget_bytes: input.options.profile.cluster_broadcast_network_budget_bytes,
+        risk_multiplier: feas.risk_multiplier,
+        reject_reason: feas.reject_reason,
+    })
+}
+
+fn broadcast_decision_is_forced(join: &PhysicalHashJoinOp, input: &CostInput<'_>) -> bool {
+    if join.join_type == JoinKind::NullAwareLeftAnti {
+        return true;
+    }
+    let Some(scalars) = input.scalars else {
+        return false;
+    };
+    let mut unresolved = join.clone();
+    unresolved.distribution = JoinDistribution::Unknown;
+    let unresolved_op = Operator::PhysicalHashJoin(unresolved);
+    let alternatives = super::derive::derive_required_alternatives(
+        &unresolved_op,
+        scalars,
+        input.required_output,
+        input.child_stats.len(),
+    );
+    feasibility_is_advisory_only(&unresolved_op, &alternatives)
+}
+
+/// True when broadcast feasibility is advisory only for this operator: broadcast
+/// is the only correct distribution, so an infeasible verdict must not prune
+/// the alternative.
+#[allow(dead_code)] // BC-1 Phase 1 staged until search.rs consumes advisory feasibility.
+pub(crate) fn feasibility_is_advisory_only(
+    op: &Operator,
+    alternatives: &[super::derive::ChildRequirementAlternative],
+) -> bool {
+    match op {
+        Operator::PhysicalHashJoin(join) => {
+            join.join_type == JoinKind::NullAwareLeftAnti
+                || (!alternatives.is_empty()
+                    && alternatives
+                        .iter()
+                        .all(|alt| alt.kind == PropertyAlternativeKind::BroadcastJoin))
+        }
+        _ => false,
+    }
 }
 
 fn scan_cost_size(scan: &ScanOp, stats: &Statistics) -> f64 {
@@ -501,17 +820,24 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
     let mut cpu_cost = finite_non_negative_cost(
         (probe_rows + build_rows) * key_factor * input.options.hash_cost_factor + output_size,
     );
+    let backends =
+        normalized_effective_backend_count(input.options.profile.effective_backend_count);
+    let build_hash =
+        estimated_build_hash_table_bytes(build_stats.unwrap_or(input.own_stats), input.options);
+    let fanout = (backends - 1.0).max(0.0);
     let mut memory_cost = if is_broadcast {
-        finite_non_negative_cost(build_size * input.options.backend_factor)
+        finite_non_negative_cost(build_hash * backends)
     } else if is_shuffle {
-        finite_non_negative_cost(build_size / input.options.backend_factor.max(1.0))
+        finite_non_negative_cost(build_hash / backends)
     } else {
-        build_size
+        build_hash
     };
     let network_cost = if is_broadcast {
-        finite_non_negative_cost(build_size * input.options.backend_factor)
+        finite_non_negative_cost(build_size * fanout)
     } else if is_shuffle {
-        if child_output_is_hash_partitioned(input.child_outputs.first())
+        if backends <= 1.0 {
+            0.0
+        } else if child_output_is_hash_partitioned(input.child_outputs.first())
             && child_output_is_hash_partitioned(input.child_outputs.get(1))
         {
             0.0
@@ -726,75 +1052,28 @@ pub(crate) fn compute_cost_from_input(input: &CostInput<'_>) -> TotalCost {
     compute_cost_estimate(input).total_with_options(input.options)
 }
 
-pub(crate) fn broadcast_gate_passes(
-    probe_stats: &Statistics,
-    build_stats: &Statistics,
-    options: &CostOptions,
-) -> bool {
-    let build_rows = build_stats.output_row_count;
-    let build_bytes = build_stats.compute_size();
-    let probe_bytes = probe_stats.compute_size();
-
-    if build_bytes > options.broadcast_byte_limit {
-        return false;
-    }
-
-    if build_stats.row_count_confidence < crate::sql::optimizer::statistics::Confidence::Exact
-        && build_rows > options.fallback_broadcast_row_limit
-    {
-        return false;
-    }
-
-    let build_is_obviously_tiny = probe_bytes
-        >= build_bytes * options.backend_factor * options.broadcast_right_table_scale_factor;
-    if build_rows > options.broadcast_row_limit && !build_is_obviously_tiny {
-        return false;
-    }
-
-    true
-}
-
 fn compute_legacy_cost_with_properties(
     op: &Operator,
     own_stats: &Statistics,
     child_stats: &[&Statistics],
-    _child_outputs: &[&PhysicalPropertySet],
+    child_outputs: &[&PhysicalPropertySet],
     alt_kind: &PropertyAlternativeKind,
     options: &CostOptions,
 ) -> TotalCost {
     match op {
-        Operator::PhysicalHashJoin(j) => {
-            let probe_stats = child_stats.first().copied();
-            let build_stats = child_stats.get(1).copied();
-            let probe_size = probe_stats.map(|s| s.compute_size()).unwrap_or(0.0);
-            let build_size = build_stats.map(|s| s.compute_size()).unwrap_or(0.0);
-
-            let base_cost = match alt_kind {
-                PropertyAlternativeKind::BroadcastJoin => {
-                    // The distribution enforcer cost models making the build
-                    // child available to the join. The join self-cost still
-                    // charges backend fanout and memory pressure during hash
-                    // table materialization/probing.
-                    probe_size
-                        + build_size * options.network_cost * options.backend_factor
-                        + build_size * options.memory_cost_weight * options.backend_factor
-                }
-                PropertyAlternativeKind::ShuffleJoin => {
-                    probe_size + build_size / options.backend_factor.max(1.0)
-                }
-                PropertyAlternativeKind::Default => compute_cost(op, own_stats, child_stats),
+        Operator::PhysicalHashJoin(join) => {
+            let required_output = PhysicalPropertySet::any();
+            let input = CostInput {
+                op,
+                own_stats,
+                child_stats,
+                child_outputs,
+                required_output: &required_output,
+                alt_kind,
+                scalars: None,
+                options,
             };
-
-            let cost_after_cross = if j.join_type == JoinKind::Cross {
-                base_cost * CROSS_JOIN_COST_PENALTY
-            } else {
-                base_cost
-            };
-            if j.other_condition.is_some() {
-                cost_after_cross * NON_EQUI_JOIN_COST_PENALTY
-            } else {
-                cost_after_cross
-            }
+            estimate_hash_join_cost(&input, join).total_with_options(options)
         }
         _ => compute_cost(op, own_stats, child_stats),
     }
@@ -829,7 +1108,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::*;
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec};
-    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, CostEstimate};
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::plan::*;
@@ -970,6 +1249,263 @@ mod tests {
         }
     }
 
+    fn column_ref(arena: &mut ScalarArena, id: u32) -> ScalarId {
+        arena.intern(
+            ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
+            arrow::datatypes::DataType::Int64,
+            false,
+        )
+    }
+
+    fn nested_column_ref(arena: &mut ScalarArena, id: u32) -> ScalarId {
+        let child = column_ref(arena, id);
+        arena.intern(
+            ScalarNode::Nested(child),
+            arrow::datatypes::DataType::Int64,
+            false,
+        )
+    }
+
+    fn column_eq_condition(
+        arena: &mut ScalarArena,
+        left_id: u32,
+        right_id: u32,
+    ) -> PhysicalHashJoinEqCondition {
+        PhysicalHashJoinEqCondition {
+            left: column_ref(arena, left_id),
+            right: column_ref(arena, right_id),
+            null_safe: false,
+        }
+    }
+
+    fn expression_key_eq_condition(
+        arena: &mut ScalarArena,
+        left_id: u32,
+        right_id: u32,
+    ) -> PhysicalHashJoinEqCondition {
+        PhysicalHashJoinEqCondition {
+            left: nested_column_ref(arena, left_id),
+            right: column_ref(arena, right_id),
+            null_safe: false,
+        }
+    }
+
+    fn join_op(
+        kind: JoinKind,
+        eq: Vec<crate::sql::optimizer::operator::PhysicalHashJoinEqCondition>,
+    ) -> Operator {
+        Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: kind,
+            eq_conditions: eq,
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        })
+    }
+
+    fn derived_alternatives(
+        op: &Operator,
+        arena: &ScalarArena,
+    ) -> Vec<super::super::derive::ChildRequirementAlternative> {
+        super::super::derive::derive_required_alternatives(
+            op,
+            arena,
+            &PhysicalPropertySet::any(),
+            2,
+        )
+    }
+
+    fn advisory_for_derived_hash_join(op: &Operator, arena: &ScalarArena) -> bool {
+        let alternatives = derived_alternatives(op, arena);
+        feasibility_is_advisory_only(op, &alternatives)
+    }
+
+    fn broadcast_input<'a>(
+        op: &'a Operator,
+        own: &'a Statistics,
+        child: &'a [&'a Statistics],
+        outs: &'a [&'a PhysicalPropertySet],
+        required: &'a PhysicalPropertySet,
+        alt: &'a PropertyAlternativeKind,
+        o: &'a CostOptions,
+    ) -> CostInput<'a> {
+        CostInput {
+            op,
+            own_stats: own,
+            child_stats: child,
+            child_outputs: outs,
+            required_output: required,
+            alt_kind: alt,
+            scalars: None,
+            options: o,
+        }
+    }
+
+    fn broadcast_input_with_scalars<'a>(
+        op: &'a Operator,
+        own: &'a Statistics,
+        child: &'a [&'a Statistics],
+        outs: &'a [&'a PhysicalPropertySet],
+        required: &'a PhysicalPropertySet,
+        alt: &'a PropertyAlternativeKind,
+        scalars: &'a ScalarArena,
+        o: &'a CostOptions,
+    ) -> CostInput<'a> {
+        CostInput {
+            op,
+            own_stats: own,
+            child_stats: child,
+            child_outputs: outs,
+            required_output: required,
+            alt_kind: alt,
+            scalars: Some(scalars),
+            options: o,
+        }
+    }
+
+    #[test]
+    fn broadcast_decision_present_for_broadcast_hash_join_absent_otherwise() {
+        let probe = stats(1_000_000.0, 64.0);
+        let mut build = stats(1_000.0, 4.0);
+        build.row_count_confidence = Confidence::Exact;
+        let own = stats(1_000.0, 64.0);
+        let mut scalars = ScalarArena::new();
+        let eq = vec![column_eq_condition(&mut scalars, 1, 2)];
+        let op = join_op(JoinKind::Inner, eq.clone());
+        let o = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let outs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let out_refs = [&outs[0], &outs[1]];
+        let child = [&probe, &build];
+        let broadcast = PropertyAlternativeKind::BroadcastJoin;
+        let input = broadcast_input_with_scalars(
+            &op, &own, &child, &out_refs, &required, &broadcast, &scalars, &o,
+        );
+
+        let decision = broadcast_decision(&input).expect("broadcast decision");
+        assert!(decision.feasible);
+        assert_eq!(decision.effective_backend_count, 3.0);
+        assert!(!decision.forced);
+
+        let shuffle = PropertyAlternativeKind::ShuffleJoin;
+        let shuffle_input = broadcast_input(&op, &own, &child, &out_refs, &required, &shuffle, &o);
+        assert!(broadcast_decision(&shuffle_input).is_none());
+
+        let default = PropertyAlternativeKind::Default;
+        let default_unknown_input =
+            broadcast_input(&op, &own, &child, &out_refs, &required, &default, &o);
+        assert!(broadcast_decision(&default_unknown_input).is_none());
+
+        let broadcast_op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: eq.clone(),
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        });
+        let default_broadcast_input = broadcast_input_with_scalars(
+            &broadcast_op,
+            &own,
+            &child,
+            &out_refs,
+            &required,
+            &default,
+            &scalars,
+            &o,
+        );
+        let default_decision =
+            broadcast_decision(&default_broadcast_input).expect("default broadcast decision");
+        assert!(!default_decision.forced);
+
+        let no_build_child = [&probe];
+        let missing_build_input = broadcast_input(
+            &op,
+            &own,
+            &no_build_child,
+            &out_refs,
+            &required,
+            &broadcast,
+            &o,
+        );
+        assert!(broadcast_decision(&missing_build_input).is_none());
+
+        let scan = scan_op();
+        let scan_input = broadcast_input(&scan, &own, &child, &out_refs, &required, &broadcast, &o);
+        assert!(broadcast_decision(&scan_input).is_none());
+    }
+
+    #[test]
+    fn broadcast_decision_marks_correctness_required_broadcast_forced() {
+        let probe = stats(1_000_000.0, 64.0);
+        let mut build = stats(1_000.0, 4.0);
+        build.row_count_confidence = Confidence::Exact;
+        let own = stats(1_000.0, 64.0);
+        let o = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let outs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let out_refs = [&outs[0], &outs[1]];
+        let child = [&probe, &build];
+        let broadcast = PropertyAlternativeKind::BroadcastJoin;
+
+        let scalars = ScalarArena::new();
+        for op in [
+            join_op(JoinKind::Inner, vec![]),
+            join_op(JoinKind::Cross, vec![]),
+            join_op(JoinKind::NullAwareLeftAnti, vec![]),
+        ] {
+            let input = broadcast_input_with_scalars(
+                &op, &own, &child, &out_refs, &required, &broadcast, &scalars, &o,
+            );
+            assert!(broadcast_decision(&input).expect("decision").forced);
+        }
+
+        let mut unsupported_scalars = ScalarArena::new();
+        let unsupported_key = vec![expression_key_eq_condition(&mut unsupported_scalars, 1, 2)];
+        let unsupported_op = join_op(JoinKind::Inner, unsupported_key);
+        let input = broadcast_input_with_scalars(
+            &unsupported_op,
+            &own,
+            &child,
+            &out_refs,
+            &required,
+            &broadcast,
+            &unsupported_scalars,
+            &o,
+        );
+        assert!(broadcast_decision(&input).expect("decision").forced);
+    }
+
+    #[test]
+    fn broadcast_decision_keeps_cross_join_forced_when_infeasible() {
+        let probe = stats(1_000.0, 64.0);
+        let mut build = stats(1_000_000.0, 2048.0);
+        build.row_count_confidence = Confidence::Exact;
+        let own = stats(1_000_000_000.0, 2112.0);
+
+        let mut options = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 3.0;
+        profile.per_node_build_memory_budget_bytes = 256.0 * 1024.0 * 1024.0;
+        options.apply_profile(profile);
+
+        let required = PhysicalPropertySet::any();
+        let outs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let out_refs = [&outs[0], &outs[1]];
+        let child = [&probe, &build];
+        let broadcast = PropertyAlternativeKind::BroadcastJoin;
+        let scalars = ScalarArena::new();
+        let op = join_op(JoinKind::Cross, vec![]);
+        let input = broadcast_input_with_scalars(
+            &op, &own, &child, &out_refs, &required, &broadcast, &scalars, &options,
+        );
+
+        let decision = broadcast_decision(&input).expect("decision");
+        assert!(!decision.feasible);
+        assert!(decision.forced);
+        assert_eq!(
+            decision.reject_reason,
+            Some(BroadcastRejectReason::PerNodeMemory)
+        );
+    }
+
     #[test]
     fn finite_non_negative_cost_saturates_only_positive_overflow() {
         assert_eq!(finite_non_negative_cost(42.0), 42.0);
@@ -1018,6 +1554,347 @@ mod tests {
         assert_eq!(cost_row_width(&stats(1.0, -1.0)), 8.0);
         assert_eq!(cost_row_width(&stats(1.0, f64::NEG_INFINITY)), 8.0);
         assert_eq!(cost_row_width(&stats(1.0, f64::NAN)), 8.0);
+    }
+
+    #[test]
+    fn estimated_build_hash_table_bytes_inflates_narrow_more_than_wide() {
+        let o = CostOptions::default();
+        // Narrow: 8B/row, 10M rows => payload 80MB; ht = 80MB/0.75 + 16*10M.
+        let narrow = stats(10_000_000.0, 8.0);
+        let narrow_ht = estimated_build_hash_table_bytes(&narrow, &o);
+        let narrow_payload = safe_compute_size(&narrow);
+        let expected_narrow = narrow_payload / 0.75 + 16.0 * 10_000_000.0;
+        assert!((narrow_ht - expected_narrow).abs() < 1.0);
+        // Index overhead must roughly double the narrow build's footprint.
+        assert!(narrow_ht > 2.0 * narrow_payload);
+
+        // Wide: 200B/row, 1M rows => payload 200MB; index ~6% only.
+        let wide = stats(1_000_000.0, 200.0);
+        let wide_ht = estimated_build_hash_table_bytes(&wide, &o);
+        let wide_payload = safe_compute_size(&wide);
+        assert!(wide_ht < 1.5 * wide_payload);
+    }
+
+    #[test]
+    fn estimated_build_hash_table_bytes_sanitizes_options() {
+        let build = stats(100.0, 8.0);
+        let payload = safe_compute_size(&build);
+        let rows = cost_row_count(&build);
+
+        let mut nan_load_factor = CostOptions::default();
+        nan_load_factor.hash_table_load_factor = f64::NAN;
+        let nan_bytes = estimated_build_hash_table_bytes(&build, &nan_load_factor);
+        let expected_default =
+            payload / 0.75 + rows * nan_load_factor.hash_table_per_row_overhead_bytes;
+        assert!(nan_bytes.is_finite());
+        assert!(nan_bytes > 0.0);
+        assert!((nan_bytes - expected_default).abs() < 1e-9);
+
+        for bad_load_factor in [-1.0, 0.0] {
+            let mut options = CostOptions::default();
+            options.hash_table_load_factor = bad_load_factor;
+            let actual = estimated_build_hash_table_bytes(&build, &options);
+            let expected = payload / 0.5 + rows * options.hash_table_per_row_overhead_bytes;
+            assert!((actual - expected).abs() < 1e-9);
+        }
+
+        let mut oversized_load_factor = CostOptions::default();
+        oversized_load_factor.hash_table_load_factor = 1.5;
+        let oversized_actual = estimated_build_hash_table_bytes(&build, &oversized_load_factor);
+        let oversized_expected =
+            payload / 1.0 + rows * oversized_load_factor.hash_table_per_row_overhead_bytes;
+        assert!((oversized_actual - oversized_expected).abs() < 1e-9);
+
+        let mut negative_overhead = CostOptions::default();
+        negative_overhead.hash_table_per_row_overhead_bytes = -16.0;
+        let negative_overhead_actual = estimated_build_hash_table_bytes(&build, &negative_overhead);
+        let negative_overhead_expected = payload / negative_overhead.hash_table_load_factor;
+        assert!((negative_overhead_actual - negative_overhead_expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn confidence_risk_multiplier_is_monotone_and_anchored() {
+        let o = CostOptions::default();
+        assert_eq!(confidence_risk_multiplier(Confidence::Fallback, &o), 4.0);
+        assert_eq!(confidence_risk_multiplier(Confidence::Estimated, &o), 2.0);
+        assert_eq!(confidence_risk_multiplier(Confidence::Exact, &o), 1.0);
+        // Measured is inert until a producer lands: must equal Exact.
+        assert_eq!(confidence_risk_multiplier(Confidence::Measured, &o), 1.0);
+        assert!(
+            confidence_risk_multiplier(Confidence::Fallback, &o)
+                >= confidence_risk_multiplier(Confidence::Estimated, &o)
+        );
+        assert!(
+            confidence_risk_multiplier(Confidence::Estimated, &o)
+                >= confidence_risk_multiplier(Confidence::Exact, &o)
+        );
+    }
+
+    #[test]
+    fn confidence_risk_multiplier_invalid_values_fall_back_to_neutral() {
+        let mut o = CostOptions::default();
+
+        o.risk_multiplier_estimated = f64::NAN;
+        assert_eq!(confidence_risk_multiplier(Confidence::Estimated, &o), 1.0);
+
+        o.risk_multiplier_estimated = -2.0;
+        assert_eq!(confidence_risk_multiplier(Confidence::Estimated, &o), 1.0);
+
+        o.risk_multiplier_estimated = 3.5;
+        assert_eq!(confidence_risk_multiplier(Confidence::Estimated, &o), 3.5);
+    }
+
+    #[test]
+    fn uninformative_fingerprint_catches_fabricated_defaults_but_allows_small_values() {
+        // NovaRocks fabricated-default fingerprint: Fallback + empty column_statistics,
+        // finite positive rows (e.g. CTE/scan fallback 10_000 rows). MUST refuse.
+        let fabricated = Statistics {
+            output_row_count: 10_000.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        };
+        assert!(build_size_is_uninformative(&fabricated));
+
+        // Small Fallback VALUES with real literal column widths: NOT uninformative.
+        let mut small_values = stats(1_000.0, 16.0); // stats() populates column_statistics
+        small_values.row_count_confidence = Confidence::Fallback;
+        assert!(!build_size_is_uninformative(&small_values));
+    }
+
+    #[test]
+    fn uninformative_fingerprint_catches_magnitude_unknown_with_real_colstats() {
+        let mut populated = stats(10.0, 16.0);
+        populated.row_count_confidence = Confidence::Exact;
+
+        // Magnitude truly unknown (defensive). MUST refuse independent of the
+        // fabricated-default fingerprint.
+        populated.output_row_count = f64::INFINITY;
+        assert!(build_size_is_uninformative(&populated));
+        populated.output_row_count = f64::NAN;
+        assert!(build_size_is_uninformative(&populated));
+        populated.output_row_count = 0.0;
+        assert!(build_size_is_uninformative(&populated));
+        populated.output_row_count = -1.0;
+        assert!(build_size_is_uninformative(&populated));
+
+        // Finite size overflow/saturation is uninformative even with real colstats.
+        let mut overflow = stats_with_column_widths(10.0, &[f64::MAX, f64::MAX]);
+        overflow.row_count_confidence = Confidence::Exact;
+        assert!(build_size_is_uninformative(&overflow));
+    }
+
+    #[test]
+    fn invalid_risk_multiplier_never_makes_infeasible_build_feasible() {
+        for invalid_multiplier in [f64::NAN, -2.0] {
+            let mut o = CostOptions::default();
+            o.risk_multiplier_estimated = invalid_multiplier;
+
+            let mut build = stats(1.0, 900.0 * 1024.0 * 1024.0);
+            build.row_count_confidence = Confidence::Estimated;
+            let probe = stats(100_000.0, 64.0);
+
+            let feas = broadcast_is_feasible(&probe, &build, &o);
+
+            assert_eq!(feas.risk_multiplier, 1.0);
+            assert!(!feas.feasible);
+            assert_eq!(
+                feas.reject_reason,
+                Some(BroadcastRejectReason::PerNodeMemory)
+            );
+        }
+    }
+
+    #[test]
+    fn layer1_per_node_floor_never_divides_by_backend_count() {
+        let mut o = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 30.0;
+        profile.per_node_build_memory_budget_bytes = 1024.0 * 1024.0 * 1024.0;
+        o.apply_profile(profile);
+
+        let mut build = stats(3_000_000.0, 2048.0);
+        build.row_count_confidence = Confidence::Estimated;
+        let probe = stats(100_000.0, 64.0);
+
+        let feas = broadcast_is_feasible(&probe, &build, &o);
+
+        assert!(!feas.feasible);
+        assert_eq!(
+            feas.reject_reason,
+            Some(BroadcastRejectReason::PerNodeMemory)
+        );
+    }
+
+    #[test]
+    fn cluster_network_floor_can_reject_when_per_node_memory_fits() {
+        let mut o = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 10.0;
+        profile.per_node_build_memory_budget_bytes = 1024.0 * 1024.0 * 1024.0;
+        o.apply_profile(profile);
+
+        let mut build = stats(1_000_000.0, 200.0);
+        build.row_count_confidence = Confidence::Exact;
+        let probe = stats(100_000.0, 64.0);
+
+        let feas = broadcast_is_feasible(&probe, &build, &o);
+
+        assert!(
+            feas.risk_adj_build_bytes <= o.profile.per_node_build_memory_budget_bytes,
+            "test shape must fit per-node memory: {:?}",
+            feas
+        );
+        assert!(
+            feas.risk_adj_fanout_bytes > o.profile.cluster_broadcast_network_budget_bytes,
+            "test shape must exceed cluster network budget: {:?}",
+            feas
+        );
+        assert!(!feas.feasible);
+        assert_eq!(
+            feas.reject_reason,
+            Some(BroadcastRejectReason::ClusterNetwork)
+        );
+    }
+
+    #[test]
+    fn degenerate_build_is_infeasible() {
+        let o = CostOptions::default();
+        let build = Statistics {
+            output_row_count: 10_000.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        };
+        let probe = stats(5_000_000.0, 100.0);
+
+        let feas = broadcast_is_feasible(&probe, &build, &o);
+
+        assert!(!feas.feasible);
+        assert_eq!(
+            feas.reject_reason,
+            Some(BroadcastRejectReason::UninformativeSize)
+        );
+    }
+
+    #[test]
+    fn small_exact_build_is_feasible() {
+        let mut o = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 3.0;
+        profile.per_node_build_memory_budget_bytes = 256.0 * 1024.0 * 1024.0;
+        o.apply_profile(profile);
+
+        let mut build = stats(1_000.0, 4.0);
+        build.row_count_confidence = Confidence::Exact;
+        let probe = stats(1_000_000.0, 64.0);
+
+        let feas = broadcast_is_feasible(&probe, &build, &o);
+
+        assert!(feas.feasible);
+        assert_eq!(feas.reject_reason, None);
+    }
+
+    #[test]
+    fn huge_exact_big_memory_allows_wide_but_rejects_extremely_narrow_build() {
+        let mut o = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 3.0;
+        profile.per_node_build_memory_budget_bytes = 32.0 * 1024.0 * 1024.0 * 1024.0;
+        o.apply_profile(profile);
+
+        let probe = stats(10_000_000.0, 8.0);
+        let mut wide = stats(10_000_000.0, 800.0);
+        wide.row_count_confidence = Confidence::Exact;
+        let mut narrow = stats(2_500_000_000.0, 8.0);
+        narrow.row_count_confidence = Confidence::Exact;
+
+        let wide_feas = broadcast_is_feasible(&probe, &wide, &o);
+        assert!(wide_feas.feasible);
+        assert_eq!(wide_feas.reject_reason, None);
+        assert!(
+            wide_feas.hash_table_bytes < o.profile.per_node_build_memory_budget_bytes,
+            "wide build hash table should fit: {:?}",
+            wide_feas
+        );
+
+        let narrow_feas = broadcast_is_feasible(&probe, &narrow, &o);
+        assert!(!narrow_feas.feasible);
+        assert_eq!(
+            narrow_feas.reject_reason,
+            Some(BroadcastRejectReason::PerNodeMemory)
+        );
+        assert!(
+            narrow_feas.hash_table_bytes > o.profile.per_node_build_memory_budget_bytes,
+            "narrow build hash table should exceed budget: {:?}",
+            narrow_feas
+        );
+    }
+
+    #[test]
+    fn feasibility_advisory_for_correctness_required_joins() {
+        let arena = ScalarArena::new();
+        assert!(advisory_for_derived_hash_join(
+            &join_op(JoinKind::Cross, vec![]),
+            &arena
+        ));
+        assert!(advisory_for_derived_hash_join(
+            &join_op(JoinKind::Inner, vec![]),
+            &arena
+        ));
+
+        let mut naaj_arena = ScalarArena::new();
+        let naaj = join_op(
+            JoinKind::NullAwareLeftAnti,
+            vec![test_eq_condition(&mut naaj_arena, 1, 2)],
+        );
+        assert!(advisory_for_derived_hash_join(&naaj, &naaj_arena));
+
+        let mut expr_arena = ScalarArena::new();
+        let unsupported_shuffle_key = join_op(
+            JoinKind::Inner,
+            vec![expression_key_eq_condition(&mut expr_arena, 10, 20)],
+        );
+        let alternatives = derived_alternatives(&unsupported_shuffle_key, &expr_arena);
+        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives[0].kind, PropertyAlternativeKind::BroadcastJoin);
+        assert!(advisory_for_derived_hash_join(
+            &unsupported_shuffle_key,
+            &expr_arena
+        ));
+    }
+
+    #[test]
+    fn feasibility_not_advisory_for_ordinary_equi_inner_join() {
+        let mut arena = ScalarArena::new();
+        let ordinary_equi = join_op(
+            JoinKind::Inner,
+            vec![column_eq_condition(&mut arena, 10, 20)],
+        );
+        let alternatives = derived_alternatives(&ordinary_equi, &arena);
+        assert!(
+            alternatives
+                .iter()
+                .any(|alt| alt.kind == PropertyAlternativeKind::BroadcastJoin)
+        );
+        assert!(
+            alternatives
+                .iter()
+                .any(|alt| alt.kind == PropertyAlternativeKind::ShuffleJoin)
+        );
+        assert!(!advisory_for_derived_hash_join(&ordinary_equi, &arena));
+
+        let right_outer = join_op(JoinKind::RightOuter, vec![]);
+        let right_outer_alternatives = derived_alternatives(&right_outer, &ScalarArena::new());
+        assert_eq!(right_outer_alternatives.len(), 1);
+        assert_eq!(
+            right_outer_alternatives[0].kind,
+            PropertyAlternativeKind::ShuffleJoin
+        );
+        assert!(!advisory_for_derived_hash_join(
+            &right_outer,
+            &ScalarArena::new()
+        ));
+
+        assert!(!feasibility_is_advisory_only(&scan_op(), &[]));
     }
 
     #[test]
@@ -1453,6 +2330,15 @@ mod tests {
             &options,
         );
         assert!((input_cost - property_cost).abs() < f64::EPSILON);
+        let legacy_cost = compute_legacy_cost_with_properties(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        );
+        assert!((input_cost - legacy_cost).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1515,8 +2401,193 @@ mod tests {
         };
 
         let estimate = compute_cost_estimate(&input);
-        assert!(estimate.memory_cost >= build.compute_size() * options.backend_factor);
-        assert!(estimate.network_cost >= build.compute_size() * options.backend_factor);
+        let hash_table_bytes = estimated_build_hash_table_bytes(&build, &options);
+        let backends = normalized_effective_backend_count(options.profile.effective_backend_count);
+        assert!(estimate.memory_cost >= hash_table_bytes * backends - f64::EPSILON);
+        assert!(
+            estimate.network_cost
+                >= safe_compute_size(&build) * (backends - 1.0).max(0.0) - f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn broadcast_memory_uses_hash_table_times_backends() {
+        let probe = stats(1_000_000.0, 64.0);
+        let build = stats(10_000.0, 32.0);
+        let own = stats(100_000.0, 96.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let options = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let child_stats = [&probe, &build];
+        let input = broadcast_input(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &required,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        );
+
+        let estimate = compute_cost_estimate(&input);
+        let hash_table_bytes = estimated_build_hash_table_bytes(&build, &options);
+        let backends = normalized_effective_backend_count(options.profile.effective_backend_count);
+        let fanout = (backends - 1.0).max(0.0);
+        assert!((estimate.memory_cost - hash_table_bytes * backends).abs() < f64::EPSILON);
+        assert!((estimate.network_cost - safe_compute_size(&build) * fanout).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn colocate_memory_uses_build_hash_table_bytes() {
+        let probe = stats(1_000_000.0, 64.0);
+        let build = stats(10_000.0, 4.0);
+        let own = stats(100_000.0, 68.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Colocate,
+        });
+        let options = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::any()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let child_stats = [&probe, &build];
+        let input = broadcast_input(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &required,
+            &PropertyAlternativeKind::Default,
+            &options,
+        );
+
+        let estimate = compute_cost_estimate(&input);
+        let hash_table_bytes = estimated_build_hash_table_bytes(&build, &options);
+
+        assert_eq!(estimate.memory_cost, hash_table_bytes);
+        assert_eq!(estimate.network_cost, 0.0);
+    }
+
+    #[test]
+    fn single_node_broadcast_and_shuffle_network_are_zero() {
+        let mut options = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 1.0;
+        options.apply_profile(profile);
+
+        let probe = stats(1_000_000.0, 64.0);
+        let build = stats(10_000.0, 32.0);
+        let own = stats(100_000.0, 96.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let child_stats = [&probe, &build];
+
+        let broadcast = compute_cost_estimate(&broadcast_input(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &required,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        ));
+        let shuffle = compute_cost_estimate(&broadcast_input(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &required,
+            &PropertyAlternativeKind::ShuffleJoin,
+            &options,
+        ));
+
+        assert_eq!(broadcast.network_cost, 0.0);
+        assert_eq!(shuffle.network_cost, 0.0);
+        assert!(
+            (broadcast.total_with_options(&options) - shuffle.total_with_options(&options)).abs()
+                < 1.0
+        );
+    }
+
+    #[test]
+    fn q9_shape_broadcast_total_below_shuffle_total() {
+        let mut options = CostOptions::default();
+        options.memory_weight = 0.15;
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 10.0;
+        profile.per_node_build_memory_budget_bytes = 256.0 * 1024.0 * 1024.0;
+        options.apply_profile(profile);
+
+        // Tuned so the pre-1.6 broadcast formula (payload * N for both memory
+        // and network) would not beat shuffle, while the new fanout term does.
+        let mut probe = stats(15_837_500.0, 80.0);
+        probe.row_count_confidence = Confidence::Exact;
+        let mut build = stats(4_000_000.0, 32.0);
+        build.row_count_confidence = Confidence::Exact;
+        let own = stats(4_000_000.0, 80.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let child_stats = [&probe, &build];
+
+        let broadcast = compute_cost_estimate(&broadcast_input(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &required,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        ));
+        let shuffle = compute_cost_estimate(&broadcast_input(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &required,
+            &PropertyAlternativeKind::ShuffleJoin,
+            &options,
+        ));
+
+        let broadcast_total = broadcast.total_with_options(&options);
+        let shuffle_total = shuffle.total_with_options(&options);
+        let backends = normalized_effective_backend_count(options.profile.effective_backend_count);
+        let old_broadcast_total = CostEstimate {
+            cpu_cost: broadcast.cpu_cost,
+            memory_cost: safe_compute_size(&build) * backends,
+            network_cost: safe_compute_size(&build) * backends,
+        }
+        .total_with_options(&options);
+        assert!(
+            old_broadcast_total >= shuffle_total,
+            "old broadcast {old_broadcast_total} should be >= shuffle {shuffle_total}"
+        );
+        assert!(
+            broadcast_total < shuffle_total,
+            "broadcast {broadcast_total} should be < shuffle {shuffle_total}"
+        );
     }
 
     #[test]
@@ -1621,7 +2692,8 @@ mod tests {
         };
 
         let estimate = compute_cost_estimate(&input);
-        let expected_memory = build.compute_size() / options.backend_factor.max(1.0);
+        let backends = normalized_effective_backend_count(options.profile.effective_backend_count);
+        let expected_memory = estimated_build_hash_table_bytes(&build, &options) / backends;
         assert!((estimate.memory_cost - expected_memory).abs() <= f64::EPSILON);
         assert_eq!(estimate.network_cost, 0.0);
     }
@@ -1948,26 +3020,6 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_gate_rejects_fallback_build_above_fallback_limit() {
-        let mut build = stats(600_000.0, 100.0);
-        build.row_count_confidence = crate::sql::optimizer::statistics::Confidence::Fallback;
-        let probe = stats(700_000.0, 100.0);
-        let options = CostOptions::default();
-
-        assert!(!broadcast_gate_passes(&probe, &build, &options));
-    }
-
-    #[test]
-    fn broadcast_gate_rejects_estimated_build_above_fallback_limit() {
-        let mut build = stats(648_000.0, 100.0);
-        build.row_count_confidence = crate::sql::optimizer::statistics::Confidence::Estimated;
-        let probe = stats(3_543_657.0, 100.0);
-        let options = CostOptions::default();
-
-        assert!(!broadcast_gate_passes(&probe, &build, &options));
-    }
-
-    #[test]
     fn broadcast_join_alternative_charges_fanout_and_memory_pressure() {
         let probe = stats(100_000.0, 100.0);
         let build = stats(10_000.0, 100.0);
@@ -2000,8 +3052,12 @@ mod tests {
                 (cost_row_count(&probe) + cost_row_count(&build)) * options.hash_cost_factor
                     + safe_compute_size(&own),
             ),
-            memory_cost: build.compute_size() * options.backend_factor,
-            network_cost: build.compute_size() * options.backend_factor,
+            memory_cost: estimated_build_hash_table_bytes(&build, &options)
+                * normalized_effective_backend_count(options.profile.effective_backend_count),
+            network_cost: safe_compute_size(&build)
+                * (normalized_effective_backend_count(options.profile.effective_backend_count)
+                    - 1.0)
+                    .max(0.0),
         };
 
         assert!((estimate.cpu_cost - expected.cpu_cost).abs() < f64::EPSILON);
@@ -2064,11 +3120,13 @@ mod tests {
             (cost_row_count(&probe) + cost_row_count(&build)) * options.hash_cost_factor
                 + safe_compute_size(&own),
         );
-        let broadcast_fanout_size = build.compute_size() * options.backend_factor;
+        let backends = normalized_effective_backend_count(options.profile.effective_backend_count);
+        let expected_memory = estimated_build_hash_table_bytes(&build, &options) * backends;
+        let expected_network = safe_compute_size(&build) * (backends - 1.0).max(0.0);
 
         assert!((estimate.cpu_cost - base_cpu * NON_EQUI_JOIN_COST_PENALTY).abs() < f64::EPSILON);
-        assert!((estimate.memory_cost - broadcast_fanout_size).abs() < f64::EPSILON);
-        assert!((estimate.network_cost - broadcast_fanout_size).abs() < f64::EPSILON);
+        assert!((estimate.memory_cost - expected_memory).abs() < f64::EPSILON);
+        assert!((estimate.network_cost - expected_network).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2279,5 +3337,54 @@ mod tests {
             cost,
             expected
         );
+    }
+
+    #[test]
+    fn cluster_resource_profile_defaults_match_ci_baseline() {
+        let opts = CostOptions::default();
+        assert_eq!(opts.profile.effective_backend_count, 3.0);
+        assert_eq!(opts.backend_factor, 3.0);
+        assert_eq!(
+            opts.profile.query_mem_limit_bytes,
+            2.0 * 1024.0 * 1024.0 * 1024.0
+        );
+        assert_eq!(
+            opts.profile.per_node_build_memory_budget_bytes,
+            1.0 * 1024.0 * 1024.0 * 1024.0
+        );
+        assert_eq!(
+            opts.profile.cluster_broadcast_network_budget_bytes,
+            opts.profile.per_node_build_memory_budget_bytes
+        );
+    }
+
+    #[test]
+    fn apply_profile_syncs_backend_factor_projection() {
+        let mut opts = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 16.0;
+        opts.apply_profile(profile);
+        assert_eq!(opts.profile.effective_backend_count, 16.0);
+        assert_eq!(opts.backend_factor, 16.0);
+    }
+
+    #[test]
+    fn apply_profile_clamps_backend_factor_to_one() {
+        for backend_count in [0.0, 0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -2.0] {
+            let mut opts = CostOptions::default();
+            let mut profile = ClusterResourceProfile::default();
+            profile.effective_backend_count = backend_count;
+            profile.per_node_build_memory_budget_bytes = 256.0 * 1024.0 * 1024.0;
+            profile.cluster_broadcast_network_budget_bytes = f64::NAN;
+
+            opts.apply_profile(profile);
+
+            assert_eq!(opts.profile.effective_backend_count, 1.0);
+            assert_eq!(opts.backend_factor, 1.0);
+            assert_eq!(
+                opts.profile.cluster_broadcast_network_budget_bytes,
+                opts.profile.per_node_build_memory_budget_bytes
+            );
+        }
     }
 }

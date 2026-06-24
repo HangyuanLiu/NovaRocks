@@ -1,0 +1,41 @@
+Explain String
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+18:PROJECT [count(*) AS cnt] stats={rows=1}
+  17:HASH AGGREGATE (GLOBAL) stats={rows=1}
+    aggregations: count()
+    16:GATHER stats={rows=1}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    PARTITION: UNPARTITIONED
+15:HASH AGGREGATE (LOCAL) stats={rows=1}
+  aggregations: count()
+  14:HASH JOIN (PARTITIONED, INNER, eq: [p.k = b.k]) stats={rows=12500000000000}
+    5:HASH EXCHANGE stats={rows=1000000}
+    13:HASH EXCHANGE stats={rows=50000000}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    PARTITION: HASH_PARTITIONED (k)
+12:PROJECT [k] stats={rows=50000000}
+  11:PROJECT [k] stats={rows=50000000}
+    10:PROJECT [k] stats={rows=50000000}
+      9:FILTER stats={rows=50000000}
+        predicate: k > 0
+        8:PROJECT [generate_series + 0 AS k] stats={rows=100000000}
+          7:GENERATE_SERIES(1, 100000000, 1) stats={rows=100000000}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 5
+    PARTITION: HASH_PARTITIONED (k)
+4:PROJECT [k] stats={rows=1000000}
+  3:PROJECT [generate_series AS k] stats={rows=1000000}
+    2:GENERATE_SERIES(1, 1000000, 1) stats={rows=1000000}

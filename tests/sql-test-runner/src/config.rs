@@ -425,7 +425,7 @@ pub fn suite_default_catalog(suite_name: &str) -> String {
         // stable catalog name is safe: each worktree's standalone-server has its
         // own in-memory catalog registry, and per-case `${case_db}` reset
         // isolates data between cases.
-        "optimizer" => "iceberg_opt".to_string(),
+        "optimizer" | "optimizer-dist" => "iceberg_opt".to_string(),
         _ => "default_catalog".to_string(),
     }
 }

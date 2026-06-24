@@ -495,6 +495,32 @@ ci_case_key_count() {
   printf "%s\n" "$count"
 }
 
+ci_suite_cluster_mode() {
+  local suite="$1"
+
+  case "$suite" in
+    optimizer-dist)
+      printf "cross-process\n"
+      ;;
+    *)
+      printf "%s\n" "$SQL_CLUSTER_MODE"
+      ;;
+  esac
+}
+
+ci_suite_cluster_size() {
+  local suite="$1"
+
+  case "$suite" in
+    optimizer-dist)
+      printf "3\n"
+      ;;
+    *)
+      printf "%s\n" "$SQL_CLUSTER_SIZE"
+      ;;
+  esac
+}
+
 ci_classify_sql_log() {
   local suite="$1"
   local log_path="$2"
@@ -656,6 +682,8 @@ run_sql_suites() {
   local -a suite_extra_args
   local query_timeout
   local novarocks_bin
+  local suite_cluster_mode
+  local suite_cluster_size
 
   novarocks_bin="$REPO_ROOT/$(ci_novarocks_binary_path "$NOVA_CI_CARGO_PROFILE")"
 
@@ -670,12 +698,17 @@ run_sql_suites() {
     start="$(ci_epoch)"
     suite_extra_args=()
     query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-60}"
+    suite_cluster_mode="$(ci_suite_cluster_mode "$suite")"
+    suite_cluster_size="$(ci_suite_cluster_size "$suite")"
     case "$suite" in
       tpc-ds|tpc-h)
         query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-180}"
         ;;
       complex-type|ssb)
         query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-120}"
+        ;;
+      optimizer-dist)
+        query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-300}"
         ;;
     esac
     if [ "$RUN_MODE" != "explicit" ]; then
@@ -706,8 +739,8 @@ run_sql_suites() {
         --suite "$suite" \
         --mode verify \
         --query-timeout "$query_timeout" \
-        --cluster-mode "$SQL_CLUSTER_MODE" \
-        --cluster-size "$SQL_CLUSTER_SIZE" \
+        --cluster-mode "$suite_cluster_mode" \
+        --cluster-size "$suite_cluster_size" \
         "${suite_extra_args[@]}" \
         -j 1
     code=$?

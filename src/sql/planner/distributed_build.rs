@@ -14,12 +14,13 @@ use crate::sql::codegen::scalar_materialize::{
     materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
-use crate::sql::optimizer::cost::{CostInput, CostOptions, compute_cost_estimate};
+use crate::sql::optimizer::cost::{CostInput, broadcast_decision, compute_cost_estimate};
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::operator::{
     CTEAnchorOp, CTEConsumeOp, CTEProduceOp, LimitOp, Operator, PhysicalDistributionOp, TopNOp,
     TopNPhase, UnionOp,
 };
+use crate::sql::optimizer::options::{OptimizerOptions, current_session_optimizer_settings};
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 use crate::sql::optimizer::scalar::ScalarArena;
@@ -63,7 +64,9 @@ fn stats_for_physical_node(node: &PhysicalPlanNode) -> PlanNodeStats {
         .child_output_properties
         .iter()
         .collect();
-    let options = CostOptions::default();
+    let settings = current_session_optimizer_settings();
+    let opts = OptimizerOptions::from_session(&settings);
+    let options = opts.cost_options;
     let alt_kind = match node.execution_props.join_distribution {
         Some(crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Broadcast) => {
             PropertyAlternativeKind::BroadcastJoin
@@ -83,7 +86,9 @@ fn stats_for_physical_node(node: &PhysicalPlanNode) -> PlanNodeStats {
         scalars: node.execution_props.scalar_arena.as_deref(),
         options: &options,
     };
-    PlanNodeStats::from_statistics_with_cost(&node.stats, Some(compute_cost_estimate(&input)))
+    let cost = compute_cost_estimate(&input);
+    let decision = broadcast_decision(&input);
+    PlanNodeStats::from_statistics_with_cost_and_broadcast(&node.stats, Some(cost), decision)
 }
 
 impl<'a> DistributedPlanBuilder<'a> {
@@ -147,9 +152,10 @@ impl<'a> DistributedPlanBuilder<'a> {
                 let mut child = self.visit(child_plan)?;
                 let predicate = materialize(self.scalars, op.predicate);
                 if fold_filter_into_scan(&mut child, &predicate) {
-                    child.stats = PlanNodeStats::from_statistics_with_cost(
+                    child.stats = PlanNodeStats::from_statistics_with_cost_and_broadcast(
                         &node.stats,
                         child.stats.cost_estimate.clone(),
+                        child.stats.broadcast_decision,
                     );
                     child
                         .probe_runtime_filters
@@ -235,9 +241,10 @@ impl<'a> DistributedPlanBuilder<'a> {
 
                 let mut child = self.visit(child_plan)?;
                 child.limit = op.limit.unwrap_or(-1);
-                child.stats = PlanNodeStats::from_statistics_with_cost(
+                child.stats = PlanNodeStats::from_statistics_with_cost_and_broadcast(
                     &node.stats,
                     child.stats.cost_estimate.clone(),
+                    child.stats.broadcast_decision,
                 );
                 match &mut child.kind {
                     PlanNodeKind::Sort(sort) => {

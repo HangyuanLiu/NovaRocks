@@ -29,7 +29,7 @@ ci_tier_suites() {
       printf "%s\n" filter project optimizer
       ;;
     targeted)
-      printf "%s\n" optimizer iceberg-rest aggregate runtime-filter
+      printf "%s\n" optimizer optimizer-dist iceberg-rest aggregate runtime-filter
       ;;
     full)
       ci_load_stable_suites "$stable_manifest"
