@@ -590,9 +590,10 @@ fn imv_equivalence_failure(
     }
 }
 
-/// Capture the MV's current (incremental) contents, force a full recompute via
-/// `REFRESH MATERIALIZED VIEW <mv> FULL`, capture again, assert multiset equality.
-/// MV is qualified by `db` like wait_alter_*. SIDE EFFECT: performs a FULL refresh.
+/// Capture the MV's current (incremental) contents, derive a full recompute by
+/// running the MV's `SelectText` query directly against the base tables (obtained
+/// from `SHOW MATERIALIZED VIEWS`), and assert multiset equality of results.
+/// MV is qualified by `db` like wait_alter_*. No side effects on the MV.
 fn run_imv_equivalence_check(
     mv: &str,
     session: &mut crate::session::MysqlSession,
@@ -619,15 +620,63 @@ fn run_imv_equivalence_check(
     let inc = inc.ok_or_else(|| {
         "@imv_equivalence_check: incremental SELECT returned no result".to_string()
     })?;
-    let refresh = format!("REFRESH MATERIALIZED VIEW {fqn} FULL");
-    let _ = writeln!(log, "    @imv_equivalence_check: forcing full recompute");
-    let (ok, _, msg) = session.execute_query(query_timeout, &refresh, None);
+
+    // Derive the full-recompute result by running the MV's defining SELECT
+    // directly against the base tables. We obtain the SELECT SQL from
+    // `SHOW MATERIALIZED VIEWS`, which exposes `SelectText` for each MV.
+    // This avoids `REFRESH MATERIALIZED VIEW ... FULL`, which is intentionally
+    // disabled pending redesign.
+    let _ = writeln!(
+        log,
+        "    @imv_equivalence_check: deriving full recompute via SelectText"
+    );
+    let (ok, show_result, msg) =
+        session.execute_query(query_timeout, "SHOW MATERIALIZED VIEWS", None);
     if !ok {
         return Err(format!(
-            "@imv_equivalence_check: forced full refresh failed: {msg}"
+            "@imv_equivalence_check: SHOW MATERIALIZED VIEWS failed: {msg}"
         ));
     }
-    let (ok, full, msg) = session.execute_query(query_timeout, &select, None);
+    let show_result = show_result.ok_or_else(|| {
+        "@imv_equivalence_check: SHOW MATERIALIZED VIEWS returned no result".to_string()
+    })?;
+
+    // Find the column indices for "Name" and "SelectText".
+    let name_col = show_result
+        .header
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("Name"))
+        .ok_or_else(|| {
+            "@imv_equivalence_check: SHOW MATERIALIZED VIEWS result has no 'Name' column"
+                .to_string()
+        })?;
+    let select_text_col = show_result
+        .header
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("SelectText"))
+        .ok_or_else(|| {
+            "@imv_equivalence_check: SHOW MATERIALIZED VIEWS result has no 'SelectText' column"
+                .to_string()
+        })?;
+
+    // Find the row for our MV (match on bare mv name).
+    let select_sql = show_result
+        .rows
+        .iter()
+        .find(|row| {
+            row.get(name_col)
+                .map(|n| n.eq_ignore_ascii_case(mv))
+                .unwrap_or(false)
+        })
+        .and_then(|row| row.get(select_text_col))
+        .ok_or_else(|| {
+            format!(
+                "@imv_equivalence_check: MV `{mv}` not found in SHOW MATERIALIZED VIEWS output"
+            )
+        })?
+        .clone();
+
+    let (ok, full, msg) = session.execute_query(query_timeout, &select_sql, None);
     if !ok {
         return Err(format!(
             "@imv_equivalence_check: full-recompute SELECT failed: {msg}"

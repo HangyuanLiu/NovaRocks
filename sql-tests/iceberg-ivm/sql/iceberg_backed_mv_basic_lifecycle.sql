@@ -59,6 +59,7 @@ SELECT k1, v2 FROM orders_mv ORDER BY k1;
 REFRESH MATERIALIZED VIEW orders_mv;
 
 -- query 8
+-- @imv_equivalence_check=orders_mv
 SELECT k1, v2 FROM orders_mv ORDER BY k1;
 
 -- query 9
