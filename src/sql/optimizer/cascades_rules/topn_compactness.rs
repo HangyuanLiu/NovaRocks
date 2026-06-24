@@ -1,6 +1,8 @@
 use crate::sql::common::OutputColumn;
-use crate::sql::optimizer::memo::{MExpr, Memo};
-use crate::sql::optimizer::operator::{Operator, TopNOp, TopNPhase};
+use crate::sql::optimizer::binder::Binding;
+use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
+use crate::sql::optimizer::operator::{Operator, ProjectOp, SortOp, TopNOp, TopNPhase, UnionOp};
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar::{
     ColumnDisplay, ScalarArena, ScalarNode, SortKey as ScalarSortKey,
@@ -29,6 +31,29 @@ impl Rule for MergeConsecutiveTopN {
     fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         merge_consecutive_topn(expr, memo)
     }
+
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::TopN,
+            children: vec![Pattern::Op {
+                kind: OpKind::TopN,
+                children: vec![Pattern::Leaf],
+            }],
+        }
+    }
+
+    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+        // interior 0 = outer TopN, interior 1 = inner TopN.
+        let Operator::LogicalTopN(outer) = binding.op(memo, 0).clone() else {
+            return vec![];
+        };
+        let Operator::LogicalTopN(inner) = binding.op(memo, 1).clone() else {
+            return vec![];
+        };
+        // The inner TopN's child group (its only child).
+        let inner_child_group_id = binding.children(1)[0];
+        merge_one_topn(&outer, &inner, inner_child_group_id, memo)
+    }
 }
 
 pub(crate) struct RemoveRedundantSortUnderTopN;
@@ -48,6 +73,32 @@ impl Rule for RemoveRedundantSortUnderTopN {
 
     fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         remove_redundant_sort_under_topn(expr, memo)
+    }
+
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::TopN,
+            children: vec![Pattern::Op {
+                kind: OpKind::Sort,
+                children: vec![Pattern::Leaf],
+            }],
+        }
+    }
+
+    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+        // interior 0 = TopN, interior 1 = Sort.
+        let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
+            return vec![];
+        };
+        let Operator::LogicalSort(sort) = binding.op(memo, 1).clone() else {
+            return vec![];
+        };
+        // The Sort's group is the TopN's only child; its equivalence_classes
+        // decide whether the Sort's ordering covers the TopN's.
+        let sort_group_id = binding.children(0)[0];
+        // The Sort's children become the rewritten TopN's children.
+        let sort_children = binding.children(1).to_vec();
+        remove_one_sort(&topn, &sort, sort_group_id, &sort_children, memo)
     }
 }
 
@@ -69,6 +120,29 @@ impl Rule for PushTopNThroughProject {
     fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         push_topn_through_project(expr, memo)
     }
+
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::TopN,
+            children: vec![Pattern::Op {
+                kind: OpKind::Project,
+                children: vec![Pattern::Leaf],
+            }],
+        }
+    }
+
+    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+        // interior 0 = TopN, interior 1 = Project.
+        let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
+            return vec![];
+        };
+        let Operator::LogicalProject(project) = binding.op(memo, 1).clone() else {
+            return vec![];
+        };
+        // The Project's child group (its only child).
+        let project_children = binding.children(1).to_vec();
+        push_one_project(&topn, &project, &project_children, memo)
+    }
 }
 
 pub(crate) struct PushTopNIntoScan;
@@ -88,6 +162,28 @@ impl Rule for PushTopNIntoScan {
 
     fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         push_topn_into_scan(expr, memo)
+    }
+
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::TopN,
+            children: vec![Pattern::Op {
+                kind: OpKind::Scan,
+                children: vec![],
+            }],
+        }
+    }
+
+    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+        // interior 0 = TopN; interior 1 = Scan (a 0-child leaf op). The binder
+        // yields one binding per Scan alternative in the child group; each
+        // produces an IDENTICAL re-emit, absorbed by explore()'s dedup.
+        let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
+            return vec![];
+        };
+        // Re-emit the TopN over its ORIGINAL child group (the scan group).
+        let topn_children = binding.children(0).to_vec();
+        push_one_scan(&topn, &topn_children)
     }
 }
 
@@ -109,6 +205,19 @@ impl Rule for PushTopNThroughJoin {
     fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         push_topn_through_join(expr, memo)
     }
+
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::TopN,
+            children: vec![Pattern::Leaf],
+        }
+    }
+
+    fn apply_bound(&self, _binding: &Binding, _memo: &mut Memo) -> Vec<NewExpr> {
+        // Stub: TopN-through-join pushdown is not yet implemented (fails closed
+        // until join multiplicity is proven). See `push_topn_through_join`.
+        Vec::new()
+    }
 }
 
 pub(crate) struct PushTopNThroughAggregate;
@@ -129,6 +238,19 @@ impl Rule for PushTopNThroughAggregate {
     fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         push_topn_through_aggregate(expr, memo)
     }
+
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::TopN,
+            children: vec![Pattern::Leaf],
+        }
+    }
+
+    fn apply_bound(&self, _binding: &Binding, _memo: &mut Memo) -> Vec<NewExpr> {
+        // Stub: TopN-through-aggregate pushdown is not yet implemented (fails
+        // closed for ordered aggregates). See `push_topn_through_aggregate`.
+        Vec::new()
+    }
 }
 
 pub(crate) struct PushTopNThroughSetOp;
@@ -148,6 +270,29 @@ impl Rule for PushTopNThroughSetOp {
 
     fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         push_topn_through_setop(expr, memo)
+    }
+
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::TopN,
+            children: vec![Pattern::Op {
+                kind: OpKind::Union,
+                children: vec![Pattern::MultiLeaf],
+            }],
+        }
+    }
+
+    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+        // interior 0 = TopN, interior 1 = Union. The Union's `MultiLeaf` tail
+        // captures ALL branch groups.
+        let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
+            return vec![];
+        };
+        let Operator::LogicalUnion(union) = binding.op(memo, 1).clone() else {
+            return vec![];
+        };
+        let union_children = binding.children(1).to_vec();
+        push_one_setop(&topn, &union, &union_children, memo)
     }
 }
 
@@ -172,44 +317,57 @@ fn merge_consecutive_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
         if child_expr.children.len() != 1 {
             continue;
         }
-        if !topn_phase_can_merge(outer, inner) {
-            continue;
-        }
-        if inner.offset.unwrap_or(0) != 0 {
-            continue;
-        }
-        let Some(outer_window) = TopNWindow::from_limit_offset(outer.limit, outer.offset) else {
-            continue;
-        };
-        let Some(inner_window) = TopNWindow::from_limit_offset(inner.limit, inner.offset) else {
-            continue;
-        };
-        if !inner_window.covers(outer_window) {
-            continue;
-        }
-
-        let Some(outer_keys) = sort_keys_to_keys(&memo.scalars, &outer.items) else {
-            continue;
-        };
-        let Some(inner_keys) = sort_keys_to_keys(&memo.scalars, &inner.items) else {
-            continue;
-        };
         let inner_child_group_id = child_expr.children[0];
-        let equivalences = memo
-            .groups
-            .get(inner_child_group_id)
-            .and_then(|group| group.logical_props.as_ref())
-            .map(|props| &props.equivalence_classes);
-        if !sort_keys_equivalent(&outer_keys, &inner_keys, equivalences) {
-            continue;
-        }
-
-        results.push(NewExpr {
-            op: Operator::LogicalTopN(outer.clone()),
-            children: vec![inner_child_group_id],
-        });
+        results.extend(merge_one_topn(outer, inner, inner_child_group_id, memo));
     }
     results
+}
+
+/// Per-child core for `MergeConsecutiveTopN`: try to merge one outer/inner
+/// `LogicalTopN` pair, where `inner_child_group_id` is the inner TopN's single
+/// child group (its `equivalence_classes` decide sort-key equivalence). Shared
+/// by the legacy loop and the declarative `apply_bound`.
+fn merge_one_topn(
+    outer: &TopNOp,
+    inner: &TopNOp,
+    inner_child_group_id: GroupId,
+    memo: &Memo,
+) -> Vec<NewExpr> {
+    if !topn_phase_can_merge(outer, inner) {
+        return vec![];
+    }
+    if inner.offset.unwrap_or(0) != 0 {
+        return vec![];
+    }
+    let Some(outer_window) = TopNWindow::from_limit_offset(outer.limit, outer.offset) else {
+        return vec![];
+    };
+    let Some(inner_window) = TopNWindow::from_limit_offset(inner.limit, inner.offset) else {
+        return vec![];
+    };
+    if !inner_window.covers(outer_window) {
+        return vec![];
+    }
+
+    let Some(outer_keys) = sort_keys_to_keys(&memo.scalars, &outer.items) else {
+        return vec![];
+    };
+    let Some(inner_keys) = sort_keys_to_keys(&memo.scalars, &inner.items) else {
+        return vec![];
+    };
+    let equivalences = memo
+        .groups
+        .get(inner_child_group_id)
+        .and_then(|group| group.logical_props.as_ref())
+        .map(|props| &props.equivalence_classes);
+    if !sort_keys_equivalent(&outer_keys, &inner_keys, equivalences) {
+        return vec![];
+    }
+
+    vec![NewExpr {
+        op: Operator::LogicalTopN(outer.clone()),
+        children: vec![inner_child_group_id],
+    }]
 }
 
 fn remove_redundant_sort_under_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
@@ -219,41 +377,63 @@ fn remove_redundant_sort_under_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
     if expr.children.len() != 1 {
         return vec![];
     }
-    let Some(topn_keys) = sort_keys_to_keys(&memo.scalars, &topn.items) else {
+    let sort_group_id = expr.children[0];
+    let Some(child_group) = memo.groups.get(sort_group_id) else {
         return vec![];
     };
-    let Some(child_group) = memo.groups.get(expr.children[0]) else {
-        return vec![];
-    };
-    let equivalences = child_group
-        .logical_props
-        .as_ref()
-        .map(|props| &props.equivalence_classes);
 
     let mut results = Vec::new();
     for child_expr in child_group.logical_exprs.iter() {
         let Operator::LogicalSort(sort) = &child_expr.op else {
             continue;
         };
-        if !sort.analytic_partition_exprs.is_empty() {
-            continue;
-        }
         if child_expr.children.len() != 1 {
             continue;
         }
-        let Some(sort_keys) = sort_keys_to_keys(&memo.scalars, &sort.items) else {
-            continue;
-        };
-        if !ordering_covers(&sort_keys, &topn_keys, equivalences) {
-            continue;
-        }
-
-        results.push(NewExpr {
-            op: Operator::LogicalTopN(topn.clone()),
-            children: child_expr.children.clone(),
-        });
+        results.extend(remove_one_sort(
+            topn,
+            sort,
+            sort_group_id,
+            &child_expr.children,
+            memo,
+        ));
     }
     results
+}
+
+/// Per-child core for `RemoveRedundantSortUnderTopN`: elide one redundant
+/// `LogicalSort` under a `LogicalTopN`, reading `equivalence_classes` from the
+/// Sort's group (`sort_group_id`, the TopN's only child) and re-parenting the
+/// TopN onto the Sort's children. Shared by the legacy loop and `apply_bound`.
+fn remove_one_sort(
+    topn: &TopNOp,
+    sort: &SortOp,
+    sort_group_id: GroupId,
+    sort_children: &[GroupId],
+    memo: &Memo,
+) -> Vec<NewExpr> {
+    if !sort.analytic_partition_exprs.is_empty() {
+        return vec![];
+    }
+    let Some(topn_keys) = sort_keys_to_keys(&memo.scalars, &topn.items) else {
+        return vec![];
+    };
+    let Some(sort_keys) = sort_keys_to_keys(&memo.scalars, &sort.items) else {
+        return vec![];
+    };
+    let equivalences = memo
+        .groups
+        .get(sort_group_id)
+        .and_then(|group| group.logical_props.as_ref())
+        .map(|props| &props.equivalence_classes);
+    if !ordering_covers(&sort_keys, &topn_keys, equivalences) {
+        return vec![];
+    }
+
+    vec![NewExpr {
+        op: Operator::LogicalTopN(topn.clone()),
+        children: sort_children.to_vec(),
+    }]
 }
 
 fn push_topn_through_project(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
@@ -279,34 +459,57 @@ fn push_topn_through_project(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         if project_expr.children.len() != 1 {
             continue;
         }
-        let Some(remapped_items) =
-            remap_sort_keys_through_project(&memo.scalars, &topn.items, &project.items)
-        else {
-            continue;
-        };
-
-        let pushed_op = Operator::LogicalTopN(TopNOp {
-            items: remapped_items,
-            limit: topn.limit,
-            offset: topn.offset,
-            phase: topn.phase,
-            is_split: topn.is_split,
-        });
-        let pushed_group = find_existing_logical_group(memo, &pushed_op, &project_expr.children)
-            .unwrap_or_else(|| {
-                let pushed_id = memo.next_expr_id();
-                memo.new_group(MExpr {
-                    id: pushed_id,
-                    op: pushed_op,
-                    children: project_expr.children.clone(),
-                })
-            });
-        results.push(NewExpr {
-            op: Operator::LogicalProject(project.clone()),
-            children: vec![pushed_group],
-        });
+        // Clone the Project op + its children out before borrowing `&mut memo`.
+        let project = project.clone();
+        let project_children = project_expr.children.clone();
+        results.extend(push_one_project(topn, &project, &project_children, memo));
     }
     results
+}
+
+/// Per-child core for `PushTopNThroughProject`: push one `LogicalTopN` below a
+/// `LogicalProject` by remapping the sort keys through the projection (fail
+/// closed) and minting/reusing the pushed-TopN group over the Project's
+/// children. Shared by the legacy loop and `apply_bound`. The phase/split gate
+/// is enforced by the callers' `push_topn_through_project` entry guard, so it
+/// is re-checked here to keep `apply_bound` correct on its own.
+fn push_one_project(
+    topn: &TopNOp,
+    project: &ProjectOp,
+    project_children: &[GroupId],
+    memo: &mut Memo,
+) -> Vec<NewExpr> {
+    // Split TopN codegen expects the final TopN to read directly from its
+    // partial root.
+    if topn.phase != TopNPhase::Final || topn.is_split {
+        return vec![];
+    }
+    let Some(remapped_items) =
+        remap_sort_keys_through_project(&memo.scalars, &topn.items, &project.items)
+    else {
+        return vec![];
+    };
+
+    let pushed_op = Operator::LogicalTopN(TopNOp {
+        items: remapped_items,
+        limit: topn.limit,
+        offset: topn.offset,
+        phase: topn.phase,
+        is_split: topn.is_split,
+    });
+    let pushed_group = find_existing_logical_group(memo, &pushed_op, project_children)
+        .unwrap_or_else(|| {
+            let pushed_id = memo.next_expr_id();
+            memo.new_group(MExpr {
+                id: pushed_id,
+                op: pushed_op,
+                children: project_children.to_vec(),
+            })
+        });
+    vec![NewExpr {
+        op: Operator::LogicalProject(project.clone()),
+        children: vec![pushed_group],
+    }]
 }
 
 fn push_topn_into_scan(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
@@ -330,11 +533,24 @@ fn push_topn_into_scan(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
         return vec![];
     }
 
+    push_one_scan(topn, &expr.children)
+}
+
+/// Per-child core for `PushTopNIntoScan`: given a `LogicalTopN` whose child
+/// group holds a `LogicalScan`, decide via the scan TopN capability whether to
+/// re-emit the TopN (over its original `topn_children`) as a candidate. The
+/// window check is the rule entry guard; it is re-checked here so `apply_bound`
+/// is correct standalone. Shared by the legacy `push_topn_into_scan` and
+/// `apply_bound`.
+fn push_one_scan(topn: &TopNOp, topn_children: &[GroupId]) -> Vec<NewExpr> {
+    if TopNWindow::from_limit_offset(topn.limit, topn.offset).is_none() {
+        return vec![];
+    }
     match default_scan_topn_capability() {
         ScanTopNCapability::NoOrdering => vec![],
         ScanTopNCapability::OrderedTopK => vec![NewExpr {
-            op: expr.op.clone(),
-            children: expr.children.clone(),
+            op: Operator::LogicalTopN(topn.clone()),
+            children: topn_children.to_vec(),
         }],
     }
 }
@@ -351,15 +567,16 @@ fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
     let Operator::LogicalTopN(topn) = &expr.op else {
         return vec![];
     };
+    // Rule entry fast-fail guards (mirrored inside `push_one_setop` so
+    // `apply_bound` is correct standalone). Phase/window/end_exclusive all
+    // depend only on the outer TopN.
     if !matches!(topn.phase, TopNPhase::Final) || topn.is_split {
         return vec![];
     }
-    let Some(window) = TopNWindow::from_limit_offset(topn.limit, topn.offset) else {
-        return vec![];
-    };
-    let Some(branch_limit) = window.end_exclusive() else {
-        return vec![];
-    };
+    match TopNWindow::from_limit_offset(topn.limit, topn.offset) {
+        Some(window) if window.end_exclusive().is_some() => {}
+        _ => return vec![],
+    }
     if expr.children.len() != 1 {
         return vec![];
     }
@@ -372,58 +589,84 @@ fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalUnion(union) = &union_expr.op else {
             continue;
         };
-        if !union.all || union_expr.children.is_empty() {
-            continue;
-        }
-        let Some(branch_topn_ops) =
-            build_union_branch_topn_ops(topn, branch_limit, union, &union_expr.children, memo)
-        else {
-            continue;
-        };
-        if union_expr
-            .children
-            .iter()
-            .zip(&branch_topn_ops)
-            .all(|(group, op)| {
-                group_starts_with_logical_op(memo, *group, &Operator::LogicalTopN(op.clone()))
-            })
-        {
-            continue;
-        }
-
-        let mut pushed_branch_groups = Vec::with_capacity(union_expr.children.len());
-        for (branch_group, branch_topn_op) in union_expr.children.iter().zip(branch_topn_ops) {
-            let pushed_op = Operator::LogicalTopN(branch_topn_op);
-            let pushed_children = vec![*branch_group];
-            let pushed_group = find_existing_logical_group(memo, &pushed_op, &pushed_children)
-                .unwrap_or_else(|| {
-                    let pushed_id = memo.next_expr_id();
-                    memo.new_group(MExpr {
-                        id: pushed_id,
-                        op: pushed_op,
-                        children: pushed_children,
-                    })
-                });
-            pushed_branch_groups.push(pushed_group);
-        }
-
-        let pushed_union_op = Operator::LogicalUnion(union.clone());
-        let pushed_union_group =
-            find_existing_logical_group(memo, &pushed_union_op, &pushed_branch_groups)
-                .unwrap_or_else(|| {
-                    let pushed_id = memo.next_expr_id();
-                    memo.new_group(MExpr {
-                        id: pushed_id,
-                        op: pushed_union_op,
-                        children: pushed_branch_groups.clone(),
-                    })
-                });
-        results.push(NewExpr {
-            op: Operator::LogicalTopN(topn.clone()),
-            children: vec![pushed_union_group],
-        });
+        // Clone the Union op + its branch groups out before borrowing `&mut memo`.
+        let union = union.clone();
+        let union_children = union_expr.children.clone();
+        results.extend(push_one_setop(topn, &union, &union_children, memo));
     }
     results
+}
+
+/// Per-child core for `PushTopNThroughSetOp`: push one `LogicalTopN` below a
+/// `LogicalUnion` (UNION ALL only), building per-branch TopNs and minting both
+/// the per-branch and the unioned pushed groups, idempotently. `union_children`
+/// is the Union's full branch-group list. Shared by the legacy loop and
+/// `apply_bound`; the phase/window gates are re-checked here so `apply_bound`
+/// is correct standalone.
+fn push_one_setop(
+    topn: &TopNOp,
+    union: &UnionOp,
+    union_children: &[GroupId],
+    memo: &mut Memo,
+) -> Vec<NewExpr> {
+    if !matches!(topn.phase, TopNPhase::Final) || topn.is_split {
+        return vec![];
+    }
+    let Some(window) = TopNWindow::from_limit_offset(topn.limit, topn.offset) else {
+        return vec![];
+    };
+    let Some(branch_limit) = window.end_exclusive() else {
+        return vec![];
+    };
+    if !union.all || union_children.is_empty() {
+        return vec![];
+    }
+    let Some(branch_topn_ops) =
+        build_union_branch_topn_ops(topn, branch_limit, union, union_children, memo)
+    else {
+        return vec![];
+    };
+    if union_children
+        .iter()
+        .zip(&branch_topn_ops)
+        .all(|(group, op)| {
+            group_starts_with_logical_op(memo, *group, &Operator::LogicalTopN(op.clone()))
+        })
+    {
+        return vec![];
+    }
+
+    let mut pushed_branch_groups = Vec::with_capacity(union_children.len());
+    for (branch_group, branch_topn_op) in union_children.iter().zip(branch_topn_ops) {
+        let pushed_op = Operator::LogicalTopN(branch_topn_op);
+        let pushed_children = vec![*branch_group];
+        let pushed_group = find_existing_logical_group(memo, &pushed_op, &pushed_children)
+            .unwrap_or_else(|| {
+                let pushed_id = memo.next_expr_id();
+                memo.new_group(MExpr {
+                    id: pushed_id,
+                    op: pushed_op,
+                    children: pushed_children,
+                })
+            });
+        pushed_branch_groups.push(pushed_group);
+    }
+
+    let pushed_union_op = Operator::LogicalUnion(union.clone());
+    let pushed_union_group =
+        find_existing_logical_group(memo, &pushed_union_op, &pushed_branch_groups)
+            .unwrap_or_else(|| {
+                let pushed_id = memo.next_expr_id();
+                memo.new_group(MExpr {
+                    id: pushed_id,
+                    op: pushed_union_op,
+                    children: pushed_branch_groups.clone(),
+                })
+            });
+    vec![NewExpr {
+        op: Operator::LogicalTopN(topn.clone()),
+        children: vec![pushed_union_group],
+    }]
 }
 
 fn build_union_branch_topn_ops(
