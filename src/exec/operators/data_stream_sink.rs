@@ -1536,7 +1536,16 @@ impl DataStreamSinkOperator {
             .error_state
             .as_ref()
             .ok_or_else(|| "missing runtime error state".to_string())?;
-        if !allow_overflow && !exchange_send_queue().try_reserve_bytes(reserve_bytes) {
+        if !allow_overflow
+            && !exchange_send_queue().reserve_bytes_for(
+                &addr.hostname,
+                addr.port as u16,
+                dest_finst_id,
+                self.sink.dest_node_id,
+                self.sender_id,
+                reserve_bytes,
+            )
+        {
             return Ok(PayloadEnqueue::NoCapacity(pending));
         }
 
