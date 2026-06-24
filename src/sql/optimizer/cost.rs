@@ -373,6 +373,23 @@ fn safe_compute_size(stats: &Statistics) -> f64 {
     finite_non_negative_cost(cost_row_count(stats) * cost_row_width(stats))
 }
 
+/// Degenerate "build size unknown" detector. Triggers on the magnitude axis
+/// (non-finite/<=0/overflow) AND on NovaRocks' real fabricated-default
+/// fingerprint (Fallback confidence + empty column_statistics), because the
+/// fallback constructors and CTE/scan missing-stats paths replace truly unknown
+/// tables with a finite default magnitude + Fallback confidence. Without the
+/// fingerprint arm the magnitude-only check is dead code. Trino: unknown ->
+/// partitioned.
+#[allow(dead_code)] // BC-1 Phase 1 staged until broadcast feasibility consumes it.
+pub(crate) fn build_size_is_uninformative(build_stats: &Statistics) -> bool {
+    let rows = build_stats.output_row_count;
+    if !rows.is_finite() || rows <= 0.0 || safe_compute_size(build_stats) >= MAX_FINITE_COST {
+        return true;
+    }
+    build_stats.row_count_confidence == crate::sql::optimizer::statistics::Confidence::Fallback
+        && build_stats.column_statistics.is_empty()
+}
+
 /// Estimated per-node memory of the broadcast build hash table, the single
 /// formula feeding BOTH the LAYER 1 floor and the LAYER 2 memory dimension.
 /// `payload / load_factor + rows * per_row_overhead`. The per-row term (16B =
@@ -1196,6 +1213,45 @@ mod tests {
             confidence_risk_multiplier(Confidence::Estimated, &o)
                 >= confidence_risk_multiplier(Confidence::Exact, &o)
         );
+    }
+
+    #[test]
+    fn uninformative_fingerprint_catches_fabricated_defaults_but_allows_small_values() {
+        // NovaRocks fabricated-default fingerprint: Fallback + empty column_statistics,
+        // finite positive rows (e.g. CTE/scan fallback 10_000 rows). MUST refuse.
+        let fabricated = Statistics {
+            output_row_count: 10_000.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        };
+        assert!(build_size_is_uninformative(&fabricated));
+
+        // Small Fallback VALUES with real literal column widths: NOT uninformative.
+        let mut small_values = stats(1_000.0, 16.0); // stats() populates column_statistics
+        small_values.row_count_confidence = Confidence::Fallback;
+        assert!(!build_size_is_uninformative(&small_values));
+    }
+
+    #[test]
+    fn uninformative_fingerprint_catches_magnitude_unknown_with_real_colstats() {
+        let mut populated = stats(10.0, 16.0);
+        populated.row_count_confidence = Confidence::Exact;
+
+        // Magnitude truly unknown (defensive). MUST refuse independent of the
+        // fabricated-default fingerprint.
+        populated.output_row_count = f64::INFINITY;
+        assert!(build_size_is_uninformative(&populated));
+        populated.output_row_count = f64::NAN;
+        assert!(build_size_is_uninformative(&populated));
+        populated.output_row_count = 0.0;
+        assert!(build_size_is_uninformative(&populated));
+        populated.output_row_count = -1.0;
+        assert!(build_size_is_uninformative(&populated));
+
+        // Finite size overflow/saturation is uninformative even with real colstats.
+        let mut overflow = stats_with_column_widths(10.0, &[f64::MAX, f64::MAX]);
+        overflow.row_count_confidence = Confidence::Exact;
+        assert!(build_size_is_uninformative(&overflow));
     }
 
     #[test]
