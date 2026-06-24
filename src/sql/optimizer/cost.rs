@@ -1711,6 +1711,44 @@ mod tests {
     }
 
     #[test]
+    fn huge_exact_big_memory_allows_wide_but_rejects_extremely_narrow_build() {
+        let mut o = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 3.0;
+        profile.per_node_build_memory_budget_bytes = 32.0 * 1024.0 * 1024.0 * 1024.0;
+        profile.cluster_broadcast_network_budget_bytes =
+            profile.per_node_build_memory_budget_bytes * 3.0;
+        o.apply_profile(profile);
+
+        let probe = stats(10_000_000.0, 8.0);
+        let mut wide = stats(10_000_000.0, 800.0);
+        wide.row_count_confidence = Confidence::Exact;
+        let mut narrow = stats(2_500_000_000.0, 8.0);
+        narrow.row_count_confidence = Confidence::Exact;
+
+        let wide_feas = broadcast_is_feasible(&probe, &wide, &o);
+        assert!(wide_feas.feasible);
+        assert_eq!(wide_feas.reject_reason, None);
+        assert!(
+            wide_feas.hash_table_bytes < o.profile.per_node_build_memory_budget_bytes,
+            "wide build hash table should fit: {:?}",
+            wide_feas
+        );
+
+        let narrow_feas = broadcast_is_feasible(&probe, &narrow, &o);
+        assert!(!narrow_feas.feasible);
+        assert_eq!(
+            narrow_feas.reject_reason,
+            Some(BroadcastRejectReason::PerNodeMemory)
+        );
+        assert!(
+            narrow_feas.hash_table_bytes > o.profile.per_node_build_memory_budget_bytes,
+            "narrow build hash table should exceed budget: {:?}",
+            narrow_feas
+        );
+    }
+
+    #[test]
     fn feasibility_advisory_for_correctness_required_joins() {
         let arena = ScalarArena::new();
         assert!(advisory_for_derived_hash_join(
