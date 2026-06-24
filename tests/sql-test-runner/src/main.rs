@@ -641,7 +641,7 @@ fn run_imv_equivalence_check(
         "@imv_equivalence_check: SHOW MATERIALIZED VIEWS returned no result".to_string()
     })?;
 
-    // Find the column indices for "Name" and "SelectText".
+    // Find the column indices for "Name", "SelectText", and optionally "Database".
     let name_col = show_result
         .header
         .iter()
@@ -658,24 +658,64 @@ fn run_imv_equivalence_check(
             "@imv_equivalence_check: SHOW MATERIALIZED VIEWS result has no 'SelectText' column"
                 .to_string()
         })?;
+    // Database column is optional — if absent we fall back to bare-name match
+    // but still apply the ambiguity check below.
+    let db_col = show_result
+        .header
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("Database"));
 
-    // Find the row for our MV (match on bare mv name).
-    let select_sql = show_result
+    // Find all rows whose name matches `mv` AND, when `db` is known and the
+    // Database column is present, whose Database column also matches `db`.
+    // This prevents silently binding the wrong SelectText when two MVs in
+    // different databases of the same catalog share a bare name.
+    let matched: Vec<&Vec<String>> = show_result
         .rows
         .iter()
-        .find(|row| {
-            row.get(name_col)
+        .filter(|row| {
+            let name_matches = row
+                .get(name_col)
                 .map(|n| n.eq_ignore_ascii_case(mv))
-                .unwrap_or(false)
+                .unwrap_or(false);
+            if !name_matches {
+                return false;
+            }
+            // Apply db-qualification when both the caller supplied a non-empty
+            // db and the SHOW output has a Database column.
+            if let (Some(d), Some(dc)) = (db.filter(|d| !d.is_empty()), db_col) {
+                row.get(dc)
+                    .map(|dbname| dbname.eq_ignore_ascii_case(d))
+                    .unwrap_or(false)
+            } else {
+                true
+            }
         })
-        .and_then(|row| row.get(select_text_col))
-        .ok_or_else(|| {
-            format!(
-                "@imv_equivalence_check: MV `{mv}` not found in SHOW MATERIALIZED VIEWS output"
-            )
-        })?
-        .clone();
+        .collect();
 
+    let select_sql = match matched.len() {
+        0 => {
+            return Err(format!(
+                "@imv_equivalence_check: MV `{mv}` not found in SHOW MATERIALIZED VIEWS output"
+            ))
+        }
+        1 => matched[0]
+            .get(select_text_col)
+            .ok_or_else(|| {
+                format!(
+                    "@imv_equivalence_check: MV `{mv}` row has no SelectText value"
+                )
+            })?
+            .clone(),
+        n => {
+            return Err(format!(
+                "@imv_equivalence_check: MV `{mv}` is ambiguous in SHOW MATERIALIZED VIEWS \
+                 (qualify with a unique db); matched {n} rows"
+            ))
+        }
+    };
+
+    // SelectText is the canonical re-parseable CREATE-MV query body (sqlparser
+    // Display round-trip, re-parsed on every refresh), so it is safe to re-run.
     let (ok, full, msg) = session.execute_query(query_timeout, &select_sql, None);
     if !ok {
         return Err(format!(
@@ -1293,10 +1333,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         case_failed = true;
                     } else {
                         // @imv_equivalence_check: assert MV incremental contents
-                        // == a forced full recompute. Verify-mode only by design:
-                        // diff mode compares against a reference engine (no
-                        // full-recompute ground truth here), and record mode would
-                        // be perturbed by the FULL refresh side effect.
+                        // == a full recompute derived by running the MV's SelectText
+                        // directly against the base tables (no MV side effects).
+                        // Verify-mode only by design: diff mode compares against a
+                        // reference engine (no full-recompute oracle here), and the
+                        // check needs the MV's own SelectText which only verify drives.
                         if let Some(mv) = step.meta.imv_equivalence_check.as_deref() {
                             if let Err(reason) = run_imv_equivalence_check(
                                 mv,
