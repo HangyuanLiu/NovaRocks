@@ -9916,6 +9916,19 @@ mod partition_planning_tests {
     }
 
     #[test]
+    fn merge_sink_partition_derivation_keeps_generic_partition_contracts() {
+        let derivation = merge_sink_partition_derivation(&contract_with_identity_partition())
+            .expect("derivation");
+
+        assert_eq!(derivation.target_spec_id, 7);
+        assert_eq!(derivation.bound_fields.len(), 1);
+        let field = &derivation.bound_fields[0];
+        assert_eq!(field.partition_field_name, "id");
+        assert_eq!(field.column_name, "id");
+        assert_eq!(field.transform, iceberg::spec::Transform::Identity);
+    }
+
+    #[test]
     fn merge_affected_partition_results_unions_known_sets() {
         let merged = merge_affected_partition_results(
             "UNION ALL MV affected partition planning",
@@ -10916,14 +10929,14 @@ fn rewrite_refresh_table_uuid_map(
 
 fn merge_sink_partition_derivation(
     contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-) -> Option<crate::engine::mv::iceberg_merge_sink::BoundTargetPartitionDerivation> {
+) -> Option<crate::engine::mv::partition::BoundJoinTargetPartitionDerivation> {
     let spec = crate::engine::mv::partition::resolve_partition_derivation_spec(contract)
         .ok()
         .flatten()?;
     let bound_fields =
         crate::engine::mv::partition::bind_spec_to_target_visible_columns(&spec, contract).ok()?;
     Some(
-        crate::engine::mv::iceberg_merge_sink::BoundTargetPartitionDerivation {
+        crate::engine::mv::partition::BoundJoinTargetPartitionDerivation {
             target_spec_id: spec.target_spec_id,
             bound_fields,
         },
