@@ -29,14 +29,36 @@ pub fn calc_pipeline_dop(pipeline_dop: i32) -> i32 {
     }
 
     // Auto mode: use half of configured executor threads
-    let exec_threads = crate::common::app_config::config()
+    ((auto_exec_threads() / 2).max(1)) as i32
+}
+
+/// Pipeline DOP for fragments whose output is a **write/data sink** (load / insert / export).
+///
+/// Mirrors StarRocks `BackendResourceStat::getSinkDefaultDOP`: a positive `pipeline_dop` override
+/// (from `SET pipeline_dop = N`) wins; otherwise a deliberately lower curve than the compute
+/// `calc_pipeline_dop` — `cores/3` for <=24 cores, `min(32, cores/4)` above — because a write
+/// fragment runs both query and storage engine work, so it must not use up CPU, and write
+/// throughput/concurrency scales sub-linearly while memory grows linearly.
+pub fn calc_sink_pipeline_dop(pipeline_dop: i32) -> i32 {
+    if pipeline_dop > 0 {
+        return pipeline_dop;
+    }
+    let cores = auto_exec_threads();
+    if cores <= 24 {
+        ((cores / 3).max(1)) as i32
+    } else {
+        ((cores / 4).min(32)) as i32
+    }
+}
+
+/// Configured executor-thread count (defaults to available CPU cores), shared by the DOP curves.
+fn auto_exec_threads() -> usize {
+    crate::common::app_config::config()
         .ok()
         .map(|c| c.runtime.actual_exec_threads())
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
-        });
-
-    ((exec_threads / 2).max(1)) as i32
+        })
 }
