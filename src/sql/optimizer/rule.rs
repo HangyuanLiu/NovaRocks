@@ -38,4 +38,49 @@ pub(crate) trait Rule: Send + Sync {
     /// Takes `&mut Memo` so that rules creating intermediate groups (e.g. two-phase
     /// aggregation) can allocate new groups for their internal structure.
     fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr>;
+
+    /// Declarative match shape for the Memo binder. Default = root-only wildcard
+    /// (`Pattern::Leaf`), so un-migrated rules behave exactly as today: the binder
+    /// yields one root binding and `apply_bound` shims to legacy `apply`.
+    fn pattern(&self) -> crate::sql::optimizer::pattern::Pattern {
+        crate::sql::optimizer::pattern::Pattern::Leaf
+    }
+
+    /// Apply against a fully-resolved binding. Default = shim to legacy `apply`
+    /// on the bound root expr. Migrated rules override this and never call the default.
+    fn apply_bound(
+        &self,
+        binding: &crate::sql::optimizer::binder::Binding,
+        memo: &mut Memo,
+    ) -> Vec<NewExpr> {
+        let root = binding.root_mexpr(memo).clone();
+        self.apply(&root, memo)
+    }
+}
+
+#[cfg(test)]
+mod trait_default_tests {
+    use super::*;
+    struct DummyRule;
+    impl Rule for DummyRule {
+        fn name(&self) -> &str {
+            "Dummy"
+        }
+        fn rule_type(&self) -> RuleType {
+            RuleType::Transformation
+        }
+        fn matches(&self, _op: &Operator) -> bool {
+            true
+        }
+        fn apply(&self, _expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+            vec![]
+        }
+    }
+    #[test]
+    fn default_pattern_is_leaf() {
+        assert!(matches!(
+            DummyRule.pattern(),
+            crate::sql::optimizer::pattern::Pattern::Leaf
+        ));
+    }
 }
