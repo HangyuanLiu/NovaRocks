@@ -30,14 +30,36 @@
 //! - A `Leaf`/`MultiLeaf` ROOT yields one binding capturing the root expr
 //!   (with no interior nodes) — this is the default-shim path; only an `Op`
 //!   root enumerates structure.
+//!
+//! ## `op_equal` and group-mint interleaving (I2 invariant)
+//!
+//! `op_equal` (used by Cascades dedup / plan output) compares `&Operator`
+//! values via their `Debug` representation. It never sees `MExpr.id` — the
+//! binder's group-mint interleaving (which perturbs ids) therefore cannot
+//! affect golden outputs or dedup decisions. This is structurally guaranteed:
+//! `op_equal` takes `&Operator`, not `&MExpr`.
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::pattern::{op_kind, Pattern};
 
+/// Process-global counter: incremented once each time [`bind`] truncates
+/// results at [`MAX_BINDINGS_PER_PATTERN`].  Used for observability and tests.
+static BINDER_TRUNCATED: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the number of times [`bind`] has hit the `MAX_BINDINGS_PER_PATTERN`
+/// cap since the last call, and resets the counter to zero.
+///
+/// Intended for tests and observability tooling only.
+#[allow(dead_code)] // used by tests / future tasks
+pub(crate) fn take_truncation_count() -> u64 {
+    BINDER_TRUNCATED.swap(0, Ordering::Relaxed)
+}
+
 /// Upper bound on the number of bindings a single `bind` call collects. Once
-/// reached the binder stops collecting. (A truncation COUNTER is a later
-/// task; this only enforces the cap.)
+/// reached the binder stops collecting and increments [`BINDER_TRUNCATED`].
 pub(crate) const MAX_BINDINGS_PER_PATTERN: usize = 1024;
 
 /// One bound interior `Op` node: the concrete memo expression it matched plus
@@ -133,14 +155,19 @@ pub(crate) fn bind(
     // Match the root expr against the pattern, producing the DFS-preorder list
     // of interior `BoundNode`s for every combination of child alternatives.
     let mut out = Vec::new();
+    let mut truncated = false;
     for interiors in match_expr(pattern, memo, group_id, expr_index) {
         if out.len() >= MAX_BINDINGS_PER_PATTERN {
+            truncated = true;
             break;
         }
         out.push(Binding {
             root: (group_id, expr_index),
             interiors,
         });
+    }
+    if truncated {
+        BINDER_TRUNCATED.fetch_add(1, Ordering::Relaxed);
     }
     out.truncate(MAX_BINDINGS_PER_PATTERN);
     out
@@ -486,5 +513,30 @@ mod tests {
         let mut memo = Memo::new();
         let g = mk_scan_group(&mut memo);
         assert_eq!(bind(&Pattern::MultiLeaf, &memo, g, 0).len(), 1);
+    }
+
+    /// Normal (non-truncating) bind must NOT increment the truncation counter.
+    #[test]
+    fn truncation_counter_not_incremented_on_normal_bind() {
+        // Drain any count accumulated by other tests running in the same process.
+        let _ = take_truncation_count();
+
+        let mut memo = Memo::new();
+        let a = mk_scan_group(&mut memo);
+        let b = mk_scan_group(&mut memo);
+        let root_expr = mk_join_mexpr(&mut memo, vec![a, b]);
+        let root_group = memo.new_group(root_expr);
+
+        let pattern = Pattern::Op {
+            kind: OpKind::Join,
+            children: vec![Pattern::Leaf, Pattern::Leaf],
+        };
+        let bs = bind(&pattern, &memo, root_group, 0);
+        assert_eq!(bs.len(), 1);
+        assert_eq!(
+            take_truncation_count(),
+            0,
+            "truncation counter must be 0 for a normal (non-capped) bind"
+        );
     }
 }

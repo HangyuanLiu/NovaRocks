@@ -43,6 +43,9 @@ pub(crate) fn op_kind(op: &Operator) -> Option<OpKind> {
 
 /// Cheap root gate used by explore/implement before constructing a Binder:
 /// equivalent to today's `rule.matches(&op)` on the root variant.
+///
+/// Used by tests and retained as a utility for future callers.
+#[allow(dead_code)]
 pub(crate) fn pattern_root_matches(p: &Pattern, op: &Operator) -> bool {
     match p {
         Pattern::Leaf | Pattern::MultiLeaf => true,
