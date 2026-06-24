@@ -314,11 +314,24 @@ impl Default for CostOptions {
 
 impl CostOptions {
     /// Install a profile and refresh the cached `backend_factor` projection.
-    /// `backend_factor` is always `profile.effective_backend_count.max(1.0)` so
+    /// `backend_factor` is always the normalized effective backend count, so
     /// existing `options.backend_factor` call sites need no change.
-    pub(crate) fn apply_profile(&mut self, profile: ClusterResourceProfile) {
-        self.backend_factor = profile.effective_backend_count.max(1.0);
+    pub(crate) fn apply_profile(&mut self, mut profile: ClusterResourceProfile) {
+        let backends = normalized_effective_backend_count(profile.effective_backend_count);
+        profile.effective_backend_count = backends;
+        profile.cluster_broadcast_network_budget_bytes = finite_non_negative_cost(
+            profile.per_node_build_memory_budget_bytes * profile.effective_backend_count,
+        );
+        self.backend_factor = backends;
         self.profile = profile;
+    }
+}
+
+fn normalized_effective_backend_count(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        1.0
     }
 }
 
@@ -380,7 +393,6 @@ fn safe_compute_size(stats: &Statistics) -> f64 {
 /// tables with a finite default magnitude + Fallback confidence. Without the
 /// fingerprint arm the magnitude-only check is dead code. Trino: unknown ->
 /// partitioned.
-#[allow(dead_code)] // BC-1 Phase 1 staged until broadcast feasibility consumes it.
 pub(crate) fn build_size_is_uninformative(build_stats: &Statistics) -> bool {
     let rows = build_stats.output_row_count;
     if !rows.is_finite() || rows <= 0.0 || safe_compute_size(build_stats) >= MAX_FINITE_COST {
@@ -390,12 +402,12 @@ pub(crate) fn build_size_is_uninformative(build_stats: &Statistics) -> bool {
         && build_stats.column_statistics.is_empty()
 }
 
-/// Estimated per-node memory of the broadcast build hash table, the single
-/// formula feeding BOTH the LAYER 1 floor and the LAYER 2 memory dimension.
+/// Estimated per-node memory of the broadcast build hash table. This feeds the
+/// LAYER 1 floor now and the Phase 1.6 memory dimension later; LAYER 2 network
+/// fanout uses raw build bytes.
 /// `payload / load_factor + rows * per_row_overhead`. The per-row term (16B =
 /// 4x Vec<u32> in JoinHashTable) is what makes a narrow build correctly
 /// expensive, dissolving the old narrow-build exception.
-#[allow(dead_code)] // BC-1 Phase 1 staged until broadcast feasibility consumes it.
 pub(crate) fn estimated_build_hash_table_bytes(
     build_stats: &Statistics,
     options: &CostOptions,
@@ -415,17 +427,100 @@ pub(crate) fn estimated_build_hash_table_bytes(
 /// bytes BEFORE the LAYER 1 feasibility check. Feasibility-only — it does NOT
 /// enter LAYER 2 cost (that would double-count and degrade into a soft gate).
 /// Anchored at Exact=1.0, monotone non-increasing as confidence rises.
-#[allow(dead_code)] // BC-1 Phase 1 staged until broadcast feasibility consumes it.
 pub(crate) fn confidence_risk_multiplier(
     confidence: crate::sql::optimizer::statistics::Confidence,
     options: &CostOptions,
 ) -> f64 {
     use crate::sql::optimizer::statistics::Confidence;
-    match confidence {
+    let multiplier = match confidence {
         Confidence::Fallback => options.risk_multiplier_fallback,
         Confidence::Estimated => options.risk_multiplier_estimated,
         Confidence::Exact => options.risk_multiplier_exact,
         Confidence::Measured => options.risk_multiplier_measured,
+    };
+    if multiplier.is_finite() && multiplier > 0.0 {
+        multiplier
+    } else {
+        1.0
+    }
+}
+
+#[allow(dead_code)] // BC-1 Phase 1 staged until search.rs consumes broadcast feasibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BroadcastRejectReason {
+    /// `risk_adj_build_bytes` exceeds the per-node memory budget (LAYER 1).
+    PerNodeMemory,
+    /// `risk_adj_fanout_bytes` exceeds the cluster network budget (LAYER 2).
+    ClusterNetwork,
+    /// Build size unknown (fabricated default stats) -> partitioned.
+    UninformativeSize,
+}
+
+#[allow(dead_code)] // BC-1 Phase 1 staged until search.rs consumes broadcast feasibility.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BroadcastFeasibility {
+    pub(crate) feasible: bool,
+    pub(crate) build_bytes: f64,
+    pub(crate) hash_table_bytes: f64,
+    pub(crate) effective_backend_count: f64,
+    pub(crate) risk_multiplier: f64,
+    pub(crate) risk_adj_build_bytes: f64,
+    pub(crate) risk_adj_fanout_bytes: f64,
+    pub(crate) reject_reason: Option<BroadcastRejectReason>,
+}
+
+/// LAYER 1 hard feasibility floor. Per-node memory floor NEVER divides by the
+/// backend count (broadcast materializes the full build on every node) plus a
+/// cluster network fanout floor. Confidence enters only here, never in cost.
+#[allow(dead_code)] // BC-1 Phase 1 staged until search.rs consumes broadcast feasibility.
+pub(crate) fn broadcast_is_feasible(
+    _probe_stats: &Statistics,
+    build_stats: &Statistics,
+    options: &CostOptions,
+) -> BroadcastFeasibility {
+    let backends = normalized_effective_backend_count(options.profile.effective_backend_count);
+    let raw = safe_compute_size(build_stats);
+    let risk_mult = confidence_risk_multiplier(build_stats.row_count_confidence, options);
+    let ht_bytes = estimated_build_hash_table_bytes(build_stats, options);
+
+    if build_size_is_uninformative(build_stats) {
+        return BroadcastFeasibility {
+            feasible: false,
+            build_bytes: raw,
+            hash_table_bytes: ht_bytes,
+            effective_backend_count: backends,
+            risk_multiplier: risk_mult,
+            risk_adj_build_bytes: finite_non_negative_cost(ht_bytes * risk_mult),
+            risk_adj_fanout_bytes: finite_non_negative_cost(raw * backends * risk_mult),
+            reject_reason: Some(BroadcastRejectReason::UninformativeSize),
+        };
+    }
+
+    // LAYER 1 (per-node memory): NO backend divisor — full build per node.
+    let risk_adj_build_bytes = finite_non_negative_cost(ht_bytes * risk_mult);
+    // LAYER 2 (cluster network): raw bytes (not expanded) * fanout * risk.
+    let risk_adj_fanout_bytes = finite_non_negative_cost(raw * backends * risk_mult);
+
+    let mem_ok = risk_adj_build_bytes <= options.profile.per_node_build_memory_budget_bytes;
+    let net_ok = risk_adj_fanout_bytes <= options.profile.cluster_broadcast_network_budget_bytes;
+
+    let reject_reason = if !mem_ok {
+        Some(BroadcastRejectReason::PerNodeMemory)
+    } else if !net_ok {
+        Some(BroadcastRejectReason::ClusterNetwork)
+    } else {
+        None
+    };
+
+    BroadcastFeasibility {
+        feasible: mem_ok && net_ok,
+        build_bytes: raw,
+        hash_table_bytes: ht_bytes,
+        effective_backend_count: backends,
+        risk_multiplier: risk_mult,
+        risk_adj_build_bytes,
+        risk_adj_fanout_bytes,
+        reject_reason,
     }
 }
 
@@ -1216,6 +1311,29 @@ mod tests {
     }
 
     #[test]
+    fn confidence_risk_multiplier_invalid_values_fall_back_to_neutral() {
+        let mut o = CostOptions::default();
+
+        o.risk_multiplier_estimated = f64::NAN;
+        assert_eq!(
+            confidence_risk_multiplier(Confidence::Estimated, &o),
+            1.0
+        );
+
+        o.risk_multiplier_estimated = -2.0;
+        assert_eq!(
+            confidence_risk_multiplier(Confidence::Estimated, &o),
+            1.0
+        );
+
+        o.risk_multiplier_estimated = 3.5;
+        assert_eq!(
+            confidence_risk_multiplier(Confidence::Estimated, &o),
+            3.5
+        );
+    }
+
+    #[test]
     fn uninformative_fingerprint_catches_fabricated_defaults_but_allows_small_values() {
         // NovaRocks fabricated-default fingerprint: Fallback + empty column_statistics,
         // finite positive rows (e.g. CTE/scan fallback 10_000 rows). MUST refuse.
@@ -1252,6 +1370,89 @@ mod tests {
         let mut overflow = stats_with_column_widths(10.0, &[f64::MAX, f64::MAX]);
         overflow.row_count_confidence = Confidence::Exact;
         assert!(build_size_is_uninformative(&overflow));
+    }
+
+    #[test]
+    fn invalid_risk_multiplier_never_makes_infeasible_build_feasible() {
+        for invalid_multiplier in [f64::NAN, -2.0] {
+            let mut o = CostOptions::default();
+            o.risk_multiplier_estimated = invalid_multiplier;
+
+            let mut build = stats(1.0, 900.0 * 1024.0 * 1024.0);
+            build.row_count_confidence = Confidence::Estimated;
+            let probe = stats(100_000.0, 64.0);
+
+            let feas = broadcast_is_feasible(&probe, &build, &o);
+
+            assert_eq!(feas.risk_multiplier, 1.0);
+            assert!(!feas.feasible);
+            assert_eq!(
+                feas.reject_reason,
+                Some(BroadcastRejectReason::PerNodeMemory)
+            );
+        }
+    }
+
+    #[test]
+    fn layer1_per_node_floor_never_divides_by_backend_count() {
+        let mut o = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 30.0;
+        profile.per_node_build_memory_budget_bytes = 1024.0 * 1024.0 * 1024.0;
+        profile.cluster_broadcast_network_budget_bytes =
+            profile.per_node_build_memory_budget_bytes * profile.effective_backend_count;
+        o.apply_profile(profile);
+
+        let mut build = stats(3_000_000.0, 2048.0);
+        build.row_count_confidence = Confidence::Estimated;
+        let probe = stats(100_000.0, 64.0);
+
+        let feas = broadcast_is_feasible(&probe, &build, &o);
+
+        assert!(!feas.feasible);
+        assert_eq!(
+            feas.reject_reason,
+            Some(BroadcastRejectReason::PerNodeMemory)
+        );
+    }
+
+    #[test]
+    fn degenerate_build_is_infeasible() {
+        let o = CostOptions::default();
+        let build = Statistics {
+            output_row_count: 10_000.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        };
+        let probe = stats(5_000_000.0, 100.0);
+
+        let feas = broadcast_is_feasible(&probe, &build, &o);
+
+        assert!(!feas.feasible);
+        assert_eq!(
+            feas.reject_reason,
+            Some(BroadcastRejectReason::UninformativeSize)
+        );
+    }
+
+    #[test]
+    fn small_exact_build_is_feasible() {
+        let mut o = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 3.0;
+        profile.per_node_build_memory_budget_bytes = 256.0 * 1024.0 * 1024.0;
+        profile.cluster_broadcast_network_budget_bytes =
+            profile.per_node_build_memory_budget_bytes * 3.0;
+        o.apply_profile(profile);
+
+        let mut build = stats(1_000.0, 4.0);
+        build.row_count_confidence = Confidence::Exact;
+        let probe = stats(1_000_000.0, 64.0);
+
+        let feas = broadcast_is_feasible(&probe, &build, &o);
+
+        assert!(feas.feasible);
+        assert_eq!(feas.reject_reason, None);
     }
 
     #[test]
@@ -2546,10 +2747,21 @@ mod tests {
 
     #[test]
     fn apply_profile_clamps_backend_factor_to_one() {
-        let mut opts = CostOptions::default();
-        let mut profile = ClusterResourceProfile::default();
-        profile.effective_backend_count = 0.0;
-        opts.apply_profile(profile);
-        assert_eq!(opts.backend_factor, 1.0);
+        for backend_count in [0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -2.0] {
+            let mut opts = CostOptions::default();
+            let mut profile = ClusterResourceProfile::default();
+            profile.effective_backend_count = backend_count;
+            profile.per_node_build_memory_budget_bytes = 256.0 * 1024.0 * 1024.0;
+            profile.cluster_broadcast_network_budget_bytes = f64::NAN;
+
+            opts.apply_profile(profile);
+
+            assert_eq!(opts.profile.effective_backend_count, 1.0);
+            assert_eq!(opts.backend_factor, 1.0);
+            assert_eq!(
+                opts.profile.cluster_broadcast_network_budget_bytes,
+                opts.profile.per_node_build_memory_budget_bytes
+            );
+        }
     }
 }
