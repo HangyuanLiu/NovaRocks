@@ -330,7 +330,7 @@ fn source_to_engine_variant_array(
     large_binary_to_variant_array(source)
 }
 
-fn object_key_path(path_str: &str) -> Option<Vec<String>> {
+pub(crate) fn object_key_path(path_str: &str) -> Option<Vec<String>> {
     let parsed = parse_variant_path(path_str).ok()?;
     if parsed.segments.is_empty() {
         return None;
@@ -775,6 +775,7 @@ mod tests {
             source_slot_id: SlotId::new(1),
             source_read_slot_id: SlotId::new(90),
             output_slot_id: SlotId::new(2),
+            source_field_id: None,
             source_name: "v".to_string(),
             output_name: "v_a".to_string(),
             source_field: Field::new("v", DataType::LargeBinary, true),
