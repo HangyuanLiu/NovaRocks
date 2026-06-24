@@ -432,7 +432,7 @@ fn explore(
                 ));
             }
             let exprs: Vec<MExpr> = memo.groups[group_id].logical_exprs.clone();
-            for expr in &exprs {
+            for (expr_index, expr) in exprs.iter().enumerate() {
                 for rule in rules {
                     if !options.is_enabled(rule.name()) {
                         continue;
@@ -450,23 +450,38 @@ fn explore(
                         continue;
                     }
                     if rule.matches(&expr.op) {
-                        let new_exprs = rule.apply(expr, memo);
-                        for new_expr in new_exprs {
-                            // Dedup: compare operator AND children to avoid
-                            // infinite JoinCommutativity A<->B oscillation.
-                            let already_exists =
-                                memo.groups[group_id].logical_exprs.iter().any(|existing| {
-                                    existing.children == new_expr.children
-                                        && op_equal(&existing.op, &new_expr.op)
-                                });
-                            if !already_exists {
-                                let mexpr = MExpr {
-                                    id: memo.next_expr_id(),
-                                    op: new_expr.op,
-                                    children: new_expr.children,
-                                };
-                                memo.add_expr_to_group(group_id, mexpr);
-                                changed = true;
+                        let pattern = rule.pattern();
+                        // Root the binder on the SAME expr legacy used. The
+                        // snapshot's positional index equals its index in the
+                        // live `logical_exprs`: rules only ever APPEND to the
+                        // tail during explore (`add_expr_to_group`), never
+                        // reorder/remove, so existing indices are stable.
+                        // (MExpr ids are not unique across snapshots, so we key
+                        // on position, not id.)
+                        let bindings = crate::sql::optimizer::binder::bind(
+                            &pattern, memo, group_id, expr_index,
+                        );
+                        for binding in &bindings {
+                            let new_exprs = rule.apply_bound(binding, memo);
+                            for new_expr in new_exprs {
+                                // Dedup: compare operator AND children to avoid
+                                // infinite JoinCommutativity A<->B oscillation.
+                                let already_exists = memo.groups[group_id]
+                                    .logical_exprs
+                                    .iter()
+                                    .any(|existing| {
+                                        existing.children == new_expr.children
+                                            && op_equal(&existing.op, &new_expr.op)
+                                    });
+                                if !already_exists {
+                                    let mexpr = MExpr {
+                                        id: memo.next_expr_id(),
+                                        op: new_expr.op,
+                                        children: new_expr.children,
+                                    };
+                                    memo.add_expr_to_group(group_id, mexpr);
+                                    changed = true;
+                                }
                             }
                         }
                     }
@@ -509,7 +524,7 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::Optimi
         let num_groups = memo.groups.len();
         for group_id in 0..num_groups {
             let exprs: Vec<MExpr> = memo.groups[group_id].logical_exprs.clone();
-            for expr in &exprs {
+            for (expr_index, expr) in exprs.iter().enumerate() {
                 for rule in rules {
                     if !options.is_enabled(rule.name()) {
                         continue;
@@ -524,21 +539,36 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::Optimi
                         if !implemented_logical_rules.insert(application_key) {
                             continue;
                         }
-                        let new_exprs = rule.apply(expr, memo);
-                        for new_expr in new_exprs {
-                            let already_exists =
-                                memo.groups[group_id].physical_exprs.iter().any(|existing| {
-                                    existing.children == new_expr.children
-                                        && op_equal(&existing.op, &new_expr.op)
-                                });
-                            if !already_exists {
-                                let mexpr = MExpr {
-                                    id: memo.next_expr_id(),
-                                    op: new_expr.op,
-                                    children: new_expr.children,
-                                };
-                                memo.add_expr_to_group(group_id, mexpr);
-                                changed = true;
+                        let pattern = rule.pattern();
+                        // Root the binder on the SAME expr legacy used. The
+                        // snapshot's positional index equals its index in the
+                        // live `logical_exprs`: implement only appends (physical
+                        // alternatives and any newly-allocated groups go
+                        // elsewhere/at the tail), so existing logical indices are
+                        // stable. (MExpr ids are not unique, so we key on
+                        // position, not id.)
+                        let bindings = crate::sql::optimizer::binder::bind(
+                            &pattern, memo, group_id, expr_index,
+                        );
+                        for binding in &bindings {
+                            let new_exprs = rule.apply_bound(binding, memo);
+                            for new_expr in new_exprs {
+                                let already_exists = memo.groups[group_id]
+                                    .physical_exprs
+                                    .iter()
+                                    .any(|existing| {
+                                        existing.children == new_expr.children
+                                            && op_equal(&existing.op, &new_expr.op)
+                                    });
+                                if !already_exists {
+                                    let mexpr = MExpr {
+                                        id: memo.next_expr_id(),
+                                        op: new_expr.op,
+                                        children: new_expr.children,
+                                    };
+                                    memo.add_expr_to_group(group_id, mexpr);
+                                    changed = true;
+                                }
                             }
                         }
                     }
