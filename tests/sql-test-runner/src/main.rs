@@ -1243,6 +1243,23 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
+                        // @imv_equivalence_check: incremental contents == full recompute.
+                        // Skipped in record mode (it would perturb golden capture).
+                        if let Some(mv) = step.meta.imv_equivalence_check.as_deref() {
+                            if !matches!(ctx.mode, Mode::Record) {
+                                if let Err(reason) = run_imv_equivalence_check(
+                                    mv,
+                                    &mut target_session,
+                                    ctx.query_timeout,
+                                    step.meta.db.as_deref().or(primary_case_db),
+                                    epsilon,
+                                    &mut log,
+                                ) {
+                                    let _ = writeln!(log, "    ❌ FAIL: {reason}");
+                                    case_failed = true;
+                                }
+                            }
+                        }
                         // @explain_*: issue EXPLAIN VERBOSE and assert substrings.
                         let explain_ok = if !step.meta.explain_contains.is_empty()
                             || !step.meta.explain_not_contains.is_empty()
