@@ -3,6 +3,7 @@
 -- Lock in dimensional CBO cost output for scan/filter, join, and TopN plans.
 -- The EXPLAIN COSTS statements are recorded directly in the golden result;
 -- do not use @explain_contains here because that directive reruns EXPLAIN VERBOSE.
+SET cbo_broadcast_backend_count = 3;
 DROP TABLE IF EXISTS ${case_db}.cost_model_explain_t;
 CREATE TABLE ${case_db}.cost_model_explain_t (k INT, v INT);
 INSERT INTO ${case_db}.cost_model_explain_t

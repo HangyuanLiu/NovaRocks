@@ -12,6 +12,23 @@ INSERT INTO ${case_db}.oq8_build_big
     SELECT generate_series, generate_series FROM TABLE(generate_series(1, 1000));
 ANALYZE TABLE ${case_db}.oq8_probe_big;
 ANALYZE TABLE ${case_db}.oq8_build_big;
+SET cbo_broadcast_backend_count = 7;
+-- @explain_contains=bcast_verdict=feasible
+SELECT COUNT(*) AS cnt
+FROM ${case_db}.oq8_probe_big p
+INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;
+
+EXPLAIN VERBOSE
+SELECT COUNT(*) AS cnt
+FROM ${case_db}.oq8_probe_big p
+INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;
+
+SET cbo_broadcast_backend_count = 3;
+-- @explain_contains=bcast_verdict=feasible
+SELECT COUNT(*) AS cnt
+FROM ${case_db}.oq8_probe_big p
+INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;
+
 EXPLAIN VERBOSE
 SELECT COUNT(*) AS cnt
 FROM ${case_db}.oq8_probe_big p
