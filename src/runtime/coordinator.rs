@@ -346,15 +346,23 @@ impl ExecutionCoordinator {
                     (output_sink, unpartitioned_partition(), None)
                 };
 
-                let fragment_report_addr = if data_sink_requires_write_report(&output_sink)
-                    || needs_fragment_status_report
-                {
-                    if novarocks_report_addr.is_none() {
-                        novarocks_report_addr = Some(local_coordinator_report_addr()?);
-                    }
-                    novarocks_report_addr.clone()
+                let fragment_has_write_sink = data_sink_requires_write_report(&output_sink);
+                let fragment_report_addr =
+                    if fragment_has_write_sink || needs_fragment_status_report {
+                        if novarocks_report_addr.is_none() {
+                            novarocks_report_addr = Some(local_coordinator_report_addr()?);
+                        }
+                        novarocks_report_addr.clone()
+                    } else {
+                        None
+                    };
+                // Align with StarRocks: a write/data-sink fragment (iceberg/hive/olap load/insert)
+                // runs at the lower sink DOP curve so it doesn't starve query CPU; compute fragments
+                // keep cores/2 (`pipeline_dop`). A `SET pipeline_dop = N` override pins both.
+                let fragment_dop = if fragment_has_write_sink {
+                    crate::runtime::dispatcher::compute_sink_pipeline_dop(session_dop)
                 } else {
-                    None
+                    pipeline_dop
                 };
 
                 let thrift_fragment = planner::TPlanFragment::new(
@@ -390,7 +398,7 @@ impl ExecutionCoordinator {
                     thrift_fragment,
                     exec_params,
                     query_options.clone(),
-                    pipeline_dop,
+                    fragment_dop,
                     ExecPlanFragmentParamOptions {
                         backend_num: Some(placement.instance_index as i32),
                         novarocks_report_addr: fragment_report_addr,
