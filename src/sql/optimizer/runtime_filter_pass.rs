@@ -450,8 +450,26 @@ fn annotate_node(
     if matches!(distribution, JoinDistribution::Unknown) {
         return;
     }
+    // `build_size`/`probe_size` stay full-row: they feed the selectivity gate
+    // below, which estimates scanned rows, not the RF footprint.
     let build_size = node.children[sides.build_child].stats.compute_size();
     let probe_size = node.children[sides.probe_child].stats.compute_size();
+
+    // The build *gate* must measure only the RF key columns — a bloom/min-max RF
+    // holds just the join keys, not the whole build row. Full-row width wrongly
+    // inflated the gate and dropped RFs on wide build sides (e.g. q18 node9's
+    // o_orderkey RF, killed by a c_name VARCHAR payload). Empty key set (no eq
+    // orients) falls back to full-column width, preserving prior behavior.
+    let mut build_key_columns: HashSet<ColumnId> = HashSet::new();
+    for (expr_order, eq) in eq_conditions.iter().enumerate() {
+        if let Some(oriented) = orient_rf_key(node, scalars, sides, expr_order, eq) {
+            column_ids(scalars, oriented.build_expr, &mut build_key_columns);
+        }
+    }
+    let build_key_column_ids: Vec<ColumnId> = build_key_columns.into_iter().collect();
+    let build_key_size = node.children[sides.build_child]
+        .stats
+        .compute_size_for_columns(&build_key_column_ids);
 
     // Cast session thresholds (u64 bytes) to f64 for size comparisons.
     let build_max = options.rf_build_max_bytes as f64;
@@ -460,7 +478,7 @@ fn annotate_node(
     let min_sel = options.rf_probe_min_selectivity;
 
     // Build gate: Shuffle joins are rejected if build side is too large or empty.
-    if !build_gate_passes(&distribution, build_size, build_max) {
+    if !build_gate_passes(&distribution, build_key_size, build_max) {
         return;
     }
 
@@ -758,6 +776,59 @@ pub(crate) mod test_support {
         with_scalars(plan, scalars)
     }
 
+    /// Shuffle inner join whose build side (children[1]) carries a narrow key
+    /// column plus a WIDE payload column. Full-row build size blows past
+    /// rf_build_max_bytes (64MB) while the key-only size stays well under it —
+    /// exercises the build-key-width gate (M0).
+    pub(crate) fn wide_build_shuffle_join(build_rows: f64, probe_rows: f64) -> PhysicalPlanNode {
+        use crate::sql::optimizer::statistics::ColumnStatistic;
+
+        let mut scalars = ScalarArena::new();
+        let (probe_oc, probe_expr) = col(1, "probe_key"); // Int32 probe key
+        let (build_key_oc, build_key_expr) = col(2, "build_key"); // Int32 build key
+        let (payload_oc, _payload_expr) =
+            col_with_type(3, "payload", arrow::datatypes::DataType::Utf8);
+
+        let width = |w: f64| ColumnStatistic {
+            average_row_size: w,
+            ..ColumnStatistic::unknown()
+        };
+
+        // probe leaf: just the key column.
+        let mut probe = leaf(probe_rows, probe_oc.clone());
+        probe.stats.column_statistics = [(probe_oc.column_id, width(8.0))].into_iter().collect();
+
+        // build leaf: narrow key (8 bytes) + wide payload (256 bytes).
+        let mut build = leaf(build_rows, build_key_oc.clone());
+        build.output_columns = vec![build_key_oc.clone(), payload_oc.clone()];
+        build.stats.column_statistics = [
+            (build_key_oc.column_id, width(8.0)),
+            (payload_oc.column_id, width(256.0)),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![eq(&mut scalars, &probe_expr, &build_key_expr)],
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+            }),
+            children: vec![probe, build], // [0]=probe, [1]=build (rf_sides_for_join Inner)
+            stats: Statistics {
+                output_row_count: build_rows.min(probe_rows),
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![probe_oc, build_key_oc, payload_oc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        with_scalars(plan, scalars)
+    }
+
     /// Shuffle join where the probe child is a `PhysicalDistribution(HashPartitioned)`
     /// over a leaf scan. Tests that probe RFs cross the shuffle exchange to reach the
     /// underlying scan rather than stopping at the exchange boundary.
@@ -976,6 +1047,21 @@ mod tests {
         annotate_test(&mut join, &OptimizerOptions::default_settings());
         assert_eq!(join.build_runtime_filters.len(), 1);
         assert_eq!(join.build_runtime_filters[0].filter_id, 0);
+    }
+
+    #[test]
+    fn keeps_rf_when_wide_build_fits_on_key_columns() {
+        // build 1M rows: full-row 1M*(8+256)=264MB > 64MB (old gate drops it),
+        // key-only 1M*8=8MB < 64MB (fixed gate keeps it). probe 100M*8=800MB so
+        // selectivity passes (full 264MB / 800MB = 0.33 < 0.5).
+        let mut j = super::test_support::wide_build_shuffle_join(1_000_000.0, 100_000_000.0);
+        annotate_test(&mut j, &OptimizerOptions::default_settings());
+        assert_eq!(
+            j.build_runtime_filters.len(),
+            1,
+            "wide build side must not drop the RF: the build gate should measure \
+             key-column width, not full-row width"
+        );
     }
 
     #[test]
