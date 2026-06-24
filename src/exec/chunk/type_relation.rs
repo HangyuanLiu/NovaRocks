@@ -329,6 +329,24 @@ pub(crate) fn merge_fields_nullability(expected: &Field, actual: &Field) -> bool
     expected.is_nullable() || actual.is_nullable()
 }
 
+pub(crate) fn nested_path_label(root: &str, path: &[NestedStep]) -> String {
+    let mut out = root.to_string();
+    for step in path {
+        match step {
+            NestedStep::ListItem => out.push_str(".list.item"),
+            NestedStep::LargeListItem => out.push_str(".large_list.item"),
+            NestedStep::MapKey => out.push_str(".map.key"),
+            NestedStep::MapValue => out.push_str(".map.value"),
+            NestedStep::StructField(idx) => {
+                out.push_str(".field[");
+                out.push_str(&idx.to_string());
+                out.push(']');
+            }
+        }
+    }
+    out
+}
+
 /// Extract the (key, value) child data types from a `Map` entries field, which
 /// Arrow models as a 2-field `Struct<key, value>`.
 fn map_key_value(entries: &arrow::datatypes::FieldRef) -> Option<(&DataType, &DataType)> {
@@ -344,7 +362,7 @@ fn map_key_value(entries: &arrow::datatypes::FieldRef) -> Option<(&DataType, &Da
 mod tests {
     use super::CompatibilityPolicy::{ExactArrow, SameScaleWiden};
     use super::TypeMismatchKind::*;
-    use super::{NestedStep, merge_fields_nullability, relate, retag_column};
+    use super::{NestedStep, merge_fields_nullability, nested_path_label, relate, retag_column};
     use arrow::array::{
         Array, ArrayRef, BinaryArray, Decimal128Array, Int32Array, Int64Array, ListArray,
         StringArray, StructArray,
@@ -508,6 +526,27 @@ mod tests {
         let err = relate(&a, &b, SameScaleWiden).unwrap_err();
         assert_eq!(err.kind, DecimalScaleMismatch);
         assert_eq!(err.nested_path, vec![NestedStep::StructField(1)]);
+    }
+
+    #[test]
+    fn nested_path_label_formats_struct_list_path() {
+        let expected = strukt(vec![("items", list(DataType::Int32))]);
+        let actual = strukt(vec![("items", list(DataType::Int64))]);
+
+        let err = relate(&expected, &actual, ExactArrow).unwrap_err();
+
+        assert_eq!(
+            err.nested_path,
+            vec![NestedStep::StructField(0), NestedStep::ListItem]
+        );
+        assert_eq!(
+            nested_path_label("field[0]", &err.nested_path[1..]),
+            "field[0].list.item"
+        );
+        assert_eq!(
+            nested_path_label("root", &err.nested_path),
+            "root.field[0].list.item"
+        );
     }
 
     #[test]
