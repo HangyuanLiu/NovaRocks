@@ -110,7 +110,8 @@ pub(crate) struct DirectIntJoinHashMap {
     len: usize,
     first: Vec<u32>,
     next: Vec<u32>,
-    group_rows: Vec<Vec<u32>>,
+    group_offsets: Vec<u32>,
+    group_rows: Vec<u32>,
     row_count: usize,
     indexed_rows: usize,
     not_null: bool,
@@ -385,6 +386,7 @@ impl DirectIntJoinHashMap {
             len,
             first: vec![ROW_NONE; len],
             next: vec![ROW_NONE; stats.row_count],
+            group_offsets: Vec::new(),
             group_rows: Vec::new(),
             row_count: stats.row_count,
             indexed_rows: stats.indexed_rows,
@@ -434,16 +436,29 @@ impl DirectIntJoinHashMap {
     }
 
     fn build_group_rows(&mut self) -> Result<(), String> {
-        let mut group_rows = Vec::with_capacity(self.len);
+        let mut group_offsets = Vec::with_capacity(
+            self.len
+                .checked_add(1)
+                .ok_or_else(|| "direct integer join group offset overflow".to_string())?,
+        );
+        let mut group_rows = Vec::with_capacity(self.indexed_rows);
         for bucket in 0..self.len {
-            let mut rows = Vec::new();
+            let offset = u32::try_from(group_rows.len())
+                .map_err(|_| "direct integer join group rows overflow".to_string())?;
+            group_offsets.push(offset);
             let mut row = self.first[bucket];
             while row != ROW_NONE {
-                rows.push(row);
+                group_rows.push(row);
                 row = self.next_row(row)?;
             }
-            group_rows.push(rows);
         }
+        let final_offset = u32::try_from(group_rows.len())
+            .map_err(|_| "direct integer join group rows overflow".to_string())?;
+        group_offsets.push(final_offset);
+        if group_rows.len() != self.indexed_rows {
+            return Err("direct integer join indexed row count mismatch".to_string());
+        }
+        self.group_offsets = group_offsets;
         self.group_rows = group_rows;
         self.refresh_accounting();
         Ok(())
@@ -464,9 +479,7 @@ impl DirectIntJoinHashMap {
         let mut group_ids = Vec::with_capacity(probe_len);
         for row in 0..probe_len {
             let group_id = match probe_view.value_at(row) {
-                Some(value) if self.lookup_bucket(value).is_some() => {
-                    direct_bucket(value, self.min, self.len)
-                }
+                Some(value) => self.lookup_existing_bucket(value),
                 _ => None,
             };
             group_ids.push(group_id);
@@ -493,16 +506,12 @@ impl DirectIntJoinHashMap {
                 group_ids.push(None);
                 continue;
             };
-            let Some(bucket) = direct_bucket(value, self.min, self.len) else {
+            let Some(bucket) = self.lookup_existing_bucket(value) else {
                 group_ids.push(None);
                 continue;
             };
-            let mut build_row = self.first[bucket];
-            if build_row == ROW_NONE {
-                group_ids.push(None);
-                continue;
-            }
             group_ids.push(Some(bucket));
+            let mut build_row = self.first[bucket];
             while build_row != ROW_NONE {
                 selection.push(probe_row as u32, build_row);
                 build_row = self.next_row(build_row)?;
@@ -511,10 +520,10 @@ impl DirectIntJoinHashMap {
         Ok((group_ids, selection))
     }
 
-    fn lookup_bucket(&self, value: i64) -> Option<u32> {
+    fn lookup_existing_bucket(&self, value: i64) -> Option<usize> {
         let bucket = direct_bucket(value, self.min, self.len)?;
         let row = self.first[bucket];
-        (row != ROW_NONE).then_some(row)
+        (row != ROW_NONE).then_some(bucket)
     }
 
     fn next_row(&self, row_id: u32) -> Result<u32, String> {
@@ -525,10 +534,23 @@ impl DirectIntJoinHashMap {
     }
 
     fn group_build_rows(&self, group_id: usize) -> Result<&[u32], String> {
-        self.group_rows
+        if group_id >= self.len {
+            return Err("direct integer join group id out of bounds".to_string());
+        }
+        let start = *self
+            .group_offsets
             .get(group_id)
-            .map(|rows| rows.as_slice())
-            .ok_or_else(|| "direct integer join group id out of bounds".to_string())
+            .ok_or_else(|| "direct integer join group offset missing".to_string())?
+            as usize;
+        let end = *self
+            .group_offsets
+            .get(group_id + 1)
+            .ok_or_else(|| "direct integer join group offset missing".to_string())?
+            as usize;
+        if start > end || end > self.group_rows.len() {
+            return Err("direct integer join group row offset out of bounds".to_string());
+        }
+        Ok(&self.group_rows[start..end])
     }
 
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
@@ -564,14 +586,10 @@ impl DirectIntJoinHashMap {
             i64::try_from(bytes).unwrap_or(i64::MAX)
         }
 
-        let inner_bytes = self
-            .group_rows
-            .iter()
-            .fold(0i64, |acc, rows| acc.saturating_add(vec_bytes(rows)));
         vec_bytes(&self.first)
             .saturating_add(vec_bytes(&self.next))
+            .saturating_add(vec_bytes(&self.group_offsets))
             .saturating_add(vec_bytes(&self.group_rows))
-            .saturating_add(inner_bytes)
     }
 }
 
@@ -905,5 +923,24 @@ mod tests {
                 not_null: true,
             }
         );
+    }
+
+    #[test]
+    fn direct_map_group_storage_uses_flat_offsets() {
+        let build = int32_chunk(vec![Some(0), Some(15)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+
+        let JoinHashMap::DirectInt(direct) = &map else {
+            panic!("expected direct map");
+        };
+        assert_eq!(direct.group_offsets.len(), 17);
+        assert_eq!(direct.group_rows, vec![0, 1]);
     }
 }
