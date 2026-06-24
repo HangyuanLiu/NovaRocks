@@ -4050,10 +4050,8 @@ fn execute_plan(
             None => Box::new(ResultSinkFactory::new(handle.clone())),
         };
 
-    // Use available CPU cores for pipeline parallelism (capped at 8)
-    let pipeline_dop = std::thread::available_parallelism()
-        .map(|p| p.get().min(4))
-        .unwrap_or(4);
+    // Unified pipeline DOP: cores/2 via the shared exec_env helper (no hardcoded min(4) cap).
+    let pipeline_dop = crate::runtime::exec_env::calc_pipeline_dop(0) as usize;
     execute_plan_with_pipeline(
         exec_plan,
         false,

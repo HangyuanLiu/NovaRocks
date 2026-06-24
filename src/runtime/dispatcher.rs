@@ -109,11 +109,17 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
     }
 }
 
-/// Return a reasonable pipeline DOP for standalone execution.
+/// Return the pipeline DOP for standalone distributed execution.
+///
+/// Unified with the FE-compatible path: delegates to `exec_env::calc_pipeline_dop(0)`
+/// (= half the executor threads, i.e. cores/2 under the default thread config), instead of the
+/// former hardcoded `min(cores, 4)` cap that left most cores idle on machines with >8 cores
+/// (e.g. TPC-H q18's CPU-bound partitioned joins ran only 4 build + 4 probe drivers on a 10-core
+/// box). The `cores/2` headroom is deliberate — it leaves cores for scan threads, the exchange IO
+/// pool, and the gRPC server. Passing 0 means "auto"; a future session `pipeline_dop` override
+/// would thread a positive value here.
 pub(crate) fn compute_pipeline_dop() -> i32 {
-    std::thread::available_parallelism()
-        .map(|p| p.get().min(4))
-        .unwrap_or(4) as i32
+    crate::runtime::exec_env::calc_pipeline_dop(0)
 }
 
 fn serialize_thrift_binary<T: TSerializable>(value: &T) -> Result<Vec<u8>, String> {
@@ -876,9 +882,15 @@ mod tests {
     }
 
     #[test]
-    fn compute_pipeline_dop_returns_positive() {
+    fn compute_pipeline_dop_is_unified_with_calc_pipeline_dop() {
         let dop = compute_pipeline_dop();
         assert!(dop > 0, "dop must be positive, got {dop}");
-        assert!(dop <= 4, "dop must be at most 4 in test env, got {dop}");
+        // Unified DOP source: no more hardcoded `min(cores, 4)` cap — it must equal the shared
+        // cores/2 derivation used by the FE-compatible path.
+        assert_eq!(
+            dop,
+            crate::runtime::exec_env::calc_pipeline_dop(0),
+            "standalone DOP must delegate to exec_env::calc_pipeline_dop"
+        );
     }
 }
