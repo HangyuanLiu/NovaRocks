@@ -11,9 +11,12 @@
 //! is a future improvement.
 
 use crate::sql::common::JoinKind;
-use crate::sql::optimizer::memo::{MExpr, Memo};
+use crate::sql::optimizer::binder::Binding;
+use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::optimizer::scalar::ScalarId;
 
 use crate::sql::optimizer::rewrite::rules::utils::collect_scalar_column_id_refs_strict;
 
@@ -87,17 +90,84 @@ impl Rule for JoinAssociativity {
             _ => return vec![],
         };
 
-        // Soundness gate: the new inner join (B JOIN C) reuses inner_op.condition
+        // Copy the `Copy` ids out before borrowing `&mut memo` in the helper.
+        let outer_cond = outer_op.condition;
+        let inner_cond = inner_op.condition;
+        self.associate(memo, outer_cond, inner_cond, a_group, b_group, c_group)
+    }
+
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Join,
+            children: vec![
+                Pattern::Op {
+                    kind: OpKind::Join,
+                    children: vec![Pattern::Leaf, Pattern::Leaf],
+                },
+                Pattern::Leaf,
+            ],
+        }
+    }
+
+    fn first_match_only(&self) -> bool {
+        true
+    }
+
+    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+        // interior 0 = outer join, interior 1 = inner join (binder guarantees
+        // both are Join kind; field predicates are checked here).
+        let Operator::LogicalJoin(outer) = binding.op(memo, 0).clone() else {
+            return vec![];
+        };
+        if outer.join_type != JoinKind::Inner {
+            return vec![];
+        }
+        let Operator::LogicalJoin(inner) = binding.op(memo, 1).clone() else {
+            return vec![];
+        };
+        if inner.join_type != JoinKind::Inner {
+            return vec![];
+        }
+        // inner = LogicalJoin(A, B); outer child[1] = C.
+        let inner_children = binding.children(1);
+        let (a_group, b_group) = (inner_children[0], inner_children[1]);
+        let c_group = binding.children(0)[1];
+        self.associate(
+            memo,
+            outer.condition,
+            inner.condition,
+            a_group,
+            b_group,
+            c_group,
+        )
+    }
+}
+
+impl JoinAssociativity {
+    /// Shared core for both the legacy `apply` (unit-tested directly) and the
+    /// declarative `apply_bound`: the soundness gate, the `B JOIN C` mint, and
+    /// the `A JOIN (B JOIN C)` emit. All scalar/group ids are `Copy`, so the
+    /// caller pre-extracts them before this takes `&mut memo`.
+    fn associate(
+        &self,
+        memo: &mut Memo,
+        outer_cond: Option<ScalarId>,
+        inner_cond: Option<ScalarId>,
+        a_group: GroupId,
+        b_group: GroupId,
+        c_group: GroupId,
+    ) -> Vec<NewExpr> {
+        // Soundness gate: the new inner join (B JOIN C) reuses inner_cond
         // verbatim, so that condition must reference only columns available in
-        // (B ∪ C). Originally inner_op.condition was over (A ∪ B); if it
+        // (B ∪ C). Originally inner_cond was over (A ∪ B); if it
         // references any column from A, A is no longer in the inner join's
         // scope after re-association, and reusing the condition would either
         // panic the fragment builder (column-not-resolvable) or silently
         // produce wrong rows. Skip the rewrite in that case rather than emit
         // an unsound plan. A future improvement would split the condition by
         // conjunct and re-distribute across the new structure.
-        if let Some(ref cond) = inner_op.condition {
-            let Some(cond_ids) = collect_scalar_column_id_refs_strict(&memo.scalars, *cond) else {
+        if let Some(cond) = inner_cond {
+            let Some(cond_ids) = collect_scalar_column_id_refs_strict(&memo.scalars, cond) else {
                 return vec![];
             };
             let a_ids = get_group_column_ids(memo, a_group);
@@ -129,7 +199,7 @@ impl Rule for JoinAssociativity {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: inner_op.condition.clone(),
+                condition: inner_cond,
             }),
             children: vec![b_group, c_group],
         };
@@ -139,7 +209,7 @@ impl Rule for JoinAssociativity {
         vec![NewExpr {
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: outer_op.condition.clone(),
+                condition: outer_cond,
             }),
             children: vec![a_group, new_inner_group],
         }]

@@ -46,6 +46,12 @@ pub(crate) trait Rule: Send + Sync {
         crate::sql::optimizer::pattern::Pattern::Leaf
     }
 
+    /// If true, only the FIRST binding from the binder is applied (reproduces a
+    /// legacy `.find`-style single-match rule). Default: apply all bindings.
+    fn first_match_only(&self) -> bool {
+        false
+    }
+
     /// Apply against a fully-resolved binding. Default = shim to legacy `apply`
     /// on the bound root expr. Migrated rules override this and never call the default.
     fn apply_bound(

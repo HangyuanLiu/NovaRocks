@@ -461,7 +461,12 @@ fn explore(
                         let bindings = crate::sql::optimizer::binder::bind(
                             &pattern, memo, group_id, expr_index,
                         );
-                        for binding in &bindings {
+                        let bindings_slice: &[_] = if rule.first_match_only() {
+                            &bindings[..bindings.len().min(1)]
+                        } else {
+                            &bindings
+                        };
+                        for binding in bindings_slice {
                             let new_exprs = rule.apply_bound(binding, memo);
                             for new_expr in new_exprs {
                                 // Dedup: compare operator AND children to avoid
@@ -550,7 +555,12 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::Optimi
                         let bindings = crate::sql::optimizer::binder::bind(
                             &pattern, memo, group_id, expr_index,
                         );
-                        for binding in &bindings {
+                        let bindings_slice: &[_] = if rule.first_match_only() {
+                            &bindings[..bindings.len().min(1)]
+                        } else {
+                            &bindings
+                        };
+                        for binding in bindings_slice {
                             let new_exprs = rule.apply_bound(binding, memo);
                             for new_expr in new_exprs {
                                 let already_exists = memo.groups[group_id]
