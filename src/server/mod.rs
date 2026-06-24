@@ -1685,6 +1685,11 @@ fn parse_admin_raise_engine_error_query(query: &str) -> Result<Option<EngineErro
         EngineErrorCode::IcebergWriteDescriptorMismatch => {
             EngineError::iceberg_write_descriptor_mismatch("forced P8 SQL runner error-code smoke")
         }
+        EngineErrorCode::UnsupportedPositionDeleteDescriptor => {
+            EngineError::unsupported_position_delete_descriptor(
+                "forced position-delete descriptor error-code smoke",
+            )
+        }
         EngineErrorCode::CommitKnownUncommitted => {
             EngineError::commit_known_uncommitted("forced P8 SQL runner error-code smoke")
         }

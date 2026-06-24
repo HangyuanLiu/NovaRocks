@@ -3546,6 +3546,7 @@ mod tests {
             Some(1),
             Some(format!("{table_location}/data")),
             Some(7),
+            None::<crate::data_sinks::TIcebergPositionDeleteOutputDescriptor>,
         )
     }
 

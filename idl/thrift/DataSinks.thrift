@@ -248,6 +248,28 @@ struct TSchemaTableSink {
     2: optional Descriptors.TNodesInfo nodes_info
 }
 
+struct TIcebergPositionDeleteOutputField {
+    1: optional i32 output_expr_index
+    2: optional string name
+    3: optional Types.TTypeDesc type_desc
+    4: optional i32 field_id
+}
+
+struct TIcebergPositionDeletePartitionSourceField {
+    1: optional i32 output_expr_index
+    2: optional string source_column_name
+    3: optional string partition_field_name
+    4: optional string transform_expr
+    5: optional i32 source_field_id
+}
+
+struct TIcebergPositionDeleteOutputDescriptor {
+    1: optional TIcebergPositionDeleteOutputField file_path
+    2: optional TIcebergPositionDeleteOutputField pos
+    3: optional list<TIcebergPositionDeletePartitionSourceField> partition_source_fields
+    4: optional i32 target_partition_spec_id
+}
+
 struct TIcebergTableSink {
     // table location
     1: optional string location
@@ -260,6 +282,7 @@ struct TIcebergTableSink {
     8: optional i32 tuple_id
     9: optional string data_location
     10: optional i32 target_partition_spec_id
+    11: optional TIcebergPositionDeleteOutputDescriptor position_delete_output_descriptor
 }
 
 struct THiveTableSink {

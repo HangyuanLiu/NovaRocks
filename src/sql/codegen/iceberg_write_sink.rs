@@ -87,6 +87,7 @@ impl IcebergWriteSinkSpec {
                 Some(tuple_id),
                 Some(self.data_location.clone()),
                 Some(self.target_partition_spec_id),
+                None::<data_sinks::TIcebergPositionDeleteOutputDescriptor>,
             )),
             None::<data_sinks::THiveTableSink>,
             None::<data_sinks::TTableFunctionTableSink>,
