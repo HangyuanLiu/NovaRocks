@@ -562,6 +562,36 @@ fn run_step_wait_alters(
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
+// @imv_equivalence_check helpers
+// ---------------------------------------------------------------------------
+
+/// Pure multiset comparison of an MV's incremental contents vs a full recompute.
+/// Returns `None` when equal, or `Some(reason)` describing the mismatch.
+fn imv_equivalence_failure(
+    mv: &str,
+    inc: &crate::types::QueryExecution,
+    full: &crate::types::QueryExecution,
+    epsilon: Option<f64>,
+) -> Option<String> {
+    let (same, reason) = compare_result_sets(
+        &inc.header,
+        &inc.rows,
+        &full.header,
+        &full.rows,
+        false,
+        epsilon,
+    );
+    if same {
+        None
+    } else {
+        Some(format!(
+            "@imv_equivalence_check: incremental result != full recompute for `{mv}`\n{reason}"
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // @explain_* helpers
 // ---------------------------------------------------------------------------
 
@@ -3364,5 +3394,32 @@ enable_path_style_access = true
                 .contains("all-in-one mode requires --cluster-size 1"),
             "unexpected: {err}"
         );
+    }
+
+    fn exec(header: &[&str], rows: &[&[&str]]) -> crate::types::QueryExecution {
+        crate::types::QueryExecution {
+            header: header.iter().map(|s| s.to_string()).collect(),
+            rows: rows
+                .iter()
+                .map(|row| row.iter().map(|s| s.to_string()).collect())
+                .collect(),
+            text_output: String::new(),
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn imv_equivalence_failure_none_when_multiset_equal() {
+        let inc = exec(&["k", "c"], &[&["a", "2"], &["b", "1"]]);
+        let full = exec(&["k", "c"], &[&["b", "1"], &["a", "2"]]);
+        assert!(super::imv_equivalence_failure("m", &inc, &full, None).is_none());
+    }
+
+    #[test]
+    fn imv_equivalence_failure_some_when_rows_differ() {
+        let inc = exec(&["k", "c"], &[&["a", "2"]]);
+        let full = exec(&["k", "c"], &[&["a", "3"]]);
+        let msg = super::imv_equivalence_failure("m", &inc, &full, None).expect("diff");
+        assert!(msg.contains("incremental result != full recompute"), "{msg}");
     }
 }
