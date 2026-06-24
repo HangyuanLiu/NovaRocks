@@ -1451,6 +1451,41 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_decision_keeps_cross_join_forced_when_infeasible() {
+        let probe = stats(1_000.0, 64.0);
+        let mut build = stats(1_000_000.0, 2048.0);
+        build.row_count_confidence = Confidence::Exact;
+        let own = stats(1_000_000_000.0, 2112.0);
+
+        let mut options = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 3.0;
+        profile.per_node_build_memory_budget_bytes = 256.0 * 1024.0 * 1024.0;
+        profile.cluster_broadcast_network_budget_bytes =
+            profile.per_node_build_memory_budget_bytes * 3.0;
+        options.apply_profile(profile);
+
+        let required = PhysicalPropertySet::any();
+        let outs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let out_refs = [&outs[0], &outs[1]];
+        let child = [&probe, &build];
+        let broadcast = PropertyAlternativeKind::BroadcastJoin;
+        let scalars = ScalarArena::new();
+        let op = join_op(JoinKind::Cross, vec![]);
+        let input = broadcast_input_with_scalars(
+            &op, &own, &child, &out_refs, &required, &broadcast, &scalars, &options,
+        );
+
+        let decision = broadcast_decision(&input).expect("decision");
+        assert!(!decision.feasible);
+        assert!(decision.forced);
+        assert_eq!(
+            decision.reject_reason,
+            Some(BroadcastRejectReason::PerNodeMemory)
+        );
+    }
+
+    #[test]
     fn finite_non_negative_cost_saturates_only_positive_overflow() {
         assert_eq!(finite_non_negative_cost(42.0), 42.0);
         assert_eq!(
