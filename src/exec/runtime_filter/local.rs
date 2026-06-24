@@ -33,15 +33,12 @@ use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::compute::filter_record_batch;
 use hashbrown::HashSet;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::hash_table::key_builder::{
     GroupKeyArrayView, build_group_key_hashes, build_group_key_views,
 };
 use crate::exec::node::join::JoinRuntimeFilterSpec;
-
-use super::apply;
 
 #[derive(Clone, Debug)]
 /// Local registry containing runtime membership filters keyed by expression id.
@@ -194,14 +191,5 @@ impl RuntimeFilterMembership {
 
     pub(in crate::exec::runtime_filter) fn contains_hash(&self, hash: u64) -> bool {
         self.hashes.contains(&hash)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn filter_chunk_by_slot(
-        &self,
-        chunk: Chunk,
-        slot_id: SlotId,
-    ) -> Result<Option<Chunk>, String> {
-        apply::filter_chunk_by_memberships(std::slice::from_ref(self), chunk, slot_id)
     }
 }

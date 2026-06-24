@@ -77,7 +77,8 @@ pub struct TopNRuntimeFilterSpec {
     pub limit: usize,
     /// Sort direction of the TopN (from FE). true = ASC ⇒ upper-bound-only filter.
     pub is_asc: bool,
-    /// Null ordering of the TopN (from FE); reserved for null handling.
+    /// Null ordering of the TopN (from FE); reserved for future null handling.
+    #[allow(dead_code)]
     pub is_nulls_first: bool,
 }
 
