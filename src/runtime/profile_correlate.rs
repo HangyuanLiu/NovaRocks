@@ -84,44 +84,108 @@ pub(crate) fn collect_distributed_profile_summary_from_profile_trees(
         if tree.nodes.is_empty() {
             continue;
         }
-        summary.fragment_instance_count += 1;
-        let fragment_wall_ns = thrift_counter_in_tree(tree, "FragmentWallTime");
-        summary.fragment_wall_sum_ns = summary
-            .fragment_wall_sum_ns
-            .saturating_add(fragment_wall_ns);
-        summary.fragment_wall_max_ns = summary.fragment_wall_max_ns.max(fragment_wall_ns);
-        summary.driver_total_time_ns = summary
-            .driver_total_time_ns
-            .saturating_add(thrift_counter_in_tree(tree, "DriverTotalTime"));
-        summary.operator_active_time_ns = summary
-            .operator_active_time_ns
-            .saturating_add(thrift_counter_in_tree(tree, "OperatorTotalTime"));
-        summary.driver_blocked_time_ns = summary
-            .driver_blocked_time_ns
-            .saturating_add(thrift_counter_in_tree(tree, "DriverBlockedTime"));
-        summary.source_wait_time_ns = summary
-            .source_wait_time_ns
-            .saturating_add(thrift_counter_in_tree(tree, "DriverInputEmptyTime"));
-        summary.sink_wait_time_ns = summary
-            .sink_wait_time_ns
-            .saturating_add(thrift_counter_in_tree(tree, "DriverOutputFullTime"));
-        summary.dependency_wait_time_ns = summary
-            .dependency_wait_time_ns
-            .saturating_add(thrift_counter_in_tree(tree, "DriverDependencyWaitTime"));
-        summary.exchange_wait_time_ns = summary
-            .exchange_wait_time_ns
-            .saturating_add(thrift_counter_in_tree(tree, "WaitTime"));
-        summary.exchange_process_time_ns = summary
-            .exchange_process_time_ns
-            .saturating_add(thrift_counter_in_tree(tree, "ReceiverProcessTotalTime"));
-        summary.network_time_ns = summary
-            .network_time_ns
-            .saturating_add(thrift_counter_in_tree(tree, "NetworkTime"));
-        summary.scan_io_time_ns = summary
-            .scan_io_time_ns
-            .saturating_add(thrift_counter_in_tree(tree, "IOTaskExecTime"));
+        merge_summary(&mut summary, &summarize_one_tree(tree));
     }
     summary
+}
+
+/// Per-fragment attribution (W0'b): group each fragment-instance profile tree by the fragment's
+/// root (output) plan-node id (see `fragment_root_plan_node_id`), merging instances of the same
+/// fragment. The renderer maps each `PLAN FRAGMENT` to the same id via `fragment.root.node_id` and
+/// prints the matching summary. Reuses `summarize_one_tree` so the math matches the query-level
+/// summary exactly.
+pub(crate) fn collect_per_fragment_profile_summaries(
+    trees: &[runtime_profile::TRuntimeProfileTree],
+) -> HashMap<i32, DistributedProfileSummary> {
+    let mut by_fragment: HashMap<i32, DistributedProfileSummary> = HashMap::new();
+    for tree in trees {
+        if tree.nodes.is_empty() {
+            continue;
+        }
+        let Some(fragment_key) = fragment_root_plan_node_id(tree) else {
+            continue;
+        };
+        let one = summarize_one_tree(tree);
+        merge_summary(by_fragment.entry(fragment_key).or_default(), &one);
+    }
+    by_fragment
+}
+
+/// The fragment's root (output) plan-node id — the unambiguous per-fragment key. It is encoded in
+/// the fragment profiler's root node name `execute_fragment (plan_node_id=N)` (see
+/// `src/lower/fragment.rs`), where `N = fragment.plan.nodes.first().node_id`, and it equals the
+/// `DistributedPlan` `fragment.root.node_id` the renderer keys by. This is unique per fragment and
+/// is never a cross-fragment-shared exchange node id (the root is the fragment's output operator),
+/// so it avoids the collision that a min-over-nodes representative hits on shared exchange ids.
+/// Falls back to the smallest operator id only if the tree root carries no plan-node id (e.g. some
+/// synthetic test trees) — real fragment trees always have the `execute_fragment` root.
+fn fragment_root_plan_node_id(tree: &runtime_profile::TRuntimeProfileTree) -> Option<i32> {
+    if let Some(id) = tree
+        .nodes
+        .first()
+        .and_then(|root| parse_plan_node_id(&root.name))
+    {
+        return Some(id);
+    }
+    let mut operators: HashMap<i32, ActualMetrics> = HashMap::new();
+    collect_thrift_rec(&tree.nodes, 0, &mut operators);
+    operators.keys().copied().min()
+}
+
+/// Summarize one fragment-instance profile tree into a single-instance summary.
+fn summarize_one_tree(tree: &runtime_profile::TRuntimeProfileTree) -> DistributedProfileSummary {
+    let fragment_wall_ns = thrift_counter_in_tree(tree, "FragmentWallTime");
+    DistributedProfileSummary {
+        fragment_instance_count: 1,
+        fragment_wall_max_ns: fragment_wall_ns,
+        fragment_wall_sum_ns: fragment_wall_ns,
+        driver_total_time_ns: thrift_counter_in_tree(tree, "DriverTotalTime"),
+        operator_active_time_ns: thrift_counter_in_tree(tree, "OperatorTotalTime"),
+        driver_blocked_time_ns: thrift_counter_in_tree(tree, "DriverBlockedTime"),
+        source_wait_time_ns: thrift_counter_in_tree(tree, "DriverInputEmptyTime"),
+        sink_wait_time_ns: thrift_counter_in_tree(tree, "DriverOutputFullTime"),
+        dependency_wait_time_ns: thrift_counter_in_tree(tree, "DriverDependencyWaitTime"),
+        exchange_wait_time_ns: thrift_counter_in_tree(tree, "WaitTime"),
+        exchange_process_time_ns: thrift_counter_in_tree(tree, "ReceiverProcessTotalTime"),
+        network_time_ns: thrift_counter_in_tree(tree, "NetworkTime"),
+        scan_io_time_ns: thrift_counter_in_tree(tree, "IOTaskExecTime"),
+    }
+}
+
+/// Fold `other` into `into`: counts/times sum, fragment wall takes max — identical to the
+/// query-level aggregation so per-fragment and query-level numbers reconcile.
+fn merge_summary(into: &mut DistributedProfileSummary, other: &DistributedProfileSummary) {
+    into.fragment_instance_count += other.fragment_instance_count;
+    into.fragment_wall_max_ns = into.fragment_wall_max_ns.max(other.fragment_wall_max_ns);
+    into.fragment_wall_sum_ns = into
+        .fragment_wall_sum_ns
+        .saturating_add(other.fragment_wall_sum_ns);
+    into.driver_total_time_ns = into
+        .driver_total_time_ns
+        .saturating_add(other.driver_total_time_ns);
+    into.operator_active_time_ns = into
+        .operator_active_time_ns
+        .saturating_add(other.operator_active_time_ns);
+    into.driver_blocked_time_ns = into
+        .driver_blocked_time_ns
+        .saturating_add(other.driver_blocked_time_ns);
+    into.source_wait_time_ns = into
+        .source_wait_time_ns
+        .saturating_add(other.source_wait_time_ns);
+    into.sink_wait_time_ns = into
+        .sink_wait_time_ns
+        .saturating_add(other.sink_wait_time_ns);
+    into.dependency_wait_time_ns = into
+        .dependency_wait_time_ns
+        .saturating_add(other.dependency_wait_time_ns);
+    into.exchange_wait_time_ns = into
+        .exchange_wait_time_ns
+        .saturating_add(other.exchange_wait_time_ns);
+    into.exchange_process_time_ns = into
+        .exchange_process_time_ns
+        .saturating_add(other.exchange_process_time_ns);
+    into.network_time_ns = into.network_time_ns.saturating_add(other.network_time_ns);
+    into.scan_io_time_ns = into.scan_io_time_ns.saturating_add(other.scan_io_time_ns);
 }
 
 fn collect_rec(node: &Profiler, actuals: &mut HashMap<i32, ActualMetrics>) {
@@ -298,7 +362,8 @@ mod tests {
     use super::{
         ActualMetrics, collect_actuals_by_plan_node_id,
         collect_actuals_by_plan_node_id_from_profile_trees, collect_actuals_by_plan_node_id_multi,
-        collect_distributed_profile_summary_from_profile_trees, merge_actual_metrics,
+        collect_distributed_profile_summary_from_profile_trees,
+        collect_per_fragment_profile_summaries, merge_actual_metrics,
     };
     use crate::metrics;
     use crate::runtime::profile::Profiler;
@@ -567,6 +632,48 @@ mod tests {
         assert_eq!(m.search_ns, 20_000);
         assert_eq!(m.output_ns, 15_000);
         assert_eq!(m.build_ht_ns, 0);
+    }
+
+    #[test]
+    fn collects_per_fragment_profile_summaries_keyed_by_fragment_root_node() {
+        // Fragment A: keyed by the root (output) plan-node id = 9, read from the
+        // `execute_fragment (plan_node_id=9)` tree root; two instances merge.
+        // The `Pipeline (id=0)` / `PipelineDriver (id=0)` wrapper nodes carry counters (as in real
+        // trees) so they are serialized — guarding against a regression to a min-over-nodes key,
+        // which would mis-key on the wrapper `(id=0)` instead of the real fragment root.
+        let make_a = |active: i64, blocked: i64| {
+            let p = Profiler::new("execute_fragment (plan_node_id=9)");
+            let pipeline = p.child("Pipeline (id=0)");
+            pipeline.counter_set("DriverTotalTime", metrics::TUnit::TIME_NS, 1);
+            let driver = pipeline.child("PipelineDriver (id=0)");
+            driver.counter_set("DriverBlockedTime", metrics::TUnit::TIME_NS, blocked);
+            add_operator_metrics(&driver, "HASH JOIN (plan_node_id=9)", 1, active, 0);
+            add_operator_metrics(&driver, "SCAN (plan_node_id=4)", 1, 0, 0);
+            p.to_thrift_tree()
+        };
+        // Fragment B: root (output) plan-node id = 2.
+        let make_b = || {
+            let p = Profiler::new("execute_fragment (plan_node_id=2)");
+            let pipeline = p.child("Pipeline (id=0)");
+            pipeline.counter_set("DriverTotalTime", metrics::TUnit::TIME_NS, 1);
+            let driver = pipeline.child("PipelineDriver (id=0)");
+            driver.counter_set("DriverBlockedTime", metrics::TUnit::TIME_NS, 300);
+            add_operator_metrics(&driver, "SCAN (plan_node_id=2)", 1, 5_000, 0);
+            p.to_thrift_tree()
+        };
+
+        let trees = vec![make_a(10_000, 100), make_a(20_000, 200), make_b()];
+        let by_fragment = collect_per_fragment_profile_summaries(&trees);
+
+        assert_eq!(by_fragment.len(), 2);
+        let a = by_fragment.get(&9).expect("fragment root node 9");
+        assert_eq!(a.fragment_instance_count, 2);
+        assert_eq!(a.operator_active_time_ns, 30_000);
+        assert_eq!(a.driver_blocked_time_ns, 300);
+        let b = by_fragment.get(&2).expect("fragment root node 2");
+        assert_eq!(b.fragment_instance_count, 1);
+        assert_eq!(b.operator_active_time_ns, 5_000);
+        assert_eq!(b.driver_blocked_time_ns, 300);
     }
 
     #[test]

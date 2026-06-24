@@ -3183,6 +3183,9 @@ fn explain_analyze_query(
         crate::runtime::profile_correlate::collect_distributed_profile_summary_from_profile_trees(
             &outcome.fragment_profiles,
         );
+    let per_fragment = crate::runtime::profile_correlate::collect_per_fragment_profile_summaries(
+        &outcome.fragment_profiles,
+    );
     let mut lines = Vec::new();
     lines.push(format!(
         "Planning: {} / Execution: {} / Rows: {}",
@@ -3195,6 +3198,7 @@ fn explain_analyze_query(
         &dp,
         ExplainLevel::Analyze,
         &actuals,
+        Some(&per_fragment),
     ));
     build_string_query_result("Explain String", lines)
 }
@@ -6580,6 +6584,8 @@ enable_path_style_access = true
         assert!(text.contains("search="), "{text}");
         assert!(text.contains("output="), "{text}");
         assert!(text.contains("build_ht="), "{text}");
+        // W0'b: per-fragment active/blocked Profile line under each PLAN FRAGMENT header.
+        assert!(text.contains("Profile: active="), "{text}");
     }
 
     /// OQ-5 Task 6: codegen must lower the runtime-filter annotations the
