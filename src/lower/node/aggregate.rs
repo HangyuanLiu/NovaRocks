@@ -195,12 +195,17 @@ pub(crate) fn lower_aggregate_node(
                 continue;
             }
 
+            let is_asc = desc.is_asc.unwrap_or(true);
+            let is_nulls_first = desc.is_nulls_first.unwrap_or(false);
+
             topn_rf_specs.push(TopNRuntimeFilterSpec {
                 filter_id,
                 expr_order,
                 build_type,
                 probe_column_name,
                 limit: limit as usize,
+                is_asc,
+                is_nulls_first,
             });
         }
     }
