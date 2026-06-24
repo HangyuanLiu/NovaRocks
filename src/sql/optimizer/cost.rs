@@ -510,6 +510,80 @@ pub(crate) fn broadcast_is_feasible(
     }
 }
 
+/// EXPLAIN-facing broadcast decision. Single source of truth: produced only by
+/// `broadcast_decision`. None for non-hash-join / non-broadcast / no-build nodes.
+#[allow(dead_code)] // BC-1 Phase 2 staged until distributed_build consumes broadcast decisions.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BroadcastDecision {
+    pub feasible: bool,
+    pub forced: bool,
+    pub build_bytes: f64,
+    pub hash_table_bytes: f64,
+    pub effective_backend_count: f64,
+    pub risk_adj_fanout_bytes: f64,
+    pub per_node_budget_bytes: f64,
+    pub cluster_network_budget_bytes: f64,
+    pub risk_multiplier: f64,
+    pub reject_reason: Option<BroadcastRejectReason>,
+}
+
+/// Produce the broadcast decision for EXPLAIN. Only fires for a hash join with
+/// a build child under the BroadcastJoin alternative (or Default+Broadcast).
+#[allow(dead_code)] // BC-1 Phase 2 staged until distributed_build consumes broadcast decisions.
+pub(crate) fn broadcast_decision(input: &CostInput<'_>) -> Option<BroadcastDecision> {
+    let join = match input.op {
+        Operator::PhysicalHashJoin(join) => join,
+        _ => return None,
+    };
+    let is_broadcast = match input.alt_kind {
+        PropertyAlternativeKind::BroadcastJoin => true,
+        PropertyAlternativeKind::ShuffleJoin => false,
+        PropertyAlternativeKind::Default => {
+            matches!(join.distribution, JoinDistribution::Broadcast)
+        }
+    };
+    if !is_broadcast {
+        return None;
+    }
+
+    let build_stats = input.child_stats.get(1).copied()?;
+    let probe_stats = input.child_stats.first().copied().unwrap_or(build_stats);
+    let feas = broadcast_is_feasible(probe_stats, build_stats, input.options);
+    let forced = broadcast_decision_is_forced(join, input);
+
+    Some(BroadcastDecision {
+        feasible: feas.feasible,
+        forced,
+        build_bytes: feas.build_bytes,
+        hash_table_bytes: feas.hash_table_bytes,
+        effective_backend_count: feas.effective_backend_count,
+        risk_adj_fanout_bytes: feas.risk_adj_fanout_bytes,
+        per_node_budget_bytes: input.options.profile.per_node_build_memory_budget_bytes,
+        cluster_network_budget_bytes: input.options.profile.cluster_broadcast_network_budget_bytes,
+        risk_multiplier: feas.risk_multiplier,
+        reject_reason: feas.reject_reason,
+    })
+}
+
+fn broadcast_decision_is_forced(join: &PhysicalHashJoinOp, input: &CostInput<'_>) -> bool {
+    if join.join_type == JoinKind::NullAwareLeftAnti {
+        return true;
+    }
+    let Some(scalars) = input.scalars else {
+        return false;
+    };
+    let mut unresolved = join.clone();
+    unresolved.distribution = JoinDistribution::Unknown;
+    let unresolved_op = Operator::PhysicalHashJoin(unresolved);
+    let alternatives = super::derive::derive_required_alternatives(
+        &unresolved_op,
+        scalars,
+        input.required_output,
+        input.child_stats.len(),
+    );
+    feasibility_is_advisory_only(&unresolved_op, &alternatives)
+}
+
 /// True when broadcast feasibility is advisory only for this operator: broadcast
 /// is the only correct distribution, so an infeasible verdict must not prune
 /// the alternative.
@@ -1241,6 +1315,139 @@ mod tests {
             scalars: None,
             options: o,
         }
+    }
+
+    fn broadcast_input_with_scalars<'a>(
+        op: &'a Operator,
+        own: &'a Statistics,
+        child: &'a [&'a Statistics],
+        outs: &'a [&'a PhysicalPropertySet],
+        required: &'a PhysicalPropertySet,
+        alt: &'a PropertyAlternativeKind,
+        scalars: &'a ScalarArena,
+        o: &'a CostOptions,
+    ) -> CostInput<'a> {
+        CostInput {
+            op,
+            own_stats: own,
+            child_stats: child,
+            child_outputs: outs,
+            required_output: required,
+            alt_kind: alt,
+            scalars: Some(scalars),
+            options: o,
+        }
+    }
+
+    #[test]
+    fn broadcast_decision_present_for_broadcast_hash_join_absent_otherwise() {
+        let probe = stats(1_000_000.0, 64.0);
+        let mut build = stats(1_000.0, 4.0);
+        build.row_count_confidence = Confidence::Exact;
+        let own = stats(1_000.0, 64.0);
+        let mut scalars = ScalarArena::new();
+        let eq = vec![column_eq_condition(&mut scalars, 1, 2)];
+        let op = join_op(JoinKind::Inner, eq.clone());
+        let o = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let outs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let out_refs = [&outs[0], &outs[1]];
+        let child = [&probe, &build];
+        let broadcast = PropertyAlternativeKind::BroadcastJoin;
+        let input = broadcast_input_with_scalars(
+            &op, &own, &child, &out_refs, &required, &broadcast, &scalars, &o,
+        );
+
+        let decision = broadcast_decision(&input).expect("broadcast decision");
+        assert!(decision.feasible);
+        assert_eq!(decision.effective_backend_count, 3.0);
+        assert!(!decision.forced);
+
+        let shuffle = PropertyAlternativeKind::ShuffleJoin;
+        let shuffle_input = broadcast_input(&op, &own, &child, &out_refs, &required, &shuffle, &o);
+        assert!(broadcast_decision(&shuffle_input).is_none());
+
+        let default = PropertyAlternativeKind::Default;
+        let default_unknown_input =
+            broadcast_input(&op, &own, &child, &out_refs, &required, &default, &o);
+        assert!(broadcast_decision(&default_unknown_input).is_none());
+
+        let broadcast_op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: eq.clone(),
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        });
+        let default_broadcast_input = broadcast_input_with_scalars(
+            &broadcast_op,
+            &own,
+            &child,
+            &out_refs,
+            &required,
+            &default,
+            &scalars,
+            &o,
+        );
+        let default_decision =
+            broadcast_decision(&default_broadcast_input).expect("default broadcast decision");
+        assert!(!default_decision.forced);
+
+        let no_build_child = [&probe];
+        let missing_build_input = broadcast_input(
+            &op,
+            &own,
+            &no_build_child,
+            &out_refs,
+            &required,
+            &broadcast,
+            &o,
+        );
+        assert!(broadcast_decision(&missing_build_input).is_none());
+
+        let scan = scan_op();
+        let scan_input = broadcast_input(&scan, &own, &child, &out_refs, &required, &broadcast, &o);
+        assert!(broadcast_decision(&scan_input).is_none());
+    }
+
+    #[test]
+    fn broadcast_decision_marks_correctness_required_broadcast_forced() {
+        let probe = stats(1_000_000.0, 64.0);
+        let mut build = stats(1_000.0, 4.0);
+        build.row_count_confidence = Confidence::Exact;
+        let own = stats(1_000.0, 64.0);
+        let o = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let outs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let out_refs = [&outs[0], &outs[1]];
+        let child = [&probe, &build];
+        let broadcast = PropertyAlternativeKind::BroadcastJoin;
+
+        let scalars = ScalarArena::new();
+        for op in [
+            join_op(JoinKind::Inner, vec![]),
+            join_op(JoinKind::Cross, vec![]),
+            join_op(JoinKind::NullAwareLeftAnti, vec![]),
+        ] {
+            let input = broadcast_input_with_scalars(
+                &op, &own, &child, &out_refs, &required, &broadcast, &scalars, &o,
+            );
+            assert!(broadcast_decision(&input).expect("decision").forced);
+        }
+
+        let mut unsupported_scalars = ScalarArena::new();
+        let unsupported_key = vec![expression_key_eq_condition(&mut unsupported_scalars, 1, 2)];
+        let unsupported_op = join_op(JoinKind::Inner, unsupported_key);
+        let input = broadcast_input_with_scalars(
+            &unsupported_op,
+            &own,
+            &child,
+            &out_refs,
+            &required,
+            &broadcast,
+            &unsupported_scalars,
+            &o,
+        );
+        assert!(broadcast_decision(&input).expect("decision").forced);
     }
 
     #[test]
