@@ -300,6 +300,16 @@ impl Default for CostOptions {
     }
 }
 
+impl CostOptions {
+    /// Install a profile and refresh the cached `backend_factor` projection.
+    /// `backend_factor` is always `profile.effective_backend_count.max(1.0)` so
+    /// existing `options.backend_factor` call sites need no change.
+    pub(crate) fn apply_profile(&mut self, profile: ClusterResourceProfile) {
+        self.backend_factor = profile.effective_backend_count.max(1.0);
+        self.profile = profile;
+    }
+}
+
 fn finite_non_negative_cost(value: f64) -> f64 {
     finite_non_negative_dimension(value)
 }
@@ -2341,5 +2351,24 @@ mod tests {
             opts.profile.cluster_broadcast_network_budget_bytes,
             opts.profile.per_node_build_memory_budget_bytes * opts.profile.effective_backend_count
         );
+    }
+
+    #[test]
+    fn apply_profile_syncs_backend_factor_projection() {
+        let mut opts = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 16.0;
+        opts.apply_profile(profile);
+        assert_eq!(opts.profile.effective_backend_count, 16.0);
+        assert_eq!(opts.backend_factor, 16.0);
+    }
+
+    #[test]
+    fn apply_profile_clamps_backend_factor_to_one() {
+        let mut opts = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 0.0;
+        opts.apply_profile(profile);
+        assert_eq!(opts.backend_factor, 1.0);
     }
 }
