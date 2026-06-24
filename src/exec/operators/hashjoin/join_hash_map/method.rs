@@ -144,12 +144,29 @@ impl JoinHashMap {
         batches: &[BuildKeyBatch],
         options: JoinHashMapBuildOptions,
     ) -> Result<Self, String> {
-        if let Some(direct) =
-            DirectIntJoinHashMap::try_build(&key_types, &null_safe_eq, batches, options)?
-        {
+        Self::build_from_key_batches_with_tracker(key_types, null_safe_eq, batches, options, None)
+    }
+
+    pub(crate) fn build_from_key_batches_with_tracker(
+        key_types: Vec<DataType>,
+        null_safe_eq: Vec<bool>,
+        batches: &[BuildKeyBatch],
+        options: JoinHashMapBuildOptions,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<Self, String> {
+        if let Some(direct) = DirectIntJoinHashMap::try_build(
+            &key_types,
+            &null_safe_eq,
+            batches,
+            options,
+            tracker.as_ref().map(Arc::clone),
+        )? {
             return Ok(Self::DirectInt(direct));
         }
         let mut chained = Self::new_chained(key_types, null_safe_eq)?;
+        if let Some(tracker) = tracker {
+            chained.set_mem_tracker(tracker);
+        }
         for batch in batches {
             chained.add_build_rows(batch.arrays(), batch.num_rows())?;
         }
@@ -357,6 +374,7 @@ impl DirectIntJoinHashMap {
         null_safe_eq: &[bool],
         batches: &[BuildKeyBatch],
         options: JoinHashMapBuildOptions,
+        tracker: Option<Arc<MemTracker>>,
     ) -> Result<Option<Self>, String> {
         if key_types.len() != 1 || null_safe_eq.len() != 1 || null_safe_eq[0] {
             return Ok(None);
@@ -395,6 +413,9 @@ impl DirectIntJoinHashMap {
             mem_tracker: None,
             accounted_bytes: 0,
         };
+        if let Some(tracker) = tracker {
+            map.set_mem_tracker(tracker);
+        }
         map.fill_from_batches(batches)?;
         map.build_group_rows()?;
         Ok(Some(map))
