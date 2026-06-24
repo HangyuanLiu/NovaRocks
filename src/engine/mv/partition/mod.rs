@@ -4,7 +4,8 @@ pub(crate) mod mapping;
 pub(crate) mod planner;
 
 pub(crate) use derivation::{
-    AffectedTargetPartitions, PartitionDerivationSpec, resolve_partition_derivation_spec,
+    AffectedPartitionDerivationSource, AffectedTargetPartitions, PartitionDerivationSpec,
+    resolve_partition_derivation_spec,
 };
 // P2 partition-pruning asset: the chunk evaluator + its bound/error types were
 // extracted in P1 (the dead pre-cutover apply path that used them is removed),

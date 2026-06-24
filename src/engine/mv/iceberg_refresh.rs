@@ -4599,11 +4599,17 @@ fn merge_affected_partition_results(
     >,
 ) -> crate::engine::mv::partition::AffectedTargetPartitions {
     let mut merged = BTreeSet::new();
+    let mut merged_source =
+        crate::engine::mv::partition::AffectedPartitionDerivationSource::MetadataDerived;
     let mut saw_unpartitioned = false;
 
     for (base, result) in results {
         match result {
-            crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } => {
+            crate::engine::mv::partition::AffectedTargetPartitions::Known {
+                partitions,
+                source,
+            } => {
+                merged_source = merged_source.merge(source);
                 merged.extend(partitions);
             }
             crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned => {
@@ -4626,7 +4632,10 @@ fn merge_affected_partition_results(
             ))
         }
     } else {
-        crate::engine::mv::partition::AffectedTargetPartitions::known(merged)
+        crate::engine::mv::partition::AffectedTargetPartitions::known_with_source(
+            merged,
+            merged_source,
+        )
     }
 }
 
@@ -6892,7 +6901,9 @@ fn finalize_iceberg_mv_partition_state(
                 .map_err(|e| format!("clear iceberg mv partition state failed: {e}"))?;
         }
         IcebergMvPartitionStateFinalize::FromAffected(affected) => match affected {
-            crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } => {
+            crate::engine::mv::partition::AffectedTargetPartitions::Known {
+                partitions, ..
+            } => {
                 let partition_keys = partitions
                     .iter()
                     .map(|key| key.canonical_string())
@@ -9934,6 +9945,31 @@ mod partition_planning_tests {
                 key("west"),
             ])
         );
+    }
+
+    #[test]
+    fn merge_affected_partition_results_promotes_row_derived_source() {
+        let merged = merge_affected_partition_results(
+            "UNION ALL MV affected partition planning",
+            vec![
+                (
+                    "ice.db.left".to_string(),
+                    crate::engine::mv::partition::AffectedTargetPartitions::known([key("west")]),
+                ),
+                (
+                    "ice.db.right".to_string(),
+                    crate::engine::mv::partition::AffectedTargetPartitions::known_row_derived([
+                        key("east"),
+                    ]),
+                ),
+            ],
+        );
+
+        assert_eq!(
+            merged.derivation_source(),
+            Some(crate::engine::mv::partition::AffectedPartitionDerivationSource::RowDerived)
+        );
+        assert_eq!(merged.explain_summary(), "known(row-derived, count=2)");
     }
 
     #[test]
@@ -15564,7 +15600,7 @@ mod tests {
             plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
                 .expect("second refresh plan");
 
-        let crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } =
+        let crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions, .. } =
             plan.affected_partitions
         else {
             panic!(
