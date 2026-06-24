@@ -590,6 +590,61 @@ fn imv_equivalence_failure(
     }
 }
 
+/// Capture the MV's current (incremental) contents, force a full recompute via
+/// `REFRESH MATERIALIZED VIEW <mv> FULL`, capture again, assert multiset equality.
+/// MV is qualified by `db` like wait_alter_*. SIDE EFFECT: performs a FULL refresh.
+fn run_imv_equivalence_check(
+    mv: &str,
+    session: &mut crate::session::MysqlSession,
+    query_timeout: u64,
+    db: Option<&str>,
+    epsilon: Option<f64>,
+    log: &mut String,
+) -> Result<(), String> {
+    let fqn = match db {
+        Some(d) if !d.is_empty() => format!("{d}.{mv}"),
+        _ => mv.to_string(),
+    };
+    let select = format!("SELECT * FROM {fqn}");
+    let _ = writeln!(
+        log,
+        "    @imv_equivalence_check: capturing incremental contents of {fqn}"
+    );
+    let (ok, inc, msg) = session.execute_query(query_timeout, &select, None);
+    if !ok {
+        return Err(format!(
+            "@imv_equivalence_check: incremental SELECT failed: {msg}"
+        ));
+    }
+    let inc = inc.ok_or_else(|| {
+        "@imv_equivalence_check: incremental SELECT returned no result".to_string()
+    })?;
+    let refresh = format!("REFRESH MATERIALIZED VIEW {fqn} FULL");
+    let _ = writeln!(log, "    @imv_equivalence_check: forcing full recompute");
+    let (ok, _, msg) = session.execute_query(query_timeout, &refresh, None);
+    if !ok {
+        return Err(format!(
+            "@imv_equivalence_check: forced full refresh failed: {msg}"
+        ));
+    }
+    let (ok, full, msg) = session.execute_query(query_timeout, &select, None);
+    if !ok {
+        return Err(format!(
+            "@imv_equivalence_check: full-recompute SELECT failed: {msg}"
+        ));
+    }
+    let full = full.ok_or_else(|| {
+        "@imv_equivalence_check: full-recompute SELECT returned no result".to_string()
+    })?;
+    match imv_equivalence_failure(&fqn, &inc, &full, epsilon) {
+        Some(reason) => Err(reason),
+        None => {
+            let _ = writeln!(log, "    @imv_equivalence_check: incremental == full ✅");
+            Ok(())
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // @explain_* helpers
