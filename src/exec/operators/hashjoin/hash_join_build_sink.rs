@@ -517,6 +517,8 @@ impl HashJoinBuildSinkOperator {
                 accounting.transfer_to(Arc::clone(tracker));
             }
             _ => {
+                let old_accounting = self.build_key_batches_accounting.take();
+                drop(old_accounting);
                 self.build_key_batches_accounting = Some(TrackedBytes::new(
                     self.build_key_batches_retained_bytes,
                     Arc::clone(tracker),
@@ -1413,5 +1415,81 @@ mod tests {
             .find(|child| child.label() == "BuildHashTable")
             .expect("BuildHashTable tracker");
         assert!(hash_table_tracker.current() > 0);
+    }
+
+    #[test]
+    fn computed_build_key_batches_peak_is_not_inflated_across_pushes() {
+        let mut arena = ExprArena::default();
+        let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let zero = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(0)), DataType::Int32);
+        let build_key = arena.push_typed(ExprNode::Add(slot, zero), DataType::Int32);
+        let arena = Arc::new(arena);
+        let state = Arc::new(TestBuildState::default());
+        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+        let root = MemTracker::new_root("hash-build-test");
+        let mut operator = HashJoinBuildSinkOperator {
+            name: "HASH_JOIN (id=1)".to_string(),
+            node_id: 1,
+            driver_id: 0,
+            arena,
+            join_type: JoinType::Inner,
+            build_keys: vec![build_key],
+            eq_null_safe: vec![false],
+            runtime_filter_specs: Vec::new(),
+            distribution_mode: JoinDistributionMode::Broadcast,
+            state,
+            partition: 0,
+            runtime_filter_hub,
+            runtime_in_filter_merger: None,
+            build_store_builder: BuildStoreBuilder::new(),
+            build_input_chunks: Vec::new(),
+            build_key_batches: Vec::new(),
+            build_key_batches_retained_bytes: 0,
+            build_key_batches_accounting: None,
+            build_key_batches_mem_tracker: None,
+            build_table: None,
+            runtime_filters: None,
+            runtime_in_filters: None,
+            finished: false,
+            build_row_count: 0,
+            build_has_null_key: false,
+            build_null_key_rows: None,
+            logged_first_input: false,
+            profile_initialized: false,
+            profiles: None,
+            input_rows: 0,
+            input_chunks: 0,
+            build_input_chunks_mem_tracker: None,
+            build_table_mem_tracker: None,
+        };
+
+        operator.set_mem_tracker(Arc::clone(&root));
+        let key_batches_tracker = root
+            .children()
+            .into_iter()
+            .find(|child| child.label() == "BuildKeyBatches")
+            .expect("BuildKeyBatches tracker");
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .expect("first push");
+        let after_first = key_batches_tracker.current();
+        assert!(after_first > 0);
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![4, 5, 6]))
+            .expect("second push");
+
+        assert_eq!(
+            key_batches_tracker.current(),
+            operator.build_key_batches_retained_bytes as i64
+        );
+        assert_eq!(key_batches_tracker.peak(), key_batches_tracker.current());
+
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        assert_eq!(key_batches_tracker.current(), 0);
     }
 }
