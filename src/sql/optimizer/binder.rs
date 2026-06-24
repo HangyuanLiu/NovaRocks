@@ -27,6 +27,9 @@
 //! - **`Op` matches KIND only** (`op_kind(&expr.op) == Some(kind)`); field
 //!   predicates live in the rule's `apply_bound`. Arity must match exactly
 //!   unless the last child-pattern is `MultiLeaf`.
+//! - A `Leaf`/`MultiLeaf` ROOT yields one binding capturing the root expr
+//!   (with no interior nodes) — this is the default-shim path; only an `Op`
+//!   root enumerates structure.
 
 use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::Operator;
@@ -92,12 +95,27 @@ pub(crate) fn bind(
     group_id: GroupId,
     expr_index: usize,
 ) -> Vec<Binding> {
-    // Only an interior `Op` pattern can root a binding (a bare Leaf/MultiLeaf
-    // captures a group without producing an interior node, which is not a
-    // useful root for rule matching).
+    // A `Leaf`/`MultiLeaf` ROOT yields exactly one binding that captures the
+    // root expr with no interior nodes. This is the default-shim path: the
+    // default `Rule::pattern()` is `Pattern::Leaf`, and `apply_bound` only
+    // reads `root_mexpr` (never `op`/`children`), so an empty `interiors` is
+    // sufficient. Returning an empty `Vec` here would silently disable every
+    // un-migrated rule.
     let kind = match pattern {
         Pattern::Op { kind, .. } => *kind,
-        Pattern::Leaf | Pattern::MultiLeaf => return Vec::new(),
+        Pattern::Leaf | Pattern::MultiLeaf => {
+            return match memo
+                .groups
+                .get(group_id)
+                .and_then(|g| g.logical_exprs.get(expr_index))
+            {
+                Some(_) => vec![Binding {
+                    root: (group_id, expr_index),
+                    interiors: Vec::new(),
+                }],
+                None => Vec::new(),
+            };
+        }
     };
 
     let group = match memo.groups.get(group_id) {
@@ -446,5 +464,27 @@ mod tests {
         assert_eq!(bs.len(), 1);
         // interior 0 = TopN (1 child group = union), interior 1 = Union.
         assert_eq!(bs[0].children(1), &[b0, b1, b2]);
+    }
+
+    /// A `Leaf` root pattern (the default `Rule::pattern()`) must yield EXACTLY
+    /// one binding that captures the root expr, so the default `apply_bound`
+    /// shim — which only reads `root_mexpr` — fires for un-migrated rules.
+    #[test]
+    fn leaf_root_yields_one_binding_for_shim() {
+        let mut memo = Memo::new();
+        let g = mk_scan_group(&mut memo);
+        let bs = bind(&Pattern::Leaf, &memo, g, 0);
+        assert_eq!(bs.len(), 1, "Leaf root must yield exactly one root binding for the shim");
+        assert!(matches!(bs[0].root_mexpr(&memo).op, Operator::LogicalScan(_)));
+        // out-of-range root → no binding
+        assert!(bind(&Pattern::Leaf, &memo, 999, 0).is_empty());
+    }
+
+    /// A `MultiLeaf` root behaves identically to a `Leaf` root: one binding.
+    #[test]
+    fn multileaf_root_yields_one_binding_for_shim() {
+        let mut memo = Memo::new();
+        let g = mk_scan_group(&mut memo);
+        assert_eq!(bind(&Pattern::MultiLeaf, &memo, g, 0).len(), 1);
     }
 }
