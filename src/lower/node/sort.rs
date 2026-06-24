@@ -128,12 +128,15 @@ pub(crate) fn lower_sort_node(
     };
     let partition_limit = match sort.partition_limit {
         None => None,
-        Some(v) if v < 0 => {
-            return Err(format!(
-                "SORT_NODE node_id={} partition_limit must be >= 0, got {v}",
-                node.node_id
-            ));
-        }
+        // StarRocks uses partition_limit = -1 as the "no per-partition cap"
+        // sentinel. It emits the field whenever partition_exprs is present
+        // (SortNode.java setPartition_limit is guarded by getPartitionExprs() !=
+        // null), so an ordinary global TopN still arrives with partition_limit =
+        // -1 and an empty partition_exprs list. Treat any negative value as
+        // absent rather than rejecting it — StarRocks itself gates on
+        // `partitionLimit >= 0`. Rejecting it broke every FE-issued
+        // `ORDER BY ... LIMIT n`.
+        Some(v) if v < 0 => None,
         Some(v) => Some(v as usize),
     };
     if partition_limit.is_some() && !use_top_n {
@@ -1055,5 +1058,46 @@ mod tests {
         assert_eq!(sort.limit, None, "global limit must remain None");
         assert_eq!(sort.partition_limit, Some(2));
         assert_eq!(sort.partition_exprs.len(), 1);
+    }
+
+    /// StarRocks sends partition_limit = -1 (the "no per-partition cap"
+    /// sentinel) for an ordinary global TopN: it sets the field whenever
+    /// partition_exprs is present, defaulting the cap to -1. Lowering must
+    /// treat any negative partition_limit as None rather than rejecting it,
+    /// otherwise every FE-issued `ORDER BY ... LIMIT n` fails to lower.
+    #[test]
+    fn lower_sort_node_treats_negative_partition_limit_as_none() {
+        let layout = single_slot_layout(0, 1);
+        let sort_info = plan_nodes::TSortInfo {
+            ordering_exprs: vec![slot_ref_expr(0, 1)],
+            is_asc_order: vec![true],
+            nulls_first: vec![true],
+            sort_tuple_slot_exprs: None,
+        };
+        let mut node = sort_plan_node(sort_info);
+        {
+            let sort_node = node.sort_node.as_mut().expect("sort node");
+            sort_node.use_top_n = true;
+            sort_node.topn_type = Some(plan_nodes::TTopNType::ROW_NUMBER);
+            // FE emits an (empty) partition_exprs list plus the -1 sentinel for
+            // a plain global TopN.
+            sort_node.partition_exprs = Some(vec![]);
+            sort_node.partition_limit = Some(-1);
+            sort_node.offset = Some(0);
+        }
+        node.limit = 5;
+
+        let lowered = lower_sort_from_node(&node, layout)
+            .expect("negative partition_limit must lower as no per-partition cap");
+        let ExecNodeKind::Sort(sort) = lowered.node.kind else {
+            panic!("expected sort node");
+        };
+        assert_eq!(
+            sort.partition_limit, None,
+            "negative partition_limit sentinel must map to None"
+        );
+        assert!(sort.use_top_n);
+        assert_eq!(sort.limit, Some(5), "global limit must be preserved");
+        assert!(sort.partition_exprs.is_empty());
     }
 }
