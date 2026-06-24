@@ -92,6 +92,7 @@ DELETE FROM ice_ivm_fanin_${uuid0}.ns_${uuid0}.fact_east WHERE id = 1;
 REFRESH MATERIALIZED VIEW fanin_mv_${uuid0};
 
 -- query 9
+-- @imv_equivalence_check=fanin_mv_${uuid0}
 SELECT region, c, s
 FROM fanin_mv_${uuid0}
 ORDER BY region;
