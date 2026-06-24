@@ -814,6 +814,19 @@ fn parse_set_group_concat_max_len(query: &str) -> Option<i64> {
     i64::try_from(value).ok()
 }
 
+fn apply_broadcast_profile_set(settings: &mut SessionOptimizerSettings, trimmed: &str) -> bool {
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "cbo_broadcast_backend_count") {
+        settings.cbo_broadcast_backend_count = Some(v as f64);
+        return true;
+    }
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "cbo_broadcast_node_mem_budget_bytes")
+    {
+        settings.cbo_broadcast_node_mem_budget_bytes = Some(v as f64);
+        return true;
+    }
+    false
+}
+
 fn parse_set_boolean(query: &str) -> Option<(String, bool)> {
     let normalized = query.replace('=', " = ");
     let mut parts = normalized.split_whitespace();
@@ -1021,6 +1034,10 @@ async fn execute_statement_text(
 
     if let Some(dop) = parse_set_pipeline_dop(trimmed) {
         shim.pipeline_dop = if dop <= 0 { None } else { Some(dop) };
+        return Ok(StatementResult::Ok);
+    }
+
+    if apply_broadcast_profile_set(&mut shim.optimizer_settings, trimmed) {
         return Ok(StatementResult::Ok);
     }
 
@@ -1910,6 +1927,73 @@ mod tests {
         assert_eq!(parse_set_boolean("SET @i = 1"), None);
         assert_eq!(parse_set_boolean("SET @i = 0"), None);
         assert_eq!(parse_set_boolean("SET @flag = true"), None);
+    }
+
+    #[test]
+    fn apply_broadcast_profile_set_accepts_zero_values() {
+        let mut settings = SessionOptimizerSettings::default();
+
+        assert!(apply_broadcast_profile_set(
+            &mut settings,
+            "SET cbo_broadcast_backend_count = 0"
+        ));
+        assert_eq!(settings.cbo_broadcast_backend_count, Some(0.0));
+
+        assert!(apply_broadcast_profile_set(
+            &mut settings,
+            "SET cbo_broadcast_node_mem_budget_bytes = 0"
+        ));
+        assert_eq!(settings.cbo_broadcast_node_mem_budget_bytes, Some(0.0));
+    }
+
+    #[test]
+    fn apply_broadcast_profile_set_accepts_one_values() {
+        let mut settings = SessionOptimizerSettings::default();
+
+        assert!(apply_broadcast_profile_set(
+            &mut settings,
+            "SET cbo_broadcast_backend_count = 1"
+        ));
+        assert_eq!(settings.cbo_broadcast_backend_count, Some(1.0));
+
+        assert!(apply_broadcast_profile_set(
+            &mut settings,
+            "SET cbo_broadcast_node_mem_budget_bytes = 1"
+        ));
+        assert_eq!(settings.cbo_broadcast_node_mem_budget_bytes, Some(1.0));
+    }
+
+    #[test]
+    fn apply_broadcast_profile_set_accepts_normal_values() {
+        let mut settings = SessionOptimizerSettings::default();
+
+        assert!(apply_broadcast_profile_set(
+            &mut settings,
+            "SET cbo_broadcast_backend_count = 3"
+        ));
+        assert_eq!(settings.cbo_broadcast_backend_count, Some(3.0));
+
+        assert!(apply_broadcast_profile_set(
+            &mut settings,
+            "SET cbo_broadcast_node_mem_budget_bytes = 3"
+        ));
+        assert_eq!(settings.cbo_broadcast_node_mem_budget_bytes, Some(3.0));
+    }
+
+    #[test]
+    fn execute_statement_text_applies_broadcast_profile_before_boolean_set() {
+        let source = include_str!("mod.rs");
+        let helper_call = source
+            .find("apply_broadcast_profile_set(&mut shim.optimizer_settings, trimmed)")
+            .expect("execute_statement_text should call broadcast profile helper");
+        let boolean_call = source
+            .find("parse_set_boolean(trimmed)")
+            .expect("execute_statement_text should call boolean parser");
+
+        assert!(
+            helper_call < boolean_call,
+            "broadcast profile SET parser must run before generic boolean SET parser"
+        );
     }
 
     #[test]
