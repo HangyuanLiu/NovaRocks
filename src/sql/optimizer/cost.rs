@@ -524,6 +524,26 @@ pub(crate) fn broadcast_is_feasible(
     }
 }
 
+/// True when broadcast feasibility is advisory only for this operator: broadcast
+/// is the only correct distribution, so an infeasible verdict must not prune
+/// the alternative.
+#[allow(dead_code)] // BC-1 Phase 1 staged until search.rs consumes advisory feasibility.
+pub(crate) fn feasibility_is_advisory_only(
+    op: &Operator,
+    alternatives: &[super::derive::ChildRequirementAlternative],
+) -> bool {
+    match op {
+        Operator::PhysicalHashJoin(join) => {
+            join.join_type == JoinKind::NullAwareLeftAnti
+                || (!alternatives.is_empty()
+                    && alternatives
+                        .iter()
+                        .all(|alt| alt.kind == PropertyAlternativeKind::BroadcastJoin))
+        }
+        _ => false,
+    }
+}
+
 fn scan_cost_size(scan: &ScanOp, stats: &Statistics) -> f64 {
     let Some(required_columns) = scan
         .required_columns
@@ -1045,7 +1065,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::*;
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec};
-    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, CostEstimate};
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::plan::*;
@@ -1184,6 +1204,76 @@ mod tests {
             right,
             null_safe: false,
         }
+    }
+
+    fn column_ref(arena: &mut ScalarArena, id: u32) -> ScalarId {
+        arena.intern(
+            ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
+            arrow::datatypes::DataType::Int64,
+            false,
+        )
+    }
+
+    fn nested_column_ref(arena: &mut ScalarArena, id: u32) -> ScalarId {
+        let child = column_ref(arena, id);
+        arena.intern(
+            ScalarNode::Nested(child),
+            arrow::datatypes::DataType::Int64,
+            false,
+        )
+    }
+
+    fn column_eq_condition(
+        arena: &mut ScalarArena,
+        left_id: u32,
+        right_id: u32,
+    ) -> PhysicalHashJoinEqCondition {
+        PhysicalHashJoinEqCondition {
+            left: column_ref(arena, left_id),
+            right: column_ref(arena, right_id),
+            null_safe: false,
+        }
+    }
+
+    fn expression_key_eq_condition(
+        arena: &mut ScalarArena,
+        left_id: u32,
+        right_id: u32,
+    ) -> PhysicalHashJoinEqCondition {
+        PhysicalHashJoinEqCondition {
+            left: nested_column_ref(arena, left_id),
+            right: column_ref(arena, right_id),
+            null_safe: false,
+        }
+    }
+
+    fn join_op(
+        kind: JoinKind,
+        eq: Vec<crate::sql::optimizer::operator::PhysicalHashJoinEqCondition>,
+    ) -> Operator {
+        Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: kind,
+            eq_conditions: eq,
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        })
+    }
+
+    fn derived_alternatives(
+        op: &Operator,
+        arena: &ScalarArena,
+    ) -> Vec<super::super::derive::ChildRequirementAlternative> {
+        super::super::derive::derive_required_alternatives(
+            op,
+            arena,
+            &PhysicalPropertySet::any(),
+            2,
+        )
+    }
+
+    fn advisory_for_derived_hash_join(op: &Operator, arena: &ScalarArena) -> bool {
+        let alternatives = derived_alternatives(op, arena);
+        feasibility_is_advisory_only(op, &alternatives)
     }
 
     #[test]
@@ -1453,6 +1543,70 @@ mod tests {
 
         assert!(feas.feasible);
         assert_eq!(feas.reject_reason, None);
+    }
+
+    #[test]
+    fn feasibility_advisory_for_correctness_required_joins() {
+        let arena = ScalarArena::new();
+        assert!(advisory_for_derived_hash_join(
+            &join_op(JoinKind::Cross, vec![]),
+            &arena
+        ));
+        assert!(advisory_for_derived_hash_join(
+            &join_op(JoinKind::Inner, vec![]),
+            &arena
+        ));
+
+        let mut naaj_arena = ScalarArena::new();
+        let naaj = join_op(
+            JoinKind::NullAwareLeftAnti,
+            vec![test_eq_condition(&mut naaj_arena, 1, 2)],
+        );
+        assert!(advisory_for_derived_hash_join(&naaj, &naaj_arena));
+
+        let mut expr_arena = ScalarArena::new();
+        let unsupported_shuffle_key = join_op(
+            JoinKind::Inner,
+            vec![expression_key_eq_condition(&mut expr_arena, 10, 20)],
+        );
+        let alternatives = derived_alternatives(&unsupported_shuffle_key, &expr_arena);
+        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives[0].kind, PropertyAlternativeKind::BroadcastJoin);
+        assert!(advisory_for_derived_hash_join(
+            &unsupported_shuffle_key,
+            &expr_arena
+        ));
+    }
+
+    #[test]
+    fn feasibility_not_advisory_for_ordinary_equi_inner_join() {
+        let mut arena = ScalarArena::new();
+        let ordinary_equi = join_op(
+            JoinKind::Inner,
+            vec![column_eq_condition(&mut arena, 10, 20)],
+        );
+        let alternatives = derived_alternatives(&ordinary_equi, &arena);
+        assert!(alternatives
+            .iter()
+            .any(|alt| alt.kind == PropertyAlternativeKind::BroadcastJoin));
+        assert!(alternatives
+            .iter()
+            .any(|alt| alt.kind == PropertyAlternativeKind::ShuffleJoin));
+        assert!(!advisory_for_derived_hash_join(&ordinary_equi, &arena));
+
+        let right_outer = join_op(JoinKind::RightOuter, vec![]);
+        let right_outer_alternatives = derived_alternatives(&right_outer, &ScalarArena::new());
+        assert_eq!(right_outer_alternatives.len(), 1);
+        assert_eq!(
+            right_outer_alternatives[0].kind,
+            PropertyAlternativeKind::ShuffleJoin
+        );
+        assert!(!advisory_for_derived_hash_join(
+            &right_outer,
+            &ScalarArena::new()
+        ));
+
+        assert!(!feasibility_is_advisory_only(&scan_op(), &[]));
     }
 
     #[test]
