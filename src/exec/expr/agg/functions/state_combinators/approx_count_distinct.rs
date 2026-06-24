@@ -125,8 +125,11 @@ mod tests {
     fn approx_count_distinct_state_byte_equal_to_min_state() {
         let input = Arc::new(Int64Array::from(vec![Some(5), Some(5), Some(3), None])) as ArrayRef;
 
-        let approx_count_distinct =
-            state_bytes("approx_count_distinct_state", &DataType::Int64, input.clone());
+        let approx_count_distinct = state_bytes(
+            "approx_count_distinct_state",
+            &DataType::Int64,
+            input.clone(),
+        );
         let min = state_bytes("min_state", &DataType::Int64, input);
 
         assert_eq!(

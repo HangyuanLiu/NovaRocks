@@ -1002,7 +1002,9 @@ mod tests {
 
         let mut ctx2 = build_ctx();
         let expr2 = logical_plan_to_opt_expr(&plan, &mut ctx2.scalar_arena().borrow_mut());
-        let result = rule.apply(expr2, &mut ctx2).expect("apply must not return Err");
+        let result = rule
+            .apply(expr2, &mut ctx2)
+            .expect("apply must not return Err");
         assert!(
             matches!(result, RewriteResult::Rejected(_)),
             "UnsupportedJoinKindCheckRule must return Rejected, got {result:?}"

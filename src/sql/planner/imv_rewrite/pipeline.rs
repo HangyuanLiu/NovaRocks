@@ -16,7 +16,9 @@ use crate::sql::planner::imv_rewrite::aggregate_rewrite::RewriteAggregateStateRu
 use crate::sql::planner::imv_rewrite::apply_key::InjectApplyKeyProjectRule;
 use crate::sql::planner::imv_rewrite::branch_union::RewriteBranchUnionRule;
 use crate::sql::planner::imv_rewrite::delta_pushdown::PushDeltaThroughUnaryRule;
-use crate::sql::planner::imv_rewrite::join_delta::{RewriteJoinDeltaRule, UnsupportedJoinKindCheckRule};
+use crate::sql::planner::imv_rewrite::join_delta::{
+    RewriteJoinDeltaRule, UnsupportedJoinKindCheckRule,
+};
 use crate::sql::planner::imv_rewrite::marker::{UnresolvedMarkerCheckRule, WrapRootInImvDeltaRule};
 use crate::sql::planner::imv_rewrite::partition_derivation::DerivePartitionSpecRule;
 use crate::sql::planner::imv_rewrite::row_id_column::InjectRowIdRule;
