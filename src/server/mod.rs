@@ -485,6 +485,9 @@ struct NovaRocksMysqlShim {
     /// Per-session group_concat limit (in bytes).
     /// Set via `SET group_concat_max_len = N`.
     group_concat_max_len: i64,
+    /// Per-session pipeline DOP override. `None` (or `SET pipeline_dop = 0`) means auto
+    /// (cores/2 via `exec_env::calc_pipeline_dop`); a positive value pins the DOP for this session.
+    pipeline_dop: Option<i32>,
     optimizer_settings: SessionOptimizerSettings,
     user_variables: BTreeMap<String, String>,
 }
@@ -507,6 +510,7 @@ impl NovaRocksMysqlShim {
             current_db: DEFAULT_DATABASE.to_string(),
             query_timeout_secs: None,
             group_concat_max_len: 1024,
+            pipeline_dop: None,
             optimizer_settings: SessionOptimizerSettings::default(),
             user_variables: BTreeMap::new(),
         }
@@ -796,6 +800,12 @@ fn parse_set_query_timeout(query: &str) -> Option<u64> {
     parse_set_non_negative_integer(query, "query_timeout")
 }
 
+/// Parse `SET pipeline_dop = N`. `N` must be a non-negative integer that fits in `i32`;
+/// `N == 0` clears the session override (auto = cores/2).
+fn parse_set_pipeline_dop(query: &str) -> Option<i32> {
+    parse_set_non_negative_integer(query, "pipeline_dop").and_then(|v| i32::try_from(v).ok())
+}
+
 /// Parse `SET group_concat_max_len = N` and `SET group_concat_max_len=N`.
 /// `N` must be a non-negative integer and is clamped later by FE-compatible
 /// lowering rules.
@@ -1009,6 +1019,11 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
+    if let Some(dop) = parse_set_pipeline_dop(trimmed) {
+        shim.pipeline_dop = if dop <= 0 { None } else { Some(dop) };
+        return Ok(StatementResult::Ok);
+    }
+
     if let Some((name, enabled)) = parse_set_boolean(trimmed) {
         match name.as_str() {
             "enable_ukfk_opt" => shim.optimizer_settings.enable_ukfk_opt = enabled,
@@ -1172,6 +1187,7 @@ async fn execute_sql_in_worker(
     let query_options = crate::internal_service::TQueryOptions {
         group_concat_max_len: Some(shim.group_concat_max_len),
         query_timeout: query_timeout.and_then(|secs| i32::try_from(secs).ok()),
+        pipeline_dop: shim.pipeline_dop,
         allow_throw_exception: if allow_throw_exception {
             Some(true)
         } else {
@@ -1716,6 +1732,18 @@ mod tests {
             parse_set_query_timeout("SET query_timeout = 60 extra"),
             None
         );
+    }
+
+    #[test]
+    fn parse_set_pipeline_dop_accepts_and_rejects() {
+        assert_eq!(parse_set_pipeline_dop("SET pipeline_dop = 8"), Some(8));
+        assert_eq!(parse_set_pipeline_dop("set pipeline_dop=1"), Some(1));
+        // 0 is accepted by the parser and interpreted as "clear override" by the dispatcher.
+        assert_eq!(parse_set_pipeline_dop("SET PIPELINE_DOP = 0"), Some(0));
+        // Unrelated / malformed statements do not match.
+        assert_eq!(parse_set_pipeline_dop("SET query_timeout = 8"), None);
+        assert_eq!(parse_set_pipeline_dop("SELECT 1"), None);
+        assert_eq!(parse_set_pipeline_dop("SET pipeline_dop = abc"), None);
     }
 
     #[test]

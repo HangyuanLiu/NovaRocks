@@ -210,7 +210,13 @@ impl ExecutionCoordinator {
         // ---------------------------------------------------------------
         // 4. Translate every placement into a fragment params and submit.
         // ---------------------------------------------------------------
-        let pipeline_dop = crate::runtime::dispatcher::compute_pipeline_dop();
+        // Honor a per-session `SET pipeline_dop = N` override (carried on TQueryOptions); 0/None
+        // means auto (cores/2).
+        let session_dop = query_options
+            .as_ref()
+            .and_then(|opts| opts.pipeline_dop)
+            .unwrap_or(0);
+        let pipeline_dop = crate::runtime::dispatcher::compute_pipeline_dop(session_dop);
         let needs_fragment_status_report =
             dispatcher.needs_fragment_status_report() || collect_profiles;
         let mut novarocks_report_addr: Option<types::TNetworkAddress> = None;

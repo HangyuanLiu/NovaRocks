@@ -4050,8 +4050,13 @@ fn execute_plan(
             None => Box::new(ResultSinkFactory::new(handle.clone())),
         };
 
-    // Unified pipeline DOP: cores/2 via the shared exec_env helper (no hardcoded min(4) cap).
-    let pipeline_dop = crate::runtime::exec_env::calc_pipeline_dop(0) as usize;
+    // Unified pipeline DOP: a per-session `SET pipeline_dop = N` override (on TQueryOptions) is
+    // honored; otherwise auto = cores/2 via the shared exec_env helper (no hardcoded min(4) cap).
+    let session_dop = query_opts
+        .as_ref()
+        .and_then(|opts| opts.pipeline_dop)
+        .unwrap_or(0);
+    let pipeline_dop = crate::runtime::exec_env::calc_pipeline_dop(session_dop) as usize;
     execute_plan_with_pipeline(
         exec_plan,
         false,
