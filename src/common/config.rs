@@ -92,7 +92,6 @@ pub(crate) fn optimizer_query_mem_limit_bytes() -> u64 {
         .unwrap_or(2 * 1024 * 1024 * 1024)
 }
 
-#[allow(dead_code)]
 pub(crate) fn optimizer_effective_backend_count() -> u64 {
     novarocks_app_config()
         .ok()

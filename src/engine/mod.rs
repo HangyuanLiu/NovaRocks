@@ -3066,6 +3066,36 @@ fn collapse_distribution_enforcers_for_single_fragment(
     node
 }
 
+/// Live BE count for broadcast fanout (1 FE + N BE distributed baseline).
+/// Precedence: live BE registry > [runtime] config (>0) > defensive 1.0.
+/// Err / empty registry / misconfig collapse to the config tier or the 1.0
+/// floor (never panics). NOT a standalone-specific branch: all-in-one is a
+/// test shell that registers one loopback BE; goldens pin SET to the real N.
+fn live_effective_backend_count() -> f64 {
+    if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
+        let entries = registry.live_endpoints();
+        if !entries.is_empty() {
+            return (entries.len() as f64).max(1.0);
+        }
+    }
+    let configured = crate::common::config::optimizer_effective_backend_count();
+    if configured > 0 {
+        return configured as f64;
+    }
+    1.0
+}
+
+/// Fold the live BE count into the TLS session settings before optimize(),
+/// unless the session explicitly SET cbo_broadcast_backend_count (which wins
+/// in from_session). Idempotent; safe to call before every optimize() site.
+fn snapshot_effective_backend_count_into_session() {
+    let mut snapshot = crate::sql::optimizer::options::current_session_optimizer_settings();
+    if snapshot.cbo_broadcast_backend_count.is_none() {
+        snapshot.effective_backend_count = Some(live_effective_backend_count());
+        crate::sql::optimizer::options::install_session_optimizer_settings(snapshot);
+    }
+}
+
 /// Common preparation pipeline shared by `EXPLAIN` and `EXPLAIN ANALYZE`:
 /// inline user-defined views and rewrite time-travel refs. Ordinary Iceberg
 /// table resolution is handled by the analyzer provider.
@@ -3137,6 +3167,7 @@ fn explain_analyze_query(
         ),
         None => Vec::new(),
     };
+    snapshot_effective_backend_count_into_session();
     let physical = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
@@ -3294,6 +3325,7 @@ fn explain_query(
         None => Vec::new(),
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
+    snapshot_effective_backend_count_into_session();
     let physical = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
@@ -3486,6 +3518,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     )?;
     let providers = query_stats::QueryStatsProviders::from_standalone_state(state);
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+    snapshot_effective_backend_count_into_session();
     let physical = match root_distribution {
         Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
             opt_expr,
@@ -3687,6 +3720,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         _ => Vec::new(),
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
+    snapshot_effective_backend_count_into_session();
     let physical = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
@@ -9411,6 +9445,66 @@ path = "meta/operations.sqlite"
         assert_eq!(super::dispatcher_kind_for_test(&dispatcher), "remote");
         assert_eq!(dispatcher.backend_count(), 1);
         assert_eq!(scheduler.live_backend_entries(), &[(2usize, endpoint)]);
+    }
+
+    fn install_optimizer_backend_count_config(
+        optimizer_backend_count: u64,
+        cluster_backends: Vec<String>,
+    ) {
+        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.backends = cluster_backends;
+        cfg.runtime.optimizer_effective_backend_count = optimizer_backend_count;
+        crate::common::app_config::install_preloaded_config(cfg);
+    }
+
+    #[test]
+    fn live_effective_backend_count_prefers_live_registry_over_runtime_config() {
+        let _guard = super::acquire_standalone_test_guard();
+        let _registry = BackendRegistryReset::new();
+        use crate::runtime::backend_registry::{BackendRegistry, BackendState};
+
+        install_optimizer_backend_count_config(7, vec!["127.0.0.1:19080".to_string()]);
+        let registry = Arc::new(BackendRegistry::new(3));
+        registry.restore_backend(2, "127.0.0.1:19081".parse().unwrap(), BackendState::Live);
+        registry.restore_backend(3, "127.0.0.1:19082".parse().unwrap(), BackendState::Live);
+        crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
+
+        assert_eq!(super::live_effective_backend_count(), 2.0);
+    }
+
+    #[test]
+    fn live_effective_backend_count_prefers_runtime_config_when_registry_absent() {
+        let _guard = super::acquire_standalone_test_guard();
+        let _registry = BackendRegistryReset::new();
+
+        install_optimizer_backend_count_config(
+            7,
+            vec!["127.0.0.1:19083".to_string(), "127.0.0.1:19084".to_string()],
+        );
+
+        assert_eq!(super::live_effective_backend_count(), 7.0);
+    }
+
+    #[test]
+    fn live_effective_backend_count_prefers_runtime_config_when_registry_empty() {
+        let _guard = super::acquire_standalone_test_guard();
+        let _registry = BackendRegistryReset::new();
+        let registry = Arc::new(crate::runtime::backend_registry::BackendRegistry::new(3));
+
+        install_optimizer_backend_count_config(7, vec!["127.0.0.1:19085".to_string()]);
+        crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
+
+        assert_eq!(super::live_effective_backend_count(), 7.0);
+    }
+
+    #[test]
+    fn live_effective_backend_count_defaults_to_one_without_registry_or_runtime_config() {
+        let _guard = super::acquire_standalone_test_guard();
+        let _registry = BackendRegistryReset::new();
+
+        install_optimizer_backend_count_config(0, Vec::new());
+
+        assert_eq!(super::live_effective_backend_count(), 1.0);
     }
 
     #[test]
