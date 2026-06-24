@@ -2124,6 +2124,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_admin_raise_engine_error_accepts_position_delete_descriptor_code() {
+        let err = parse_admin_raise_engine_error_query(
+            "ADMIN RAISE ENGINE ERROR 'UnsupportedPositionDeleteDescriptor'",
+        )
+        .expect("parse ok")
+        .expect("matched");
+
+        assert_eq!(
+            err.to_bracketed_user_message(),
+            "[UnsupportedPositionDeleteDescriptor] forced position-delete descriptor error-code smoke"
+        );
+    }
+
+    #[test]
     fn parse_admin_raise_engine_error_rejects_unknown_code() {
         let err = parse_admin_raise_engine_error_query("ADMIN RAISE ENGINE ERROR 'NotARealCode'")
             .expect_err("unknown code should fail");

@@ -249,23 +249,30 @@ struct TSchemaTableSink {
 }
 
 struct TIcebergPositionDeleteOutputField {
+    // Zero-based index in TIcebergTableSink output_exprs.
     1: optional i32 output_expr_index
+    // Output column name in the delete-file projection.
     2: optional string name
     3: optional Types.TTypeDesc type_desc
+    // Iceberg field id written to Parquet field-id metadata.
     4: optional i32 field_id
 }
 
 struct TIcebergPositionDeletePartitionSourceField {
+    // Zero-based index in TIcebergTableSink output_exprs.
     1: optional i32 output_expr_index
     2: optional string source_column_name
     3: optional string partition_field_name
     4: optional string transform_expr
+    // Iceberg source table field id for the partition transform source.
     5: optional i32 source_field_id
 }
 
+// Planner-provided position-delete output contract consumed by the sink.
 struct TIcebergPositionDeleteOutputDescriptor {
     1: optional TIcebergPositionDeleteOutputField file_path
     2: optional TIcebergPositionDeleteOutputField pos
+    // Source columns projected after file_path and pos for partition reporting.
     3: optional list<TIcebergPositionDeletePartitionSourceField> partition_source_fields
     4: optional i32 target_partition_spec_id
 }
@@ -282,6 +289,7 @@ struct TIcebergTableSink {
     8: optional i32 tuple_id
     9: optional string data_location
     10: optional i32 target_partition_spec_id
+    // Optional planner contract for position-delete and deletion-vector writes.
     11: optional TIcebergPositionDeleteOutputDescriptor position_delete_output_descriptor
 }
 
