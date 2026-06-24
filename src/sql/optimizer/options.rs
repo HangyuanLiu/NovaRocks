@@ -44,6 +44,16 @@ pub(crate) struct SessionOptimizerSettings {
     pub max_reorder_node_use_greedy: Option<usize>,
     /// Session override for `cbo_max_reorder_node` (None = default 50).
     pub max_reorder_node: Option<usize>,
+    /// Session override for the broadcast fanout backend count (`cbo_broadcast_backend_count`).
+    /// `None` means use the engine-snapshotted live BE count (CI baseline 3).
+    pub cbo_broadcast_backend_count: Option<f64>,
+    /// Session override for the per-node broadcast build memory budget in bytes
+    /// (`cbo_broadcast_node_mem_budget_bytes`). `None` means the profile default (1 GiB).
+    pub cbo_broadcast_node_mem_budget_bytes: Option<f64>,
+    /// Snapshot of the live BE registry count, written by the engine before
+    /// `optimize()` when the session has not explicitly SET a backend count.
+    /// `None` means no snapshot available (fall back to profile default).
+    pub effective_backend_count: Option<f64>,
 }
 
 impl SessionOptimizerSettings {
@@ -119,7 +129,7 @@ pub(crate) struct OptimizerOptions {
     /// match StarRocks; overridable via the `cbo_enable_dp/greedy_join_reorder`
     /// and `cbo_max_reorder_node*` session variables.
     pub reorder: ReorderOptions,
-    /// Physical operator cost-model options. Currently not session-overridable.
+    /// Physical operator cost-model options, including session resource-profile overrides.
     pub cost_options: CostOptions,
 }
 
@@ -189,6 +199,23 @@ impl OptimizerOptions {
         if let Some(v) = settings.max_reorder_node {
             opts.reorder.max_reorder_node = v;
         }
+        // BC-1: cluster/resource profile overrides. Precedence: explicit
+        // session SET > engine live-registry snapshot > profile default.
+        let mut profile = opts.cost_options.profile.clone();
+        if let Some(v) = settings
+            .cbo_broadcast_backend_count
+            .or(settings.effective_backend_count)
+        {
+            profile.effective_backend_count = v;
+        }
+        if let Some(v) = settings.cbo_broadcast_node_mem_budget_bytes {
+            profile.per_node_build_memory_budget_bytes = v;
+        }
+        // Re-derive the LAYER 2 network budget from the possibly overridden
+        // per-node budget and backend count.
+        profile.cluster_broadcast_network_budget_bytes =
+            profile.per_node_build_memory_budget_bytes * profile.effective_backend_count;
+        opts.cost_options.apply_profile(profile);
         opts
     }
 }
@@ -307,6 +334,63 @@ mod tests {
         let o = OptimizerOptions::from_session(&s);
         assert_eq!(o.rf_build_max_bytes, 1);
         assert!((o.rf_probe_min_selectivity - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn from_session_overrides_profile_and_syncs_backend_factor() {
+        let mut settings = SessionOptimizerSettings::default();
+        settings.cbo_broadcast_backend_count = Some(16.0);
+        settings.cbo_broadcast_node_mem_budget_bytes = Some(256.0 * 1024.0 * 1024.0);
+        let opts = OptimizerOptions::from_session(&settings);
+        assert_eq!(opts.cost_options.profile.effective_backend_count, 16.0);
+        assert_eq!(opts.cost_options.backend_factor, 16.0);
+        assert_eq!(
+            opts.cost_options.profile.per_node_build_memory_budget_bytes,
+            256.0 * 1024.0 * 1024.0
+        );
+        // LAYER 2 network budget re-derives from per-node * backends.
+        assert_eq!(
+            opts.cost_options
+                .profile
+                .cluster_broadcast_network_budget_bytes,
+            256.0 * 1024.0 * 1024.0 * 16.0
+        );
+    }
+
+    #[test]
+    fn from_session_default_keeps_ci_baseline_profile() {
+        let opts = OptimizerOptions::from_session(&SessionOptimizerSettings::default());
+        assert_eq!(opts.cost_options.profile.effective_backend_count, 3.0);
+        assert_eq!(opts.cost_options.backend_factor, 3.0);
+    }
+
+    #[test]
+    fn from_session_uses_engine_snapshot_when_set_unset() {
+        let mut settings = SessionOptimizerSettings::default();
+        settings.cbo_broadcast_backend_count = None;
+        settings.effective_backend_count = Some(11.0);
+        let default_per_node = CostOptions::default()
+            .profile
+            .per_node_build_memory_budget_bytes;
+        let opts = OptimizerOptions::from_session(&settings);
+        assert_eq!(opts.cost_options.profile.effective_backend_count, 11.0);
+        assert_eq!(opts.cost_options.backend_factor, 11.0);
+        assert_eq!(
+            opts.cost_options
+                .profile
+                .cluster_broadcast_network_budget_bytes,
+            default_per_node * 11.0
+        );
+    }
+
+    #[test]
+    fn from_session_explicit_set_overrides_engine_snapshot() {
+        // SET takes precedence over the engine-written snapshot.
+        let mut settings = SessionOptimizerSettings::default();
+        settings.cbo_broadcast_backend_count = Some(7.0);
+        settings.effective_backend_count = Some(3.0);
+        let opts = OptimizerOptions::from_session(&settings);
+        assert_eq!(opts.cost_options.profile.effective_backend_count, 7.0);
     }
 
     #[test]
