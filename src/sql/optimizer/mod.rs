@@ -13,6 +13,7 @@ pub(crate) mod memo_copy;
 pub(crate) mod operator;
 pub(crate) mod opt_expr;
 pub(crate) mod options;
+pub(crate) mod pattern;
 pub(crate) mod physical_plan;
 pub(crate) mod property;
 pub(crate) mod rewrite;
