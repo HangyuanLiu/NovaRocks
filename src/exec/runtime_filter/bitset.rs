@@ -28,9 +28,9 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::DataType;
@@ -282,6 +282,8 @@ pub(crate) fn maybe_build_runtime_bitset_filter(
 
 fn supports_runtime_bitset_ltype(ltype: &crate::types::TPrimitiveType) -> bool {
     use crate::types::TPrimitiveType;
+    // Mirrors StarRocks bitset-supported logical types; DATETIME, VARCHAR,
+    // LARGEINT, FLOAT, DOUBLE, and DECIMAL128 stay on bloom/min-max paths.
     matches!(
         ltype,
         t if *t == TPrimitiveType::BOOLEAN
@@ -290,7 +292,22 @@ fn supports_runtime_bitset_ltype(ltype: &crate::types::TPrimitiveType) -> bool {
             || *t == TPrimitiveType::INT
             || *t == TPrimitiveType::BIGINT
             || *t == TPrimitiveType::DATE
+            || *t == TPrimitiveType::DECIMAL32
+            || *t == TPrimitiveType::DECIMAL64
     )
+}
+
+fn is_decimal_bitset_ltype(ltype: &crate::types::TPrimitiveType) -> bool {
+    matches!(
+        *ltype,
+        crate::types::TPrimitiveType::DECIMAL32 | crate::types::TPrimitiveType::DECIMAL64
+    )
+}
+
+fn decimal_value_for_bitset(arr: &Decimal128Array, index: usize) -> Result<i64, String> {
+    let value = arr.value(index);
+    i64::try_from(value)
+        .map_err(|_| format!("runtime bitset decimal value out of i64 range: {}", value))
 }
 
 fn should_use_bitset(bitset_memory_usage: usize, bloom_memory_usage: usize) -> bool {
@@ -397,6 +414,21 @@ fn scan_bitset_build_stats(
                         continue;
                     }
                     update(arr.value(i) as i64);
+                }
+            }
+            DataType::Decimal128(_, _) if is_decimal_bitset_ltype(ltype) => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        "runtime bitset build type mismatch for Decimal128".to_string()
+                    })?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        has_null = true;
+                        continue;
+                    }
+                    update(decimal_value_for_bitset(arr, i)?);
                 }
             }
             _ => {
@@ -509,6 +541,20 @@ fn fill_bitset_from_arrays(
                     set_value(arr.value(i) as i64);
                 }
             }
+            DataType::Decimal128(_, _) if is_decimal_bitset_ltype(ltype) => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        "runtime bitset build type mismatch for Decimal128".to_string()
+                    })?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        continue;
+                    }
+                    set_value(decimal_value_for_bitset(arr, i)?);
+                }
+            }
             _ => {
                 return Err(format!(
                     "runtime bitset build unsupported type mapping: ltype={:?} data_type={:?}",
@@ -519,6 +565,148 @@ fn fill_bitset_from_arrays(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Decimal128Array, StringArray, TimestampMicrosecondArray};
+
+    use crate::types::TPrimitiveType;
+
+    use super::*;
+
+    fn decimal_array(values: Vec<Option<i128>>, precision: u8, scale: i8) -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(precision, scale)
+                .expect("decimal precision and scale"),
+        )
+    }
+
+    fn min_max_for(ltype: TPrimitiveType) -> RuntimeMinMaxFilter {
+        RuntimeMinMaxFilter::full_range(ltype).expect("runtime min/max full range")
+    }
+
+    #[test]
+    fn decimal64_compact_domain_builds_and_filters() {
+        let scale = 2;
+        let build = decimal_array(
+            vec![Some(100_i128), Some(101_i128), Some(103_i128)],
+            18,
+            scale,
+        );
+        let filter = maybe_build_runtime_bitset_filter(
+            7,
+            SlotId(3),
+            TPrimitiveType::DECIMAL64,
+            0,
+            16,
+            &[build],
+            min_max_for(TPrimitiveType::DECIMAL64),
+        )
+        .expect("build decimal64 bitset")
+        .expect("decimal64 compact domain should use bitset");
+
+        let probe = decimal_array(
+            vec![
+                Some(99_i128),
+                Some(100_i128),
+                Some(101_i128),
+                Some(102_i128),
+                Some(103_i128),
+                None,
+            ],
+            18,
+            scale,
+        );
+        let mut keep = vec![true; probe.len()];
+        apply_bitset_filter(
+            &filter,
+            &TPrimitiveType::DECIMAL64,
+            filter.has_null(),
+            probe,
+            &mut keep,
+        )
+        .expect("filter decimal64 probe");
+
+        assert_eq!(keep, vec![false, true, true, false, true, false]);
+    }
+
+    #[test]
+    fn decimal32_compact_domain_builds_and_filters() {
+        let scale = 1;
+        let build = decimal_array(
+            vec![Some(-12_i128), Some(-10_i128), Some(-9_i128)],
+            9,
+            scale,
+        );
+        let filter = maybe_build_runtime_bitset_filter(
+            8,
+            SlotId(4),
+            TPrimitiveType::DECIMAL32,
+            0,
+            16,
+            &[build],
+            min_max_for(TPrimitiveType::DECIMAL32),
+        )
+        .expect("build decimal32 bitset")
+        .expect("decimal32 compact domain should use bitset");
+
+        let probe = decimal_array(
+            vec![
+                Some(-13_i128),
+                Some(-12_i128),
+                Some(-11_i128),
+                Some(-10_i128),
+                Some(-9_i128),
+                None,
+            ],
+            9,
+            scale,
+        );
+        let mut keep = vec![true; probe.len()];
+        apply_bitset_filter(
+            &filter,
+            &TPrimitiveType::DECIMAL32,
+            filter.has_null(),
+            probe,
+            &mut keep,
+        )
+        .expect("filter decimal32 probe");
+
+        assert_eq!(keep, vec![false, true, false, true, true, false]);
+    }
+
+    #[test]
+    fn datetime_and_varchar_still_fall_back_to_bloom() {
+        let datetime = Arc::new(TimestampMicrosecondArray::from(vec![Some(1_000_i64)])) as ArrayRef;
+        let datetime_filter = maybe_build_runtime_bitset_filter(
+            9,
+            SlotId(5),
+            TPrimitiveType::DATETIME,
+            0,
+            1,
+            &[datetime],
+            min_max_for(TPrimitiveType::DATETIME),
+        )
+        .expect("build datetime bitset fallback");
+        assert!(datetime_filter.is_none());
+
+        let varchar = Arc::new(StringArray::from(vec![Some("a"), Some("b")])) as ArrayRef;
+        let varchar_filter = maybe_build_runtime_bitset_filter(
+            10,
+            SlotId(6),
+            TPrimitiveType::VARCHAR,
+            0,
+            2,
+            &[varchar],
+            min_max_for(TPrimitiveType::VARCHAR),
+        )
+        .expect("build varchar bitset fallback");
+        assert!(varchar_filter.is_none());
+    }
 }
 
 fn apply_bitset_filter(
@@ -643,6 +831,22 @@ fn apply_bitset_filter(
                     continue;
                 }
                 *keep = test_value(arr.value(i) as i64);
+            }
+        }
+        DataType::Decimal128(_, _) if is_decimal_bitset_ltype(ltype) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| "runtime bitset filter type mismatch for Decimal128".to_string())?;
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
+                    continue;
+                }
+                if arr.is_null(i) {
+                    *keep = has_null;
+                    continue;
+                }
+                *keep = test_value(decimal_value_for_bitset(arr, i)?);
             }
         }
         DataType::Timestamp(unit, _) => match unit {
