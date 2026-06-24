@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use super::cost::{CostInput, CostOptions, compute_cost_estimate};
 use super::derive::PropertyAlternativeKind;
 use super::memo::{GroupId, Memo, TotalCost};
+#[cfg(test)]
 use super::operator::*;
 use super::property::*;
 use super::statistics::CostEstimate;
@@ -227,9 +228,8 @@ impl SearchContext {
                 required,
                 expr.children.len(),
             );
-            let broadcast_is_only_alternative = !alternatives
-                .iter()
-                .any(|alt| alt.kind != PropertyAlternativeKind::BroadcastJoin);
+            let feasibility_is_advisory =
+                super::cost::feasibility_is_advisory_only(&expr.op, &alternatives);
             for alt in alternatives {
                 let child_reqs = alt.child_props.clone();
                 if child_reqs.len() != expr.children.len() {
@@ -237,11 +237,6 @@ impl SearchContext {
                 }
 
                 if alt.kind == PropertyAlternativeKind::BroadcastJoin {
-                    let required_for_correctness = matches!(
-                        &expr.op,
-                        Operator::PhysicalHashJoin(join)
-                            if join.join_type == crate::sql::common::JoinKind::NullAwareLeftAnti
-                    );
                     if let (Some(&probe_group_id), Some(&build_group_id)) =
                         (expr.children.first(), expr.children.get(1))
                     {
@@ -249,14 +244,12 @@ impl SearchContext {
                             stats_for_group(&memo.groups[probe_group_id], memo, &self.stats_input);
                         let build_stats =
                             stats_for_group(&memo.groups[build_group_id], memo, &self.stats_input);
-                        if !required_for_correctness
-                            && !broadcast_is_only_alternative
-                            && !super::cost::broadcast_gate_passes(
-                                &probe_stats,
-                                &build_stats,
-                                &self.cost_options,
-                            )
-                        {
+                        let feas = super::cost::broadcast_is_feasible(
+                            &probe_stats,
+                            &build_stats,
+                            &self.cost_options,
+                        );
+                        if !feasibility_is_advisory && !feas.feasible {
                             continue;
                         }
                     }
@@ -739,6 +732,24 @@ mod tests {
             equivalence_classes: Default::default(),
             unique_columns: vec![],
         });
+    }
+
+    fn set_group_logical_stats_for_test(
+        memo: &mut Memo,
+        group: GroupId,
+        rows: f64,
+        row_width: f64,
+        confidence: crate::sql::optimizer::statistics::Confidence,
+    ) {
+        set_group_logical_rows_for_test(memo, group, rows, confidence);
+        let props = memo.groups[group]
+            .logical_props
+            .as_mut()
+            .expect("logical props should have been installed");
+        let mut column = crate::sql::optimizer::statistics::ColumnStatistic::unknown();
+        column.average_row_size = row_width;
+        column.confidence = confidence;
+        props.column_statistics.insert(ColumnId(10_000), column);
     }
 
     fn make_large_build_inner_join_memo_for_test(
@@ -1328,9 +1339,8 @@ mod tests {
         ctx.optimize_group(&memo, root, &required).expect("search");
         let winner = ctx.winners.get(&(root, required.clone())).expect("winner");
 
-        // The exact probe side is much larger than the fallback build side,
-        // so broadcast would be cheaper than shuffle if the fallback
-        // broadcast row gate did not reject builds above 500k rows.
+        // Fallback stats without column statistics are uninformative, so the
+        // feasibility predicate prunes broadcast even when it could be cheaper.
         assert_eq!(
             winner.alt_kind,
             crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
@@ -1338,48 +1348,96 @@ mod tests {
     }
 
     #[test]
-    fn search_broadcast_gate_uses_context_cost_options() {
-        let (memo, root, table_stats) = make_large_build_inner_join_memo_for_test(
+    fn search_broadcast_feasibility_uses_context_cost_options() {
+        let (mut memo, root) = make_two_table_inner_join_memo_for_test();
+        let (probe_group, build_group) = inner_join_child_groups_for_test(&memo, root);
+        set_group_logical_stats_for_test(
+            &mut memo,
+            probe_group,
             10_000_000.0,
-            500_001.0,
-            crate::sql::optimizer::statistics::Confidence::Fallback,
+            8.0,
+            crate::sql::optimizer::statistics::Confidence::Exact,
         );
+        set_group_logical_stats_for_test(
+            &mut memo,
+            build_group,
+            100_000.0,
+            8.0,
+            crate::sql::optimizer::statistics::Confidence::Exact,
+        );
+
         let required = PhysicalPropertySet::gather();
-
-        let mut default_ctx = SearchContext::new(
-            legacy_stats_input(table_stats.clone()),
-            CostOptions::default(),
-        );
-        default_ctx
+        let mut low_budget_profile = crate::sql::optimizer::cost::ClusterResourceProfile::default();
+        low_budget_profile.per_node_build_memory_budget_bytes = 1.0 * 1024.0 * 1024.0;
+        let mut low_budget_options = CostOptions::default();
+        low_budget_options.apply_profile(low_budget_profile);
+        let mut low_budget_ctx = SearchContext::new(empty_stats_input(), low_budget_options);
+        low_budget_ctx
             .optimize_group(&memo, root, &required)
-            .expect("default search");
-        let default_winner = default_ctx
+            .expect("low-budget search");
+        let low_budget_winner = low_budget_ctx
             .winners
             .get(&(root, required.clone()))
-            .expect("default winner");
+            .expect("low-budget winner");
 
-        let custom_options = CostOptions {
-            fallback_broadcast_row_limit: 600_000.0,
-            ..Default::default()
-        };
-        let mut custom_ctx = SearchContext::new(legacy_stats_input(table_stats), custom_options);
-        custom_ctx
+        let mut high_budget_profile =
+            crate::sql::optimizer::cost::ClusterResourceProfile::default();
+        high_budget_profile.per_node_build_memory_budget_bytes = 8.0 * 1024.0 * 1024.0;
+        let mut high_budget_options = CostOptions::default();
+        high_budget_options.apply_profile(high_budget_profile);
+        let mut high_budget_ctx = SearchContext::new(empty_stats_input(), high_budget_options);
+        high_budget_ctx
             .optimize_group(&memo, root, &required)
-            .expect("custom search");
-        let custom_winner = custom_ctx
+            .expect("high-budget search");
+        let high_budget_winner = high_budget_ctx
             .winners
             .get(&(root, required.clone()))
-            .expect("custom winner");
+            .expect("high-budget winner");
 
         assert_eq!(
-            default_winner.alt_kind,
+            low_budget_winner.alt_kind,
             crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
         );
         assert_eq!(
-            custom_winner.alt_kind,
+            high_budget_winner.alt_kind,
             crate::sql::optimizer::derive::PropertyAlternativeKind::BroadcastJoin
         );
-        assert_ne!(default_winner.alt_kind, custom_winner.alt_kind);
+        assert_ne!(low_budget_winner.alt_kind, high_budget_winner.alt_kind);
+    }
+
+    #[test]
+    fn search_prunes_broadcast_when_hash_table_exceeds_node_budget() {
+        let (mut memo, root) = make_two_table_inner_join_memo_for_test();
+        let (probe_group, build_group) = inner_join_child_groups_for_test(&memo, root);
+        set_group_logical_stats_for_test(
+            &mut memo,
+            probe_group,
+            10_000_000.0,
+            8.0,
+            crate::sql::optimizer::statistics::Confidence::Exact,
+        );
+        set_group_logical_stats_for_test(
+            &mut memo,
+            build_group,
+            100_000.0,
+            8.0,
+            crate::sql::optimizer::statistics::Confidence::Exact,
+        );
+
+        let mut profile = crate::sql::optimizer::cost::ClusterResourceProfile::default();
+        profile.per_node_build_memory_budget_bytes = 1.0 * 1024.0 * 1024.0;
+        let mut options = CostOptions::default();
+        options.apply_profile(profile);
+        let mut ctx = SearchContext::new(empty_stats_input(), options);
+        let required = PhysicalPropertySet::gather();
+
+        ctx.optimize_group(&memo, root, &required).expect("search");
+        let winner = ctx.winners.get(&(root, required.clone())).expect("winner");
+
+        assert_eq!(
+            winner.alt_kind,
+            crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
+        );
     }
 
     #[test]
@@ -1504,7 +1562,6 @@ mod cascaded_derivation_tests {
     use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
-    use crate::sql::optimizer::operator::*;
     use crate::sql::optimizer::statistics::TableStatistics;
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::optimizer_bridge::scalar::intern_window_exprs;
