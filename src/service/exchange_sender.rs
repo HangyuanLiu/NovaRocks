@@ -130,18 +130,39 @@ pub enum ExchangeSendEnqueue {
     NoCapacity,
 }
 
+/// Divisor applied to the global inflight budget to derive the per-destination cap. A single slow
+/// destination's queued backlog is bounded to `max_inflight_bytes / DIVISOR`, so it cannot consume
+/// the whole global budget and head-of-line-block sends to other (healthy) destinations. Tunable;
+/// derived (not yet a config knob) to keep this change focused.
+const INFLIGHT_BYTES_PER_DEST_DIVISOR: usize = 4;
+
 pub struct ExchangeSendQueue {
     inflight_bytes: Arc<AtomicUsize>,
     max_inflight_bytes: usize,
+    /// Per-destination reserved bytes (in-flight + queued), keyed by destination channel. Bounds
+    /// each destination's backlog (see `INFLIGHT_BYTES_PER_DEST_DIVISOR`) so one slow receiver does
+    /// not exhaust the shared `inflight_bytes` and stall senders to other destinations.
+    per_dest_bytes: Arc<Mutex<HashMap<ExchangeSendKey, usize>>>,
+    max_inflight_bytes_per_dest: usize,
     queues: Arc<Mutex<HashMap<ExchangeSendKey, VecDeque<QueuedSendTask>>>>,
     send_observers: Mutex<Vec<std::sync::Weak<Observable>>>,
 }
 
 impl ExchangeSendQueue {
     fn new() -> Self {
+        let max_inflight_bytes = exchange_io_max_inflight_bytes().max(1);
+        Self::with_limits(
+            max_inflight_bytes,
+            (max_inflight_bytes / INFLIGHT_BYTES_PER_DEST_DIVISOR).max(1),
+        )
+    }
+
+    fn with_limits(max_inflight_bytes: usize, max_inflight_bytes_per_dest: usize) -> Self {
         Self {
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
-            max_inflight_bytes: exchange_io_max_inflight_bytes().max(1),
+            max_inflight_bytes: max_inflight_bytes.max(1),
+            per_dest_bytes: Arc::new(Mutex::new(HashMap::new())),
+            max_inflight_bytes_per_dest: max_inflight_bytes_per_dest.max(1),
             queues: Arc::new(Mutex::new(HashMap::new())),
             send_observers: Mutex::new(Vec::new()),
         }
@@ -192,11 +213,6 @@ impl ExchangeSendQueue {
         self.inflight_bytes.load(Ordering::Acquire)
     }
 
-    pub fn try_reserve_bytes(&self, bytes: usize) -> bool {
-        let bytes = bytes.max(1);
-        self.reserve_bytes(bytes)
-    }
-
     pub fn submit_reserved(
         &self,
         task: ExchangeSendTask,
@@ -214,12 +230,19 @@ impl ExchangeSendQueue {
         allow_overflow: bool,
     ) -> Result<ExchangeSendEnqueue, String> {
         let reserve_bytes = task.payload_bytes.max(1);
-        if !allow_overflow && !self.reserve_bytes(reserve_bytes) {
-            return Ok(ExchangeSendEnqueue::NoCapacity);
-        }
+        let key = ExchangeSendKey::from_task(&task);
         if allow_overflow {
+            self.force_add_per_dest(&key, reserve_bytes);
             self.inflight_bytes
                 .fetch_add(reserve_bytes, Ordering::AcqRel);
+        } else {
+            if !self.reserve_per_dest(&key, reserve_bytes) {
+                return Ok(ExchangeSendEnqueue::NoCapacity);
+            }
+            if !self.reserve_bytes(reserve_bytes) {
+                self.release_per_dest(&key, reserve_bytes);
+                return Ok(ExchangeSendEnqueue::NoCapacity);
+            }
         }
 
         task.tracker.on_enqueue(reserve_bytes);
@@ -242,6 +265,78 @@ impl ExchangeSendQueue {
                 return true;
             }
         }
+    }
+
+    /// Reserve `bytes` against the destination's per-channel cap. The first task to a destination
+    /// (cur == 0) is always admitted (subject to the global ceiling) so a single payload larger
+    /// than the per-destination cap never deadlocks; once a destination has a backlog, further
+    /// tasks are bounded by `max_inflight_bytes_per_dest`. Returns false without mutating on reject.
+    fn reserve_per_dest(&self, key: &ExchangeSendKey, bytes: usize) -> bool {
+        let mut guard = self
+            .per_dest_bytes
+            .lock()
+            .expect("exchange per-dest bytes lock");
+        let cur = guard.get(key).copied().unwrap_or(0);
+        if cur > 0 && cur.saturating_add(bytes) > self.max_inflight_bytes_per_dest {
+            return false;
+        }
+        guard.insert(key.clone(), cur.saturating_add(bytes));
+        true
+    }
+
+    fn force_add_per_dest(&self, key: &ExchangeSendKey, bytes: usize) {
+        let mut guard = self
+            .per_dest_bytes
+            .lock()
+            .expect("exchange per-dest bytes lock");
+        let cur = guard.get(key).copied().unwrap_or(0);
+        guard.insert(key.clone(), cur.saturating_add(bytes));
+    }
+
+    fn release_per_dest(&self, key: &ExchangeSendKey, bytes: usize) {
+        let mut guard = self
+            .per_dest_bytes
+            .lock()
+            .expect("exchange per-dest bytes lock");
+        if let Some(cur) = guard.get(key).copied() {
+            let next = cur.saturating_sub(bytes);
+            if next == 0 {
+                guard.remove(key);
+            } else {
+                guard.insert(key.clone(), next);
+            }
+        }
+    }
+
+    /// Reserve `bytes` for a specific destination channel: passes only when both the destination's
+    /// per-channel cap (see `reserve_per_dest`) and the global ceiling admit it. On global reject
+    /// the per-destination reservation is rolled back. This is what isolates a slow receiver — its
+    /// backlog cannot exhaust the shared budget and stall senders to other destinations.
+    pub fn reserve_bytes_for(
+        &self,
+        dest_host: &str,
+        dest_port: u16,
+        finst_id: UniqueId,
+        node_id: i32,
+        sender_id: i32,
+        bytes: usize,
+    ) -> bool {
+        let bytes = bytes.max(1);
+        let key = ExchangeSendKey {
+            dest_host: dest_host.to_string(),
+            dest_port,
+            finst_id,
+            node_id,
+            sender_id,
+        };
+        if !self.reserve_per_dest(&key, bytes) {
+            return false;
+        }
+        if !self.reserve_bytes(bytes) {
+            self.release_per_dest(&key, bytes);
+            return false;
+        }
+        true
     }
 
     fn enqueue_task(&self, task: ExchangeSendTask, reserve_bytes: usize) {
@@ -275,6 +370,9 @@ impl ExchangeSendQueue {
 
 fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_bytes: usize) {
     let send_start = Instant::now();
+    // Built before the send moves `task.payload`, so we can release this destination's per-channel
+    // reservation symmetrically with the global one on completion.
+    let dest_key = ExchangeSendKey::from_task(&task);
 
     #[cfg(feature = "compat")]
     let result = crate::service::internal_rpc_client::send_chunks(
@@ -356,6 +454,7 @@ fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_byt
     }
 
     inflight.fetch_sub(reserve_bytes, Ordering::AcqRel);
+    exchange_send_queue().release_per_dest(&dest_key, reserve_bytes);
     task.tracker.on_complete(reserve_bytes);
     let notify = task.notify.defer_notify();
     notify.arm();
@@ -403,4 +502,55 @@ static SEND_QUEUE: OnceLock<ExchangeSendQueue> = OnceLock::new();
 
 pub fn exchange_send_queue() -> &'static ExchangeSendQueue {
     SEND_QUEUE.get_or_init(ExchangeSendQueue::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finst() -> UniqueId {
+        UniqueId { hi: 1, lo: 1 }
+    }
+
+    #[test]
+    fn per_destination_cap_isolates_and_global_ceiling_binds() {
+        // Global budget 100, per-destination cap 40.
+        let q = ExchangeSendQueue::with_limits(100, 40);
+        let key_a = ExchangeSendKey {
+            dest_host: "A".to_string(),
+            dest_port: 1,
+            finst_id: finst(),
+            node_id: 0,
+            sender_id: 0,
+        };
+
+        // First task to destination A is admitted (empty destination).
+        assert!(q.reserve_bytes_for("A", 1, finst(), 0, 0, 30));
+        // A now has a 30-byte backlog; a second 30 would be 60 > 40 cap -> rejected.
+        // A slow destination's backlog is bounded and cannot grow without limit.
+        assert!(!q.reserve_bytes_for("A", 1, finst(), 0, 0, 30));
+        // Destination B is NOT blocked by A's cap (B empty; global 30+30=60 <= 100).
+        // This is the head-of-line-blocking fix: a slow A does not stall sends to a healthy B.
+        assert!(q.reserve_bytes_for("B", 1, finst(), 0, 0, 30));
+        assert_eq!(q.inflight_bytes(), 60);
+
+        // The global ceiling still binds: C is empty but 60+50=110 > 100 -> rejected and rolled back.
+        assert!(!q.reserve_bytes_for("C", 1, finst(), 0, 0, 50));
+        assert_eq!(q.inflight_bytes(), 60);
+
+        // Releasing A's per-destination reservation lets A admit again (global room: 60+30=90).
+        q.release_per_dest(&key_a, 30);
+        assert!(q.reserve_bytes_for("A", 1, finst(), 0, 0, 30));
+        assert_eq!(q.inflight_bytes(), 90);
+    }
+
+    #[test]
+    fn first_task_admitted_even_above_per_destination_cap() {
+        // A single payload larger than the per-destination cap must not deadlock: the first task to
+        // an empty destination is always admitted (subject to the global ceiling).
+        let q = ExchangeSendQueue::with_limits(1000, 40);
+        assert!(q.reserve_bytes_for("A", 1, finst(), 0, 0, 100));
+        // Once it has a backlog, further tasks are capped.
+        assert!(!q.reserve_bytes_for("A", 1, finst(), 0, 0, 1));
+    }
 }
