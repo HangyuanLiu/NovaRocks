@@ -210,12 +210,54 @@ pub(crate) fn compute_cost(
     }
 }
 
+/// Default per-query planning-time memory budget (StarRocks maxExecMemByte analog).
+const DEFAULT_QUERY_MEM_LIMIT_BYTES: f64 = 2.0 * 1024.0 * 1024.0 * 1024.0;
+/// Fraction of the per-query budget a single broadcast build hash table may use.
+const BUILD_HASH_TABLE_MEM_FRACTION: f64 = 0.5;
+/// CI distributed baseline backend count (1 FE + 3 BE). NOT a standalone assumption.
+const DEFAULT_EFFECTIVE_BACKEND_COUNT: f64 = 3.0;
+
+/// Cluster/resource snapshot the cost kernel uses to normalize broadcast risk
+/// into real resource units. All `f64` to match `CostOptions` (hot-path, no cast).
+/// Populated at the engine boundary from the live BE registry; the cost formulas
+/// must NEVER read a global registry directly (keeps cost free of hidden state).
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct ClusterResourceProfile {
+    /// Real BE count (live BE registry snapshot); clamped `>= 1.0` at use sites.
+    /// Replaces the hardcoded `backend_factor=3.0`. CI baseline = 3.
+    pub effective_backend_count: f64,
+    /// LAYER 1 per-node OOM floor denominator.
+    pub per_node_build_memory_budget_bytes: f64,
+    /// Planning-time per-query memory limit (StarRocks maxExecMemByte analog).
+    pub query_mem_limit_bytes: f64,
+    /// LAYER 2 cluster-wide broadcast network floor (finite default, NOT INF).
+    pub cluster_broadcast_network_budget_bytes: f64,
+}
+
+impl Default for ClusterResourceProfile {
+    fn default() -> Self {
+        let backends = DEFAULT_EFFECTIVE_BACKEND_COUNT;
+        let per_node = DEFAULT_QUERY_MEM_LIMIT_BYTES * BUILD_HASH_TABLE_MEM_FRACTION;
+        Self {
+            effective_backend_count: backends,
+            per_node_build_memory_budget_bytes: per_node,
+            query_mem_limit_bytes: DEFAULT_QUERY_MEM_LIMIT_BYTES,
+            cluster_broadcast_network_budget_bytes: per_node * backends,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CostOptions {
     pub cpu_weight: f64,
     pub memory_weight: f64,
     pub network_weight: f64,
     pub backend_factor: f64,
+    /// BC-1 phase 0 resource snapshot; formulas still use `backend_factor`
+    /// until the resource-normalized broadcast gates are wired.
+    #[allow(dead_code)]
+    pub profile: ClusterResourceProfile,
     pub broadcast_row_limit: f64,
     pub broadcast_byte_limit: f64,
     pub broadcast_right_table_scale_factor: f64,
@@ -239,6 +281,7 @@ impl Default for CostOptions {
             memory_weight: DEFAULT_MEMORY_COST_WEIGHT,
             network_weight: DEFAULT_NETWORK_COST_WEIGHT,
             backend_factor: 3.0,
+            profile: ClusterResourceProfile::default(),
             broadcast_row_limit: 15_000_000.0,
             broadcast_byte_limit: 512.0 * 1024.0 * 1024.0,
             broadcast_right_table_scale_factor: 10.0,
@@ -2278,6 +2321,25 @@ mod tests {
             "got {}, expected {}",
             cost,
             expected
+        );
+    }
+
+    #[test]
+    fn cluster_resource_profile_defaults_match_ci_baseline() {
+        let opts = CostOptions::default();
+        assert_eq!(opts.profile.effective_backend_count, 3.0);
+        assert_eq!(opts.backend_factor, 3.0);
+        assert_eq!(
+            opts.profile.query_mem_limit_bytes,
+            2.0 * 1024.0 * 1024.0 * 1024.0
+        );
+        assert_eq!(
+            opts.profile.per_node_build_memory_budget_bytes,
+            1.0 * 1024.0 * 1024.0 * 1024.0
+        );
+        assert_eq!(
+            opts.profile.cluster_broadcast_network_budget_bytes,
+            opts.profile.per_node_build_memory_budget_bytes * opts.profile.effective_backend_count
         );
     }
 }
