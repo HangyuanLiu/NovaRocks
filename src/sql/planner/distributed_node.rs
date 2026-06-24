@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::cost::BroadcastDecision;
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, CostEstimate, Statistics};
 pub(crate) use crate::sql::planner::plan::PlanNodeKind;
 
@@ -13,6 +14,7 @@ pub(crate) struct PlanNodeStats {
     pub row_count_confidence: Confidence,
     pub column_statistics: HashMap<ColumnId, ColumnStatistic>,
     pub cost_estimate: Option<CostEstimate>,
+    pub broadcast_decision: Option<BroadcastDecision>,
 }
 
 impl PlanNodeStats {
@@ -24,11 +26,20 @@ impl PlanNodeStats {
         stats: &Statistics,
         cost_estimate: Option<CostEstimate>,
     ) -> Self {
+        Self::from_statistics_with_cost_and_broadcast(stats, cost_estimate, None)
+    }
+
+    pub fn from_statistics_with_cost_and_broadcast(
+        stats: &Statistics,
+        cost_estimate: Option<CostEstimate>,
+        broadcast_decision: Option<BroadcastDecision>,
+    ) -> Self {
         Self {
             output_row_count: stats.output_row_count,
             row_count_confidence: stats.row_count_confidence,
             column_statistics: stats.column_statistics.clone(),
             cost_estimate,
+            broadcast_decision,
         }
     }
 }
