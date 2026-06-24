@@ -716,13 +716,33 @@ fn write_min_max_i64(
         buf.extend_from_slice(&max.to_le_bytes());
         return Ok(());
     }
+    if *ltype == types::TPrimitiveType::DECIMAL32 {
+        let min = i32::try_from(min_value)
+            .map_err(|_| "runtime bitset filter decimal32 min out of range".to_string())?;
+        let max = i32::try_from(max_value)
+            .map_err(|_| "runtime bitset filter decimal32 max out of range".to_string())?;
+        buf.extend_from_slice(&min.to_le_bytes());
+        buf.extend_from_slice(&max.to_le_bytes());
+        return Ok(());
+    }
     if *ltype == types::TPrimitiveType::BIGINT {
         buf.extend_from_slice(&min_value.to_le_bytes());
         buf.extend_from_slice(&max_value.to_le_bytes());
         return Ok(());
     }
+    if *ltype == types::TPrimitiveType::DECIMAL64 {
+        buf.extend_from_slice(&min_value.to_le_bytes());
+        buf.extend_from_slice(&max_value.to_le_bytes());
+        return Ok(());
+    }
     if *ltype == types::TPrimitiveType::LARGEINT {
-        return Err("runtime bitset filter does not support LARGEINT".to_string());
+        return Err(unsupported_runtime_bitset_filter_type(ltype));
+    }
+    if *ltype == types::TPrimitiveType::DECIMAL128
+        || *ltype == types::TPrimitiveType::DECIMAL
+        || *ltype == types::TPrimitiveType::DECIMALV2
+    {
+        return Err(unsupported_runtime_bitset_filter_type(ltype));
     }
     if *ltype == types::TPrimitiveType::DATE {
         let min = i32::try_from(min_value)
@@ -770,13 +790,29 @@ fn read_min_max_i64(
         let max = read_i32_le(data, offset)? as i64;
         return Ok((min, max));
     }
+    if *ltype == types::TPrimitiveType::DECIMAL32 {
+        let min = read_i32_le(data, offset)? as i64;
+        let max = read_i32_le(data, offset)? as i64;
+        return Ok((min, max));
+    }
     if *ltype == types::TPrimitiveType::BIGINT {
         let min = read_i64_le(data, offset)?;
         let max = read_i64_le(data, offset)?;
         return Ok((min, max));
     }
+    if *ltype == types::TPrimitiveType::DECIMAL64 {
+        let min = read_i64_le(data, offset)?;
+        let max = read_i64_le(data, offset)?;
+        return Ok((min, max));
+    }
     if *ltype == types::TPrimitiveType::LARGEINT {
-        return Err("runtime bitset filter does not support LARGEINT".to_string());
+        return Err(unsupported_runtime_bitset_filter_type(ltype));
+    }
+    if *ltype == types::TPrimitiveType::DECIMAL128
+        || *ltype == types::TPrimitiveType::DECIMAL
+        || *ltype == types::TPrimitiveType::DECIMALV2
+    {
+        return Err(unsupported_runtime_bitset_filter_type(ltype));
     }
     if *ltype == types::TPrimitiveType::DATE {
         let min = read_i32_le(data, offset)? as i64;
@@ -794,16 +830,40 @@ fn read_min_max_i64(
     ))
 }
 
+fn unsupported_runtime_bitset_filter_type(ltype: &crate::types::TPrimitiveType) -> String {
+    use crate::types;
+    let name = if *ltype == types::TPrimitiveType::LARGEINT {
+        "LARGEINT"
+    } else if *ltype == types::TPrimitiveType::DECIMAL128 {
+        "DECIMAL128"
+    } else if *ltype == types::TPrimitiveType::DECIMAL {
+        "DECIMAL"
+    } else if *ltype == types::TPrimitiveType::DECIMALV2 {
+        "DECIMALV2"
+    } else {
+        return format!(
+            "unsupported runtime bitset filter primitive type: {:?}",
+            ltype
+        );
+    };
+    format!("runtime bitset filter does not support {name}")
+}
+
 #[cfg(test)]
 mod tests {
     use hashbrown::HashSet;
 
     use super::{
-        RF_TYPE_BITSET_FILTER, RF_TYPE_IN_FILTER, RF_VERSION_V3, decode_starrocks_in_filter,
-        decode_starrocks_membership_filter, encode_starrocks_in_filter,
+        decode_starrocks_in_filter, decode_starrocks_membership_filter,
+        encode_starrocks_bitset_filter, encode_starrocks_in_filter, RF_TYPE_BITSET_FILTER,
+        RF_TYPE_IN_FILTER, RF_VERSION_V3,
     };
     use crate::common::ids::SlotId;
-    use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeInFilterValues};
+    use crate::exec::runtime_filter::min_max::MinMaxValue;
+    use crate::exec::runtime_filter::{
+        RuntimeBitsetFilter, RuntimeInFilter, RuntimeInFilterValues, RuntimeMembershipFilter,
+        RuntimeMinMaxFilter,
+    };
 
     #[test]
     fn test_largeint_in_filter_roundtrip() {
@@ -963,6 +1023,78 @@ mod tests {
         let encoded = encode_starrocks_in_filter(&filter).expect("encode");
         let wrong = arrow::datatypes::DataType::Int64;
         assert!(decode_starrocks_in_filter(9, SlotId::new(4), Some(&wrong), &encoded).is_err());
+    }
+
+    #[test]
+    fn decimal64_bitset_filter_round_trips() {
+        let ltype = crate::types::TPrimitiveType::DECIMAL64;
+        let min_value = -123_456_789i64;
+        let max_value = 987_654_321i64;
+        let bitset = vec![0b1010_0101, 0b0101_1010, 0xff];
+        let min_max = RuntimeMinMaxFilter::new(
+            ltype,
+            true,
+            MinMaxValue::Decimal128(min_value as i128),
+            MinMaxValue::Decimal128(max_value as i128),
+        );
+        let filter = RuntimeBitsetFilter::new(
+            11,
+            SlotId::new(5),
+            ltype,
+            true,
+            7,
+            123,
+            min_value,
+            max_value,
+            bitset.clone(),
+            min_max,
+        );
+
+        let encoded = encode_starrocks_bitset_filter(&filter).expect("encode");
+        let decoded =
+            decode_starrocks_membership_filter(11, SlotId::new(5), &encoded).expect("decode");
+
+        match decoded {
+            RuntimeMembershipFilter::Bitset(decoded) => {
+                assert_eq!(decoded.ltype(), ltype);
+                assert!(decoded.has_null());
+                assert_eq!(decoded.size(), 123);
+                assert_eq!(decoded.join_mode(), 7);
+                assert_eq!(decoded.min_value(), min_value);
+                assert_eq!(decoded.max_value(), max_value);
+                assert_eq!(decoded.bitset(), bitset.as_slice());
+                assert!(decoded.min_max().has_min_max());
+                match decoded.min_max().min() {
+                    MinMaxValue::Decimal128(min) => assert_eq!(*min, min_value as i128),
+                    other => panic!("expected Decimal128 min, got {other:?}"),
+                }
+                match decoded.min_max().max() {
+                    MinMaxValue::Decimal128(max) => assert_eq!(*max, max_value as i128),
+                    other => panic!("expected Decimal128 max, got {other:?}"),
+                }
+            }
+            other => panic!("expected Bitset runtime filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal128_bitset_payload_is_rejected() {
+        let mut payload = Vec::new();
+        payload.push(RF_VERSION_V3);
+        payload.push(RF_TYPE_BITSET_FILTER);
+        payload.extend_from_slice(&crate::types::TPrimitiveType::DECIMAL128.0.to_le_bytes());
+        payload.push(0); // has_null
+        payload.extend_from_slice(&0u64.to_le_bytes()); // size
+        payload.push(0); // join_mode
+        payload.extend_from_slice(&(-1i128).to_le_bytes()); // min_value
+        payload.extend_from_slice(&(1i128).to_le_bytes()); // max_value
+        payload.extend_from_slice(&0u64.to_le_bytes()); // bitset_size
+
+        let err = decode_starrocks_membership_filter(12, SlotId::new(6), &payload).unwrap_err();
+        assert!(
+            err.contains("does not support DECIMAL128")
+                || err.contains("unsupported runtime bitset filter decimal type")
+        );
     }
 
     #[test]
