@@ -121,6 +121,14 @@ pub(crate) fn compute_pipeline_dop(session_dop: i32) -> i32 {
     crate::runtime::exec_env::calc_pipeline_dop(session_dop)
 }
 
+/// Pipeline DOP for a standalone fragment whose output is a write/data sink (load/insert/export).
+/// Delegates to `exec_env::calc_sink_pipeline_dop` (StarRocks `getSinkDefaultDOP`): a positive
+/// `session_dop` override wins; otherwise the lower sink curve (cores/3, or min(32, cores/4) above
+/// 24 cores) so writes don't starve query CPU. Compute fragments keep `compute_pipeline_dop`.
+pub(crate) fn compute_sink_pipeline_dop(session_dop: i32) -> i32 {
+    crate::runtime::exec_env::calc_sink_pipeline_dop(session_dop)
+}
+
 fn serialize_thrift_binary<T: TSerializable>(value: &T) -> Result<Vec<u8>, String> {
     const INITIAL_CAPACITY: usize = 256;
     const MAX_CAPACITY: usize = 64 * 1024 * 1024;
@@ -894,5 +902,20 @@ mod tests {
         // A positive session override (SET pipeline_dop = N) is honored verbatim.
         assert_eq!(compute_pipeline_dop(7), 7);
         assert_eq!(compute_pipeline_dop(1), 1);
+    }
+
+    #[test]
+    fn compute_sink_pipeline_dop_is_lower_and_honors_override() {
+        // Auto mode: the sink curve is never higher than the compute curve (cores/3..4 vs cores/2),
+        // so write fragments don't starve query CPU.
+        let sink = compute_sink_pipeline_dop(0);
+        let compute = compute_pipeline_dop(0);
+        assert!(sink > 0, "sink dop must be positive, got {sink}");
+        assert!(
+            sink <= compute,
+            "sink dop ({sink}) must be <= compute dop ({compute})"
+        );
+        // A positive session override pins the sink DOP too.
+        assert_eq!(compute_sink_pipeline_dop(7), 7);
     }
 }
