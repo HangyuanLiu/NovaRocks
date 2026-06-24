@@ -221,7 +221,6 @@ const DEFAULT_EFFECTIVE_BACKEND_COUNT: f64 = 3.0;
 /// into real resource units. All `f64` to match `CostOptions` (hot-path, no cast).
 /// Populated at the engine boundary from the live BE registry; the cost formulas
 /// must NEVER read a global registry directly (keeps cost free of hidden state).
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct ClusterResourceProfile {
     /// Real BE count (live BE registry snapshot); clamped `>= 1.0` at use sites.
@@ -254,9 +253,8 @@ pub(crate) struct CostOptions {
     pub memory_weight: f64,
     pub network_weight: f64,
     pub backend_factor: f64,
-    /// BC-1 phase 0 resource snapshot; formulas still use `backend_factor`
-    /// until the resource-normalized broadcast gates are wired.
-    #[allow(dead_code)]
+    /// Cluster/resource snapshot used by broadcast feasibility and hash-join
+    /// costing. `backend_factor` remains a cached projection for older callers.
     pub profile: ClusterResourceProfile,
     pub hash_table_per_row_overhead_bytes: f64,
     pub hash_table_load_factor: f64,
@@ -268,8 +266,6 @@ pub(crate) struct CostOptions {
     pub risk_multiplier_estimated: f64,
     pub risk_multiplier_exact: f64,
     pub risk_multiplier_measured: f64,
-    pub network_cost: f64,
-    pub memory_cost_weight: f64,
     pub predicate_cost_factor: f64,
     pub projection_cost_factor: f64,
     pub hash_cost_factor: f64,
@@ -277,7 +273,6 @@ pub(crate) struct CostOptions {
     pub topn_cost_factor: f64,
     pub aggregate_cost_factor: f64,
     pub exchange_startup_cost: f64,
-    pub fallback_cpu_factor: f64,
 }
 
 impl Default for CostOptions {
@@ -298,8 +293,6 @@ impl Default for CostOptions {
             risk_multiplier_estimated: 2.0,
             risk_multiplier_exact: 1.0,
             risk_multiplier_measured: 1.0,
-            network_cost: NETWORK_COST,
-            memory_cost_weight: 0.25,
             predicate_cost_factor: 0.02,
             projection_cost_factor: 0.01,
             hash_cost_factor: 1.0,
@@ -307,7 +300,6 @@ impl Default for CostOptions {
             topn_cost_factor: 1.0,
             aggregate_cost_factor: 1.0,
             exchange_startup_cost: DISTRIBUTION_STARTUP_COST,
-            fallback_cpu_factor: 0.01,
         }
     }
 }
@@ -329,7 +321,7 @@ impl CostOptions {
 
 fn normalized_effective_backend_count(value: f64) -> f64 {
     if value.is_finite() && value > 0.0 {
-        value
+        value.max(1.0)
     } else {
         1.0
     }
@@ -403,8 +395,8 @@ pub(crate) fn build_size_is_uninformative(build_stats: &Statistics) -> bool {
 }
 
 /// Estimated per-node memory of the broadcast build hash table. This feeds the
-/// LAYER 1 floor now and the Phase 1.6 memory dimension later; LAYER 2 network
-/// fanout uses raw build bytes.
+/// LAYER 1 floor and the hash-join memory dimension; network terms use raw
+/// build bytes.
 /// `payload / load_factor + rows * per_row_overhead`. The per-row term (16B =
 /// 4x Vec<u32> in JoinHashTable) is what makes a narrow build correctly
 /// expensive, dissolving the old narrow-build exception.
@@ -498,7 +490,9 @@ pub(crate) fn broadcast_is_feasible(
 
     // LAYER 1 (per-node memory): NO backend divisor — full build per node.
     let risk_adj_build_bytes = finite_non_negative_cost(ht_bytes * risk_mult);
-    // LAYER 2 (cluster network): raw bytes (not expanded) * fanout * risk.
+    // LAYER 2 (cluster network): spec's conservative cluster network floor.
+    // This intentionally charges raw bytes * backend count * risk. It is not
+    // the cost-model fanout term, which uses (backends - 1).
     let risk_adj_fanout_bytes = finite_non_negative_cost(raw * backends * risk_mult);
 
     let mem_ok = risk_adj_build_bytes <= options.profile.per_node_build_memory_budget_bytes;
@@ -737,17 +731,24 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
     let mut cpu_cost = finite_non_negative_cost(
         (probe_rows + build_rows) * key_factor * input.options.hash_cost_factor + output_size,
     );
+    let backends =
+        normalized_effective_backend_count(input.options.profile.effective_backend_count);
+    let build_hash =
+        estimated_build_hash_table_bytes(build_stats.unwrap_or(input.own_stats), input.options);
+    let fanout = (backends - 1.0).max(0.0);
     let mut memory_cost = if is_broadcast {
-        finite_non_negative_cost(build_size * input.options.backend_factor)
+        finite_non_negative_cost(build_hash * backends)
     } else if is_shuffle {
-        finite_non_negative_cost(build_size / input.options.backend_factor.max(1.0))
+        finite_non_negative_cost(build_hash / backends)
     } else {
         build_size
     };
     let network_cost = if is_broadcast {
-        finite_non_negative_cost(build_size * input.options.backend_factor)
+        finite_non_negative_cost(build_size * fanout)
     } else if is_shuffle {
-        if child_output_is_hash_partitioned(input.child_outputs.first())
+        if backends <= 1.0 {
+            0.0
+        } else if child_output_is_hash_partitioned(input.child_outputs.first())
             && child_output_is_hash_partitioned(input.child_outputs.get(1))
         {
             0.0
@@ -994,43 +995,24 @@ fn compute_legacy_cost_with_properties(
     op: &Operator,
     own_stats: &Statistics,
     child_stats: &[&Statistics],
-    _child_outputs: &[&PhysicalPropertySet],
+    child_outputs: &[&PhysicalPropertySet],
     alt_kind: &PropertyAlternativeKind,
     options: &CostOptions,
 ) -> TotalCost {
     match op {
-        Operator::PhysicalHashJoin(j) => {
-            let probe_stats = child_stats.first().copied();
-            let build_stats = child_stats.get(1).copied();
-            let probe_size = probe_stats.map(|s| s.compute_size()).unwrap_or(0.0);
-            let build_size = build_stats.map(|s| s.compute_size()).unwrap_or(0.0);
-
-            let base_cost = match alt_kind {
-                PropertyAlternativeKind::BroadcastJoin => {
-                    // The distribution enforcer cost models making the build
-                    // child available to the join. The join self-cost still
-                    // charges backend fanout and memory pressure during hash
-                    // table materialization/probing.
-                    probe_size
-                        + build_size * options.network_cost * options.backend_factor
-                        + build_size * options.memory_cost_weight * options.backend_factor
-                }
-                PropertyAlternativeKind::ShuffleJoin => {
-                    probe_size + build_size / options.backend_factor.max(1.0)
-                }
-                PropertyAlternativeKind::Default => compute_cost(op, own_stats, child_stats),
+        Operator::PhysicalHashJoin(join) => {
+            let required_output = PhysicalPropertySet::any();
+            let input = CostInput {
+                op,
+                own_stats,
+                child_stats,
+                child_outputs,
+                required_output: &required_output,
+                alt_kind,
+                scalars: None,
+                options,
             };
-
-            let cost_after_cross = if j.join_type == JoinKind::Cross {
-                base_cost * CROSS_JOIN_COST_PENALTY
-            } else {
-                base_cost
-            };
-            if j.other_condition.is_some() {
-                cost_after_cross * NON_EQUI_JOIN_COST_PENALTY
-            } else {
-                cost_after_cross
-            }
+            estimate_hash_join_cost(&input, join).total_with_options(options)
         }
         _ => compute_cost(op, own_stats, child_stats),
     }
@@ -1276,6 +1258,27 @@ mod tests {
         feasibility_is_advisory_only(op, &alternatives)
     }
 
+    fn broadcast_input<'a>(
+        op: &'a Operator,
+        own: &'a Statistics,
+        child: &'a [&'a Statistics],
+        outs: &'a [&'a PhysicalPropertySet],
+        required: &'a PhysicalPropertySet,
+        alt: &'a PropertyAlternativeKind,
+        o: &'a CostOptions,
+    ) -> CostInput<'a> {
+        CostInput {
+            op,
+            own_stats: own,
+            child_stats: child,
+            child_outputs: outs,
+            required_output: required,
+            alt_kind: alt,
+            scalars: None,
+            options: o,
+        }
+    }
+
     #[test]
     fn finite_non_negative_cost_saturates_only_positive_overflow() {
         assert_eq!(finite_non_negative_cost(42.0), 42.0);
@@ -1405,22 +1408,13 @@ mod tests {
         let mut o = CostOptions::default();
 
         o.risk_multiplier_estimated = f64::NAN;
-        assert_eq!(
-            confidence_risk_multiplier(Confidence::Estimated, &o),
-            1.0
-        );
+        assert_eq!(confidence_risk_multiplier(Confidence::Estimated, &o), 1.0);
 
         o.risk_multiplier_estimated = -2.0;
-        assert_eq!(
-            confidence_risk_multiplier(Confidence::Estimated, &o),
-            1.0
-        );
+        assert_eq!(confidence_risk_multiplier(Confidence::Estimated, &o), 1.0);
 
         o.risk_multiplier_estimated = 3.5;
-        assert_eq!(
-            confidence_risk_multiplier(Confidence::Estimated, &o),
-            3.5
-        );
+        assert_eq!(confidence_risk_multiplier(Confidence::Estimated, &o), 3.5);
     }
 
     #[test]
@@ -1586,12 +1580,16 @@ mod tests {
             vec![column_eq_condition(&mut arena, 10, 20)],
         );
         let alternatives = derived_alternatives(&ordinary_equi, &arena);
-        assert!(alternatives
-            .iter()
-            .any(|alt| alt.kind == PropertyAlternativeKind::BroadcastJoin));
-        assert!(alternatives
-            .iter()
-            .any(|alt| alt.kind == PropertyAlternativeKind::ShuffleJoin));
+        assert!(
+            alternatives
+                .iter()
+                .any(|alt| alt.kind == PropertyAlternativeKind::BroadcastJoin)
+        );
+        assert!(
+            alternatives
+                .iter()
+                .any(|alt| alt.kind == PropertyAlternativeKind::ShuffleJoin)
+        );
         assert!(!advisory_for_derived_hash_join(&ordinary_equi, &arena));
 
         let right_outer = join_op(JoinKind::RightOuter, vec![]);
@@ -2042,6 +2040,15 @@ mod tests {
             &options,
         );
         assert!((input_cost - property_cost).abs() < f64::EPSILON);
+        let legacy_cost = compute_legacy_cost_with_properties(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        );
+        assert!((input_cost - legacy_cost).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2104,8 +2111,162 @@ mod tests {
         };
 
         let estimate = compute_cost_estimate(&input);
-        assert!(estimate.memory_cost >= build.compute_size() * options.backend_factor);
-        assert!(estimate.network_cost >= build.compute_size() * options.backend_factor);
+        let hash_table_bytes = estimated_build_hash_table_bytes(&build, &options);
+        let backends = normalized_effective_backend_count(options.profile.effective_backend_count);
+        assert!(estimate.memory_cost >= hash_table_bytes * backends - f64::EPSILON);
+        assert!(
+            estimate.network_cost
+                >= safe_compute_size(&build) * (backends - 1.0).max(0.0) - f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn broadcast_memory_uses_hash_table_times_backends() {
+        let probe = stats(1_000_000.0, 64.0);
+        let build = stats(10_000.0, 32.0);
+        let own = stats(100_000.0, 96.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let options = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let child_stats = [&probe, &build];
+        let input = broadcast_input(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &required,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        );
+
+        let estimate = compute_cost_estimate(&input);
+        let hash_table_bytes = estimated_build_hash_table_bytes(&build, &options);
+        let backends = normalized_effective_backend_count(options.profile.effective_backend_count);
+        let fanout = (backends - 1.0).max(0.0);
+        assert!((estimate.memory_cost - hash_table_bytes * backends).abs() < f64::EPSILON);
+        assert!((estimate.network_cost - safe_compute_size(&build) * fanout).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn single_node_broadcast_and_shuffle_network_are_zero() {
+        let mut options = CostOptions::default();
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 1.0;
+        options.apply_profile(profile);
+
+        let probe = stats(1_000_000.0, 64.0);
+        let build = stats(10_000.0, 32.0);
+        let own = stats(100_000.0, 96.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let child_stats = [&probe, &build];
+
+        let broadcast = compute_cost_estimate(&broadcast_input(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &required,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        ));
+        let shuffle = compute_cost_estimate(&broadcast_input(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &required,
+            &PropertyAlternativeKind::ShuffleJoin,
+            &options,
+        ));
+
+        assert_eq!(broadcast.network_cost, 0.0);
+        assert_eq!(shuffle.network_cost, 0.0);
+        assert!(
+            (broadcast.total_with_options(&options) - shuffle.total_with_options(&options)).abs()
+                < 1.0
+        );
+    }
+
+    #[test]
+    fn q9_shape_broadcast_total_below_shuffle_total() {
+        let mut options = CostOptions::default();
+        options.memory_weight = 0.15;
+        let mut profile = ClusterResourceProfile::default();
+        profile.effective_backend_count = 10.0;
+        profile.per_node_build_memory_budget_bytes = 256.0 * 1024.0 * 1024.0;
+        profile.cluster_broadcast_network_budget_bytes =
+            profile.per_node_build_memory_budget_bytes * 10.0;
+        options.apply_profile(profile);
+
+        // Tuned so the pre-1.6 broadcast formula (payload * N for both memory
+        // and network) would not beat shuffle, while the new fanout term does.
+        let mut probe = stats(15_837_500.0, 80.0);
+        probe.row_count_confidence = Confidence::Exact;
+        let mut build = stats(4_000_000.0, 32.0);
+        build.row_count_confidence = Confidence::Exact;
+        let own = stats(4_000_000.0, 80.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let child_stats = [&probe, &build];
+
+        let broadcast = compute_cost_estimate(&broadcast_input(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &required,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        ));
+        let shuffle = compute_cost_estimate(&broadcast_input(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &required,
+            &PropertyAlternativeKind::ShuffleJoin,
+            &options,
+        ));
+
+        let broadcast_total = broadcast.total_with_options(&options);
+        let shuffle_total = shuffle.total_with_options(&options);
+        let backends = normalized_effective_backend_count(options.profile.effective_backend_count);
+        let old_broadcast_total = CostEstimate {
+            cpu_cost: broadcast.cpu_cost,
+            memory_cost: safe_compute_size(&build) * backends,
+            network_cost: safe_compute_size(&build) * backends,
+        }
+        .total_with_options(&options);
+        assert!(
+            old_broadcast_total >= shuffle_total,
+            "old broadcast {old_broadcast_total} should be >= shuffle {shuffle_total}"
+        );
+        assert!(
+            broadcast_total < shuffle_total,
+            "broadcast {broadcast_total} should be < shuffle {shuffle_total}"
+        );
     }
 
     #[test]
@@ -2210,7 +2371,8 @@ mod tests {
         };
 
         let estimate = compute_cost_estimate(&input);
-        let expected_memory = build.compute_size() / options.backend_factor.max(1.0);
+        let backends = normalized_effective_backend_count(options.profile.effective_backend_count);
+        let expected_memory = estimated_build_hash_table_bytes(&build, &options) / backends;
         assert!((estimate.memory_cost - expected_memory).abs() <= f64::EPSILON);
         assert_eq!(estimate.network_cost, 0.0);
     }
@@ -2589,8 +2751,12 @@ mod tests {
                 (cost_row_count(&probe) + cost_row_count(&build)) * options.hash_cost_factor
                     + safe_compute_size(&own),
             ),
-            memory_cost: build.compute_size() * options.backend_factor,
-            network_cost: build.compute_size() * options.backend_factor,
+            memory_cost: estimated_build_hash_table_bytes(&build, &options)
+                * normalized_effective_backend_count(options.profile.effective_backend_count),
+            network_cost: safe_compute_size(&build)
+                * (normalized_effective_backend_count(options.profile.effective_backend_count)
+                    - 1.0)
+                    .max(0.0),
         };
 
         assert!((estimate.cpu_cost - expected.cpu_cost).abs() < f64::EPSILON);
@@ -2653,11 +2819,13 @@ mod tests {
             (cost_row_count(&probe) + cost_row_count(&build)) * options.hash_cost_factor
                 + safe_compute_size(&own),
         );
-        let broadcast_fanout_size = build.compute_size() * options.backend_factor;
+        let backends = normalized_effective_backend_count(options.profile.effective_backend_count);
+        let expected_memory = estimated_build_hash_table_bytes(&build, &options) * backends;
+        let expected_network = safe_compute_size(&build) * (backends - 1.0).max(0.0);
 
         assert!((estimate.cpu_cost - base_cpu * NON_EQUI_JOIN_COST_PENALTY).abs() < f64::EPSILON);
-        assert!((estimate.memory_cost - broadcast_fanout_size).abs() < f64::EPSILON);
-        assert!((estimate.network_cost - broadcast_fanout_size).abs() < f64::EPSILON);
+        assert!((estimate.memory_cost - expected_memory).abs() < f64::EPSILON);
+        assert!((estimate.network_cost - expected_network).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2901,7 +3069,7 @@ mod tests {
 
     #[test]
     fn apply_profile_clamps_backend_factor_to_one() {
-        for backend_count in [0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -2.0] {
+        for backend_count in [0.0, 0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -2.0] {
             let mut opts = CostOptions::default();
             let mut profile = ClusterResourceProfile::default();
             profile.effective_backend_count = backend_count;
