@@ -50,7 +50,6 @@ use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
-use crate::exec::schema_compat::is_execution_data_type_compatible;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
 
@@ -104,7 +103,7 @@ pub(super) fn align_schema_with_arrays(
 }
 
 pub(super) fn is_compatible_aggregate_data_type(expected: &DataType, actual: &DataType) -> bool {
-    is_execution_data_type_compatible(expected, actual)
+    expected == actual
 }
 
 /// Factory that constructs aggregate processors backed by group-key hash tables and aggregate kernels.
@@ -1179,14 +1178,18 @@ mod tests {
     use super::is_compatible_aggregate_data_type;
 
     #[test]
-    fn aggregate_accepts_decimal_precision_widening_with_same_scale() {
-        assert!(is_compatible_aggregate_data_type(
+    fn aggregate_rejects_decimal_precision_drift() {
+        assert!(!is_compatible_aggregate_data_type(
             &DataType::Decimal128(10, 2),
             &DataType::Decimal128(38, 2)
         ));
         assert!(!is_compatible_aggregate_data_type(
             &DataType::Decimal128(10, 2),
             &DataType::Decimal128(38, 3)
+        ));
+        assert!(is_compatible_aggregate_data_type(
+            &DataType::Decimal128(10, 2),
+            &DataType::Decimal128(10, 2)
         ));
     }
 
