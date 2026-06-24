@@ -88,6 +88,8 @@ pub(crate) fn data_type_to_tprimitive(
         DataType::Date32 => types::TPrimitiveType::DATE,
         DataType::Timestamp(_, _) => types::TPrimitiveType::DATETIME,
         DataType::Utf8 => types::TPrimitiveType::VARCHAR,
+        DataType::Decimal128(precision, _) if *precision <= 9 => types::TPrimitiveType::DECIMAL32,
+        DataType::Decimal128(precision, _) if *precision <= 18 => types::TPrimitiveType::DECIMAL64,
         DataType::Decimal128(_, _) => types::TPrimitiveType::DECIMAL128,
         _ => {
             return Err(format!(
@@ -97,4 +99,45 @@ pub(crate) fn data_type_to_tprimitive(
         }
     };
     Ok(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::{DataType, TimeUnit};
+
+    use crate::types::TPrimitiveType;
+
+    use super::data_type_to_tprimitive;
+
+    #[test]
+    fn runtime_filter_decimal_widths_map_to_starrocks_primitives() {
+        assert_eq!(
+            data_type_to_tprimitive(&DataType::Decimal128(9, 0)).unwrap(),
+            TPrimitiveType::DECIMAL32
+        );
+        assert_eq!(
+            data_type_to_tprimitive(&DataType::Decimal128(18, 2)).unwrap(),
+            TPrimitiveType::DECIMAL64
+        );
+        assert_eq!(
+            data_type_to_tprimitive(&DataType::Decimal128(19, 0)).unwrap(),
+            TPrimitiveType::DECIMAL128
+        );
+    }
+
+    #[test]
+    fn runtime_filter_non_bitset_candidates_keep_their_primitives() {
+        assert_eq!(
+            data_type_to_tprimitive(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
+            TPrimitiveType::DATETIME
+        );
+        assert_eq!(
+            data_type_to_tprimitive(&DataType::Utf8).unwrap(),
+            TPrimitiveType::VARCHAR
+        );
+        assert_eq!(
+            data_type_to_tprimitive(&DataType::Float64).unwrap(),
+            TPrimitiveType::DOUBLE
+        );
+    }
 }
