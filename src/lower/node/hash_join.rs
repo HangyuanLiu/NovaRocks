@@ -352,6 +352,7 @@ pub(crate) fn lower_hash_join_node(
                 filter_id,
                 expr_order,
                 probe_slot_id: *probe_slot_id,
+                build_data_type: build_type.clone(),
                 merge_nodes,
                 has_remote_targets,
             });

@@ -27,9 +27,12 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use arrow::array::ArrayRef;
 
 use crate::common::ids::SlotId;
+use crate::novarocks_logging::warn;
 
 use super::bloom::RuntimeBloomFilter;
 use super::in_filter::RuntimeInFilter;
@@ -108,6 +111,7 @@ impl Default for RuntimeMembershipBuildOptions {
 pub(crate) struct PartialRuntimeInFilterMerger {
     max_conditions: usize,
     expected_partitions: usize,
+    drop_counters: RuntimeFilterMergeDropCountersAtomic,
     state: std::sync::Mutex<PartialRuntimeInFilterState>,
 }
 
@@ -121,6 +125,37 @@ struct PartialRuntimeInFilterState {
 }
 
 pub(crate) const MAX_RUNTIME_IN_FILTER_CONDITIONS: usize = 1024;
+pub(crate) const RUNTIME_FILTER_JOIN_MODE_BROADCAST: i8 = 1;
+pub(crate) const RUNTIME_FILTER_JOIN_MODE_PARTITIONED: i8 = 2;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterMergeDropCounters {
+    pub(crate) in_filters: u64,
+    pub(crate) membership_filters: u64,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeFilterMergeDropCountersAtomic {
+    in_filters: AtomicU64,
+    membership_filters: AtomicU64,
+}
+
+impl RuntimeFilterMergeDropCountersAtomic {
+    fn add_in_filter_drop(&self) {
+        self.in_filters.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn add_membership_filter_drop(&self) {
+        self.membership_filters.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn drain(&self) -> RuntimeFilterMergeDropCounters {
+        RuntimeFilterMergeDropCounters {
+            in_filters: self.in_filters.swap(0, Ordering::AcqRel),
+            membership_filters: self.membership_filters.swap(0, Ordering::AcqRel),
+        }
+    }
+}
 
 impl PartialRuntimeInFilterMerger {
     pub(crate) fn new(expected_partitions: usize, max_conditions: usize) -> Self {
@@ -135,8 +170,29 @@ impl PartialRuntimeInFilterMerger {
         Self {
             max_conditions,
             expected_partitions,
+            drop_counters: RuntimeFilterMergeDropCountersAtomic::default(),
             state: std::sync::Mutex::new(state),
         }
+    }
+
+    pub(crate) fn drain_drop_counters(&self) -> RuntimeFilterMergeDropCounters {
+        self.drop_counters.drain()
+    }
+
+    fn record_in_filter_drop(&self, reason: &str) {
+        warn!(
+            "runtime in-filter dropped during partial merge: reason={}",
+            reason
+        );
+        self.drop_counters.add_in_filter_drop();
+    }
+
+    fn record_membership_filter_drop(&self, reason: &str) {
+        warn!(
+            "runtime membership filter dropped during partial merge: reason={}",
+            reason
+        );
+        self.drop_counters.add_membership_filter_drop();
     }
 
     pub(crate) fn add_partial(
@@ -165,6 +221,7 @@ impl PartialRuntimeInFilterMerger {
             }
             max_rows = max_rows.max(rows);
             let Some(filters) = guard.partial_filters[idx].as_ref() else {
+                self.record_in_filter_drop("in_filter_partial_missing_or_empty");
                 return Err("runtime in-filter missing partial filters".to_string());
             };
             if filters.is_empty() {
@@ -174,7 +231,16 @@ impl PartialRuntimeInFilterMerger {
             active_indices.push(idx);
         }
 
-        if !can_merge || max_rows > self.max_conditions || active_indices.is_empty() {
+        if !can_merge {
+            self.record_in_filter_drop("in_filter_partial_missing_or_empty");
+            return Ok(Some(Vec::new()));
+        }
+        if max_rows > self.max_conditions {
+            self.record_in_filter_drop("in_filter_condition_limit_exceeded");
+            return Ok(Some(Vec::new()));
+        }
+        if active_indices.is_empty() {
+            self.record_in_filter_drop("in_filter_all_build_partitions_empty");
             return Ok(Some(Vec::new()));
         }
 
@@ -227,10 +293,12 @@ impl PartialRuntimeInFilterMerger {
             parts.push(params);
         }
         if parts.is_empty() {
+            self.record_membership_filter_drop("membership_filter_no_partitions");
             return Ok(Some(Vec::new()));
         }
         let expected_len = parts[0].len();
         if expected_len == 0 {
+            self.record_membership_filter_drop("membership_filter_no_filter_params");
             return Ok(Some(Vec::new()));
         }
         for params in parts.iter().skip(1) {
@@ -275,7 +343,8 @@ impl PartialRuntimeInFilterMerger {
                 )));
                 continue;
             }
-            let can_try_bitset = maybe_use_bitset_base && meta.join_mode() == 1;
+            let can_try_bitset =
+                maybe_use_bitset_base && meta.join_mode() == RUNTIME_FILTER_JOIN_MODE_BROADCAST;
             if can_try_bitset {
                 let part = &parts[0][idx];
                 if let Some(bitset) = maybe_build_runtime_bitset_filter(
@@ -309,5 +378,80 @@ impl PartialRuntimeInFilterMerger {
         }
 
         Ok(Some(merged))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::*;
+    use crate::common::ids::SlotId;
+
+    #[test]
+    fn add_partial_records_drop_when_in_filter_exceeds_limit() {
+        let merger = PartialRuntimeInFilterMerger::new(1, 0);
+        let filter =
+            RuntimeInFilter::empty(7, SlotId::new(11), &DataType::Int32).expect("empty in filter");
+
+        let ready = merger
+            .add_partial(0, 1, vec![filter])
+            .expect("add partial")
+            .expect("ready merged filters");
+
+        assert!(ready.is_empty());
+        let counters = merger.drain_drop_counters();
+        assert_eq!(counters.in_filters, 1);
+        assert_eq!(counters.membership_filters, 0);
+
+        let counters = merger.drain_drop_counters();
+        assert_eq!(counters.in_filters, 0);
+        assert_eq!(counters.membership_filters, 0);
+    }
+
+    #[test]
+    fn add_partial_records_drop_when_active_partition_payload_is_missing() {
+        let merger = PartialRuntimeInFilterMerger::new(2, 1024);
+        let filter =
+            RuntimeInFilter::empty(7, SlotId::new(11), &DataType::Int32).expect("empty in filter");
+        {
+            let mut guard = merger.state.lock().expect("runtime in-filter merge lock");
+            guard.received = 1;
+            guard.ht_row_counts[1] = 1;
+            guard.partial_filters[1] = None;
+        }
+
+        let err = merger
+            .add_partial(0, 1, vec![filter])
+            .expect_err("missing active partition payload should remain an error");
+
+        assert_eq!(err, "runtime in-filter missing partial filters");
+        let counters = merger.drain_drop_counters();
+        assert_eq!(counters.in_filters, 1);
+        assert_eq!(counters.membership_filters, 0);
+    }
+
+    #[test]
+    fn add_partial_membership_records_drop_when_no_membership_filters_exist() {
+        let merger = PartialRuntimeInFilterMerger::new(1, 1024);
+
+        let ready = merger
+            .add_partial_membership(
+                0,
+                Vec::<RuntimeMembershipFilterBuildParam>::new(),
+                RuntimeMembershipBuildOptions::default(),
+            )
+            .expect("add partial membership")
+            .expect("ready membership filters");
+
+        assert!(ready.is_empty());
+        let counters = merger.drain_drop_counters();
+        assert_eq!(counters.in_filters, 0);
+        assert_eq!(counters.membership_filters, 1);
+    }
+
+    #[test]
+    fn broadcast_join_mode_constant_matches_starrocks_wire_value() {
+        assert_eq!(RUNTIME_FILTER_JOIN_MODE_BROADCAST, 1);
     }
 }

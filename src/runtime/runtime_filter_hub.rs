@@ -844,3 +844,76 @@ fn ms_to_duration(ms: i64) -> Option<Duration> {
         Some(Duration::from_millis(ms as u64))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use arrow::datatypes::DataType;
+
+    use super::{RuntimeFilterHub, RuntimeFilterProbe};
+    use crate::common::ids::SlotId;
+    use crate::exec::expr::ExprId;
+    use crate::exec::node::RuntimeFilterProbeSpec;
+    use crate::exec::pipeline::dependency::DependencyManager;
+
+    fn new_probe_with_timeouts() -> RuntimeFilterProbe {
+        let hub = RuntimeFilterHub::new(DependencyManager::new());
+        hub.set_wait_timeouts(
+            Some(Duration::from_millis(10)),
+            Some(Duration::from_millis(10)),
+        );
+        hub.register_probe_specs(
+            42,
+            &[RuntimeFilterProbeSpec {
+                filter_id: 7,
+                expr_id: ExprId(0),
+                slot_id: SlotId::new(11),
+                data_type: DataType::Int32,
+            }],
+        );
+        hub.register_probe(42)
+    }
+
+    fn wait_until_ready(
+        dep: &crate::exec::pipeline::dependency::DependencyHandle,
+        timeout: Duration,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if dep.is_ready() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(dep.is_ready(), "runtime filter dependency did not time out");
+    }
+
+    #[test]
+    fn probe_dependency_times_out_when_remote_filter_never_arrives() {
+        let probe = new_probe_with_timeouts();
+        let dep = probe
+            .dependency_or_timeout(true)
+            .expect("dependency should be returned before timeout");
+
+        wait_until_ready(&dep, Duration::from_millis(200));
+
+        assert!(probe.dependency_or_timeout(true).is_none());
+        assert!(dep.is_ready());
+        assert!(probe.snapshot().is_empty());
+    }
+
+    #[test]
+    fn non_scan_probe_dependency_times_out_when_remote_filter_never_arrives() {
+        let probe = new_probe_with_timeouts();
+        let dep = probe
+            .dependency_or_timeout(false)
+            .expect("dependency should be returned before timeout");
+
+        wait_until_ready(&dep, Duration::from_millis(200));
+
+        assert!(probe.dependency_or_timeout(false).is_none());
+        assert!(dep.is_ready());
+        assert!(probe.snapshot().is_empty());
+    }
+}

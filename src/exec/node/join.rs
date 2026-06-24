@@ -44,6 +44,7 @@ pub struct JoinRuntimeFilterSpec {
     pub filter_id: i32,
     pub expr_order: usize,
     pub probe_slot_id: SlotId,
+    pub build_data_type: arrow::datatypes::DataType,
     pub merge_nodes: Vec<types::TNetworkAddress>,
     pub has_remote_targets: bool,
 }

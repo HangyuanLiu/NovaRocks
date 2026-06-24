@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arrow::datatypes::DataType;
+
 use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
@@ -85,6 +87,7 @@ pub(crate) struct PendingRuntimeFilter {
     pub(crate) filter_id: i32,
     pub(crate) build_be_number: i32,
     pub(crate) data: Vec<u8>,
+    pub(crate) build_data_type: Option<DataType>,
 }
 
 impl QueryContext {
@@ -258,11 +261,13 @@ impl QueryContext {
         filter_id: i32,
         build_be_number: i32,
         data: Vec<u8>,
+        build_data_type: Option<DataType>,
     ) {
         self.pending_runtime_filters.push(PendingRuntimeFilter {
             filter_id,
             build_be_number,
             data,
+            build_data_type,
         });
     }
 
@@ -663,7 +668,12 @@ impl QueryContextManager {
         })?;
         if let Some(worker) = self.get_or_create_runtime_filter_worker(query_id) {
             for item in pending {
-                let _ = worker.receive_partial(item.filter_id, &item.data, item.build_be_number);
+                let _ = worker.receive_partial(
+                    item.filter_id,
+                    &item.data,
+                    item.build_be_number,
+                    item.build_data_type,
+                );
             }
         }
         Ok(())
@@ -747,9 +757,10 @@ impl QueryContextManager {
         filter_id: i32,
         build_be_number: i32,
         data: Vec<u8>,
+        build_data_type: Option<DataType>,
     ) -> Result<(), String> {
         self.with_context_mut(query_id, |ctx| {
-            ctx.push_pending_runtime_filter(filter_id, build_be_number, data);
+            ctx.push_pending_runtime_filter(filter_id, build_be_number, data, build_data_type);
             Ok(())
         })
     }
