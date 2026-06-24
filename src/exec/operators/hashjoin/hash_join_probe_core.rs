@@ -1605,6 +1605,90 @@ mod tests {
         Chunk::new_with_chunk_schema(batch, chunk_schema_of(&schema, slot_ids))
     }
 
+    fn direct_build_artifact_from_build_chunk(build: Chunk) -> JoinBuildArtifact {
+        let key_arrays = vec![build.column_by_slot_id(RIGHT_K_SLOT_ID).expect("build key")];
+        let batch = crate::exec::operators::hashjoin::join_hash_map::method::BuildKeyBatch::new(
+            key_arrays,
+            build.len(),
+        )
+        .expect("key batch");
+        let build_table =
+            crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMap::build_from_key_batches(
+                vec![DataType::Int32],
+                vec![false],
+                &[batch],
+                crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapBuildOptions::default(),
+            )
+            .expect("direct build table");
+        assert!(matches!(
+            build_table.method_kind(),
+            crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind::DirectInt { .. }
+        ));
+        JoinBuildArtifact::new(
+            Some(BuildStore::new(build)),
+            Some(build_table),
+            3,
+            false,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn inner_join_uses_direct_map_and_preserves_duplicate_matches() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let arena = Arc::new(arena);
+
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[100, 101, 100],
+            &[10, 11, 12],
+        );
+        let artifact = Arc::new(direct_build_artifact_from_build_chunk(build_chunk));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::Inner,
+            vec![probe_key],
+            None,
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        core.set_build_artifact(artifact, 3, false)
+            .expect("set build");
+
+        let probe_chunk = chunk_of_two(
+            Arc::clone(&left_schema),
+            &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID],
+            &[100, 102],
+            &[1, 2],
+        );
+
+        let out = core
+            .join_probe_chunks(vec![probe_chunk])
+            .expect("probe")
+            .expect("inner join output");
+        assert_eq!(out.len(), 2);
+        assert_eq!(core.lookup_hit_rows(), 1);
+        assert_eq!(core.lookup_miss_rows(), 1);
+    }
+
     #[test]
     fn concat_compatible_batches_rejects_decimal_precision_drift() {
         let schema = Arc::new(Schema::new(vec![Field::new(
