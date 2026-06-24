@@ -14,13 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! M1 join hash map method wrapper.
+//! Join hash map method wrapper.
 //!
-//! This module owns the join-facing hash map abstraction.  M1 only supports the
-//! existing chained hash-table implementation and deliberately delegates storage
-//! and lookup primitives to `JoinHashTable`.
+//! This module owns the join-facing hash map abstraction and dispatches between
+//! the existing chained hash table and specialized join-owned lookup methods.
 
-use std::ops::Deref;
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
@@ -28,6 +26,7 @@ use arrow::datatypes::DataType;
 
 use super::search::JoinSelection;
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::agg::IntArrayView;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::hash_table::key_builder::{
     GroupKeyArrayView, build_compressed_flags, build_group_key_hashes, build_group_key_views,
@@ -37,9 +36,91 @@ use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::operators::hashjoin::join_hash_table::{JoinHashTable, row_has_forbidden_null};
 use crate::runtime::mem_tracker::MemTracker;
 
-/// Join-owned hash map abstraction.  M1 wraps the existing chained table.
-pub(crate) struct JoinHashMap {
+const DIRECT_RANGE_ROW_MULTIPLIER: u64 = 8;
+const DIRECT_RANGE_MAX_LEN: u64 = 16 * 1024 * 1024;
+const ROW_NONE: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JoinHashMapBuildOptions {
+    pub(crate) direct_range_row_multiplier: u64,
+    pub(crate) direct_range_max_len: u64,
+}
+
+impl Default for JoinHashMapBuildOptions {
+    fn default() -> Self {
+        Self {
+            direct_range_row_multiplier: DIRECT_RANGE_ROW_MULTIPLIER,
+            direct_range_max_len: DIRECT_RANGE_MAX_LEN,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct BuildKeyBatch {
+    arrays: Vec<ArrayRef>,
+    num_rows: usize,
+}
+
+impl BuildKeyBatch {
+    pub(crate) fn new(arrays: Vec<ArrayRef>, num_rows: usize) -> Result<Self, String> {
+        for array in &arrays {
+            if array.len() != num_rows {
+                return Err(format!(
+                    "join build key batch length mismatch: array={} rows={}",
+                    array.len(),
+                    num_rows
+                ));
+            }
+        }
+        Ok(Self { arrays, num_rows })
+    }
+
+    pub(crate) fn arrays(&self) -> &[ArrayRef] {
+        &self.arrays
+    }
+
+    pub(crate) fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JoinHashMapMethodKind {
+    Chained,
+    DirectInt {
+        min: i64,
+        len: usize,
+        not_null: bool,
+    },
+}
+
+pub(crate) enum JoinHashMap {
+    Chained(ChainedJoinHashMap),
+    DirectInt(DirectIntJoinHashMap),
+}
+
+pub(crate) struct ChainedJoinHashMap {
     table: JoinHashTable,
+}
+
+pub(crate) struct DirectIntJoinHashMap {
+    data_type: DataType,
+    min: i64,
+    len: usize,
+    first: Vec<u32>,
+    next: Vec<u32>,
+    row_count: usize,
+    indexed_rows: usize,
+    not_null: bool,
+    runtime_filter_hash_seed: u64,
+}
+
+struct DirectIntStats {
+    min: i64,
+    max: i64,
+    row_count: usize,
+    indexed_rows: usize,
+    not_null: bool,
 }
 
 impl JoinHashMap {
@@ -47,21 +128,60 @@ impl JoinHashMap {
         key_types: Vec<DataType>,
         null_safe_eq: Vec<bool>,
     ) -> Result<Self, String> {
-        Ok(Self {
+        Ok(Self::Chained(ChainedJoinHashMap {
             table: JoinHashTable::new(key_types, null_safe_eq)?,
-        })
+        }))
+    }
+
+    pub(crate) fn build_from_key_batches(
+        key_types: Vec<DataType>,
+        null_safe_eq: Vec<bool>,
+        batches: &[BuildKeyBatch],
+        options: JoinHashMapBuildOptions,
+    ) -> Result<Self, String> {
+        if let Some(direct) =
+            DirectIntJoinHashMap::try_build(&key_types, &null_safe_eq, batches, options)?
+        {
+            return Ok(Self::DirectInt(direct));
+        }
+        let mut chained = Self::new_chained(key_types, null_safe_eq)?;
+        for batch in batches {
+            chained.add_build_rows(batch.arrays(), batch.num_rows())?;
+        }
+        chained.finalize()?;
+        Ok(chained)
+    }
+
+    pub(crate) fn method_kind(&self) -> JoinHashMapMethodKind {
+        match self {
+            Self::Chained(_) => JoinHashMapMethodKind::Chained,
+            Self::DirectInt(map) => JoinHashMapMethodKind::DirectInt {
+                min: map.min,
+                len: map.len,
+                not_null: map.not_null,
+            },
+        }
     }
 
     pub(crate) fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
-        self.table.set_mem_tracker(tracker);
+        match self {
+            Self::Chained(map) => map.table.set_mem_tracker(tracker),
+            Self::DirectInt(_) => {}
+        }
     }
 
     pub(crate) fn hash_seed(&self) -> u64 {
-        self.table.hash_seed()
+        match self {
+            Self::Chained(map) => map.table.hash_seed(),
+            Self::DirectInt(map) => map.runtime_filter_hash_seed,
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.table.is_empty()
+        match self {
+            Self::Chained(map) => map.table.is_empty(),
+            Self::DirectInt(map) => map.indexed_rows == 0,
+        }
     }
 
     pub(crate) fn add_build_rows(
@@ -69,14 +189,59 @@ impl JoinHashMap {
         key_arrays: &[ArrayRef],
         num_rows: usize,
     ) -> Result<(), String> {
-        self.table.add_build_rows(key_arrays, num_rows)
+        match self {
+            Self::Chained(map) => map.table.add_build_rows(key_arrays, num_rows),
+            Self::DirectInt(_) => {
+                Err("direct integer join hash map does not support incremental build".to_string())
+            }
+        }
     }
 
     pub(crate) fn finalize(&mut self) -> Result<(), String> {
-        self.table.finalize_groups()
+        match self {
+            Self::Chained(map) => map.table.finalize_groups(),
+            Self::DirectInt(_) => {
+                Err("direct integer join hash map is finalized during build".to_string())
+            }
+        }
     }
 
     pub(crate) fn lookup_selection(
+        &self,
+        arena: &ExprArena,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+    ) -> Result<(Vec<Option<usize>>, JoinSelection), String> {
+        match self {
+            Self::Chained(map) => map.lookup_selection(arena, probe_keys, probe),
+            Self::DirectInt(map) => map.lookup_selection(arena, probe_keys, probe),
+        }
+    }
+
+    pub(crate) fn lookup_group_ids(
+        &self,
+        arena: &ExprArena,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+    ) -> Result<Vec<Option<usize>>, String> {
+        match self {
+            Self::Chained(map) => map.lookup_group_ids(arena, probe_keys, probe),
+            Self::DirectInt(map) => map.lookup_group_ids(arena, probe_keys, probe),
+        }
+    }
+
+    pub(crate) fn group_build_rows(&self, group_id: usize) -> Result<&[u32], String> {
+        match self {
+            Self::Chained(map) => map.table.group_build_rows(group_id),
+            Self::DirectInt(_) => {
+                Err("direct integer join hash map does not expose grouped rows".to_string())
+            }
+        }
+    }
+}
+
+impl ChainedJoinHashMap {
+    fn lookup_selection(
         &self,
         arena: &ExprArena,
         probe_keys: &[ExprId],
@@ -183,12 +348,262 @@ impl JoinHashMap {
     }
 }
 
-impl Deref for JoinHashMap {
-    type Target = JoinHashTable;
-
-    fn deref(&self) -> &Self::Target {
-        &self.table
+impl DirectIntJoinHashMap {
+    fn try_build(
+        key_types: &[DataType],
+        null_safe_eq: &[bool],
+        batches: &[BuildKeyBatch],
+        options: JoinHashMapBuildOptions,
+    ) -> Result<Option<Self>, String> {
+        if key_types.len() != 1 || null_safe_eq.len() != 1 || null_safe_eq[0] {
+            return Ok(None);
+        }
+        if !is_direct_int_type(&key_types[0]) {
+            return Ok(None);
+        }
+        let stats = collect_direct_int_stats(&key_types[0], batches)?;
+        if stats.indexed_rows == 0 {
+            return Ok(None);
+        }
+        let range = checked_direct_range(stats.min, stats.max)?;
+        if range > options.direct_range_max_len {
+            return Ok(None);
+        }
+        let row_scaled = (stats.indexed_rows as u64)
+            .checked_mul(options.direct_range_row_multiplier)
+            .unwrap_or(u64::MAX);
+        if range > row_scaled {
+            return Ok(None);
+        }
+        let len = usize::try_from(range)
+            .map_err(|_| "direct integer join range length overflow".to_string())?;
+        let mut map = Self {
+            data_type: key_types[0].clone(),
+            min: stats.min,
+            len,
+            first: vec![ROW_NONE; len],
+            next: vec![ROW_NONE; stats.row_count],
+            row_count: stats.row_count,
+            indexed_rows: stats.indexed_rows,
+            not_null: stats.not_null,
+            runtime_filter_hash_seed: fallback_hash_seed(key_types, null_safe_eq)?,
+        };
+        map.fill_from_batches(batches)?;
+        Ok(Some(map))
     }
+
+    fn fill_from_batches(&mut self, batches: &[BuildKeyBatch]) -> Result<(), String> {
+        let mut base_row = 0usize;
+        for batch in batches {
+            let array = batch
+                .arrays()
+                .first()
+                .ok_or_else(|| "direct integer join build key missing".to_string())?;
+            if array.data_type() != &self.data_type {
+                return Err("direct integer join key type mismatch".to_string());
+            }
+            let view = IntArrayView::new(array)?;
+            for row in 0..batch.num_rows() {
+                let global_row = base_row
+                    .checked_add(row)
+                    .ok_or_else(|| "direct integer join row count overflow".to_string())?;
+                let Some(value) = view.value_at(row) else {
+                    continue;
+                };
+                let bucket = direct_bucket(value, self.min, self.len)
+                    .ok_or_else(|| "direct integer join key outside collected range".to_string())?;
+                let row_id = u32::try_from(global_row)
+                    .map_err(|_| "direct integer join row id overflow".to_string())?;
+                self.next[global_row] = self.first[bucket];
+                self.first[bucket] = row_id;
+            }
+            base_row = base_row
+                .checked_add(batch.num_rows())
+                .ok_or_else(|| "direct integer join row count overflow".to_string())?;
+        }
+        if base_row != self.row_count {
+            return Err("direct integer join row count mismatch".to_string());
+        }
+        Ok(())
+    }
+
+    fn lookup_group_ids(
+        &self,
+        arena: &ExprArena,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+    ) -> Result<Vec<Option<usize>>, String> {
+        let probe_len = probe.len();
+        if probe_len == 0 {
+            return Ok(Vec::new());
+        }
+        let probe_array = eval_single_probe_int_key(arena, probe_keys, probe, &self.data_type)?;
+        let probe_view = IntArrayView::new(&probe_array)?;
+        let mut group_ids = Vec::with_capacity(probe_len);
+        for row in 0..probe_len {
+            let group_id = match probe_view.value_at(row) {
+                Some(value) if self.lookup_bucket(value).is_some() => {
+                    direct_bucket(value, self.min, self.len)
+                }
+                _ => None,
+            };
+            group_ids.push(group_id);
+        }
+        Ok(group_ids)
+    }
+
+    fn lookup_selection(
+        &self,
+        arena: &ExprArena,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+    ) -> Result<(Vec<Option<usize>>, JoinSelection), String> {
+        let probe_len = probe.len();
+        if probe_len == 0 {
+            return Ok((Vec::new(), JoinSelection::new()));
+        }
+        let probe_array = eval_single_probe_int_key(arena, probe_keys, probe, &self.data_type)?;
+        let probe_view = IntArrayView::new(&probe_array)?;
+        let mut group_ids = Vec::with_capacity(probe_len);
+        let mut selection = JoinSelection::new();
+        for probe_row in 0..probe_len {
+            let Some(value) = probe_view.value_at(probe_row) else {
+                group_ids.push(None);
+                continue;
+            };
+            let Some(bucket) = direct_bucket(value, self.min, self.len) else {
+                group_ids.push(None);
+                continue;
+            };
+            let mut build_row = self.first[bucket];
+            if build_row == ROW_NONE {
+                group_ids.push(None);
+                continue;
+            }
+            group_ids.push(Some(bucket));
+            while build_row != ROW_NONE {
+                selection.push(probe_row as u32, build_row);
+                build_row = self.next_row(build_row)?;
+            }
+        }
+        Ok((group_ids, selection))
+    }
+
+    fn lookup_bucket(&self, value: i64) -> Option<u32> {
+        let bucket = direct_bucket(value, self.min, self.len)?;
+        let row = self.first[bucket];
+        (row != ROW_NONE).then_some(row)
+    }
+
+    fn next_row(&self, row_id: u32) -> Result<u32, String> {
+        self.next
+            .get(row_id as usize)
+            .copied()
+            .ok_or_else(|| "direct integer join row id out of bounds".to_string())
+    }
+}
+
+fn collect_direct_int_stats(
+    data_type: &DataType,
+    batches: &[BuildKeyBatch],
+) -> Result<DirectIntStats, String> {
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    let mut row_count = 0usize;
+    let mut indexed_rows = 0usize;
+    let not_null = false;
+    for batch in batches {
+        if batch.arrays().len() != 1 {
+            return Err("direct integer join requires one build key".to_string());
+        }
+        let array = batch
+            .arrays()
+            .first()
+            .ok_or_else(|| "direct integer join build key missing".to_string())?;
+        if array.len() != batch.num_rows() {
+            return Err(format!(
+                "join build key batch length mismatch: array={} rows={}",
+                array.len(),
+                batch.num_rows()
+            ));
+        }
+        if array.data_type() != data_type {
+            return Err("direct integer join key type mismatch".to_string());
+        }
+        let next_row_count = row_count
+            .checked_add(batch.num_rows())
+            .ok_or_else(|| "direct integer join row count overflow".to_string())?;
+        if next_row_count > u32::MAX as usize {
+            return Err("direct integer join row count overflow".to_string());
+        }
+        row_count = next_row_count;
+        let view = IntArrayView::new(array)?;
+        for row in 0..batch.num_rows() {
+            let Some(value) = view.value_at(row) else {
+                continue;
+            };
+            min = min.min(value);
+            max = max.max(value);
+            indexed_rows = indexed_rows
+                .checked_add(1)
+                .ok_or_else(|| "direct integer join indexed row count overflow".to_string())?;
+        }
+    }
+    Ok(DirectIntStats {
+        min,
+        max,
+        row_count,
+        indexed_rows,
+        not_null,
+    })
+}
+
+fn checked_direct_range(min: i64, max: i64) -> Result<u64, String> {
+    if max < min {
+        return Err("direct integer join range is empty".to_string());
+    }
+    let range = (max as i128) - (min as i128) + 1;
+    u64::try_from(range).map_err(|_| "direct integer join range overflow".to_string())
+}
+
+fn direct_bucket(value: i64, min: i64, len: usize) -> Option<usize> {
+    let delta = (value as i128) - (min as i128);
+    if delta < 0 {
+        return None;
+    }
+    let bucket = usize::try_from(delta).ok()?;
+    (bucket < len).then_some(bucket)
+}
+
+fn fallback_hash_seed(key_types: &[DataType], null_safe_eq: &[bool]) -> Result<u64, String> {
+    let table = JoinHashTable::new(key_types.to_vec(), null_safe_eq.to_vec())?;
+    Ok(table.hash_seed())
+}
+
+fn eval_single_probe_int_key(
+    arena: &ExprArena,
+    probe_keys: &[ExprId],
+    probe: &Chunk,
+    data_type: &DataType,
+) -> Result<ArrayRef, String> {
+    if probe_keys.len() != 1 {
+        return Err("direct integer join requires one probe key".to_string());
+    }
+    let array = arena
+        .eval(probe_keys[0], probe)
+        .map_err(|e| e.to_string())?;
+    if array.data_type() != data_type {
+        return Err("direct integer join probe key type mismatch".to_string());
+    }
+    IntArrayView::new(&array)?;
+    Ok(array)
+}
+
+fn is_direct_int_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
 }
 
 fn build_nulls(views: &[GroupKeyArrayView<'_>], len: usize, null_safe_eq: &[bool]) -> Vec<bool> {
@@ -207,7 +622,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use super::JoinHashMap;
+    use super::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions, JoinHashMapMethodKind};
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
@@ -274,5 +689,66 @@ mod tests {
         assert!(group_ids[1].is_none());
         assert_eq!(selection.probe, vec![0]);
         assert_eq!(selection.build, vec![1]);
+    }
+
+    #[test]
+    fn direct_map_lookup_selection_uses_key_minus_min_and_preserves_duplicates() {
+        let build = int32_chunk(vec![Some(100), Some(101), Some(100), Some(103)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+        assert_eq!(
+            map.method_kind(),
+            JoinHashMapMethodKind::DirectInt {
+                min: 100,
+                len: 4,
+                not_null: false,
+            }
+        );
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
+        let probe = int32_chunk(vec![Some(100), Some(102), Some(103), None]);
+
+        let (group_ids, selection) = map
+            .lookup_selection(&arena, &[probe_key], &probe)
+            .expect("lookup");
+
+        assert_eq!(group_ids.len(), 4);
+        assert!(group_ids[0].is_some());
+        assert!(group_ids[1].is_none());
+        assert!(group_ids[2].is_some());
+        assert!(group_ids[3].is_none());
+        assert_eq!(selection.probe, vec![0, 0, 2]);
+        assert_eq!(selection.build, vec![2, 0, 3]);
+    }
+
+    #[test]
+    fn direct_map_skips_null_build_rows_without_compressing_build_row_ids() {
+        let build = int32_chunk(vec![Some(10), None, Some(10)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
+        let probe = int32_chunk(vec![Some(10), None]);
+
+        let (_group_ids, selection) = map
+            .lookup_selection(&arena, &[probe_key], &probe)
+            .expect("lookup");
+
+        assert_eq!(selection.probe, vec![0, 0]);
+        assert_eq!(selection.build, vec![2, 0]);
     }
 }
