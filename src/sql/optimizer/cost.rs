@@ -258,10 +258,6 @@ pub(crate) struct CostOptions {
     pub profile: ClusterResourceProfile,
     pub hash_table_per_row_overhead_bytes: f64,
     pub hash_table_load_factor: f64,
-    pub broadcast_row_limit: f64,
-    pub broadcast_byte_limit: f64,
-    pub broadcast_right_table_scale_factor: f64,
-    pub fallback_broadcast_row_limit: f64,
     pub risk_multiplier_fallback: f64,
     pub risk_multiplier_estimated: f64,
     pub risk_multiplier_exact: f64,
@@ -285,10 +281,6 @@ impl Default for CostOptions {
             profile: ClusterResourceProfile::default(),
             hash_table_per_row_overhead_bytes: 16.0,
             hash_table_load_factor: 0.75,
-            broadcast_row_limit: 15_000_000.0,
-            broadcast_byte_limit: 512.0 * 1024.0 * 1024.0,
-            broadcast_right_table_scale_factor: 10.0,
-            fallback_broadcast_row_limit: 500_000.0,
             risk_multiplier_fallback: 4.0,
             risk_multiplier_estimated: 2.0,
             risk_multiplier_exact: 1.0,
@@ -961,34 +953,6 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
 
 pub(crate) fn compute_cost_from_input(input: &CostInput<'_>) -> TotalCost {
     compute_cost_estimate(input).total_with_options(input.options)
-}
-
-pub(crate) fn broadcast_gate_passes(
-    probe_stats: &Statistics,
-    build_stats: &Statistics,
-    options: &CostOptions,
-) -> bool {
-    let build_rows = build_stats.output_row_count;
-    let build_bytes = build_stats.compute_size();
-    let probe_bytes = probe_stats.compute_size();
-
-    if build_bytes > options.broadcast_byte_limit {
-        return false;
-    }
-
-    if build_stats.row_count_confidence < crate::sql::optimizer::statistics::Confidence::Exact
-        && build_rows > options.fallback_broadcast_row_limit
-    {
-        return false;
-    }
-
-    let build_is_obviously_tiny = probe_bytes
-        >= build_bytes * options.backend_factor * options.broadcast_right_table_scale_factor;
-    if build_rows > options.broadcast_row_limit && !build_is_obviously_tiny {
-        return false;
-    }
-
-    true
 }
 
 fn compute_legacy_cost_with_properties(
@@ -2696,26 +2660,6 @@ mod tests {
 
         assert!(cost > 0.0);
         assert!(cost < unshuffled_cost);
-    }
-
-    #[test]
-    fn broadcast_gate_rejects_fallback_build_above_fallback_limit() {
-        let mut build = stats(600_000.0, 100.0);
-        build.row_count_confidence = crate::sql::optimizer::statistics::Confidence::Fallback;
-        let probe = stats(700_000.0, 100.0);
-        let options = CostOptions::default();
-
-        assert!(!broadcast_gate_passes(&probe, &build, &options));
-    }
-
-    #[test]
-    fn broadcast_gate_rejects_estimated_build_above_fallback_limit() {
-        let mut build = stats(648_000.0, 100.0);
-        build.row_count_confidence = crate::sql::optimizer::statistics::Confidence::Estimated;
-        let probe = stats(3_543_657.0, 100.0);
-        let options = CostOptions::default();
-
-        assert!(!broadcast_gate_passes(&probe, &build, &options));
     }
 
     #[test]
