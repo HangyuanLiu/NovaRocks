@@ -432,6 +432,11 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 self.partition,
                 table.method_kind()
             );
+            if let Some(profile) = self.profiles.as_ref() {
+                profile
+                    .common
+                    .add_info_string("JoinHashMapMethod", table.method_kind().as_profile_str());
+            }
             self.build_table = Some(table);
         }
 
@@ -471,6 +476,10 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         let runtime_filters = self.runtime_filters.take().map(Arc::new);
         self.clear_build_key_batches();
         let build_null_key_rows = self.build_null_key_rows.take().map(Arc::new);
+        let join_map_method = table
+            .as_ref()
+            .map(|t| t.method_kind().as_profile_str())
+            .unwrap_or("None");
         let artifact = Arc::new(JoinBuildArtifact::new(
             build_store,
             table,
@@ -483,7 +492,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             .set_build(self.partition, artifact)
             .map_err(|e| e.to_string())?;
         debug!(
-            "HashJoinBuildSink finished: dep_key={} driver_id={} partition={} node_id={} join_type={} input_rows={} input_chunks={} build_row_count={} build_has_null_key={} build_store_rows={} build_table={} build_keys={}",
+            "HashJoinBuildSink finished: dep_key={} driver_id={} partition={} node_id={} join_type={} input_rows={} input_chunks={} build_row_count={} build_has_null_key={} build_store_rows={} build_table={} build_keys={} join_map_method={}",
             self.state.dep_name(self.partition),
             self.driver_id,
             self.partition,
@@ -495,7 +504,8 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             self.build_has_null_key,
             build_store_rows,
             table_present,
-            self.build_keys.len()
+            self.build_keys.len(),
+            join_map_method
         );
         Ok(())
     }
@@ -1242,6 +1252,7 @@ mod tests {
     use crate::exec::expr::{ExprNode, LiteralValue};
     use crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind;
     use crate::exec::pipeline::dependency::DependencyManager;
+    use crate::runtime::profile::{OperatorProfiles, RuntimeProfile};
 
     #[derive(Default)]
     struct TestBuildState {
@@ -1277,26 +1288,22 @@ mod tests {
         Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
     }
 
-    #[test]
-    fn defers_hash_map_construction_until_build_finish() {
+    fn direct_int_build_operator(state: Arc<TestBuildState>) -> HashJoinBuildSinkOperator {
         let mut arena = ExprArena::default();
         let build_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let arena = Arc::new(arena);
-        let state = Arc::new(TestBuildState::default());
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
-        let mut operator = HashJoinBuildSinkOperator {
+        HashJoinBuildSinkOperator {
             name: "HASH_JOIN (id=1)".to_string(),
             node_id: 1,
             driver_id: 0,
-            arena,
+            arena: Arc::new(arena),
             join_type: JoinType::Inner,
             build_keys: vec![build_key],
             eq_null_safe: vec![false],
             runtime_filter_specs: Vec::new(),
             distribution_mode: JoinDistributionMode::Broadcast,
-            state: state.clone(),
+            state,
             partition: 0,
-            runtime_filter_hub,
+            runtime_filter_hub: Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
             runtime_in_filter_merger: None,
             build_store_builder: BuildStoreBuilder::new(),
             build_input_chunks: Vec::new(),
@@ -1318,7 +1325,13 @@ mod tests {
             input_chunks: 0,
             build_input_chunks_mem_tracker: None,
             build_table_mem_tracker: None,
-        };
+        }
+    }
+
+    #[test]
+    fn defers_hash_map_construction_until_build_finish() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = direct_int_build_operator(state.clone());
 
         operator
             .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
@@ -1343,6 +1356,26 @@ mod tests {
             JoinHashMapMethodKind::DirectInt { .. }
         ));
         assert!(operator.build_key_batches.is_empty());
+    }
+
+    #[test]
+    fn records_join_hash_map_method_in_profile() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = direct_int_build_operator(state);
+        let profiles = OperatorProfiles::new(RuntimeProfile::new("HASH_JOIN"));
+        operator.set_profiles(profiles.clone());
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .expect("push chunk");
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        assert_eq!(
+            profiles.common.get_info_string("JoinHashMapMethod"),
+            Some("DirectIntNotNull".to_string())
+        );
     }
 
     #[test]

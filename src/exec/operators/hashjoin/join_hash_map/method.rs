@@ -95,6 +95,18 @@ pub(crate) enum JoinHashMapMethodKind {
     },
 }
 
+impl JoinHashMapMethodKind {
+    pub(crate) fn as_profile_str(&self) -> &'static str {
+        match self {
+            Self::Chained => "Chained",
+            Self::DirectInt { not_null: true, .. } => "DirectIntNotNull",
+            Self::DirectInt {
+                not_null: false, ..
+            } => "DirectIntNullable",
+        }
+    }
+}
+
 pub(crate) enum JoinHashMap {
     Chained(ChainedJoinHashMap),
     DirectInt(DirectIntJoinHashMap),
@@ -758,6 +770,29 @@ mod tests {
     use crate::runtime::mem_tracker::MemTracker;
 
     const KEY_SLOT_ID: SlotId = SlotId(1);
+
+    #[test]
+    fn method_kind_profile_strings_are_stable() {
+        assert_eq!(JoinHashMapMethodKind::Chained.as_profile_str(), "Chained");
+        assert_eq!(
+            JoinHashMapMethodKind::DirectInt {
+                min: 1,
+                len: 2,
+                not_null: true,
+            }
+            .as_profile_str(),
+            "DirectIntNotNull"
+        );
+        assert_eq!(
+            JoinHashMapMethodKind::DirectInt {
+                min: 1,
+                len: 2,
+                not_null: false,
+            }
+            .as_profile_str(),
+            "DirectIntNullable"
+        );
+    }
 
     fn int32_chunk(values: Vec<Option<i32>>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]));
