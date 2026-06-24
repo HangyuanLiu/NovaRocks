@@ -262,6 +262,10 @@ pub(crate) struct CostOptions {
     pub broadcast_byte_limit: f64,
     pub broadcast_right_table_scale_factor: f64,
     pub fallback_broadcast_row_limit: f64,
+    pub risk_multiplier_fallback: f64,
+    pub risk_multiplier_estimated: f64,
+    pub risk_multiplier_exact: f64,
+    pub risk_multiplier_measured: f64,
     pub network_cost: f64,
     pub memory_cost_weight: f64,
     pub predicate_cost_factor: f64,
@@ -286,6 +290,10 @@ impl Default for CostOptions {
             broadcast_byte_limit: 512.0 * 1024.0 * 1024.0,
             broadcast_right_table_scale_factor: 10.0,
             fallback_broadcast_row_limit: 500_000.0,
+            risk_multiplier_fallback: 4.0,
+            risk_multiplier_estimated: 2.0,
+            risk_multiplier_exact: 1.0,
+            risk_multiplier_measured: 1.0,
             network_cost: NETWORK_COST,
             memory_cost_weight: 0.25,
             predicate_cost_factor: 0.02,
@@ -359,6 +367,24 @@ fn cost_row_width(stats: &Statistics) -> f64 {
 
 fn safe_compute_size(stats: &Statistics) -> f64 {
     finite_non_negative_cost(cost_row_count(stats) * cost_row_width(stats))
+}
+
+/// Dimensionless inflation factor applied to the estimated build hash-table
+/// bytes BEFORE the LAYER 1 feasibility check. Feasibility-only — it does NOT
+/// enter LAYER 2 cost (that would double-count and degrade into a soft gate).
+/// Anchored at Exact=1.0, monotone non-increasing as confidence rises.
+#[allow(dead_code)] // BC-1 Phase 1 staged until broadcast feasibility consumes it.
+pub(crate) fn confidence_risk_multiplier(
+    confidence: crate::sql::optimizer::statistics::Confidence,
+    options: &CostOptions,
+) -> f64 {
+    use crate::sql::optimizer::statistics::Confidence;
+    match confidence {
+        Confidence::Fallback => options.risk_multiplier_fallback,
+        Confidence::Estimated => options.risk_multiplier_estimated,
+        Confidence::Exact => options.risk_multiplier_exact,
+        Confidence::Measured => options.risk_multiplier_measured,
+    }
 }
 
 fn scan_cost_size(scan: &ScanOp, stats: &Statistics) -> f64 {
@@ -1071,6 +1097,24 @@ mod tests {
         assert_eq!(cost_row_width(&stats(1.0, -1.0)), 8.0);
         assert_eq!(cost_row_width(&stats(1.0, f64::NEG_INFINITY)), 8.0);
         assert_eq!(cost_row_width(&stats(1.0, f64::NAN)), 8.0);
+    }
+
+    #[test]
+    fn confidence_risk_multiplier_is_monotone_and_anchored() {
+        let o = CostOptions::default();
+        assert_eq!(confidence_risk_multiplier(Confidence::Fallback, &o), 4.0);
+        assert_eq!(confidence_risk_multiplier(Confidence::Estimated, &o), 2.0);
+        assert_eq!(confidence_risk_multiplier(Confidence::Exact, &o), 1.0);
+        // Measured is inert until a producer lands: must equal Exact.
+        assert_eq!(confidence_risk_multiplier(Confidence::Measured, &o), 1.0);
+        assert!(
+            confidence_risk_multiplier(Confidence::Fallback, &o)
+                >= confidence_risk_multiplier(Confidence::Estimated, &o)
+        );
+        assert!(
+            confidence_risk_multiplier(Confidence::Estimated, &o)
+                >= confidence_risk_multiplier(Confidence::Exact, &o)
+        );
     }
 
     #[test]
