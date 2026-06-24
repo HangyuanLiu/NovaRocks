@@ -146,6 +146,13 @@ pub(crate) fn bind_position_delete_descriptor(
             desc.target_partition_spec_id
         )));
     }
+    if expected_partition_source_column_names.len() != expected_partition_column_names.len() {
+        return Err(descriptor_error(format!(
+            "partition metadata count mismatch: source columns={}, partition columns={}",
+            expected_partition_source_column_names.len(),
+            expected_partition_column_names.len()
+        )));
+    }
     let partition_fields = desc.partition_source_fields.as_deref().unwrap_or_default();
     if partition_fields.len() != expected_partition_source_column_names.len() {
         return Err(descriptor_error(format!(
@@ -250,6 +257,12 @@ mod tests {
         )
     }
 
+    fn empty_output_exprs(count: usize) -> Vec<crate::exprs::TExpr> {
+        (0..count)
+            .map(|_| crate::exprs::TExpr::new(Vec::new()))
+            .collect()
+    }
+
     #[test]
     fn descriptor_missing_file_path_field_id_fails() {
         let mut desc = valid_descriptor();
@@ -293,6 +306,28 @@ mod tests {
                 .metadata()
                 .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY),
             Some(&ICEBERG_POSITION_DELETE_POS_FIELD_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn descriptor_partition_metadata_count_mismatch_fails() {
+        let desc = valid_descriptor();
+        let output_exprs = empty_output_exprs(3);
+        let err = bind_position_delete_descriptor(
+            Some(&desc),
+            &output_exprs,
+            7,
+            &[String::from("id")],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        assert!(
+            err.to_user_message()
+                .contains("partition metadata count mismatch")
         );
     }
 }
