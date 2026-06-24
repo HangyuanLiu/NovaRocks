@@ -5,7 +5,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
-use crate::sql::optimizer::rewrite::result::RewriteResult;
+use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
@@ -354,6 +354,50 @@ fn project_item_output_column(item: &ProjectItem) -> OutputColumn {
         data_type: item.expr.data_type.clone(),
         nullable: item.expr.nullable,
         is_internal: false,
+    }
+}
+
+/// Defense-in-depth: any Outer/Semi/Anti join that survived into the validated
+/// IMV plan is a bug (rewrite should have rejected it). Fail fast before apply.
+pub(crate) struct UnsupportedJoinKindCheckRule;
+
+/// Returns true if `plan` contains any Join node whose kind is not supported
+/// for incremental delta rewrite (i.e., anything other than Inner/Cross).
+fn plan_contains_unsupported_join(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        PlanNodeKind::Join(join) => {
+            if !join_delta_kind_supported(join.join_type) {
+                return true;
+            }
+            plan.children.iter().any(plan_contains_unsupported_join)
+        }
+        _ => plan.children.iter().any(plan_contains_unsupported_join),
+    }
+}
+
+impl LogicalRewriteRule for UnsupportedJoinKindCheckRule {
+    fn name(&self) -> &'static str {
+        "UnsupportedJoinKindCheck"
+    }
+
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::Validation
+    }
+
+    fn traversal(&self) -> RewriteTraversal {
+        RewriteTraversal::TopDown
+    }
+
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
+        plan_contains_unsupported_join(&plan)
+    }
+
+    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
+            "UnsupportedJoinKindCheck",
+            "incremental apply reached an unsupported join kind (only inner/cross are incrementalizable) — this is a bug: rewrite should have rejected it".to_string(),
+        )))
     }
 }
 
@@ -930,5 +974,40 @@ mod tests {
             panic!("expected Scan");
         };
         assert_eq!(scan.table.name, expected_scan);
+    }
+
+    #[test]
+    fn validation_rejects_outer_join_reaching_apply() {
+        // Build a delta-marked plan containing a LEFT OUTER join (which rewrite
+        // should have rejected, but defense-in-depth catches it at validation).
+        let plan = LogicalPlanNode::new(
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                is_root: false,
+                action_column: Some(ColumnId(100)),
+                branch_scope: None,
+            }),
+            vec![join_over(JoinKind::LeftOuter)],
+            None,
+        );
+
+        let ctx = build_ctx();
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+
+        let rule = super::UnsupportedJoinKindCheckRule;
+        assert!(
+            rule.matches(&expr, &ctx),
+            "UnsupportedJoinKindCheckRule must match a plan containing a LeftOuter join"
+        );
+
+        let mut ctx2 = build_ctx();
+        let expr2 = logical_plan_to_opt_expr(&plan, &mut ctx2.scalar_arena().borrow_mut());
+        let result = rule
+            .apply(expr2, &mut ctx2)
+            .expect("apply must not return Err");
+        assert!(
+            matches!(result, RewriteResult::Rejected(_)),
+            "UnsupportedJoinKindCheckRule must return Rejected, got {result:?}"
+        );
     }
 }

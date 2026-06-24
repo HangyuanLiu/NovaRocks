@@ -80,6 +80,7 @@ INSERT INTO mv_agg2_${uuid0}.ns_${uuid0}.measurements VALUES
 REFRESH MATERIALIZED VIEW measurements_mv;
 
 -- query 7
+-- @imv_equivalence_check=measurements_mv
 SELECT k, c_all, s_v, a_v, a_d, mn_v, mx_v, mn_s, mx_s, mn_ts, mx_ts
 FROM measurements_mv
 ORDER BY k;

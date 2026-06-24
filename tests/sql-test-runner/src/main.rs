@@ -562,6 +562,180 @@ fn run_step_wait_alters(
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
+// @imv_equivalence_check helpers
+// ---------------------------------------------------------------------------
+
+/// Pure multiset comparison of an MV's incremental contents vs a full recompute.
+/// Returns `None` when equal, or `Some(reason)` describing the mismatch.
+fn imv_equivalence_failure(
+    mv: &str,
+    inc: &crate::types::QueryExecution,
+    full: &crate::types::QueryExecution,
+    epsilon: Option<f64>,
+) -> Option<String> {
+    let (same, reason) = compare_result_sets(
+        &inc.header,
+        &inc.rows,
+        &full.header,
+        &full.rows,
+        false,
+        epsilon,
+    );
+    if same {
+        None
+    } else {
+        Some(format!(
+            "@imv_equivalence_check: incremental result != full recompute for `{mv}`\n{reason}"
+        ))
+    }
+}
+
+/// Capture the MV's current (incremental) contents, derive a full recompute by
+/// running the MV's `SelectText` query directly against the base tables (obtained
+/// from `SHOW MATERIALIZED VIEWS`), and assert multiset equality of results.
+/// MV is qualified by `db` like wait_alter_*. No side effects on the MV.
+fn run_imv_equivalence_check(
+    mv: &str,
+    session: &mut crate::session::MysqlSession,
+    query_timeout: u64,
+    db: Option<&str>,
+    epsilon: Option<f64>,
+    log: &mut String,
+) -> Result<(), String> {
+    let fqn = match db {
+        Some(d) if !d.is_empty() => format!("{d}.{mv}"),
+        _ => mv.to_string(),
+    };
+    let select = format!("SELECT * FROM {fqn}");
+    let _ = writeln!(
+        log,
+        "    @imv_equivalence_check: capturing incremental contents of {fqn}"
+    );
+    let (ok, inc, msg) = session.execute_query(query_timeout, &select, None);
+    if !ok {
+        return Err(format!(
+            "@imv_equivalence_check: incremental SELECT failed: {msg}"
+        ));
+    }
+    let inc = inc.ok_or_else(|| {
+        "@imv_equivalence_check: incremental SELECT returned no result".to_string()
+    })?;
+
+    // Derive the full-recompute result by running the MV's defining SELECT
+    // directly against the base tables. We obtain the SELECT SQL from
+    // `SHOW MATERIALIZED VIEWS`, which exposes `SelectText` for each MV.
+    // This avoids `REFRESH MATERIALIZED VIEW ... FULL`, which is intentionally
+    // disabled pending redesign.
+    let _ = writeln!(
+        log,
+        "    @imv_equivalence_check: deriving full recompute via SelectText"
+    );
+    let (ok, show_result, msg) =
+        session.execute_query(query_timeout, "SHOW MATERIALIZED VIEWS", None);
+    if !ok {
+        return Err(format!(
+            "@imv_equivalence_check: SHOW MATERIALIZED VIEWS failed: {msg}"
+        ));
+    }
+    let show_result = show_result.ok_or_else(|| {
+        "@imv_equivalence_check: SHOW MATERIALIZED VIEWS returned no result".to_string()
+    })?;
+
+    // Find the column indices for "Name", "SelectText", and optionally "Database".
+    let name_col = show_result
+        .header
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("Name"))
+        .ok_or_else(|| {
+            "@imv_equivalence_check: SHOW MATERIALIZED VIEWS result has no 'Name' column"
+                .to_string()
+        })?;
+    let select_text_col = show_result
+        .header
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("SelectText"))
+        .ok_or_else(|| {
+            "@imv_equivalence_check: SHOW MATERIALIZED VIEWS result has no 'SelectText' column"
+                .to_string()
+        })?;
+    // Database column is optional — if absent we fall back to bare-name match
+    // but still apply the ambiguity check below.
+    let db_col = show_result
+        .header
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("Database"));
+
+    // Find all rows whose name matches `mv` AND, when `db` is known and the
+    // Database column is present, whose Database column also matches `db`.
+    // This prevents silently binding the wrong SelectText when two MVs in
+    // different databases of the same catalog share a bare name.
+    let matched: Vec<&Vec<String>> = show_result
+        .rows
+        .iter()
+        .filter(|row| {
+            let name_matches = row
+                .get(name_col)
+                .map(|n| n.eq_ignore_ascii_case(mv))
+                .unwrap_or(false);
+            if !name_matches {
+                return false;
+            }
+            // Apply db-qualification when both the caller supplied a non-empty
+            // db and the SHOW output has a Database column.
+            if let (Some(d), Some(dc)) = (db.filter(|d| !d.is_empty()), db_col) {
+                row.get(dc)
+                    .map(|dbname| dbname.eq_ignore_ascii_case(d))
+                    .unwrap_or(false)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let select_sql = match matched.len() {
+        0 => {
+            return Err(format!(
+                "@imv_equivalence_check: MV `{mv}` not found in SHOW MATERIALIZED VIEWS output"
+            ))
+        }
+        1 => matched[0]
+            .get(select_text_col)
+            .ok_or_else(|| {
+                format!(
+                    "@imv_equivalence_check: MV `{mv}` row has no SelectText value"
+                )
+            })?
+            .clone(),
+        n => {
+            return Err(format!(
+                "@imv_equivalence_check: MV `{mv}` is ambiguous in SHOW MATERIALIZED VIEWS \
+                 (qualify with a unique db); matched {n} rows"
+            ))
+        }
+    };
+
+    // SelectText is the canonical re-parseable CREATE-MV query body (sqlparser
+    // Display round-trip, re-parsed on every refresh), so it is safe to re-run.
+    let (ok, full, msg) = session.execute_query(query_timeout, &select_sql, None);
+    if !ok {
+        return Err(format!(
+            "@imv_equivalence_check: full-recompute SELECT failed: {msg}"
+        ));
+    }
+    let full = full.ok_or_else(|| {
+        "@imv_equivalence_check: full-recompute SELECT returned no result".to_string()
+    })?;
+    match imv_equivalence_failure(&fqn, &inc, &full, epsilon) {
+        Some(reason) => Err(reason),
+        None => {
+            let _ = writeln!(log, "    @imv_equivalence_check: incremental == full ✅");
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // @explain_* helpers
 // ---------------------------------------------------------------------------
 
@@ -1158,6 +1332,25 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
+                        // @imv_equivalence_check: assert MV incremental contents
+                        // == a full recompute derived by running the MV's SelectText
+                        // directly against the base tables (no MV side effects).
+                        // Verify-mode only by design: diff mode compares against a
+                        // reference engine (no full-recompute oracle here), and the
+                        // check needs the MV's own SelectText which only verify drives.
+                        if let Some(mv) = step.meta.imv_equivalence_check.as_deref() {
+                            if let Err(reason) = run_imv_equivalence_check(
+                                mv,
+                                &mut target_session,
+                                ctx.query_timeout,
+                                step.meta.db.as_deref().or(primary_case_db),
+                                epsilon,
+                                &mut log,
+                            ) {
+                                let _ = writeln!(log, "    ❌ FAIL: {reason}");
+                                case_failed = true;
+                            }
+                        }
                         // @explain_*: issue EXPLAIN VERBOSE and assert substrings.
                         let explain_ok = if !step.meta.explain_contains.is_empty()
                             || !step.meta.explain_not_contains.is_empty()
@@ -3364,5 +3557,32 @@ enable_path_style_access = true
                 .contains("all-in-one mode requires --cluster-size 1"),
             "unexpected: {err}"
         );
+    }
+
+    fn exec(header: &[&str], rows: &[&[&str]]) -> crate::types::QueryExecution {
+        crate::types::QueryExecution {
+            header: header.iter().map(|s| s.to_string()).collect(),
+            rows: rows
+                .iter()
+                .map(|row| row.iter().map(|s| s.to_string()).collect())
+                .collect(),
+            text_output: String::new(),
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn imv_equivalence_failure_none_when_multiset_equal() {
+        let inc = exec(&["k", "c"], &[&["a", "2"], &["b", "1"]]);
+        let full = exec(&["k", "c"], &[&["b", "1"], &["a", "2"]]);
+        assert!(super::imv_equivalence_failure("m", &inc, &full, None).is_none());
+    }
+
+    #[test]
+    fn imv_equivalence_failure_some_when_rows_differ() {
+        let inc = exec(&["k", "c"], &[&["a", "2"]]);
+        let full = exec(&["k", "c"], &[&["a", "3"]]);
+        let msg = super::imv_equivalence_failure("m", &inc, &full, None).expect("diff");
+        assert!(msg.contains("incremental result != full recompute"), "{msg}");
     }
 }

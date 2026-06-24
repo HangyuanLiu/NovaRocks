@@ -1,4 +1,10 @@
-//! Approximate count distinct state combinator aggregate functions.
+//! Approx-count-distinct state combinator for IMV.
+//!
+//! INVARIANT: the MV signed state MUST be an exact, invertible multiset
+//! (aliased to `MinMaxState`). It must NEVER be replaced by an HLL/approximate
+//! sketch — HLL is not invertible, so a `-1` (delete) under signed refresh
+//! would corrupt the maintained count. Query-time approximate distinct lives
+//! elsewhere (`agg::hll_raw` / `HistogramHllNdvAgg`) and must not leak here.
 
 pub(in crate::exec::expr::agg::functions) use super::min_max::{
     MinMaxStateAgg as ApproxCountDistinctStateAgg,
@@ -116,24 +122,24 @@ mod tests {
     }
 
     #[test]
-    fn approx_count_distinct_state_byte_equal_to_count_distinct_state() {
+    fn approx_count_distinct_state_byte_equal_to_min_state() {
         let input = Arc::new(Int64Array::from(vec![Some(5), Some(5), Some(3), None])) as ArrayRef;
 
-        let approx = state_bytes(
+        let approx_count_distinct = state_bytes(
             "approx_count_distinct_state",
             &DataType::Int64,
             input.clone(),
         );
-        let exact = state_bytes("count_distinct_state", &DataType::Int64, input);
+        let min = state_bytes("min_state", &DataType::Int64, input);
 
         assert_eq!(
-            approx, exact,
-            "ApproxCountDistinct state must share CountDistinct state encoding"
+            approx_count_distinct, min,
+            "ApproxCountDistinct state must be byte-identical to Min state on same input"
         );
     }
 
     #[test]
-    fn approx_count_distinct_state_signed_byte_equal_to_count_distinct_state_signed() {
+    fn approx_count_distinct_state_signed_byte_equal_to_min_state_signed() {
         let input_type = signed_input_type(DataType::Int64);
         let input = signed_i64_input(
             vec![Some(5), Some(5), Some(3)],
@@ -144,16 +150,16 @@ mod tests {
             ],
         );
 
-        let approx = state_bytes(
+        let approx_count_distinct = state_bytes(
             "approx_count_distinct_state_signed",
             &input_type,
             input.clone(),
         );
-        let exact = state_bytes("count_distinct_state_signed", &input_type, input);
+        let min = state_bytes("min_state_signed", &input_type, input);
 
         assert_eq!(
-            approx, exact,
-            "ApproxCountDistinct signed state must share CountDistinct signed state encoding"
+            approx_count_distinct, min,
+            "ApproxCountDistinct signed state must be byte-identical to Min signed state on same input"
         );
     }
 
