@@ -84,12 +84,8 @@ pub(crate) fn data_type_to_tprimitive(
         DataType::Date32 => types::TPrimitiveType::DATE,
         DataType::Timestamp(_, _) => types::TPrimitiveType::DATETIME,
         DataType::Utf8 => types::TPrimitiveType::VARCHAR,
-        DataType::Decimal128(precision, _) if *precision <= 9 => {
-            types::TPrimitiveType::DECIMAL32
-        }
-        DataType::Decimal128(precision, _) if *precision <= 18 => {
-            types::TPrimitiveType::DECIMAL64
-        }
+        DataType::Decimal128(precision, _) if *precision <= 9 => types::TPrimitiveType::DECIMAL32,
+        DataType::Decimal128(precision, _) if *precision <= 18 => types::TPrimitiveType::DECIMAL64,
         DataType::Decimal128(_, _) => types::TPrimitiveType::DECIMAL128,
         _ => {
             return Err(format!(

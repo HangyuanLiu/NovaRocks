@@ -854,9 +854,9 @@ mod tests {
     use hashbrown::HashSet;
 
     use super::{
-        decode_starrocks_in_filter, decode_starrocks_membership_filter,
-        encode_starrocks_bitset_filter, encode_starrocks_in_filter, RF_TYPE_BITSET_FILTER,
-        RF_TYPE_IN_FILTER, RF_VERSION_V3,
+        RF_TYPE_BITSET_FILTER, RF_TYPE_IN_FILTER, RF_VERSION_V3, decode_starrocks_in_filter,
+        decode_starrocks_membership_filter, encode_starrocks_bitset_filter,
+        encode_starrocks_in_filter,
     };
     use crate::common::ids::SlotId;
     use crate::exec::runtime_filter::min_max::MinMaxValue;

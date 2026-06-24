@@ -28,9 +28,9 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::DataType;
