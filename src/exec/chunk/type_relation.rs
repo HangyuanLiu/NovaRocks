@@ -22,7 +22,6 @@
 //! It is the one place that answers "is column type `actual` relatable to the
 //! authoritative descriptor type `expected`?". It replaces the five hand-rolled
 //! copies of that predicate that drifted apart:
-//!   - `exec::schema_compat::is_execution_data_type_compatible`
 //!   - `exec::chunk::schema::is_compatible_chunk_field_type` / `reconcile_chunk_data_type`
 //!   - `exec::operators::sort::is_compatible_sort_field_type`
 //!   - `runtime::exchange::is_compatible_exchange_arrow_type` / `merge_exchange_field_type`
