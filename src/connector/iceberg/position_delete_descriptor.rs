@@ -1,0 +1,298 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+use crate::{data_sinks, exprs, types};
+
+pub(crate) const ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = 2_147_483_546;
+pub(crate) const ICEBERG_POSITION_DELETE_POS_FIELD_ID: i32 = 2_147_483_545;
+pub(crate) const ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN: &str = "file_path";
+pub(crate) const ICEBERG_POSITION_DELETE_POS_COLUMN: &str = "pos";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct PositionDeleteDescriptorBinding {
+    pub(crate) output_schema: SchemaRef,
+    pub(crate) output_column_names: Vec<String>,
+    pub(crate) partition_source_column_names: Vec<String>,
+    pub(crate) partition_column_names: Vec<String>,
+}
+
+fn descriptor_error(message: impl Into<String>) -> crate::common::engine_error::EngineError {
+    crate::common::engine_error::EngineError::unsupported_position_delete_descriptor(message)
+}
+
+fn primitive_type(type_desc: &types::TTypeDesc) -> Option<types::TPrimitiveType> {
+    type_desc
+        .types
+        .as_ref()
+        .and_then(|types| types.first())
+        .and_then(|node| node.scalar_type.as_ref())
+        .map(|scalar| scalar.type_)
+}
+
+fn validate_output_field(
+    label: &str,
+    field: Option<&data_sinks::TIcebergPositionDeleteOutputField>,
+    expected_index: i32,
+    expected_name: &str,
+    expected_primitive: types::TPrimitiveType,
+    expected_field_id: i32,
+) -> Result<(), crate::common::engine_error::EngineError> {
+    let field = field.ok_or_else(|| descriptor_error(format!("{label} descriptor is missing")))?;
+    if field.output_expr_index != Some(expected_index) {
+        return Err(descriptor_error(format!(
+            "{label} output_expr_index mismatch: expected {expected_index}, got {:?}",
+            field.output_expr_index
+        )));
+    }
+    if field.name.as_deref() != Some(expected_name) {
+        return Err(descriptor_error(format!(
+            "{label} name mismatch: expected {expected_name}, got {:?}",
+            field.name
+        )));
+    }
+    let actual_primitive = field.type_desc.as_ref().and_then(primitive_type);
+    if actual_primitive != Some(expected_primitive) {
+        return Err(descriptor_error(format!(
+            "{label} type mismatch: expected {expected_primitive:?}, got {actual_primitive:?}"
+        )));
+    }
+    if field.field_id != Some(expected_field_id) {
+        return Err(descriptor_error(format!(
+            "{label} field_id mismatch: expected {expected_field_id}, got {:?}",
+            field.field_id
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_required_fields(
+    desc: &data_sinks::TIcebergPositionDeleteOutputDescriptor,
+) -> Result<(), crate::common::engine_error::EngineError> {
+    validate_output_field(
+        "file_path",
+        desc.file_path.as_ref(),
+        0,
+        ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
+        types::TPrimitiveType::VARCHAR,
+        ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+    )?;
+    validate_output_field(
+        "pos",
+        desc.pos.as_ref(),
+        1,
+        ICEBERG_POSITION_DELETE_POS_COLUMN,
+        types::TPrimitiveType::BIGINT,
+        ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+    )
+}
+
+pub(crate) fn output_schema_from_descriptor(
+    desc: &data_sinks::TIcebergPositionDeleteOutputDescriptor,
+) -> Result<SchemaRef, crate::common::engine_error::EngineError> {
+    validate_required_fields(desc)?;
+    let file_path = Field::new(
+        ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
+        DataType::Utf8,
+        false,
+    )
+    .with_metadata(HashMap::from([(
+        PARQUET_FIELD_ID_META_KEY.to_string(),
+        ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID.to_string(),
+    )]));
+    let pos = Field::new(ICEBERG_POSITION_DELETE_POS_COLUMN, DataType::Int64, false).with_metadata(
+        HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            ICEBERG_POSITION_DELETE_POS_FIELD_ID.to_string(),
+        )]),
+    );
+    Ok(Arc::new(Schema::new(vec![file_path, pos])))
+}
+
+#[allow(dead_code)]
+pub(crate) fn bind_position_delete_descriptor(
+    desc: Option<&data_sinks::TIcebergPositionDeleteOutputDescriptor>,
+    output_exprs: &[exprs::TExpr],
+    target_partition_spec_id: i32,
+    expected_partition_source_column_names: &[String],
+    expected_partition_column_names: &[String],
+) -> Result<PositionDeleteDescriptorBinding, crate::common::engine_error::EngineError> {
+    let desc =
+        desc.ok_or_else(|| descriptor_error("position delete output descriptor is missing"))?;
+    validate_required_fields(desc)?;
+    if desc.target_partition_spec_id != Some(target_partition_spec_id) {
+        return Err(descriptor_error(format!(
+            "target partition spec id mismatch: sink={target_partition_spec_id}, descriptor={:?}",
+            desc.target_partition_spec_id
+        )));
+    }
+    let partition_fields = desc.partition_source_fields.as_deref().unwrap_or_default();
+    if partition_fields.len() != expected_partition_source_column_names.len() {
+        return Err(descriptor_error(format!(
+            "partition source field count mismatch: expected {}, got {}",
+            expected_partition_source_column_names.len(),
+            partition_fields.len()
+        )));
+    }
+    let expected_exprs = 2 + partition_fields.len();
+    if output_exprs.len() != expected_exprs {
+        return Err(descriptor_error(format!(
+            "output expr count mismatch: expected {expected_exprs}, got {}",
+            output_exprs.len()
+        )));
+    }
+    for (idx, field) in partition_fields.iter().enumerate() {
+        let output_expr_index = i32::try_from(idx + 2)
+            .map_err(|_| descriptor_error("partition source output index overflow"))?;
+        if field.output_expr_index != Some(output_expr_index) {
+            return Err(descriptor_error(format!(
+                "partition source {} output_expr_index mismatch: expected {output_expr_index}, got {:?}",
+                expected_partition_source_column_names[idx], field.output_expr_index
+            )));
+        }
+        if field.source_column_name.as_deref()
+            != Some(expected_partition_source_column_names[idx].as_str())
+        {
+            return Err(descriptor_error(format!(
+                "partition source column mismatch: expected {}, got {:?}",
+                expected_partition_source_column_names[idx], field.source_column_name
+            )));
+        }
+        if field.partition_field_name.as_deref()
+            != Some(expected_partition_column_names[idx].as_str())
+        {
+            return Err(descriptor_error(format!(
+                "partition field name mismatch: expected {}, got {:?}",
+                expected_partition_column_names[idx], field.partition_field_name
+            )));
+        }
+    }
+    let mut output_column_names = vec![
+        ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string(),
+        ICEBERG_POSITION_DELETE_POS_COLUMN.to_string(),
+    ];
+    output_column_names.extend(expected_partition_source_column_names.iter().cloned());
+    Ok(PositionDeleteDescriptorBinding {
+        output_schema: output_schema_from_descriptor(desc)?,
+        output_column_names,
+        partition_source_column_names: expected_partition_source_column_names.to_vec(),
+        partition_column_names: expected_partition_column_names.to_vec(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lower::type_lowering::scalar_type_desc;
+
+    fn field(
+        index: i32,
+        name: &str,
+        primitive: crate::types::TPrimitiveType,
+        field_id: i32,
+    ) -> crate::data_sinks::TIcebergPositionDeleteOutputField {
+        crate::data_sinks::TIcebergPositionDeleteOutputField::new(
+            Some(index),
+            Some(name.to_string()),
+            Some(scalar_type_desc(primitive)),
+            Some(field_id),
+        )
+    }
+
+    fn partition_source(
+        index: i32,
+    ) -> crate::data_sinks::TIcebergPositionDeletePartitionSourceField {
+        crate::data_sinks::TIcebergPositionDeletePartitionSourceField::new(
+            Some(index),
+            Some("id".to_string()),
+            Some("id_bucket".to_string()),
+            Some("bucket[8]".to_string()),
+            Some(42),
+        )
+    }
+
+    fn valid_descriptor() -> crate::data_sinks::TIcebergPositionDeleteOutputDescriptor {
+        crate::data_sinks::TIcebergPositionDeleteOutputDescriptor::new(
+            Some(field(
+                0,
+                ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
+                crate::types::TPrimitiveType::VARCHAR,
+                ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+            )),
+            Some(field(
+                1,
+                ICEBERG_POSITION_DELETE_POS_COLUMN,
+                crate::types::TPrimitiveType::BIGINT,
+                ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+            )),
+            Some(vec![partition_source(2)]),
+            Some(7),
+        )
+    }
+
+    #[test]
+    fn descriptor_missing_file_path_field_id_fails() {
+        let mut desc = valid_descriptor();
+        desc.file_path.as_mut().unwrap().field_id = None;
+        let err = validate_required_fields(&desc).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        assert!(err.to_user_message().contains("file_path field_id"));
+    }
+
+    #[test]
+    fn descriptor_output_order_mismatch_fails() {
+        let mut desc = valid_descriptor();
+        desc.pos.as_mut().unwrap().output_expr_index = Some(0);
+        let err = validate_required_fields(&desc).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        assert!(err.to_user_message().contains("pos output_expr_index"));
+    }
+
+    #[test]
+    fn descriptor_builds_required_arrow_schema() {
+        let schema = output_schema_from_descriptor(&valid_descriptor()).expect("schema");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "file_path");
+        assert_eq!(schema.field(1).name(), "pos");
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY),
+            Some(&ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID.to_string())
+        );
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY),
+            Some(&ICEBERG_POSITION_DELETE_POS_FIELD_ID.to_string())
+        );
+    }
+}
