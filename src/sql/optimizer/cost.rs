@@ -258,6 +258,8 @@ pub(crate) struct CostOptions {
     /// until the resource-normalized broadcast gates are wired.
     #[allow(dead_code)]
     pub profile: ClusterResourceProfile,
+    pub hash_table_per_row_overhead_bytes: f64,
+    pub hash_table_load_factor: f64,
     pub broadcast_row_limit: f64,
     pub broadcast_byte_limit: f64,
     pub broadcast_right_table_scale_factor: f64,
@@ -286,6 +288,8 @@ impl Default for CostOptions {
             network_weight: DEFAULT_NETWORK_COST_WEIGHT,
             backend_factor: 3.0,
             profile: ClusterResourceProfile::default(),
+            hash_table_per_row_overhead_bytes: 16.0,
+            hash_table_load_factor: 0.75,
             broadcast_row_limit: 15_000_000.0,
             broadcast_byte_limit: 512.0 * 1024.0 * 1024.0,
             broadcast_right_table_scale_factor: 10.0,
@@ -367,6 +371,27 @@ fn cost_row_width(stats: &Statistics) -> f64 {
 
 fn safe_compute_size(stats: &Statistics) -> f64 {
     finite_non_negative_cost(cost_row_count(stats) * cost_row_width(stats))
+}
+
+/// Estimated per-node memory of the broadcast build hash table, the single
+/// formula feeding BOTH the LAYER 1 floor and the LAYER 2 memory dimension.
+/// `payload / load_factor + rows * per_row_overhead`. The per-row term (16B =
+/// 4x Vec<u32> in JoinHashTable) is what makes a narrow build correctly
+/// expensive, dissolving the old narrow-build exception.
+#[allow(dead_code)] // BC-1 Phase 1 staged until broadcast feasibility consumes it.
+pub(crate) fn estimated_build_hash_table_bytes(
+    build_stats: &Statistics,
+    options: &CostOptions,
+) -> f64 {
+    let payload = safe_compute_size(build_stats);
+    let rows = cost_row_count(build_stats);
+    let load_factor = if options.hash_table_load_factor.is_nan() {
+        0.75
+    } else {
+        options.hash_table_load_factor.clamp(0.5, 1.0)
+    };
+    let per_row = options.hash_table_per_row_overhead_bytes.max(0.0);
+    finite_non_negative_cost(payload / load_factor + rows * per_row)
 }
 
 /// Dimensionless inflation factor applied to the estimated build hash-table
@@ -1097,6 +1122,62 @@ mod tests {
         assert_eq!(cost_row_width(&stats(1.0, -1.0)), 8.0);
         assert_eq!(cost_row_width(&stats(1.0, f64::NEG_INFINITY)), 8.0);
         assert_eq!(cost_row_width(&stats(1.0, f64::NAN)), 8.0);
+    }
+
+    #[test]
+    fn estimated_build_hash_table_bytes_inflates_narrow_more_than_wide() {
+        let o = CostOptions::default();
+        // Narrow: 8B/row, 10M rows => payload 80MB; ht = 80MB/0.75 + 16*10M.
+        let narrow = stats(10_000_000.0, 8.0);
+        let narrow_ht = estimated_build_hash_table_bytes(&narrow, &o);
+        let narrow_payload = safe_compute_size(&narrow);
+        let expected_narrow = narrow_payload / 0.75 + 16.0 * 10_000_000.0;
+        assert!((narrow_ht - expected_narrow).abs() < 1.0);
+        // Index overhead must roughly double the narrow build's footprint.
+        assert!(narrow_ht > 2.0 * narrow_payload);
+
+        // Wide: 200B/row, 1M rows => payload 200MB; index ~6% only.
+        let wide = stats(1_000_000.0, 200.0);
+        let wide_ht = estimated_build_hash_table_bytes(&wide, &o);
+        let wide_payload = safe_compute_size(&wide);
+        assert!(wide_ht < 1.5 * wide_payload);
+    }
+
+    #[test]
+    fn estimated_build_hash_table_bytes_sanitizes_options() {
+        let build = stats(100.0, 8.0);
+        let payload = safe_compute_size(&build);
+        let rows = cost_row_count(&build);
+
+        let mut nan_load_factor = CostOptions::default();
+        nan_load_factor.hash_table_load_factor = f64::NAN;
+        let nan_bytes = estimated_build_hash_table_bytes(&build, &nan_load_factor);
+        let expected_default =
+            payload / 0.75 + rows * nan_load_factor.hash_table_per_row_overhead_bytes;
+        assert!(nan_bytes.is_finite());
+        assert!(nan_bytes > 0.0);
+        assert!((nan_bytes - expected_default).abs() < 1e-9);
+
+        for bad_load_factor in [-1.0, 0.0] {
+            let mut options = CostOptions::default();
+            options.hash_table_load_factor = bad_load_factor;
+            let actual = estimated_build_hash_table_bytes(&build, &options);
+            let expected = payload / 0.5 + rows * options.hash_table_per_row_overhead_bytes;
+            assert!((actual - expected).abs() < 1e-9);
+        }
+
+        let mut oversized_load_factor = CostOptions::default();
+        oversized_load_factor.hash_table_load_factor = 1.5;
+        let oversized_actual = estimated_build_hash_table_bytes(&build, &oversized_load_factor);
+        let oversized_expected =
+            payload / 1.0 + rows * oversized_load_factor.hash_table_per_row_overhead_bytes;
+        assert!((oversized_actual - oversized_expected).abs() < 1e-9);
+
+        let mut negative_overhead = CostOptions::default();
+        negative_overhead.hash_table_per_row_overhead_bytes = -16.0;
+        let negative_overhead_actual = estimated_build_hash_table_bytes(&build, &negative_overhead);
+        let negative_overhead_expected = payload / negative_overhead.hash_table_load_factor;
+        assert!((negative_overhead_actual - negative_overhead_expected).abs() < 1e-9);
     }
 
     #[test]
