@@ -185,6 +185,9 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "wait_alter_optimize" => {
                 meta.wait_alter_optimize = Some(raw_value);
             }
+            "imv_equivalence_check" => {
+                meta.imv_equivalence_check = Some(raw_value);
+            }
             "sequential" => {
                 // Parsed here but ignored in merge_meta; handled at case level.
             }
@@ -262,6 +265,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .wait_alter_optimize
             .clone()
             .or_else(|| base.wait_alter_optimize.clone()),
+        imv_equivalence_check: override_meta
+            .imv_equivalence_check
+            .clone()
+            .or_else(|| base.imv_equivalence_check.clone()),
     }
 }
 
@@ -702,6 +709,14 @@ mod opt5_directive_tests {
         let merged = merge_meta(&base, &QueryMeta::default());
 
         assert_eq!(merged.expect_error_code, Some("CommitUnknown".to_string()));
+    }
+
+    #[test]
+    fn parse_meta_collects_imv_equivalence_check() {
+        let re = meta_re();
+        let lines = vec!["-- @imv_equivalence_check=orders_mv".to_string()];
+        let meta = parse_meta(&lines, &re).unwrap();
+        assert_eq!(meta.imv_equivalence_check.as_deref(), Some("orders_mv"));
     }
 
     #[test]

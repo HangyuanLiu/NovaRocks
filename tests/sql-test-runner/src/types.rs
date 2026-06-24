@@ -46,6 +46,10 @@ pub struct QueryMeta {
     /// After the step SQL executes, poll `SHOW ALTER TABLE OPTIMIZE` until FINISHED.
     /// Value is the table name.
     pub wait_alter_optimize: Option<String>,
+    /// After the step SQL executes, assert the named MV's incremental contents
+    /// equal a forced full recompute (`REFRESH MATERIALIZED VIEW <mv> FULL`).
+    /// Value is the MV name (qualified by the step/case db like wait_alter_*).
+    pub imv_equivalence_check: Option<String>,
 }
 
 #[derive(Debug, Clone)]
