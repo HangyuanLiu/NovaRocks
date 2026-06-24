@@ -21,7 +21,7 @@
 //! - Tracks filter availability and probe eligibility metadata per expression.
 //!
 //! Key exported interfaces:
-//! - Types: `LocalRuntimeFilterSet`, `RuntimeFilterMembership`.
+//! - Types: `LocalRuntimeFilterSet`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -45,13 +45,6 @@ use crate::exec::node::join::JoinRuntimeFilterSpec;
 pub(crate) struct LocalRuntimeFilterSet {
     hash_seed: u64,
     filters: Vec<LocalRuntimeFilter>,
-}
-
-#[derive(Clone, Debug)]
-/// Probe-side runtime filter membership metadata for one expression.
-pub(crate) struct RuntimeFilterMembership {
-    hash_seed: u64,
-    hashes: HashSet<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -181,15 +174,5 @@ impl LocalRuntimeFilterSet {
         let mask = BooleanArray::from(keep);
         let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
-    }
-}
-
-impl RuntimeFilterMembership {
-    pub(in crate::exec::runtime_filter) fn hash_seed(&self) -> u64 {
-        self.hash_seed
-    }
-
-    pub(in crate::exec::runtime_filter) fn contains_hash(&self, hash: u64) -> bool {
-        self.hashes.contains(&hash)
     }
 }

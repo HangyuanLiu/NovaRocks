@@ -54,7 +54,7 @@ pub(crate) use codec::{
     encode_starrocks_in_filter, peek_starrocks_filter_type,
 };
 pub(crate) use in_filter::{LocalRuntimeInFilterSet, RuntimeInFilter};
-pub(crate) use local::{LocalRuntimeFilterSet, RuntimeFilterMembership};
+pub(crate) use local::LocalRuntimeFilterSet;
 pub(crate) use membership::{RuntimeEmptyFilter, RuntimeMembershipFilter};
 pub(crate) use merger::{
     MAX_RUNTIME_IN_FILTER_CONDITIONS, PartialRuntimeInFilterMerger,
@@ -67,7 +67,6 @@ pub(crate) use proto_type::{arrow_type_from_proto_type_desc, arrow_type_to_proto
 
 pub(in crate::exec::runtime_filter) use bloom::SimdBlockFilter;
 pub(in crate::exec::runtime_filter) use in_filter::RuntimeInFilterValues;
-pub(in crate::exec::runtime_filter) use local::row_has_null;
 
 /// Map Arrow data type to StarRocks thrift primitive type for runtime filter serialization.
 pub(crate) fn data_type_to_tprimitive(

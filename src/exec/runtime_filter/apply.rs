@@ -35,11 +35,8 @@ use arrow::compute::filter_record_batch;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::hash_table::key_builder::{build_group_key_hashes, build_group_key_views};
 
-use super::{
-    RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter,
-};
+use super::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 
 /// Apply IN filters to a chunk and return the filtered chunk.
 pub(crate) fn filter_chunk_by_in_filters(
