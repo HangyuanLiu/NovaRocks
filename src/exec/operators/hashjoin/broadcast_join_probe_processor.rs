@@ -494,6 +494,7 @@ mod tests {
         let build_factory = HashJoinBuildSinkFactory::new(
             Arc::clone(&arena),
             JoinType::Inner,
+            false,
             vec![build_key],
             vec![false],
             Vec::new(),
@@ -600,6 +601,7 @@ mod tests {
         let build_factory = HashJoinBuildSinkFactory::new(
             Arc::clone(&arena),
             JoinType::LeftSemi,
+            false,
             vec![build_key],
             vec![false],
             Vec::new(),
@@ -701,6 +703,7 @@ mod tests {
         let build_factory = HashJoinBuildSinkFactory::new(
             Arc::clone(&arena),
             JoinType::RightSemi,
+            true,
             vec![build_key],
             vec![false],
             Vec::new(),

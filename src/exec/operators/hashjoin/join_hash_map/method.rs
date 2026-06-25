@@ -39,19 +39,31 @@ use crate::runtime::mem_tracker::MemTracker;
 
 const DIRECT_RANGE_ROW_MULTIPLIER: u64 = 8;
 const DIRECT_RANGE_MAX_LEN: u64 = 16 * 1024 * 1024;
+const DIRECT_SET_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const DIRECT_SET_BUCKET_BYTE_FACTOR: u64 = 64;
 const ROW_NONE: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JoinHashMapBuildPurpose {
+    RowMatches,
+    PresenceOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct JoinHashMapBuildOptions {
+    pub(crate) purpose: JoinHashMapBuildPurpose,
     pub(crate) direct_range_row_multiplier: u64,
     pub(crate) direct_range_max_len: u64,
+    pub(crate) direct_set_max_bytes: u64,
 }
 
 impl Default for JoinHashMapBuildOptions {
     fn default() -> Self {
         Self {
+            purpose: JoinHashMapBuildPurpose::RowMatches,
             direct_range_row_multiplier: DIRECT_RANGE_ROW_MULTIPLIER,
             direct_range_max_len: DIRECT_RANGE_MAX_LEN,
+            direct_set_max_bytes: DIRECT_SET_MAX_BYTES,
         }
     }
 }
@@ -93,6 +105,11 @@ pub(crate) enum JoinHashMapMethodKind {
         len: usize,
         not_null: bool,
     },
+    DirectIntSet {
+        min: i64,
+        len: usize,
+        not_null: bool,
+    },
 }
 
 impl JoinHashMapMethodKind {
@@ -103,6 +120,10 @@ impl JoinHashMapMethodKind {
             Self::DirectInt {
                 not_null: false, ..
             } => "DirectIntNullable",
+            Self::DirectIntSet { not_null: true, .. } => "DirectIntSetNotNull",
+            Self::DirectIntSet {
+                not_null: false, ..
+            } => "DirectIntSetNullable",
         }
     }
 }
@@ -764,7 +785,10 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use super::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions, JoinHashMapMethodKind};
+    use super::{
+        BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions, JoinHashMapBuildPurpose,
+        JoinHashMapMethodKind,
+    };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
@@ -792,6 +816,36 @@ mod tests {
             }
             .as_profile_str(),
             "DirectIntNullable"
+        );
+    }
+
+    #[test]
+    fn build_options_default_to_row_matches() {
+        let options = JoinHashMapBuildOptions::default();
+
+        assert_eq!(options.purpose, JoinHashMapBuildPurpose::RowMatches);
+        assert_eq!(options.direct_set_max_bytes, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn direct_set_method_kind_profile_strings_are_stable() {
+        assert_eq!(
+            JoinHashMapMethodKind::DirectIntSet {
+                min: 1,
+                len: 2,
+                not_null: true,
+            }
+            .as_profile_str(),
+            "DirectIntSetNotNull"
+        );
+        assert_eq!(
+            JoinHashMapMethodKind::DirectIntSet {
+                min: 1,
+                len: 2,
+                not_null: false,
+            }
+            .as_profile_str(),
+            "DirectIntSetNullable"
         );
     }
 
@@ -900,6 +954,7 @@ mod tests {
         let options = JoinHashMapBuildOptions {
             direct_range_row_multiplier: u64::MAX / 4,
             direct_range_max_len: 16 * 1024 * 1024,
+            ..JoinHashMapBuildOptions::default()
         };
         let map = JoinHashMap::build_from_key_batches(
             vec![DataType::Int32],
@@ -934,6 +989,7 @@ mod tests {
         let options = JoinHashMapBuildOptions {
             direct_range_row_multiplier: u64::MAX / 2 + 1,
             direct_range_max_len: u64::MAX,
+            ..JoinHashMapBuildOptions::default()
         };
         let result = JoinHashMap::build_from_key_batches(
             vec![DataType::Int32],

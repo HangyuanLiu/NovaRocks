@@ -1023,6 +1023,7 @@ fn build_pipeline_for_node(
                     .push(Box::new(HashJoinBuildSinkFactory::new(
                         Arc::clone(&ctx.arena),
                         *join_type,
+                        residual_predicate.is_some(),
                         build_keys.clone(),
                         eq_null_safe.clone(),
                         runtime_filters.clone(),
@@ -1116,6 +1117,7 @@ fn build_pipeline_for_node(
                 .push(Box::new(HashJoinBuildSinkFactory::new(
                     Arc::clone(&ctx.arena),
                     *join_type,
+                    residual_predicate.is_some(),
                     build_keys.clone(),
                     eq_null_safe.clone(),
                     runtime_filters.clone(),

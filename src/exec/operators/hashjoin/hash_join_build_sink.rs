@@ -34,7 +34,9 @@ use arrow::array::{Array, ArrayRef};
 use super::build_artifact::JoinBuildArtifact;
 use super::build_state::JoinBuildSinkState;
 use super::join_hash_map::build_store::BuildStoreBuilder;
-use super::join_hash_map::method::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions};
+use super::join_hash_map::method::{
+    BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions, JoinHashMapBuildPurpose,
+};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::{JoinDistributionMode, JoinRuntimeFilterSpec, JoinType};
@@ -65,6 +67,7 @@ pub struct HashJoinBuildSinkFactory {
     node_id: i32,
     arena: Arc<ExprArena>,
     join_type: JoinType,
+    has_residual_predicate: bool,
     build_keys: Vec<ExprId>,
     eq_null_safe: Vec<bool>,
     runtime_filters: Vec<JoinRuntimeFilterSpec>,
@@ -78,6 +81,7 @@ impl HashJoinBuildSinkFactory {
     pub(crate) fn new(
         arena: Arc<ExprArena>,
         join_type: JoinType,
+        has_residual_predicate: bool,
         build_keys: Vec<ExprId>,
         eq_null_safe: Vec<bool>,
         runtime_filters: Vec<JoinRuntimeFilterSpec>,
@@ -97,6 +101,7 @@ impl HashJoinBuildSinkFactory {
             node_id,
             arena,
             join_type,
+            has_residual_predicate,
             build_keys,
             eq_null_safe,
             runtime_filters,
@@ -120,11 +125,12 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             JoinDistributionMode::Partitioned => "PARTITIONED",
         };
         debug!(
-            "HashJoinBuildSink create: node_id={} driver_id={} partition={} join_type={} dist={} build_keys={} null_safe_keys={} runtime_filters={}",
+            "HashJoinBuildSink create: node_id={} driver_id={} partition={} join_type={} residual_predicate={} dist={} build_keys={} null_safe_keys={} runtime_filters={}",
             self.node_id,
             driver_id,
             partition,
             join_type_str(self.join_type),
+            self.has_residual_predicate,
             dist,
             self.build_keys.len(),
             self.eq_null_safe.iter().filter(|v| **v).count(),
@@ -136,6 +142,7 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             driver_id,
             arena: Arc::clone(&self.arena),
             join_type: self.join_type,
+            has_residual_predicate: self.has_residual_predicate,
             build_keys: self.build_keys.clone(),
             eq_null_safe: self.eq_null_safe.clone(),
             runtime_filter_specs: self.runtime_filters.clone(),
@@ -182,6 +189,7 @@ struct HashJoinBuildSinkOperator {
     driver_id: i32,
     arena: Arc<ExprArena>,
     join_type: JoinType,
+    has_residual_predicate: bool,
     build_keys: Vec<ExprId>,
     eq_null_safe: Vec<bool>,
     runtime_filter_specs: Vec<JoinRuntimeFilterSpec>,
@@ -420,7 +428,13 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 key_types,
                 self.eq_null_safe.clone(),
                 &self.build_key_batches,
-                JoinHashMapBuildOptions::default(),
+                JoinHashMapBuildOptions {
+                    purpose: join_hash_map_build_purpose(
+                        self.join_type,
+                        self.has_residual_predicate,
+                    ),
+                    ..JoinHashMapBuildOptions::default()
+                },
                 self.build_table_mem_tracker.as_ref().map(Arc::clone),
             )?;
             if let Some(timer) = build_ht_timer.as_ref() {
@@ -1238,6 +1252,17 @@ fn join_type_str(join_type: JoinType) -> &'static str {
     }
 }
 
+fn join_hash_map_build_purpose(
+    join_type: JoinType,
+    has_residual_predicate: bool,
+) -> JoinHashMapBuildPurpose {
+    if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) && !has_residual_predicate {
+        JoinHashMapBuildPurpose::PresenceOnly
+    } else {
+        JoinHashMapBuildPurpose::RowMatches
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1297,6 +1322,7 @@ mod tests {
             driver_id: 0,
             arena: Arc::new(arena),
             join_type: JoinType::Inner,
+            has_residual_predicate: false,
             build_keys: vec![build_key],
             eq_null_safe: vec![false],
             runtime_filter_specs: Vec::new(),
@@ -1394,6 +1420,7 @@ mod tests {
             driver_id: 0,
             arena,
             join_type: JoinType::Inner,
+            has_residual_predicate: false,
             build_keys: vec![build_key],
             eq_null_safe: vec![false],
             runtime_filter_specs: Vec::new(),
@@ -1466,6 +1493,7 @@ mod tests {
             driver_id: 0,
             arena,
             join_type: JoinType::Inner,
+            has_residual_predicate: false,
             build_keys: vec![build_key],
             eq_null_safe: vec![false],
             runtime_filter_specs: Vec::new(),
@@ -1524,5 +1552,37 @@ mod tests {
             .expect("finish");
 
         assert_eq!(key_batches_tracker.current(), 0);
+    }
+
+    #[test]
+    fn build_purpose_uses_presence_only_for_left_semi_without_residual() {
+        assert_eq!(
+            join_hash_map_build_purpose(JoinType::LeftSemi, false),
+            JoinHashMapBuildPurpose::PresenceOnly
+        );
+    }
+
+    #[test]
+    fn build_purpose_uses_presence_only_for_left_anti_without_residual() {
+        assert_eq!(
+            join_hash_map_build_purpose(JoinType::LeftAnti, false),
+            JoinHashMapBuildPurpose::PresenceOnly
+        );
+    }
+
+    #[test]
+    fn build_purpose_uses_row_matches_for_left_semi_with_residual() {
+        assert_eq!(
+            join_hash_map_build_purpose(JoinType::LeftSemi, true),
+            JoinHashMapBuildPurpose::RowMatches
+        );
+    }
+
+    #[test]
+    fn build_purpose_uses_row_matches_for_right_semi_without_residual() {
+        assert_eq!(
+            join_hash_map_build_purpose(JoinType::RightSemi, false),
+            JoinHashMapBuildPurpose::RowMatches
+        );
     }
 }
