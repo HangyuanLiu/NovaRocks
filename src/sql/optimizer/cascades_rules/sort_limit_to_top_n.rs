@@ -4,8 +4,10 @@
 //! The Limit group's children are replaced: where Limit had [sort_group],
 //! TopN has [grandchild_group].
 
-use crate::sql::optimizer::memo::{MExpr, Memo};
-use crate::sql::optimizer::operator::{Operator, TopNOp, TopNPhase};
+use crate::sql::optimizer::binder::Binding;
+use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
+use crate::sql::optimizer::operator::{LimitOp, Operator, SortOp, TopNOp, TopNPhase};
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 
 pub(crate) struct SortLimitToTopN;
@@ -49,31 +51,75 @@ impl Rule for SortLimitToTopN {
             let Operator::LogicalSort(sort_op) = &child_mexpr.op else {
                 continue;
             };
-            // A partition-topn Sort carries per-partition truncation semantics
-            // (partition_limit / topn_type set by RankingWindowPredicatePushdown).
-            // Converting it to a plain LogicalTopN would silently discard the
-            // partition_limit, producing wrong results. Skip such sorts; the
-            // partition-topn path handles them independently.
-            if sort_op.partition_limit.is_some() {
-                continue;
-            }
             if child_mexpr.children.len() != 1 {
                 continue;
             }
             let grandchild_group_id = child_mexpr.children[0];
-            results.push(NewExpr {
-                op: Operator::LogicalTopN(TopNOp {
-                    items: sort_op.items.clone(),
-                    limit: limit_op.limit,
-                    offset: limit_op.offset,
-                    phase: TopNPhase::Final,
-                    is_split: false,
-                }),
-                children: vec![grandchild_group_id],
-            });
+            results.extend(rewrite_one_sort(
+                limit_op,
+                sort_op,
+                grandchild_group_id,
+            ));
         }
         results
     }
+
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Limit,
+            children: vec![Pattern::Op {
+                kind: OpKind::Sort,
+                children: vec![Pattern::Leaf],
+            }],
+        }
+    }
+
+    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+        // interior 0 = Limit, interior 1 = Sort (binder guarantees both kinds;
+        // field predicates live in `rewrite_one_sort`).
+        let Operator::LogicalLimit(limit_op) = binding.op(memo, 0).clone() else {
+            return vec![];
+        };
+        let Operator::LogicalSort(sort_op) = binding.op(memo, 1).clone() else {
+            return vec![];
+        };
+        // The Sort's child group (its only child).
+        let grandchild_group_id = binding.children(1)[0];
+        rewrite_one_sort(&limit_op, &sort_op, grandchild_group_id)
+    }
+}
+
+/// Per-child core shared by the legacy `apply` (unit-tested directly) and the
+/// declarative `apply_bound`: convert a single `LogicalLimit(LogicalSort(x))`
+/// pair into a `LogicalTopN(x)`, or emit nothing if the guards reject it.
+fn rewrite_one_sort(
+    limit_op: &LimitOp,
+    sort_op: &SortOp,
+    grandchild_group_id: GroupId,
+) -> Vec<NewExpr> {
+    // A LogicalTopN without a limit is just a Sort -- don't rewrite that case,
+    // let the plain Sort path handle it.
+    if limit_op.limit.is_none() {
+        return vec![];
+    }
+    // A partition-topn Sort carries per-partition truncation semantics
+    // (partition_limit / topn_type set by RankingWindowPredicatePushdown).
+    // Converting it to a plain LogicalTopN would silently discard the
+    // partition_limit, producing wrong results. Skip such sorts; the
+    // partition-topn path handles them independently.
+    if sort_op.partition_limit.is_some() {
+        return vec![];
+    }
+    vec![NewExpr {
+        op: Operator::LogicalTopN(TopNOp {
+            items: sort_op.items.clone(),
+            limit: limit_op.limit,
+            offset: limit_op.offset,
+            phase: TopNPhase::Final,
+            is_split: false,
+        }),
+        children: vec![grandchild_group_id],
+    }]
 }
 
 #[cfg(test)]

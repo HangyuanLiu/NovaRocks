@@ -2,12 +2,14 @@
 
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::{JoinKind, OutputColumn};
+use crate::sql::optimizer::binder::Binding;
 use crate::sql::optimizer::logical_props::{
     collect_literal_equalities, collect_strict_column_equalities, combine_with_and,
     literal_signature, make_eq_literal_predicate,
 };
 use crate::sql::optimizer::memo::{GroupId, LogicalProperties, MExpr, Memo};
 use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar::ScalarId;
 use std::collections::{HashMap, HashSet};
@@ -43,83 +45,31 @@ impl Rule for InnerJoinEquivalencePredicateRule {
 
         let left_group = expr.children[0];
         let right_group = expr.children[1];
-        let Some(left_props) = memo.groups[left_group].logical_props.clone() else {
-            return Vec::new();
-        };
-        let Some(right_props) = memo.groups[right_group].logical_props.clone() else {
-            return Vec::new();
-        };
+        apply_inner(join, left_group, right_group, memo)
+    }
 
-        let left_columns = columns_by_id(&left_props.output_columns);
-        let right_columns = columns_by_id(&right_props.output_columns);
-        let mut literal_by_column = literal_equalities_from_join(memo, join)
-            .into_iter()
-            .chain(literal_equalities_from_group(memo, left_group))
-            .chain(literal_equalities_from_group(memo, right_group))
-            .collect::<HashMap<ColumnId, ScalarId>>();
-        expand_literals_with_equivalence(&left_props, &mut literal_by_column);
-        expand_literals_with_equivalence(&right_props, &mut literal_by_column);
-
-        let join_literals = literal_equalities_from_join(memo, join);
-        let mut left_new = Vec::new();
-        let mut right_new = Vec::new();
-        for (raw_left, raw_right) in join_column_pairs(memo, join) {
-            let Some((left_id, right_id)) =
-                orient_pair(raw_left, raw_right, &left_columns, &right_columns)
-            else {
-                continue;
-            };
-
-            if let Some(literal) = literal_by_column.get(&left_id).cloned() {
-                if !has_literal_equality_in_side(
-                    memo,
-                    right_group,
-                    &join_literals,
-                    right_id,
-                    literal,
-                ) {
-                    if let Some(column) = right_columns.get(&right_id) {
-                        right_new.push(make_eq_literal_predicate(
-                            &mut memo.scalars,
-                            column,
-                            literal,
-                        ));
-                    }
-                }
-            }
-            if let Some(literal) = literal_by_column.get(&right_id).cloned() {
-                if !has_literal_equality_in_side(memo, left_group, &join_literals, left_id, literal)
-                {
-                    if let Some(column) = left_columns.get(&left_id) {
-                        left_new.push(make_eq_literal_predicate(
-                            &mut memo.scalars,
-                            column,
-                            literal,
-                        ));
-                    }
-                }
-            }
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Join,
+            children: vec![Pattern::Leaf, Pattern::Leaf],
         }
+    }
 
-        if left_new.is_empty() && right_new.is_empty() {
+    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalJoin(join) = binding.op(memo, 0) else {
+            return Vec::new();
+        };
+        if join.join_type != JoinKind::Inner {
             return Vec::new();
         }
-
-        let new_left = if left_new.is_empty() {
-            left_group
-        } else {
-            add_filter_group(memo, left_group, left_new)
-        };
-        let new_right = if right_new.is_empty() {
-            right_group
-        } else {
-            add_filter_group(memo, right_group, right_new)
-        };
-
-        vec![NewExpr {
-            op: Operator::LogicalJoin(join.clone()),
-            children: vec![new_left, new_right],
-        }]
+        let children = binding.children(0);
+        if children.len() != 2 {
+            return Vec::new();
+        }
+        let left_group = children[0];
+        let right_group = children[1];
+        let join = join.clone();
+        apply_inner(&join, left_group, right_group, memo)
     }
 }
 
@@ -300,6 +250,92 @@ fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<Scala
         memo.groups[new_group].logical_props = Some(props);
     }
     new_group
+}
+
+/// Shared body of `apply` and `apply_bound`: given the join op and the two
+/// child group ids, synthesize filter groups and return the new join expression.
+fn apply_inner(
+    join: &LogicalJoinOp,
+    left_group: GroupId,
+    right_group: GroupId,
+    memo: &mut Memo,
+) -> Vec<NewExpr> {
+    let Some(left_props) = memo.groups[left_group].logical_props.clone() else {
+        return Vec::new();
+    };
+    let Some(right_props) = memo.groups[right_group].logical_props.clone() else {
+        return Vec::new();
+    };
+
+    let left_columns = columns_by_id(&left_props.output_columns);
+    let right_columns = columns_by_id(&right_props.output_columns);
+    let mut literal_by_column = literal_equalities_from_join(memo, join)
+        .into_iter()
+        .chain(literal_equalities_from_group(memo, left_group))
+        .chain(literal_equalities_from_group(memo, right_group))
+        .collect::<HashMap<ColumnId, ScalarId>>();
+    expand_literals_with_equivalence(&left_props, &mut literal_by_column);
+    expand_literals_with_equivalence(&right_props, &mut literal_by_column);
+
+    let join_literals = literal_equalities_from_join(memo, join);
+    let mut left_new = Vec::new();
+    let mut right_new = Vec::new();
+    for (raw_left, raw_right) in join_column_pairs(memo, join) {
+        let Some((left_id, right_id)) =
+            orient_pair(raw_left, raw_right, &left_columns, &right_columns)
+        else {
+            continue;
+        };
+
+        if let Some(literal) = literal_by_column.get(&left_id).cloned() {
+            if !has_literal_equality_in_side(
+                memo,
+                right_group,
+                &join_literals,
+                right_id,
+                literal,
+            ) {
+                if let Some(column) = right_columns.get(&right_id) {
+                    right_new.push(make_eq_literal_predicate(
+                        &mut memo.scalars,
+                        column,
+                        literal,
+                    ));
+                }
+            }
+        }
+        if let Some(literal) = literal_by_column.get(&right_id).cloned() {
+            if !has_literal_equality_in_side(memo, left_group, &join_literals, left_id, literal) {
+                if let Some(column) = left_columns.get(&left_id) {
+                    left_new.push(make_eq_literal_predicate(
+                        &mut memo.scalars,
+                        column,
+                        literal,
+                    ));
+                }
+            }
+        }
+    }
+
+    if left_new.is_empty() && right_new.is_empty() {
+        return Vec::new();
+    }
+
+    let new_left = if left_new.is_empty() {
+        left_group
+    } else {
+        add_filter_group(memo, left_group, left_new)
+    };
+    let new_right = if right_new.is_empty() {
+        right_group
+    } else {
+        add_filter_group(memo, right_group, right_new)
+    };
+
+    vec![NewExpr {
+        op: Operator::LogicalJoin(join.clone()),
+        children: vec![new_left, new_right],
+    }]
 }
 
 #[cfg(test)]

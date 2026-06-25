@@ -1554,6 +1554,85 @@ mod tests {
         );
         assert_eq!(right_winner.output, winner.child_props[1]);
     }
+
+    // -------------------------------------------------------------------------
+    // G5 A2 precondition: deterministic equal-cost tie-break
+    // -------------------------------------------------------------------------
+
+    /// Pin the existing strict-less-than tie-break in `optimize_group`.
+    ///
+    /// Two structurally-identical `PhysicalScan` expressions are placed in the
+    /// same Memo group at indices 0 and 1.  Because they scan the same table
+    /// with the same statistics the optimizer assigns them identical costs.
+    /// The loop in `SearchContext::optimize_group` uses strict `<`, so the
+    /// best index is only updated when a *strictly* cheaper candidate is
+    /// found; on a tie the first (lowest-index) alternative wins.
+    ///
+    /// This test characterises that existing deterministic behaviour so that
+    /// any future regression (e.g. accidental `<=`) is caught.
+    #[test]
+    fn equal_cost_winner_is_lowest_index_alternative() {
+        // Build a group with a single PhysicalScan (index 0).
+        let (mut memo, gid) = single_scan_memo();
+
+        // Add a second, identical PhysicalScan to the *same* group (index 1).
+        // It is byte-for-byte the same operator so its computed cost will be
+        // equal to the first one.
+        let second_scan = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalScan(ScanOp {
+                database: "db".into(),
+                table: crate::sql::catalog::TableDef {
+                    name: "t".into(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: crate::sql::catalog::ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: None,
+                stats_ref: None,
+                columns: vec![],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            children: vec![],
+        };
+        memo.add_expr_to_group(gid, second_scan);
+
+        // Confirm the fixture: the group must have exactly two physical exprs.
+        assert_eq!(
+            memo.groups[gid].physical_exprs.len(),
+            2,
+            "fixture should have exactly two physical exprs"
+        );
+
+        // Run the search.
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
+        let required = PhysicalPropertySet::any();
+        let cost = ctx
+            .optimize_group(&memo, gid, &required)
+            .expect("optimize_group should succeed");
+        assert!(cost.is_finite(), "group with two scans must have a finite cost");
+
+        // The winner must be index 0: on equal cost the first-inserted
+        // (lowest-index) physical expression wins because the comparison is
+        // strict `<` (not `<=`).
+        let winner = ctx
+            .winners
+            .get(&(gid, required))
+            .expect("winner must be recorded");
+        assert_eq!(
+            winner.expr_index, 0,
+            "on equal cost the lowest-index (first-inserted) physical expression \
+             must win; got expr_index={} instead",
+            winner.expr_index,
+        );
+    }
 }
 
 #[cfg(test)]
