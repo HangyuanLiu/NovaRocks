@@ -91,6 +91,10 @@ fn try_rewrite(
     cand: &MvRewriteCandidate,
     memo: &mut Memo,
 ) -> Option<NewExpr> {
+    if query.joins.is_some() || cand.mv.joins.is_some() {
+        return None;
+    }
+
     // 1. Same physical base table (compare Iceberg identity, not names).
     if !same_iceberg_table(&query.table, &cand.mv.table) {
         return None;
@@ -469,6 +473,9 @@ mod tests {
         ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::cascades_rules::mv_rewrite::descriptor::{
+        EquiEdge, JoinInput, JoinShape,
+    };
     use crate::sql::optimizer::memo::{GroupId, Memo};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::optimizer_bridge::scalar::materialize;
@@ -764,6 +771,54 @@ mod tests {
         assert!(
             rule.apply(&root_expr, &mut memo).is_empty(),
             "second apply must be a no-op"
+        );
+    }
+
+    #[test]
+    fn rejects_multitable_mv_descriptor_candidate() {
+        // Until memo-side multi-table descriptor matching exists, a candidate
+        // that carries MV-side join shape must fail closed.
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let s = col(3, "s");
+        let query_plan = LogicalPlanNode::new(
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                PlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: ge(col_ref(&a), 10),
+                }),
+                vec![base_scan(&[a.clone(), v.clone()])],
+                None,
+            )],
+            None,
+        );
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        let mut candidate = agg_candidate(0);
+        candidate.mv.joins = Some(JoinShape {
+            inputs: vec![JoinInput {
+                table: iceberg_table("cat", "ns", "t2", &["c"]),
+                scan_columns: vec![col(300, "c")],
+            }],
+            equi_edges: vec![EquiEdge {
+                left: ColumnId(1),
+                right: ColumnId(300),
+            }],
+        });
+
+        let rule = MvRewriteRule::new(vec![candidate]);
+        assert!(
+            rule.apply(&root_expr, &mut memo).is_empty(),
+            "multi-table MV descriptor must not rewrite before join matching exists"
         );
     }
 

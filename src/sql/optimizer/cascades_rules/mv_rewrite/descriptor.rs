@@ -13,7 +13,7 @@ use crate::sql::common::OutputColumn;
 use crate::sql::common::expr::JoinKind;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{
-    AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec, ScanOp as LogicalScanOp,
+    AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec, ScanOp,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey};
@@ -549,8 +549,16 @@ fn peel_join_spine_opt<'a>(
     node: &'a OptExpr,
     arena: &ScalarArena,
     predicates: &mut Vec<ScalarId>,
-) -> Result<(&'a LogicalScanOp, Option<JoinShape>), String> {
-    match &node.op {
+) -> Result<(&'a ScanOp, Option<JoinShape>), String> {
+    let mut n = node;
+    while let Operator::LogicalFilter(f) = &n.op {
+        scalar_expr::split_conjuncts(arena, f.predicate, predicates);
+        n = n
+            .children
+            .first()
+            .ok_or_else(|| "filter without child in MV rewrite join spine".to_string())?;
+    }
+    match &n.op {
         Operator::LogicalScan(scan) => Ok((scan, None)),
         Operator::LogicalJoin(join) => {
             if join.join_type != JoinKind::Inner {
@@ -559,11 +567,11 @@ fn peel_join_spine_opt<'a>(
                     join.join_type
                 ));
             }
-            let left = node
+            let left = n
                 .children
                 .first()
                 .ok_or_else(|| "inner join without left child in MV rewrite shape".to_string())?;
-            let right = node
+            let right = n
                 .children
                 .get(1)
                 .ok_or_else(|| "inner join without right child in MV rewrite shape".to_string())?;
@@ -574,6 +582,9 @@ fn peel_join_spine_opt<'a>(
             let right_input = peel_filter_scan_opt(right, arena, predicates)?;
 
             let (edges, residuals) = split_join_condition(arena, join.condition);
+            if edges.is_empty() {
+                return Err("inner join without equi edge in MV rewrite shape".to_string());
+            }
             predicates.extend(residuals);
 
             let mut shape = left_joins.unwrap_or(JoinShape {
@@ -586,7 +597,7 @@ fn peel_join_spine_opt<'a>(
         }
         _ => Err(format!(
             "not an SPJG base shape: unexpected node {:?}",
-            std::mem::discriminant(&node.op)
+            std::mem::discriminant(&n.op)
         )),
     }
 }
@@ -1094,6 +1105,78 @@ mod tests {
         assert_eq!(joins.equi_edges.len(), 1);
         assert_eq!(joins.equi_edges[0].left, ColumnId(1));
         assert_eq!(joins.equi_edges[0].right, ColumnId(3));
+    }
+
+    #[test]
+    fn extracts_inner_join_with_driving_filter() {
+        use crate::sql::common::expr::JoinKind;
+
+        // SELECT ... FROM (SELECT * FROM t1 WHERE a >= 5) t1 JOIN t2 ON t1.a = t2.c
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let driving = LogicalPlanNode::new(
+            PlanNodeKind::Filter(LogicalFilterNode {
+                predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
+            }),
+            vec![scan_plan_named("t1", &[a.clone(), b.clone()])],
+            None,
+        );
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            driving,
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+
+        let (desc, _arena) = descriptor_from_plan(&plan).expect("inner join spjg");
+        assert_eq!(desc.table.name, "t1");
+        assert_eq!(
+            desc.predicates.len(),
+            1,
+            "driving-side filter predicate must be included exactly once"
+        );
+        let joins = desc.joins.as_ref().expect("join shape present");
+        assert_eq!(joins.inputs.len(), 1);
+        assert_eq!(joins.equi_edges.len(), 1);
+    }
+
+    #[test]
+    fn rejects_inner_join_without_condition() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            None,
+        );
+        assert!(
+            descriptor_from_plan(&plan).is_err(),
+            "inner join without equi edges must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_inner_join_with_only_residual_condition() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Gt, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+        assert!(
+            descriptor_from_plan(&plan).is_err(),
+            "inner join without equi edges must be rejected"
+        );
     }
 
     #[test]
