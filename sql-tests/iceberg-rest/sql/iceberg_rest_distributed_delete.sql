@@ -56,13 +56,19 @@ SELECT id, region
   ORDER BY id;
 
 -- query 10
--- @skip_result_check=true
-DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_v3_${uuid0};
+SELECT region, COUNT(*) AS cnt
+  FROM iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_${uuid0}
+  GROUP BY region
+  ORDER BY region;
 
 -- query 11
 -- @skip_result_check=true
-DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_${uuid0};
+DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_v3_${uuid0};
 
 -- query 12
+-- @skip_result_check=true
+DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_${uuid0};
+
+-- query 13
 -- @skip_result_check=true
 DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0};
