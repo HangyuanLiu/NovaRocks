@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{FilterOp, Operator, ProjectOp, ScalarProjectItem};
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -32,13 +33,18 @@ impl LogicalRewriteRule for PushDownPredicateProject {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
-        matches!(&expr.op, Operator::LogicalFilter(_))
-            && expr
-                .children
-                .first()
-                .map(|c| matches!(&c.op, Operator::LogicalProject(_)))
-                .unwrap_or(false)
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Filter,
+            children: vec![Pattern::Op {
+                kind: OpKind::Project,
+                children: vec![Pattern::MultiLeaf],
+            }],
+        }
+    }
+
+    fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        true
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -395,7 +401,8 @@ mod tests {
     };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::scalar::{self, ScalarArena};
+    use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use arrow::datatypes::DataType;
 
     // Helper: intern a TypedExpr that uses ColumnId::UNSET (used for
@@ -579,7 +586,7 @@ mod tests {
 
         let rule = PushDownPredicateProject;
         let mut ctx = make_ctx(arena);
-        assert!(rule.matches(&filter, &ctx));
+        assert!(bind_tree(&rule.pattern(), &filter).is_some());
         let result = rule.apply(filter, &mut ctx).unwrap();
 
         match result {
@@ -690,7 +697,7 @@ mod tests {
 
         let rule = PushDownPredicateProject;
         let mut ctx = make_ctx(arena);
-        assert!(rule.matches(&filter, &ctx));
+        assert!(bind_tree(&rule.pattern(), &filter).is_some());
         let result = rule.apply(filter, &mut ctx).unwrap();
         assert!(
             matches!(result, RewriteResult::Unchanged),

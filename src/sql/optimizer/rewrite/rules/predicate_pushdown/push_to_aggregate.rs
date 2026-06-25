@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{FilterOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -35,17 +36,25 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
         RewritePhase::StructuralRewrite
     }
 
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Filter,
+            children: vec![Pattern::Op {
+                kind: OpKind::Aggregate,
+                children: vec![Pattern::MultiLeaf],
+            }],
+        }
+    }
+
     fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
-        let Operator::LogicalFilter(_) = &expr.op else {
-            return false;
-        };
         if expr.children.is_empty() {
             return false;
         }
         let input = expr.unary_input();
-        matches!(&input.op, Operator::LogicalAggregate(_))
-            && !input.children.is_empty()
-            && !aggregate_child_is_repeat(input.unary_input())
+        if input.children.is_empty() {
+            return false;
+        }
+        !aggregate_child_is_repeat(input.unary_input())
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -164,15 +173,17 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{LogicalAggregateOp, ScalarAggregateSpec, ScanOp};
+    use crate::sql::optimizer::operator::{
+        LogicalAggregateOp, RepeatOp, ScalarAggregateSpec, ScanOp,
+    };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::ScalarArena;
 
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
     use std::cell::RefCell;
-    use std::collections::HashSet;
     use std::rc::Rc;
 
     fn test_col_id(name: &str) -> ColumnId {
@@ -265,6 +276,23 @@ mod tests {
         }))
     }
 
+    fn make_repeat(input: OptExpr) -> OptExpr {
+        OptExpr::new(
+            Operator::LogicalRepeat(RepeatOp {
+                repeat_column_ref_list: vec![],
+                repeat_column_ref_ids: vec![],
+                grouping_ids: vec![],
+                all_rollup_columns: vec![],
+                all_rollup_column_ids: vec![],
+                grouping_key_aliases: vec![],
+                grouping_fn_args: vec![],
+                grouping_fn_arg_ids: vec![],
+                grouping_fn_ids: vec![],
+            }),
+            vec![input],
+        )
+    }
+
     fn make_agg(arena: &mut ScalarArena, input: OptExpr) -> OptExpr {
         let group_by = vec![intern_typed(arena, &col_typed_expr("a"))];
         let count_spec = ScalarAggregateSpec {
@@ -304,6 +332,7 @@ mod tests {
 
         let rule = PushDownPredicateAggregate;
         let mut ctx = make_ctx(arena);
+        assert!(bind_tree(&rule.pattern(), &filter).is_some());
         assert!(rule.matches(&filter, &ctx));
         let result = rule.apply(filter, &mut ctx).unwrap();
         let RewriteResult::Changed(out) = result else {
@@ -344,6 +373,7 @@ mod tests {
 
         let rule = PushDownPredicateAggregate;
         let mut ctx = make_ctx(arena);
+        assert!(bind_tree(&rule.pattern(), &filter).is_some());
         assert!(rule.matches(&filter, &ctx));
         let result = rule.apply(filter, &mut ctx).unwrap();
         assert!(
@@ -369,11 +399,32 @@ mod tests {
 
         let rule = PushDownPredicateAggregate;
         let mut ctx = make_ctx(arena);
+        assert!(bind_tree(&rule.pattern(), &filter).is_some());
         assert!(rule.matches(&filter, &ctx));
         let result = rule.apply(filter, &mut ctx).unwrap();
         assert!(
             matches!(result, RewriteResult::Unchanged),
             "constant predicate must not be pushed through an aggregate"
         );
+    }
+
+    #[test]
+    fn pattern_matches_filter_aggregate_but_matches_rejects_repeat_child() {
+        let mut arena = ScalarArena::new();
+        let scan = make_scan(&mut arena);
+        let repeat = make_repeat(scan);
+        let agg = make_agg(&mut arena, repeat);
+        let filter_pred = intern_typed(&mut arena, &eq_expr(col_typed_expr("a"), int_lit_expr(1)));
+        let filter = OptExpr::new(
+            Operator::LogicalFilter(FilterOp {
+                predicate: filter_pred,
+            }),
+            vec![agg],
+        );
+
+        let rule = PushDownPredicateAggregate;
+        let ctx = make_ctx(arena);
+        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(!rule.matches(&filter, &ctx));
     }
 }

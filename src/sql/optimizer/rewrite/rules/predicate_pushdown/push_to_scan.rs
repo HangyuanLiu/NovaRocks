@@ -10,6 +10,7 @@ use std::collections::HashSet;
 
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -31,13 +32,18 @@ impl LogicalRewriteRule for PushDownPredicateScan {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
-        matches!(&expr.op, Operator::LogicalFilter(_))
-            && expr
-                .children
-                .first()
-                .map(|c| matches!(&c.op, Operator::LogicalScan(_)))
-                .unwrap_or(false)
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Filter,
+            children: vec![Pattern::Op {
+                kind: OpKind::Scan,
+                children: vec![Pattern::MultiLeaf],
+            }],
+        }
+    }
+
+    fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        true
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -141,7 +147,8 @@ mod tests {
     use crate::sql::optimizer::operator::{FilterOp, Operator, ScanOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::scalar::{self, ScalarArena};
+    use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use arrow::datatypes::DataType;
 
     fn test_col_id(name: &str) -> ColumnId {
@@ -279,7 +286,7 @@ mod tests {
         let filter = filter_opt(&mut arena, eq(col("a"), int_lit(1)), scan);
         let rule = PushDownPredicateScan;
         let mut ctx = make_ctx(arena);
-        assert!(rule.matches(&filter, &ctx));
+        assert!(bind_tree(&rule.pattern(), &filter).is_some());
         let result = rule.apply(filter, &mut ctx).unwrap();
         match result {
             RewriteResult::Changed(out) => match &out.op {
@@ -297,8 +304,23 @@ mod tests {
         let mut arena = ScalarArena::new();
         let scan = scan_opt(&mut arena, &["a"]);
         let rule = PushDownPredicateScan;
-        let ctx = make_ctx(arena);
-        assert!(!rule.matches(&scan, &ctx));
+        assert!(bind_tree(&rule.pattern(), &scan).is_none());
+    }
+
+    #[test]
+    fn pattern_rejects_filter_over_project() {
+        let mut arena = ScalarArena::new();
+        let scan = scan_opt(&mut arena, &["a"]);
+        let project = OptExpr::new(
+            Operator::LogicalProject(crate::sql::optimizer::operator::ProjectOp {
+                items: vec![],
+                output_qualifier: None,
+            }),
+            vec![scan],
+        );
+        let filter = filter_opt(&mut arena, eq(col("a"), int_lit(1)), project);
+        let rule = PushDownPredicateScan;
+        assert!(bind_tree(&rule.pattern(), &filter).is_none());
     }
 
     #[test]

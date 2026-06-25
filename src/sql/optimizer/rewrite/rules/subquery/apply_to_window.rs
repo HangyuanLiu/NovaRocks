@@ -19,6 +19,7 @@ use crate::sql::optimizer::operator::{
     ApplyOp, LogicalAggregateOp, Operator, ScalarAggregateSpec, SortOp, WindowOp,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -53,9 +54,18 @@ impl LogicalRewriteRule for ApplyToWindow {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
-        let _ = ctx;
-        matches_plan(expr)
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Filter,
+            children: vec![Pattern::Op {
+                kind: OpKind::Apply,
+                children: vec![Pattern::MultiLeaf],
+            }],
+        }
+    }
+
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches_apply_fields(apply_payload_after_pattern_gate(expr))
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -68,15 +78,21 @@ impl LogicalRewriteRule for ApplyToWindow {
     }
 }
 
-fn matches_plan(plan: &OptExpr) -> bool {
-    let Operator::LogicalFilter(_) = &plan.op else {
-        return false;
+fn matches_apply_fields(apply: &ApplyOp) -> bool {
+    apply.kind == ApplyKind::Scalar
+        && !apply.need_check_max_rows
+        && !apply.correlation_conjuncts.is_empty()
+}
+
+fn apply_payload_after_pattern_gate(expr: &OptExpr) -> &ApplyOp {
+    let apply_expr = expr
+        .children
+        .first()
+        .expect("ApplyToWindow::matches requires Filter(Apply) pattern pre-gate");
+    let Operator::LogicalApply(apply) = &apply_expr.op else {
+        unreachable!("ApplyToWindow::matches requires Filter(Apply) pattern pre-gate");
     };
-    let apply = plan.unary_input();
-    let Operator::LogicalApply(a) = &apply.op else {
-        return false;
-    };
-    a.kind == ApplyKind::Scalar && !a.need_check_max_rows && !a.correlation_conjuncts.is_empty()
+    apply
 }
 
 fn apply_plan_inner(
@@ -519,6 +535,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::rewrite::rules::subquery::bridge::opt_expr_to_plan;
     use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
+    use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
@@ -1024,11 +1041,12 @@ mod tests {
         let plan = winmagic_filter_apply();
         let mut ctx = ctx();
         let expr = to_opt_expr(&plan, &mut ctx);
+        assert!(bind_tree(&rule.pattern(), &expr).is_some());
         assert!(rule.matches(&expr, &ctx));
     }
 
     #[test]
-    fn matches_returns_false_for_bare_apply() {
+    fn pattern_rejects_bare_apply() {
         let rule = ApplyToWindow;
         // Apply without Filter wrapper → should not match
         let apply = LogicalPlanNode::new(
@@ -1058,7 +1076,54 @@ mod tests {
         );
         let mut ctx = ctx();
         let expr = to_opt_expr(&apply, &mut ctx);
-        assert!(!rule.matches(&expr, &ctx));
+        assert!(bind_tree(&rule.pattern(), &expr).is_none());
+    }
+
+    #[test]
+    fn pattern_rejects_filter_over_non_apply_child() {
+        let rule = ApplyToWindow;
+        let filter_over_join = LogicalPlanNode::new(
+            PlanNodeKind::Filter(LogicalFilterNode {
+                predicate: TypedExpr {
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                    kind: ExprKind::Literal(LiteralValue::Bool(true)),
+                },
+            }),
+            vec![make_outer_join()],
+            None,
+        );
+        let mut ctx = ctx();
+        let expr = to_opt_expr(&filter_over_join, &mut ctx);
+
+        assert!(bind_tree(&rule.pattern(), &expr).is_none());
+    }
+
+    #[test]
+    fn matches_checks_apply_field_predicates_after_pattern_gate() {
+        fn matches_with_apply(apply_mutator: impl FnOnce(&mut LogicalApplyNode)) -> bool {
+            let rule = ApplyToWindow;
+            let plan = winmagic_filter_apply();
+            let (predicate, apply, left, right) = extract_filter_apply(&plan);
+            let mut apply = apply.clone();
+            apply_mutator(&mut apply);
+            let plan = make_filter_apply(predicate.clone(), apply, left.clone(), right.clone());
+            let mut ctx = ctx();
+            let expr = to_opt_expr(&plan, &mut ctx);
+            assert!(bind_tree(&rule.pattern(), &expr).is_some());
+            rule.matches(&expr, &ctx)
+        }
+
+        assert!(matches_with_apply(|_| {}));
+        assert!(!matches_with_apply(|apply| {
+            apply.kind = ApplyKind::Exists { negated: false };
+        }));
+        assert!(!matches_with_apply(|apply| {
+            apply.need_check_max_rows = true;
+        }));
+        assert!(!matches_with_apply(|apply| {
+            apply.correlation_conjuncts.clear();
+        }));
     }
 
     // ---- transform tests --------------------------------------------------------
