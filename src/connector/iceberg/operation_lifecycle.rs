@@ -58,17 +58,40 @@ pub fn operation_fact_from_commit_result(
                 next_action: cleanup_next_action(cleanup),
             }),
         },
+        Err(CommitServiceError::InvalidInput { message }) => IcebergOperationFact {
+            state: IcebergOperationState::FailedKnownUncommitted,
+            commit_outcome: None,
+            cleanup_outcome: None,
+            recovery_evidence: None,
+            failure: Some(IcebergOperationFailureRecord {
+                kind: IcebergOperationFailureKind::KnownUncommitted,
+                message: message.clone(),
+                next_action: IcebergOperationNextAction::None,
+            }),
+        },
+        Err(CommitServiceError::FinalizeFailedKnownCommitted {
+            outcome,
+            finalize_error,
+            evidence,
+        }) => IcebergOperationFact {
+            state: IcebergOperationState::FinalizeFailedKnownCommitted,
+            commit_outcome: outcome.as_ref().map(|outcome| IcebergCommitOutcomeRecord {
+                snapshot_id: outcome.new_snapshot_id,
+                written_manifest_paths: outcome.written_manifest_paths.clone(),
+            }),
+            cleanup_outcome: None,
+            recovery_evidence: Some(recovery_evidence_record_from_evidence(evidence)),
+            failure: Some(IcebergOperationFailureRecord {
+                kind: IcebergOperationFailureKind::FinalizeKnownCommitted,
+                message: finalize_error.clone(),
+                next_action: IcebergOperationNextAction::RetryFinalize,
+            }),
+        },
         Err(CommitServiceError::Unknown { message, evidence }) => IcebergOperationFact {
             state: IcebergOperationState::CommitUnknown,
             commit_outcome: None,
             cleanup_outcome: None,
-            recovery_evidence: Some(IcebergRecoveryEvidenceRecord {
-                table_ident: evidence.table_ident.clone(),
-                commit_op_kind: commit_op_kind_record_name(evidence.op_kind).to_string(),
-                base_snapshot_id: evidence.base_snapshot_id,
-                base_sequence_number: Some(evidence.base_sequence_number),
-                staging_dir: evidence.staging_dir.clone(),
-            }),
+            recovery_evidence: Some(recovery_evidence_record_from_evidence(evidence)),
             failure: Some(IcebergOperationFailureRecord {
                 kind: IcebergOperationFailureKind::Unknown,
                 message: message.clone(),
@@ -120,6 +143,18 @@ fn cleanup_outcome_from_attempt(cleanup: &CleanupAttempt) -> IcebergCleanupOutco
         attempted: cleanup.attempted,
         error_count: cleanup.error_count as i64,
         error_paths: cleanup.error_paths.clone(),
+    }
+}
+
+fn recovery_evidence_record_from_evidence(
+    evidence: &crate::connector::iceberg::commit::RecoveryEvidence,
+) -> IcebergRecoveryEvidenceRecord {
+    IcebergRecoveryEvidenceRecord {
+        table_ident: evidence.table_ident.clone(),
+        commit_op_kind: commit_op_kind_record_name(evidence.op_kind).to_string(),
+        base_snapshot_id: evidence.base_snapshot_id,
+        base_sequence_number: Some(evidence.base_sequence_number),
+        staging_dir: evidence.staging_dir.clone(),
     }
 }
 
@@ -227,6 +262,103 @@ mod tests {
             1
         );
         assert_eq!(fact.recovery_evidence, None);
+    }
+
+    #[test]
+    fn invalid_input_maps_to_finished_known_uncommitted_without_cleanup_retry() {
+        let error = CommitServiceError::invalid_input(
+            "CommitOpKind::RewriteManifests must be invoked directly".to_string(),
+        );
+        let fact = operation_fact_from_commit_result(Err(&error));
+        assert_eq!(fact.state, IcebergOperationState::FailedKnownUncommitted);
+        assert_eq!(fact.cleanup_outcome, None);
+        assert_eq!(fact.recovery_evidence, None);
+        let failure = fact.failure.expect("failure");
+        assert_eq!(failure.kind, IcebergOperationFailureKind::KnownUncommitted);
+        assert_eq!(failure.next_action, IcebergOperationNextAction::None);
+        assert_eq!(
+            failure.message,
+            "CommitOpKind::RewriteManifests must be invoked directly"
+        );
+    }
+
+    #[test]
+    fn finalize_failed_known_committed_error_maps_to_retry_finalize() {
+        let outcome = CommitOutcome {
+            new_snapshot_id: 88,
+            written_manifest_paths: vec!["s3://warehouse/metadata/m88.avro".to_string()],
+        };
+        let error = CommitServiceError::finalize_failed_known_committed(
+            Some(outcome),
+            "target ref main is not visible after catalog commit".to_string(),
+            RecoveryEvidence {
+                table_ident: "ice.sales.orders".to_string(),
+                op_kind: CommitOpKind::FastAppend,
+                base_snapshot_id: Some(77),
+                base_sequence_number: 9,
+                staging_dir: "s3://warehouse/orders/_staging/finalize".to_string(),
+            },
+        );
+
+        let fact = operation_fact_from_commit_result(Err(&error));
+        assert_eq!(
+            fact.state,
+            IcebergOperationState::FinalizeFailedKnownCommitted
+        );
+        assert_eq!(fact.commit_outcome.expect("commit outcome").snapshot_id, 88);
+        let failure = fact.failure.expect("failure");
+        assert_eq!(
+            failure.kind,
+            IcebergOperationFailureKind::FinalizeKnownCommitted
+        );
+        assert_eq!(
+            failure.next_action,
+            IcebergOperationNextAction::RetryFinalize
+        );
+        assert_eq!(
+            failure.message,
+            "target ref main is not visible after catalog commit"
+        );
+    }
+
+    #[test]
+    fn finalize_failed_known_committed_without_outcome_preserves_recovery_evidence() {
+        let error = CommitServiceError::finalize_failed_known_committed(
+            None,
+            "snapshot id was not captured after catalog commit".to_string(),
+            RecoveryEvidence {
+                table_ident: "ice.sales.orders".to_string(),
+                op_kind: CommitOpKind::FastAppend,
+                base_snapshot_id: Some(77),
+                base_sequence_number: 9,
+                staging_dir: "s3://warehouse/orders/_staging/finalize".to_string(),
+            },
+        );
+
+        let fact = operation_fact_from_commit_result(Err(&error));
+        assert_eq!(
+            fact.state,
+            IcebergOperationState::FinalizeFailedKnownCommitted
+        );
+        assert_eq!(fact.commit_outcome, None);
+        let evidence = fact.recovery_evidence.expect("recovery evidence");
+        assert_eq!(evidence.table_ident, "ice.sales.orders");
+        assert_eq!(evidence.commit_op_kind, "fast_append");
+        assert_eq!(evidence.base_snapshot_id, Some(77));
+        assert_eq!(evidence.base_sequence_number, Some(9));
+        assert_eq!(
+            evidence.staging_dir,
+            "s3://warehouse/orders/_staging/finalize"
+        );
+        let failure = fact.failure.expect("failure");
+        assert_eq!(
+            failure.kind,
+            IcebergOperationFailureKind::FinalizeKnownCommitted
+        );
+        assert_eq!(
+            failure.next_action,
+            IcebergOperationNextAction::RetryFinalize
+        );
     }
 
     #[test]
