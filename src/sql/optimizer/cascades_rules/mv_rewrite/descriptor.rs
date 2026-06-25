@@ -545,7 +545,7 @@ fn substitute_sort_key(
 /// conjuncts (everything else). A `None` condition (e.g. a cross join, which we
 /// reject earlier anyway) yields two empty vectors.
 fn split_join_condition(
-    arena: &mut ScalarArena,
+    arena: &ScalarArena,
     condition: Option<ScalarId>,
 ) -> (Vec<EquiEdge>, Vec<ScalarId>) {
     let Some(cond) = condition else {
@@ -945,17 +945,18 @@ mod tests {
             true,
         );
 
-        let (edges, residuals) = super::split_join_condition(&mut arena, Some(cond));
+        let (edges, residuals) = super::split_join_condition(&arena, Some(cond));
         assert_eq!(edges.len(), 1, "one equi edge");
         assert_eq!(edges[0].left, ColumnId(1));
         assert_eq!(edges[0].right, ColumnId(2));
         assert_eq!(residuals.len(), 1, "the a>b conjunct is a residual");
+        assert_eq!(residuals, vec![gt]);
     }
 
     #[test]
     fn split_join_condition_none_is_empty() {
-        let mut arena = ScalarArena::new();
-        let (edges, residuals) = super::split_join_condition(&mut arena, None);
+        let arena = ScalarArena::new();
+        let (edges, residuals) = super::split_join_condition(&arena, None);
         assert!(edges.is_empty() && residuals.is_empty());
     }
 
