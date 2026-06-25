@@ -9,8 +9,8 @@
 //! Kept for architectural symmetry and to allow per-operator
 //! `disable_optimizer_rules` control in the future.
 
-use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -27,8 +27,15 @@ impl LogicalRewriteRule for PruneTableFunctionColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
-        matches!(&expr.op, Operator::LogicalTableFunction(_))
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::TableFunction,
+            children: vec![Pattern::MultiLeaf],
+        }
+    }
+
+    fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        true
     }
 
     fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -77,8 +84,11 @@ mod tests {
 
         let rule = PruneTableFunctionColumns;
 
-        // matches the right variant
-        assert!(rule.matches(&expr, &ctx()));
+        // pattern gates the structural operator kind.
+        assert!(
+            crate::sql::optimizer::rewrite::tree_binder::bind_tree(&rule.pattern(), &expr)
+                .is_some()
+        );
 
         // apply always returns Unchanged
         let result = rule.apply(expr, &mut ctx()).unwrap();

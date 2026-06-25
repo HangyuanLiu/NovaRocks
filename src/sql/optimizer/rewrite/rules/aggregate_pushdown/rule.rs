@@ -2,6 +2,7 @@
 
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -19,8 +20,15 @@ impl RewriteRule for AggregatePushdownRule {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
-        matches!(&expr.op, Operator::LogicalAggregate(_))
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Aggregate,
+            children: vec![Pattern::MultiLeaf],
+        }
+    }
+
+    fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        true
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -136,6 +144,15 @@ mod tests {
     }
 
     #[test]
+    fn pattern_matches_only_aggregate_roots() {
+        use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
+
+        let rule = AggregatePushdownRule;
+        assert!(bind_tree(&rule.pattern(), &dummy_aggregate()).is_some());
+        assert!(bind_tree(&rule.pattern(), &dummy_scan("t", &["id"])).is_none());
+    }
+
+    #[test]
     fn stub_returns_none() {
         use crate::sql::optimizer::scalar::ScalarArena;
         use std::cell::RefCell;
@@ -145,7 +162,10 @@ mod tests {
         let mut ctx = RewriteContext::new(RewriteConsumer::Query);
         set_empty_stats_input(&mut ctx);
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
-        assert!(rule.matches(&plan, &ctx));
+        assert!(
+            crate::sql::optimizer::rewrite::tree_binder::bind_tree(&rule.pattern(), &plan)
+                .is_some()
+        );
         assert!(matches!(
             rule.apply(plan, &mut ctx).unwrap(),
             RewriteResult::Unchanged
