@@ -234,11 +234,17 @@ pub(crate) fn bind_position_delete_descriptor(
                 expected_partition_source_column_names[idx], field.output_expr_index
             )));
         }
-        output_expr_root_primitive(
+        let partition_source_primitive = output_expr_root_primitive(
             expected_partition_source_column_names[idx].as_str(),
             output_exprs,
             output_expr_index,
         )?;
+        if partition_source_primitive.is_none() {
+            return Err(descriptor_error(format!(
+                "partition source {} output expr type is not scalar",
+                expected_partition_source_column_names[idx]
+            )));
+        }
         if field.source_column_name.as_deref()
             != Some(expected_partition_source_column_names[idx].as_str())
         {
@@ -615,6 +621,31 @@ mod tests {
             crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
         );
         assert!(err.to_user_message().contains("output expr"));
+    }
+
+    #[test]
+    fn descriptor_partition_source_non_scalar_output_expr_fails() {
+        let desc = valid_descriptor();
+        let mut output_exprs = valid_output_exprs();
+        output_exprs[2].nodes[0].type_ =
+            malformed_non_scalar_type_desc(crate::types::TPrimitiveType::INT);
+        let err = bind_position_delete_descriptor(
+            Some(&desc),
+            &output_exprs,
+            7,
+            &[String::from("id")],
+            &[String::from("id_bucket")],
+            &[String::from("bucket[8]")],
+            &[42],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        let message = err.to_user_message();
+        assert!(message.contains("partition source"));
+        assert!(message.contains("type"));
     }
 
     #[test]
