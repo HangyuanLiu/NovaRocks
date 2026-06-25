@@ -454,9 +454,9 @@ pub(crate) fn build_iceberg_write_sink_spec(
         )
     });
     let position_delete_output_descriptor = match mode {
-        IcebergWriteSinkMode::PositionDeletes | IcebergWriteSinkMode::DeletionVectors => {
-            build_position_delete_output_descriptor(metadata, &target_columns)?
-        }
+        IcebergWriteSinkMode::PositionDeletes | IcebergWriteSinkMode::DeletionVectors => Some(
+            build_position_delete_output_descriptor(metadata, &target_columns)?,
+        ),
         IcebergWriteSinkMode::Data
         | IcebergWriteSinkMode::RowLineageData
         | IcebergWriteSinkMode::EqualityDeletes => None,
@@ -579,7 +579,7 @@ fn position_delete_sink_input_columns(
 fn build_position_delete_output_descriptor(
     metadata: &iceberg::spec::TableMetadata,
     target_columns: &[ColumnDef],
-) -> Result<Option<crate::data_sinks::TIcebergPositionDeleteOutputDescriptor>, String> {
+) -> Result<crate::data_sinks::TIcebergPositionDeleteOutputDescriptor, String> {
     use crate::connector::iceberg::position_delete_descriptor::{
         ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
         ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
@@ -624,7 +624,7 @@ fn build_position_delete_output_descriptor(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    Ok(Some(
+    Ok(
         crate::data_sinks::TIcebergPositionDeleteOutputDescriptor::new(
             Some(crate::data_sinks::TIcebergPositionDeleteOutputField::new(
                 Some(0),
@@ -641,7 +641,7 @@ fn build_position_delete_output_descriptor(
             Some(partition_source_fields),
             Some(metadata.default_partition_spec_id()),
         ),
-    ))
+    )
 }
 
 fn append_source_to_query(
@@ -1379,6 +1379,22 @@ mod tests {
         source_field_id: i32,
         partition_spec_id: i32,
     ) -> iceberg::spec::TableMetadata {
+        test_iceberg_metadata_with_partition(
+            source_column_name,
+            source_column_name,
+            iceberg::spec::Transform::Identity,
+            source_field_id,
+            partition_spec_id,
+        )
+    }
+
+    fn test_iceberg_metadata_with_partition(
+        source_column_name: &str,
+        partition_field_name: &str,
+        transform: iceberg::spec::Transform,
+        source_field_id: i32,
+        partition_spec_id: i32,
+    ) -> iceberg::spec::TableMetadata {
         let schema = iceberg::spec::Schema::builder()
             .with_fields(vec![
                 Arc::new(iceberg::spec::NestedField::required(
@@ -1396,11 +1412,7 @@ mod tests {
             .expect("schema");
         let partition_spec = iceberg::spec::PartitionSpec::builder(Arc::new(schema.clone()))
             .with_spec_id(partition_spec_id)
-            .add_partition_field(
-                source_column_name,
-                source_column_name,
-                iceberg::spec::Transform::Identity,
-            )
+            .add_partition_field(source_column_name, partition_field_name, transform)
             .expect("partition field")
             .build()
             .expect("partition spec");
@@ -1424,6 +1436,9 @@ mod tests {
         source_field_id: i32,
         partition_spec_id: i32,
     ) -> iceberg::spec::TableMetadata {
+        // TableMetadataBuilder::from_table_creation intentionally reassigns
+        // field and spec ids; this fixture retags serialized metadata so tests
+        // can assert planner descriptors carry target-table ids verbatim.
         let mut value = serde_json::to_value(metadata).expect("metadata json");
         let object = value.as_object_mut().expect("metadata object");
         object.insert(
@@ -1523,11 +1538,69 @@ mod tests {
             cloud_configuration: None,
             file_format: "parquet".to_string(),
             compression: crate::types::TCompressionType::SNAPPY,
-            position_delete_output_descriptor: build_position_delete_output_descriptor(
+            position_delete_output_descriptor: Some(build_position_delete_output_descriptor(
                 metadata,
                 resolved_columns,
-            )?,
+            )?),
         })
+    }
+
+    fn assert_position_delete_output_field(
+        field: Option<&crate::data_sinks::TIcebergPositionDeleteOutputField>,
+        output_expr_index: i32,
+        name: &str,
+        primitive: crate::types::TPrimitiveType,
+        field_id: i32,
+    ) {
+        let field = field.expect("position delete output field");
+        assert_eq!(field.output_expr_index, Some(output_expr_index));
+        assert_eq!(field.name.as_deref(), Some(name));
+        assert_eq!(field.field_id, Some(field_id));
+        assert_eq!(
+            field
+                .type_desc
+                .as_ref()
+                .and_then(crate::lower::type_lowering::primitive_type_from_desc),
+            Some(primitive)
+        );
+    }
+
+    fn assert_position_delete_descriptor_contract(
+        desc: &crate::data_sinks::TIcebergPositionDeleteOutputDescriptor,
+    ) {
+        use crate::connector::iceberg::position_delete_descriptor::{
+            ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+            ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+        };
+
+        assert_eq!(desc.target_partition_spec_id, Some(7));
+        assert_position_delete_output_field(
+            desc.file_path.as_ref(),
+            0,
+            ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
+            crate::types::TPrimitiveType::VARCHAR,
+            ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+        );
+        assert_position_delete_output_field(
+            desc.pos.as_ref(),
+            1,
+            ICEBERG_POSITION_DELETE_POS_COLUMN,
+            crate::types::TPrimitiveType::BIGINT,
+            ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+        );
+        let partition_field = desc
+            .partition_source_fields
+            .as_ref()
+            .and_then(|fields| fields.first())
+            .expect("partition source field");
+        assert_eq!(partition_field.output_expr_index, Some(2));
+        assert_eq!(partition_field.source_column_name.as_deref(), Some("id"));
+        assert_eq!(
+            partition_field.partition_field_name.as_deref(),
+            Some("id_bucket")
+        );
+        assert_eq!(partition_field.transform_expr.as_deref(), Some("bucket[8]"));
+        assert_eq!(partition_field.source_field_id, Some(42));
     }
 
     #[test]
@@ -1621,7 +1694,13 @@ mod tests {
             test_column("id", DataType::Int32, None),
             test_column("v", DataType::Utf8, None),
         ];
-        let metadata = test_iceberg_metadata_with_identity_partition("id", 42, 7);
+        let metadata = test_iceberg_metadata_with_partition(
+            "id",
+            "id_bucket",
+            iceberg::spec::Transform::Bucket(8),
+            42,
+            7,
+        );
         let spec =
             build_position_delete_sink_spec_from_parts_for_test(&resolved_columns, &metadata)
                 .expect("position delete sink spec");
@@ -1629,19 +1708,15 @@ mod tests {
             .position_delete_output_descriptor
             .as_ref()
             .expect("descriptor");
-        assert_eq!(desc.target_partition_spec_id, Some(7));
-        assert_eq!(desc.file_path.as_ref().unwrap().output_expr_index, Some(0));
-        assert_eq!(desc.pos.as_ref().unwrap().output_expr_index, Some(1));
-        assert_eq!(
-            desc.partition_source_fields.as_ref().unwrap()[0]
-                .source_column_name
-                .as_deref(),
-            Some("id")
-        );
-        assert_eq!(
-            desc.partition_source_fields.as_ref().unwrap()[0].output_expr_index,
-            Some(2)
-        );
+        assert_position_delete_descriptor_contract(desc);
+
+        let sink = spec.build_sink(17);
+        let sink_desc = sink
+            .iceberg_table_sink
+            .as_ref()
+            .and_then(|sink| sink.position_delete_output_descriptor.as_ref())
+            .expect("sink descriptor");
+        assert_position_delete_descriptor_contract(sink_desc);
     }
 
     #[test]
