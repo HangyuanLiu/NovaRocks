@@ -110,10 +110,19 @@ impl SpjgDescriptor {
     /// Map from scan ColumnId to base column name (for cross-side matching:
     /// the two sides see the same physical table through different ids).
     pub(crate) fn base_name_of(&self) -> HashMap<ColumnId, String> {
-        self.scan_columns
+        let mut map: HashMap<ColumnId, String> = self
+            .scan_columns
             .iter()
             .map(|c| (c.column_id, c.name.clone()))
-            .collect()
+            .collect();
+        if let Some(joins) = &self.joins {
+            for input in &joins.inputs {
+                for c in &input.scan_columns {
+                    map.insert(c.column_id, c.name.clone());
+                }
+            }
+        }
+        map
     }
 
     pub(crate) fn from_opt_expr(
@@ -1160,6 +1169,31 @@ mod tests {
         assert_eq!(joins.equi_edges.len(), 1);
         assert_eq!(joins.equi_edges[0].left, ColumnId(1));
         assert_eq!(joins.equi_edges[0].right, ColumnId(3));
+    }
+
+    #[test]
+    fn base_name_of_includes_join_input_columns() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let d = col(4, "d");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", &[a.clone(), b.clone()]),
+            scan_plan_named("t2", &[c.clone(), d.clone()]),
+            Some(on),
+        );
+        let (desc, _arena) = descriptor_from_plan(&plan).expect("inner join spjg");
+        let names = desc.base_name_of();
+        // Driving scan columns:
+        assert_eq!(names.get(&ColumnId(1)).map(String::as_str), Some("a"));
+        assert_eq!(names.get(&ColumnId(2)).map(String::as_str), Some("b"));
+        // Join-input columns must also be present:
+        assert_eq!(names.get(&ColumnId(3)).map(String::as_str), Some("c"));
+        assert_eq!(names.get(&ColumnId(4)).map(String::as_str), Some("d"));
     }
 
     #[test]
