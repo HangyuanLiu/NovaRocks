@@ -58,6 +58,10 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         RewritePhase::StructuralRewrite
     }
 
+    // Keep the default Leaf pattern: this rule accepts multiple paths
+    // (`Filter -> Window` over Sort, or `Filter -> Project -> Window -> Sort`)
+    // plus deeper field guards. Pattern has no optional/intermediate
+    // alternative for this shape today.
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         let Operator::LogicalFilter(_) = &expr.op else {
             return false;

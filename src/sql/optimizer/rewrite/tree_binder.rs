@@ -1,4 +1,17 @@
-//! Tree-side declarative Pattern matcher. Intentionally unwired for now.
+//! Tree-side declarative Pattern matcher.
+//!
+//! The tree rewrite driver uses this matcher as a structural pre-gate before
+//! calling each rule's field-level `matches` method. The migration invariants
+//! are:
+//! - driver traversal and fixed-point order stay unchanged;
+//! - default `Pattern::Leaf` is a root wildcard, so holdout rules keep their
+//!   legacy imperative matching behavior;
+//! - for migrated rules, structural `pattern` matching plus field-level
+//!   `matches` is equivalent to the old monolithic `matches` predicate;
+//! - `apply` remains the semantic rewrite boundary and is not interpreted by
+//!   the binder;
+//! - `first_match_only` is degenerate on concrete trees because one node can
+//!   produce at most one binding.
 //!
 //! Unlike the memo binder, an `OptExpr` child is one concrete subtree, so a
 //! successful match produces at most one binding.
@@ -18,8 +31,8 @@ pub(crate) struct TreeBinding<'t> {
 }
 
 impl<'t> TreeBinding<'t> {
-    // These accessors are intentionally available before the unwired matcher is
-    // consumed by rewrite rules.
+    // These accessors support migrated rules and tests that need matched
+    // interior nodes.
     /// Return the root expression matched by the pattern.
     #[allow(dead_code)]
     pub(crate) fn root(&self) -> &'t OptExpr {

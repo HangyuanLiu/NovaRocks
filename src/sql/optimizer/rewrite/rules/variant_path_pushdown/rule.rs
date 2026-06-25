@@ -37,6 +37,9 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
         RewriteTraversal::TopDown
     }
 
+    // Keep the default Leaf pattern: candidates can be rooted at Filter,
+    // Project, or Scan, while the guard is scalar/context-dependent and the
+    // rewrite may mutate child scan bindings.
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         let arena_rc = ctx.scalar_arena();
         let arena = arena_rc.borrow();
