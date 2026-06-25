@@ -1156,6 +1156,19 @@ impl HashJoinProbeCore {
             return Ok(None);
         }
 
+        if self.probe_is_left
+            && matches!(self.join_type, JoinType::LeftSemi | JoinType::LeftAnti)
+            && self.residual_predicate.is_none()
+        {
+            let is_semi = self.join_type == JoinType::LeftSemi;
+            return self.join_left_semi_anti_by_membership(
+                probe_chunks,
+                &output_schema,
+                &table,
+                is_semi,
+            );
+        }
+
         if matches!(
             self.join_type,
             JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti
@@ -1244,6 +1257,64 @@ impl HashJoinProbeCore {
             return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
         }
         Ok(None)
+    }
+
+    fn join_left_semi_anti_by_membership(
+        &mut self,
+        probe_chunks: Vec<Chunk>,
+        output_schema: &SchemaRef,
+        table: &JoinHashMap,
+        is_semi: bool,
+    ) -> Result<Option<Chunk>, String> {
+        let mut output_batches = Vec::new();
+        for probe in probe_chunks {
+            let search_start = std::time::Instant::now();
+            let membership = table.lookup_membership(&self.arena, &self.probe_keys, &probe)?;
+            self.record_search_ns(search_start);
+            if membership.len() != probe.len() {
+                return Err(format!(
+                    "semi/anti membership length mismatch: membership={} rows={}",
+                    membership.len(),
+                    probe.len()
+                ));
+            }
+            let hits = membership.iter().filter(|matched| **matched).count() as u64;
+            let misses = membership.len() as u64 - hits;
+            self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(hits);
+            self.lookup_miss_rows = self.lookup_miss_rows.saturating_add(misses);
+
+            let keep = membership
+                .into_iter()
+                .map(|matched| if is_semi { matched } else { !matched })
+                .collect::<Vec<bool>>();
+            let output_start = std::time::Instant::now();
+            let mask = BooleanArray::from(keep);
+            let filtered_batch = filter_record_batch(&probe.batch, &mask)
+                .map_err(|e| format!("semi/anti membership filter failed: {e}"))?;
+            self.record_output_ns(output_start);
+            if filtered_batch.num_rows() > 0 {
+                output_batches.push(filtered_batch);
+            }
+        }
+
+        if output_batches.is_empty() {
+            return Ok(None);
+        }
+        let output_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
+        self.output_rows = self.output_rows.saturating_add(output_rows as u64);
+        let probe_batch = if output_batches.len() == 1 {
+            output_batches.remove(0)
+        } else {
+            let output_start = std::time::Instant::now();
+            let batch = concat_compatible_batches(
+                output_schema,
+                &output_batches,
+                "semi anti membership join concat",
+            )?;
+            self.record_output_ns(output_start);
+            batch
+        };
+        Ok(Some(self.extend_with_null_build_columns(probe_batch)?))
     }
 
     fn join_null_aware_left_anti(
@@ -1634,6 +1705,39 @@ mod tests {
         )
     }
 
+    fn direct_set_build_artifact_from_build_chunk(build: Chunk) -> JoinBuildArtifact {
+        let key_arrays = vec![build.column_by_slot_id(RIGHT_K_SLOT_ID).expect("build key")];
+        let batch = crate::exec::operators::hashjoin::join_hash_map::method::BuildKeyBatch::new(
+            key_arrays,
+            build.len(),
+        )
+        .expect("key batch");
+        let build_row_count = build.len();
+        let build_table =
+            crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMap::build_from_key_batches(
+                vec![DataType::Int32],
+                vec![false],
+                &[batch],
+                crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapBuildOptions {
+                    purpose: crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapBuildPurpose::PresenceOnly,
+                    ..crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapBuildOptions::default()
+                },
+            )
+            .expect("direct set build table");
+        assert!(matches!(
+            build_table.method_kind(),
+            crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind::DirectIntSet { .. }
+        ));
+        JoinBuildArtifact::new(
+            Some(BuildStore::new(build)),
+            Some(build_table),
+            build_row_count,
+            false,
+            None,
+            None,
+        )
+    }
+
     #[test]
     fn inner_join_uses_direct_map_and_preserves_duplicate_matches() {
         let left_schema = schema_kv("lk", "lv");
@@ -1687,6 +1791,120 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(core.lookup_hit_rows(), 1);
         assert_eq!(core.lookup_miss_rows(), 1);
+    }
+
+    #[test]
+    fn left_semi_without_residual_uses_direct_set_membership() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let arena = Arc::new(arena);
+
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[100, 100, 102],
+            &[10, 12, 30],
+        );
+        let artifact = Arc::new(direct_set_build_artifact_from_build_chunk(build_chunk));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::LeftSemi,
+            vec![probe_key],
+            None,
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        core.set_build_artifact(artifact, 3, false)
+            .expect("set build");
+
+        let probe_chunk = chunk_of_two(
+            Arc::clone(&left_schema),
+            &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID],
+            &[100, 101, 102],
+            &[1, 2, 3],
+        );
+
+        let out = core
+            .join_probe_chunks(vec![probe_chunk])
+            .expect("probe")
+            .expect("left semi output");
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(core.lookup_hit_rows(), 2);
+        assert_eq!(core.lookup_miss_rows(), 1);
+        assert_eq!(core.residual_group_rows_total(), 0);
+    }
+
+    #[test]
+    fn left_anti_without_residual_uses_direct_set_membership() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let arena = Arc::new(arena);
+
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[100, 102, 102],
+            &[10, 30, 31],
+        );
+        let artifact = Arc::new(direct_set_build_artifact_from_build_chunk(build_chunk));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::LeftAnti,
+            vec![probe_key],
+            None,
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        core.set_build_artifact(artifact, 3, false)
+            .expect("set build");
+
+        let probe_chunk = chunk_of_two(
+            Arc::clone(&left_schema),
+            &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID],
+            &[100, 101, 102],
+            &[1, 2, 3],
+        );
+
+        let out = core
+            .join_probe_chunks(vec![probe_chunk])
+            .expect("probe")
+            .expect("left anti output");
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(core.lookup_hit_rows(), 2);
+        assert_eq!(core.lookup_miss_rows(), 1);
+        assert_eq!(core.residual_group_rows_total(), 0);
     }
 
     #[test]
