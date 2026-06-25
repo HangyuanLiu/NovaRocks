@@ -27,7 +27,7 @@
 //! DELETED. The `IcebergCommitCollector` is built with
 //! `CommitOpKind::Truncate` and no `inject_written_file` calls; the
 //! `TruncateCommit` action then drives the manifest writes through
-//! `run_iceberg_commit_typed` exactly the same way `OverwriteCommit` does.
+//! `run_iceberg_commit` exactly the same way `OverwriteCommit` does.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -38,7 +38,7 @@ use iceberg::{NamespaceIdent, TableIdent};
 use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, IcebergCommitCollector, RunInput, run_iceberg_commit_typed,
+    CommitOpKind, IcebergCommitCollector, RunInput, run_iceberg_commit,
 };
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::iceberg_writer::{
@@ -87,7 +87,7 @@ pub(crate) fn execute_iceberg_truncate_table(
     // 3. Build the collector. TRUNCATE never adds files, so no
     //    `inject_written_file` calls — the collector exists only to carry the
     //    op-kind, table identifier, base snapshot id, sequence number, schema,
-    //    and partition spec into `run_iceberg_commit_typed`.
+    //    and partition spec into `run_iceberg_commit`.
     let metadata = table.metadata();
     let staging_dir = format!(
         "{}/data/_staging/{}",
@@ -114,7 +114,7 @@ pub(crate) fn execute_iceberg_truncate_table(
 
     // 5. Drive commit + abort cleanup on failure.
     let _outcome = block_on_iceberg(async {
-        run_iceberg_commit_typed(RunInput {
+        run_iceberg_commit(RunInput {
             collector: collector.clone(),
             catalog: catalog.clone(),
             table,

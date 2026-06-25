@@ -19,7 +19,7 @@ use crate::connector::iceberg::commit::{
     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
     MvRefreshPublishPlan, MvRefreshSnapshotMarker, PositionDeleteGroup, RecoveryEvidence,
     RefAction, RefActionPlan, RunInput, execute_ref_action, publish_staging_branch_to_main,
-    run_iceberg_commit_typed, snapshot_matches_refresh_marker,
+    run_iceberg_commit, snapshot_matches_refresh_marker,
 };
 use crate::connector::iceberg::data_writer::{
     write_record_batches_as_data_files, written_file_to_sink_commit_info_for_metadata,
@@ -8538,7 +8538,7 @@ async fn commit_iceberg_mv_target_files_with_ref(
     let abort_cleanup = crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)
         .map_err(CommitServiceError::invalid_input)?;
 
-    let outcome = match run_iceberg_commit_typed(RunInput {
+    let outcome = match run_iceberg_commit(RunInput {
         collector: collector.clone(),
         catalog: catalog.clone(),
         table: table.clone(),
@@ -8581,7 +8581,7 @@ pub(crate) async fn commit_iceberg_mv_with_populated_collector(
 ) -> Result<CommitOutcome, CommitServiceError> {
     let abort_cleanup = crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)
         .map_err(CommitServiceError::invalid_input)?;
-    let outcome = match run_iceberg_commit_typed(RunInput {
+    let outcome = match run_iceberg_commit(RunInput {
         collector: collector.clone(),
         catalog: catalog.clone(),
         table: table.clone(),
@@ -8709,7 +8709,7 @@ async fn commit_iceberg_mv_apply_with_ref(
 
     let abort_cleanup = crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)
         .map_err(CommitServiceError::invalid_input)?;
-    let outcome = match run_iceberg_commit_typed(RunInput {
+    let outcome = match run_iceberg_commit(RunInput {
         collector: collector.clone(),
         catalog: catalog.clone(),
         table: table.clone(),

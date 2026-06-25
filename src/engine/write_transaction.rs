@@ -23,7 +23,7 @@ use crate::common::engine_error::EngineError;
 use crate::connector::iceberg::catalog::registry::block_on_iceberg;
 use crate::connector::iceberg::commit::{
     AbortLog, CleanupAttempt, CleanupPathMapper, CommitOpKind, CommitOutcome, CommitServiceError,
-    CowUpdateRewriteSet, IcebergCommitCollector, RunInput, WrittenFile, run_iceberg_commit_typed,
+    CowUpdateRewriteSet, IcebergCommitCollector, RunInput, WrittenFile, run_iceberg_commit,
 };
 use crate::connector::iceberg::operation_lifecycle::{
     IcebergOperationFact, operation_fact_from_commit_result, operation_fact_from_finalize_failure,
@@ -152,7 +152,7 @@ impl IcebergWriteCommitExecutor {
             snapshot_properties: self.snapshot_properties.clone(),
         };
 
-        match block_on_iceberg(async { run_iceberg_commit_typed(input).await }) {
+        match block_on_iceberg(async { run_iceberg_commit(input).await }) {
             Ok(result) => result,
             Err(message) => Err(CommitServiceError::known_uncommitted(
                 message,
