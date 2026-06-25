@@ -99,7 +99,16 @@ SQL client / SQL test runner
    SQL parsing, catalog resolution, and session context. Do not mix assumptions
    between the two modes without checking the active entrypoint.
 
-5. **Language policy**
+5. **Distributed deployment is the source of truth; standalone is test-only**
+   The real, user-facing deployment is NovaRocks distributed (1 NovaRocks FE +
+   N BE; CI baseline 1FE+3BE). The single-process all-in-one form ("standalone")
+   is only a testing convenience. Do NOT model for, or add special-case branches
+   for, the single-process form. Cluster-topology quantities (broadcast fanout,
+   backend count, per-node budgets) must be read dynamically from the live BE
+   registry, never hardcoded or defaulted to "single-process = 1 node". Tests
+   must never pass only in standalone while failing under 1FE+3BE.
+
+6. **Language policy**
    - User interaction and design docs: Chinese
    - Code comments, logs, error messages, commit messages: English
 
