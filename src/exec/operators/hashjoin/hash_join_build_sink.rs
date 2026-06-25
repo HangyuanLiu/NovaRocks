@@ -1354,6 +1354,13 @@ mod tests {
         }
     }
 
+    fn direct_set_build_operator(state: Arc<TestBuildState>) -> HashJoinBuildSinkOperator {
+        let mut operator = direct_int_build_operator(state);
+        operator.join_type = JoinType::LeftSemi;
+        operator.has_residual_predicate = false;
+        operator
+    }
+
     #[test]
     fn defers_hash_map_construction_until_build_finish() {
         let state = Arc::new(TestBuildState::default());
@@ -1401,6 +1408,47 @@ mod tests {
         assert_eq!(
             profiles.common.get_info_string("JoinHashMapMethod"),
             Some("DirectIntNotNull".to_string())
+        );
+    }
+
+    #[test]
+    fn records_direct_set_method_for_left_semi_without_residual() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = direct_set_build_operator(state);
+        let profiles = OperatorProfiles::new(RuntimeProfile::new("HASH_JOIN"));
+        operator.set_profiles(profiles.clone());
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 1_000_000]))
+            .expect("push chunk");
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        assert_eq!(
+            profiles.common.get_info_string("JoinHashMapMethod"),
+            Some("DirectIntSetNotNull".to_string())
+        );
+    }
+
+    #[test]
+    fn records_row_match_method_for_left_semi_with_residual() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = direct_set_build_operator(state);
+        operator.has_residual_predicate = true;
+        let profiles = OperatorProfiles::new(RuntimeProfile::new("HASH_JOIN"));
+        operator.set_profiles(profiles.clone());
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 1_000_000]))
+            .expect("push chunk");
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        assert_eq!(
+            profiles.common.get_info_string("JoinHashMapMethod"),
+            Some("Chained".to_string())
         );
     }
 
