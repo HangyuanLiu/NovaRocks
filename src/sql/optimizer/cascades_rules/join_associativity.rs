@@ -109,6 +109,18 @@ impl Rule for JoinAssociativity {
         }
     }
 
+    /// Consume only the FIRST binding, reproducing the legacy `.find(Inner)`.
+    ///
+    /// INVARIANT (byte-identity depends on it): an inner-join group is
+    /// homogeneous today — JoinCommutativity maps Inner→Inner and the reorder
+    /// pass injects only Inner/Cross into inner chains — so the binder's first
+    /// Join-kind alternative is always the Inner one legacy `.find` picked.
+    /// If a future rule (e.g. the outer→inner simplification in the
+    /// outer-join-reorder arc) ever places a non-Inner alternative ahead of an
+    /// Inner one in the same group, `apply_bound` below would bail on it and
+    /// MISS the Inner re-association legacy would have found. Then revisit: drop
+    /// `first_match_only` and have the rule scan bindings for the first Inner
+    /// (deduping to one result) instead of slicing to binding 0.
     fn first_match_only(&self) -> bool {
         true
     }
