@@ -28,7 +28,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
-use crate::exec::chunk::type_relation::retag_column;
+use crate::exec::chunk::type_compatibility::retag_column;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::lower::type_lowering::arrow_type_from_desc;
@@ -933,7 +933,7 @@ fn normalize_exchange_array_for_field(
     field: &arrow::datatypes::Field,
 ) -> Result<ArrayRef, String> {
     // Metadata-only retag of the column to the wire contract schema's type, via
-    // the single type-relation primitive (same-scale decimal / utf8<->binary /
+    // the shared compatibility primitive (same-scale decimal / utf8<->binary /
     // recursive). Replaces the exchange-local decimal retag helpers.
     retag_column(array, field.data_type()).map_err(|m| {
         format!(
@@ -1162,7 +1162,7 @@ fn materialize_chunk_for_wire_meta(
         {
             // Receiver is the type authority: materialize the decoded column
             // to the registered descriptor type (metadata-only retag).
-            out_column = crate::exec::chunk::type_relation::retag_column(
+            out_column = crate::exec::chunk::type_compatibility::retag_column(
                 batch.column(idx),
                 &expected_arrow_type,
             )

@@ -1,7 +1,7 @@
 mod chunk_impl;
 mod memory;
 mod schema;
-pub(crate) mod type_relation;
+pub(crate) mod type_compatibility;
 
 pub use chunk_impl::Chunk;
 pub use memory::record_batch_bytes;

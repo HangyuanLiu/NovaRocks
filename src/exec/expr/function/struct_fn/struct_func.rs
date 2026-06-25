@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::chunk::type_relation::{CompatibilityPolicy, nested_path_label, relate};
+use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check, nested_path_label};
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, StructArray, new_null_array};
 use arrow::datatypes::DataType;
@@ -30,7 +30,7 @@ fn assert_struct_child_type(
     if expected == actual {
         return Ok(());
     }
-    let path = match relate(expected, actual, CompatibilityPolicy::ExactArrow) {
+    let path = match check(expected, actual, CompatibilityPolicy::ExactArrow) {
         Ok(()) => format!("field[{idx}]"),
         Err(mismatch) => nested_path_label(&format!("field[{idx}]"), &mismatch.nested_path),
     };
