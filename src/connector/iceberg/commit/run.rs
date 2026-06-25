@@ -70,9 +70,7 @@ pub struct RunInput {
 /// On definite commit failure this function runs best-effort abort cleanup and
 /// returns `KnownUncommitted`. On commit-unknown failure it leaves staged files
 /// untouched and returns `Unknown` with recovery evidence.
-pub async fn run_iceberg_commit_typed(
-    input: RunInput,
-) -> Result<CommitOutcome, CommitServiceError> {
+pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, CommitServiceError> {
     let RunInput {
         collector,
         catalog,
@@ -269,14 +267,13 @@ mod tests {
     async fn invalid_dispatch_errors_are_invalid_input_not_known_uncommitted() {
         let fixture = empty_v3_iceberg_table().await;
 
-        let cow_err =
-            run_iceberg_commit_typed(input_for_op(fixture.clone(), CommitOpKind::CowUpdate))
-                .await
-                .expect_err("missing CowUpdate rewrite set should fail before dispatch");
+        let cow_err = run_iceberg_commit(input_for_op(fixture.clone(), CommitOpKind::CowUpdate))
+            .await
+            .expect_err("missing CowUpdate rewrite set should fail before dispatch");
         assert!(matches!(cow_err, CommitServiceError::InvalidInput { .. }));
 
         let rewrite_manifests_err =
-            run_iceberg_commit_typed(input_for_op(fixture, CommitOpKind::RewriteManifests))
+            run_iceberg_commit(input_for_op(fixture, CommitOpKind::RewriteManifests))
                 .await
                 .expect_err("RewriteManifests should not use the collector dispatcher");
         assert!(matches!(

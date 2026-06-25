@@ -32,7 +32,7 @@ use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_icebe
 use crate::connector::iceberg::catalog::row_lineage_enabled;
 use crate::connector::iceberg::commit::{
     AbortLog, CommitOpKind, IcebergCommitCollector, LiveFileMetrics, RunInput,
-    current_live_file_metrics, run_iceberg_commit_typed,
+    current_live_file_metrics, run_iceberg_commit,
 };
 use crate::connector::iceberg::data_writer::{
     RowLineageColumns, RowLineageWriteBatch, write_row_lineage_batches_as_data_files,
@@ -533,7 +533,7 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
 
     let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
     let file_io = table.file_io().clone();
-    let commit_outcome = block_on_iceberg(run_iceberg_commit_typed(RunInput {
+    let commit_outcome = block_on_iceberg(run_iceberg_commit(RunInput {
         collector,
         catalog: Arc::clone(&catalog),
         table,
