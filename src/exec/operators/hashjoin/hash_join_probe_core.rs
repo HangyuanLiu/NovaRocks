@@ -45,7 +45,6 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinType;
 use crate::exec::runtime_filter::LocalRuntimeFilterSet;
-use crate::exec::schema_compat::{align_schema_to_batches, normalize_batch_to_schema};
 use crate::runtime::profile::{CounterRef, clamp_u128_to_i64};
 
 fn concat_compatible_batches(
@@ -53,12 +52,26 @@ fn concat_compatible_batches(
     batches: &[RecordBatch],
     context: &str,
 ) -> Result<RecordBatch, String> {
-    let schema = align_schema_to_batches(schema, batches, context)?;
-    let batches = batches
-        .iter()
-        .map(|batch| normalize_batch_to_schema(&schema, batch, context))
-        .collect::<Result<Vec<_>, _>>()?;
-    concat_batches(&schema, &batches).map_err(|e| e.to_string())
+    for batch in batches {
+        if schema.fields().len() != batch.num_columns() {
+            return Err(format!(
+                "{context} column count mismatch: schema_fields={} batch_columns={}",
+                schema.fields().len(),
+                batch.num_columns()
+            ));
+        }
+        for (idx, column) in batch.columns().iter().enumerate() {
+            let descriptor = schema.field(idx).data_type();
+            if descriptor != column.data_type() {
+                return Err(format!(
+                    "{context} type mismatch at column {idx}: descriptor={:?} actual={:?}",
+                    descriptor,
+                    column.data_type()
+                ));
+            }
+        }
+    }
+    concat_batches(schema, batches).map_err(|e| e.to_string())
 }
 
 /// Core hash-join probing engine that performs key lookup and join-type specific row assembly.
@@ -1550,7 +1563,7 @@ pub(crate) fn join_type_str(join_type: JoinType) -> &'static str {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::array::{ArrayRef, Decimal128Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
 
@@ -1590,6 +1603,39 @@ mod tests {
         let batch =
             RecordBatch::try_new(Arc::clone(&schema), vec![k_arr, v_arr]).expect("record batch");
         Chunk::new_with_chunk_schema(batch, chunk_schema_of(&schema, slot_ids))
+    }
+
+    #[test]
+    fn concat_compatible_batches_rejects_decimal_precision_drift() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Decimal128(10, 2),
+            false,
+        )]));
+        let array = Arc::new(
+            Decimal128Array::from(vec![Some(123_i128)])
+                .with_precision_and_scale(38, 2)
+                .expect("decimal type"),
+        ) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "d",
+                DataType::Decimal128(38, 2),
+                false,
+            )])),
+            vec![array],
+        )
+        .expect("record batch");
+
+        let err = super::concat_compatible_batches(&schema, &[batch], "join merge")
+            .expect_err("join concat must reject actual-widen decimal");
+
+        assert!(
+            err.contains("join merge type mismatch at column 0"),
+            "err={err}"
+        );
+        assert!(err.contains("Decimal128(10, 2)"), "err={err}");
+        assert!(err.contains("Decimal128(38, 2)"), "err={err}");
     }
 
     #[test]

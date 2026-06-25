@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::type_relation::{CompatibilityPolicy, relate};
+use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check};
 use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_desc};
 use crate::types;
 use arrow::array::ArrayRef;
@@ -408,12 +408,12 @@ fn logical_type_desc_from_field(field: &Field) -> Option<types::TTypeDesc> {
 }
 
 fn is_compatible_chunk_field_type(expected: &DataType, actual: &DataType) -> bool {
-    // The one type relation governs chunk-construction compatibility: same-scale
+    // The shared compatibility check governs chunk-construction semantics: same-scale
     // decimal (precision may differ), timestamp, utf8<->binary, and recursion into
     // list/largelist/map/struct. This tightens the previous any-scale decimal
     // tolerance to same-scale, failing fast on a real scale mismatch instead of
     // silently adopting the batch's scale.
-    relate(expected, actual, CompatibilityPolicy::SameScaleWiden).is_ok()
+    check(expected, actual, CompatibilityPolicy::SameScaleWiden).is_ok()
 }
 
 fn reconcile_chunk_field_to_field(expected: &Field, actual: &Field) -> Result<Arc<Field>, String> {
@@ -444,10 +444,10 @@ fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<D
     if expected == actual {
         return Ok(expected.clone());
     }
-    crate::exec::chunk::type_relation::relate(
+    crate::exec::chunk::type_compatibility::check(
         expected,
         actual,
-        crate::exec::chunk::type_relation::CompatibilityPolicy::SameScaleWiden,
+        crate::exec::chunk::type_compatibility::CompatibilityPolicy::SameScaleWiden,
     )
     .map_err(|_| {
         format!(

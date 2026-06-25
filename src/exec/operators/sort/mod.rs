@@ -22,7 +22,7 @@
 //! - Keep sorting algorithms isolated from operator state transitions.
 
 use crate::exec::chunk::Chunk;
-use crate::exec::chunk::type_relation::{CompatibilityPolicy, relate, retag_column};
+use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check, retag_column};
 use arrow::array::{
     Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int8Array, ListArray, MapArray,
     StructArray, UInt64Array,
@@ -104,7 +104,7 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
             let actual = schema.field(idx);
             let actual = sort_field_from_array(actual, chunk.batch.column(idx));
             if expected.name() != actual.name()
-                || relate(
+                || check(
                     expected.data_type(),
                     actual.data_type(),
                     CompatibilityPolicy::SameScaleWiden,
@@ -141,7 +141,7 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
 
 fn normalize_sort_array_for_field(array: &ArrayRef, field: &Field) -> Result<ArrayRef, String> {
     // Metadata-only retag of the column to the merged concat schema's type, via
-    // the single type-relation primitive (same-scale decimal / utf8<->binary /
+    // the shared compatibility primitive (same-scale decimal / utf8<->binary /
     // recursive). Replaces the sort-local decimal retag helpers.
     retag_column(array, field.data_type()).map_err(|m| {
         format!(

@@ -24,17 +24,41 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::schema_compat::align_schema_to_arrays;
 
 pub(crate) const MAX_JOIN_OUTPUT_ROWS_PER_BATCH: usize = 16 * 1024;
+
+fn assert_columns_match_schema(
+    output_schema: &SchemaRef,
+    columns: &[ArrayRef],
+    context: &str,
+) -> Result<(), String> {
+    if output_schema.fields().len() != columns.len() {
+        return Err(format!(
+            "{context} column count mismatch: schema_fields={} arrays={}",
+            output_schema.fields().len(),
+            columns.len()
+        ));
+    }
+    for (idx, column) in columns.iter().enumerate() {
+        let descriptor = output_schema.field(idx).data_type();
+        if descriptor != column.data_type() {
+            return Err(format!(
+                "{context} type mismatch at column {idx}: descriptor={:?} actual={:?}",
+                descriptor,
+                column.data_type()
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn build_output_record_batch(
     output_schema: &SchemaRef,
     columns: Vec<ArrayRef>,
     context: &str,
 ) -> Result<RecordBatch, String> {
-    let output_schema = align_schema_to_arrays(output_schema, &columns, context)?;
-    RecordBatch::try_new(output_schema, columns).map_err(|e| e.to_string())
+    assert_columns_match_schema(output_schema, &columns, context)?;
+    RecordBatch::try_new(Arc::clone(output_schema), columns).map_err(|e| e.to_string())
 }
 
 pub(crate) fn gather_join_batch(
@@ -165,7 +189,7 @@ pub(crate) fn gather_null_left_with_right(
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Array, ArrayRef, Int32Array};
+    use arrow::array::{Array, ArrayRef, Decimal128Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
 
@@ -187,9 +211,27 @@ mod tests {
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
+    fn decimal_chunk(name: &str, slot_id: SlotId, precision: u8, scale: i8) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            name,
+            DataType::Decimal128(precision, scale),
+            false,
+        )]));
+        let array = Arc::new(
+            Decimal128Array::from(vec![Some(123_i128)])
+                .with_precision_and_scale(precision, scale)
+                .expect("decimal type"),
+        ) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[slot_id])
+                .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
     fn join_schema(left_name: &str, right_name: &str) -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(left_name, DataType::Int32, false),
+            Field::new(left_name, DataType::Int32, true),
             Field::new(right_name, DataType::Int32, true),
         ]))
     }
@@ -218,6 +260,26 @@ mod tests {
             batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
             rows
         );
+    }
+
+    #[test]
+    fn gather_join_batch_rejects_decimal_precision_drift() {
+        let left = decimal_chunk("l", SlotId::new(1), 38, 2);
+        let right = one_column_chunk("r", SlotId::new(2), vec![7]);
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("l", DataType::Decimal128(10, 2), false),
+            Field::new("r", DataType::Int32, true),
+        ]));
+
+        let err = super::gather_join_batch(&left, &right, &[0], &[0], &output_schema)
+            .expect_err("join output must reject actual-widen decimal");
+
+        assert!(
+            err.contains("join output type mismatch at column 0"),
+            "err={err}"
+        );
+        assert!(err.contains("Decimal128(10, 2)"), "err={err}");
+        assert!(err.contains("Decimal128(38, 2)"), "err={err}");
     }
 
     #[test]

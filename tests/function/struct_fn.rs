@@ -17,8 +17,13 @@
 #![allow(unused_imports)]
 
 use crate::common;
-use arrow::array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
+use arrow::array::{
+    Array, ArrayRef, Decimal128Array, Int64Array, ListArray, StringArray, StructArray,
+};
 use arrow::datatypes::{DataType, Field, Fields};
+use arrow::record_batch::RecordBatch;
+use novarocks::common::ids::SlotId;
+use novarocks::exec::chunk::{Chunk, ChunkSchema};
 use novarocks::exec::expr::ExprId;
 use novarocks::exec::expr::function::FunctionKind;
 use novarocks::exec::expr::function::struct_fn::eval_struct_function;
@@ -35,6 +40,27 @@ fn literal_i64(arena: &mut ExprArena, v: i64) -> ExprId {
 
 fn literal_string(arena: &mut ExprArena, v: &str) -> ExprId {
     arena.push(ExprNode::Literal(LiteralValue::Utf8(v.to_string())))
+}
+
+fn chunk_from_array(name: &str, slot_id: SlotId, array: ArrayRef) -> Chunk {
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+        name,
+        array.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[slot_id])
+            .expect("chunk schema");
+    Chunk::new_with_chunk_schema(batch, chunk_schema)
+}
+
+fn decimal_array(values: Vec<i128>, precision: u8, scale: i8) -> ArrayRef {
+    Arc::new(
+        Decimal128Array::from(values.into_iter().map(Some).collect::<Vec<_>>())
+            .with_precision_and_scale(precision, scale)
+            .expect("decimal type"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +115,69 @@ fn test_struct_alias() {
     let st = out.as_any().downcast_ref::<StructArray>().unwrap();
     let c0 = st.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(c0.value(0), 7);
+}
+
+#[test]
+fn test_row_rejects_decimal_precision_drift() {
+    let mut arena = ExprArena::default();
+    let slot_id = SlotId::new(11);
+    let chunk = chunk_from_array("d", slot_id, decimal_array(vec![1234], 38, 2));
+    let struct_type = DataType::Struct(Fields::from(vec![Arc::new(Field::new(
+        "d",
+        DataType::Decimal128(10, 2),
+        true,
+    ))]));
+    let expr = common::typed_null(&mut arena, struct_type);
+    let value = arena.push_typed(ExprNode::SlotId(slot_id), DataType::Decimal128(38, 2));
+
+    let err = eval_struct_function("row", &arena, expr, &[value], &chunk)
+        .expect_err("row must reject actual-widen decimal child");
+
+    assert!(
+        err.contains("row field type mismatch at field[0]"),
+        "err={err}"
+    );
+    assert!(err.contains("Decimal128(10, 2)"), "err={err}");
+    assert!(err.contains("Decimal128(38, 2)"), "err={err}");
+}
+
+#[test]
+fn test_struct_expr_nested_list_mismatch_reports_path() {
+    let mut arena = ExprArena::default();
+    let slot_id = SlotId::new(12);
+    let list = Arc::new(ListArray::from_iter_primitive::<
+        arrow::datatypes::Int64Type,
+        _,
+        _,
+    >(vec![Some(vec![Some(7_i64)])])) as ArrayRef;
+    let chunk = chunk_from_array("xs", slot_id, list);
+    let expected_list = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+    let struct_type = DataType::Struct(Fields::from(vec![Arc::new(Field::new(
+        "xs",
+        expected_list,
+        true,
+    ))]));
+    let child = arena.push_typed(
+        ExprNode::SlotId(slot_id),
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+    );
+    let expr = arena.push_typed(
+        ExprNode::StructExpr {
+            fields: vec![child],
+        },
+        struct_type,
+    );
+
+    let err = arena
+        .eval(expr, &chunk)
+        .expect_err("struct expr must reject nested list item drift");
+
+    assert!(
+        err.contains("struct_expr field type mismatch at field[0].list.item"),
+        "err={err}"
+    );
+    assert!(err.contains("Int32"), "err={err}");
+    assert!(err.contains("Int64"), "err={err}");
 }
 
 #[test]

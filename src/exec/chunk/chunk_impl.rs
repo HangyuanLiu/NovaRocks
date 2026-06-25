@@ -27,7 +27,7 @@ use super::memory::{ChunkAccounting, chunk_bytes_i64, record_batch_bytes};
 use super::schema::{
     ChunkSchema, ChunkSchemaRef, align_chunk_schema_to_batch, align_chunk_schema_to_columns,
 };
-use super::type_relation::retag_column;
+use super::type_compatibility::retag_column;
 
 /// A chunk of data, consisting of multiple rows.
 /// Phase 2: Wrapper around Arrow RecordBatch.

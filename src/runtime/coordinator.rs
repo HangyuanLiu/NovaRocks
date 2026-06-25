@@ -655,10 +655,10 @@ fn align_fetch_chunk_to_output_columns(
     let mut arrays = Vec::with_capacity(output_columns.len());
     for (idx, output) in output_columns.iter().enumerate() {
         let array = chunk.batch.column(idx).clone();
-        if let Err(mismatch) = crate::exec::chunk::type_relation::relate(
+        if let Err(mismatch) = crate::exec::chunk::type_compatibility::check(
             &output.data_type,
             array.data_type(),
-            crate::exec::chunk::type_relation::CompatibilityPolicy::SameScaleWiden,
+            crate::exec::chunk::type_compatibility::CompatibilityPolicy::SameScaleWiden,
         ) {
             return Err(format!(
                 "typed root result column {idx} type mismatch: output={:?} chunk={:?} ({:?})",
