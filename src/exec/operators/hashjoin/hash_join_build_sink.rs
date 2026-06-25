@@ -29,12 +29,12 @@
 
 use std::sync::Arc;
 
-use arrow::array::Array;
+use arrow::array::{Array, ArrayRef};
 
 use super::build_artifact::JoinBuildArtifact;
 use super::build_state::JoinBuildSinkState;
 use super::join_hash_map::build_store::BuildStoreBuilder;
-use super::join_hash_map::method::JoinHashMap;
+use super::join_hash_map::method::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::{JoinDistributionMode, JoinRuntimeFilterSpec, JoinType};
@@ -52,7 +52,7 @@ use crate::exec::runtime_filter::{
 };
 use crate::metrics;
 use crate::novarocks_logging::{debug, warn};
-use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_state::RuntimeState;
@@ -146,6 +146,10 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             runtime_in_filter_merger: self.runtime_in_filter_merger.as_ref().map(Arc::clone),
             build_store_builder: BuildStoreBuilder::new(),
             build_input_chunks: Vec::new(),
+            build_key_batches: Vec::new(),
+            build_key_batches_retained_bytes: 0,
+            build_key_batches_accounting: None,
+            build_key_batches_mem_tracker: None,
             build_table: None,
             runtime_filters: None,
             runtime_in_filters: None,
@@ -188,6 +192,10 @@ struct HashJoinBuildSinkOperator {
     runtime_in_filter_merger: Option<Arc<PartialRuntimeInFilterMerger>>,
     build_store_builder: BuildStoreBuilder,
     build_input_chunks: Vec<Chunk>,
+    build_key_batches: Vec<BuildKeyBatch>,
+    build_key_batches_retained_bytes: usize,
+    build_key_batches_accounting: Option<TrackedBytes>,
+    build_key_batches_mem_tracker: Option<Arc<MemTracker>>,
     build_table: Option<JoinHashMap>,
     runtime_filters: Option<LocalRuntimeFilterSet>,
     runtime_in_filters: Option<LocalRuntimeInFilterSet>,
@@ -221,6 +229,10 @@ impl Operator for HashJoinBuildSinkOperator {
         if let Some(build_table) = self.build_table.as_mut() {
             build_table.set_mem_tracker(table);
         }
+
+        let key_batches = MemTracker::new_child("BuildKeyBatches", &tracker);
+        self.build_key_batches_mem_tracker = Some(Arc::clone(&key_batches));
+        self.refresh_build_key_batches_accounting();
     }
 
     fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
@@ -332,31 +344,13 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             }
         }
 
-        if self.build_table.is_none() {
-            let key_types = key_arrays
-                .iter()
-                .map(|array| array.data_type().clone())
-                .collect::<Vec<_>>();
-            let mut table = JoinHashMap::new_chained(key_types, self.eq_null_safe.clone())
-                .map_err(|e| e.to_string())?;
-            if let Some(tracker) = self.build_table_mem_tracker.as_ref() {
-                table.set_mem_tracker(Arc::clone(tracker));
-            }
-            self.build_table = Some(table);
-        }
-
-        let build_ht_timer = self
-            .profiles
-            .as_ref()
-            .map(|p| p.common.add_timer("BuildHashTableTime"));
-        let table = self.build_table.as_mut().expect("join build table");
-        let start = std::time::Instant::now();
-        table
-            .add_build_rows(&key_arrays, chunk.len())
-            .map_err(|e| e.to_string())?;
-        if let Some(timer) = build_ht_timer.as_ref() {
-            timer.add(clamp_u128_to_i64(start.elapsed().as_nanos()));
-        }
+        let retained_bytes = retained_key_arrays_bytes(&key_arrays, &chunk);
+        self.build_key_batches
+            .push(BuildKeyBatch::new(key_arrays.clone(), chunk.len())?);
+        self.build_key_batches_retained_bytes = self
+            .build_key_batches_retained_bytes
+            .saturating_add(retained_bytes);
+        self.refresh_build_key_batches_accounting();
         if !self.runtime_filter_specs.is_empty() {
             if self.build_keys.is_empty() {
                 return Err("runtime filters require join build keys".to_string());
@@ -375,9 +369,10 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 }
             }
             if self.runtime_filters.is_none() {
+                let hash_seed = self.runtime_filter_hash_seed()?;
                 self.runtime_filters = Some(LocalRuntimeFilterSet::new(
                     &self.runtime_filter_specs,
-                    table.hash_seed(),
+                    hash_seed,
                 ));
             }
             if let Some(filters) = self.runtime_filters.as_mut() {
@@ -411,12 +406,38 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             .profiles
             .as_ref()
             .map(|p| p.common.add_timer("BuildHashTableTime"));
-        if let Some(table) = self.build_table.as_mut() {
+        if !self.build_key_batches.is_empty() && self.build_table.is_none() {
+            let key_types = self
+                .build_key_batches
+                .first()
+                .expect("first build key batch")
+                .arrays()
+                .iter()
+                .map(|array| array.data_type().clone())
+                .collect::<Vec<_>>();
             let start = std::time::Instant::now();
-            table.finalize().map_err(|e| e.to_string())?;
+            let table = JoinHashMap::build_from_key_batches_with_tracker(
+                key_types,
+                self.eq_null_safe.clone(),
+                &self.build_key_batches,
+                JoinHashMapBuildOptions::default(),
+                self.build_table_mem_tracker.as_ref().map(Arc::clone),
+            )?;
             if let Some(timer) = build_ht_timer.as_ref() {
                 timer.add(clamp_u128_to_i64(start.elapsed().as_nanos()));
             }
+            debug!(
+                "HashJoinBuildSink selected join map: dep_key={} partition={} method={:?}",
+                self.state.dep_name(self.partition),
+                self.partition,
+                table.method_kind()
+            );
+            if let Some(profile) = self.profiles.as_ref() {
+                profile
+                    .common
+                    .add_info_string("JoinHashMapMethod", table.method_kind().as_profile_str());
+            }
+            self.build_table = Some(table);
         }
 
         self.publish_runtime_filters(state)?;
@@ -453,7 +474,12 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             }
         }
         let runtime_filters = self.runtime_filters.take().map(Arc::new);
+        self.clear_build_key_batches();
         let build_null_key_rows = self.build_null_key_rows.take().map(Arc::new);
+        let join_map_method = table
+            .as_ref()
+            .map(|t| t.method_kind().as_profile_str())
+            .unwrap_or("None");
         let artifact = Arc::new(JoinBuildArtifact::new(
             build_store,
             table,
@@ -466,7 +492,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             .set_build(self.partition, artifact)
             .map_err(|e| e.to_string())?;
         debug!(
-            "HashJoinBuildSink finished: dep_key={} driver_id={} partition={} node_id={} join_type={} input_rows={} input_chunks={} build_row_count={} build_has_null_key={} build_store_rows={} build_table={} build_keys={}",
+            "HashJoinBuildSink finished: dep_key={} driver_id={} partition={} node_id={} join_type={} input_rows={} input_chunks={} build_row_count={} build_has_null_key={} build_store_rows={} build_table={} build_keys={} join_map_method={}",
             self.state.dep_name(self.partition),
             self.driver_id,
             self.partition,
@@ -478,13 +504,45 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             self.build_has_null_key,
             build_store_rows,
             table_present,
-            self.build_keys.len()
+            self.build_keys.len(),
+            join_map_method
         );
         Ok(())
     }
 }
 
 impl HashJoinBuildSinkOperator {
+    fn refresh_build_key_batches_accounting(&mut self) {
+        let Some(tracker) = self.build_key_batches_mem_tracker.as_ref() else {
+            return;
+        };
+        if self.build_key_batches_retained_bytes == 0 {
+            self.build_key_batches_accounting = None;
+            return;
+        }
+        match self.build_key_batches_accounting.as_mut() {
+            Some(accounting)
+                if accounting.bytes() as usize == self.build_key_batches_retained_bytes =>
+            {
+                accounting.transfer_to(Arc::clone(tracker));
+            }
+            _ => {
+                let old_accounting = self.build_key_batches_accounting.take();
+                drop(old_accounting);
+                self.build_key_batches_accounting = Some(TrackedBytes::new(
+                    self.build_key_batches_retained_bytes,
+                    Arc::clone(tracker),
+                ));
+            }
+        }
+    }
+
+    fn clear_build_key_batches(&mut self) {
+        self.build_key_batches.clear();
+        self.build_key_batches_retained_bytes = 0;
+        self.build_key_batches_accounting = None;
+    }
+
     fn publish_runtime_filters(&mut self, state: &RuntimeState) -> Result<(), String> {
         if self.runtime_filter_specs.is_empty() {
             return Ok(());
@@ -1153,6 +1211,19 @@ fn parse_join_node_id_from_dep_key(dep_key: &str) -> i32 {
     node_id_str.parse::<i32>().unwrap_or(-1)
 }
 
+fn retained_key_arrays_bytes(key_arrays: &[ArrayRef], chunk: &Chunk) -> usize {
+    key_arrays
+        .iter()
+        .filter(|key_array| {
+            !chunk
+                .columns()
+                .iter()
+                .any(|chunk_array| Arc::ptr_eq(key_array, chunk_array))
+        })
+        .map(|array| array.get_array_memory_size())
+        .sum()
+}
+
 fn join_type_str(join_type: JoinType) -> &'static str {
     match join_type {
         JoinType::Inner => "INNER",
@@ -1164,5 +1235,294 @@ fn join_type_str(join_type: JoinType) -> &'static str {
         JoinType::LeftAnti => "LEFT_ANTI",
         JoinType::RightAnti => "RIGHT_ANTI",
         JoinType::NullAwareLeftAnti => "NULL_AWARE_LEFT_ANTI",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::expr::{ExprNode, LiteralValue};
+    use crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind;
+    use crate::exec::pipeline::dependency::DependencyManager;
+    use crate::runtime::profile::{OperatorProfiles, RuntimeProfile};
+
+    #[derive(Default)]
+    struct TestBuildState {
+        artifact: Mutex<Option<Arc<JoinBuildArtifact>>>,
+    }
+
+    impl JoinBuildSinkState for TestBuildState {
+        fn partition_for_driver(&self, _driver_id: i32) -> usize {
+            0
+        }
+
+        fn dep_name(&self, _partition: usize) -> &str {
+            "join_build:1"
+        }
+
+        fn set_build(
+            &self,
+            _partition: usize,
+            artifact: Arc<JoinBuildArtifact>,
+        ) -> Result<(), String> {
+            *self.artifact.lock().expect("artifact lock") = Some(artifact);
+            Ok(())
+        }
+    }
+
+    fn int32_chunk(values: Vec<i32>) -> Chunk {
+        let array = Arc::new(Int32Array::from(values)) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).expect("record batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema");
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+    }
+
+    fn direct_int_build_operator(state: Arc<TestBuildState>) -> HashJoinBuildSinkOperator {
+        let mut arena = ExprArena::default();
+        let build_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        HashJoinBuildSinkOperator {
+            name: "HASH_JOIN (id=1)".to_string(),
+            node_id: 1,
+            driver_id: 0,
+            arena: Arc::new(arena),
+            join_type: JoinType::Inner,
+            build_keys: vec![build_key],
+            eq_null_safe: vec![false],
+            runtime_filter_specs: Vec::new(),
+            distribution_mode: JoinDistributionMode::Broadcast,
+            state,
+            partition: 0,
+            runtime_filter_hub: Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
+            runtime_in_filter_merger: None,
+            build_store_builder: BuildStoreBuilder::new(),
+            build_input_chunks: Vec::new(),
+            build_key_batches: Vec::new(),
+            build_key_batches_retained_bytes: 0,
+            build_key_batches_accounting: None,
+            build_key_batches_mem_tracker: None,
+            build_table: None,
+            runtime_filters: None,
+            runtime_in_filters: None,
+            finished: false,
+            build_row_count: 0,
+            build_has_null_key: false,
+            build_null_key_rows: None,
+            logged_first_input: false,
+            profile_initialized: false,
+            profiles: None,
+            input_rows: 0,
+            input_chunks: 0,
+            build_input_chunks_mem_tracker: None,
+            build_table_mem_tracker: None,
+        }
+    }
+
+    #[test]
+    fn defers_hash_map_construction_until_build_finish() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = direct_int_build_operator(state.clone());
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .expect("push chunk");
+
+        assert!(operator.build_table.is_none());
+        assert_eq!(operator.build_key_batches.len(), 1);
+
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        let artifact = state
+            .artifact
+            .lock()
+            .expect("artifact lock")
+            .clone()
+            .expect("artifact");
+        let build_table = artifact.build_table.as_ref().expect("build table");
+        assert!(matches!(
+            build_table.method_kind(),
+            JoinHashMapMethodKind::DirectInt { .. }
+        ));
+        assert!(operator.build_key_batches.is_empty());
+    }
+
+    #[test]
+    fn records_join_hash_map_method_in_profile() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = direct_int_build_operator(state);
+        let profiles = OperatorProfiles::new(RuntimeProfile::new("HASH_JOIN"));
+        operator.set_profiles(profiles.clone());
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .expect("push chunk");
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        assert_eq!(
+            profiles.common.get_info_string("JoinHashMapMethod"),
+            Some("DirectIntNotNull".to_string())
+        );
+    }
+
+    #[test]
+    fn computed_build_key_batches_are_accounted_and_released() {
+        let mut arena = ExprArena::default();
+        let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let zero = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(0)), DataType::Int32);
+        let build_key = arena.push_typed(ExprNode::Add(slot, zero), DataType::Int32);
+        let arena = Arc::new(arena);
+        let state = Arc::new(TestBuildState::default());
+        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+        let root = MemTracker::new_root("hash-build-test");
+        let mut operator = HashJoinBuildSinkOperator {
+            name: "HASH_JOIN (id=1)".to_string(),
+            node_id: 1,
+            driver_id: 0,
+            arena,
+            join_type: JoinType::Inner,
+            build_keys: vec![build_key],
+            eq_null_safe: vec![false],
+            runtime_filter_specs: Vec::new(),
+            distribution_mode: JoinDistributionMode::Broadcast,
+            state,
+            partition: 0,
+            runtime_filter_hub,
+            runtime_in_filter_merger: None,
+            build_store_builder: BuildStoreBuilder::new(),
+            build_input_chunks: Vec::new(),
+            build_key_batches: Vec::new(),
+            build_key_batches_retained_bytes: 0,
+            build_key_batches_accounting: None,
+            build_key_batches_mem_tracker: None,
+            build_table: None,
+            runtime_filters: None,
+            runtime_in_filters: None,
+            finished: false,
+            build_row_count: 0,
+            build_has_null_key: false,
+            build_null_key_rows: None,
+            logged_first_input: false,
+            profile_initialized: false,
+            profiles: None,
+            input_rows: 0,
+            input_chunks: 0,
+            build_input_chunks_mem_tracker: None,
+            build_table_mem_tracker: None,
+        };
+
+        operator.set_mem_tracker(Arc::clone(&root));
+        let key_batches_tracker = root
+            .children()
+            .into_iter()
+            .find(|child| child.label() == "BuildKeyBatches")
+            .expect("BuildKeyBatches tracker");
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .expect("push chunk");
+
+        assert!(key_batches_tracker.current() > 0);
+
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        assert_eq!(key_batches_tracker.current(), 0);
+        let hash_table_tracker = root
+            .children()
+            .into_iter()
+            .find(|child| child.label() == "BuildHashTable")
+            .expect("BuildHashTable tracker");
+        assert!(hash_table_tracker.current() > 0);
+    }
+
+    #[test]
+    fn computed_build_key_batches_peak_is_not_inflated_across_pushes() {
+        let mut arena = ExprArena::default();
+        let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let zero = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(0)), DataType::Int32);
+        let build_key = arena.push_typed(ExprNode::Add(slot, zero), DataType::Int32);
+        let arena = Arc::new(arena);
+        let state = Arc::new(TestBuildState::default());
+        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+        let root = MemTracker::new_root("hash-build-test");
+        let mut operator = HashJoinBuildSinkOperator {
+            name: "HASH_JOIN (id=1)".to_string(),
+            node_id: 1,
+            driver_id: 0,
+            arena,
+            join_type: JoinType::Inner,
+            build_keys: vec![build_key],
+            eq_null_safe: vec![false],
+            runtime_filter_specs: Vec::new(),
+            distribution_mode: JoinDistributionMode::Broadcast,
+            state,
+            partition: 0,
+            runtime_filter_hub,
+            runtime_in_filter_merger: None,
+            build_store_builder: BuildStoreBuilder::new(),
+            build_input_chunks: Vec::new(),
+            build_key_batches: Vec::new(),
+            build_key_batches_retained_bytes: 0,
+            build_key_batches_accounting: None,
+            build_key_batches_mem_tracker: None,
+            build_table: None,
+            runtime_filters: None,
+            runtime_in_filters: None,
+            finished: false,
+            build_row_count: 0,
+            build_has_null_key: false,
+            build_null_key_rows: None,
+            logged_first_input: false,
+            profile_initialized: false,
+            profiles: None,
+            input_rows: 0,
+            input_chunks: 0,
+            build_input_chunks_mem_tracker: None,
+            build_table_mem_tracker: None,
+        };
+
+        operator.set_mem_tracker(Arc::clone(&root));
+        let key_batches_tracker = root
+            .children()
+            .into_iter()
+            .find(|child| child.label() == "BuildKeyBatches")
+            .expect("BuildKeyBatches tracker");
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .expect("first push");
+        let after_first = key_batches_tracker.current();
+        assert!(after_first > 0);
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![4, 5, 6]))
+            .expect("second push");
+
+        assert_eq!(
+            key_batches_tracker.current(),
+            operator.build_key_batches_retained_bytes as i64
+        );
+        assert_eq!(key_batches_tracker.peak(), key_batches_tracker.current());
+
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        assert_eq!(key_batches_tracker.current(), 0);
     }
 }
