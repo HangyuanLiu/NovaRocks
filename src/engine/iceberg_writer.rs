@@ -1495,54 +1495,49 @@ mod tests {
         serde_json::from_value(value).expect("retagged metadata")
     }
 
-    fn build_position_delete_sink_spec_from_parts_for_test(
-        resolved_columns: &[ColumnDef],
-        metadata: &iceberg::spec::TableMetadata,
-    ) -> Result<IcebergWriteSinkSpec, String> {
-        let target_columns = position_delete_sink_input_columns(metadata, resolved_columns)?;
-        let iceberg = crate::sql::catalog::IcebergTableInfo {
+    fn test_iceberg_target() -> TargetBackend {
+        TargetBackend {
+            backend_name: "iceberg",
             catalog: "test_catalog".to_string(),
             namespace: "test_db".to_string(),
             table: "target_orders".to_string(),
-            table_uuid: Some(metadata.uuid().to_string()),
-            current_snapshot_id: metadata.current_snapshot_id(),
-            schema_id: metadata.current_schema_id(),
-            location: metadata.location().to_string(),
-            schema: iceberg_schema_def_for_codegen(metadata.current_schema()),
-            serialized_metadata: Some(
-                serde_json::to_string(metadata)
-                    .map_err(|err| format!("serialize metadata failed: {err}"))?,
-            ),
-            serialized_metadata_rows: None,
-        };
-        let target_table = crate::sql::catalog::TableDef {
-            name: "target_orders".to_string(),
-            columns: resolved_columns.to_vec(),
-            iceberg_row_lineage_metadata_columns: Vec::new(),
-            source: crate::sql::catalog::ScanSource::IcebergDataFiles {
-                table: iceberg.clone(),
-                files: Vec::new(),
-                cloud_properties: Default::default(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
-            },
-        };
-        Ok(IcebergWriteSinkSpec {
-            mode: IcebergWriteSinkMode::PositionDeletes,
-            target_table_id: synthetic_iceberg_write_table_id(),
-            target_table,
-            iceberg,
-            target_columns,
-            table_location: metadata.location().to_string(),
-            data_location: format!("{}/data", metadata.location().trim_end_matches('/')),
-            target_partition_spec_id: metadata.default_partition_spec_id(),
-            cloud_configuration: None,
-            file_format: "parquet".to_string(),
-            compression: crate::types::TCompressionType::SNAPPY,
-            position_delete_output_descriptor: Some(build_position_delete_output_descriptor(
-                metadata,
-                resolved_columns,
-            )?),
-        })
+        }
+    }
+
+    fn test_resolved_table(columns: Vec<ColumnDef>) -> ResolvedTable {
+        ResolvedTable {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "target_orders".to_string(),
+            columns,
+        }
+    }
+
+    fn test_iceberg_table(metadata: iceberg::spec::TableMetadata) -> iceberg::table::Table {
+        iceberg::table::Table::builder()
+            .identifier(TableIdent::new(
+                NamespaceIdent::new("test_db".to_string()),
+                "target_orders".to_string(),
+            ))
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .metadata(metadata)
+            .build()
+            .expect("iceberg table")
+    }
+
+    fn test_iceberg_catalog_entry() -> IcebergCatalogEntry {
+        let warehouse = tempfile::TempDir::new().expect("warehouse tempdir");
+        crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "test_catalog",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    warehouse.path().display().to_string(),
+                ),
+            ],
+        )
+        .expect("iceberg catalog entry")
     }
 
     fn assert_position_delete_output_field(
@@ -1701,9 +1696,12 @@ mod tests {
             42,
             7,
         );
-        let spec =
-            build_position_delete_sink_spec_from_parts_for_test(&resolved_columns, &metadata)
-                .expect("position delete sink spec");
+        let target = test_iceberg_target();
+        let resolved = test_resolved_table(resolved_columns);
+        let table = test_iceberg_table(metadata);
+        let entry = test_iceberg_catalog_entry();
+        let spec = build_position_delete_sink_spec(&target, &resolved, &table, &entry)
+            .expect("position delete sink spec");
         let desc = spec
             .position_delete_output_descriptor
             .as_ref()
@@ -1723,9 +1721,16 @@ mod tests {
     fn position_delete_sink_spec_rejects_missing_partition_source() {
         let resolved_columns = vec![test_column("v", DataType::Utf8, None)];
         let metadata = test_iceberg_metadata_with_identity_partition("id", 42, 7);
-        let err = build_position_delete_sink_spec_from_parts_for_test(&resolved_columns, &metadata)
-            .unwrap_err();
-        assert!(err.contains("UnsupportedPositionDeleteDescriptor"), "{err}");
+        let target = test_iceberg_target();
+        let resolved = test_resolved_table(resolved_columns);
+        let table = test_iceberg_table(metadata);
+        let entry = test_iceberg_catalog_entry();
+        let err = build_position_delete_sink_spec(&target, &resolved, &table, &entry).unwrap_err();
+
+        assert!(
+            err.contains("[UnsupportedPositionDeleteDescriptor]"),
+            "{err}"
+        );
         assert!(err.contains("partition source column `id`"), "{err}");
     }
 
