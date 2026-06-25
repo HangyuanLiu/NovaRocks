@@ -41,6 +41,10 @@ fn apply_rule_to_node(
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
 ) -> Result<(OptExpr, bool), String> {
+    if super::tree_binder::bind_tree(&rule.pattern(), &plan).is_none() {
+        return Ok((plan, false));
+    }
+
     if !rule.matches(&plan, ctx) {
         return Ok((plan, false));
     }
@@ -112,6 +116,7 @@ mod tests {
         Operator, ProjectOp, ScalarProjectItem, ScanOp, ValuesOp,
     };
     use crate::sql::optimizer::opt_expr::OptExpr;
+    use crate::sql::optimizer::pattern::{OpKind, Pattern};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
     use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
@@ -214,6 +219,66 @@ mod tests {
                 } if message == "project rejected"
             )
         }));
+    }
+
+    #[test]
+    fn pattern_pre_gate_skips_matches_on_structural_miss() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FilterPatternRule {
+            matches_count: Arc<AtomicUsize>,
+        }
+
+        impl LogicalRewriteRule for FilterPatternRule {
+            fn name(&self) -> &'static str {
+                "FilterPatternRule"
+            }
+
+            fn phase(&self) -> RewritePhase {
+                RewritePhase::StructuralRewrite
+            }
+
+            fn pattern(&self) -> Pattern {
+                Pattern::Op {
+                    kind: OpKind::Filter,
+                    children: vec![Pattern::MultiLeaf],
+                }
+            }
+
+            fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+                self.matches_count.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+
+            fn apply(
+                &self,
+                _expr: OptExpr,
+                _ctx: &mut RewriteContext,
+            ) -> Result<RewriteResult, String> {
+                Ok(RewriteResult::Unchanged)
+            }
+        }
+
+        let plan = OptExpr::new(
+            Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+        );
+        let before = format!("{plan:?}");
+        let matches_count = Arc::new(AtomicUsize::new(0));
+        let rule = FilterPatternRule {
+            matches_count: Arc::clone(&matches_count),
+        };
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+
+        let (rewritten, changed) = rewrite_with_rule(plan, &rule, &mut ctx).unwrap();
+
+        assert!(!changed);
+        assert_eq!(format!("{rewritten:?}"), before);
+        assert_eq!(matches_count.load(Ordering::SeqCst), 0);
     }
 
     fn project_over_scan(table_name: &str) -> OptExpr {

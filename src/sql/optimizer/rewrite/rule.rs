@@ -15,6 +15,17 @@ pub(crate) trait LogicalRewriteRule: Send + Sync {
     fn traversal(&self) -> RewriteTraversal {
         RewriteTraversal::BottomUp
     }
+    /// Declarative structural match shape, consumed by the tree driver's bind_tree
+    /// pre-gate. Default `Leaf` = root wildcard -> bind_tree always matches -> the
+    /// rule's own `matches`/`apply` decide exactly as before.
+    fn pattern(&self) -> crate::sql::optimizer::pattern::Pattern {
+        crate::sql::optimizer::pattern::Pattern::Leaf
+    }
+    /// Symmetry with the memo Rule trait; degenerate on the tree (<=1 binding/node).
+    #[allow(dead_code)]
+    fn first_match_only(&self) -> bool {
+        false
+    }
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool;
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String>;
 }
