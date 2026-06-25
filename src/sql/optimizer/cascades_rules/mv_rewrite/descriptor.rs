@@ -10,9 +10,10 @@ use crate::sql::analysis::BinOp;
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::OutputColumn;
+use crate::sql::common::expr::JoinKind;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{
-    AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec,
+    AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec, ScanOp as LogicalScanOp,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey};
@@ -172,12 +173,7 @@ impl SpjgDescriptor {
                 .ok_or_else(|| "filter without child in MV rewrite shape".to_string())?;
         }
 
-        let Operator::LogicalScan(scan) = &node.op else {
-            return Err(format!(
-                "not a single-table SPJG shape: unexpected node {:?}",
-                std::mem::discriminant(&node.op)
-            ));
-        };
+        let (scan, joins) = peel_join_spine_opt(node, arena, &mut predicates)?;
         predicates.extend(scan.predicates.iter().copied());
 
         // Composition map: ColumnId -> defining expr over scan columns
@@ -265,7 +261,7 @@ impl SpjgDescriptor {
             predicates,
             aggregate: agg,
             outputs,
-            joins: None,
+            joins,
         })
     }
 
@@ -539,6 +535,88 @@ fn substitute_sort_key(
         nulls_first: key.nulls_first,
         display: key.display.clone(),
     }
+}
+
+/// Peel a left-deep inner-join spine (or a bare scan) at the bottom of the
+/// SPJG shape. On entry `node` is the operator directly below the filter
+/// chain. Returns the driving (left-deep first) scan and an optional
+/// `JoinShape` describing every additional inner-join input. Predicates pushed
+/// onto join inputs and residual (non-equi) join conjuncts are appended to
+/// `predicates` (the descriptor keeps a single flat predicate list). Rejects
+/// any non-`Inner` join kind, a right child that is not `Filter*->Scan`, and
+/// any non-scan/non-join leaf.
+fn peel_join_spine_opt<'a>(
+    node: &'a OptExpr,
+    arena: &ScalarArena,
+    predicates: &mut Vec<ScalarId>,
+) -> Result<(&'a LogicalScanOp, Option<JoinShape>), String> {
+    match &node.op {
+        Operator::LogicalScan(scan) => Ok((scan, None)),
+        Operator::LogicalJoin(join) => {
+            if join.join_type != JoinKind::Inner {
+                return Err(format!(
+                    "unsupported join kind for MV rewrite: {:?}",
+                    join.join_type
+                ));
+            }
+            let left = node
+                .children
+                .first()
+                .ok_or_else(|| "inner join without left child in MV rewrite shape".to_string())?;
+            let right = node
+                .children
+                .get(1)
+                .ok_or_else(|| "inner join without right child in MV rewrite shape".to_string())?;
+
+            // Left-deep: recurse the left spine; the right child must reduce to
+            // Filter*->Scan (one base input). A right-side join is rejected.
+            let (driving, left_joins) = peel_join_spine_opt(left, arena, predicates)?;
+            let right_input = peel_filter_scan_opt(right, arena, predicates)?;
+
+            let (edges, residuals) = split_join_condition(arena, join.condition);
+            predicates.extend(residuals);
+
+            let mut shape = left_joins.unwrap_or(JoinShape {
+                inputs: Vec::new(),
+                equi_edges: Vec::new(),
+            });
+            shape.inputs.push(right_input);
+            shape.equi_edges.extend(edges);
+            Ok((driving, Some(shape)))
+        }
+        _ => Err(format!(
+            "not an SPJG base shape: unexpected node {:?}",
+            std::mem::discriminant(&node.op)
+        )),
+    }
+}
+
+/// Peel one join input's `Filter*->Scan`, pushing its predicates into
+/// `predicates`. Rejects a nested join (right-deep/bushy) or any non-scan leaf.
+fn peel_filter_scan_opt(
+    node: &OptExpr,
+    arena: &ScalarArena,
+    predicates: &mut Vec<ScalarId>,
+) -> Result<JoinInput, String> {
+    let mut n = node;
+    while let Operator::LogicalFilter(f) = &n.op {
+        scalar_expr::split_conjuncts(arena, f.predicate, predicates);
+        n = n
+            .children
+            .first()
+            .ok_or_else(|| "filter without child in MV rewrite join input".to_string())?;
+    }
+    let Operator::LogicalScan(scan) = &n.op else {
+        return Err(format!(
+            "unsupported join input shape (only Filter*->Scan): {:?}",
+            std::mem::discriminant(&n.op)
+        ));
+    };
+    predicates.extend(scan.predicates.iter().copied());
+    Ok(JoinInput {
+        table: scan.table.clone(),
+        scan_columns: scan.columns.clone(),
+    })
 }
 
 /// Split a join `ON` condition into equi-join edges (`col = col`) and residual
@@ -897,6 +975,38 @@ mod tests {
         LogicalPlanNode::new(PlanNodeKind::Scan(scan(cols)), vec![], None)
     }
 
+    /// A scan over a named table (the shared `scan()` helper hardcodes "t").
+    fn scan_named(table_name: &str, cols: &[OutputColumn]) -> LogicalScanNode {
+        let mut s = scan(cols);
+        s.table.name = table_name.to_string();
+        s
+    }
+
+    fn scan_plan_named(table_name: &str, cols: &[OutputColumn]) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            PlanNodeKind::Scan(scan_named(table_name, cols)),
+            vec![],
+            None,
+        )
+    }
+
+    /// Build `Join(left, right)` with the given kind and ON condition.
+    fn join_plan(
+        kind: crate::sql::common::expr::JoinKind,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
+        on: Option<TypedExpr>,
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            PlanNodeKind::Join(crate::sql::planner::plan::LogicalJoinNode {
+                join_type: kind,
+                condition: on,
+            }),
+            vec![left, right],
+            None,
+        )
+    }
+
     fn descriptor_from_plan(
         plan: &LogicalPlanNode,
     ) -> Result<(SpjgDescriptor, ScalarArena), String> {
@@ -958,6 +1068,79 @@ mod tests {
         let arena = ScalarArena::new();
         let (edges, residuals) = super::split_join_condition(&arena, None);
         assert!(edges.is_empty() && residuals.is_empty());
+    }
+
+    #[test]
+    fn extracts_inner_join_two_tables() {
+        use crate::sql::common::expr::JoinKind;
+
+        // SELECT ... FROM t1 JOIN t2 ON t1.a = t2.c
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let d = col(4, "d");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", &[a.clone(), b.clone()]),
+            scan_plan_named("t2", &[c.clone(), d.clone()]),
+            Some(on),
+        );
+        let (desc, _arena) = descriptor_from_plan(&plan).expect("inner join spjg");
+        assert_eq!(desc.table.name, "t1", "driving (left-deep first) scan");
+        let joins = desc.joins.as_ref().expect("join shape present");
+        assert_eq!(joins.inputs.len(), 1);
+        assert_eq!(joins.inputs[0].table.name, "t2");
+        assert_eq!(joins.equi_edges.len(), 1);
+        assert_eq!(joins.equi_edges[0].left, ColumnId(1));
+        assert_eq!(joins.equi_edges[0].right, ColumnId(3));
+    }
+
+    #[test]
+    fn rejects_left_outer_join() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::LeftOuter,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+        assert!(
+            descriptor_from_plan(&plan).is_err(),
+            "outer join must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_right_deep_join() {
+        use crate::sql::common::expr::JoinKind;
+
+        // t1 JOIN (t2 JOIN t3): right child is itself a join -> unsupported in v1.
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let e = col(5, "e");
+        let on_inner = cmp(col_ref(&c), crate::sql::analysis::BinOp::Eq, col_ref(&e));
+        let inner = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            scan_plan_named("t3", std::slice::from_ref(&e)),
+            Some(on_inner),
+        );
+        let on_outer = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            inner,
+            Some(on_outer),
+        );
+        assert!(
+            descriptor_from_plan(&plan).is_err(),
+            "right-deep join must be rejected"
+        );
     }
 
     #[test]
