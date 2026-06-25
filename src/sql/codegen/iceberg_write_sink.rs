@@ -22,6 +22,8 @@ pub(crate) struct IcebergWriteSinkSpec {
     pub cloud_configuration: Option<TCloudConfiguration>,
     pub file_format: String,
     pub compression: types::TCompressionType,
+    pub position_delete_output_descriptor:
+        Option<data_sinks::TIcebergPositionDeleteOutputDescriptor>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,7 +89,7 @@ impl IcebergWriteSinkSpec {
                 Some(tuple_id),
                 Some(self.data_location.clone()),
                 Some(self.target_partition_spec_id),
-                None::<data_sinks::TIcebergPositionDeleteOutputDescriptor>,
+                self.position_delete_output_descriptor.clone(),
             )),
             None::<data_sinks::THiveTableSink>,
             None::<data_sinks::TTableFunctionTableSink>,
@@ -362,6 +364,7 @@ pub(crate) mod test_support {
             cloud_configuration: None,
             file_format: "parquet".to_string(),
             compression: types::TCompressionType::SNAPPY,
+            position_delete_output_descriptor: None,
         }
     }
 
