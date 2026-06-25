@@ -161,6 +161,32 @@ pub(crate) fn output_schema_from_descriptor(
     Ok(Arc::new(Schema::new(vec![file_path, pos])))
 }
 
+#[cfg(test)]
+pub(crate) fn required_position_delete_descriptor_for_tests(
+    target_partition_spec_id: i32,
+) -> data_sinks::TIcebergPositionDeleteOutputDescriptor {
+    data_sinks::TIcebergPositionDeleteOutputDescriptor::new(
+        Some(data_sinks::TIcebergPositionDeleteOutputField::new(
+            Some(0),
+            Some(ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string()),
+            Some(crate::lower::type_lowering::scalar_type_desc(
+                types::TPrimitiveType::VARCHAR,
+            )),
+            Some(ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID),
+        )),
+        Some(data_sinks::TIcebergPositionDeleteOutputField::new(
+            Some(1),
+            Some(ICEBERG_POSITION_DELETE_POS_COLUMN.to_string()),
+            Some(crate::lower::type_lowering::scalar_type_desc(
+                types::TPrimitiveType::BIGINT,
+            )),
+            Some(ICEBERG_POSITION_DELETE_POS_FIELD_ID),
+        )),
+        Some(Vec::new()),
+        Some(target_partition_spec_id),
+    )
+}
+
 #[allow(dead_code)]
 pub(crate) fn bind_position_delete_descriptor(
     desc: Option<&data_sinks::TIcebergPositionDeleteOutputDescriptor>,
