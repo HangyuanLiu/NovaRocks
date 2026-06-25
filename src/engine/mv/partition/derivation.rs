@@ -1263,7 +1263,7 @@ mod tests {
     // (resolve -> bind -> evaluate) exactly as the old single-shot deriver
     // did, so these lock the same observable behavior over the retained
     // derivation library. `None` mirrors the old `Unpartitioned` result;
-    // `Some(partitions)` mirrors the old `Known { partitions }` result.
+    // `Some(partitions)` mirrors the old known-partition result.
     fn derive_for_test(
         contract: &MvSchemaContract,
         layout: &AggregateMvLayout,

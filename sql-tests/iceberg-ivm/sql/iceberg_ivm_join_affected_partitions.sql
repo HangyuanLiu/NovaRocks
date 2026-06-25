@@ -68,7 +68,7 @@ INSERT INTO ice_ivm_join_part_${uuid0}.ns_${uuid0}.fact VALUES
 -- query 5
 -- @skip_result_check=true
 -- @explain_contains=MV Refresh affected partitions: not-derived(join MV affected partition planning requires row-derived delta rows)
--- @explain_not_contains=join MV affected partition planning is not implemented
+-- @explain_not_contains=affected partition planning is not implemented
 EXPLAIN REFRESH MATERIALIZED VIEW join_part_mv_${uuid0};
 
 -- query 6
