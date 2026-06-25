@@ -558,7 +558,7 @@ fn position_delete_sink_input_columns(
     for field in metadata.default_partition_spec().fields() {
         let source = schema.field_by_id(field.source_id).ok_or_else(|| {
             format!(
-                "iceberg position-delete sink partition source field id {} not found",
+                "[UnsupportedPositionDeleteDescriptor] iceberg position-delete sink partition source field id {} not found",
                 field.source_id
             )
         })?;
@@ -567,7 +567,7 @@ fn position_delete_sink_input_columns(
             .find(|column| column.name.eq_ignore_ascii_case(&source.name))
             .ok_or_else(|| {
                 format!(
-                    "iceberg position-delete sink partition source column `{}` not found in target table",
+                    "[UnsupportedPositionDeleteDescriptor] iceberg position-delete sink partition source column `{}` not found in target table",
                     source.name
                 )
             })?;
@@ -1530,13 +1530,6 @@ mod tests {
         })
     }
 
-    fn build_position_delete_output_descriptor_for_test(
-        metadata: &iceberg::spec::TableMetadata,
-        resolved_columns: &[ColumnDef],
-    ) -> Result<Option<crate::data_sinks::TIcebergPositionDeleteOutputDescriptor>, String> {
-        build_position_delete_output_descriptor(metadata, resolved_columns)
-    }
-
     #[test]
     fn arrow_data_type_to_sql_type_accepts_time64_for_insert_defaults() {
         assert_eq!(
@@ -1652,10 +1645,10 @@ mod tests {
     }
 
     #[test]
-    fn position_delete_descriptor_rejects_missing_partition_source() {
+    fn position_delete_sink_spec_rejects_missing_partition_source() {
         let resolved_columns = vec![test_column("v", DataType::Utf8, None)];
         let metadata = test_iceberg_metadata_with_identity_partition("id", 42, 7);
-        let err = build_position_delete_output_descriptor_for_test(&metadata, &resolved_columns)
+        let err = build_position_delete_sink_spec_from_parts_for_test(&resolved_columns, &metadata)
             .unwrap_err();
         assert!(err.contains("UnsupportedPositionDeleteDescriptor"), "{err}");
         assert!(err.contains("partition source column `id`"), "{err}");
