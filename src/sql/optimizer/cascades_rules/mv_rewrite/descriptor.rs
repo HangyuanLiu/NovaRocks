@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use crate::sql::analysis::BinOp;
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::OutputColumn;
@@ -540,6 +541,44 @@ fn substitute_sort_key(
     }
 }
 
+/// Split a join `ON` condition into equi-join edges (`col = col`) and residual
+/// conjuncts (everything else). A `None` condition (e.g. a cross join, which we
+/// reject earlier anyway) yields two empty vectors.
+fn split_join_condition(
+    arena: &mut ScalarArena,
+    condition: Option<ScalarId>,
+) -> (Vec<EquiEdge>, Vec<ScalarId>) {
+    let Some(cond) = condition else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut conjuncts: Vec<ScalarId> = Vec::new();
+    scalar_expr::split_conjuncts(arena, cond, &mut conjuncts);
+
+    let mut edges = Vec::new();
+    let mut residuals = Vec::new();
+    for c in conjuncts {
+        let edge = match arena.node(c) {
+            ScalarNode::BinaryOp {
+                op: BinOp::Eq,
+                left,
+                right,
+            } => match (arena.node(*left), arena.node(*right)) {
+                (ScalarNode::ColumnRef(l), ScalarNode::ColumnRef(r)) => Some(EquiEdge {
+                    left: *l,
+                    right: *r,
+                }),
+                _ => None,
+            },
+            _ => None,
+        };
+        match edge {
+            Some(e) => edges.push(e),
+            None => residuals.push(c),
+        }
+    }
+    (edges, residuals)
+}
+
 pub(crate) fn substitute_scalar(
     arena: &mut ScalarArena,
     expr: ScalarId,
@@ -867,6 +906,57 @@ mod tests {
         )?;
         let descriptor = SpjgDescriptor::from_opt_expr(&opt_expr, &mut arena)?;
         Ok((descriptor, arena))
+    }
+
+    #[test]
+    fn split_join_condition_separates_equi_edges_from_residuals() {
+        use crate::sql::analysis::BinOp;
+
+        let mut arena = ScalarArena::new();
+        // a(=col 1) = b(=col 2)  AND  a > b   (the `>` conjunct is a residual;
+        // two ColumnRefs avoid depending on the ScalarNode::Literal payload type).
+        let a_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
+        let b_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Int64, true);
+        let eq = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Eq,
+                left: a_ref,
+                right: b_ref,
+            },
+            DataType::Boolean,
+            true,
+        );
+        let gt = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Gt,
+                left: a_ref,
+                right: b_ref,
+            },
+            DataType::Boolean,
+            true,
+        );
+        let cond = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::And,
+                left: eq,
+                right: gt,
+            },
+            DataType::Boolean,
+            true,
+        );
+
+        let (edges, residuals) = super::split_join_condition(&mut arena, Some(cond));
+        assert_eq!(edges.len(), 1, "one equi edge");
+        assert_eq!(edges[0].left, ColumnId(1));
+        assert_eq!(edges[0].right, ColumnId(2));
+        assert_eq!(residuals.len(), 1, "the a>b conjunct is a residual");
+    }
+
+    #[test]
+    fn split_join_condition_none_is_empty() {
+        let mut arena = ScalarArena::new();
+        let (edges, residuals) = super::split_join_condition(&mut arena, None);
+        assert!(edges.is_empty() && residuals.is_empty());
     }
 
     #[test]
