@@ -86,6 +86,43 @@ fn validate_output_field(
     Ok(())
 }
 
+fn output_expr_root_primitive(
+    label: &str,
+    output_exprs: &[exprs::TExpr],
+    output_expr_index: i32,
+) -> Result<Option<types::TPrimitiveType>, crate::common::engine_error::EngineError> {
+    let index = usize::try_from(output_expr_index).map_err(|_| {
+        descriptor_error(format!(
+            "{label} output expr index is negative: {output_expr_index}"
+        ))
+    })?;
+    let expr = output_exprs.get(index).ok_or_else(|| {
+        descriptor_error(format!(
+            "{label} output expr index out of bounds: index={output_expr_index}, exprs={}",
+            output_exprs.len()
+        ))
+    })?;
+    let root = expr.nodes.first().ok_or_else(|| {
+        descriptor_error(format!("{label} output expr {output_expr_index} is empty"))
+    })?;
+    Ok(primitive_type(&root.type_))
+}
+
+fn validate_output_expr_root_type(
+    label: &str,
+    output_exprs: &[exprs::TExpr],
+    output_expr_index: i32,
+    expected_primitive: types::TPrimitiveType,
+) -> Result<(), crate::common::engine_error::EngineError> {
+    let actual_primitive = output_expr_root_primitive(label, output_exprs, output_expr_index)?;
+    if actual_primitive != Some(expected_primitive) {
+        return Err(descriptor_error(format!(
+            "{label} output expr type mismatch: expected {expected_primitive:?}, got {actual_primitive:?}"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_required_fields(
     desc: &data_sinks::TIcebergPositionDeleteOutputDescriptor,
 ) -> Result<(), crate::common::engine_error::EngineError> {
@@ -136,6 +173,8 @@ pub(crate) fn bind_position_delete_descriptor(
     target_partition_spec_id: i32,
     expected_partition_source_column_names: &[String],
     expected_partition_column_names: &[String],
+    expected_partition_transform_exprs: &[String],
+    expected_partition_source_field_ids: &[i32],
 ) -> Result<PositionDeleteDescriptorBinding, crate::common::engine_error::EngineError> {
     let desc =
         desc.ok_or_else(|| descriptor_error("position delete output descriptor is missing"))?;
@@ -146,11 +185,16 @@ pub(crate) fn bind_position_delete_descriptor(
             desc.target_partition_spec_id
         )));
     }
-    if expected_partition_source_column_names.len() != expected_partition_column_names.len() {
+    if expected_partition_source_column_names.len() != expected_partition_column_names.len()
+        || expected_partition_source_column_names.len() != expected_partition_transform_exprs.len()
+        || expected_partition_source_column_names.len() != expected_partition_source_field_ids.len()
+    {
         return Err(descriptor_error(format!(
-            "partition metadata count mismatch: source columns={}, partition columns={}",
+            "partition metadata count mismatch: source columns={}, partition columns={}, transforms={}, source field ids={}",
             expected_partition_source_column_names.len(),
-            expected_partition_column_names.len()
+            expected_partition_column_names.len(),
+            expected_partition_transform_exprs.len(),
+            expected_partition_source_field_ids.len()
         )));
     }
     let partition_fields = desc.partition_source_fields.as_deref().unwrap_or_default();
@@ -168,6 +212,24 @@ pub(crate) fn bind_position_delete_descriptor(
             output_exprs.len()
         )));
     }
+    validate_output_expr_root_type(
+        "file_path",
+        output_exprs,
+        desc.file_path
+            .as_ref()
+            .and_then(|field| field.output_expr_index)
+            .ok_or_else(|| descriptor_error("file_path output_expr_index is missing"))?,
+        types::TPrimitiveType::VARCHAR,
+    )?;
+    validate_output_expr_root_type(
+        "pos",
+        output_exprs,
+        desc.pos
+            .as_ref()
+            .and_then(|field| field.output_expr_index)
+            .ok_or_else(|| descriptor_error("pos output_expr_index is missing"))?,
+        types::TPrimitiveType::BIGINT,
+    )?;
     for (idx, field) in partition_fields.iter().enumerate() {
         let output_expr_index = i32::try_from(idx + 2)
             .map_err(|_| descriptor_error("partition source output index overflow"))?;
@@ -177,6 +239,11 @@ pub(crate) fn bind_position_delete_descriptor(
                 expected_partition_source_column_names[idx], field.output_expr_index
             )));
         }
+        output_expr_root_primitive(
+            expected_partition_source_column_names[idx].as_str(),
+            output_exprs,
+            output_expr_index,
+        )?;
         if field.source_column_name.as_deref()
             != Some(expected_partition_source_column_names[idx].as_str())
         {
@@ -191,6 +258,23 @@ pub(crate) fn bind_position_delete_descriptor(
             return Err(descriptor_error(format!(
                 "partition field name mismatch: expected {}, got {:?}",
                 expected_partition_column_names[idx], field.partition_field_name
+            )));
+        }
+        if field.transform_expr.as_deref() != Some(expected_partition_transform_exprs[idx].as_str())
+        {
+            return Err(descriptor_error(format!(
+                "partition transform mismatch for {}: expected {}, got {:?}",
+                expected_partition_source_column_names[idx],
+                expected_partition_transform_exprs[idx],
+                field.transform_expr
+            )));
+        }
+        if field.source_field_id != Some(expected_partition_source_field_ids[idx]) {
+            return Err(descriptor_error(format!(
+                "partition source field id mismatch for {}: expected {}, got {:?}",
+                expected_partition_source_column_names[idx],
+                expected_partition_source_field_ids[idx],
+                field.source_field_id
             )));
         }
     }
@@ -263,6 +347,77 @@ mod tests {
             .collect()
     }
 
+    fn typed_expr(primitive: crate::types::TPrimitiveType) -> crate::exprs::TExpr {
+        let (node_type, int_literal, string_literal) =
+            if primitive == crate::types::TPrimitiveType::VARCHAR {
+                (
+                    crate::exprs::TExprNodeType::STRING_LITERAL,
+                    None,
+                    Some(crate::exprs::TStringLiteral {
+                        value: "value".to_string(),
+                    }),
+                )
+            } else {
+                (
+                    crate::exprs::TExprNodeType::INT_LITERAL,
+                    Some(crate::exprs::TIntLiteral { value: 1 }),
+                    None,
+                )
+            };
+        crate::exprs::TExpr::new(vec![crate::exprs::TExprNode {
+            node_type,
+            type_: scalar_type_desc(primitive),
+            opcode: None,
+            num_children: 0,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal,
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: None,
+            string_literal,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: 0,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+        }])
+    }
+
+    fn valid_output_exprs() -> Vec<crate::exprs::TExpr> {
+        vec![
+            typed_expr(crate::types::TPrimitiveType::VARCHAR),
+            typed_expr(crate::types::TPrimitiveType::BIGINT),
+            typed_expr(crate::types::TPrimitiveType::INT),
+        ]
+    }
+
     #[test]
     fn descriptor_missing_file_path_field_id_fails() {
         let mut desc = valid_descriptor();
@@ -319,6 +474,8 @@ mod tests {
             7,
             &[String::from("id")],
             &[],
+            &[String::from("bucket[8]")],
+            &[42],
         )
         .unwrap_err();
         assert_eq!(
@@ -329,5 +486,122 @@ mod tests {
             err.to_user_message()
                 .contains("partition metadata count mismatch")
         );
+    }
+
+    #[test]
+    fn descriptor_empty_required_output_expr_fails() {
+        let desc = valid_descriptor();
+        let mut output_exprs = valid_output_exprs();
+        output_exprs[0] = crate::exprs::TExpr::new(Vec::new());
+        let err = bind_position_delete_descriptor(
+            Some(&desc),
+            &output_exprs,
+            7,
+            &[String::from("id")],
+            &[String::from("id_bucket")],
+            &[String::from("bucket[8]")],
+            &[42],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        assert!(err.to_user_message().contains("output expr"));
+    }
+
+    #[test]
+    fn descriptor_wrong_required_output_expr_type_fails() {
+        let desc = valid_descriptor();
+        let mut output_exprs = valid_output_exprs();
+        output_exprs[1] = typed_expr(crate::types::TPrimitiveType::VARCHAR);
+        let err = bind_position_delete_descriptor(
+            Some(&desc),
+            &output_exprs,
+            7,
+            &[String::from("id")],
+            &[String::from("id_bucket")],
+            &[String::from("bucket[8]")],
+            &[42],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        assert!(err.to_user_message().contains("output expr"));
+    }
+
+    #[test]
+    fn descriptor_partition_transform_mismatch_fails() {
+        let desc = valid_descriptor();
+        let output_exprs = valid_output_exprs();
+        let err = bind_position_delete_descriptor(
+            Some(&desc),
+            &output_exprs,
+            7,
+            &[String::from("id")],
+            &[String::from("id_bucket")],
+            &[String::from("identity")],
+            &[42],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        assert!(err.to_user_message().contains("transform"));
+    }
+
+    #[test]
+    fn descriptor_partition_source_field_id_mismatch_fails() {
+        let desc = valid_descriptor();
+        let output_exprs = valid_output_exprs();
+        let err = bind_position_delete_descriptor(
+            Some(&desc),
+            &output_exprs,
+            7,
+            &[String::from("id")],
+            &[String::from("id_bucket")],
+            &[String::from("bucket[8]")],
+            &[43],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        assert!(err.to_user_message().contains("source field id"));
+    }
+
+    #[test]
+    fn descriptor_bind_returns_expected_metadata() {
+        let desc = valid_descriptor();
+        let output_exprs = valid_output_exprs();
+        let binding = bind_position_delete_descriptor(
+            Some(&desc),
+            &output_exprs,
+            7,
+            &[String::from("id")],
+            &[String::from("id_bucket")],
+            &[String::from("bucket[8]")],
+            &[42],
+        )
+        .expect("binding");
+        assert_eq!(
+            binding.output_column_names,
+            vec!["file_path".to_string(), "pos".to_string(), "id".to_string()]
+        );
+        assert_eq!(
+            binding.partition_source_column_names,
+            vec!["id".to_string()]
+        );
+        assert_eq!(
+            binding.partition_column_names,
+            vec!["id_bucket".to_string()]
+        );
+        assert_eq!(binding.output_schema.fields().len(), 2);
+        assert_eq!(binding.output_schema.field(0).name(), "file_path");
+        assert_eq!(binding.output_schema.field(1).name(), "pos");
     }
 }
