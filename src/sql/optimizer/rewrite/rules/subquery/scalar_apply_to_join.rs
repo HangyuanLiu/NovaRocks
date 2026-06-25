@@ -24,9 +24,10 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::common::ApplyKind;
 use crate::sql::common::{BinOp, JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{
-    AssertOneRowOp, LogicalAggregateOp, Operator, ProjectOp, ScalarProjectItem,
+    ApplyOp, AssertOneRowOp, LogicalAggregateOp, Operator, ProjectOp, ScalarProjectItem,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -44,9 +45,16 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
         RewritePhase::StructuralRewrite
     }
 
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Apply,
+            children: vec![Pattern::MultiLeaf],
+        }
+    }
+
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         let _ = ctx;
-        matches!(&expr.op, Operator::LogicalApply(a) if a.kind == ApplyKind::Scalar)
+        matches_apply_fields(apply_payload_after_pattern_gate(expr))
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -57,6 +65,17 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
             None => Ok(RewriteResult::Unchanged),
         }
     }
+}
+
+fn matches_apply_fields(apply: &ApplyOp) -> bool {
+    apply.kind == ApplyKind::Scalar
+}
+
+fn apply_payload_after_pattern_gate(expr: &OptExpr) -> &ApplyOp {
+    let Operator::LogicalApply(apply) = &expr.op else {
+        unreachable!("ScalarApplyToJoin::matches requires Apply pattern pre-gate");
+    };
+    apply
 }
 
 fn apply_opt(
@@ -441,6 +460,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rules::subquery::bridge::opt_expr_to_plan;
     use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs;
+    use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
@@ -562,6 +582,18 @@ mod tests {
             vec![],
             None,
         )
+    }
+
+    #[test]
+    fn pattern_rejects_non_apply_structure() {
+        let rule = ScalarApplyToJoin;
+        let mut ctx = ctx_with_factory();
+        let expr = to_opt_expr(make_left_values(), &mut ctx);
+
+        assert!(
+            bind_tree(&rule.pattern(), &expr).is_none(),
+            "ScalarApplyToJoin pattern must only match Apply roots"
+        );
     }
 
     /// Build a scalar-aggregate inner: `Aggregate{group_by:[], max(v2)}(Scan t2)`.

@@ -20,6 +20,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::common::JoinKind;
 use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -39,10 +40,15 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         RewritePhase::StructuralRewrite
     }
 
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Join,
+            children: vec![Pattern::MultiLeaf],
+        }
+    }
+
     fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
-        let Operator::LogicalJoin(j) = &expr.op else {
-            return false;
-        };
+        let j = join_payload_after_pattern_gate(expr);
         matches!(
             j.join_type,
             JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::RightSemi | JoinKind::RightAnti
@@ -122,6 +128,13 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
     }
 }
 
+fn join_payload_after_pattern_gate(expr: &OptExpr) -> &LogicalJoinOp {
+    let Operator::LogicalJoin(join) = &expr.op else {
+        unreachable!("PushSemiAntiRightOnlyCondition::matches requires Join pattern pre-gate");
+    };
+    join
+}
+
 fn classify_right_only_by_column_ids(
     expr: ScalarId,
     left_ids: &std::collections::HashSet<ColumnId>,
@@ -152,6 +165,7 @@ mod tests {
     use crate::sql::optimizer::operator::{ScanOp, ValuesOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::ScalarArena;
 
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
@@ -527,6 +541,18 @@ mod tests {
         assert!(
             !rule.matches(&join, &ctx),
             "INNER join must not match PushSemiAntiRightOnlyCondition"
+        );
+    }
+
+    #[test]
+    fn pattern_rejects_non_join_structure() {
+        let mut arena = ScalarArena::new();
+        let scan = make_scan(&mut arena, "t1", &["x"]);
+        let rule = PushSemiAntiRightOnlyCondition;
+
+        assert!(
+            bind_tree(&rule.pattern(), &scan).is_none(),
+            "PushSemiAntiRightOnlyCondition pattern must only match Join roots"
         );
     }
 }
