@@ -3186,6 +3186,42 @@ mod tests {
     }
 
     #[test]
+    fn mor_update_and_merge_reuse_position_delete_descriptor_builder() {
+        let source = include_str!("mutation_flow.rs");
+        let update_section = source
+            .split("fn build_update_mor_distributed_write")
+            .nth(1)
+            .expect("UPDATE MOR builder")
+            .split("fn build_merge_mor_distributed_write")
+            .next()
+            .expect("UPDATE section");
+        assert!(
+            update_section.contains("build_position_delete_sink_spec"),
+            "UPDATE MOR delete side must reuse descriptor builder"
+        );
+        assert!(
+            update_section.contains("IcebergWriteSinkMode::DeletionVectors"),
+            "UPDATE MOR delete side must still select DV sink mode"
+        );
+
+        let merge_section = source
+            .split("fn build_merge_mor_distributed_write")
+            .nth(1)
+            .expect("MERGE MOR builder")
+            .split("#[allow(clippy::too_many_arguments)]")
+            .next()
+            .expect("MERGE section");
+        assert!(
+            merge_section.contains("build_position_delete_sink_spec"),
+            "MERGE matched UPDATE delete side must reuse descriptor builder"
+        );
+        assert!(
+            merge_section.contains("build_merge_mor_dv_sink_query_from_matched"),
+            "MERGE matched UPDATE must build query from descriptor-backed sink columns"
+        );
+    }
+
+    #[test]
     fn merge_folds_all_branches_into_one_runner() {
         let src = include_str!("mutation_flow.rs");
         let body = src
@@ -3497,6 +3533,14 @@ mod tests {
         assert!(sql.contains("`t`.`_file` AS `_file`"), "{sql}");
         assert!(sql.contains("`t`.`_pos` AS `_pos`"), "{sql}");
         assert!(sql.contains("`t`.`id` AS `id`"), "{sql}");
+        assert!(
+            sql.find("`t`.`_file` AS `_file`").unwrap() < sql.find("`t`.`_pos` AS `_pos`").unwrap(),
+            "{sql}"
+        );
+        assert!(
+            sql.find("`t`.`_pos` AS `_pos`").unwrap() < sql.find("`t`.`id` AS `id`").unwrap(),
+            "{sql}"
+        );
         assert!(sql.contains("CROSS JOIN staging.s AS s"), "{sql}");
         assert!(sql.contains("WHERE t.id = s.id"), "{sql}");
         assert!(sql.contains("ORDER BY `t`.`_file`"), "{sql}");
@@ -3559,6 +3603,14 @@ mod tests {
         assert!(sql.contains("AS `_file`"), "{sql}");
         assert!(sql.contains("AS `_pos`"), "{sql}");
         assert!(sql.contains("AS `id`"), "{sql}");
+        assert!(
+            sql.find("AS `_file`").unwrap() < sql.find("AS `_pos`").unwrap(),
+            "{sql}"
+        );
+        assert!(
+            sql.find("AS `_pos`").unwrap() < sql.find("AS `id`").unwrap(),
+            "{sql}"
+        );
         // The partition value must come from old_rows: the distinctive literal
         // 42 appears in the VALUES, while the non-partition `v` value 55 does
         // not leak into the generated SQL.
