@@ -42,12 +42,7 @@ fn descriptor_error(message: impl Into<String>) -> crate::common::engine_error::
 }
 
 fn primitive_type(type_desc: &types::TTypeDesc) -> Option<types::TPrimitiveType> {
-    type_desc
-        .types
-        .as_ref()
-        .and_then(|types| types.first())
-        .and_then(|node| node.scalar_type.as_ref())
-        .map(|scalar| scalar.type_)
+    crate::lower::type_lowering::primitive_type_from_desc(type_desc)
 }
 
 fn validate_output_field(
@@ -418,6 +413,17 @@ mod tests {
         ]
     }
 
+    fn malformed_non_scalar_type_desc(
+        primitive: crate::types::TPrimitiveType,
+    ) -> crate::types::TTypeDesc {
+        crate::types::TTypeDesc::new(vec![crate::types::TTypeNode::new(
+            crate::types::TTypeNodeType::ARRAY,
+            crate::types::TScalarType::new(primitive, None, None, None, None),
+            None,
+            None,
+        )])
+    }
+
     #[test]
     fn descriptor_missing_file_path_field_id_fails() {
         let mut desc = valid_descriptor();
@@ -443,6 +449,20 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_non_scalar_type_desc_fails() {
+        let mut desc = valid_descriptor();
+        desc.file_path.as_mut().unwrap().type_desc = Some(malformed_non_scalar_type_desc(
+            crate::types::TPrimitiveType::VARCHAR,
+        ));
+        let err = validate_required_fields(&desc).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        assert!(err.to_user_message().contains("type"));
+    }
+
+    #[test]
     fn descriptor_builds_required_arrow_schema() {
         let schema = output_schema_from_descriptor(&valid_descriptor()).expect("schema");
         assert_eq!(schema.fields().len(), 2);
@@ -462,6 +482,71 @@ mod tests {
                 .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY),
             Some(&ICEBERG_POSITION_DELETE_POS_FIELD_ID.to_string())
         );
+    }
+
+    #[test]
+    fn descriptor_missing_descriptor_fails() {
+        let output_exprs = valid_output_exprs();
+        let err = bind_position_delete_descriptor(
+            None,
+            &output_exprs,
+            7,
+            &[String::from("id")],
+            &[String::from("id_bucket")],
+            &[String::from("bucket[8]")],
+            &[42],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        assert!(err.to_user_message().contains("descriptor is missing"));
+    }
+
+    #[test]
+    fn descriptor_target_spec_mismatch_fails() {
+        let desc = valid_descriptor();
+        let output_exprs = valid_output_exprs();
+        let err = bind_position_delete_descriptor(
+            Some(&desc),
+            &output_exprs,
+            8,
+            &[String::from("id")],
+            &[String::from("id_bucket")],
+            &[String::from("bucket[8]")],
+            &[42],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        assert!(
+            err.to_user_message()
+                .contains("target partition spec id mismatch")
+        );
+    }
+
+    #[test]
+    fn descriptor_output_expr_count_mismatch_fails() {
+        let desc = valid_descriptor();
+        let output_exprs = valid_output_exprs();
+        let err = bind_position_delete_descriptor(
+            Some(&desc),
+            &output_exprs[..2],
+            7,
+            &[String::from("id")],
+            &[String::from("id_bucket")],
+            &[String::from("bucket[8]")],
+            &[42],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::common::engine_error_codes::EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        assert!(err.to_user_message().contains("output expr count"));
     }
 
     #[test]
