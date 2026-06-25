@@ -904,6 +904,16 @@ mod tests {
 
         let rule = MvRewriteRule::new(vec![agg_candidate(0)]);
         assert!(
+            rule.matches(&root_expr.op),
+            "test must exercise a production rule entry op"
+        );
+        let (query, _) =
+            SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("query descriptor");
+        assert!(
+            query.joins.is_some(),
+            "test must exercise the query-side join descriptor path"
+        );
+        assert!(
             rule.apply(&root_expr, &mut memo).is_empty(),
             "multi-table query descriptor must not rewrite against a single-table candidate yet"
         );
