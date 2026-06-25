@@ -58,6 +58,35 @@ pub(crate) struct SpjgAggregate {
     pub group_by: Vec<ScalarId>,
 }
 
+/// One additional (non-driving) base input of an inner-join SPJG shape.
+/// The driving (left-deep first) scan stays in the descriptor's own
+/// `table`/`scan_columns`; every other inner-join input lands here.
+#[derive(Clone, Debug)]
+pub(crate) struct JoinInput {
+    pub table: TableDef,
+    /// Scan output columns of this input: ColumnId -> base column binding.
+    pub scan_columns: Vec<OutputColumn>,
+}
+
+/// Equi-join key `left_column = right_column`, addressed by the ColumnIds
+/// visible at the two joined inputs. Non-equi join conjuncts are folded into
+/// the descriptor's flat `predicates` list, not here.
+#[derive(Clone, Debug)]
+pub(crate) struct EquiEdge {
+    pub left: ColumnId,
+    pub right: ColumnId,
+}
+
+/// Inner-join shape attached to an `SpjgDescriptor`. `inputs` are every base
+/// table joined onto the driving scan (left-deep order); `equi_edges` are the
+/// equi-join keys. `None` on the descriptor means single-table (the original,
+/// unchanged shape).
+#[derive(Clone, Debug)]
+pub(crate) struct JoinShape {
+    pub inputs: Vec<JoinInput>,
+    pub equi_edges: Vec<EquiEdge>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SpjgDescriptor {
     pub table: TableDef,
@@ -68,6 +97,11 @@ pub(crate) struct SpjgDescriptor {
     pub aggregate: Option<SpjgAggregate>,
     /// Visible outputs in order (the subtree's output schema).
     pub outputs: Vec<SpjgOutput>,
+    /// Inner-join shape, or `None` for a single-table SPJG. Populated by the
+    /// descriptor builders when a left-deep inner-equi-join sits below the
+    /// filter chain. The rewrite rule does not yet act on multi-table
+    /// descriptors (see `rule::try_rewrite` guard) - extraction only.
+    pub joins: Option<JoinShape>,
 }
 
 impl SpjgDescriptor {
@@ -230,6 +264,7 @@ impl SpjgDescriptor {
             predicates,
             aggregate: agg,
             outputs,
+            joins: None,
         })
     }
 
@@ -390,6 +425,7 @@ impl SpjgDescriptor {
                 predicates,
                 aggregate: agg,
                 outputs,
+                joins: None,
             },
             shape,
         ))
@@ -849,6 +885,24 @@ mod tests {
         assert_eq!(d.predicates.len(), 1);
         assert!(d.aggregate.is_none());
         assert_eq!(d.outputs.len(), 2); // pass-through scan columns
+    }
+
+    #[test]
+    fn single_table_descriptor_has_no_joins() {
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let plan = LogicalPlanNode::new(
+            PlanNodeKind::Filter(LogicalFilterNode {
+                predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
+            }),
+            vec![scan_plan(&[a.clone(), b.clone()])],
+            None,
+        );
+        let (d, _arena) = descriptor_from_plan(&plan).expect("spjg");
+        assert!(
+            d.joins.is_none(),
+            "single-table shape must not carry a JoinShape"
+        );
     }
 
     #[test]
