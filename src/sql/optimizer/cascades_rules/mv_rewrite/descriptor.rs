@@ -4,7 +4,7 @@
 //! the MV defining plan (built at candidate-prep time from the planner
 //! LogicalPlanNode) and the query subtree (rebuilt from memo MExprs by the rule).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::sql::analysis::BinOp;
 use crate::sql::catalog::TableDef;
@@ -65,6 +65,7 @@ pub(crate) struct SpjgAggregate {
 /// `table`/`scan_columns`; every other inner-join input lands here.
 #[derive(Clone, Debug)]
 pub(crate) struct JoinInput {
+    #[allow(dead_code)]
     pub table: TableDef,
     /// Scan output columns of this input: ColumnId -> base column binding.
     pub scan_columns: Vec<OutputColumn>,
@@ -221,7 +222,7 @@ impl SpjgDescriptor {
                 let mut agg_outputs: Vec<SpjgOutput> = Vec::new();
                 for (i, oc) in a.output_columns.iter().enumerate() {
                     let expr = if i < a.group_by.len() {
-                        SpjgOutputExpr::Dimension(group_by[i].clone())
+                        SpjgOutputExpr::Dimension(group_by[i])
                     } else {
                         SpjgOutputExpr::Aggregate(aggregates[i - a.group_by.len()].clone())
                     };
@@ -560,7 +561,10 @@ fn peel_join_spine_memo(
             let (driving, left_joins) = peel_join_spine_memo(&left, memo, predicates)?;
             let right_input = peel_filter_scan_memo(&right, memo, predicates)?;
 
-            let (edges, residuals) = split_join_condition(&memo.scalars, join.condition);
+            let left_columns = join_left_column_ids(&driving.columns, left_joins.as_ref());
+            let right_columns = column_id_set(&right_input.scan_columns);
+            let (edges, residuals) =
+                split_join_condition(&memo.scalars, join.condition, &left_columns, &right_columns);
             if edges.is_empty() {
                 return None;
             }
@@ -645,7 +649,10 @@ fn peel_join_spine_opt<'a>(
             let (driving, left_joins) = peel_join_spine_opt(left, arena, predicates)?;
             let right_input = peel_filter_scan_opt(right, arena, predicates)?;
 
-            let (edges, residuals) = split_join_condition(arena, join.condition);
+            let left_columns = join_left_column_ids(&driving.columns, left_joins.as_ref());
+            let right_columns = column_id_set(&right_input.scan_columns);
+            let (edges, residuals) =
+                split_join_condition(arena, join.condition, &left_columns, &right_columns);
             if edges.is_empty() {
                 return Err("inner join without equi edge in MV rewrite shape".to_string());
             }
@@ -700,6 +707,8 @@ fn peel_filter_scan_opt(
 fn split_join_condition(
     arena: &ScalarArena,
     condition: Option<ScalarId>,
+    left_columns: &HashSet<ColumnId>,
+    right_columns: &HashSet<ColumnId>,
 ) -> (Vec<EquiEdge>, Vec<ScalarId>) {
     let Some(cond) = condition else {
         return (Vec::new(), Vec::new());
@@ -716,10 +725,9 @@ fn split_join_condition(
                 left,
                 right,
             } => match (arena.node(*left), arena.node(*right)) {
-                (ScalarNode::ColumnRef(l), ScalarNode::ColumnRef(r)) => Some(EquiEdge {
-                    left: *l,
-                    right: *r,
-                }),
+                (ScalarNode::ColumnRef(l), ScalarNode::ColumnRef(r)) => {
+                    normalize_equi_edge(*l, *r, left_columns, right_columns)
+                }
                 _ => None,
             },
             _ => None,
@@ -729,7 +737,72 @@ fn split_join_condition(
             None => residuals.push(c),
         }
     }
+    debug_assert!(
+        edges
+            .iter()
+            .all(|edge| left_columns.contains(&edge.left) && right_columns.contains(&edge.right))
+    );
     (edges, residuals)
+}
+
+fn normalize_equi_edge(
+    left_expr: ColumnId,
+    right_expr: ColumnId,
+    left_columns: &HashSet<ColumnId>,
+    right_columns: &HashSet<ColumnId>,
+) -> Option<EquiEdge> {
+    match (
+        join_side(left_expr, left_columns, right_columns),
+        join_side(right_expr, left_columns, right_columns),
+    ) {
+        (Some(JoinSide::Left), Some(JoinSide::Right)) => Some(EquiEdge {
+            left: left_expr,
+            right: right_expr,
+        }),
+        (Some(JoinSide::Right), Some(JoinSide::Left)) => Some(EquiEdge {
+            left: right_expr,
+            right: left_expr,
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JoinSide {
+    Left,
+    Right,
+}
+
+fn join_side(
+    column: ColumnId,
+    left_columns: &HashSet<ColumnId>,
+    right_columns: &HashSet<ColumnId>,
+) -> Option<JoinSide> {
+    match (
+        left_columns.contains(&column),
+        right_columns.contains(&column),
+    ) {
+        (true, false) => Some(JoinSide::Left),
+        (false, true) => Some(JoinSide::Right),
+        _ => None,
+    }
+}
+
+fn join_left_column_ids(
+    driving_columns: &[OutputColumn],
+    joins: Option<&JoinShape>,
+) -> HashSet<ColumnId> {
+    let mut columns = column_id_set(driving_columns);
+    if let Some(joins) = joins {
+        for input in &joins.inputs {
+            columns.extend(input.scan_columns.iter().map(|c| c.column_id));
+        }
+    }
+    columns
+}
+
+fn column_id_set(columns: &[OutputColumn]) -> HashSet<ColumnId> {
+    columns.iter().map(|c| c.column_id).collect()
 }
 
 pub(crate) fn substitute_scalar(
@@ -1130,7 +1203,10 @@ mod tests {
             true,
         );
 
-        let (edges, residuals) = super::split_join_condition(&arena, Some(cond));
+        let left_columns = HashSet::from([ColumnId(1)]);
+        let right_columns = HashSet::from([ColumnId(2)]);
+        let (edges, residuals) =
+            super::split_join_condition(&arena, Some(cond), &left_columns, &right_columns);
         assert_eq!(edges.len(), 1, "one equi edge");
         assert_eq!(edges[0].left, ColumnId(1));
         assert_eq!(edges[0].right, ColumnId(2));
@@ -1141,8 +1217,63 @@ mod tests {
     #[test]
     fn split_join_condition_none_is_empty() {
         let arena = ScalarArena::new();
-        let (edges, residuals) = super::split_join_condition(&arena, None);
+        let left_columns = HashSet::from([ColumnId(1)]);
+        let right_columns = HashSet::from([ColumnId(2)]);
+        let (edges, residuals) =
+            super::split_join_condition(&arena, None, &left_columns, &right_columns);
         assert!(edges.is_empty() && residuals.is_empty());
+    }
+
+    #[test]
+    fn split_join_condition_normalizes_reversed_equi_edge() {
+        use crate::sql::analysis::BinOp;
+
+        let mut arena = ScalarArena::new();
+        let a_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
+        let c_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(3)), DataType::Int64, true);
+        let cond = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Eq,
+                left: c_ref,
+                right: a_ref,
+            },
+            DataType::Boolean,
+            true,
+        );
+
+        let left_columns = HashSet::from([ColumnId(1), ColumnId(2)]);
+        let right_columns = HashSet::from([ColumnId(3), ColumnId(4)]);
+        let (edges, residuals) =
+            super::split_join_condition(&arena, Some(cond), &left_columns, &right_columns);
+        assert!(residuals.is_empty());
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].left, ColumnId(1));
+        assert_eq!(edges[0].right, ColumnId(3));
+    }
+
+    #[test]
+    fn split_join_condition_keeps_same_side_equality_as_residual() {
+        use crate::sql::analysis::BinOp;
+
+        let mut arena = ScalarArena::new();
+        let a_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
+        let b_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Int64, true);
+        let cond = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Eq,
+                left: a_ref,
+                right: b_ref,
+            },
+            DataType::Boolean,
+            true,
+        );
+
+        let left_columns = HashSet::from([ColumnId(1), ColumnId(2)]);
+        let right_columns = HashSet::from([ColumnId(3), ColumnId(4)]);
+        let (edges, residuals) =
+            super::split_join_condition(&arena, Some(cond), &left_columns, &right_columns);
+        assert!(edges.is_empty());
+        assert_eq!(residuals, vec![cond]);
     }
 
     #[test]
@@ -1265,6 +1396,26 @@ mod tests {
         assert!(
             descriptor_from_plan(&plan).is_err(),
             "inner join without equi edges must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_inner_join_with_only_same_side_equality() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&b));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", &[a.clone(), b.clone()]),
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+        assert!(
+            descriptor_from_plan(&plan).is_err(),
+            "same-side equality must not be extracted as a join edge"
         );
     }
 
