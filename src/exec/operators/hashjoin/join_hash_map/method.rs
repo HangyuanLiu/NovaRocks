@@ -119,6 +119,7 @@ pub(crate) struct ChainedJoinHashMap {
 pub(crate) struct DirectIntJoinHashMap {
     data_type: DataType,
     min: i64,
+    max: i64,
     len: usize,
     first: Vec<u32>,
     next: Vec<u32>,
@@ -413,6 +414,7 @@ impl DirectIntJoinHashMap {
         let mut map = Self {
             data_type: key_types[0].clone(),
             min: stats.min,
+            max: stats.max,
             len,
             first: vec![ROW_NONE; len],
             next: vec![ROW_NONE; stats.row_count],
@@ -451,7 +453,7 @@ impl DirectIntJoinHashMap {
                 let Some(value) = view.value_at(row) else {
                     continue;
                 };
-                let bucket = direct_bucket(value, self.min, self.len)
+                let bucket = direct_bucket(value, self.min, self.max, self.len)
                     .ok_or_else(|| "direct integer join key outside collected range".to_string())?;
                 let row_id = u32::try_from(global_row)
                     .map_err(|_| "direct integer join row id overflow".to_string())?;
@@ -554,7 +556,7 @@ impl DirectIntJoinHashMap {
     }
 
     fn lookup_existing_bucket(&self, value: i64) -> Option<usize> {
-        let bucket = direct_bucket(value, self.min, self.len)?;
+        let bucket = direct_bucket(value, self.min, self.max, self.len)?;
         let row = self.first[bucket];
         (row != ROW_NONE).then_some(bucket)
     }
@@ -706,12 +708,11 @@ fn checked_direct_range(min: i64, max: i64) -> Result<u64, String> {
     u64::try_from(range).map_err(|_| "direct integer join range overflow".to_string())
 }
 
-fn direct_bucket(value: i64, min: i64, len: usize) -> Option<usize> {
-    let delta = (value as i128) - (min as i128);
-    if delta < 0 {
+fn direct_bucket(value: i64, min: i64, max: i64, len: usize) -> Option<usize> {
+    if value < min || value > max {
         return None;
     }
-    let bucket = usize::try_from(delta).ok()?;
+    let bucket = usize::try_from(value - min).ok()?;
     (bucket < len).then_some(bucket)
 }
 
@@ -759,7 +760,7 @@ mod tests {
     use std::mem;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::array::{ArrayRef, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
@@ -807,6 +808,16 @@ mod tests {
     fn int32_not_null_chunk(values: Vec<i32>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[KEY_SLOT_ID])
+                .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn int64_chunk(values: Vec<Option<i64>>) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let array = Arc::new(Int64Array::from(values)) as ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
         let chunk_schema =
             ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[KEY_SLOT_ID])
@@ -1110,6 +1121,42 @@ mod tests {
         assert!(group_ids[1].is_some());
         assert_eq!(selection.probe, vec![1]);
         assert_eq!(selection.build, vec![1]);
+    }
+
+    #[test]
+    fn direct_map_i64_min_range_does_not_overflow_probe_bucket() {
+        let min = i64::MIN;
+        let build = int64_chunk(vec![Some(min), Some(min + 1)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int64],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+
+        assert_eq!(
+            map.method_kind(),
+            JoinHashMapMethodKind::DirectInt {
+                min,
+                len: 2,
+                not_null: true,
+            }
+        );
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int64);
+        let probe = int64_chunk(vec![Some(i64::MAX), Some(min + 1), Some(min)]);
+        let (group_ids, selection) = map
+            .lookup_selection(&arena, &[probe_key], &probe)
+            .expect("lookup");
+
+        assert!(group_ids[0].is_none());
+        assert!(group_ids[1].is_some());
+        assert!(group_ids[2].is_some());
+        assert_eq!(selection.probe, vec![1, 2]);
+        assert_eq!(selection.build, vec![1, 0]);
     }
 
     #[test]
