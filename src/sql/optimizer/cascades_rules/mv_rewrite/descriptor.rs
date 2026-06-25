@@ -309,16 +309,8 @@ impl SpjgDescriptor {
             _ => None,
         };
 
-        // Filter chain down to the scan.
         let mut predicates: Vec<ScalarId> = Vec::new();
-        while let Operator::LogicalFilter(f) = &node.op {
-            scalar_expr::split_conjuncts(&memo.scalars, f.predicate, &mut predicates);
-            node = first_logical_expr(memo, *node.children.first()?)?;
-        }
-
-        let Operator::LogicalScan(scan) = &node.op else {
-            return None;
-        };
+        let (scan, joins) = peel_join_spine_memo(&node, memo, &mut predicates)?;
         // Reject scans already injected by a prior MV rewrite (MV-on-MV).
         if scan.mv_rewritten_from.is_some() {
             return None;
@@ -422,7 +414,7 @@ impl SpjgDescriptor {
                 predicates,
                 aggregate: agg,
                 outputs,
-                joins: None,
+                joins,
             },
             shape,
         ))
@@ -535,6 +527,69 @@ fn substitute_sort_key(
         nulls_first: key.nulls_first,
         display: key.display.clone(),
     }
+}
+
+fn peel_join_spine_memo(
+    node: &MExpr,
+    memo: &Memo,
+    predicates: &mut Vec<ScalarId>,
+) -> Option<(ScanOp, Option<JoinShape>)> {
+    let mut n = node.clone();
+    while let Operator::LogicalFilter(f) = &n.op {
+        scalar_expr::split_conjuncts(&memo.scalars, f.predicate, predicates);
+        n = first_logical_expr(memo, *n.children.first()?)?;
+    }
+    match &n.op {
+        Operator::LogicalScan(scan) => Some((scan.clone(), None)),
+        Operator::LogicalJoin(join) => {
+            if join.join_type != JoinKind::Inner {
+                return None;
+            }
+            let left = first_logical_expr(memo, *n.children.first()?)?;
+            let right = first_logical_expr(memo, *n.children.get(1)?)?;
+
+            let (driving, left_joins) = peel_join_spine_memo(&left, memo, predicates)?;
+            let right_input = peel_filter_scan_memo(&right, memo, predicates)?;
+
+            let (edges, residuals) = split_join_condition(&memo.scalars, join.condition);
+            if edges.is_empty() {
+                return None;
+            }
+            predicates.extend(residuals);
+
+            let mut shape = left_joins.unwrap_or(JoinShape {
+                inputs: Vec::new(),
+                equi_edges: Vec::new(),
+            });
+            shape.inputs.push(right_input);
+            shape.equi_edges.extend(edges);
+            Some((driving, Some(shape)))
+        }
+        _ => None,
+    }
+}
+
+fn peel_filter_scan_memo(
+    node: &MExpr,
+    memo: &Memo,
+    predicates: &mut Vec<ScalarId>,
+) -> Option<JoinInput> {
+    let mut n = node.clone();
+    while let Operator::LogicalFilter(f) = &n.op {
+        scalar_expr::split_conjuncts(&memo.scalars, f.predicate, predicates);
+        n = first_logical_expr(memo, *n.children.first()?)?;
+    }
+    let Operator::LogicalScan(scan) = &n.op else {
+        return None;
+    };
+    if scan.mv_rewritten_from.is_some() {
+        return None;
+    }
+    predicates.extend(scan.predicates.iter().copied());
+    Some(JoinInput {
+        table: scan.table.clone(),
+        scan_columns: scan.columns.clone(),
+    })
 }
 
 /// Peel a left-deep inner-join spine (or a bare scan) at the bottom of the
@@ -1346,6 +1401,103 @@ mod tests {
         assert_eq!(mem.predicates.len(), logical.predicates.len());
         assert!(mem.aggregate.is_none());
         assert_eq!(mem.outputs.len(), logical.outputs.len());
+    }
+
+    #[test]
+    fn from_memo_extracts_inner_join_two_tables() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let d = col(4, "d");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", &[a.clone(), b.clone()]),
+            scan_plan_named("t2", &[c.clone(), d.clone()]),
+            Some(on),
+        );
+        let (mut memo, root_expr) = memo_root(&plan);
+        let (mem, shape) =
+            SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("from_memo join");
+        assert!(matches!(shape, MatchedShape::Spj));
+        assert_eq!(mem.table.name, "t1");
+        let joins = mem.joins.as_ref().expect("join shape present");
+        assert_eq!(joins.inputs.len(), 1);
+        assert_eq!(joins.inputs[0].table.name, "t2");
+        assert_eq!(joins.equi_edges.len(), 1);
+        assert_eq!(joins.equi_edges[0].left, ColumnId(1));
+        assert_eq!(joins.equi_edges[0].right, ColumnId(3));
+    }
+
+    #[test]
+    fn from_memo_rejects_left_outer_join() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::LeftOuter,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+        let (mut memo, root_expr) = memo_root(&plan);
+        assert!(SpjgDescriptor::from_memo(&root_expr, &mut memo).is_none());
+    }
+
+    #[test]
+    fn from_memo_extracts_inner_join_with_driving_filter() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let driving = LogicalPlanNode::new(
+            PlanNodeKind::Filter(LogicalFilterNode {
+                predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
+            }),
+            vec![scan_plan_named("t1", &[a.clone(), b.clone()])],
+            None,
+        );
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            driving,
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+        let (mut memo, root_expr) = memo_root(&plan);
+        let (mem, shape) =
+            SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("from_memo join");
+        assert!(matches!(shape, MatchedShape::Spj));
+        assert_eq!(mem.table.name, "t1");
+        assert_eq!(
+            mem.predicates.len(),
+            1,
+            "driving-side filter predicate must be included exactly once"
+        );
+        let joins = mem.joins.as_ref().expect("join shape present");
+        assert_eq!(joins.inputs.len(), 1);
+        assert_eq!(joins.equi_edges.len(), 1);
+    }
+
+    #[test]
+    fn from_memo_rejects_inner_join_without_condition() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            None,
+        );
+        let (mut memo, root_expr) = memo_root(&plan);
+        assert!(SpjgDescriptor::from_memo(&root_expr, &mut memo).is_none());
     }
 
     #[test]
