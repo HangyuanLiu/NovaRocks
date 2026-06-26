@@ -949,20 +949,36 @@ fn compute_batch_col_indexes(
     (group_key_batch_col, state_col_batch_col)
 }
 
-fn build_row_id_array(
-    batch: &RecordBatch,
-    group_key_batch_cols: &[usize],
-) -> Result<ArrayRef, String> {
-    let mut row_ids = Vec::with_capacity(batch.num_rows());
-    for row in 0..batch.num_rows() {
-        let mut cells = Vec::with_capacity(group_key_batch_cols.len());
-        for &column_index in group_key_batch_cols {
-            let array = batch.column(column_index);
+pub(crate) fn aggregate_group_row_id_array(columns: &[ArrayRef]) -> Result<ArrayRef, String> {
+    let rows = columns.first().map(|column| column.len()).unwrap_or(0);
+    for (idx, column) in columns.iter().enumerate() {
+        if column.len() != rows {
+            return Err(format!(
+                "aggregate MV row id group key column {idx} length mismatch: {} vs {rows}",
+                column.len()
+            ));
+        }
+    }
+    let mut row_ids = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let mut cells = Vec::with_capacity(columns.len());
+        for array in columns {
             cells.push(hex_encode(&encoded_cell(array, row)?));
         }
         row_ids.push(cells.join("|"));
     }
     Ok(Arc::new(StringArray::from(row_ids)))
+}
+
+fn build_row_id_array(
+    batch: &RecordBatch,
+    group_key_batch_cols: &[usize],
+) -> Result<ArrayRef, String> {
+    let columns = group_key_batch_cols
+        .iter()
+        .map(|&column_index| batch.column(column_index).clone())
+        .collect::<Vec<_>>();
+    aggregate_group_row_id_array(&columns)
 }
 
 fn load_aggregate_physical_rows_from_batch(

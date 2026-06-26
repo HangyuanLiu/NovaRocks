@@ -194,11 +194,19 @@ fn is_mv_state_scalar_function(name: &str) -> bool {
             | "bool_and_state_union"
             | "bool_and_state_visible"
             | "state_all_zero"
+            | "mv_group_row_id"
     )
 }
 
 fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Result<(), String> {
     let binary_arg = |ty: &DataType| matches!(ty, DataType::Binary | DataType::LargeBinary);
+    let zero_check_arg = |ty: &DataType| binary_arg(ty) || matches!(ty, DataType::Int64);
+    if name == "mv_group_row_id" {
+        if arg_types.is_empty() {
+            return Err(no_matching_signature(name, arg_types));
+        }
+        return Ok(());
+    }
     let expected = match name {
         "count_state_union"
         | "count_distinct_state_union"
@@ -221,7 +229,12 @@ fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Resu
         | "state_all_zero" => 1,
         _ => return Ok(()),
     };
-    if arg_types.len() != expected || arg_types.iter().any(|ty| !binary_arg(ty)) {
+    let valid_args = if name == "state_all_zero" {
+        arg_types.iter().all(zero_check_arg)
+    } else {
+        arg_types.iter().all(binary_arg)
+    };
+    if arg_types.len() != expected || !valid_args {
         return Err(no_matching_signature(name, arg_types));
     }
     Ok(())
@@ -985,6 +998,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "min_state_visible"
         | "max_state_visible" => DataType::Int64,
         "bool_or_state_visible" | "bool_and_state_visible" => DataType::Boolean,
+        "mv_group_row_id" => DataType::Utf8,
         "state_all_zero" => DataType::Boolean,
         "bitmap_to_array" => DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
@@ -1610,9 +1624,13 @@ mod tests {
     }
 
     #[test]
-    fn state_all_zero_scalar_function_requires_binary_input() {
+    fn state_all_zero_scalar_function_accepts_binary_or_int64_count_input() {
         assert_eq!(
             crate::sql::functions::resolve_scalar_function("state_all_zero", &[DataType::Binary]),
+            Ok(DataType::Boolean)
+        );
+        assert_eq!(
+            crate::sql::functions::resolve_scalar_function("state_all_zero", &[DataType::Int64]),
             Ok(DataType::Boolean)
         );
         assert_eq!(
@@ -1621,9 +1639,10 @@ mod tests {
         );
         validate_scalar_function_call("state_all_zero", &[DataType::Binary]).unwrap();
         validate_scalar_function_call("state_all_zero", &[DataType::LargeBinary]).unwrap();
+        validate_scalar_function_call("state_all_zero", &[DataType::Int64]).unwrap();
 
         let err = validate_scalar_function_call("state_all_zero", &[DataType::Utf8])
-            .expect_err("state_all_zero should reject non-binary input");
+            .expect_err("state_all_zero should reject non-state/count input");
         assert_eq!(
             err,
             "No matching function with signature: state_all_zero(varchar(255))."

@@ -156,7 +156,6 @@ mod tests {
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
             }],
-            direct_exec: None,
             boundary_schemas: vec![],
             cte_id: None,
             cte_exchange_nodes: vec![],

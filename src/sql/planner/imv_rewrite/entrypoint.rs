@@ -32,6 +32,7 @@ pub(crate) struct ImvRewriteOutcome {
     pub plan: LogicalPlanNode,
     pub trace: RewriteTrace,
     pub annotation: ImvPlanAnnotation,
+    pub next_column_id: u32,
 }
 
 pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcome, String> {
@@ -81,6 +82,7 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         plan: plan_out,
         trace: ctx_rw.trace().clone(),
         annotation: ext.annotation,
+        next_column_id: ext.next_column_id.load(std::sync::atomic::Ordering::SeqCst),
     })
 }
 
@@ -282,6 +284,8 @@ mod tests {
     ) -> Arc<IcebergMvRewriteContext> {
         let mut mv_def = make_mv_definition();
         let mut contract = make_schema_contract();
+        contract.target.visible_columns[0].output_name = "k".to_string();
+        contract.target.visible_columns[1].output_name = "s".to_string();
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
         contract.target.hidden_apply_key.target_field_id = 999;
         contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
@@ -510,6 +514,8 @@ mod tests {
         .into_iter()
         .collect();
         let mut contract = make_schema_contract();
+        contract.target.visible_columns[0].output_name = "k".to_string();
+        contract.target.visible_columns[1].output_name = "s".to_string();
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
         contract.target.hidden_apply_key.target_field_id = 999;
         contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
@@ -1494,10 +1500,8 @@ mod tests {
         })
         .expect("aggregate IMV pipeline must rewrite and validate");
 
-        let PlanNodeKind::AggregateStateMerge(_) = &outcome.plan.kind else {
-            panic!("expected AggregateStateMerge");
-        };
-        let delta_input = outcome.plan.right();
+        assert_aggregate_change_stream_plan(&outcome.plan);
+        let delta_input = find_signed_delta_project(&outcome.plan);
         let PlanNodeKind::Project(_) = &delta_input.kind else {
             panic!("expected signed aggregate projection delta input");
         };
@@ -1549,10 +1553,8 @@ mod tests {
         })
         .expect("join aggregate IMV pipeline must rewrite and validate");
 
-        let PlanNodeKind::AggregateStateMerge(_) = &outcome.plan.kind else {
-            panic!("expected AggregateStateMerge");
-        };
-        let delta_input = outcome.plan.right();
+        assert_aggregate_change_stream_plan(&outcome.plan);
+        let delta_input = find_signed_delta_project(&outcome.plan);
         assert!(
             !plan_contains_imv_marker(delta_input),
             "final delta input must not contain unresolved IMV markers"
@@ -1601,10 +1603,8 @@ mod tests {
             &ctx.scalar_arena().borrow(),
         );
 
-        let PlanNodeKind::AggregateStateMerge(_) = &rewritten.kind else {
-            panic!("expected AggregateStateMerge after query rewrite");
-        };
-        let delta_input = rewritten.right();
+        assert_aggregate_change_stream_plan(&rewritten);
+        let delta_input = find_signed_delta_project(&rewritten);
         let PlanNodeKind::Project(_) = &delta_input.kind else {
             panic!("expected signed aggregate projection delta input");
         };
@@ -1627,6 +1627,85 @@ mod tests {
             "Union output schema must retain action column after pruning"
         );
         assert_join_delta_union_shape(union_plan, signed_action_id);
+    }
+
+    fn assert_aggregate_change_stream_plan(plan: &LogicalPlanNode) {
+        assert!(
+            contains_aggregate_change_stream_union(plan),
+            "expected aggregate change-stream Union in plan: {plan:?}"
+        );
+        assert!(
+            contains_target_state_scan(plan),
+            "expected target-state old input scan in plan: {plan:?}"
+        );
+        assert!(
+            contains_signed_delta_project(plan),
+            "expected signed aggregate delta input in plan: {plan:?}"
+        );
+        assert!(
+            !plan_contains_imv_marker(plan),
+            "final aggregate change-stream plan must not contain IMV markers"
+        );
+    }
+
+    fn contains_aggregate_change_stream_union(plan: &LogicalPlanNode) -> bool {
+        matches!(
+            &plan.kind,
+            PlanNodeKind::Union(union)
+                if union.output_columns.iter().any(|column| {
+                    column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)
+                })
+        ) || plan
+            .children
+            .iter()
+            .any(contains_aggregate_change_stream_union)
+    }
+
+    fn find_signed_delta_project(plan: &LogicalPlanNode) -> &LogicalPlanNode {
+        if let PlanNodeKind::Project(_) = &plan.kind
+            && matches!(
+                &plan.unary_input().kind,
+                PlanNodeKind::Aggregate(LogicalAggregateNode { aggregates, .. })
+                    if aggregates.iter().any(|call| call.name.ends_with("_state_signed"))
+            )
+        {
+            return plan;
+        }
+        plan.children
+            .iter()
+            .find_map(|child| {
+                if contains_signed_delta_project(child) {
+                    Some(find_signed_delta_project(child))
+                } else {
+                    None
+                }
+            })
+            .expect("expected signed aggregate projection")
+    }
+
+    fn contains_signed_delta_project(plan: &LogicalPlanNode) -> bool {
+        matches!(
+            &plan.kind,
+            PlanNodeKind::Project(_)
+                if matches!(
+                    &plan.unary_input().kind,
+                    PlanNodeKind::Aggregate(LogicalAggregateNode { aggregates, .. })
+                        if aggregates.iter().any(|call| call.name.ends_with("_state_signed"))
+                )
+        ) || plan.children.iter().any(contains_signed_delta_project)
+    }
+
+    fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
+        matches!(
+            &plan.kind,
+            PlanNodeKind::Scan(LogicalScanNode {
+                table: TableDef {
+                    source: ScanSource::IcebergMvTargetState(_),
+                    ..
+                },
+                ..
+            })
+        ) || plan.children.iter().any(contains_target_state_scan)
     }
 
     fn assert_join_delta_union_shape(union_plan: &LogicalPlanNode, signed_action_id: ColumnId) {

@@ -57,7 +57,7 @@ INSERT INTO imv_agg_cut_${uuid0}.ns_${uuid0}.orders VALUES
 
 -- query 4
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergMvTargetState
 -- @explain_contains=count_state_signed
 -- @explain_contains=sum_state_signed

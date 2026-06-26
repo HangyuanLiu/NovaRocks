@@ -74,7 +74,7 @@ INSERT INTO ice_ivm_fanin_${uuid0}.ns_${uuid0}.fact_west VALUES
 
 -- query 5
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergMvTargetState
 REFRESH MATERIALIZED VIEW fanin_mv_${uuid0};
 

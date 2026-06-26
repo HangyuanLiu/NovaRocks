@@ -111,6 +111,24 @@ impl ColumnRefFactory {
         id
     }
 
+    /// Reserve all ids below `next_id` so future `create()` calls cannot
+    /// collide with ids allocated by a rewrite stage that manages its own
+    /// column counter.
+    pub fn reserve_until(&mut self, next_id: u32) {
+        let next_id = next_id.max(1);
+        while self.next_id < next_id {
+            let id = ColumnId(self.next_id);
+            self.next_id += 1;
+            self.columns.push(ColumnMeta {
+                id,
+                name: format!("__reserved_col_{}", id.0),
+                qualifier: None,
+                data_type: DataType::Null,
+                nullable: true,
+            });
+        }
+    }
+
     /// Look up metadata for a previously allocated [`ColumnId`].
     ///
     /// # Panics
@@ -157,5 +175,27 @@ impl ColumnRefFactory {
 impl Default for ColumnRefFactory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserve_until_advances_future_allocations_without_sparse_metadata() {
+        let mut factory = ColumnRefFactory::new();
+        let first = factory.create(None, "a".to_string(), DataType::Int64, false);
+        assert_eq!(first, ColumnId(1));
+
+        factory.reserve_until(5);
+
+        assert_eq!(factory.peek_next_id(), 5);
+        assert_eq!(factory.len(), 4);
+        assert_eq!(factory.column_name(ColumnId(3)), "__reserved_col_3");
+
+        let next = factory.create(None, "b".to_string(), DataType::Utf8, true);
+        assert_eq!(next, ColumnId(5));
+        assert_eq!(factory.column_name(next), "b");
     }
 }

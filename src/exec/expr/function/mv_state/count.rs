@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BinaryBuilder, BooleanBuilder, Int64Builder};
+use arrow::array::{Array, ArrayRef, BinaryBuilder, BooleanBuilder, Int64Array, Int64Builder};
 
 use crate::connector::starrocks::table::state_codec::{decode_count_state, encode_count_state};
 use crate::exec::chunk::Chunk;
@@ -120,9 +120,27 @@ pub(crate) fn eval_count_state_visible_array(input: &ArrayRef) -> Result<ArrayRe
 
 pub(crate) fn eval_state_all_zero_array(input: &ArrayRef) -> Result<ArrayRef, String> {
     let mut builder = BooleanBuilder::new();
-    for row in 0..input.len() {
-        let state = binary_value_or_empty(input, row, "state_all_zero", 0)?;
-        builder.append_value(state_all_zero(state)?);
+    match input.data_type() {
+        arrow::datatypes::DataType::Binary | arrow::datatypes::DataType::LargeBinary => {
+            for row in 0..input.len() {
+                let state = binary_value_or_empty(input, row, "state_all_zero", 0)?;
+                builder.append_value(state_all_zero(state)?);
+            }
+        }
+        arrow::datatypes::DataType::Int64 => {
+            let counts = input
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "state_all_zero downcast Int64Array failed for arg 0".to_string())?;
+            for row in 0..input.len() {
+                builder.append_value(counts.is_null(row) || counts.value(row) == 0);
+            }
+        }
+        other => {
+            return Err(format!(
+                "state_all_zero expects Binary, LargeBinary, or Int64 input for arg 0, got {other:?}"
+            ));
+        }
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -215,6 +233,18 @@ mod tests {
 
         assert!(arr.value(0));
         assert!(arr.value(1));
+    }
+
+    #[test]
+    fn state_all_zero_accepts_int64_retraction_count() {
+        let input = Arc::new(Int64Array::from(vec![Some(0), Some(2), Some(-1), None]));
+        let out = eval_state_all_zero_array(&(input as ArrayRef)).unwrap();
+        let arr = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+
+        assert!(arr.value(0));
+        assert!(!arr.value(1));
+        assert!(!arr.value(2));
+        assert!(arr.value(3));
     }
 
     #[test]

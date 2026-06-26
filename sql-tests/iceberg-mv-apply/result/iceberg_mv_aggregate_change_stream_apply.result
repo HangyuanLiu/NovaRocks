@@ -1,0 +1,65 @@
+-- query 3
+region	c	s
+east	2	0
+west	1	5
+
+-- query 4
+region	c	s
+east	2	0
+west	1	5
+
+-- query 7
+region	c	s
+east	3	0
+north	1	7
+
+-- query 8
+region	c	s
+east	3	0
+north	1	7
+
+-- query 9
+region	c	s
+east	1	100
+west	1	50
+
+-- query 10
+region	c	s
+east	1	100
+west	1	50
+
+-- query 13
+region	c	s
+north	1	100
+south	1	70
+
+-- query 14
+region	c	s
+north	1	100
+south	1	70
+
+-- query 15
+region	c	s
+k1	1	10
+k1	1	100
+k2	1	5
+k3	1	7
+
+-- query 16
+region	c	s
+k1	1	10
+k1	1	100
+k2	1	5
+k3	1	7
+
+-- query 19
+region	c	s
+k1	2	60
+k2	1	5
+k3	1	7
+
+-- query 20
+region	c	s
+k1	2	60
+k2	1	5
+k3	1	7

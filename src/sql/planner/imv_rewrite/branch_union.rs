@@ -1,20 +1,19 @@
 use arrow::datatypes::DataType;
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN;
-use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
+use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
-use crate::sql::planner::imv_rewrite::join_delta::plan_output_columns;
 use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{
-    LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanNode, LogicalProjectNode,
-    LogicalUnionNode, PlanNodeKind,
+    LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanNode, LogicalUnionNode, PlanNodeKind,
 };
 
 pub(crate) struct RewriteBranchUnionRule;
@@ -86,7 +85,6 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                 );
             }
 
-            let output_columns = union.output_columns;
             for branch in &inputs {
                 if !is_branch_union_aggregate_branch(branch) {
                     return Err(format!(
@@ -102,7 +100,7 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                     "RewriteBranchUnion requires ImvExtension in RewriteContext".to_string()
                 })?
                 .clone();
-            let branch_id_column = ext.allocate_column_id();
+            let output_columns = branch_union_aggregate_change_stream_output_columns(&ext)?;
             let mut rewritten_inputs = Vec::with_capacity(inputs.len());
             for (idx, branch) in inputs.into_iter().enumerate() {
                 let branch_id = i32::try_from(idx)
@@ -138,19 +136,13 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                     vec![aggregate],
                     None,
                 );
-                let rewritten = match branch.post_project {
-                    Some(project) => {
-                        append_branch_id_to_project(project, core, branch_id, branch_id_column)
-                    }
-                    None => append_branch_id_project(core, branch_id, branch_id_column),
-                }?;
-                rewritten_inputs.push(rewritten);
+                rewritten_inputs.push(core);
             }
 
             Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
                 PlanNodeKind::Union(LogicalUnionNode {
                     all: true,
-                    output_columns: branch_union_output_columns(output_columns, branch_id_column),
+                    output_columns,
                 }),
                 rewritten_inputs,
                 required_output_columns,
@@ -163,12 +155,6 @@ struct BranchUnionAggregateBranch {
     aggregate: LogicalAggregateNode,
     aggregate_input: LogicalPlanNode,
     aggregate_required_output_columns: Option<std::collections::HashSet<ColumnId>>,
-    post_project: Option<BranchUnionAggregateProject>,
-}
-
-struct BranchUnionAggregateProject {
-    items: Vec<ProjectItem>,
-    output_qualifier: Option<String>,
 }
 
 fn is_branch_union_aggregate_branch(plan: &LogicalPlanNode) -> bool {
@@ -194,13 +180,9 @@ fn extract_branch_union_aggregate_branch(
             aggregate,
             aggregate_input: single_child(&mut children)?,
             aggregate_required_output_columns: required_output_columns,
-            post_project: None,
         }),
         PlanNodeKind::Project(project) => {
-            let LogicalProjectNode {
-                items,
-                output_qualifier,
-            } = project;
+            let _ = project;
             let aggregate_plan = single_child(&mut children)?;
             let LogicalPlanNode {
                 kind,
@@ -214,10 +196,6 @@ fn extract_branch_union_aggregate_branch(
                 aggregate,
                 aggregate_input: single_child(&mut children)?,
                 aggregate_required_output_columns,
-                post_project: Some(BranchUnionAggregateProject {
-                    items,
-                    output_qualifier,
-                }),
             })
         }
         _ => None,
@@ -232,86 +210,49 @@ fn single_child(children: &mut Vec<LogicalPlanNode>) -> Option<LogicalPlanNode> 
     }
 }
 
-fn append_branch_id_to_project(
-    project: BranchUnionAggregateProject,
-    input: LogicalPlanNode,
-    branch_id: i32,
-    branch_id_column: ColumnId,
-) -> Result<LogicalPlanNode, String> {
-    let mut items = project.items;
-    items.push(branch_id_project_item(branch_id, branch_id_column));
-    Ok(LogicalPlanNode::new(
-        PlanNodeKind::Project(LogicalProjectNode {
-            items,
-            output_qualifier: project.output_qualifier,
-        }),
-        vec![input],
-        None,
-    ))
-}
-
-fn branch_id_project_item(branch_id: i32, branch_id_column: ColumnId) -> ProjectItem {
-    ProjectItem {
-        expr: TypedExpr {
-            kind: ExprKind::Cast {
-                expr: Box::new(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                }),
-                target: DataType::Int32,
-            },
-            data_type: DataType::Int32,
-            nullable: false,
+fn branch_union_aggregate_change_stream_output_columns(
+    ext: &ImvExtension,
+) -> Result<Vec<OutputColumn>, String> {
+    let (_shape, layout) = ext.mv_ctx.aggregate_shape_and_layout_for_execution()?;
+    let mut columns =
+        Vec::with_capacity(1 + layout.visible_columns.len() + layout.state_columns.len() + 2);
+    columns.push(OutputColumn {
+        column_id: ext.allocate_column_id(),
+        name: layout.row_id_column.column.name.clone(),
+        data_type: DataType::Utf8,
+        nullable: false,
+        is_internal: true,
+    });
+    columns.extend(layout.visible_columns.iter().map(|column| OutputColumn {
+        column_id: ext.allocate_column_id(),
+        name: column.name.clone(),
+        data_type: column.data_type.clone(),
+        nullable: column.nullable,
+        is_internal: false,
+    }));
+    columns.extend(layout.state_columns.iter().map(|column| OutputColumn {
+        column_id: ext.allocate_column_id(),
+        name: column.name.clone(),
+        data_type: match column.state_role {
+            crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::Single => {
+                DataType::Binary
+            }
+            crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::RetractionCount => {
+                column.data_type.clone()
+            }
         },
-        output_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
-        output_column_id: branch_id_column,
-    }
-}
-
-fn append_branch_id_project(
-    input: LogicalPlanNode,
-    branch_id: i32,
-    branch_id_column: ColumnId,
-) -> Result<LogicalPlanNode, String> {
-    let mut items = plan_output_columns(&input)?
-        .into_iter()
-        .map(|column| ProjectItem {
-            expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: column.column_id,
-                    qualifier: None,
-                    column: column.name.clone(),
-                },
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
-            },
-            output_name: column.name,
-            output_column_id: column.column_id,
-        })
-        .collect::<Vec<_>>();
-    items.push(branch_id_project_item(branch_id, branch_id_column));
-    Ok(LogicalPlanNode::new(
-        PlanNodeKind::Project(LogicalProjectNode {
-            items,
-            output_qualifier: None,
-        }),
-        vec![input],
-        None,
-    ))
-}
-fn branch_union_output_columns(
-    mut output_columns: Vec<OutputColumn>,
-    branch_id_column: ColumnId,
-) -> Vec<OutputColumn> {
-    output_columns.push(OutputColumn {
-        column_id: branch_id_column,
+        nullable: column.nullable,
+        is_internal: true,
+    }));
+    columns.push(OutputColumn {
+        column_id: ext.allocate_column_id(),
         name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
         data_type: DataType::Int32,
         nullable: false,
         is_internal: true,
     });
-    output_columns
+    columns.push(ImvActionColumn::output_column(ext.allocate_column_id()));
+    Ok(columns)
 }
 
 fn plan_kind(plan: &LogicalPlanNode) -> &'static str {
@@ -397,31 +338,7 @@ mod tests {
 
         assert_eq!(rewritten.children.len(), 2);
         for (idx, branch) in rewritten.children.iter().enumerate() {
-            let PlanNodeKind::Project(project) = &branch.kind else {
-                panic!("expected Project branch");
-            };
-            let branch_item = project
-                .items
-                .iter()
-                .find(|item| item.output_name.eq_ignore_ascii_case("__branch_id__"))
-                .expect("branch id item");
-            assert_branch_id_cast(branch_item, idx as i64);
-            let delta_plan = branch.unary_input();
-            let PlanNodeKind::ImvDelta(d) = &delta_plan.kind else {
-                panic!(
-                    "branch core must be a delegated ImvDelta, got {:?}",
-                    delta_plan
-                )
-            };
-            assert!(d.is_root, "branch sub-problem delta must be a root delta");
-            assert_eq!(
-                d.branch_scope.as_ref().map(|s| s.branch_id),
-                Some(idx as i32)
-            );
-            assert!(
-                matches!(&delta_plan.unary_input().kind, PlanNodeKind::Aggregate(_)),
-                "delta must sit directly over the Aggregate core"
-            );
+            assert_branch_scoped_delta(branch, idx as i32);
         }
     }
 
@@ -459,34 +376,7 @@ mod tests {
 
         assert_eq!(rewritten.children.len(), 2);
         for (idx, branch) in rewritten.children.iter().enumerate() {
-            let PlanNodeKind::Project(project) = &branch.kind else {
-                panic!("expected Project branch");
-            };
-            let delta_plan = branch.unary_input();
-            let PlanNodeKind::ImvDelta(d) = &delta_plan.kind else {
-                panic!(
-                    "branch core must be a delegated ImvDelta, got {:?}",
-                    delta_plan
-                )
-            };
-            assert!(d.is_root, "branch sub-problem delta must be a root delta");
-            assert_eq!(
-                d.branch_scope.as_ref().map(|s| s.branch_id),
-                Some(idx as i32)
-            );
-            assert!(
-                matches!(&delta_plan.unary_input().kind, PlanNodeKind::Aggregate(_)),
-                "delta must sit directly over the Aggregate core"
-            );
-            assert!(project.items.iter().any(|item| {
-                item.output_name == "total" && item.output_column_id == ColumnId::new_for_test(30)
-            }));
-            let branch_item = project
-                .items
-                .iter()
-                .find(|item| item.output_name.eq_ignore_ascii_case("__branch_id__"))
-                .expect("branch id item");
-            assert_branch_id_cast(branch_item, idx as i64);
+            assert_branch_scoped_delta(branch, idx as i32);
         }
     }
 
@@ -589,8 +479,9 @@ mod tests {
             &arena.borrow(),
         );
 
-        // Top is a Union whose branches each end in Project over AggregateStateMerge,
-        // carrying a __branch_id__ column, with no IMV marker left anywhere.
+        // Top is a Union whose branches are branch-scoped aggregate
+        // change-streams carrying __branch_id__ and __change_op, with no IMV
+        // marker left anywhere.
         assert!(
             !plan_contains_imv_marker(&out),
             "no marker may survive validation"
@@ -607,40 +498,96 @@ mod tests {
             "union output must expose __branch_id__"
         );
         for branch in &out.children {
-            let PlanNodeKind::Project(p) = &branch.kind else {
-                panic!("expected Project branch, got {branch:?}")
-            };
-            assert!(
-                matches!(
-                    &branch.unary_input().kind,
-                    PlanNodeKind::AggregateStateMerge(_)
-                ),
-                "expected Project over AggregateStateMerge, got {:?}",
-                branch.unary_input()
-            );
-            assert!(
-                p.items
-                    .iter()
-                    .any(|i| i.output_name.eq_ignore_ascii_case("__branch_id__")),
-                "branch Project must carry __branch_id__, items: {:?}",
-                p.items
-            );
+            assert_aggregate_change_stream_branch(branch);
         }
     }
 
-    fn assert_branch_id_cast(item: &ProjectItem, expected_branch_id: i64) {
-        assert_eq!(item.expr.data_type, DataType::Int32);
-        assert!(!item.expr.nullable);
-        let ExprKind::Cast { expr, target } = &item.expr.kind else {
-            panic!("expected branch id Cast, got {:?}", item.expr.kind);
+    fn assert_branch_scoped_delta(branch: &LogicalPlanNode, expected_branch_id: i32) {
+        let PlanNodeKind::ImvDelta(delta) = &branch.kind else {
+            panic!("branch core must be a delegated ImvDelta, got {branch:?}")
         };
-        assert_eq!(*target, DataType::Int32);
-        assert_eq!(expr.data_type, DataType::Int64);
-        assert!(!expr.nullable);
-        assert!(matches!(
-            &expr.kind,
-            ExprKind::Literal(LiteralValue::Int(value)) if *value == expected_branch_id
-        ));
+        assert!(
+            delta.is_root,
+            "branch sub-problem delta must be a root delta"
+        );
+        assert_eq!(
+            delta.branch_scope.as_ref().map(|s| s.branch_id),
+            Some(expected_branch_id)
+        );
+        assert!(
+            matches!(&branch.unary_input().kind, PlanNodeKind::Aggregate(_)),
+            "delta must sit directly over the Aggregate core"
+        );
+    }
+
+    fn assert_aggregate_change_stream_branch(branch: &LogicalPlanNode) {
+        let union = aggregate_change_stream_union(branch);
+        assert!(union.all);
+        assert!(
+            union
+                .output_columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case("__branch_id__")),
+            "change-stream branch output must expose __branch_id__"
+        );
+        assert!(
+            union
+                .output_columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
+            "change-stream branch output must expose __change_op"
+        );
+        assert!(
+            contains_target_state_scan(branch),
+            "change-stream branch must read old target state"
+        );
+        assert!(
+            contains_signed_state_aggregate(branch),
+            "change-stream branch must contain signed state aggregate"
+        );
+        assert!(
+            !contains_aggregate_state_merge(branch),
+            "relation cutover must not emit AggregateStateMerge"
+        );
+    }
+
+    fn aggregate_change_stream_union(branch: &LogicalPlanNode) -> &LogicalUnionNode {
+        match &branch.kind {
+            PlanNodeKind::Union(union) => union,
+            PlanNodeKind::CTEAnchor(_) => {
+                let PlanNodeKind::Union(union) = &branch.child(1).kind else {
+                    panic!("expected CTEAnchor consumer to be aggregate change-stream Union");
+                };
+                union
+            }
+            other => panic!("expected aggregate change-stream Union branch, got {other:?}"),
+        }
+    }
+
+    fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
+        matches!(
+            &plan.kind,
+            PlanNodeKind::Scan(LogicalScanNode {
+                table: TableDef {
+                    source: ScanSource::IcebergMvTargetState(_),
+                    ..
+                },
+                ..
+            })
+        ) || plan.children.iter().any(contains_target_state_scan)
+    }
+
+    fn contains_signed_state_aggregate(plan: &LogicalPlanNode) -> bool {
+        matches!(
+            &plan.kind,
+            PlanNodeKind::Aggregate(LogicalAggregateNode { aggregates, .. })
+                if aggregates.iter().any(|call| call.name.ends_with("_state_signed"))
+        ) || plan.children.iter().any(contains_signed_state_aggregate)
+    }
+
+    fn contains_aggregate_state_merge(plan: &LogicalPlanNode) -> bool {
+        matches!(&plan.kind, PlanNodeKind::AggregateStateMerge(_))
+            || plan.children.iter().any(contains_aggregate_state_merge)
     }
 
     fn single_state_column(type_signature: &str) -> AggregateStateColumnContract {
@@ -1080,24 +1027,7 @@ mod tests {
             "union output must expose __branch_id__"
         );
         for branch in &out.children {
-            let PlanNodeKind::Project(p) = &branch.kind else {
-                panic!("expected Project branch, got {branch:?}")
-            };
-            assert!(
-                matches!(
-                    &branch.unary_input().kind,
-                    PlanNodeKind::AggregateStateMerge(_)
-                ),
-                "Project-over-Aggregate branch must land on AggregateStateMerge, got {:?}",
-                branch.unary_input()
-            );
-            assert!(
-                p.items
-                    .iter()
-                    .any(|i| i.output_name.eq_ignore_ascii_case("__branch_id__")),
-                "branch Project must carry __branch_id__, items: {:?}",
-                p.items
-            );
+            assert_aggregate_change_stream_branch(branch);
         }
     }
 

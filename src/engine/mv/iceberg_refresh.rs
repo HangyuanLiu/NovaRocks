@@ -10068,14 +10068,14 @@ fn validate_aggregate_refresh_rewrite_outcome(
             target_fqn_string(&ctx.target)
         ));
     }
-    if !logical_plan_contains_aggregate_state_merge(&outcome.plan) {
+    if !logical_plan_contains_aggregate_change_stream(&outcome.plan) {
         let label = match evidence {
             RewriteMergeRefreshEvidence::JoinAggregate => "join aggregate",
             RewriteMergeRefreshEvidence::BranchUnionAggregate => "branch UNION ALL aggregate",
             _ => "aggregate",
         };
         return Err(format!(
-            "iceberg {label} MV {} incremental refresh rewrite plan does not contain AggregateStateMerge",
+            "iceberg {label} MV {} incremental refresh rewrite plan does not contain aggregate state change stream",
             target_fqn_string(&ctx.target)
         ));
     }
@@ -10101,16 +10101,107 @@ fn rewrite_outcome_rule_changed(
     })
 }
 
-fn logical_plan_contains_aggregate_state_merge(
+fn logical_plan_contains_aggregate_change_stream(
     plan: &crate::sql::planner::plan::LogicalPlanNode,
 ) -> bool {
+    let is_change_stream_union = match &plan.kind {
+        crate::sql::planner::plan::PlanNodeKind::Union(union) => {
+            union.output_columns.iter().any(|column| {
+                column
+                    .name
+                    .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+            }) && logical_plan_contains_signed_state_aggregate(plan)
+        }
+        crate::sql::planner::plan::PlanNodeKind::CTEAnchor(_) if plan.children.len() == 2 => {
+            logical_plan_is_change_stream_union(plan.child(1))
+                && logical_plan_contains_signed_state_aggregate(plan.child(0))
+        }
+        crate::sql::planner::plan::PlanNodeKind::Project(_) => {
+            logical_plan_is_branch_marker_change_stream(plan)
+        }
+        _ => false,
+    };
+    is_change_stream_union
+        || plan
+            .children
+            .iter()
+            .any(logical_plan_contains_aggregate_change_stream)
+}
+
+fn logical_plan_is_change_stream_union(plan: &crate::sql::planner::plan::LogicalPlanNode) -> bool {
     matches!(
         &plan.kind,
-        crate::sql::planner::plan::PlanNodeKind::AggregateStateMerge(_)
-    ) || plan
-        .children
-        .iter()
-        .any(logical_plan_contains_aggregate_state_merge)
+        crate::sql::planner::plan::PlanNodeKind::Union(union)
+            if union.output_columns.iter().any(|column| {
+                column
+                    .name
+                    .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+            })
+    )
+}
+
+fn logical_plan_is_branch_marker_change_stream(
+    plan: &crate::sql::planner::plan::LogicalPlanNode,
+) -> bool {
+    let crate::sql::planner::plan::PlanNodeKind::Project(project) = &plan.kind else {
+        return false;
+    };
+    if !project.items.iter().any(|item| {
+        item.output_name
+            .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+    }) {
+        return false;
+    }
+    let filter = plan.unary_input();
+    if !matches!(
+        &filter.kind,
+        crate::sql::planner::plan::PlanNodeKind::Filter(_)
+    ) {
+        return false;
+    }
+    let expanded = filter.unary_input();
+    let crate::sql::planner::plan::PlanNodeKind::Join(join) = &expanded.kind else {
+        return false;
+    };
+    if join.join_type != crate::sql::analysis::JoinKind::Cross || expanded.children.len() != 2 {
+        return false;
+    }
+    let left = expanded.left();
+    let right = expanded.right();
+    let core = if logical_plan_is_change_branch_values(left) {
+        right
+    } else if logical_plan_is_change_branch_values(right) {
+        left
+    } else {
+        return false;
+    };
+    logical_plan_contains_signed_state_aggregate(core)
+}
+
+fn logical_plan_is_change_branch_values(plan: &crate::sql::planner::plan::LogicalPlanNode) -> bool {
+    matches!(
+        &plan.kind,
+        crate::sql::planner::plan::PlanNodeKind::Values(values)
+            if values
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case("__imv_change_branch"))
+    )
+}
+
+fn logical_plan_contains_signed_state_aggregate(
+    plan: &crate::sql::planner::plan::LogicalPlanNode,
+) -> bool {
+    match &plan.kind {
+        crate::sql::planner::plan::PlanNodeKind::Aggregate(node) => node
+            .aggregates
+            .iter()
+            .any(|call| call.name.ends_with("_state_signed")),
+        _ => plan
+            .children
+            .iter()
+            .any(logical_plan_contains_signed_state_aggregate),
+    }
 }
 
 #[cfg(test)]
@@ -10295,12 +10386,19 @@ mod partition_planning_tests {
 mod aggregate_refresh_rewrite_validation_tests {
     use super::*;
 
+    use arrow::datatypes::DataType;
+
+    use crate::sql::analysis::{
+        ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
     use crate::sql::optimizer::rewrite::trace::RewriteTrace;
     use crate::sql::planner::imv_rewrite::annotation::ImvPlanAnnotation;
     use crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome;
     use crate::sql::planner::plan::{
-        LogicalAggregateStateMergeNode, LogicalPlanNode, LogicalValuesNode, PlanNodeKind,
+        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,
+        LogicalProjectNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,
     };
 
     fn empty_values_plan() -> LogicalPlanNode {
@@ -10314,15 +10412,113 @@ mod aggregate_refresh_rewrite_validation_tests {
         )
     }
 
-    fn aggregate_state_merge_plan() -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            PlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
-                group_key_names: Vec::new(),
-                aggregate_state_names: Vec::new(),
-                change_op_column: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+    fn aggregate_change_stream_plan() -> LogicalPlanNode {
+        let signed = LogicalPlanNode::new(
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: Vec::new(),
+                aggregates: vec![AggregateCall {
+                    name: "sum_state_signed".to_string(),
+                    args: vec![TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(1)),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    }],
+                    distinct: false,
+                    result_type: DataType::Binary,
+                    order_by: Vec::new(),
+                    output_column_id: ColumnId::new_for_test(2),
+                }],
                 output_columns: Vec::new(),
+                already_pushed: false,
             }),
-            vec![empty_values_plan(), empty_values_plan()],
+            vec![empty_values_plan()],
+            None,
+        );
+        LogicalPlanNode::new(
+            PlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId::new_for_test(1),
+                    name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                    data_type: DataType::Int8,
+                    nullable: false,
+                    is_internal: true,
+                }],
+            }),
+            vec![signed],
+            None,
+        )
+    }
+
+    fn branch_marker_change_stream_plan() -> LogicalPlanNode {
+        let signed = LogicalPlanNode::new(
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: Vec::new(),
+                aggregates: vec![AggregateCall {
+                    name: "sum_state_signed".to_string(),
+                    args: vec![TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(1)),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    }],
+                    distinct: false,
+                    result_type: DataType::Binary,
+                    order_by: Vec::new(),
+                    output_column_id: ColumnId::new_for_test(2),
+                }],
+                output_columns: Vec::new(),
+                already_pushed: false,
+            }),
+            vec![empty_values_plan()],
+            None,
+        );
+        let branch = LogicalPlanNode::new(
+            PlanNodeKind::Values(LogicalValuesNode {
+                rows: Vec::new(),
+                columns: vec![OutputColumn {
+                    column_id: ColumnId::new_for_test(3),
+                    name: "__imv_change_branch".to_string(),
+                    data_type: DataType::Int8,
+                    nullable: false,
+                    is_internal: true,
+                }],
+            }),
+            vec![],
+            None,
+        );
+        let expanded = LogicalPlanNode::new(
+            PlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Cross,
+                condition: None,
+            }),
+            vec![signed, branch],
+            None,
+        );
+        let filtered = LogicalPlanNode::new(
+            PlanNodeKind::Filter(LogicalFilterNode {
+                predicate: TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Bool(true)),
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                },
+            }),
+            vec![expanded],
+            None,
+        );
+        LogicalPlanNode::new(
+            PlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(1)),
+                        data_type: DataType::Int8,
+                        nullable: false,
+                    },
+                    output_name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                    output_column_id: ColumnId::new_for_test(1),
+                }],
+                output_qualifier: None,
+            }),
+            vec![filtered],
             None,
         )
     }
@@ -10336,6 +10532,7 @@ mod aggregate_refresh_rewrite_validation_tests {
             plan,
             trace,
             annotation: ImvPlanAnnotation::default(),
+            next_column_id: 1,
         }
     }
 
@@ -10367,10 +10564,10 @@ mod aggregate_refresh_rewrite_validation_tests {
             &outcome,
             RewriteMergeRefreshEvidence::Aggregate,
         )
-        .expect_err("aggregate refresh must require AggregateStateMerge in the rewrite plan");
+        .expect_err("aggregate refresh must require change stream in the rewrite plan");
 
         assert!(
-            err.contains("does not contain AggregateStateMerge"),
+            err.contains("does not contain aggregate state change stream"),
             "got: {err}"
         );
     }
@@ -10378,7 +10575,7 @@ mod aggregate_refresh_rewrite_validation_tests {
     #[test]
     fn join_aggregate_refresh_rejects_missing_join_rewrite_evidence() {
         let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
-        let outcome = outcome(aggregate_state_merge_plan(), &["RewriteAggregateState"]);
+        let outcome = outcome(aggregate_change_stream_plan(), &["RewriteAggregateState"]);
 
         let err = validate_aggregate_refresh_rewrite_outcome(
             &ctx,
@@ -10403,11 +10600,11 @@ mod aggregate_refresh_rewrite_validation_tests {
             &outcome,
             RewriteMergeRefreshEvidence::JoinAggregate,
         )
-        .expect_err("join aggregate refresh must require AggregateStateMerge in the rewrite plan");
+        .expect_err("join aggregate refresh must require change stream in the rewrite plan");
 
         assert!(
             err.contains("iceberg join aggregate MV")
-                && err.contains("does not contain AggregateStateMerge"),
+                && err.contains("does not contain aggregate state change stream"),
             "got: {err}"
         );
     }
@@ -10415,7 +10612,7 @@ mod aggregate_refresh_rewrite_validation_tests {
     #[test]
     fn branch_union_aggregate_refresh_rejects_missing_branch_union_rewrite_evidence() {
         let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
-        let outcome = outcome(aggregate_state_merge_plan(), &["RewriteAggregateState"]);
+        let outcome = outcome(aggregate_change_stream_plan(), &["RewriteAggregateState"]);
 
         let err = validate_aggregate_refresh_rewrite_outcome(
             &ctx,
@@ -10441,21 +10638,19 @@ mod aggregate_refresh_rewrite_validation_tests {
             &outcome,
             RewriteMergeRefreshEvidence::BranchUnionAggregate,
         )
-        .expect_err(
-            "branch UNION ALL aggregate refresh must require AggregateStateMerge plan evidence",
-        );
+        .expect_err("branch UNION ALL aggregate refresh must require change-stream plan evidence");
 
         assert!(
             err.contains("iceberg branch UNION ALL aggregate MV")
-                && err.contains("does not contain AggregateStateMerge"),
+                && err.contains("does not contain aggregate state change stream"),
             "got: {err}"
         );
     }
 
     #[test]
-    fn branch_union_aggregate_refresh_accepts_branch_rewrite_with_state_merge_plan() {
+    fn branch_union_aggregate_refresh_accepts_branch_rewrite_with_change_stream_plan() {
         let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
-        let outcome = outcome(aggregate_state_merge_plan(), &["RewriteBranchUnion"]);
+        let outcome = outcome(aggregate_change_stream_plan(), &["RewriteBranchUnion"]);
 
         validate_aggregate_refresh_rewrite_outcome(
             &ctx,
@@ -10463,7 +10658,25 @@ mod aggregate_refresh_rewrite_validation_tests {
             RewriteMergeRefreshEvidence::BranchUnionAggregate,
         )
         .expect(
-            "branch UNION ALL aggregate refresh should accept branch rewrite with aggregate-state plan evidence",
+            "branch UNION ALL aggregate refresh should accept branch rewrite with aggregate-state change-stream evidence",
+        );
+    }
+
+    #[test]
+    fn aggregate_refresh_accepts_branch_marker_change_stream_plan() {
+        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let outcome = outcome(
+            branch_marker_change_stream_plan(),
+            &["RewriteAggregateState"],
+        );
+
+        validate_aggregate_refresh_rewrite_outcome(
+            &ctx,
+            &outcome,
+            RewriteMergeRefreshEvidence::Aggregate,
+        )
+        .expect(
+            "aggregate refresh should accept branch-marker aggregate-state change-stream evidence",
         );
     }
 

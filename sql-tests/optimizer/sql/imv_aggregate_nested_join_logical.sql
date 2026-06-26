@@ -84,7 +84,7 @@ INSERT INTO imv_anj_cut_${uuid0}.ns_${uuid0}.fact VALUES
 
 -- query 4
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=UNION
 -- @explain_contains=IcebergVersionTable
 -- @explain_contains=sum_state_signed

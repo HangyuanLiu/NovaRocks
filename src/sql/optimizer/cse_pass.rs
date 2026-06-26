@@ -30,7 +30,23 @@ pub(crate) fn rewrite(
     if !options.is_enabled(CSE_RULE) {
         return;
     }
+    factory.reserve_until(max_existing_column_id(root).saturating_add(1));
     rewrite_node(root, scalars, factory);
+}
+
+fn max_existing_column_id(node: &PhysicalPlanNode) -> u32 {
+    let local = node
+        .output_columns
+        .iter()
+        .map(|column| column.column_id.0)
+        .max()
+        .unwrap_or(0);
+    node.children
+        .iter()
+        .map(max_existing_column_id)
+        .max()
+        .unwrap_or(0)
+        .max(local)
 }
 
 /// Post-order walk. Per-operator drivers are added in later tasks.
@@ -1680,6 +1696,53 @@ mod tests {
             vec![("a", false), ("b", false), ("__cse_0", true)]
         );
         assert_eq!(node.children[0].stats.output_row_count, 42.0);
+    }
+
+    #[test]
+    fn rewrite_reserves_factory_above_existing_plan_column_ids() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 1);
+        let b = col(&mut arena, 2);
+        let a_plus_b = add(&mut arena, a, b);
+        let doubled = add(&mut arena, a_plus_b, a_plus_b);
+        let child = values_node(vec![output_column(1, "a"), output_column(2, "b")]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items: vec![
+                    project_item(a_plus_b, 3, "x"),
+                    project_item(doubled, 4, "y"),
+                ],
+                output_qualifier: None,
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(3, "x"), output_column(4, "y")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::options::OptimizerOptions::default_settings(),
+        );
+
+        let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
+            panic!("expected inserted CSE project");
+        };
+        let cse_id = cse_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__cse_0")
+            .expect("CSE project item")
+            .output_column_id;
+        assert!(
+            cse_id.0 > 4,
+            "CSE output id {cse_id:?} must not collide with existing plan ids"
+        );
     }
 
     #[test]

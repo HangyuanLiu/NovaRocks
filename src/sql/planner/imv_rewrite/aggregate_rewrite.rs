@@ -4,7 +4,9 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 
-use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
+use crate::sql::analysis::{
+    BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr, UnOp,
+};
 use crate::sql::catalog::{
     ColumnDef, IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
 };
@@ -17,14 +19,14 @@ use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
-use crate::sql::planner::imv_rewrite::join_delta::plan_output_columns;
 use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
 use crate::sql::planner::imv_rewrite::target_state::build_target_state_scan_source;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{
-    AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalFilterNode,
-    LogicalImvDeltaNode, LogicalPlanNode, LogicalProjectNode, LogicalScanNode, PlanNodeKind,
+    AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalImvDeltaNode, LogicalJoinNode,
+    LogicalPlanNode, LogicalProjectNode, LogicalScanNode, LogicalValuesNode, PlanNodeKind,
 };
+use crate::sql::planner::plan_output_columns as planner_plan_output_columns;
 
 pub(crate) struct RewriteAggregateStateRule;
 
@@ -173,14 +175,13 @@ pub(crate) fn build_aggregate_state_merge(
         old_source,
         ext,
     );
-    let old_input = branch_scoped_old_input(old_scan, branch_scope, &aggregate_layout)?;
+    let old_input = branch_scoped_old_input(old_scan, branch_scope.clone(), &aggregate_layout)?;
 
     let action_column = match action_column {
         Some(action_column) => action_column,
         None => existing_delta_action_column(&aggregate_input)?
             .unwrap_or_else(|| ext.allocate_column_id()),
     };
-    let output_columns = aggregate.output_columns.clone();
     let signed_aggregate = signed_aggregate(
         aggregate,
         aggregate_input,
@@ -191,16 +192,13 @@ pub(crate) fn build_aggregate_state_merge(
         &aggregate_layout,
     )?;
 
-    Ok(LogicalPlanNode::new(
-        PlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
-            group_key_names,
-            aggregate_state_names,
-            change_op_column: ImvActionColumn::NAME.to_string(),
-            output_columns,
-        }),
-        vec![old_input, signed_aggregate],
-        None,
-    ))
+    build_relational_aggregate_change_stream(
+        old_input,
+        signed_aggregate,
+        branch_scope,
+        ext,
+        &aggregate_layout,
+    )
 }
 
 fn target_state_old_scan(
@@ -270,6 +268,668 @@ fn branch_scoped_old_input(
         vec![filtered],
         None,
     ))
+}
+
+fn build_relational_aggregate_change_stream(
+    old_input: LogicalPlanNode,
+    signed_delta: LogicalPlanNode,
+    branch_scope: Option<crate::sql::catalog::BranchScope>,
+    ext: &ImvExtension,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+) -> Result<LogicalPlanNode, String> {
+    let old_outputs = plan_output_columns(&old_input)?;
+    let delta_with_row_id = delta_state_with_row_id(signed_delta, layout, ext)?;
+    let delta_outputs = plan_output_columns(&delta_with_row_id)?;
+    let row_id_name = &layout.row_id_column.column.name;
+    let delta_row_id = find_output_column_by_name(&delta_outputs, row_id_name)?.clone();
+    let old_row_id = find_output_column_by_name(&old_outputs, row_id_name)?.clone();
+
+    let join = LogicalPlanNode::new(
+        PlanNodeKind::Join(LogicalJoinNode {
+            join_type: JoinKind::LeftOuter,
+            condition: Some(TypedExpr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(column_ref(&delta_row_id)),
+                    op: BinOp::Eq,
+                    right: Box::new(column_ref(&old_row_id)),
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            }),
+        }),
+        vec![delta_with_row_id, old_input],
+        None,
+    );
+    let output_columns = aggregate_change_stream_output_columns(layout, branch_scope.as_ref(), ext);
+    let branch_marker = change_branch_column(ext);
+    let branch_values = change_branch_values(branch_marker.clone());
+    let expanded = LogicalPlanNode::new(
+        PlanNodeKind::Join(LogicalJoinNode {
+            join_type: JoinKind::Cross,
+            condition: None,
+        }),
+        vec![join, branch_values],
+        None,
+    );
+    let expanded_outputs = plan_output_columns(&expanded)?;
+    let branch_marker = find_output_column_by_id(&expanded_outputs, branch_marker.column_id)?;
+    let old_row_id_join = find_output_column_by_id(&expanded_outputs, old_row_id.column_id)?;
+    let retraction_count = retraction_count_state_column(layout)?;
+    let merged_count = merged_state_expr(
+        retraction_count,
+        &expanded_outputs,
+        &delta_outputs,
+        &old_outputs,
+    )?;
+    let delete_predicate = bool_and(
+        branch_marker_eq(branch_marker, CHANGE_BRANCH_DELETE),
+        TypedExpr {
+            kind: ExprKind::IsNull {
+                expr: Box::new(column_ref(old_row_id_join)),
+                negated: true,
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        },
+    );
+    let insert_predicate = bool_and(
+        branch_marker_eq(branch_marker, CHANGE_BRANCH_INSERT),
+        TypedExpr {
+            kind: ExprKind::UnaryOp {
+                op: UnOp::Not,
+                expr: Box::new(TypedExpr {
+                    kind: ExprKind::FunctionCall {
+                        name: "state_all_zero".to_string(),
+                        args: vec![merged_count],
+                        distinct: false,
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        },
+    );
+    let filtered = LogicalPlanNode::new(
+        PlanNodeKind::Filter(LogicalFilterNode {
+            predicate: bool_or(delete_predicate, insert_predicate),
+        }),
+        vec![expanded],
+        None,
+    );
+    let filtered_outputs = plan_output_columns(&filtered)?;
+    aggregate_change_stream_project(
+        filtered,
+        &filtered_outputs,
+        &delta_outputs,
+        &old_outputs,
+        &output_columns,
+        branch_scope.as_ref(),
+        layout,
+    )
+}
+
+const CHANGE_BRANCH_DELETE: i8 = 0;
+const CHANGE_BRANCH_INSERT: i8 = 1;
+
+fn change_branch_column(ext: &ImvExtension) -> OutputColumn {
+    OutputColumn {
+        column_id: ext.allocate_column_id(),
+        name: "__imv_change_branch".to_string(),
+        data_type: DataType::Int8,
+        nullable: false,
+        is_internal: true,
+    }
+}
+
+fn change_branch_values(column: OutputColumn) -> LogicalPlanNode {
+    LogicalPlanNode::new(
+        PlanNodeKind::Values(LogicalValuesNode {
+            rows: vec![
+                vec![tinyint_literal(CHANGE_BRANCH_DELETE)],
+                vec![tinyint_literal(CHANGE_BRANCH_INSERT)],
+            ],
+            columns: vec![column],
+        }),
+        Vec::new(),
+        None,
+    )
+}
+
+fn branch_marker_eq(branch_marker: &OutputColumn, branch: i8) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::BinaryOp {
+            left: Box::new(column_ref(branch_marker)),
+            op: BinOp::Eq,
+            right: Box::new(tinyint_literal(branch)),
+        },
+        data_type: DataType::Boolean,
+        nullable: false,
+    }
+}
+
+fn tinyint_literal(value: i8) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::Cast {
+            expr: Box::new(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(value as i64)),
+                data_type: DataType::Int64,
+                nullable: false,
+            }),
+            target: DataType::Int8,
+        },
+        data_type: DataType::Int8,
+        nullable: false,
+    }
+}
+
+fn bool_and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::And,
+            right: Box::new(right),
+        },
+        data_type: DataType::Boolean,
+        nullable: false,
+    }
+}
+
+fn bool_or(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::Or,
+            right: Box::new(right),
+        },
+        data_type: DataType::Boolean,
+        nullable: false,
+    }
+}
+
+fn delta_state_with_row_id(
+    signed_delta: LogicalPlanNode,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    ext: &ImvExtension,
+) -> Result<LogicalPlanNode, String> {
+    let delta_outputs = plan_output_columns(&signed_delta)?;
+    let mut row_id_args = Vec::with_capacity(layout.group_key_source_indexes.len());
+    for &visible_source_index in &layout.group_key_source_indexes {
+        let visible = layout.visible_columns.get(visible_source_index).ok_or_else(|| {
+            format!(
+                "Iceberg IMV aggregate rewrite group key visible source index {visible_source_index} out of range"
+            )
+        })?;
+        row_id_args.push(column_ref(find_output_column_by_name(
+            &delta_outputs,
+            &visible.name,
+        )?));
+    }
+
+    let row_id_name = layout.row_id_column.column.name.clone();
+    let mut items = Vec::with_capacity(delta_outputs.len() + 1);
+    items.push(ProjectItem {
+        expr: TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: "mv_group_row_id".to_string(),
+                args: row_id_args,
+                distinct: false,
+            },
+            data_type: DataType::Utf8,
+            nullable: false,
+        },
+        output_name: row_id_name,
+        output_column_id: ext.allocate_column_id(),
+    });
+    for output in delta_outputs {
+        items.push(ProjectItem {
+            expr: column_ref(&output),
+            output_name: output.name.clone(),
+            output_column_id: output.column_id,
+        });
+    }
+
+    Ok(LogicalPlanNode::new(
+        PlanNodeKind::Project(LogicalProjectNode {
+            items,
+            output_qualifier: None,
+        }),
+        vec![signed_delta],
+        None,
+    ))
+}
+
+fn merged_state_expr(
+    state_column: &crate::connector::starrocks::table::mv_agg_state::AggregateStateColumn,
+    join_outputs: &[OutputColumn],
+    delta_outputs: &[OutputColumn],
+    old_outputs: &[OutputColumn],
+) -> Result<TypedExpr, String> {
+    use crate::connector::starrocks::table::mv_agg_state::AggregateStateRole;
+
+    let delta = find_output_column_by_name(delta_outputs, &state_column.name)?;
+    let delta = find_output_column_by_id(join_outputs, delta.column_id)?;
+    let old = find_output_column_by_name(old_outputs, &state_column.name)?;
+    let old = find_output_column_by_id(join_outputs, old.column_id)?;
+    match state_column.state_role {
+        AggregateStateRole::Single => Ok(TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: state_union_function(state_column.function)?.to_string(),
+                args: vec![column_ref(old), column_ref(delta)],
+                distinct: false,
+            },
+            data_type: DataType::Binary,
+            nullable: state_column.nullable,
+        }),
+        AggregateStateRole::RetractionCount => Ok(TypedExpr {
+            kind: ExprKind::Case {
+                operand: None,
+                when_then: vec![(
+                    TypedExpr {
+                        kind: ExprKind::IsNull {
+                            expr: Box::new(column_ref(old)),
+                            negated: false,
+                        },
+                        data_type: DataType::Boolean,
+                        nullable: false,
+                    },
+                    column_ref(delta),
+                )],
+                else_expr: Some(Box::new(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(column_ref(old)),
+                        op: BinOp::Add,
+                        right: Box::new(column_ref(delta)),
+                    },
+                    data_type: state_column.data_type.clone(),
+                    nullable: false,
+                })),
+            },
+            data_type: state_column.data_type.clone(),
+            nullable: false,
+        }),
+    }
+}
+
+fn aggregate_change_stream_project(
+    input: LogicalPlanNode,
+    input_outputs: &[OutputColumn],
+    delta_outputs: &[OutputColumn],
+    old_outputs: &[OutputColumn],
+    output_columns: &[OutputColumn],
+    branch_scope: Option<&crate::sql::catalog::BranchScope>,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+) -> Result<LogicalPlanNode, String> {
+    let branch_marker = find_output_column_by_name(input_outputs, "__imv_change_branch")?;
+    let mut items = Vec::with_capacity(output_columns.len());
+    for output in output_columns {
+        if output.name.eq_ignore_ascii_case(ImvActionColumn::NAME) {
+            items.push(ProjectItem {
+                expr: branch_case_expr(
+                    branch_marker,
+                    tinyint_literal(ImvActionColumn::DELETE_VALUE),
+                    tinyint_literal(ImvActionColumn::INSERT_VALUE),
+                    DataType::Int8,
+                    false,
+                ),
+                output_name: output.name.clone(),
+                output_column_id: output.column_id,
+            });
+            continue;
+        }
+        if let Some(scope) = branch_scope
+            && output
+                .name
+                .eq_ignore_ascii_case(&scope.branch_id_column_name)
+        {
+            items.push(ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(scope.branch_id as i64)),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                },
+                output_name: output.name.clone(),
+                output_column_id: output.column_id,
+            });
+            continue;
+        }
+
+        let delete_expr =
+            aggregate_delete_expr_for_output(input_outputs, old_outputs, output, layout)?;
+        let insert_expr = aggregate_insert_expr_for_output(
+            input_outputs,
+            delta_outputs,
+            old_outputs,
+            output,
+            layout,
+        )?;
+        items.push(ProjectItem {
+            expr: branch_case_expr(
+                branch_marker,
+                delete_expr,
+                insert_expr,
+                output.data_type.clone(),
+                output.nullable,
+            ),
+            output_name: output.name.clone(),
+            output_column_id: output.column_id,
+        });
+    }
+
+    Ok(LogicalPlanNode::new(
+        PlanNodeKind::Project(LogicalProjectNode {
+            items,
+            output_qualifier: None,
+        }),
+        vec![input],
+        None,
+    ))
+}
+
+fn aggregate_delete_expr_for_output(
+    input_outputs: &[OutputColumn],
+    old_outputs: &[OutputColumn],
+    output: &OutputColumn,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+) -> Result<TypedExpr, String> {
+    let row_id_name = &layout.row_id_column.column.name;
+    if output.name.eq_ignore_ascii_case(row_id_name) {
+        return source_expr_by_name(input_outputs, old_outputs, row_id_name);
+    }
+
+    for (visible_index, visible) in layout.visible_columns.iter().enumerate() {
+        if !output.name.eq_ignore_ascii_case(&visible.name) {
+            continue;
+        }
+        if layout
+            .group_key_source_indexes
+            .iter()
+            .any(|&idx| idx == visible_index)
+        {
+            return source_expr_by_name(input_outputs, old_outputs, &visible.name);
+        }
+        return Ok(typed_null(output.data_type.clone()));
+    }
+
+    for state_column in &layout.state_columns {
+        if output.name.eq_ignore_ascii_case(&state_column.name) {
+            return source_expr_by_name(input_outputs, old_outputs, &state_column.name);
+        }
+    }
+
+    Err(format!(
+        "Iceberg IMV aggregate rewrite cannot project delete-side change-stream output column {}",
+        output.name
+    ))
+}
+
+fn aggregate_insert_expr_for_output(
+    input_outputs: &[OutputColumn],
+    delta_outputs: &[OutputColumn],
+    old_outputs: &[OutputColumn],
+    output: &OutputColumn,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+) -> Result<TypedExpr, String> {
+    let row_id_name = &layout.row_id_column.column.name;
+    if output.name.eq_ignore_ascii_case(row_id_name) {
+        return source_expr_by_name(input_outputs, delta_outputs, row_id_name);
+    }
+
+    for (visible_index, visible) in layout.visible_columns.iter().enumerate() {
+        if !output.name.eq_ignore_ascii_case(&visible.name) {
+            continue;
+        }
+        if layout
+            .group_key_source_indexes
+            .iter()
+            .any(|&idx| idx == visible_index)
+        {
+            return source_expr_by_name(input_outputs, delta_outputs, &visible.name);
+        }
+        let state_column = single_state_column_for_visible(layout, visible_index)?;
+        let merged_state =
+            merged_state_expr(state_column, input_outputs, delta_outputs, old_outputs)?;
+        return Ok(TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: visible_state_function(state_column.function)?.to_string(),
+                args: vec![merged_state],
+                distinct: false,
+            },
+            data_type: visible.data_type.clone(),
+            nullable: visible.nullable,
+        });
+    }
+
+    for state_column in &layout.state_columns {
+        if output.name.eq_ignore_ascii_case(&state_column.name) {
+            return merged_state_expr(state_column, input_outputs, delta_outputs, old_outputs);
+        }
+    }
+
+    Err(format!(
+        "Iceberg IMV aggregate rewrite cannot project change-stream output column {}",
+        output.name
+    ))
+}
+
+fn typed_null(data_type: DataType) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::Null),
+        data_type,
+        nullable: true,
+    }
+}
+
+fn source_expr_by_name(
+    input_outputs: &[OutputColumn],
+    source_outputs: &[OutputColumn],
+    name: &str,
+) -> Result<TypedExpr, String> {
+    let source = find_output_column_by_name(source_outputs, name)?;
+    let input_output = find_output_column_by_id(input_outputs, source.column_id)?;
+    Ok(column_ref(input_output))
+}
+
+fn branch_case_expr(
+    branch_marker: &OutputColumn,
+    delete_expr: TypedExpr,
+    insert_expr: TypedExpr,
+    data_type: DataType,
+    nullable: bool,
+) -> TypedExpr {
+    let delete_expr = branch_case_arm_expr(delete_expr, &data_type);
+    let insert_expr = branch_case_arm_expr(insert_expr, &data_type);
+    TypedExpr {
+        kind: ExprKind::Case {
+            operand: None,
+            when_then: vec![(
+                branch_marker_eq(branch_marker, CHANGE_BRANCH_DELETE),
+                delete_expr,
+            )],
+            else_expr: Some(Box::new(insert_expr)),
+        },
+        data_type,
+        nullable,
+    }
+}
+
+fn branch_case_arm_expr(expr: TypedExpr, target: &DataType) -> TypedExpr {
+    if !branch_case_requires_runtime_cast(target) && expr.data_type == *target {
+        return expr;
+    }
+    let nullable = expr.nullable;
+    TypedExpr {
+        kind: ExprKind::Cast {
+            expr: Box::new(expr),
+            target: target.clone(),
+        },
+        data_type: target.clone(),
+        nullable,
+    }
+}
+
+fn branch_case_requires_runtime_cast(target: &DataType) -> bool {
+    matches!(target, DataType::Utf8 | DataType::LargeUtf8)
+}
+
+fn aggregate_change_stream_output_columns(
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    branch_scope: Option<&crate::sql::catalog::BranchScope>,
+    ext: &ImvExtension,
+) -> Vec<OutputColumn> {
+    let mut columns = Vec::with_capacity(
+        1 + layout.visible_columns.len()
+            + layout.state_columns.len()
+            + usize::from(branch_scope.is_some())
+            + 1,
+    );
+    columns.push(OutputColumn {
+        column_id: ext.allocate_column_id(),
+        name: layout.row_id_column.column.name.clone(),
+        data_type: DataType::Utf8,
+        nullable: false,
+        is_internal: true,
+    });
+    columns.extend(layout.visible_columns.iter().map(|column| OutputColumn {
+        column_id: ext.allocate_column_id(),
+        name: column.name.clone(),
+        data_type: column.data_type.clone(),
+        nullable: column.nullable,
+        is_internal: false,
+    }));
+    columns.extend(layout.state_columns.iter().map(|column| OutputColumn {
+        column_id: ext.allocate_column_id(),
+        name: column.name.clone(),
+        data_type: state_shaped_state_data_type(column),
+        nullable: column.nullable,
+        is_internal: true,
+    }));
+    if let Some(scope) = branch_scope {
+        columns.push(OutputColumn {
+            column_id: ext.allocate_column_id(),
+            name: scope.branch_id_column_name.clone(),
+            data_type: DataType::Int32,
+            nullable: false,
+            is_internal: true,
+        });
+    }
+    columns.push(ImvActionColumn::output_column(ext.allocate_column_id()));
+    columns
+}
+
+fn column_ref(column: &OutputColumn) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id: column.column_id,
+            qualifier: None,
+            column: column.name.clone(),
+        },
+        data_type: column.data_type.clone(),
+        nullable: column.nullable,
+    }
+}
+
+fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputColumn>, String> {
+    match &plan.kind {
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
+            plan_output_columns(plan.unary_input())
+        }
+        _ => planner_plan_output_columns(plan),
+    }
+}
+
+fn find_output_column_by_id(
+    outputs: &[OutputColumn],
+    column_id: ColumnId,
+) -> Result<&OutputColumn, String> {
+    outputs
+        .iter()
+        .find(|column| column.column_id == column_id)
+        .ok_or_else(|| {
+            format!("Iceberg IMV aggregate rewrite missing output column id {column_id:?}")
+        })
+}
+
+fn single_state_column_for_visible(
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    visible_index: usize,
+) -> Result<&crate::connector::starrocks::table::mv_agg_state::AggregateStateColumn, String> {
+    use crate::connector::starrocks::table::mv_agg_state::AggregateStateRole;
+
+    layout
+        .state_columns
+        .iter()
+        .find(|column| {
+            column.state_role == AggregateStateRole::Single
+                && column.visible_source_index == visible_index
+        })
+        .ok_or_else(|| {
+            format!(
+                "Iceberg IMV aggregate rewrite missing single state column for visible output index {visible_index}"
+            )
+        })
+}
+
+fn retraction_count_state_column(
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+) -> Result<&crate::connector::starrocks::table::mv_agg_state::AggregateStateColumn, String> {
+    use crate::connector::starrocks::table::mv_agg_state::AggregateStateRole;
+    use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
+
+    layout
+        .state_columns
+        .iter()
+        .find(|column| column.state_role == AggregateStateRole::RetractionCount)
+        .or_else(|| {
+            layout.state_columns.iter().find(|column| {
+                column.state_role == AggregateStateRole::Single
+                    && column.function == AggregateFunctionKind::Count
+                    && column.count_star
+            })
+        })
+        .ok_or_else(|| {
+            "Iceberg IMV aggregate rewrite requires a retraction-count or COUNT(*) state column"
+                .to_string()
+        })
+}
+
+fn state_union_function(
+    function: crate::connector::starrocks::table::mv_shape::AggregateFunctionKind,
+) -> Result<&'static str, String> {
+    use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
+
+    match function {
+        AggregateFunctionKind::Count => Ok("count_state_union"),
+        AggregateFunctionKind::Sum => Ok("sum_state_union"),
+        AggregateFunctionKind::Avg => Ok("avg_state_union"),
+        AggregateFunctionKind::Min => Ok("min_state_union"),
+        AggregateFunctionKind::Max => Ok("max_state_union"),
+        AggregateFunctionKind::BoolOr => Ok("bool_or_state_union"),
+        AggregateFunctionKind::BoolAnd => Ok("bool_and_state_union"),
+        other => Err(format!(
+            "Iceberg IMV aggregate rewrite does not support state union for {other:?}"
+        )),
+    }
+}
+
+fn visible_state_function(
+    function: crate::connector::starrocks::table::mv_shape::AggregateFunctionKind,
+) -> Result<&'static str, String> {
+    use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
+
+    match function {
+        AggregateFunctionKind::Count => Ok("count_state_visible"),
+        AggregateFunctionKind::Sum => Ok("sum_state_visible"),
+        AggregateFunctionKind::Avg => Ok("avg_state_visible"),
+        AggregateFunctionKind::Min => Ok("min_state_visible"),
+        AggregateFunctionKind::Max => Ok("max_state_visible"),
+        AggregateFunctionKind::BoolOr => Ok("bool_or_state_visible"),
+        AggregateFunctionKind::BoolAnd => Ok("bool_and_state_visible"),
+        other => Err(format!(
+            "Iceberg IMV aggregate rewrite does not support visible state for {other:?}"
+        )),
+    }
 }
 
 fn branch_scope_predicate(
@@ -1249,8 +1909,7 @@ mod tests {
         logical_plan_to_opt_expr, opt_expr_to_logical_plan,
     };
     use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalImvDeltaNode,
-        LogicalScanNode, LogicalUnionNode, PlanNodeKind,
+        AggregateCall, LogicalAggregateNode, LogicalImvDeltaNode, LogicalScanNode, PlanNodeKind,
     };
 
     #[test]
@@ -1628,19 +2287,160 @@ mod tests {
     }
 
     fn expect_changed_merge(result: RewriteResult, arena: &ScalarArena) -> LogicalPlanNode {
-        let RewriteResult::Changed(opt) = result else {
-            panic!("expected Changed(AggregateStateMerge)");
-        };
-        let plan = opt_expr_to_logical_plan(opt, arena);
-        assert!(matches!(&plan.kind, PlanNodeKind::AggregateStateMerge(_)));
+        let plan = expect_changed_plan(result, arena);
+        let _ = aggregate_change_stream_project(&plan);
+        assert!(
+            !plan_contains_aggregate_state_merge(&plan),
+            "aggregate IMV cutover must not emit AggregateStateMerge"
+        );
         plan
     }
 
-    fn merge_node(plan: &LogicalPlanNode) -> &LogicalAggregateStateMergeNode {
-        match &plan.kind {
-            PlanNodeKind::AggregateStateMerge(node) => node,
-            _ => unreachable!(),
+    fn aggregate_change_stream_project(plan: &LogicalPlanNode) -> &LogicalProjectNode {
+        let PlanNodeKind::Project(project) = &plan.kind else {
+            panic!(
+                "expected aggregate change-stream Project, got {:?}",
+                plan.kind
+            );
+        };
+        let PlanNodeKind::Filter(_) = &plan.unary_input().kind else {
+            panic!("expected aggregate change-stream Project over Filter");
+        };
+        project
+    }
+
+    fn aggregate_change_stream_filter(plan: &LogicalPlanNode) -> &LogicalFilterNode {
+        let project = aggregate_change_stream_project(plan);
+        let _ = project;
+        let filter_plan = plan.unary_input();
+        let PlanNodeKind::Filter(filter) = &filter_plan.kind else {
+            panic!("expected aggregate change-stream Filter");
+        };
+        filter
+    }
+
+    fn expect_changed_plan(result: RewriteResult, arena: &ScalarArena) -> LogicalPlanNode {
+        let RewriteResult::Changed(opt) = result else {
+            panic!("expected Changed logical plan");
+        };
+        opt_expr_to_logical_plan(opt, arena)
+    }
+
+    fn plan_contains_aggregate_state_merge(plan: &LogicalPlanNode) -> bool {
+        matches!(&plan.kind, PlanNodeKind::AggregateStateMerge(_))
+            || plan
+                .children
+                .iter()
+                .any(plan_contains_aggregate_state_merge)
+    }
+
+    fn find_target_state_scan(plan: &LogicalPlanNode) -> &LogicalScanNode {
+        if let PlanNodeKind::Scan(scan) = &plan.kind
+            && matches!(&scan.table.source, ScanSource::IcebergMvTargetState(_))
+        {
+            return scan;
         }
+        plan.children
+            .iter()
+            .find_map(|child| {
+                if contains_target_state_scan(child) {
+                    Some(find_target_state_scan(child))
+                } else {
+                    None
+                }
+            })
+            .expect("expected target-state scan")
+    }
+
+    fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
+        matches!(
+            &plan.kind,
+            PlanNodeKind::Scan(LogicalScanNode {
+                table: TableDef {
+                    source: ScanSource::IcebergMvTargetState(_),
+                    ..
+                },
+                ..
+            })
+        ) || plan.children.iter().any(contains_target_state_scan)
+    }
+
+    fn find_signed_delta_project(plan: &LogicalPlanNode) -> &LogicalPlanNode {
+        if let PlanNodeKind::Project(_) = &plan.kind
+            && matches!(
+                &plan.unary_input().kind,
+                PlanNodeKind::Aggregate(LogicalAggregateNode { aggregates, .. })
+                    if aggregates.iter().any(|call| call.name.ends_with("_state_signed"))
+            )
+        {
+            return plan;
+        }
+        plan.children
+            .iter()
+            .find_map(|child| {
+                if contains_signed_delta_project(child) {
+                    Some(find_signed_delta_project(child))
+                } else {
+                    None
+                }
+            })
+            .expect("expected signed aggregate projection")
+    }
+
+    fn contains_signed_delta_project(plan: &LogicalPlanNode) -> bool {
+        matches!(
+            &plan.kind,
+            PlanNodeKind::Project(_)
+                if matches!(
+                    &plan.unary_input().kind,
+                    PlanNodeKind::Aggregate(LogicalAggregateNode { aggregates, .. })
+                        if aggregates.iter().any(|call| call.name.ends_with("_state_signed"))
+                )
+        ) || plan.children.iter().any(contains_signed_delta_project)
+    }
+
+    fn find_branch_scoped_old_input(
+        plan: &LogicalPlanNode,
+    ) -> (&LogicalProjectNode, &LogicalFilterNode, &LogicalScanNode) {
+        if let PlanNodeKind::Project(project) = &plan.kind {
+            let filter_plan = plan.unary_input();
+            if let PlanNodeKind::Filter(filter) = &filter_plan.kind
+                && let PlanNodeKind::Scan(scan) = &filter_plan.unary_input().kind
+                && matches!(&scan.table.source, ScanSource::IcebergMvTargetState(_))
+            {
+                return (project, filter, scan);
+            }
+        }
+        plan.children
+            .iter()
+            .find_map(|child| {
+                if contains_branch_scoped_old_input(child) {
+                    Some(find_branch_scoped_old_input(child))
+                } else {
+                    None
+                }
+            })
+            .expect("expected branch-scoped old input")
+    }
+
+    fn contains_branch_scoped_old_input(plan: &LogicalPlanNode) -> bool {
+        matches!(
+            &plan.kind,
+            PlanNodeKind::Project(_)
+                if matches!(
+                    &plan.unary_input().kind,
+                    PlanNodeKind::Filter(_)
+                ) && matches!(
+                    &plan.unary_input().unary_input().kind,
+                    PlanNodeKind::Scan(LogicalScanNode {
+                        table: TableDef {
+                            source: ScanSource::IcebergMvTargetState(_),
+                            ..
+                        },
+                        ..
+                    })
+                )
+        ) || plan.children.iter().any(contains_branch_scoped_old_input)
     }
 
     fn delta(input: LogicalPlanNode) -> LogicalPlanNode {
@@ -1777,19 +2577,8 @@ mod tests {
             .apply(expr, &mut ctx)
             .expect("aggregate rewrite must succeed");
         let changed = expect_changed_merge(result, &arena_rc.borrow());
-        let merge = merge_node(&changed);
 
-        assert_eq!(merge.group_key_names, vec!["k"]);
-        assert_eq!(
-            merge.aggregate_state_names,
-            vec!["__agg_state_s", "__agg_state___ivm_row_count"]
-        );
-        assert_eq!(merge.change_op_column, "__change_op");
-        assert_eq!(merge.output_columns[1].name, "s");
-
-        let PlanNodeKind::Scan(old_scan) = &changed.left().kind else {
-            panic!("expected target-state scan");
-        };
+        let old_scan = find_target_state_scan(&changed);
         let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
             panic!("expected IcebergMvTargetState source");
         };
@@ -1800,7 +2589,7 @@ mod tests {
             vec!["__agg_state_s", "__agg_state___ivm_row_count"]
         );
 
-        let delta_input = changed.right();
+        let delta_input = find_signed_delta_project(&changed);
         let PlanNodeKind::Project(project) = &delta_input.kind else {
             panic!("expected signed aggregate projection delta input");
         };
@@ -1875,6 +2664,287 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_aggregate_state_builds_relational_change_stream() {
+        let rule = RewriteAggregateStateRule;
+        let mut ctx = build_ctx();
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(
+            &delta(aggregate_over(leaf_scan())),
+            &mut arena_rc.borrow_mut(),
+        );
+        let result = rule
+            .apply(expr, &mut ctx)
+            .expect("aggregate rewrite must succeed");
+        let changed = expect_changed_plan(result, &arena_rc.borrow());
+
+        assert_eq!(
+            count_plan_nodes(&changed, |plan| matches!(
+                &plan.kind,
+                PlanNodeKind::Join(LogicalJoinNode {
+                    join_type: JoinKind::LeftOuter,
+                    ..
+                })
+            )),
+            1,
+            "aggregate merge join must not be cloned into both change-stream branches"
+        );
+        assert_eq!(
+            count_plan_nodes(&changed, |plan| matches!(
+                &plan.kind,
+                PlanNodeKind::Join(LogicalJoinNode {
+                    join_type: JoinKind::Cross,
+                    ..
+                })
+            )),
+            1,
+            "change-stream branch marker must expand rows through one cross join"
+        );
+        assert_eq!(
+            count_plan_nodes(&changed, |plan| matches!(
+                &plan.kind,
+                PlanNodeKind::Values(_)
+            )),
+            1,
+            "change-stream branch marker must come from one VALUES source"
+        );
+        assert_eq!(
+            count_plan_nodes(&changed, |plan| matches!(
+                &plan.kind,
+                PlanNodeKind::CTEConsume(_)
+            )),
+            0,
+            "aggregate change-stream must not introduce a CTE fragment boundary"
+        );
+        assert!(matches!(
+            aggregate_change_stream_filter(&changed).predicate.kind,
+            ExprKind::BinaryOp { .. }
+        ));
+        assert!(
+            expr_contains_function(
+                &aggregate_change_stream_filter(&changed).predicate,
+                "state_all_zero"
+            ),
+            "change-stream filter must guard INSERT branches with state_all_zero"
+        );
+        assert!(
+            !plan_contains_aggregate_state_merge(&changed),
+            "aggregate IMV cutover must not emit AggregateStateMerge"
+        );
+        let project = aggregate_change_stream_project(&changed);
+        assert_eq!(
+            project
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "__row_id__",
+                "k",
+                "v",
+                "__agg_state_s",
+                "__agg_state___ivm_row_count",
+                "__change_op"
+            ]
+        );
+        for item in &project.items {
+            if branch_case_requires_runtime_cast(&item.expr.data_type) {
+                assert_branch_case_arms_cast_to_output_type(item);
+            }
+        }
+    }
+
+    #[test]
+    fn rewrite_aggregate_state_row_id_case_arms_keep_delta_and_old_ids() {
+        let rule = RewriteAggregateStateRule;
+        let mut ctx = build_ctx();
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(
+            &delta(aggregate_over(leaf_scan())),
+            &mut arena_rc.borrow_mut(),
+        );
+        let result = rule
+            .apply(expr, &mut ctx)
+            .expect("aggregate rewrite must succeed");
+        let changed = expect_changed_plan(result, &arena_rc.borrow());
+
+        let project = aggregate_change_stream_project(&changed);
+        let row_id_item = project
+            .items
+            .iter()
+            .find(|item| item.output_name.eq_ignore_ascii_case("__row_id__"))
+            .expect("expected row id output");
+        let filter_plan = changed.unary_input();
+        let expanded_plan = filter_plan.unary_input();
+        let left_join_plan = expanded_plan.left();
+        let delta_row_id = find_output_column_by_name(
+            &plan_output_columns(left_join_plan.left()).expect("delta outputs"),
+            "__row_id__",
+        )
+        .expect("delta row id")
+        .column_id;
+        let old_row_id = find_output_column_by_name(
+            &plan_output_columns(left_join_plan.right()).expect("old outputs"),
+            "__row_id__",
+        )
+        .expect("old row id")
+        .column_id;
+        let branch_marker = find_output_column_by_name(
+            &plan_output_columns(expanded_plan).expect("expanded outputs"),
+            "__imv_change_branch",
+        )
+        .expect("branch marker")
+        .column_id;
+
+        let (delete_row_id, insert_row_id) = case_arm_column_ids(&row_id_item.expr);
+        assert_eq!(
+            delete_row_id, old_row_id,
+            "DELETE branch must use the old target-state row id"
+        );
+        assert_eq!(
+            insert_row_id, delta_row_id,
+            "INSERT branch must use the delta group row id"
+        );
+        assert_ne!(
+            delete_row_id, branch_marker,
+            "DELETE row id must not bind to the branch marker"
+        );
+        assert_ne!(
+            insert_row_id, branch_marker,
+            "INSERT row id must not bind to the branch marker"
+        );
+    }
+
+    fn count_plan_nodes(
+        plan: &LogicalPlanNode,
+        predicate: impl Fn(&LogicalPlanNode) -> bool + Copy,
+    ) -> usize {
+        usize::from(predicate(plan))
+            + plan
+                .children
+                .iter()
+                .map(|child| count_plan_nodes(child, predicate))
+                .sum::<usize>()
+    }
+
+    fn case_arm_column_ids(expr: &TypedExpr) -> (ColumnId, ColumnId) {
+        let ExprKind::Case {
+            when_then,
+            else_expr,
+            ..
+        } = &expr.kind
+        else {
+            panic!("expected CASE expression");
+        };
+        let delete_expr = when_then
+            .first()
+            .map(|(_, then_expr)| then_expr)
+            .expect("expected delete branch");
+        let insert_expr = else_expr
+            .as_deref()
+            .expect("expected insert branch in CASE ELSE");
+        (
+            column_id_through_cast(delete_expr),
+            column_id_through_cast(insert_expr),
+        )
+    }
+
+    fn column_id_through_cast(expr: &TypedExpr) -> ColumnId {
+        let expr = match &expr.kind {
+            ExprKind::Cast { expr, .. } => expr.as_ref(),
+            _ => expr,
+        };
+        let ExprKind::ColumnRef { column_id, .. } = &expr.kind else {
+            panic!("expected CASE arm to read a ColumnRef through optional Cast");
+        };
+        *column_id
+    }
+
+    fn assert_branch_case_arms_cast_to_output_type(item: &ProjectItem) {
+        let ExprKind::Case {
+            when_then,
+            else_expr,
+            ..
+        } = &item.expr.kind
+        else {
+            panic!(
+                "expected aggregate change-stream output {} to use CASE",
+                item.output_name
+            );
+        };
+        for (_, then_expr) in when_then {
+            assert_cast_target(then_expr, &item.expr.data_type, &item.output_name);
+        }
+        let else_expr = else_expr
+            .as_deref()
+            .unwrap_or_else(|| panic!("expected CASE ELSE for {}", item.output_name));
+        assert_cast_target(else_expr, &item.expr.data_type, &item.output_name);
+    }
+
+    fn assert_cast_target(expr: &TypedExpr, expected: &DataType, output_name: &str) {
+        let ExprKind::Cast { target, .. } = &expr.kind else {
+            panic!("expected CASE arm for {output_name} to force a cast");
+        };
+        assert_eq!(
+            target, expected,
+            "CASE arm for {output_name} must cast to the output column type"
+        );
+    }
+
+    fn expr_contains_function(expr: &TypedExpr, target: &str) -> bool {
+        match &expr.kind {
+            ExprKind::FunctionCall { name, args, .. }
+            | ExprKind::AggregateCall { name, args, .. }
+            | ExprKind::WindowCall { name, args, .. } => {
+                name.eq_ignore_ascii_case(target)
+                    || args.iter().any(|arg| expr_contains_function(arg, target))
+            }
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_contains_function(left, target) || expr_contains_function(right, target)
+            }
+            ExprKind::UnaryOp { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::IsTruthValue { expr, .. }
+            | ExprKind::Nested(expr)
+            | ExprKind::Lambda { body: expr, .. }
+            | ExprKind::LambdaFunction { body: expr, .. } => expr_contains_function(expr, target),
+            ExprKind::InList { expr, list, .. } => {
+                expr_contains_function(expr, target)
+                    || list.iter().any(|item| expr_contains_function(item, target))
+            }
+            ExprKind::Between {
+                expr, low, high, ..
+            } => {
+                expr_contains_function(expr, target)
+                    || expr_contains_function(low, target)
+                    || expr_contains_function(high, target)
+            }
+            ExprKind::Like { expr, pattern, .. } => {
+                expr_contains_function(expr, target) || expr_contains_function(pattern, target)
+            }
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand
+                    .as_deref()
+                    .is_some_and(|expr| expr_contains_function(expr, target))
+                    || when_then.iter().any(|(when, then)| {
+                        expr_contains_function(when, target) || expr_contains_function(then, target)
+                    })
+                    || else_expr
+                        .as_deref()
+                        .is_some_and(|expr| expr_contains_function(expr, target))
+            }
+            ExprKind::ColumnRef { .. }
+            | ExprKind::LambdaParamRef { .. }
+            | ExprKind::Literal(_)
+            | ExprKind::SubqueryPlaceholder { .. } => false,
+        }
+    }
+
+    #[test]
     fn rewrite_aggregate_state_treats_empty_target_partition_contract_as_unpartitioned() {
         let rule = RewriteAggregateStateRule;
         let mut ctx = build_ctx_with_state_columns_and_target_partition(
@@ -1896,9 +2966,7 @@ mod tests {
             .apply(expr, &mut ctx)
             .expect("aggregate rewrite must succeed");
         let changed = expect_changed_merge(result, &arena_rc.borrow());
-        let PlanNodeKind::Scan(old_scan) = &changed.left().kind else {
-            panic!("expected target-state scan");
-        };
+        let old_scan = find_target_state_scan(&changed);
         let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
             panic!("expected IcebergMvTargetState source");
         };
@@ -1935,20 +3003,8 @@ mod tests {
             )
             .expect("branch-scoped merge builds");
 
-        let PlanNodeKind::AggregateStateMerge(_) = &merge.kind else {
-            panic!("expected AggregateStateMerge");
-        };
-        let old_input = merge.left();
-        let PlanNodeKind::Project(project) = &old_input.kind else {
-            panic!("expected old input Project dropping branch id");
-        };
-        let filter_plan = old_input.unary_input();
-        let PlanNodeKind::Filter(filter) = &filter_plan.kind else {
-            panic!("expected branch filter under old-input Project");
-        };
-        let PlanNodeKind::Scan(old_scan) = &filter_plan.unary_input().kind else {
-            panic!("expected target-state scan under branch filter");
-        };
+        let _ = aggregate_change_stream_project(&merge);
+        let (project, filter, old_scan) = find_branch_scoped_old_input(&merge);
         let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
             panic!("expected IcebergMvTargetState source");
         };
@@ -2011,10 +3067,8 @@ mod tests {
             &arena_rc.borrow(),
         );
         // Branch scope manifests as Project(Filter(Scan)) on the old input.
-        assert!(
-            matches!(&changed.left().kind, PlanNodeKind::Project(_)),
-            "branch-scoped old input must be wrapped in a passthrough Project over a Filter"
-        );
+        let _ = find_branch_scoped_old_input(&changed);
+        let _ = aggregate_change_stream_project(&changed);
     }
 
     #[test]
@@ -2031,7 +3085,7 @@ mod tests {
             .expect("aggregate rewrite must succeed");
         let changed = expect_changed_merge(result, &arena_rc.borrow());
 
-        let delta_input = changed.right();
+        let delta_input = find_signed_delta_project(&changed);
         let PlanNodeKind::Project(_) = &delta_input.kind else {
             panic!("expected signed aggregate projection delta input");
         };
@@ -2077,7 +3131,7 @@ mod tests {
             .apply(expr, &mut ctx)
             .expect("aggregate rewrite must succeed");
         let changed = expect_changed_merge(result, &arena_rc.borrow());
-        let delta_input = changed.right();
+        let delta_input = find_signed_delta_project(&changed);
         let PlanNodeKind::Project(_) = &delta_input.kind else {
             panic!("expected signed aggregate projection delta input");
         };
@@ -2135,9 +3189,11 @@ mod tests {
             .apply(expr, &mut ctx)
             .expect("aggregate rewrite must succeed");
         let changed = expect_changed_merge(result, &arena_rc.borrow());
-        let merge = merge_node(&changed);
-
-        assert_eq!(merge.group_key_names, vec!["k"]);
+        let old_scan = find_target_state_scan(&changed);
+        let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
+            panic!("expected IcebergMvTargetState source");
+        };
+        assert_eq!(target_state.group_key_names, vec!["k"]);
     }
 
     #[test]

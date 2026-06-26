@@ -14,7 +14,7 @@
 -- recompute. Mutate both bases (INSERT + DELETE); REFRESH again; cross-check
 -- again (exercises the composed incremental delta path).
 -- Scope: BranchUnionAggregate contract with BranchShape::Composed branches,
--- BranchUtf8 apply key, join-aggregate delta + AggregateStateMerge +
+-- BranchUtf8 apply key, join-aggregate delta + relation aggregate merge +
 -- IcebergMvTargetState refresh.
 -- Note: branches are differentiated by aggregate input, NOT by a WHERE filter:
 -- the join-aggregate delta rule matches Aggregate(Join) directly, so a filter
@@ -107,7 +107,7 @@ INSERT INTO ice_ivm_ujoin_${uuid0}.ns_${uuid0}.fact VALUES
 
 -- query 6
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergVersionTable
 -- @explain_contains=IcebergMvTargetState
 REFRESH MATERIALIZED VIEW ujoin_mv_${uuid0};
@@ -135,7 +135,7 @@ DELETE FROM ice_ivm_ujoin_${uuid0}.ns_${uuid0}.fact WHERE id = 1;
 
 -- query 10
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergVersionTable
 -- @explain_contains=IcebergMvTargetState
 REFRESH MATERIALIZED VIEW ujoin_mv_${uuid0};

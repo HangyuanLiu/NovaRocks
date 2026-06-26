@@ -87,14 +87,14 @@ DELETE FROM ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim WHERE id = 30;
 
 -- query 6
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergVersionTable
 -- @explain_contains=IcebergMvTargetState
 REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergVersionTable
 -- @explain_contains=IcebergMvTargetState
 REFRESH MATERIALIZED VIEW join_agg_dim_amount_mv_${uuid0};
@@ -129,14 +129,14 @@ INSERT INTO ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact VALUES (6, 20, 20);
 
 -- query 13
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergVersionTable
 -- @explain_contains=IcebergMvTargetState
 REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0};
 
 -- query 14
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergVersionTable
 -- @explain_contains=IcebergMvTargetState
 REFRESH MATERIALIZED VIEW join_agg_dim_amount_mv_${uuid0};
@@ -157,14 +157,14 @@ UPDATE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim SET region = 'coast', amount = 
 
 -- query 18
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergVersionTable
 -- @explain_contains=IcebergMvTargetState
 REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0};
 
 -- query 19
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergVersionTable
 -- @explain_contains=IcebergMvTargetState
 REFRESH MATERIALIZED VIEW join_agg_dim_amount_mv_${uuid0};
