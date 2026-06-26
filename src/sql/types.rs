@@ -306,10 +306,97 @@ fn wider_map_type(left_entries: &Field, right_entries: &Field) -> DataType {
     )
 }
 
+/// Comparison operand common type for `col op col`, aligned with the execution
+/// backstop `exec::expr::comparison::normalize_comparison_types`. Returns the
+/// type BOTH operands should be cast to, or `None` when no cast is needed
+/// (equal types) or this layer does not coerce the pair (non-numeric: string /
+/// date-ts / cross-family / incompatible — left to literal coercion or the
+/// execution-time normalizer). Numeric/decimal only — kept in lock-step with
+/// `normalize_comparison_types`' numeric/decimal arms so the materialized cast
+/// type equals the execution-time comparison type.
+pub(crate) fn comparison_common_type(left: &DataType, right: &DataType) -> Option<DataType> {
+    if left == right {
+        return None;
+    }
+    let is_int = |dt: &DataType| {
+        matches!(
+            dt,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        )
+    };
+    let is_float = |dt: &DataType| matches!(dt, DataType::Float32 | DataType::Float64);
+
+    if is_int(left) && is_int(right) {
+        return Some(DataType::Int64);
+    }
+    if (is_int(left) && is_float(right)) || (is_float(left) && is_int(right)) {
+        return Some(DataType::Float64);
+    }
+    if is_float(left) && is_float(right) {
+        return Some(DataType::Float64);
+    }
+    if let (DataType::Decimal128(lp, ls), DataType::Decimal128(rp, rs)) = (left, right) {
+        let target_scale: i8 = (*ls).max(*rs);
+        let lhs_int_digits: i16 = (*lp as i16) - (*ls as i16);
+        let rhs_int_digits: i16 = (*rp as i16) - (*rs as i16);
+        let int_digits: i16 = lhs_int_digits.max(rhs_int_digits).max(0);
+        let target_precision: i16 = int_digits + (target_scale as i16);
+        // Out-of-range precision is left to the execution normalizer to error
+        // on (this layer only opportunistically pre-casts the safe cases).
+        if target_precision <= 0 || target_precision > 38 {
+            return None;
+        }
+        let target = DataType::Decimal128(target_precision as u8, target_scale);
+        if &target == left && &target == right {
+            return None;
+        }
+        return Some(target);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
+
+    #[test]
+    fn comparison_common_type_numeric_and_decimal() {
+        // equal -> None (no cast needed)
+        assert_eq!(comparison_common_type(&DataType::Int32, &DataType::Int32), None);
+        // int width mismatch -> both Int64 (aligned with normalize_comparison_types,
+        // NOT wider_type's Int16/Int8 behavior)
+        assert_eq!(
+            comparison_common_type(&DataType::Int32, &DataType::Int64),
+            Some(DataType::Int64)
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Int16, &DataType::Int8),
+            Some(DataType::Int64)
+        );
+        // int <-> float / float x float -> both Float64
+        assert_eq!(
+            comparison_common_type(&DataType::Int32, &DataType::Float64),
+            Some(DataType::Float64)
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Float32, &DataType::Float64),
+            Some(DataType::Float64)
+        );
+        // decimal x decimal -> common decimal: scale=max(2,4)=4,
+        // int_digits=max(10-2,18-4)=14, precision=14+4=18
+        assert_eq!(
+            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Decimal128(18, 4)),
+            Some(DataType::Decimal128(18, 4))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Decimal128(10, 2)),
+            None
+        );
+        // non-numeric (string / cross-family) -> None (out of scope here)
+        assert_eq!(comparison_common_type(&DataType::Utf8, &DataType::Int32), None);
+        assert_eq!(comparison_common_type(&DataType::Utf8, &DataType::Utf8), None);
+    }
 
     #[test]
     fn decimal_times_float_returns_float64() {

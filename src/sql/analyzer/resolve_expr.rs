@@ -4,7 +4,7 @@ use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
 use crate::sql::analysis::*;
-use crate::sql::types::{arithmetic_result_type_with_op, wider_type};
+use crate::sql::types::{arithmetic_result_type_with_op, comparison_common_type, wider_type};
 
 use super::functions::*;
 use super::helpers::{eval_const_i64, expr_display_name, sql_type_to_arrow};
@@ -1236,7 +1236,20 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 let right_coerced = coerce_literal_for_comparison(&left_typed, right_typed);
                 let left_coerced = coerce_literal_for_comparison(&right_coerced, left_typed);
-                (left_coerced, right_coerced)
+                // StarRocks ImplicitCastRule analog for `col op col`: coerce the
+                // two operands to a common numeric/decimal type and materialize a
+                // Cast on each differing side, BEFORE the optimizer / runtime-filter
+                // pass. This lets mixed-type equi-joins (e.g. int32 = int64) carry
+                // matching key types so the RF gate (rf_key_types_match) passes.
+                // Non-numeric pairs return None and are left to literal coercion /
+                // the execution-time normalizer (normalize_comparison_types).
+                match comparison_common_type(&left_coerced.data_type, &right_coerced.data_type) {
+                    Some(common) => (
+                        cast_null_preserving_target_type(left_coerced, &common),
+                        cast_null_preserving_target_type(right_coerced, &common),
+                    ),
+                    None => (left_coerced, right_coerced),
+                }
             } else {
                 (left_typed, right_typed)
             }
@@ -5019,6 +5032,33 @@ mod tests {
             .next()
             .map(|item| item.expr)
             .ok_or_else(|| "expected projection".to_string())
+    }
+
+    #[test]
+    fn col_op_col_numeric_comparison_coerced_to_common_type() {
+        // Int32 vs Int64 comparison: the analyzer should coerce BOTH operands to
+        // Int64 (StarRocks ImplicitCastRule analog) before emitting the
+        // comparison, so a mixed-type equi-join key carries matching types into
+        // runtime-filter planning. (casts stand in for differently-typed columns,
+        // since the test catalog has no tables.)
+        let expr = analyze_projection_expr("select cast(1 as int) = cast(1 as bigint)")
+            .expect("comparison should analyze");
+        assert_eq!(expr.data_type, DataType::Boolean);
+        match expr.kind {
+            crate::sql::analysis::ExprKind::BinaryOp { left, right, .. } => {
+                assert_eq!(
+                    left.data_type,
+                    DataType::Int64,
+                    "left operand coerced to common type"
+                );
+                assert_eq!(
+                    right.data_type,
+                    DataType::Int64,
+                    "right operand coerced to common type"
+                );
+            }
+            other => panic!("expected BinaryOp comparison, got {:?}", other),
+        }
     }
 
     #[test]
