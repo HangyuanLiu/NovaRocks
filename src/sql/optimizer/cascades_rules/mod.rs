@@ -6,6 +6,7 @@ pub(crate) mod join_associativity;
 pub(crate) mod join_commutativity;
 pub(crate) mod multi_join_reorder;
 pub(crate) mod mv_rewrite;
+pub(crate) mod push_topn_through_join;
 pub(crate) mod push_topn_to_preagg;
 pub(crate) mod sort_limit_to_top_n;
 pub(crate) mod split_aggregate;
@@ -59,8 +60,7 @@ pub(crate) fn all_transformation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(topn_compactness::RemoveRedundantSortUnderTopN),
         Box::new(topn_compactness::PushTopNIntoScan),
         Box::new(topn_compactness::PushTopNThroughProject),
-        Box::new(topn_compactness::PushTopNThroughJoin),
-        Box::new(topn_compactness::PushTopNThroughAggregate),
+        Box::new(push_topn_through_join::PushTopNThroughJoin),
         Box::new(topn_compactness::PushTopNThroughSetOp),
     ]
 }

@@ -1,7 +1,7 @@
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::ScalarProjectItem;
-use crate::sql::optimizer::property::{EquivalenceClasses, SortKey};
-use crate::sql::optimizer::scalar::{ScalarArena, ScalarNode, SortKey as ScalarSortKey};
+use crate::sql::optimizer::property::{ColumnIdSet, EquivalenceClasses, SortKey};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey as ScalarSortKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TopNWindow {
@@ -44,6 +44,86 @@ pub(crate) fn scalar_expr_to_column_id(
     match arena.node(expr) {
         ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => Some(*column_id),
         _ => None,
+    }
+}
+
+pub(crate) fn collect_column_ids(arena: &ScalarArena, expr: ScalarId) -> ColumnIdSet {
+    let mut columns = Vec::new();
+    collect_column_ids_inner(arena, expr, &mut columns);
+    ColumnIdSet::from_columns(columns)
+}
+
+fn collect_column_ids_inner(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ColumnId>) {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(column_id) => out.push(*column_id),
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::BinaryOp { left, right, .. } => {
+            collect_column_ids_inner(arena, *left, out);
+            collect_column_ids_inner(arena, *right, out);
+        }
+        ScalarNode::UnaryOp { child, .. }
+        | ScalarNode::LambdaFunction { body: child, .. }
+        | ScalarNode::Cast { child, .. }
+        | ScalarNode::IsNull { child, .. }
+        | ScalarNode::IsTruthValue { child, .. }
+        | ScalarNode::Nested(child)
+        | ScalarNode::Lambda { body: child, .. } => {
+            collect_column_ids_inner(arena, *child, out);
+        }
+        ScalarNode::FunctionCall { args, .. } | ScalarNode::AggregateCall { args, .. } => {
+            for arg in args {
+                collect_column_ids_inner(arena, *arg, out);
+            }
+        }
+        ScalarNode::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_column_ids_inner(arena, *arg, out);
+            }
+            for partition_expr in partition_by {
+                collect_column_ids_inner(arena, *partition_expr, out);
+            }
+            for key in order_by {
+                collect_column_ids_inner(arena, key.expr, out);
+            }
+        }
+        ScalarNode::InList { child, list, .. } => {
+            collect_column_ids_inner(arena, *child, out);
+            for item in list {
+                collect_column_ids_inner(arena, *item, out);
+            }
+        }
+        ScalarNode::Between {
+            child, low, high, ..
+        } => {
+            collect_column_ids_inner(arena, *child, out);
+            collect_column_ids_inner(arena, *low, out);
+            collect_column_ids_inner(arena, *high, out);
+        }
+        ScalarNode::Like { child, pattern, .. } => {
+            collect_column_ids_inner(arena, *child, out);
+            collect_column_ids_inner(arena, *pattern, out);
+        }
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_column_ids_inner(arena, *operand, out);
+            }
+            for (when, then_expr) in when_then {
+                collect_column_ids_inner(arena, *when, out);
+                collect_column_ids_inner(arena, *then_expr, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_column_ids_inner(arena, *else_expr, out);
+            }
+        }
     }
 }
 
@@ -250,6 +330,54 @@ mod tests {
         };
         assert!(inner.covers(outer));
         assert!(!outer.covers(inner));
+    }
+
+    #[test]
+    fn collect_column_ids_finds_nested_binary_columns() {
+        let mut arena = ScalarArena::new();
+        let left = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
+        let right = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Int64, true);
+        let expr = arena.intern(
+            ScalarNode::BinaryOp {
+                op: crate::sql::common::BinOp::Add,
+                left,
+                right,
+            },
+            DataType::Int64,
+            true,
+        );
+
+        let columns = collect_column_ids(&arena, expr);
+
+        assert!(columns.contains(ColumnId(1)));
+        assert!(columns.contains(ColumnId(2)));
+        assert_eq!(columns.len(), 2);
+    }
+
+    #[test]
+    fn collect_column_ids_ignores_literals_and_unset_columns() {
+        let mut arena = ScalarArena::new();
+        let unset = arena.intern(
+            ScalarNode::ColumnRef(ColumnId::UNSET),
+            DataType::Int64,
+            true,
+        );
+        let lit = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(7))),
+            DataType::Int64,
+            false,
+        );
+        let expr = arena.intern(
+            ScalarNode::BinaryOp {
+                op: crate::sql::common::BinOp::Add,
+                left: unset,
+                right: lit,
+            },
+            DataType::Int64,
+            true,
+        );
+
+        assert!(collect_column_ids(&arena, expr).is_empty());
     }
 
     #[test]
