@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BinaryBuilder, Int64Builder};
+use arrow::array::{ArrayRef, BinaryBuilder, BooleanBuilder, Int64Builder};
 
 use crate::connector::starrocks::table::state_codec::{decode_count_state, encode_count_state};
 use crate::exec::chunk::Chunk;
@@ -40,6 +40,10 @@ pub(crate) fn count_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
 
 pub(crate) fn count_state_visible(s: &[u8]) -> Result<i64, String> {
     decode_count_state(s)
+}
+
+pub(crate) fn state_all_zero(s: &[u8]) -> Result<bool, String> {
+    count_state_visible(s).map(|count| count == 0)
 }
 
 pub(crate) fn eval_count_state_union(
@@ -75,6 +79,22 @@ pub(crate) fn eval_count_state_visible(
     eval_count_state_visible_array(&input)
 }
 
+pub(crate) fn eval_state_all_zero(
+    arena: &ExprArena,
+    _expr: ExprId,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "state_all_zero expects 1 argument, got {}",
+            args.len()
+        ));
+    }
+    let input = arena.eval(args[0], chunk)?;
+    eval_state_all_zero_array(&input)
+}
+
 pub(crate) fn eval_count_state_union_arrays(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
@@ -98,11 +118,20 @@ pub(crate) fn eval_count_state_visible_array(input: &ArrayRef) -> Result<ArrayRe
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
+pub(crate) fn eval_state_all_zero_array(input: &ArrayRef) -> Result<ArrayRef, String> {
+    let mut builder = BooleanBuilder::new();
+    for row in 0..input.len() {
+        let state = binary_value_or_empty(input, row, "state_all_zero", 0)?;
+        builder.append_value(state_all_zero(state)?);
+    }
+    Ok(Arc::new(builder.finish()) as ArrayRef)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::connector::starrocks::table::state_codec::{decode_count_state, encode_count_state};
-    use arrow::array::{Array, BinaryArray, BinaryBuilder, Int64Array};
+    use arrow::array::{Array, BinaryArray, BinaryBuilder, BooleanArray, Int64Array};
     use std::sync::Arc;
 
     fn binary_array(values: &[Option<Vec<u8>>]) -> arrow::array::ArrayRef {
@@ -174,5 +203,40 @@ mod tests {
 
         assert_eq!(arr.value(0), 9);
         assert_eq!(arr.value(1), 0);
+    }
+
+    #[test]
+    fn state_all_zero_treats_empty_and_null_count_state_as_zero() {
+        assert!(state_all_zero(&[]).unwrap());
+
+        let input = binary_array(&[Some(Vec::new()), None]);
+        let out = eval_state_all_zero_array(&input).unwrap();
+        let arr = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+
+        assert!(arr.value(0));
+        assert!(arr.value(1));
+    }
+
+    #[test]
+    fn state_all_zero_rejects_positive_and_negative_count_states() {
+        assert!(!state_all_zero(&encode_count_state(2)).unwrap());
+        assert!(!state_all_zero(&encode_count_state(-1)).unwrap());
+    }
+
+    #[test]
+    fn state_all_zero_does_not_treat_zero_visible_sum_as_empty_group() {
+        let net_zero_sum = crate::connector::starrocks::table::state_codec::encode_sum_int64(2, 0);
+        let (rows, sum) =
+            crate::connector::starrocks::table::state_codec::decode_sum_int64(&net_zero_sum)
+                .unwrap();
+        assert_eq!((rows, sum), (2, 0));
+
+        assert!(!state_all_zero(&encode_count_state(2)).unwrap());
+    }
+
+    #[test]
+    fn state_all_zero_rejects_invalid_count_state_bytes() {
+        let err = state_all_zero(&[0x01]).expect_err("invalid count state should fail");
+        assert!(err.contains("Count"), "{err}");
     }
 }

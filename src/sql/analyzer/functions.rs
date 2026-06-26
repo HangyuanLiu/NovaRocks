@@ -193,6 +193,7 @@ fn is_mv_state_scalar_function(name: &str) -> bool {
             | "bool_or_state_visible"
             | "bool_and_state_union"
             | "bool_and_state_visible"
+            | "state_all_zero"
     )
 }
 
@@ -216,7 +217,8 @@ fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Resu
         | "min_state_visible"
         | "max_state_visible"
         | "bool_or_state_visible"
-        | "bool_and_state_visible" => 1,
+        | "bool_and_state_visible"
+        | "state_all_zero" => 1,
         _ => return Ok(()),
     };
     if arg_types.len() != expected || arg_types.iter().any(|ty| !binary_arg(ty)) {
@@ -983,6 +985,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "min_state_visible"
         | "max_state_visible" => DataType::Int64,
         "bool_or_state_visible" | "bool_and_state_visible" => DataType::Boolean,
+        "state_all_zero" => DataType::Boolean,
         "bitmap_to_array" => DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
             DataType::Int64,
@@ -1603,6 +1606,27 @@ mod tests {
         assert_eq!(
             err,
             "No matching function with signature: count_state_union(varchar(255))."
+        );
+    }
+
+    #[test]
+    fn state_all_zero_scalar_function_requires_binary_input() {
+        assert_eq!(
+            crate::sql::functions::resolve_scalar_function("state_all_zero", &[DataType::Binary]),
+            Ok(DataType::Boolean)
+        );
+        assert_eq!(
+            infer_scalar_return_type("state_all_zero", &[DataType::LargeBinary]),
+            DataType::Boolean
+        );
+        validate_scalar_function_call("state_all_zero", &[DataType::Binary]).unwrap();
+        validate_scalar_function_call("state_all_zero", &[DataType::LargeBinary]).unwrap();
+
+        let err = validate_scalar_function_call("state_all_zero", &[DataType::Utf8])
+            .expect_err("state_all_zero should reject non-binary input");
+        assert_eq!(
+            err,
+            "No matching function with signature: state_all_zero(varchar(255))."
         );
     }
 

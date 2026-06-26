@@ -55,6 +55,7 @@ pub fn eval_mv_state_function(
     match canonical {
         "count_state_union" => super::count::eval_count_state_union(arena, expr, args, chunk),
         "count_state_visible" => super::count::eval_count_state_visible(arena, expr, args, chunk),
+        "state_all_zero" => super::count::eval_state_all_zero(arena, expr, args, chunk),
         "count_distinct_state_union" => {
             super::count_distinct::eval_count_distinct_state_union(arena, expr, args, chunk)
         }
@@ -98,6 +99,7 @@ pub fn eval_mv_state_function(
 static MV_STATE_FUNCTIONS: &[(&str, &str)] = &[
     ("count_state_union", "count_state_union"),
     ("count_state_visible", "count_state_visible"),
+    ("state_all_zero", "state_all_zero"),
     ("count_distinct_state_union", "count_distinct_state_union"),
     (
         "count_distinct_state_visible",
@@ -133,6 +135,11 @@ static MV_STATE_METADATA: &[FunctionMeta] = &[
     },
     FunctionMeta {
         name: "count_state_visible",
+        min_args: 1,
+        max_args: 1,
+    },
+    FunctionMeta {
+        name: "state_all_zero",
         min_args: 1,
         max_args: 1,
     },
@@ -217,3 +224,26 @@ static MV_STATE_METADATA: &[FunctionMeta] = &[
         max_args: 1,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::expr::function::{FunctionKind, function_metadata, lookup_function};
+
+    #[test]
+    fn state_all_zero_is_registered_as_mv_state_function() {
+        assert_eq!(
+            lookup_function("state_all_zero"),
+            Some(FunctionKind::MvState("state_all_zero"))
+        );
+
+        let direct_meta = metadata("state_all_zero").unwrap();
+        assert_eq!(direct_meta.min_args, 1);
+        assert_eq!(direct_meta.max_args, 1);
+
+        let registry_meta = function_metadata(FunctionKind::MvState("state_all_zero"));
+        assert_eq!(registry_meta.name, "state_all_zero");
+        assert_eq!(registry_meta.min_args, 1);
+        assert_eq!(registry_meta.max_args, 1);
+    }
+}
