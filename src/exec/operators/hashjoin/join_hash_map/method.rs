@@ -25,7 +25,7 @@ use std::sync::Arc;
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 
-use super::search::JoinSelection;
+use super::search::{JoinSelection, SearchStats};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::agg::IntArrayView;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -352,6 +352,22 @@ impl JoinHashMap {
         }
     }
 
+    #[allow(dead_code)] // M3.2 wires the vectorized probe core to this staged API.
+    pub(crate) fn search_pairs(
+        &self,
+        arena: &ExprArena,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+    ) -> Result<(JoinSelection, SearchStats), String> {
+        match self {
+            Self::Chained(map) => map.search_pairs(arena, probe_keys, probe),
+            Self::DirectInt(map) => map.search_pairs(arena, probe_keys, probe),
+            Self::DirectIntSet(_) => {
+                Err("presence-only direct integer join set cannot enumerate build rows".to_string())
+            }
+        }
+    }
+
     pub(crate) fn group_build_rows(&self, group_id: usize) -> Result<&[u32], String> {
         match self {
             Self::Chained(map) => map.table.group_build_rows(group_id),
@@ -382,6 +398,28 @@ impl ChainedJoinHashMap {
             }
         }
         Ok((group_ids, selection))
+    }
+
+    #[allow(dead_code)] // Called through JoinHashMap::search_pairs once M3.2 wires it in.
+    fn search_pairs(
+        &self,
+        arena: &ExprArena,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+    ) -> Result<(JoinSelection, SearchStats), String> {
+        let group_ids = self.lookup_group_ids(arena, probe_keys, probe)?;
+        let stats = SearchStats::from_group_ids(&group_ids);
+        let mut selection = JoinSelection::new();
+        for (probe_row, group_id_opt) in group_ids.iter().enumerate() {
+            let Some(group_id) = group_id_opt else {
+                continue;
+            };
+            let rows = self.table.group_build_rows(*group_id)?;
+            for &build_row in rows {
+                selection.push(probe_row as u32, build_row);
+            }
+        }
+        Ok((selection, stats))
     }
 
     pub(crate) fn lookup_group_ids(
@@ -643,6 +681,56 @@ impl DirectIntJoinHashMap {
             }
         }
         Ok((group_ids, selection))
+    }
+
+    #[allow(dead_code)] // Called through JoinHashMap::search_pairs once M3.2 wires it in.
+    fn search_pairs(
+        &self,
+        arena: &ExprArena,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+    ) -> Result<(JoinSelection, SearchStats), String> {
+        let probe_len = probe.len();
+        if probe_len == 0 {
+            return Ok((
+                JoinSelection::new(),
+                SearchStats {
+                    lookup_hit_rows: 0,
+                    lookup_miss_rows: 0,
+                },
+            ));
+        }
+        let probe_array = eval_single_probe_int_key(arena, probe_keys, probe, &self.data_type)?;
+        let probe_view = IntArrayView::new(&probe_array)?;
+        let mut cursor = Vec::with_capacity(probe_len);
+        let mut hit_rows = 0u64;
+        for probe_row in 0..probe_len {
+            let head = match probe_view.value_at(probe_row) {
+                Some(value) => direct_bucket(value, self.min, self.max, self.len)
+                    .map(|bucket| self.first[bucket])
+                    .unwrap_or(ROW_NONE),
+                None => ROW_NONE,
+            };
+            if head != ROW_NONE {
+                hit_rows += 1;
+            }
+            cursor.push(head);
+        }
+
+        let mut selection = JoinSelection::new();
+        for (probe_row, mut build_row) in cursor.into_iter().enumerate() {
+            while build_row != ROW_NONE {
+                selection.push(probe_row as u32, build_row);
+                build_row = self.next_row(build_row)?;
+            }
+        }
+        Ok((
+            selection,
+            SearchStats {
+                lookup_hit_rows: hit_rows,
+                lookup_miss_rows: probe_len as u64 - hit_rows,
+            },
+        ))
     }
 
     fn lookup_existing_bucket(&self, value: i64) -> Option<usize> {
@@ -1061,6 +1149,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::operators::hashjoin::join_hash_map::search::SearchStats;
     use crate::runtime::mem_tracker::MemTracker;
 
     const KEY_SLOT_ID: SlotId = SlotId(1);
@@ -1386,6 +1475,199 @@ mod tests {
         let probe = int32_chunk(vec![Some(10)]);
         let err = map
             .lookup_selection(&arena, &[probe_key], &probe)
+            .expect_err("set cannot enumerate rows");
+
+        assert_eq!(
+            err,
+            "presence-only direct integer join set cannot enumerate build rows"
+        );
+    }
+
+    #[test]
+    fn search_pairs_matches_chained_lookup_selection_and_stats() {
+        let mut map = JoinHashMap::new_chained(vec![DataType::Int32], vec![false]).expect("map");
+        let build = int32_chunk(vec![Some(1), Some(2), Some(1), None]);
+        map.add_build_rows(build.columns(), build.len())
+            .expect("add build");
+        map.finalize().expect("finalize");
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
+        let probe = int32_chunk(vec![Some(1), Some(3), None, Some(2)]);
+
+        let (group_ids, lookup_selection) = map
+            .lookup_selection(&arena, &[probe_key], &probe)
+            .expect("lookup");
+        let (selection, stats) = map
+            .search_pairs(&arena, &[probe_key], &probe)
+            .expect("search pairs");
+
+        assert_eq!(selection, lookup_selection);
+        assert_eq!(stats, SearchStats::from_group_ids(&group_ids));
+        assert_eq!(stats.lookup_hit_rows, 2);
+        assert_eq!(stats.lookup_miss_rows, 2);
+    }
+
+    #[test]
+    fn search_pairs_matches_null_safe_chained_lookup_selection() {
+        let mut map = JoinHashMap::new_chained(vec![DataType::Int32], vec![true]).expect("map");
+        let build = int32_chunk(vec![Some(1), None, Some(1), None]);
+        map.add_build_rows(build.columns(), build.len())
+            .expect("add build");
+        map.finalize().expect("finalize");
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
+        let probe = int32_chunk(vec![None, Some(1), Some(2)]);
+
+        let (group_ids, lookup_selection) = map
+            .lookup_selection(&arena, &[probe_key], &probe)
+            .expect("lookup");
+        let (selection, stats) = map
+            .search_pairs(&arena, &[probe_key], &probe)
+            .expect("search pairs");
+
+        assert_eq!(selection, lookup_selection);
+        assert_eq!(selection.probe, vec![0, 0, 1, 1]);
+        assert_eq!(selection.build, vec![3, 1, 2, 0]);
+        assert_eq!(stats, SearchStats::from_group_ids(&group_ids));
+        assert_eq!(stats.lookup_hit_rows, 2);
+        assert_eq!(stats.lookup_miss_rows, 1);
+    }
+
+    #[test]
+    fn search_pairs_matches_direct_lookup_selection_and_preserves_order() {
+        let build = int32_chunk(vec![Some(100), Some(101), Some(100), Some(103)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+        assert_eq!(
+            map.method_kind(),
+            JoinHashMapMethodKind::DirectInt {
+                min: 100,
+                len: 4,
+                not_null: true,
+            }
+        );
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
+        let probe = int32_chunk(vec![Some(100), Some(102), Some(103), None]);
+
+        let (group_ids, lookup_selection) = map
+            .lookup_selection(&arena, &[probe_key], &probe)
+            .expect("lookup");
+        let (selection, stats) = map
+            .search_pairs(&arena, &[probe_key], &probe)
+            .expect("search pairs");
+
+        assert_eq!(selection, lookup_selection);
+        assert_eq!(selection.probe, vec![0, 0, 2]);
+        assert_eq!(selection.build, vec![2, 0, 3]);
+        assert_eq!(stats, SearchStats::from_group_ids(&group_ids));
+        assert_eq!(stats.lookup_hit_rows, 2);
+        assert_eq!(stats.lookup_miss_rows, 2);
+    }
+
+    #[test]
+    fn search_pairs_direct_handles_nulls_and_i64_min_like_lookup() {
+        let min = i64::MIN;
+        let build = int64_chunk(vec![Some(min), None, Some(min + 1), Some(min)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int64],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+        assert_eq!(
+            map.method_kind(),
+            JoinHashMapMethodKind::DirectInt {
+                min,
+                len: 2,
+                not_null: false,
+            }
+        );
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int64);
+        let probe = int64_chunk(vec![None, Some(i64::MAX), Some(min), Some(min + 1)]);
+
+        let (group_ids, lookup_selection) = map
+            .lookup_selection(&arena, &[probe_key], &probe)
+            .expect("lookup");
+        let (selection, stats) = map
+            .search_pairs(&arena, &[probe_key], &probe)
+            .expect("search pairs");
+
+        assert_eq!(selection, lookup_selection);
+        assert_eq!(selection.probe, vec![2, 2, 3]);
+        assert_eq!(selection.build, vec![3, 0, 2]);
+        assert_eq!(stats, SearchStats::from_group_ids(&group_ids));
+        assert_eq!(stats.lookup_hit_rows, 2);
+        assert_eq!(stats.lookup_miss_rows, 2);
+    }
+
+    #[test]
+    fn search_pairs_empty_probe_returns_empty_with_zero_stats() {
+        let build = int32_chunk(vec![Some(10)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+        assert_eq!(
+            map.method_kind(),
+            JoinHashMapMethodKind::DirectInt {
+                min: 10,
+                len: 1,
+                not_null: true,
+            }
+        );
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
+        let probe = int32_chunk(Vec::new());
+
+        let (selection, stats) = map
+            .search_pairs(&arena, &[probe_key], &probe)
+            .expect("search pairs");
+
+        assert!(selection.is_empty());
+        assert_eq!(stats.lookup_hit_rows, 0);
+        assert_eq!(stats.lookup_miss_rows, 0);
+    }
+
+    #[test]
+    fn search_pairs_rejects_direct_int_set_row_enumeration() {
+        let build = int32_chunk(vec![Some(10), Some(12)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let options = JoinHashMapBuildOptions {
+            purpose: JoinHashMapBuildPurpose::PresenceOnly,
+            ..JoinHashMapBuildOptions::default()
+        };
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            options,
+        )
+        .expect("map");
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
+        let probe = int32_chunk(vec![Some(10)]);
+        let err = map
+            .search_pairs(&arena, &[probe_key], &probe)
             .expect_err("set cannot enumerate rows");
 
         assert_eq!(
