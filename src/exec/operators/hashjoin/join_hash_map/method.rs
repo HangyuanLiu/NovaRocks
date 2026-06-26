@@ -737,9 +737,16 @@ impl DirectIntJoinHashSet {
         options: JoinHashMapBuildOptions,
         tracker: Option<Arc<MemTracker>>,
     ) -> Result<Option<Self>, String> {
+        // DirectIntSet stores one bit per integer key in the observed
+        // [min, max] range. It is only useful for presence-only joins: once
+        // callers need group ids or build rows, the bitset no longer carries
+        // enough information.
         if options.purpose != JoinHashMapBuildPurpose::PresenceOnly {
             return Ok(None);
         }
+        // The direct bit index is computed from a single non-null-safe integer
+        // key. Multi-key joins need tuple hashing, and null-safe equality needs
+        // explicit NULL group semantics rather than treating NULL as a miss.
         if key_types.len() != 1 || null_safe_eq.len() != 1 || null_safe_eq[0] {
             return Ok(None);
         }
@@ -756,6 +763,9 @@ impl DirectIntJoinHashSet {
         }
         let bitset_bytes = direct_set_bytes(range)?;
         let bucket_gate = direct_set_bucket_gate(stats.indexed_rows);
+        // A direct set is a range-indexed structure, so sparse keys can waste
+        // memory even when there are few build rows. Fall back unless the bitset
+        // fits the absolute cap or remains small relative to the indexed rows.
         if bitset_bytes > options.direct_set_max_bytes && bitset_bytes > bucket_gate {
             return Ok(None);
         }

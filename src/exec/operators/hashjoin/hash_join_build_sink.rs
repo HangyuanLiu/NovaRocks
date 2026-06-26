@@ -1256,6 +1256,11 @@ fn join_hash_map_build_purpose(
     join_type: JoinType,
     has_residual_predicate: bool,
 ) -> JoinHashMapBuildPurpose {
+    // Presence-only maps are safe only when the join answer depends on key existence.
+    // A residual predicate can reference build-side columns and must be evaluated
+    // against concrete build rows, so those joins still need row-match storage.
+    // Right semi/anti joins also keep row-match storage because their current
+    // execution path marks build rows rather than filtering probe rows directly.
     if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) && !has_residual_predicate {
         JoinHashMapBuildPurpose::PresenceOnly
     } else {
