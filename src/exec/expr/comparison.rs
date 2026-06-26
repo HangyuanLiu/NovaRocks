@@ -1114,103 +1114,28 @@ fn normalize_comparison_types(
         return Ok((left_ts, right));
     }
 
-    // Handle integer type mismatches by casting to Int64.
-    let is_int = |dt: &DataType| {
-        matches!(
-            dt,
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-        )
-    };
-
-    if is_int(left_type) && is_int(right_type) {
-        let left_64 = if matches!(left_type, DataType::Int64) {
-            left
-        } else {
-            cast(&left, &DataType::Int64).map_err(|e| e.to_string())?
-        };
-        let right_64 = if matches!(right_type, DataType::Int64) {
-            right
-        } else {
-            cast(&right, &DataType::Int64).map_err(|e| e.to_string())?
-        };
-        return Ok((left_64, right_64));
-    }
-
-    // Handle float type mismatches by casting to Float64
-    let is_float = |dt: &DataType| matches!(dt, DataType::Float32 | DataType::Float64);
-
-    // Handle mixed integer/float numeric comparisons by casting both sides to Float64.
-    // StarRocks allows expressions like `abs(1 - 2) = 0` even when one side is inferred
-    // as floating point and the other side is integer.
-    if (is_int(left_type) && is_float(right_type)) || (is_float(left_type) && is_int(right_type)) {
-        let left_64 = if matches!(left_type, DataType::Float64) {
-            left
-        } else {
-            cast(&left, &DataType::Float64).map_err(|e| e.to_string())?
-        };
-        let right_64 = if matches!(right_type, DataType::Float64) {
-            right
-        } else {
-            cast(&right, &DataType::Float64).map_err(|e| e.to_string())?
-        };
-        return Ok((left_64, right_64));
-    }
-
-    if is_float(left_type) && is_float(right_type) {
-        let left_64 = if matches!(left_type, DataType::Float64) {
-            left
-        } else {
-            cast(&left, &DataType::Float64).map_err(|e| e.to_string())?
-        };
-        let right_64 = if matches!(right_type, DataType::Float64) {
-            right
-        } else {
-            cast(&right, &DataType::Float64).map_err(|e| e.to_string())?
-        };
-        return Ok((left_64, right_64));
-    }
-
-    // Handle decimal type mismatches by casting to a common decimal type (StarRocks-aligned).
-    //
-    // Arrow comparison kernels require identical data types, but StarRocks allows comparing
-    // decimal values with different precisions/scales by coercing both sides to a compatible
-    // decimal type:
-    //   scale = max(s1, s2)
-    //   precision = max(p1-s1, p2-s2) + scale
-    if let (DataType::Decimal128(lp, ls), DataType::Decimal128(rp, rs)) = (left_type, right_type) {
-        let target_scale: i8 = (*ls).max(*rs);
-        let lhs_int_digits: i16 = (*lp as i16) - (*ls as i16);
-        let rhs_int_digits: i16 = (*rp as i16) - (*rs as i16);
-        let int_digits: i16 = lhs_int_digits.max(rhs_int_digits).max(0);
-        let target_precision: i16 = int_digits + (target_scale as i16);
-        if target_precision <= 0 {
-            return Err("invalid decimal precision for comparison".to_string());
+    // Numeric / decimal: delegate the type decision to the single authority,
+    // then materialize the cast on both arrays. String / temporal pairs were
+    // already handled above; everything else is incompatible.
+    match crate::types::comparison_common_type(left_type, right_type)? {
+        Some(target) => {
+            let left_cast = if left_type == &target {
+                left
+            } else {
+                cast(&left, &target).map_err(|e| e.to_string())?
+            };
+            let right_cast = if right_type == &target {
+                right
+            } else {
+                cast(&right, &target).map_err(|e| e.to_string())?
+            };
+            Ok((left_cast, right_cast))
         }
-        if target_precision > 38 {
-            return Err(format!(
-                "decimal comparison precision overflow: lhs={:?} rhs={:?} => target=Decimal128({}, {})",
-                left_type, right_type, target_precision, target_scale
-            ));
-        }
-        let target_type = DataType::Decimal128(target_precision as u8, target_scale);
-        let left_cast = if left_type == &target_type {
-            left
-        } else {
-            cast(&left, &target_type).map_err(|e| e.to_string())?
-        };
-        let right_cast = if right_type == &target_type {
-            right
-        } else {
-            cast(&right, &target_type).map_err(|e| e.to_string())?
-        };
-        return Ok((left_cast, right_cast));
+        None => Err(format!(
+            "Cannot compare incompatible types: {:?} vs {:?}",
+            left_type, right_type
+        )),
     }
-
-    // If no conversion possible, return error
-    Err(format!(
-        "Cannot compare incompatible types: {:?} vs {:?}",
-        left_type, right_type
-    ))
 }
 
 // Arrow vectorized versions
@@ -1918,6 +1843,34 @@ mod tests {
         assert!(out.value(0));
         // 0.50 > 5.00 => false
         assert!(!out.value(1));
+    }
+
+    #[test]
+    fn normalize_promotes_decimal_overflow_to_decimal256() {
+        // common precision 40 > 38 -> both sides become Decimal256(40, 10)
+        let left: ArrayRef = std::sync::Arc::new(
+            Decimal128Array::from(vec![1_i128])
+                .with_precision_and_scale(30, 0)
+                .unwrap(),
+        );
+        let right: ArrayRef = std::sync::Arc::new(
+            Decimal128Array::from(vec![1_i128])
+                .with_precision_and_scale(30, 10)
+                .unwrap(),
+        );
+        let (l, r) = normalize_comparison_types(left, right).expect("should promote, not error");
+        assert_eq!(l.data_type(), &DataType::Decimal256(40, 10));
+        assert_eq!(r.data_type(), &DataType::Decimal256(40, 10));
+    }
+
+    #[test]
+    fn normalize_int_mismatch_still_int64() {
+        use arrow::array::{Int32Array, Int64Array};
+        let left: ArrayRef = std::sync::Arc::new(Int32Array::from(vec![1]));
+        let right: ArrayRef = std::sync::Arc::new(Int64Array::from(vec![1_i64]));
+        let (l, r) = normalize_comparison_types(left, right).unwrap();
+        assert_eq!(l.data_type(), &DataType::Int64);
+        assert_eq!(r.data_type(), &DataType::Int64);
     }
 
     #[test]
