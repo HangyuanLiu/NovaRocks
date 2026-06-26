@@ -857,6 +857,10 @@ fn subtree_untagged(expr: &OptExpr) -> bool {
 /// **No behavior change**: this pass only writes metadata.  Nothing reads
 /// `required_output_columns` until the per-operator prune rules are registered
 /// in a later task.
+///
+/// This intentionally keeps the default Leaf pattern. It is a top-down
+/// whole-tree tagging pass driven by parent-needed state, not a per-node
+/// structural rewrite.
 pub(crate) struct TagRequiredColumns;
 
 impl LogicalRewriteRule for TagRequiredColumns {

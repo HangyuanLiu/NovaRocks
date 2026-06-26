@@ -4,6 +4,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::common::JoinKind;
 use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -27,10 +28,15 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
         RewritePhase::StructuralRewrite
     }
 
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Join,
+            children: vec![Pattern::MultiLeaf],
+        }
+    }
+
     fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
-        let Operator::LogicalJoin(join) = &expr.op else {
-            return false;
-        };
+        let join = join_payload_after_pattern_gate(expr);
         matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) && join.condition.is_some()
     }
 
@@ -126,6 +132,13 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
 
         Ok(RewriteResult::Changed(new_join))
     }
+}
+
+fn join_payload_after_pattern_gate(expr: &OptExpr) -> &LogicalJoinOp {
+    let Operator::LogicalJoin(join) = &expr.op else {
+        unreachable!("JoinPredicateMoveAround::matches requires Join pattern pre-gate");
+    };
+    join
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,6 +278,7 @@ mod tests {
     use crate::sql::optimizer::operator::{LogicalJoinOp, ScanOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::ScalarArena;
 
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
@@ -569,5 +583,16 @@ mod tests {
             panic!("expected Changed result");
         };
         assert_left_is_filter(&out);
+    }
+
+    #[test]
+    fn pattern_rejects_non_join_structure() {
+        let scan = make_scan("l", &[("a", 1)]);
+        let rule = JoinPredicateMoveAround;
+
+        assert!(
+            bind_tree(&rule.pattern(), &scan).is_none(),
+            "JoinPredicateMoveAround pattern must only match Join roots"
+        );
     }
 }

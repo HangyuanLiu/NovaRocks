@@ -35,6 +35,10 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
         RewritePhase::StructuralRewrite
     }
 
+    // Keep the default Leaf pattern: this rule has a disjunctive structural
+    // shape, `Filter(Join)` or `Join` with an inline condition. The current
+    // Pattern language has no `Or`, and splitting the rule would change the
+    // rule-name and disable-rule surface.
     fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
         (matches!(&expr.op, Operator::LogicalFilter(_))
             && !expr.children.is_empty()

@@ -11,6 +11,7 @@ use crate::sql::optimizer::operator::{
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::options::current_session_optimizer_settings;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -43,13 +44,18 @@ impl LogicalRewriteRule for PruneUkFkJoin {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
-        matches!(&expr.op, Operator::LogicalProject(_))
-            && expr
-                .children
-                .first()
-                .map(|c| matches!(&c.op, Operator::LogicalJoin(_)))
-                .unwrap_or(false)
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Project,
+            children: vec![Pattern::Op {
+                kind: OpKind::Join,
+                children: vec![Pattern::MultiLeaf],
+            }],
+        }
+    }
+
+    fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        true
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -164,13 +170,18 @@ impl LogicalRewriteRule for EliminateUniqueAggregate {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
-        matches!(&expr.op, Operator::LogicalProject(_))
-            && expr
-                .children
-                .first()
-                .map(|c| matches!(&c.op, Operator::LogicalAggregate(_)))
-                .unwrap_or(false)
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Project,
+            children: vec![Pattern::Op {
+                kind: OpKind::Aggregate,
+                children: vec![Pattern::MultiLeaf],
+            }],
+        }
+    }
+
+    fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        true
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -735,6 +746,8 @@ mod tests {
 
     use crate::sql::analysis::{LiteralValue, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::optimizer::operator::LogicalAggregateOp;
+    use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
 
     fn output_col(id: u32, name: &str) -> OutputColumn {
@@ -794,6 +807,56 @@ mod tests {
             DataType::Int64,
             false,
         )
+    }
+
+    fn empty_project(input: OptExpr) -> OptExpr {
+        OptExpr::new(
+            Operator::LogicalProject(ProjectOp {
+                items: vec![],
+                output_qualifier: None,
+            }),
+            vec![input],
+        )
+    }
+
+    fn join_expr() -> OptExpr {
+        OptExpr::new(
+            Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            vec![
+                scan_expr("left_t", &[(1, "left_key")]),
+                scan_expr("right_t", &[(2, "right_key")]),
+            ],
+        )
+    }
+
+    fn aggregate_expr(input: OptExpr) -> OptExpr {
+        OptExpr::new(
+            Operator::LogicalAggregate(LogicalAggregateOp::single(vec![], vec![], vec![])),
+            vec![input],
+        )
+    }
+
+    #[test]
+    fn prune_ukfk_join_pattern_matches_project_join_only() {
+        let rule = PruneUkFkJoin;
+        let project_join = empty_project(join_expr());
+        let project_aggregate = empty_project(aggregate_expr(scan_expr("t", &[(1, "k")])));
+
+        assert!(bind_tree(&rule.pattern(), &project_join).is_some());
+        assert!(bind_tree(&rule.pattern(), &project_aggregate).is_none());
+    }
+
+    #[test]
+    fn eliminate_unique_aggregate_pattern_matches_project_aggregate_only() {
+        let rule = EliminateUniqueAggregate;
+        let project_aggregate = empty_project(aggregate_expr(scan_expr("t", &[(1, "k")])));
+        let project_join = empty_project(join_expr());
+
+        assert!(bind_tree(&rule.pattern(), &project_aggregate).is_some());
+        assert!(bind_tree(&rule.pattern(), &project_join).is_none());
     }
 
     #[test]

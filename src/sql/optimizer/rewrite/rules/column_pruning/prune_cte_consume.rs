@@ -3,8 +3,8 @@
 //! Intentionally a no-op: CTE consume output columns are NOT pruned here.
 //! See the `apply` comment for the rationale (Gap-3 deferred).
 
-use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -21,8 +21,15 @@ impl LogicalRewriteRule for PruneCTEConsumeColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
-        matches!(&expr.op, Operator::LogicalCTEConsume(_))
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::CTEConsume,
+            children: vec![Pattern::MultiLeaf],
+        }
+    }
+
+    fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        true
     }
 
     fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {

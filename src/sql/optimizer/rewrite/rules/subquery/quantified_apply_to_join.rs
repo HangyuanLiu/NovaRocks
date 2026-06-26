@@ -11,8 +11,9 @@ use super::predicate_apply_util::lift_correlated_inner_opt;
 use super::scalar_utils;
 use crate::sql::common::ApplyKind;
 use crate::sql::common::JoinKind;
-use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::operator::{ApplyOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -31,9 +32,16 @@ impl LogicalRewriteRule for QuantifiedApplyToJoin {
         RewritePhase::StructuralRewrite
     }
 
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Apply,
+            children: vec![Pattern::MultiLeaf],
+        }
+    }
+
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         let _ = ctx;
-        matches_expr(expr)
+        matches_apply_fields(apply_payload_after_pattern_gate(expr))
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -46,11 +54,15 @@ impl LogicalRewriteRule for QuantifiedApplyToJoin {
     }
 }
 
-fn matches_expr(expr: &OptExpr) -> bool {
-    matches!(
-        &expr.op,
-        Operator::LogicalApply(a) if a.use_semi_anti && matches!(a.kind, ApplyKind::In { .. })
-    )
+fn matches_apply_fields(apply: &ApplyOp) -> bool {
+    apply.use_semi_anti && matches!(apply.kind, ApplyKind::In { .. })
+}
+
+fn apply_payload_after_pattern_gate(expr: &OptExpr) -> &ApplyOp {
+    let Operator::LogicalApply(apply) = &expr.op else {
+        unreachable!("QuantifiedApplyToJoin::matches requires Apply pattern pre-gate");
+    };
+    apply
 }
 
 fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>, String> {
@@ -153,6 +165,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rules::subquery::bridge::opt_expr_to_plan;
     use crate::sql::optimizer::rewrite::rules::utils::split_and;
+    use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
@@ -354,6 +367,21 @@ mod tests {
             }
             other => panic!("expected Changed, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn pattern_rejects_non_apply_structure() {
+        let rule = QuantifiedApplyToJoin;
+        let mut ctx = ctx_with_arena();
+        let expr = to_opt_expr(
+            &scan("outer", vec![output_column(OUTER_K, "k", false)]),
+            &mut ctx,
+        );
+
+        assert!(
+            bind_tree(&rule.pattern(), &expr).is_none(),
+            "QuantifiedApplyToJoin pattern must only match Apply roots"
+        );
     }
 
     fn assert_join(plan: &LogicalPlanNode, expected_kind: JoinKind) -> &LogicalJoinNode {

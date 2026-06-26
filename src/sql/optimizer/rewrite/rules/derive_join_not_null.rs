@@ -12,6 +12,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::common::{BinOp, JoinKind};
 use crate::sql::optimizer::operator::{FilterOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -48,8 +49,15 @@ impl LogicalRewriteRule for DeriveJoinNotNullPredicate {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
-        matches!(&expr.op, Operator::LogicalJoin(_))
+    fn pattern(&self) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Join,
+            children: vec![Pattern::MultiLeaf],
+        }
+    }
+
+    fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        true
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {

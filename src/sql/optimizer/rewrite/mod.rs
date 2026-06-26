@@ -8,3 +8,4 @@ pub(crate) mod rule;
 pub(crate) mod rules;
 pub(crate) mod trace;
 pub(crate) mod tree;
+pub(crate) mod tree_binder;

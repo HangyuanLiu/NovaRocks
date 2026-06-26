@@ -22,6 +22,9 @@ impl LogicalRewriteRule for LowCardinalityDictionaryRewriteRule {
         RewriteTraversal::TopDown
     }
 
+    // Keep the default Leaf pattern: this TopDown rule is whole-tree and
+    // context-dependent. The guard combines a dictionary provider check with a
+    // recursive `contains_scan` walk instead of matching one node shape.
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         ctx.dictionary_provider().is_some() && contains_scan(expr)
     }
