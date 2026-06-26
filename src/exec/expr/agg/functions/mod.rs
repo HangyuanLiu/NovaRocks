@@ -41,8 +41,7 @@ pub(super) enum AggKind {
     SumDecimal256,
     SumStateInt64,
     SumStateDecimal128,
-    SumStateMergeInt64,
-    SumStateMergeDecimal128,
+    SumStateMerge,
     SumStateSignedInt64,
     SumStateSignedDecimal128,
     MinInt,
@@ -376,7 +375,7 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         | AggKind::SumDecimal128
         | AggKind::SumDecimal256 => &SUM,
         AggKind::SumStateInt64 | AggKind::SumStateDecimal128 => &SUM_STATE,
-        AggKind::SumStateMergeInt64 | AggKind::SumStateMergeDecimal128 => &SUM_STATE_MERGE,
+        AggKind::SumStateMerge => &SUM_STATE_MERGE,
         AggKind::SumStateSignedInt64 | AggKind::SumStateSignedDecimal128 => &SUM_STATE_SIGNED,
         AggKind::MinInt
         | AggKind::MinFloat
