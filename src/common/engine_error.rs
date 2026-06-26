@@ -152,6 +152,13 @@ impl EngineError {
         Self::static_message(EngineErrorCode::IcebergWriteDescriptorMismatch, message)
     }
 
+    pub fn unsupported_position_delete_descriptor(message: impl Into<String>) -> Self {
+        Self::static_message(
+            EngineErrorCode::UnsupportedPositionDeleteDescriptor,
+            message,
+        )
+    }
+
     pub fn to_user_message(&self) -> String {
         match &self.detail {
             EngineErrorDetail::WriteCoordinatorGone { query_id } => {
@@ -235,6 +242,7 @@ mod tests {
             EngineErrorCode::ExchangeDescriptorMismatch,
             EngineErrorCode::AggregateStateLayoutMismatch,
             EngineErrorCode::IcebergWriteDescriptorMismatch,
+            EngineErrorCode::UnsupportedPositionDeleteDescriptor,
             EngineErrorCode::UnsupportedDistributedDmlShape,
             EngineErrorCode::DistributedWriteOutputMismatch,
             EngineErrorCode::WriteCoordinatorGone,
@@ -366,6 +374,21 @@ mod tests {
         assert_eq!(
             err.to_bracketed_user_message(),
             "[IcebergWriteDescriptorMismatch] missing partition descriptor"
+        );
+    }
+
+    #[test]
+    fn unsupported_position_delete_descriptor_formats_bracketed_message() {
+        let err = EngineError::unsupported_position_delete_descriptor(
+            "position delete output descriptor missing file_path field",
+        );
+        assert_eq!(
+            err.code(),
+            EngineErrorCode::UnsupportedPositionDeleteDescriptor
+        );
+        assert_eq!(
+            err.to_bracketed_user_message(),
+            "[UnsupportedPositionDeleteDescriptor] position delete output descriptor missing file_path field"
         );
     }
 

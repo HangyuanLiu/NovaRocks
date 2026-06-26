@@ -49,18 +49,11 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::{Statistics, ValueStatistics};
 
-// Iceberg spec v2: reserved field ids used by position-delete files. Reader
-// implementations in Spark/Trino/Flink key off these ids, so they must be
-// preserved exactly in the parquet file metadata.
-const ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = 2_147_483_546;
-const ICEBERG_POSITION_DELETE_POS_FIELD_ID: i32 = 2_147_483_545;
-const ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN: &str = "file_path";
-const ICEBERG_POSITION_DELETE_POS_COLUMN: &str = "pos";
-
 use super::data_writer::{
     StagedWriteContext, StagedWriteOptions, partition_path_from_struct, to_sink_commit_info,
     write_record_batches, written_file_to_sink_commit_info_for_metadata,
 };
+use super::position_delete_descriptor::bind_position_delete_descriptor;
 use super::schema::{apply_field_id_recursive, build_full_output_schema};
 use super::write_descriptor::encode_partition_descriptor;
 use crate::common::config;
@@ -171,6 +164,35 @@ impl IcebergTableSinkFactory {
             mut partition_exprs,
         ) = build_partition_exprs(&iceberg_table)?;
 
+        let target_table_metadata = parse_target_table_metadata(&iceberg_table, mode)?;
+        let position_delete_binding = if matches!(
+            mode,
+            IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors
+        ) {
+            let target_schema = build_output_schema(&iceberg_table)?;
+            let metadata = target_table_metadata.as_ref().ok_or_else(|| {
+                format!(
+                    "iceberg {:?} sink requires serialized target table metadata",
+                    mode
+                )
+            })?;
+            let partition_source_field_ids =
+                partition_source_field_ids_from_metadata(metadata, &partition_source_column_names)?;
+            let binding = bind_position_delete_descriptor(
+                sink.position_delete_output_descriptor.as_ref(),
+                output_exprs,
+                target_partition_spec_id,
+                &partition_source_column_names,
+                &partition_column_names,
+                &transform_exprs,
+                &partition_source_field_ids,
+            )
+            .map_err(|err| err.to_bracketed_user_message())?;
+            Some((target_schema, binding))
+        } else {
+            None
+        };
+
         let (output_schema, target_schema, equality_delete_columns) = match mode {
             IcebergSinkMode::Data => {
                 let target_schema = build_output_schema(&iceberg_table)?;
@@ -184,21 +206,12 @@ impl IcebergTableSinkFactory {
                 (Arc::clone(&target_schema), target_schema, Vec::new())
             }
             IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors => {
-                let target_schema = build_output_schema(&iceberg_table)?;
-                let expected = 2 + partition_column_names.len();
-                if output_exprs.len() != expected {
-                    return Err(format!(
-                        "iceberg {:?} sink expects {} output exprs \
-                        (file_path, pos, <{} partition cols>); got {}",
-                        mode,
-                        expected,
-                        partition_column_names.len(),
-                        output_exprs.len(),
-                    ));
-                }
+                let (target_schema, binding) = position_delete_binding
+                    .as_ref()
+                    .expect("position delete binding must exist for delete-like sink");
                 (
-                    build_position_delete_output_schema(),
-                    target_schema,
+                    Arc::clone(&binding.output_schema),
+                    Arc::clone(target_schema),
                     Vec::new(),
                 )
             }
@@ -234,12 +247,12 @@ impl IcebergTableSinkFactory {
                 .map(|field| field.name().to_string())
                 .collect::<Vec<_>>(),
             IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors => {
-                let mut names = vec![
-                    ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string(),
-                    ICEBERG_POSITION_DELETE_POS_COLUMN.to_string(),
-                ];
-                names.extend(partition_source_column_names.iter().cloned());
-                names
+                position_delete_binding
+                    .as_ref()
+                    .expect("position delete binding must exist for delete-like sink")
+                    .1
+                    .output_column_names
+                    .clone()
             }
             IcebergSinkMode::EqualityDeletes => output_schema
                 .fields()
@@ -260,7 +273,6 @@ impl IcebergTableSinkFactory {
             .ok_or_else(|| "iceberg sink missing table location".to_string())?;
         let data_location = resolve_data_location(&sink)?;
         let object_store_s3 = resolve_sink_s3_config(&sink, &data_location)?;
-        let target_table_metadata = parse_target_table_metadata(&iceberg_table, mode)?;
         let target_snapshot_id = iceberg_table.current_snapshot_id;
         let position_delete_data_file_partitions = if matches!(
             mode,
@@ -1715,32 +1727,6 @@ fn equality_delete_schema_fields(
     Ok(fields.iter().collect())
 }
 
-/// Arrow/parquet schema for an Iceberg v2 position-delete file.
-///
-/// Iceberg spec mandates `file_path: required string (field_id=2147483546)` and
-/// `pos: required long (field_id=2147483545)`. External engines (Spark, Trino,
-/// Flink) key off these exact field ids, so they must be preserved verbatim in
-/// the parquet file-level schema metadata. `nullable=false` maps to
-/// Iceberg-spec `required`.
-fn build_position_delete_output_schema() -> SchemaRef {
-    let file_path = Field::new(
-        ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
-        DataType::Utf8,
-        false,
-    )
-    .with_metadata(HashMap::from([(
-        PARQUET_FIELD_ID_META_KEY.to_string(),
-        ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID.to_string(),
-    )]));
-    let pos = Field::new(ICEBERG_POSITION_DELETE_POS_COLUMN, DataType::Int64, false).with_metadata(
-        HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            ICEBERG_POSITION_DELETE_POS_FIELD_ID.to_string(),
-        )]),
-    );
-    Arc::new(Schema::new(vec![file_path, pos]))
-}
-
 fn iceberg_schema_from_arrow_schema(schema: &Schema) -> Result<iceberg::spec::Schema, String> {
     let fields = schema
         .fields()
@@ -1783,6 +1769,26 @@ fn arrow_field_id(field: &Field) -> Result<i32, String> {
             field.name()
         )
     })
+}
+
+fn partition_source_field_ids_from_metadata(
+    metadata: &TableMetadata,
+    source_column_names: &[String],
+) -> Result<Vec<i32>, String> {
+    let target_schema = metadata.current_schema();
+    source_column_names
+        .iter()
+        .map(|source_name| {
+            target_schema
+                .field_by_name_case_insensitive(source_name)
+                .map(|field| field.id)
+                .ok_or_else(|| {
+                    format!(
+                        "iceberg sink partition source column {source_name} missing from target metadata schema"
+                    )
+                })
+        })
+        .collect()
 }
 
 fn schema_has_reserved_row_lineage_columns(schema: &Schema) -> Result<bool, String> {
@@ -3091,12 +3097,10 @@ mod tests {
     use crate::exec::pipeline::operator::Operator;
 
     use super::{
-        ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
-        ICEBERG_POSITION_DELETE_POS_FIELD_ID,
-        ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-        ICEBERG_ROW_ID_COL, IcebergSinkMode, IcebergSinkPlan, IcebergTableSinkBackend,
-        IcebergTableSinkFactory, PositionDeleteDataFilePartition, align_arrays_to_schema,
-        build_column_slot_map, build_position_delete_output_schema, collect_theta_sketches_by_name,
+        ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL, IcebergSinkMode, IcebergSinkPlan,
+        IcebergTableSinkBackend, IcebergTableSinkFactory, PositionDeleteDataFilePartition,
+        align_arrays_to_schema, build_column_slot_map, collect_theta_sketches_by_name,
         iceberg_partition_key_for_row, iceberg_schema_from_arrow_schema,
         merge_deletion_vectors_by_file, row_lineage_row_id_index,
         schema_has_reserved_row_lineage_columns, unique_file_path, write_parquet_to_bytes,
@@ -3108,6 +3112,13 @@ mod tests {
     use crate::lower::layout::Layout;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::{common::ids::SlotId, common::types::UniqueId};
+
+    fn position_delete_required_schema_for_tests() -> SchemaRef {
+        crate::connector::iceberg::position_delete_descriptor::output_schema_from_descriptor(
+            &crate::connector::iceberg::position_delete_descriptor::required_position_delete_descriptor_for_tests(0),
+        )
+        .expect("required position delete schema")
+    }
 
     #[test]
     fn build_column_slot_map_uses_sink_output_column_names() {
@@ -3546,7 +3557,33 @@ mod tests {
             Some(1),
             Some(format!("{table_location}/data")),
             Some(7),
+            None::<crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor>,
         )
+    }
+
+    fn test_position_delete_descriptor(
+        target_partition_spec_id: i32,
+        include_partition_source: bool,
+    ) -> crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor {
+        let mut descriptor =
+            crate::connector::iceberg::position_delete_descriptor::required_position_delete_descriptor_for_tests(
+                target_partition_spec_id,
+            );
+        let partitions = if include_partition_source {
+            vec![
+                crate::thrift::data_sinks::TIcebergPositionDeletePartitionSourceField::new(
+                    Some(2),
+                    Some("id".to_string()),
+                    Some("id_part".to_string()),
+                    Some("identity".to_string()),
+                    Some(42),
+                ),
+            ]
+        } else {
+            Vec::new()
+        };
+        descriptor.partition_source_fields = Some(partitions);
+        descriptor
     }
 
     fn test_delete_output_exprs(
@@ -3790,6 +3827,83 @@ mod tests {
     }
 
     #[test]
+    fn position_delete_factory_requires_descriptor() {
+        let table_id = 101;
+        let table_location = "file:///warehouse/position-delete-no-descriptor";
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "42".to_string(),
+            )])),
+        ]));
+        let metadata =
+            test_identity_partition_metadata(table_location, table_location, target_schema, 7);
+        let desc_tbl =
+            test_partitioned_desc_table_with_metadata(table_id, table_location, &metadata);
+        let sink = test_iceberg_table_sink(table_id, table_location);
+        let layout = Layout {
+            order: Vec::new(),
+            index: HashMap::new(),
+        };
+
+        let err = match IcebergTableSinkFactory::try_new(
+            sink,
+            IcebergSinkMode::PositionDeletes,
+            &test_delete_output_exprs(true),
+            &layout,
+            &desc_tbl,
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("position-delete sink should require descriptor"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("UnsupportedPositionDeleteDescriptor"), "{err}");
+        assert!(err.contains("descriptor is missing"), "{err}");
+    }
+
+    #[test]
+    fn position_delete_factory_rejects_descriptor_order_mismatch() {
+        let table_id = 102;
+        let table_location = "file:///warehouse/position-delete-order";
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "42".to_string(),
+            )])),
+        ]));
+        let metadata =
+            test_identity_partition_metadata(table_location, table_location, target_schema, 7);
+        let desc_tbl =
+            test_partitioned_desc_table_with_metadata(table_id, table_location, &metadata);
+        let mut sink = test_iceberg_table_sink(table_id, table_location);
+        let mut descriptor = test_position_delete_descriptor(7, true);
+        descriptor.file_path.as_mut().unwrap().output_expr_index = Some(1);
+        sink.position_delete_output_descriptor = Some(descriptor);
+        let layout = Layout {
+            order: Vec::new(),
+            index: HashMap::new(),
+        };
+
+        let err = match IcebergTableSinkFactory::try_new(
+            sink,
+            IcebergSinkMode::PositionDeletes,
+            &test_delete_output_exprs(true),
+            &layout,
+            &desc_tbl,
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("position-delete sink should reject descriptor order mismatch"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("UnsupportedPositionDeleteDescriptor"), "{err}");
+        assert!(err.contains("file_path output_expr_index"), "{err}");
+    }
+
+    #[test]
     fn deletion_vector_factory_requires_position_delete_input_shape() {
         let table_id = 99;
         let table_location = "file:///warehouse/dv-shape";
@@ -3803,7 +3917,8 @@ mod tests {
             test_identity_partition_metadata(table_location, table_location, target_schema, 7);
         let desc_tbl =
             test_partitioned_desc_table_with_metadata(table_id, table_location, &metadata);
-        let sink = test_iceberg_table_sink(table_id, table_location);
+        let mut sink = test_iceberg_table_sink(table_id, table_location);
+        sink.position_delete_output_descriptor = Some(test_position_delete_descriptor(7, true));
         let layout = Layout {
             order: Vec::new(),
             index: HashMap::new(),
@@ -3824,7 +3939,7 @@ mod tests {
         };
 
         assert!(
-            err.contains("expects 3 output exprs"),
+            err.contains("output expr count mismatch"),
             "unexpected error: {err}"
         );
     }
@@ -3843,7 +3958,8 @@ mod tests {
             test_identity_partition_metadata(table_location, table_location, target_schema, 7);
         let desc_tbl =
             test_partitioned_desc_table_with_metadata(table_id, table_location, &metadata);
-        let sink = test_iceberg_table_sink(table_id, table_location);
+        let mut sink = test_iceberg_table_sink(table_id, table_location);
+        sink.position_delete_output_descriptor = Some(test_position_delete_descriptor(7, true));
         let layout = Layout {
             order: Vec::new(),
             index: HashMap::new(),
@@ -3863,7 +3979,7 @@ mod tests {
 
         assert_eq!(
             factory.plan.output_schema,
-            build_position_delete_output_schema()
+            position_delete_required_schema_for_tests()
         );
         assert!(factory.plan.target_table_metadata.is_some());
     }
@@ -4395,7 +4511,7 @@ mod tests {
             object_store_s3: None,
             file_format: "parquet".to_string(),
             compression: crate::thrift::types::TCompressionType::SNAPPY,
-            output_schema: build_position_delete_output_schema(),
+            output_schema: position_delete_required_schema_for_tests(),
             target_schema,
             equality_delete_columns: Vec::new(),
             row_lineage_data: false,
@@ -4541,7 +4657,7 @@ mod tests {
             object_store_s3: None,
             file_format: "parquet".to_string(),
             compression: crate::thrift::types::TCompressionType::SNAPPY,
-            output_schema: build_position_delete_output_schema(),
+            output_schema: position_delete_required_schema_for_tests(),
             target_schema,
             equality_delete_columns: Vec::new(),
             row_lineage_data: false,
@@ -4684,7 +4800,7 @@ mod tests {
             object_store_s3: None,
             file_format: "parquet".to_string(),
             compression: crate::thrift::types::TCompressionType::SNAPPY,
-            output_schema: build_position_delete_output_schema(),
+            output_schema: position_delete_required_schema_for_tests(),
             target_schema,
             equality_delete_columns: Vec::new(),
             row_lineage_data: false,
@@ -5087,7 +5203,7 @@ mod tests {
 
     #[test]
     fn test_position_delete_schema_carries_iceberg_field_ids() {
-        let schema = build_position_delete_output_schema();
+        let schema = position_delete_required_schema_for_tests();
         assert_eq!(schema.fields().len(), 2);
 
         let file_path_field = schema.field(0);
@@ -5096,7 +5212,7 @@ mod tests {
         assert!(!file_path_field.is_nullable());
         assert_eq!(
             file_path_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
-            Some(&ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID.to_string()),
+            Some(&"2147483546".to_string()),
         );
 
         let pos_field = schema.field(1);
@@ -5105,7 +5221,7 @@ mod tests {
         assert!(!pos_field.is_nullable());
         assert_eq!(
             pos_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
-            Some(&ICEBERG_POSITION_DELETE_POS_FIELD_ID.to_string()),
+            Some(&"2147483545".to_string()),
         );
     }
 
@@ -5114,7 +5230,7 @@ mod tests {
         // Round-trip check: write a position-delete batch out to parquet bytes
         // and confirm the parquet file-level schema exposes the Iceberg-spec
         // field ids. External engines (Spark/Trino) key off these exact ids.
-        let schema = build_position_delete_output_schema();
+        let schema = position_delete_required_schema_for_tests();
         let file_paths = Arc::new(StringArray::from(vec![
             "s3://b/path/data-a.parquet",
             "s3://b/path/data-a.parquet",
@@ -5135,14 +5251,8 @@ mod tests {
         let columns = schema_desc.columns();
         assert_eq!(columns.len(), 2);
         // Parquet ColumnDescriptor carries the field_id from SchemaElement::field_id.
-        assert_eq!(
-            columns[0].self_type().get_basic_info().id(),
-            ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID
-        );
-        assert_eq!(
-            columns[1].self_type().get_basic_info().id(),
-            ICEBERG_POSITION_DELETE_POS_FIELD_ID
-        );
+        assert_eq!(columns[0].self_type().get_basic_info().id(), 2_147_483_546);
+        assert_eq!(columns[1].self_type().get_basic_info().id(), 2_147_483_545);
     }
 
     #[test]
@@ -5150,7 +5260,7 @@ mod tests {
         // Ensures the file_path / pos values survive write + read and that the
         // ArrowReader can reconstruct them. Ordering by (file_path, pos) is the
         // writer's responsibility; this test just validates the write plumbing.
-        let schema = build_position_delete_output_schema();
+        let schema = position_delete_required_schema_for_tests();
         let file_paths = Arc::new(StringArray::from(vec!["s3://b/a", "s3://b/a", "s3://b/b"]));
         let positions = Arc::new(Int64Array::from(vec![1_i64, 7, 0]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![file_paths, positions])
@@ -5199,7 +5309,7 @@ mod tests {
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        let schema = build_position_delete_output_schema();
+        let schema = position_delete_required_schema_for_tests();
         let file_paths = Arc::new(StringArray::from(vec![
             "s3://bucket/data-a.parquet",
             "s3://bucket/data-a.parquet",
@@ -5220,7 +5330,7 @@ mod tests {
 
     #[test]
     fn test_unique_file_path_uniform_and_mixed() {
-        let schema = build_position_delete_output_schema();
+        let schema = position_delete_required_schema_for_tests();
 
         let uniform = RecordBatch::try_new(
             Arc::clone(&schema),

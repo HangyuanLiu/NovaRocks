@@ -453,6 +453,14 @@ pub(crate) fn build_iceberg_write_sink_spec(
             None::<bool>,
         )
     });
+    let position_delete_output_descriptor = match mode {
+        IcebergWriteSinkMode::PositionDeletes | IcebergWriteSinkMode::DeletionVectors => Some(
+            build_position_delete_output_descriptor(metadata, &target_columns)?,
+        ),
+        IcebergWriteSinkMode::Data
+        | IcebergWriteSinkMode::RowLineageData
+        | IcebergWriteSinkMode::EqualityDeletes => None,
+    };
 
     Ok(IcebergWriteSinkSpec {
         mode,
@@ -466,6 +474,7 @@ pub(crate) fn build_iceberg_write_sink_spec(
         cloud_configuration,
         file_format: "parquet".to_string(),
         compression: crate::thrift::types::TCompressionType::SNAPPY,
+        position_delete_output_descriptor,
     })
 }
 
@@ -549,7 +558,7 @@ fn position_delete_sink_input_columns(
     for field in metadata.default_partition_spec().fields() {
         let source = schema.field_by_id(field.source_id).ok_or_else(|| {
             format!(
-                "iceberg position-delete sink partition source field id {} not found",
+                "[UnsupportedPositionDeleteDescriptor] iceberg position-delete sink partition source field id {} not found",
                 field.source_id
             )
         })?;
@@ -558,13 +567,89 @@ fn position_delete_sink_input_columns(
             .find(|column| column.name.eq_ignore_ascii_case(&source.name))
             .ok_or_else(|| {
                 format!(
-                    "iceberg position-delete sink partition source column `{}` not found in target table",
+                    "[UnsupportedPositionDeleteDescriptor] iceberg position-delete sink partition source column `{}` not found in target table",
                     source.name
                 )
             })?;
         columns.push(column.clone());
     }
     Ok(columns)
+}
+
+fn build_position_delete_output_descriptor(
+    metadata: &iceberg::spec::TableMetadata,
+    target_columns: &[ColumnDef],
+) -> Result<crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor, String> {
+    use crate::connector::iceberg::position_delete_descriptor::{
+        ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+        ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+    };
+    use crate::lower::type_lowering::scalar_type_desc;
+
+    let schema = metadata.current_schema();
+    let partition_source_fields = metadata
+        .default_partition_spec()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            let source = schema.field_by_id(field.source_id).ok_or_else(|| {
+                format!(
+                    "[UnsupportedPositionDeleteDescriptor] iceberg position-delete sink partition source field id {} not found",
+                    field.source_id
+                )
+            })?;
+            target_columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(&source.name))
+                .ok_or_else(|| {
+                    format!(
+                        "[UnsupportedPositionDeleteDescriptor] iceberg position-delete sink partition source column `{}` not found in target table",
+                        source.name
+                    )
+                })?;
+            let output_expr_index = i32::try_from(idx + 2).map_err(|_| {
+                "[UnsupportedPositionDeleteDescriptor] position-delete partition source index overflow"
+                    .to_string()
+            })?;
+            Ok(crate::thrift::data_sinks::TIcebergPositionDeletePartitionSourceField::new(
+                Some(output_expr_index),
+                Some(source.name.clone()),
+                Some(field.name.clone()),
+                Some(crate::sql::codegen::iceberg_write_sink::transform_to_thrift_string(
+                    &field.transform,
+                )),
+                Some(field.source_id),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(
+        crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor::new(
+            Some(
+                crate::thrift::data_sinks::TIcebergPositionDeleteOutputField::new(
+                    Some(0),
+                    Some(ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string()),
+                    Some(scalar_type_desc(
+                        crate::thrift::types::TPrimitiveType::VARCHAR,
+                    )),
+                    Some(ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID),
+                ),
+            ),
+            Some(
+                crate::thrift::data_sinks::TIcebergPositionDeleteOutputField::new(
+                    Some(1),
+                    Some(ICEBERG_POSITION_DELETE_POS_COLUMN.to_string()),
+                    Some(scalar_type_desc(
+                        crate::thrift::types::TPrimitiveType::BIGINT,
+                    )),
+                    Some(ICEBERG_POSITION_DELETE_POS_FIELD_ID),
+                ),
+            ),
+            Some(partition_source_fields),
+            Some(metadata.default_partition_spec_id()),
+        ),
+    )
 }
 
 fn append_source_to_query(
@@ -1297,6 +1382,230 @@ mod tests {
         ))
     }
 
+    fn test_iceberg_metadata_with_identity_partition(
+        source_column_name: &str,
+        source_field_id: i32,
+        partition_spec_id: i32,
+    ) -> iceberg::spec::TableMetadata {
+        test_iceberg_metadata_with_partition(
+            source_column_name,
+            source_column_name,
+            iceberg::spec::Transform::Identity,
+            source_field_id,
+            partition_spec_id,
+        )
+    }
+
+    fn test_iceberg_metadata_with_partition(
+        source_column_name: &str,
+        partition_field_name: &str,
+        transform: iceberg::spec::Transform,
+        source_field_id: i32,
+        partition_spec_id: i32,
+    ) -> iceberg::spec::TableMetadata {
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(iceberg::spec::NestedField::required(
+                    source_field_id,
+                    source_column_name,
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+                )),
+                Arc::new(iceberg::spec::NestedField::optional(
+                    source_field_id + 1,
+                    "v",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .expect("schema");
+        let partition_spec = iceberg::spec::PartitionSpec::builder(Arc::new(schema.clone()))
+            .with_spec_id(partition_spec_id)
+            .add_partition_field(source_column_name, partition_field_name, transform)
+            .expect("partition field")
+            .build()
+            .expect("partition spec");
+        let creation = iceberg::TableCreation::builder()
+            .name("t".to_string())
+            .location("file:///warehouse/db/t".to_string())
+            .schema(schema)
+            .partition_spec(partition_spec.into_unbound())
+            .format_version(iceberg::spec::FormatVersion::V3)
+            .build();
+        let metadata = iceberg::spec::TableMetadataBuilder::from_table_creation(creation)
+            .expect("metadata builder")
+            .build()
+            .expect("metadata")
+            .metadata;
+        retag_test_metadata_partition_source(metadata, source_field_id, partition_spec_id)
+    }
+
+    fn retag_test_metadata_partition_source(
+        metadata: iceberg::spec::TableMetadata,
+        source_field_id: i32,
+        partition_spec_id: i32,
+    ) -> iceberg::spec::TableMetadata {
+        // TableMetadataBuilder::from_table_creation intentionally reassigns
+        // field and spec ids; this fixture retags serialized metadata so tests
+        // can assert planner descriptors carry target-table ids verbatim.
+        let mut value = serde_json::to_value(metadata).expect("metadata json");
+        let object = value.as_object_mut().expect("metadata object");
+        object.insert(
+            "default-spec-id".to_string(),
+            serde_json::Value::from(partition_spec_id),
+        );
+        object.insert(
+            "last-column-id".to_string(),
+            serde_json::Value::from(source_field_id + 1),
+        );
+
+        let schemas = object
+            .get_mut("schemas")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("schemas array");
+        let schema_fields = schemas[0]
+            .as_object_mut()
+            .and_then(|schema| schema.get_mut("fields"))
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("schema fields");
+        schema_fields[0]
+            .as_object_mut()
+            .expect("first field")
+            .insert("id".to_string(), serde_json::Value::from(source_field_id));
+        schema_fields[1]
+            .as_object_mut()
+            .expect("second field")
+            .insert(
+                "id".to_string(),
+                serde_json::Value::from(source_field_id + 1),
+            );
+
+        let specs = object
+            .get_mut("partition-specs")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("partition specs");
+        let spec = specs[0].as_object_mut().expect("partition spec object");
+        spec.insert(
+            "spec-id".to_string(),
+            serde_json::Value::from(partition_spec_id),
+        );
+        let partition_fields = spec
+            .get_mut("fields")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("partition fields");
+        partition_fields[0]
+            .as_object_mut()
+            .expect("partition field")
+            .insert(
+                "source-id".to_string(),
+                serde_json::Value::from(source_field_id),
+            );
+
+        serde_json::from_value(value).expect("retagged metadata")
+    }
+
+    fn test_iceberg_target() -> TargetBackend {
+        TargetBackend {
+            backend_name: "iceberg",
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "target_orders".to_string(),
+        }
+    }
+
+    fn test_resolved_table(columns: Vec<ColumnDef>) -> ResolvedTable {
+        ResolvedTable {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "target_orders".to_string(),
+            columns,
+        }
+    }
+
+    fn test_iceberg_table(metadata: iceberg::spec::TableMetadata) -> iceberg::table::Table {
+        iceberg::table::Table::builder()
+            .identifier(TableIdent::new(
+                NamespaceIdent::new("test_db".to_string()),
+                "target_orders".to_string(),
+            ))
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .metadata(metadata)
+            .build()
+            .expect("iceberg table")
+    }
+
+    fn test_iceberg_catalog_entry() -> IcebergCatalogEntry {
+        let warehouse = tempfile::TempDir::new().expect("warehouse tempdir");
+        crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "test_catalog",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    warehouse.path().display().to_string(),
+                ),
+            ],
+        )
+        .expect("iceberg catalog entry")
+    }
+
+    fn assert_position_delete_output_field(
+        field: Option<&crate::thrift::data_sinks::TIcebergPositionDeleteOutputField>,
+        output_expr_index: i32,
+        name: &str,
+        primitive: crate::thrift::types::TPrimitiveType,
+        field_id: i32,
+    ) {
+        let field = field.expect("position delete output field");
+        assert_eq!(field.output_expr_index, Some(output_expr_index));
+        assert_eq!(field.name.as_deref(), Some(name));
+        assert_eq!(field.field_id, Some(field_id));
+        assert_eq!(
+            field
+                .type_desc
+                .as_ref()
+                .and_then(crate::lower::type_lowering::primitive_type_from_desc),
+            Some(primitive)
+        );
+    }
+
+    fn assert_position_delete_descriptor_contract(
+        desc: &crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor,
+    ) {
+        use crate::connector::iceberg::position_delete_descriptor::{
+            ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+            ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+        };
+
+        assert_eq!(desc.target_partition_spec_id, Some(7));
+        assert_position_delete_output_field(
+            desc.file_path.as_ref(),
+            0,
+            ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
+            crate::thrift::types::TPrimitiveType::VARCHAR,
+            ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+        );
+        assert_position_delete_output_field(
+            desc.pos.as_ref(),
+            1,
+            ICEBERG_POSITION_DELETE_POS_COLUMN,
+            crate::thrift::types::TPrimitiveType::BIGINT,
+            ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+        );
+        let partition_field = desc
+            .partition_source_fields
+            .as_ref()
+            .and_then(|fields| fields.first())
+            .expect("partition source field");
+        assert_eq!(partition_field.output_expr_index, Some(2));
+        assert_eq!(partition_field.source_column_name.as_deref(), Some("id"));
+        assert_eq!(
+            partition_field.partition_field_name.as_deref(),
+            Some("id_bucket")
+        );
+        assert_eq!(partition_field.transform_expr.as_deref(), Some("bucket[8]"));
+        assert_eq!(partition_field.source_field_id, Some(42));
+    }
+
     #[test]
     fn arrow_data_type_to_sql_type_accepts_time64_for_insert_defaults() {
         assert_eq!(
@@ -1380,6 +1689,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["id", "v"]
         );
+    }
+
+    #[test]
+    fn position_delete_sink_spec_carries_descriptor() {
+        let resolved_columns = vec![
+            test_column("id", DataType::Int32, None),
+            test_column("v", DataType::Utf8, None),
+        ];
+        let metadata = test_iceberg_metadata_with_partition(
+            "id",
+            "id_bucket",
+            iceberg::spec::Transform::Bucket(8),
+            42,
+            7,
+        );
+        let target = test_iceberg_target();
+        let resolved = test_resolved_table(resolved_columns);
+        let table = test_iceberg_table(metadata);
+        let entry = test_iceberg_catalog_entry();
+        let spec = build_position_delete_sink_spec(&target, &resolved, &table, &entry)
+            .expect("position delete sink spec");
+        let desc = spec
+            .position_delete_output_descriptor
+            .as_ref()
+            .expect("descriptor");
+        assert_position_delete_descriptor_contract(desc);
+
+        let sink = spec.build_sink(17);
+        let sink_desc = sink
+            .iceberg_table_sink
+            .as_ref()
+            .and_then(|sink| sink.position_delete_output_descriptor.as_ref())
+            .expect("sink descriptor");
+        assert_position_delete_descriptor_contract(sink_desc);
+    }
+
+    #[test]
+    fn position_delete_sink_spec_rejects_missing_partition_source() {
+        let resolved_columns = vec![test_column("v", DataType::Utf8, None)];
+        let metadata = test_iceberg_metadata_with_identity_partition("id", 42, 7);
+        let target = test_iceberg_target();
+        let resolved = test_resolved_table(resolved_columns);
+        let table = test_iceberg_table(metadata);
+        let entry = test_iceberg_catalog_entry();
+        let err = build_position_delete_sink_spec(&target, &resolved, &table, &entry).unwrap_err();
+
+        assert!(
+            err.contains("[UnsupportedPositionDeleteDescriptor]"),
+            "{err}"
+        );
+        assert!(err.contains("partition source column `id`"), "{err}");
     }
 
     #[test]

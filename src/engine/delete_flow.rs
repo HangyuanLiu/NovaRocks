@@ -2036,6 +2036,27 @@ mod tests {
     }
 
     #[test]
+    fn delete_distributed_write_uses_position_delete_sink_spec_builder() {
+        let source = include_str!("delete_flow.rs");
+        let legacy_delete = source
+            .split("let sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec")
+            .nth(1)
+            .expect("legacy DELETE must build position-delete sink spec");
+        assert!(
+            legacy_delete.contains("build_delete_position_sink_query"),
+            "DELETE must build the sink query from the descriptor-backed sink spec"
+        );
+        let dv_delete = source
+            .split("fn run_delete_dv_write_transaction")
+            .nth(1)
+            .expect("DV DELETE entrypoint");
+        assert!(
+            dv_delete.contains("build_position_delete_sink_spec"),
+            "DV DELETE must reuse position-delete descriptor builder"
+        );
+    }
+
+    #[test]
     fn referenced_data_file_partition_insert_rejects_conflicting_duplicate_metadata() {
         let path = "/warehouse/db/t/data.parquet".to_string();
         let mut partitions = HashMap::new();

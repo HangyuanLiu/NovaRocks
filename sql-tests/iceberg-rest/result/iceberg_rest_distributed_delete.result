@@ -5,3 +5,8 @@ id	region	amount
 
 -- query 9
 id	region
+
+-- query 10
+region	cnt
+east	1
+west	1

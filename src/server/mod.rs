@@ -1685,6 +1685,11 @@ fn parse_admin_raise_engine_error_query(query: &str) -> Result<Option<EngineErro
         EngineErrorCode::IcebergWriteDescriptorMismatch => {
             EngineError::iceberg_write_descriptor_mismatch("forced P8 SQL runner error-code smoke")
         }
+        EngineErrorCode::UnsupportedPositionDeleteDescriptor => {
+            EngineError::unsupported_position_delete_descriptor(
+                "forced position-delete descriptor error-code smoke",
+            )
+        }
         EngineErrorCode::CommitKnownUncommitted => {
             EngineError::commit_known_uncommitted("forced P8 SQL runner error-code smoke")
         }
@@ -2115,6 +2120,20 @@ mod tests {
         assert_eq!(
             err.to_bracketed_user_message(),
             "[IcebergWriteDescriptorMismatch] forced P8 SQL runner error-code smoke"
+        );
+    }
+
+    #[test]
+    fn parse_admin_raise_engine_error_accepts_position_delete_descriptor_code() {
+        let err = parse_admin_raise_engine_error_query(
+            "ADMIN RAISE ENGINE ERROR 'UnsupportedPositionDeleteDescriptor'",
+        )
+        .expect("parse ok")
+        .expect("matched");
+
+        assert_eq!(
+            err.to_bracketed_user_message(),
+            "[UnsupportedPositionDeleteDescriptor] forced position-delete descriptor error-code smoke"
         );
     }
 

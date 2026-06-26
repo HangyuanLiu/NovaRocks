@@ -24,6 +24,7 @@ pub enum EngineErrorCode {
     ExchangeDescriptorMismatch,
     AggregateStateLayoutMismatch,
     IcebergWriteDescriptorMismatch,
+    UnsupportedPositionDeleteDescriptor,
     UnsupportedDistributedDmlShape,
     DistributedWriteOutputMismatch,
     WriteCoordinatorGone,
@@ -43,6 +44,7 @@ impl EngineErrorCode {
             Self::ExchangeDescriptorMismatch => "ExchangeDescriptorMismatch",
             Self::AggregateStateLayoutMismatch => "AggregateStateLayoutMismatch",
             Self::IcebergWriteDescriptorMismatch => "IcebergWriteDescriptorMismatch",
+            Self::UnsupportedPositionDeleteDescriptor => "UnsupportedPositionDeleteDescriptor",
             Self::UnsupportedDistributedDmlShape => "UnsupportedDistributedDmlShape",
             Self::DistributedWriteOutputMismatch => "DistributedWriteOutputMismatch",
             Self::WriteCoordinatorGone => "WriteCoordinatorGone",
@@ -62,6 +64,9 @@ impl EngineErrorCode {
             "ExchangeDescriptorMismatch" => Some(Self::ExchangeDescriptorMismatch),
             "AggregateStateLayoutMismatch" => Some(Self::AggregateStateLayoutMismatch),
             "IcebergWriteDescriptorMismatch" => Some(Self::IcebergWriteDescriptorMismatch),
+            "UnsupportedPositionDeleteDescriptor" => {
+                Some(Self::UnsupportedPositionDeleteDescriptor)
+            }
             "UnsupportedDistributedDmlShape" => Some(Self::UnsupportedDistributedDmlShape),
             "DistributedWriteOutputMismatch" => Some(Self::DistributedWriteOutputMismatch),
             "WriteCoordinatorGone" => Some(Self::WriteCoordinatorGone),
@@ -79,5 +84,22 @@ impl EngineErrorCode {
 impl fmt::Display for EngineErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_position_delete_descriptor_code_round_trips() {
+        assert_eq!(
+            EngineErrorCode::UnsupportedPositionDeleteDescriptor.as_str(),
+            "UnsupportedPositionDeleteDescriptor"
+        );
+        assert_eq!(
+            EngineErrorCode::parse("UnsupportedPositionDeleteDescriptor"),
+            Some(EngineErrorCode::UnsupportedPositionDeleteDescriptor)
+        );
     }
 }
