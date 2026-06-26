@@ -157,17 +157,67 @@ fn wider_map_type(left_entries: &Field, right_entries: &Field) -> DataType {
     )
 }
 
-/// Comparison operand common type for `col op col`, aligned with the execution
-/// backstop `exec::expr::comparison::normalize_comparison_types`. Returns the
-/// type BOTH operands should be cast to, or `None` when no cast is needed
-/// (equal types) or this layer does not coerce the pair (non-numeric: string /
-/// date-ts / cross-family / incompatible — left to literal coercion or the
-/// execution-time normalizer). Numeric/decimal only — kept in lock-step with
-/// `normalize_comparison_types`' numeric/decimal arms so the materialized cast
-/// type equals the execution-time comparison type.
-pub(crate) fn comparison_common_type(left: &DataType, right: &DataType) -> Option<DataType> {
+/// Common decimal type for a decimal-vs-decimal comparison / equi-join key.
+/// scale = max(s1,s2); precision = max(p1-s1, p2-s2) + scale. Promotes to
+/// Decimal256 when the precision exceeds 38 or either side is already 256;
+/// errors when it would exceed 76 (Decimal256 max). This is the single source
+/// shared by `comparison_common_type`, lower binary_pred, and lower join-key.
+pub(crate) fn decimal_compare_type(left: &DataType, right: &DataType) -> Result<DataType, String> {
+    let (lp, ls, left_is_256) = match left {
+        DataType::Decimal128(p, s) => (*p, *s, false),
+        DataType::Decimal256(p, s) => (*p, *s, true),
+        _ => {
+            return Err(format!(
+                "decimal comparison requires decimal operands (left={left:?}, right={right:?})"
+            ));
+        }
+    };
+    let (rp, rs, right_is_256) = match right {
+        DataType::Decimal128(p, s) => (*p, *s, false),
+        DataType::Decimal256(p, s) => (*p, *s, true),
+        _ => {
+            return Err(format!(
+                "decimal comparison requires decimal operands (left={left:?}, right={right:?})"
+            ));
+        }
+    };
+
+    let target_scale: i8 = ls.max(rs);
+    let lhs_int_digits: i16 = (lp as i16) - (ls as i16);
+    let rhs_int_digits: i16 = (rp as i16) - (rs as i16);
+    let int_digits: i16 = lhs_int_digits.max(rhs_int_digits).max(0);
+    let target_precision: i16 = int_digits + (target_scale as i16);
+    if target_precision <= 0 {
+        return Err(format!(
+            "decimal comparison invalid precision (left={left:?}, right={right:?})"
+        ));
+    }
+    let need_decimal256 = left_is_256 || right_is_256 || target_precision > 38;
+    if need_decimal256 {
+        if target_precision > 76 {
+            return Err(format!(
+                "decimal comparison precision overflow (left={left:?}, right={right:?}, target=Decimal256({target_precision}, {target_scale}))"
+            ));
+        }
+        let target_precision_u8 = target_precision as u8;
+        return Ok(DataType::Decimal256(target_precision_u8, target_scale));
+    }
+    let target_precision_u8 = target_precision as u8;
+    Ok(DataType::Decimal128(target_precision_u8, target_scale))
+}
+
+/// Comparison operand common type. Single authority shared by analyzer,
+/// execution `normalize_comparison_types`, and lower binary_pred / join-key.
+/// `Ok(None)`: operands already equal, OR pair is out of scope (int x decimal —
+/// handled in S3 —, string, temporal, cross-family) and is left to the caller.
+/// `Ok(Some(t))`: numeric / decimal pair -> cast BOTH operands to `t`.
+/// `Err`: decimal pair whose common precision exceeds Decimal256 (> 76).
+pub(crate) fn comparison_common_type(
+    left: &DataType,
+    right: &DataType,
+) -> Result<Option<DataType>, String> {
     if left == right {
-        return None;
+        return Ok(None);
     }
     let is_int = |dt: &DataType| {
         matches!(
@@ -178,32 +228,25 @@ pub(crate) fn comparison_common_type(left: &DataType, right: &DataType) -> Optio
     let is_float = |dt: &DataType| matches!(dt, DataType::Float32 | DataType::Float64);
 
     if is_int(left) && is_int(right) {
-        return Some(DataType::Int64);
+        return Ok(Some(DataType::Int64));
     }
     if (is_int(left) && is_float(right)) || (is_float(left) && is_int(right)) {
-        return Some(DataType::Float64);
+        return Ok(Some(DataType::Float64));
     }
     if is_float(left) && is_float(right) {
-        return Some(DataType::Float64);
+        return Ok(Some(DataType::Float64));
     }
-    if let (DataType::Decimal128(lp, ls), DataType::Decimal128(rp, rs)) = (left, right) {
-        let target_scale: i8 = (*ls).max(*rs);
-        let lhs_int_digits: i16 = (*lp as i16) - (*ls as i16);
-        let rhs_int_digits: i16 = (*rp as i16) - (*rs as i16);
-        let int_digits: i16 = lhs_int_digits.max(rhs_int_digits).max(0);
-        let target_precision: i16 = int_digits + (target_scale as i16);
-        // Out-of-range precision is left to the execution normalizer to error
-        // on (this layer only opportunistically pre-casts the safe cases).
-        if target_precision <= 0 || target_precision > 38 {
-            return None;
-        }
-        let target = DataType::Decimal128(target_precision as u8, target_scale);
-        if &target == left && &target == right {
-            return None;
-        }
-        return Some(target);
+    if matches!(
+        left,
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+    ) && matches!(
+        right,
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+    ) {
+        return Ok(Some(decimal_compare_type(left, right)?));
     }
-    None
+    // int x decimal (S3), string, temporal, cross-family: not this layer's job.
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -213,48 +256,72 @@ mod tests {
 
     #[test]
     fn comparison_common_type_numeric_and_decimal() {
-        // equal -> None (no cast needed)
+        // equal -> Ok(None)
         assert_eq!(
             comparison_common_type(&DataType::Int32, &DataType::Int32),
-            None
+            Ok(None)
         );
-        // int width mismatch -> both Int64 (aligned with normalize_comparison_types,
-        // NOT wider_type's Int16/Int8 behavior)
+        // int width mismatch -> both Int64
         assert_eq!(
             comparison_common_type(&DataType::Int32, &DataType::Int64),
-            Some(DataType::Int64)
+            Ok(Some(DataType::Int64))
         );
         assert_eq!(
             comparison_common_type(&DataType::Int16, &DataType::Int8),
-            Some(DataType::Int64)
+            Ok(Some(DataType::Int64))
         );
         // int <-> float / float x float -> both Float64
         assert_eq!(
             comparison_common_type(&DataType::Int32, &DataType::Float64),
-            Some(DataType::Float64)
+            Ok(Some(DataType::Float64))
         );
         assert_eq!(
             comparison_common_type(&DataType::Float32, &DataType::Float64),
-            Some(DataType::Float64)
+            Ok(Some(DataType::Float64))
         );
-        // decimal x decimal -> common decimal: scale=max(2,4)=4,
-        // int_digits=max(10-2,18-4)=14, precision=14+4=18
+        // decimal x decimal <=38 -> common Decimal128
         assert_eq!(
             comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Decimal128(18, 4)),
-            Some(DataType::Decimal128(18, 4))
+            Ok(Some(DataType::Decimal128(18, 4)))
         );
         assert_eq!(
             comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Decimal128(10, 2)),
-            None
+            Ok(None)
         );
-        // non-numeric (string / cross-family) -> None (out of scope here)
+        // out of scope (int x decimal handled in S3; string / cross-family) -> Ok(None)
+        assert_eq!(
+            comparison_common_type(&DataType::Int32, &DataType::Decimal128(10, 2)),
+            Ok(None)
+        );
         assert_eq!(
             comparison_common_type(&DataType::Utf8, &DataType::Int32),
-            None
+            Ok(None)
         );
+    }
+
+    #[test]
+    fn comparison_common_type_decimal_overflow_promotes_to_256() {
+        // scale=max(0,10)=10, int_digits=max(30-0,30-10)=30, precision=40 > 38 -> Decimal256
         assert_eq!(
-            comparison_common_type(&DataType::Utf8, &DataType::Utf8),
-            None
+            comparison_common_type(&DataType::Decimal128(30, 0), &DataType::Decimal128(30, 10)),
+            Ok(Some(DataType::Decimal256(40, 10)))
+        );
+        // either side already Decimal256 -> Decimal256
+        assert_eq!(
+            comparison_common_type(&DataType::Decimal256(40, 2), &DataType::Decimal128(10, 2)),
+            Ok(Some(DataType::Decimal256(40, 2)))
+        );
+    }
+
+    #[test]
+    fn comparison_common_type_decimal_overflow_beyond_256_errs() {
+        // precision > 76 -> Err
+        let err =
+            comparison_common_type(&DataType::Decimal256(76, 0), &DataType::Decimal256(76, 38));
+        let err = err.expect_err("expected overflow Err");
+        assert!(
+            err.contains("precision overflow"),
+            "expected precision overflow Err, got {err}"
         );
     }
 

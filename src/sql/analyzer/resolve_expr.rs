@@ -1243,7 +1243,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 // matching key types so the RF gate (rf_key_types_match) passes.
                 // Non-numeric pairs return None and are left to literal coercion /
                 // the execution-time normalizer (normalize_comparison_types).
-                match comparison_common_type(&left_coerced.data_type, &right_coerced.data_type) {
+                match comparison_common_type(&left_coerced.data_type, &right_coerced.data_type)? {
                     Some(common) => (
                         cast_null_preserving_target_type(left_coerced, &common),
                         cast_null_preserving_target_type(right_coerced, &common),
