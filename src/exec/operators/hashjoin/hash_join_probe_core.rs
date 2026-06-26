@@ -889,10 +889,9 @@ impl HashJoinProbeCore {
             residual_applied_during_selection = self.residual_predicate.is_some();
             for probe in probe_chunks {
                 let search_start = std::time::Instant::now();
-                let (group_ids, mut selection) =
-                    table.lookup_selection(&self.arena, &self.probe_keys, &probe)?;
+                let (mut selection, stats) =
+                    table.search_pairs(&self.arena, &self.probe_keys, &probe)?;
                 self.record_search_ns(search_start);
-                let stats = SearchStats::from_group_ids(&group_ids);
                 self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(stats.lookup_hit_rows);
                 self.lookup_miss_rows =
                     self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);

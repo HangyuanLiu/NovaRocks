@@ -352,7 +352,6 @@ impl JoinHashMap {
         }
     }
 
-    #[allow(dead_code)] // M3.2 wires the vectorized probe core to this staged API.
     pub(crate) fn search_pairs(
         &self,
         arena: &ExprArena,
@@ -400,7 +399,6 @@ impl ChainedJoinHashMap {
         Ok((group_ids, selection))
     }
 
-    #[allow(dead_code)] // Called through JoinHashMap::search_pairs once M3.2 wires it in.
     fn search_pairs(
         &self,
         arena: &ExprArena,
@@ -683,7 +681,6 @@ impl DirectIntJoinHashMap {
         Ok((group_ids, selection))
     }
 
-    #[allow(dead_code)] // Called through JoinHashMap::search_pairs once M3.2 wires it in.
     fn search_pairs(
         &self,
         arena: &ExprArena,
