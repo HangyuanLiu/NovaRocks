@@ -91,6 +91,10 @@ fn try_rewrite(
     cand: &MvRewriteCandidate,
     memo: &mut Memo,
 ) -> Option<NewExpr> {
+    if query.joins.is_some() || cand.mv.joins.is_some() {
+        return None;
+    }
+
     // 1. Same physical base table (compare Iceberg identity, not names).
     if !same_iceberg_table(&query.table, &cand.mv.table) {
         return None;
@@ -469,12 +473,15 @@ mod tests {
         ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::cascades_rules::mv_rewrite::descriptor::{
+        EquiEdge, JoinInput, JoinShape,
+    };
     use crate::sql::optimizer::memo::{GroupId, Memo};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::optimizer_bridge::scalar::materialize;
     use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalPlanNode, LogicalScanNode,
-        PlanNodeKind,
+        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,
+        LogicalScanNode, PlanNodeKind,
     };
     use arrow::datatypes::DataType;
 
@@ -541,6 +548,18 @@ mod tests {
         }
     }
 
+    fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Eq,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        }
+    }
+
     fn iceberg_info(catalog: &str, ns: &str, tbl: &str) -> IcebergTableInfo {
         IcebergTableInfo {
             catalog: catalog.to_string(),
@@ -599,6 +618,22 @@ mod tests {
                 mv_rewritten_from: None,
             }),
             vec![],
+            None,
+        )
+    }
+
+    fn join_plan(
+        kind: crate::sql::common::expr::JoinKind,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
+        on: Option<TypedExpr>,
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            PlanNodeKind::Join(LogicalJoinNode {
+                join_type: kind,
+                condition: on,
+            }),
+            vec![left, right],
             None,
         )
     }
@@ -764,6 +799,123 @@ mod tests {
         assert!(
             rule.apply(&root_expr, &mut memo).is_empty(),
             "second apply must be a no-op"
+        );
+    }
+
+    #[test]
+    fn rejects_multitable_mv_descriptor_candidate() {
+        // Until memo-side multi-table descriptor matching exists, a candidate
+        // that carries MV-side join shape must fail closed.
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let s = col(3, "s");
+        let query_plan = LogicalPlanNode::new(
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                PlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: ge(col_ref(&a), 10),
+                }),
+                vec![base_scan(&[a.clone(), v.clone()])],
+                None,
+            )],
+            None,
+        );
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        let mut candidate = agg_candidate(0);
+        candidate.mv.joins = Some(JoinShape {
+            inputs: vec![JoinInput {
+                table: iceberg_table("cat", "ns", "t2", &["c"]),
+                scan_columns: vec![col(300, "c")],
+            }],
+            equi_edges: vec![EquiEdge {
+                left: ColumnId(1),
+                right: ColumnId(300),
+            }],
+        });
+
+        let rule = MvRewriteRule::new(vec![candidate]);
+        assert!(
+            rule.apply(&root_expr, &mut memo).is_empty(),
+            "multi-table MV descriptor must not rewrite before join matching exists"
+        );
+    }
+
+    #[test]
+    fn multi_table_query_descriptor_does_not_rewrite_against_single_table_candidate() {
+        use crate::sql::common::expr::JoinKind;
+
+        // Aggregate(Filter(Join(...))) is important: MvRewriteRule::matches
+        // accepts Aggregate, not a bare LogicalJoin root.
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let c = col(3, "c");
+        let s = col(4, "s");
+        let join = join_plan(
+            JoinKind::Inner,
+            base_scan(&[a.clone(), v.clone()]),
+            LogicalPlanNode::new(
+                PlanNodeKind::Scan(LogicalScanNode {
+                    database: "ns".to_string(),
+                    table: iceberg_table("cat", "ns", "t2", &["c"]),
+                    alias: None,
+                    columns: vec![c.clone()],
+                    predicates: vec![],
+                    required_columns: None,
+                    dict_columns: vec![],
+                    variant_columns: vec![],
+                    mv_rewritten_from: None,
+                }),
+                vec![],
+                None,
+            ),
+            Some(eq(col_ref(&a), col_ref(&c))),
+        );
+        let query_plan = LogicalPlanNode::new(
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                PlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: ge(col_ref(&a), 10),
+                }),
+                vec![join],
+                None,
+            )],
+            None,
+        );
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        let rule = MvRewriteRule::new(vec![agg_candidate(0)]);
+        assert!(
+            rule.matches(&root_expr.op),
+            "test must exercise a production rule entry op"
+        );
+        let (query, _) =
+            SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("query descriptor");
+        assert!(
+            query.joins.is_some(),
+            "test must exercise the query-side join descriptor path"
+        );
+        assert!(
+            rule.apply(&root_expr, &mut memo).is_empty(),
+            "multi-table query descriptor must not rewrite against a single-table candidate yet"
         );
     }
 

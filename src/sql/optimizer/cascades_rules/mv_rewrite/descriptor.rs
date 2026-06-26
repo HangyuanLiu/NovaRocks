@@ -4,14 +4,16 @@
 //! the MV defining plan (built at candidate-prep time from the planner
 //! LogicalPlanNode) and the query subtree (rebuilt from memo MExprs by the rule).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::sql::analysis::BinOp;
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::OutputColumn;
+use crate::sql::common::expr::JoinKind;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{
-    AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec,
+    AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec, ScanOp,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey};
@@ -58,6 +60,36 @@ pub(crate) struct SpjgAggregate {
     pub group_by: Vec<ScalarId>,
 }
 
+/// One additional (non-driving) base input of an inner-join SPJG shape.
+/// The driving (left-deep first) scan stays in the descriptor's own
+/// `table`/`scan_columns`; every other inner-join input lands here.
+#[derive(Clone, Debug)]
+pub(crate) struct JoinInput {
+    #[allow(dead_code)]
+    pub table: TableDef,
+    /// Scan output columns of this input: ColumnId -> base column binding.
+    pub scan_columns: Vec<OutputColumn>,
+}
+
+/// Equi-join key `left_column = right_column`, addressed by the ColumnIds
+/// visible at the two joined inputs. Non-equi join conjuncts are folded into
+/// the descriptor's flat `predicates` list, not here.
+#[derive(Clone, Debug)]
+pub(crate) struct EquiEdge {
+    pub left: ColumnId,
+    pub right: ColumnId,
+}
+
+/// Inner-join shape attached to an `SpjgDescriptor`. `inputs` are every base
+/// table joined onto the driving scan (left-deep order); `equi_edges` are the
+/// equi-join keys. `None` on the descriptor means single-table (the original,
+/// unchanged shape).
+#[derive(Clone, Debug)]
+pub(crate) struct JoinShape {
+    pub inputs: Vec<JoinInput>,
+    pub equi_edges: Vec<EquiEdge>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SpjgDescriptor {
     pub table: TableDef,
@@ -68,16 +100,30 @@ pub(crate) struct SpjgDescriptor {
     pub aggregate: Option<SpjgAggregate>,
     /// Visible outputs in order (the subtree's output schema).
     pub outputs: Vec<SpjgOutput>,
+    /// Inner-join shape, or `None` for a single-table SPJG. Populated by the
+    /// descriptor builders when a left-deep inner-equi-join sits below the
+    /// filter chain. The rewrite rule does not yet act on multi-table
+    /// descriptors (see `rule::try_rewrite` guard) - extraction only.
+    pub joins: Option<JoinShape>,
 }
 
 impl SpjgDescriptor {
     /// Map from scan ColumnId to base column name (for cross-side matching:
     /// the two sides see the same physical table through different ids).
     pub(crate) fn base_name_of(&self) -> HashMap<ColumnId, String> {
-        self.scan_columns
+        let mut map: HashMap<ColumnId, String> = self
+            .scan_columns
             .iter()
             .map(|c| (c.column_id, c.name.clone()))
-            .collect()
+            .collect();
+        if let Some(joins) = &self.joins {
+            for input in &joins.inputs {
+                for c in &input.scan_columns {
+                    map.insert(c.column_id, c.name.clone());
+                }
+            }
+        }
+        map
     }
 
     pub(crate) fn from_opt_expr(
@@ -137,12 +183,7 @@ impl SpjgDescriptor {
                 .ok_or_else(|| "filter without child in MV rewrite shape".to_string())?;
         }
 
-        let Operator::LogicalScan(scan) = &node.op else {
-            return Err(format!(
-                "not a single-table SPJG shape: unexpected node {:?}",
-                std::mem::discriminant(&node.op)
-            ));
-        };
+        let (scan, joins) = peel_join_spine_opt(node, arena, &mut predicates)?;
         predicates.extend(scan.predicates.iter().copied());
 
         // Composition map: ColumnId -> defining expr over scan columns
@@ -181,7 +222,7 @@ impl SpjgDescriptor {
                 let mut agg_outputs: Vec<SpjgOutput> = Vec::new();
                 for (i, oc) in a.output_columns.iter().enumerate() {
                     let expr = if i < a.group_by.len() {
-                        SpjgOutputExpr::Dimension(group_by[i].clone())
+                        SpjgOutputExpr::Dimension(group_by[i])
                     } else {
                         SpjgOutputExpr::Aggregate(aggregates[i - a.group_by.len()].clone())
                     };
@@ -230,6 +271,7 @@ impl SpjgDescriptor {
             predicates,
             aggregate: agg,
             outputs,
+            joins,
         })
     }
 
@@ -277,16 +319,8 @@ impl SpjgDescriptor {
             _ => None,
         };
 
-        // Filter chain down to the scan.
         let mut predicates: Vec<ScalarId> = Vec::new();
-        while let Operator::LogicalFilter(f) = &node.op {
-            scalar_expr::split_conjuncts(&memo.scalars, f.predicate, &mut predicates);
-            node = first_logical_expr(memo, *node.children.first()?)?;
-        }
-
-        let Operator::LogicalScan(scan) = &node.op else {
-            return None;
-        };
+        let (scan, joins) = peel_join_spine_memo(&node, memo, &mut predicates)?;
         // Reject scans already injected by a prior MV rewrite (MV-on-MV).
         if scan.mv_rewritten_from.is_some() {
             return None;
@@ -390,6 +424,7 @@ impl SpjgDescriptor {
                 predicates,
                 aggregate: agg,
                 outputs,
+                joins,
             },
             shape,
         ))
@@ -502,6 +537,272 @@ fn substitute_sort_key(
         nulls_first: key.nulls_first,
         display: key.display.clone(),
     }
+}
+
+fn peel_join_spine_memo(
+    node: &MExpr,
+    memo: &Memo,
+    predicates: &mut Vec<ScalarId>,
+) -> Option<(ScanOp, Option<JoinShape>)> {
+    let mut n = node.clone();
+    while let Operator::LogicalFilter(f) = &n.op {
+        scalar_expr::split_conjuncts(&memo.scalars, f.predicate, predicates);
+        n = first_logical_expr(memo, *n.children.first()?)?;
+    }
+    match &n.op {
+        Operator::LogicalScan(scan) => Some((scan.clone(), None)),
+        Operator::LogicalJoin(join) => {
+            if join.join_type != JoinKind::Inner {
+                return None;
+            }
+            let left = first_logical_expr(memo, *n.children.first()?)?;
+            let right = first_logical_expr(memo, *n.children.get(1)?)?;
+
+            let (driving, left_joins) = peel_join_spine_memo(&left, memo, predicates)?;
+            let right_input = peel_filter_scan_memo(&right, memo, predicates)?;
+
+            let left_columns = join_left_column_ids(&driving.columns, left_joins.as_ref());
+            let right_columns = column_id_set(&right_input.scan_columns);
+            let (edges, residuals) =
+                split_join_condition(&memo.scalars, join.condition, &left_columns, &right_columns);
+            if edges.is_empty() {
+                return None;
+            }
+            predicates.extend(residuals);
+
+            let mut shape = left_joins.unwrap_or(JoinShape {
+                inputs: Vec::new(),
+                equi_edges: Vec::new(),
+            });
+            shape.inputs.push(right_input);
+            shape.equi_edges.extend(edges);
+            Some((driving, Some(shape)))
+        }
+        _ => None,
+    }
+}
+
+fn peel_filter_scan_memo(
+    node: &MExpr,
+    memo: &Memo,
+    predicates: &mut Vec<ScalarId>,
+) -> Option<JoinInput> {
+    let mut n = node.clone();
+    while let Operator::LogicalFilter(f) = &n.op {
+        scalar_expr::split_conjuncts(&memo.scalars, f.predicate, predicates);
+        n = first_logical_expr(memo, *n.children.first()?)?;
+    }
+    let Operator::LogicalScan(scan) = &n.op else {
+        return None;
+    };
+    if scan.mv_rewritten_from.is_some() {
+        return None;
+    }
+    predicates.extend(scan.predicates.iter().copied());
+    Some(JoinInput {
+        table: scan.table.clone(),
+        scan_columns: scan.columns.clone(),
+    })
+}
+
+/// Peel a left-deep inner-join spine (or a bare scan) at the bottom of the
+/// SPJG shape. On entry `node` is the operator directly below the filter
+/// chain. Returns the driving (left-deep first) scan and an optional
+/// `JoinShape` describing every additional inner-join input. Predicates pushed
+/// onto join inputs and residual (non-equi) join conjuncts are appended to
+/// `predicates` (the descriptor keeps a single flat predicate list). Rejects
+/// any non-`Inner` join kind, a right child that is not `Filter*->Scan`, and
+/// any non-scan/non-join leaf.
+fn peel_join_spine_opt<'a>(
+    node: &'a OptExpr,
+    arena: &ScalarArena,
+    predicates: &mut Vec<ScalarId>,
+) -> Result<(&'a ScanOp, Option<JoinShape>), String> {
+    let mut n = node;
+    while let Operator::LogicalFilter(f) = &n.op {
+        scalar_expr::split_conjuncts(arena, f.predicate, predicates);
+        n = n
+            .children
+            .first()
+            .ok_or_else(|| "filter without child in MV rewrite join spine".to_string())?;
+    }
+    match &n.op {
+        Operator::LogicalScan(scan) => Ok((scan, None)),
+        Operator::LogicalJoin(join) => {
+            if join.join_type != JoinKind::Inner {
+                return Err(format!(
+                    "unsupported join kind for MV rewrite: {:?}",
+                    join.join_type
+                ));
+            }
+            let left = n
+                .children
+                .first()
+                .ok_or_else(|| "inner join without left child in MV rewrite shape".to_string())?;
+            let right = n
+                .children
+                .get(1)
+                .ok_or_else(|| "inner join without right child in MV rewrite shape".to_string())?;
+
+            // Left-deep: recurse the left spine; the right child must reduce to
+            // Filter*->Scan (one base input). A right-side join is rejected.
+            let (driving, left_joins) = peel_join_spine_opt(left, arena, predicates)?;
+            let right_input = peel_filter_scan_opt(right, arena, predicates)?;
+
+            let left_columns = join_left_column_ids(&driving.columns, left_joins.as_ref());
+            let right_columns = column_id_set(&right_input.scan_columns);
+            let (edges, residuals) =
+                split_join_condition(arena, join.condition, &left_columns, &right_columns);
+            if edges.is_empty() {
+                return Err("inner join without equi edge in MV rewrite shape".to_string());
+            }
+            predicates.extend(residuals);
+
+            let mut shape = left_joins.unwrap_or(JoinShape {
+                inputs: Vec::new(),
+                equi_edges: Vec::new(),
+            });
+            shape.inputs.push(right_input);
+            shape.equi_edges.extend(edges);
+            Ok((driving, Some(shape)))
+        }
+        _ => Err(format!(
+            "not an SPJG base shape: unexpected node {:?}",
+            std::mem::discriminant(&n.op)
+        )),
+    }
+}
+
+/// Peel one join input's `Filter*->Scan`, pushing its predicates into
+/// `predicates`. Rejects a nested join (right-deep/bushy) or any non-scan leaf.
+fn peel_filter_scan_opt(
+    node: &OptExpr,
+    arena: &ScalarArena,
+    predicates: &mut Vec<ScalarId>,
+) -> Result<JoinInput, String> {
+    let mut n = node;
+    while let Operator::LogicalFilter(f) = &n.op {
+        scalar_expr::split_conjuncts(arena, f.predicate, predicates);
+        n = n
+            .children
+            .first()
+            .ok_or_else(|| "filter without child in MV rewrite join input".to_string())?;
+    }
+    let Operator::LogicalScan(scan) = &n.op else {
+        return Err(format!(
+            "unsupported join input shape (only Filter*->Scan): {:?}",
+            std::mem::discriminant(&n.op)
+        ));
+    };
+    predicates.extend(scan.predicates.iter().copied());
+    Ok(JoinInput {
+        table: scan.table.clone(),
+        scan_columns: scan.columns.clone(),
+    })
+}
+
+/// Split a join `ON` condition into equi-join edges (`col = col`) and residual
+/// conjuncts (everything else). A `None` condition (e.g. a cross join, which we
+/// reject earlier anyway) yields two empty vectors.
+fn split_join_condition(
+    arena: &ScalarArena,
+    condition: Option<ScalarId>,
+    left_columns: &HashSet<ColumnId>,
+    right_columns: &HashSet<ColumnId>,
+) -> (Vec<EquiEdge>, Vec<ScalarId>) {
+    let Some(cond) = condition else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut conjuncts: Vec<ScalarId> = Vec::new();
+    scalar_expr::split_conjuncts(arena, cond, &mut conjuncts);
+
+    let mut edges = Vec::new();
+    let mut residuals = Vec::new();
+    for c in conjuncts {
+        let edge = match arena.node(c) {
+            ScalarNode::BinaryOp {
+                op: BinOp::Eq,
+                left,
+                right,
+            } => match (arena.node(*left), arena.node(*right)) {
+                (ScalarNode::ColumnRef(l), ScalarNode::ColumnRef(r)) => {
+                    normalize_equi_edge(*l, *r, left_columns, right_columns)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        match edge {
+            Some(e) => edges.push(e),
+            None => residuals.push(c),
+        }
+    }
+    debug_assert!(
+        edges
+            .iter()
+            .all(|edge| left_columns.contains(&edge.left) && right_columns.contains(&edge.right))
+    );
+    (edges, residuals)
+}
+
+fn normalize_equi_edge(
+    left_expr: ColumnId,
+    right_expr: ColumnId,
+    left_columns: &HashSet<ColumnId>,
+    right_columns: &HashSet<ColumnId>,
+) -> Option<EquiEdge> {
+    match (
+        join_side(left_expr, left_columns, right_columns),
+        join_side(right_expr, left_columns, right_columns),
+    ) {
+        (Some(JoinSide::Left), Some(JoinSide::Right)) => Some(EquiEdge {
+            left: left_expr,
+            right: right_expr,
+        }),
+        (Some(JoinSide::Right), Some(JoinSide::Left)) => Some(EquiEdge {
+            left: right_expr,
+            right: left_expr,
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JoinSide {
+    Left,
+    Right,
+}
+
+fn join_side(
+    column: ColumnId,
+    left_columns: &HashSet<ColumnId>,
+    right_columns: &HashSet<ColumnId>,
+) -> Option<JoinSide> {
+    match (
+        left_columns.contains(&column),
+        right_columns.contains(&column),
+    ) {
+        (true, false) => Some(JoinSide::Left),
+        (false, true) => Some(JoinSide::Right),
+        _ => None,
+    }
+}
+
+fn join_left_column_ids(
+    driving_columns: &[OutputColumn],
+    joins: Option<&JoinShape>,
+) -> HashSet<ColumnId> {
+    let mut columns = column_id_set(driving_columns);
+    if let Some(joins) = joins {
+        for input in &joins.inputs {
+            columns.extend(input.scan_columns.iter().map(|c| c.column_id));
+        }
+    }
+    columns
+}
+
+fn column_id_set(columns: &[OutputColumn]) -> HashSet<ColumnId> {
+    columns.iter().map(|c| c.column_id).collect()
 }
 
 pub(crate) fn substitute_scalar(
@@ -822,6 +1123,38 @@ mod tests {
         LogicalPlanNode::new(PlanNodeKind::Scan(scan(cols)), vec![], None)
     }
 
+    /// A scan over a named table (the shared `scan()` helper hardcodes "t").
+    fn scan_named(table_name: &str, cols: &[OutputColumn]) -> LogicalScanNode {
+        let mut s = scan(cols);
+        s.table.name = table_name.to_string();
+        s
+    }
+
+    fn scan_plan_named(table_name: &str, cols: &[OutputColumn]) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            PlanNodeKind::Scan(scan_named(table_name, cols)),
+            vec![],
+            None,
+        )
+    }
+
+    /// Build `Join(left, right)` with the given kind and ON condition.
+    fn join_plan(
+        kind: crate::sql::common::expr::JoinKind,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
+        on: Option<TypedExpr>,
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            PlanNodeKind::Join(crate::sql::planner::plan::LogicalJoinNode {
+                join_type: kind,
+                condition: on,
+            }),
+            vec![left, right],
+            None,
+        )
+    }
+
     fn descriptor_from_plan(
         plan: &LogicalPlanNode,
     ) -> Result<(SpjgDescriptor, ScalarArena), String> {
@@ -831,6 +1164,306 @@ mod tests {
         )?;
         let descriptor = SpjgDescriptor::from_opt_expr(&opt_expr, &mut arena)?;
         Ok((descriptor, arena))
+    }
+
+    #[test]
+    fn split_join_condition_separates_equi_edges_from_residuals() {
+        use crate::sql::analysis::BinOp;
+
+        let mut arena = ScalarArena::new();
+        // a(=col 1) = b(=col 2)  AND  a > b   (the `>` conjunct is a residual;
+        // two ColumnRefs avoid depending on the ScalarNode::Literal payload type).
+        let a_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
+        let b_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Int64, true);
+        let eq = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Eq,
+                left: a_ref,
+                right: b_ref,
+            },
+            DataType::Boolean,
+            true,
+        );
+        let gt = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Gt,
+                left: a_ref,
+                right: b_ref,
+            },
+            DataType::Boolean,
+            true,
+        );
+        let cond = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::And,
+                left: eq,
+                right: gt,
+            },
+            DataType::Boolean,
+            true,
+        );
+
+        let left_columns = HashSet::from([ColumnId(1)]);
+        let right_columns = HashSet::from([ColumnId(2)]);
+        let (edges, residuals) =
+            super::split_join_condition(&arena, Some(cond), &left_columns, &right_columns);
+        assert_eq!(edges.len(), 1, "one equi edge");
+        assert_eq!(edges[0].left, ColumnId(1));
+        assert_eq!(edges[0].right, ColumnId(2));
+        assert_eq!(residuals.len(), 1, "the a>b conjunct is a residual");
+        assert_eq!(residuals, vec![gt]);
+    }
+
+    #[test]
+    fn split_join_condition_none_is_empty() {
+        let arena = ScalarArena::new();
+        let left_columns = HashSet::from([ColumnId(1)]);
+        let right_columns = HashSet::from([ColumnId(2)]);
+        let (edges, residuals) =
+            super::split_join_condition(&arena, None, &left_columns, &right_columns);
+        assert!(edges.is_empty() && residuals.is_empty());
+    }
+
+    #[test]
+    fn split_join_condition_normalizes_reversed_equi_edge() {
+        use crate::sql::analysis::BinOp;
+
+        let mut arena = ScalarArena::new();
+        let a_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
+        let c_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(3)), DataType::Int64, true);
+        let cond = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Eq,
+                left: c_ref,
+                right: a_ref,
+            },
+            DataType::Boolean,
+            true,
+        );
+
+        let left_columns = HashSet::from([ColumnId(1), ColumnId(2)]);
+        let right_columns = HashSet::from([ColumnId(3), ColumnId(4)]);
+        let (edges, residuals) =
+            super::split_join_condition(&arena, Some(cond), &left_columns, &right_columns);
+        assert!(residuals.is_empty());
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].left, ColumnId(1));
+        assert_eq!(edges[0].right, ColumnId(3));
+    }
+
+    #[test]
+    fn split_join_condition_keeps_same_side_equality_as_residual() {
+        use crate::sql::analysis::BinOp;
+
+        let mut arena = ScalarArena::new();
+        let a_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
+        let b_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Int64, true);
+        let cond = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Eq,
+                left: a_ref,
+                right: b_ref,
+            },
+            DataType::Boolean,
+            true,
+        );
+
+        let left_columns = HashSet::from([ColumnId(1), ColumnId(2)]);
+        let right_columns = HashSet::from([ColumnId(3), ColumnId(4)]);
+        let (edges, residuals) =
+            super::split_join_condition(&arena, Some(cond), &left_columns, &right_columns);
+        assert!(edges.is_empty());
+        assert_eq!(residuals, vec![cond]);
+    }
+
+    #[test]
+    fn extracts_inner_join_two_tables() {
+        use crate::sql::common::expr::JoinKind;
+
+        // SELECT ... FROM t1 JOIN t2 ON t1.a = t2.c
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let d = col(4, "d");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", &[a.clone(), b.clone()]),
+            scan_plan_named("t2", &[c.clone(), d.clone()]),
+            Some(on),
+        );
+        let (desc, _arena) = descriptor_from_plan(&plan).expect("inner join spjg");
+        assert_eq!(desc.table.name, "t1", "driving (left-deep first) scan");
+        let joins = desc.joins.as_ref().expect("join shape present");
+        assert_eq!(joins.inputs.len(), 1);
+        assert_eq!(joins.inputs[0].table.name, "t2");
+        assert_eq!(joins.equi_edges.len(), 1);
+        assert_eq!(joins.equi_edges[0].left, ColumnId(1));
+        assert_eq!(joins.equi_edges[0].right, ColumnId(3));
+    }
+
+    #[test]
+    fn base_name_of_includes_join_input_columns() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let d = col(4, "d");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", &[a.clone(), b.clone()]),
+            scan_plan_named("t2", &[c.clone(), d.clone()]),
+            Some(on),
+        );
+        let (desc, _arena) = descriptor_from_plan(&plan).expect("inner join spjg");
+        let names = desc.base_name_of();
+        // Driving scan columns:
+        assert_eq!(names.get(&ColumnId(1)).map(String::as_str), Some("a"));
+        assert_eq!(names.get(&ColumnId(2)).map(String::as_str), Some("b"));
+        // Join-input columns must also be present:
+        assert_eq!(names.get(&ColumnId(3)).map(String::as_str), Some("c"));
+        assert_eq!(names.get(&ColumnId(4)).map(String::as_str), Some("d"));
+    }
+
+    #[test]
+    fn extracts_inner_join_with_driving_filter() {
+        use crate::sql::common::expr::JoinKind;
+
+        // SELECT ... FROM (SELECT * FROM t1 WHERE a >= 5) t1 JOIN t2 ON t1.a = t2.c
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let driving = LogicalPlanNode::new(
+            PlanNodeKind::Filter(LogicalFilterNode {
+                predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
+            }),
+            vec![scan_plan_named("t1", &[a.clone(), b.clone()])],
+            None,
+        );
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            driving,
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+
+        let (desc, _arena) = descriptor_from_plan(&plan).expect("inner join spjg");
+        assert_eq!(desc.table.name, "t1");
+        assert_eq!(
+            desc.predicates.len(),
+            1,
+            "driving-side filter predicate must be included exactly once"
+        );
+        let joins = desc.joins.as_ref().expect("join shape present");
+        assert_eq!(joins.inputs.len(), 1);
+        assert_eq!(joins.equi_edges.len(), 1);
+    }
+
+    #[test]
+    fn rejects_inner_join_without_condition() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            None,
+        );
+        assert!(
+            descriptor_from_plan(&plan).is_err(),
+            "inner join without equi edges must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_inner_join_with_only_residual_condition() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Gt, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+        assert!(
+            descriptor_from_plan(&plan).is_err(),
+            "inner join without equi edges must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_inner_join_with_only_same_side_equality() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&b));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", &[a.clone(), b.clone()]),
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+        assert!(
+            descriptor_from_plan(&plan).is_err(),
+            "same-side equality must not be extracted as a join edge"
+        );
+    }
+
+    #[test]
+    fn rejects_left_outer_join() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::LeftOuter,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+        assert!(
+            descriptor_from_plan(&plan).is_err(),
+            "outer join must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_right_deep_join() {
+        use crate::sql::common::expr::JoinKind;
+
+        // t1 JOIN (t2 JOIN t3): right child is itself a join -> unsupported in v1.
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let e = col(5, "e");
+        let on_inner = cmp(col_ref(&c), crate::sql::analysis::BinOp::Eq, col_ref(&e));
+        let inner = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            scan_plan_named("t3", std::slice::from_ref(&e)),
+            Some(on_inner),
+        );
+        let on_outer = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            inner,
+            Some(on_outer),
+        );
+        assert!(
+            descriptor_from_plan(&plan).is_err(),
+            "right-deep join must be rejected"
+        );
     }
 
     #[test]
@@ -849,6 +1482,24 @@ mod tests {
         assert_eq!(d.predicates.len(), 1);
         assert!(d.aggregate.is_none());
         assert_eq!(d.outputs.len(), 2); // pass-through scan columns
+    }
+
+    #[test]
+    fn single_table_descriptor_has_no_joins() {
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let plan = LogicalPlanNode::new(
+            PlanNodeKind::Filter(LogicalFilterNode {
+                predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
+            }),
+            vec![scan_plan(&[a.clone(), b.clone()])],
+            None,
+        );
+        let (d, _arena) = descriptor_from_plan(&plan).expect("spjg");
+        assert!(
+            d.joins.is_none(),
+            "single-table shape must not carry a JoinShape"
+        );
     }
 
     #[test]
@@ -935,6 +1586,103 @@ mod tests {
         assert_eq!(mem.predicates.len(), logical.predicates.len());
         assert!(mem.aggregate.is_none());
         assert_eq!(mem.outputs.len(), logical.outputs.len());
+    }
+
+    #[test]
+    fn from_memo_extracts_inner_join_two_tables() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let d = col(4, "d");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", &[a.clone(), b.clone()]),
+            scan_plan_named("t2", &[c.clone(), d.clone()]),
+            Some(on),
+        );
+        let (mut memo, root_expr) = memo_root(&plan);
+        let (mem, shape) =
+            SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("from_memo join");
+        assert!(matches!(shape, MatchedShape::Spj));
+        assert_eq!(mem.table.name, "t1");
+        let joins = mem.joins.as_ref().expect("join shape present");
+        assert_eq!(joins.inputs.len(), 1);
+        assert_eq!(joins.inputs[0].table.name, "t2");
+        assert_eq!(joins.equi_edges.len(), 1);
+        assert_eq!(joins.equi_edges[0].left, ColumnId(1));
+        assert_eq!(joins.equi_edges[0].right, ColumnId(3));
+    }
+
+    #[test]
+    fn from_memo_rejects_left_outer_join() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::LeftOuter,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+        let (mut memo, root_expr) = memo_root(&plan);
+        assert!(SpjgDescriptor::from_memo(&root_expr, &mut memo).is_none());
+    }
+
+    #[test]
+    fn from_memo_extracts_inner_join_with_driving_filter() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let driving = LogicalPlanNode::new(
+            PlanNodeKind::Filter(LogicalFilterNode {
+                predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
+            }),
+            vec![scan_plan_named("t1", &[a.clone(), b.clone()])],
+            None,
+        );
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let plan = join_plan(
+            JoinKind::Inner,
+            driving,
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+        let (mut memo, root_expr) = memo_root(&plan);
+        let (mem, shape) =
+            SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("from_memo join");
+        assert!(matches!(shape, MatchedShape::Spj));
+        assert_eq!(mem.table.name, "t1");
+        assert_eq!(
+            mem.predicates.len(),
+            1,
+            "driving-side filter predicate must be included exactly once"
+        );
+        let joins = mem.joins.as_ref().expect("join shape present");
+        assert_eq!(joins.inputs.len(), 1);
+        assert_eq!(joins.equi_edges.len(), 1);
+    }
+
+    #[test]
+    fn from_memo_rejects_inner_join_without_condition() {
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            scan_plan_named("t2", std::slice::from_ref(&c)),
+            None,
+        );
+        let (mut memo, root_expr) = memo_root(&plan);
+        assert!(SpjgDescriptor::from_memo(&root_expr, &mut memo).is_none());
     }
 
     #[test]

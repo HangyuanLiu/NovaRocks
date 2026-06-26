@@ -30,6 +30,10 @@ struct PreparedMvRewriteCandidate {
     target_table: crate::sql::catalog::TableDef,
 }
 
+fn supports_current_mv_rewrite_shape(desc: &SpjgDescriptor) -> bool {
+    desc.joins.is_none()
+}
+
 pub(crate) fn prepare_mv_rewrite_candidates(
     state: &Arc<StandaloneState>,
     analyzer_catalog: &dyn CatalogProvider,
@@ -185,6 +189,9 @@ fn build_candidate(
         &mut mv_scalars,
     )?;
     let mv_desc = SpjgDescriptor::from_opt_expr(&mv_opt_expr, &mut mv_scalars)?;
+    if !supports_current_mv_rewrite_shape(&mv_desc) {
+        return Ok(None);
+    }
 
     // 3b. Fail closed on name-resolution drift: the analyzed scan must be
     //     one of the recorded base tables.
@@ -299,4 +306,72 @@ fn current_table_uuid(
     let entry = registry.get(&r.catalog)?;
     let loaded = crate::connector::iceberg::catalog::load_table(&entry, &r.namespace, &r.table)?;
     Ok(Some(loaded.table.metadata().uuid().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::*;
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::common::OutputColumn;
+    use crate::sql::optimizer::cascades_rules::mv_rewrite::descriptor::{
+        EquiEdge, JoinInput, JoinShape,
+    };
+
+    fn table(name: &str) -> crate::sql::catalog::TableDef {
+        crate::sql::catalog::TableDef {
+            name: name.to_string(),
+            columns: Vec::new(),
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            source: ScanSource::StarRocks {
+                db_id: 0,
+                table_id: 0,
+            },
+        }
+    }
+
+    fn output_column(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId(id),
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    fn descriptor_with_joins(joins: Option<JoinShape>) -> SpjgDescriptor {
+        SpjgDescriptor {
+            table: table("t"),
+            scan_columns: Vec::new(),
+            predicates: Vec::new(),
+            aggregate: None,
+            outputs: Vec::new(),
+            joins,
+        }
+    }
+
+    #[test]
+    fn current_mv_rewrite_shape_support_accepts_single_table_descriptor() {
+        let desc = descriptor_with_joins(None);
+
+        assert!(supports_current_mv_rewrite_shape(&desc));
+    }
+
+    #[test]
+    fn current_mv_rewrite_shape_support_rejects_join_descriptor() {
+        let desc = descriptor_with_joins(Some(JoinShape {
+            inputs: vec![JoinInput {
+                table: table("t2"),
+                scan_columns: vec![output_column(2, "c")],
+            }],
+            equi_edges: vec![EquiEdge {
+                left: ColumnId(1),
+                right: ColumnId(2),
+            }],
+        }));
+
+        assert!(!supports_current_mv_rewrite_shape(&desc));
+    }
 }
