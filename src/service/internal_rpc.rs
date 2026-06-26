@@ -20,10 +20,10 @@ use crate::common::failpoint::{self, FailPointMode};
 use crate::common::ids::SlotId;
 use crate::exec::runtime_filter::arrow_type_from_proto_type_desc;
 use crate::novarocks_logging::warn;
+use crate::proto;
 use crate::runtime::exchange;
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
 use crate::runtime::query_context::{QueryId, query_context_manager, query_expire_durations};
-use crate::service::grpc_proto as proto;
 
 fn ok_status() -> proto::starrocks::StatusPb {
     proto::starrocks::StatusPb {
@@ -351,7 +351,6 @@ mod tests {
     };
     use crate::cache::CacheOptions;
     use crate::common::ids::SlotId;
-    use crate::descriptors;
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::ExprId;
     use crate::exec::node::RuntimeFilterProbeSpec;
@@ -361,12 +360,13 @@ mod tests {
     #[cfg(feature = "compat")]
     use crate::exec::runtime_filter::{arrow_type_to_proto_type_desc, decode_starrocks_in_filter};
     use crate::fs::scan_context::FileScanRange;
+    use crate::proto;
     use crate::runtime::exchange;
     use crate::runtime::query_context::{QueryId, query_context_manager};
-    use crate::service::grpc_proto as proto;
     #[cfg(feature = "compat")]
     use crate::service::internal_rpc_client;
-    use crate::types;
+    use crate::thrift::descriptors;
+    use crate::thrift::types;
 
     fn unique_id(hi: i64, lo: i64) -> proto::starrocks::PUniqueId {
         proto::starrocks::PUniqueId { hi, lo }
@@ -556,10 +556,10 @@ mod tests {
         query_context_manager()
             .set_runtime_filter_params(
                 query_id,
-                crate::runtime_filter::TRuntimeFilterParams {
+                crate::thrift::runtime_filter::TRuntimeFilterParams {
                     id_to_prober_params: Some(BTreeMap::from([(
                         7,
-                        vec![crate::runtime_filter::TRuntimeFilterProberParams {
+                        vec![crate::thrift::runtime_filter::TRuntimeFilterProberParams {
                             fragment_instance_id: None,
                             fragment_instance_address: Some(types::TNetworkAddress::new(
                                 "probe-host".to_string(),
@@ -641,10 +641,10 @@ mod tests {
         query_context_manager()
             .set_runtime_filter_params(
                 query_id,
-                crate::runtime_filter::TRuntimeFilterParams {
+                crate::thrift::runtime_filter::TRuntimeFilterParams {
                     id_to_prober_params: Some(BTreeMap::from([(
                         9,
-                        vec![crate::runtime_filter::TRuntimeFilterProberParams {
+                        vec![crate::thrift::runtime_filter::TRuntimeFilterProberParams {
                             fragment_instance_id: None,
                             fragment_instance_address: Some(types::TNetworkAddress::new(
                                 "probe-host".to_string(),
@@ -780,10 +780,10 @@ mod tests {
         query_context_manager()
             .set_runtime_filter_params(
                 query_id,
-                crate::runtime_filter::TRuntimeFilterParams {
+                crate::thrift::runtime_filter::TRuntimeFilterParams {
                     id_to_prober_params: Some(BTreeMap::from([(
                         10,
-                        vec![crate::runtime_filter::TRuntimeFilterProberParams {
+                        vec![crate::thrift::runtime_filter::TRuntimeFilterProberParams {
                             fragment_instance_id: None,
                             fragment_instance_address: Some(types::TNetworkAddress::new(
                                 "probe-host".to_string(),
