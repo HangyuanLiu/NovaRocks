@@ -286,4 +286,18 @@ mod tests {
             "assert_true(bool, varchar) must resolve to Boolean"
         );
     }
+
+    #[test]
+    fn resolve_join_row_key_returns_utf8() {
+        let r = resolve_scalar_function(
+            "join_row_key",
+            &[
+                DataType::Utf8,
+                DataType::Int64,
+                DataType::Utf8,
+                DataType::Int64,
+            ],
+        );
+        assert_eq!(r, Ok(DataType::Utf8));
+    }
 }

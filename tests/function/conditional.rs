@@ -121,6 +121,32 @@ fn assert_true_uses_custom_message() {
     assert_eq!(err, "custom assert");
 }
 
+#[test]
+fn join_delta_shape_assertion_rejects_net_two() {
+    let chunk = create_test_chunk_int(vec![Some(2)]);
+    let mut arena = ExprArena::default();
+    let net_change_op = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+    let abs_net_change_op = arena.push_typed(
+        ExprNode::FunctionCall {
+            kind: FunctionKind::Abs,
+            args: vec![net_change_op],
+        },
+        DataType::Int64,
+    );
+    let one = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
+    let condition = arena.push_typed(ExprNode::Le(abs_net_change_op, one), DataType::Boolean);
+    let message = arena.push_typed(
+        ExprNode::Literal(LiteralValue::Utf8(
+            "join delta per-key net change exceeds 1".to_string(),
+        )),
+        DataType::Utf8,
+    );
+
+    let err = eval_assert_true(&arena, &[condition, message], &chunk).unwrap_err();
+
+    assert_eq!(err, "join delta per-key net change exceeds 1");
+}
+
 // ---------------------------------------------------------------------------
 // Tests migrated from conditional/coalesce.rs
 // ---------------------------------------------------------------------------

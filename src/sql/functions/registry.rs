@@ -254,6 +254,21 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Utf8),
     );
 
+    // Stable relational identity for IMV join coalesce rows.
+    add(
+        m,
+        "join_row_key",
+        Signature::new(
+            vec![
+                TypeSpec::Utf8,
+                TypeSpec::Int64,
+                TypeSpec::Utf8,
+                TypeSpec::Int64,
+            ],
+            TypeSpec::Utf8,
+        ),
+    );
+
     // space(n) -> str
     add(
         m,
