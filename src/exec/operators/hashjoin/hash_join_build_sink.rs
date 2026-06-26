@@ -306,12 +306,16 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         self.input_chunks = self.input_chunks.saturating_add(1);
         let base_row_id = self.build_row_count;
         self.build_row_count = self.build_row_count.saturating_add(chunk.len());
-        self.build_store_builder.push_chunk(&chunk)?;
+        let retain_build_rows =
+            join_build_requires_row_storage(self.join_type, self.has_residual_predicate);
+        if retain_build_rows {
+            self.build_store_builder.push_chunk(&chunk)?;
 
-        if let Some(tracker) = self.build_input_chunks_mem_tracker.as_ref() {
-            chunk.transfer_to(tracker);
+            if let Some(tracker) = self.build_input_chunks_mem_tracker.as_ref() {
+                chunk.transfer_to(tracker);
+            }
+            self.build_input_chunks.push(chunk.clone());
         }
-        self.build_input_chunks.push(chunk.clone());
 
         if self.build_keys.is_empty() {
             return Ok(());
@@ -352,7 +356,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             }
         }
 
-        let retained_bytes = retained_key_arrays_bytes(&key_arrays, &chunk);
+        let retained_bytes = retained_key_arrays_bytes(&key_arrays, &chunk, retain_build_rows);
         self.build_key_batches
             .push(BuildKeyBatch::new(key_arrays.clone(), chunk.len())?);
         self.build_key_batches_retained_bytes = self
@@ -467,12 +471,22 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         self.runtime_filter_hub
             .mark_local_filters_ready(self.node_id);
 
-        let build_store_rows = self.build_store_builder.row_count();
+        let retain_build_rows =
+            join_build_requires_row_storage(self.join_type, self.has_residual_predicate);
+        let build_store_rows = if retain_build_rows {
+            self.build_store_builder.row_count()
+        } else {
+            0
+        };
         let table_present = self.build_table.is_some();
         let input_chunks = std::mem::take(&mut self.build_input_chunks);
         let mut table = self.build_table.take();
-        let mut build_store =
-            std::mem::replace(&mut self.build_store_builder, BuildStoreBuilder::new()).finish()?;
+        let mut build_store = if retain_build_rows {
+            std::mem::replace(&mut self.build_store_builder, BuildStoreBuilder::new()).finish()?
+        } else {
+            self.build_store_builder = BuildStoreBuilder::new();
+            None
+        };
         drop(input_chunks);
 
         if let Some(root) = state.mem_tracker() {
@@ -1225,10 +1239,17 @@ fn parse_join_node_id_from_dep_key(dep_key: &str) -> i32 {
     node_id_str.parse::<i32>().unwrap_or(-1)
 }
 
-fn retained_key_arrays_bytes(key_arrays: &[ArrayRef], chunk: &Chunk) -> usize {
+fn retained_key_arrays_bytes(
+    key_arrays: &[ArrayRef],
+    chunk: &Chunk,
+    chunk_columns_are_retained: bool,
+) -> usize {
     key_arrays
         .iter()
         .filter(|key_array| {
+            if !chunk_columns_are_retained {
+                return true;
+            }
             !chunk
                 .columns()
                 .iter()
@@ -1266,6 +1287,11 @@ fn join_hash_map_build_purpose(
     } else {
         JoinHashMapBuildPurpose::RowMatches
     }
+}
+
+fn join_build_requires_row_storage(join_type: JoinType, has_residual_predicate: bool) -> bool {
+    join_hash_map_build_purpose(join_type, has_residual_predicate)
+        == JoinHashMapBuildPurpose::RowMatches
 }
 
 #[cfg(test)]
@@ -1419,7 +1445,7 @@ mod tests {
     #[test]
     fn records_direct_set_method_for_left_semi_without_residual() {
         let state = Arc::new(TestBuildState::default());
-        let mut operator = direct_set_build_operator(state);
+        let mut operator = direct_set_build_operator(Arc::clone(&state));
         let profiles = OperatorProfiles::new(RuntimeProfile::new("HASH_JOIN"));
         operator.set_profiles(profiles.clone());
 
@@ -1434,12 +1460,22 @@ mod tests {
             profiles.common.get_info_string("JoinHashMapMethod"),
             Some("DirectIntSetNotNull".to_string())
         );
+        let artifact = state
+            .artifact
+            .lock()
+            .expect("artifact lock")
+            .clone()
+            .expect("artifact");
+        assert!(artifact.build_store.is_none());
+        assert_eq!(artifact.build_row_count, 2);
+        assert_eq!(operator.build_store_builder.row_count(), 0);
+        assert!(operator.build_input_chunks.is_empty());
     }
 
     #[test]
     fn records_row_match_method_for_left_semi_with_residual() {
         let state = Arc::new(TestBuildState::default());
-        let mut operator = direct_set_build_operator(state);
+        let mut operator = direct_set_build_operator(Arc::clone(&state));
         operator.has_residual_predicate = true;
         let profiles = OperatorProfiles::new(RuntimeProfile::new("HASH_JOIN"));
         operator.set_profiles(profiles.clone());
@@ -1455,6 +1491,15 @@ mod tests {
             profiles.common.get_info_string("JoinHashMapMethod"),
             Some("Chained".to_string())
         );
+        let artifact = state
+            .artifact
+            .lock()
+            .expect("artifact lock")
+            .clone()
+            .expect("artifact");
+        assert!(artifact.build_store.is_some());
+        assert_eq!(artifact.build_store.as_ref().expect("build store").len(), 2);
+        assert_eq!(artifact.build_row_count, 2);
     }
 
     #[test]
@@ -1528,6 +1573,41 @@ mod tests {
             .find(|child| child.label() == "BuildHashTable")
             .expect("BuildHashTable tracker");
         assert!(hash_table_tracker.current() > 0);
+    }
+
+    #[test]
+    fn presence_only_slot_key_batches_are_accounted_without_input_chunk_storage() {
+        let state = Arc::new(TestBuildState::default());
+        let root = MemTracker::new_root("presence-only-build-test");
+        let mut operator = direct_set_build_operator(state);
+
+        operator.set_mem_tracker(Arc::clone(&root));
+        let children = root.children();
+        let key_batches_tracker = children
+            .iter()
+            .find(|child| child.label() == "BuildKeyBatches")
+            .expect("BuildKeyBatches tracker")
+            .clone();
+        let input_chunks_tracker = children
+            .iter()
+            .find(|child| child.label() == "BuildInputChunks")
+            .expect("BuildInputChunks tracker")
+            .clone();
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .expect("push chunk");
+
+        assert_eq!(operator.build_store_builder.row_count(), 0);
+        assert!(operator.build_input_chunks.is_empty());
+        assert_eq!(input_chunks_tracker.current(), 0);
+        assert!(key_batches_tracker.current() > 0);
+
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        assert_eq!(key_batches_tracker.current(), 0);
     }
 
     #[test]

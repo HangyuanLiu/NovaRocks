@@ -1128,13 +1128,7 @@ impl HashJoinProbeCore {
             }
             return Ok(None);
         };
-        if table.is_empty()
-            || self
-                .build_chunk
-                .as_ref()
-                .map(|chunk| chunk.is_empty())
-                .unwrap_or(true)
-        {
+        if table.is_empty() {
             if is_anti {
                 let batches: Vec<_> = probe_chunks.into_iter().map(|c| c.batch).collect();
                 if batches.is_empty() {
@@ -1728,14 +1722,7 @@ mod tests {
             build_table.method_kind(),
             crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind::DirectIntSet { .. }
         ));
-        JoinBuildArtifact::new(
-            Some(BuildStore::new(build)),
-            Some(build_table),
-            build_row_count,
-            false,
-            None,
-            None,
-        )
+        JoinBuildArtifact::new(None, Some(build_table), build_row_count, false, None, None)
     }
 
     #[test]
