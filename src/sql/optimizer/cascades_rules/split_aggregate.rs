@@ -199,7 +199,11 @@ pub(crate) fn aggregate_group_key_output_ref(
         .collect()
 }
 
-fn find_existing_logical_group(memo: &Memo, op: &Operator, children: &[usize]) -> Option<usize> {
+pub(crate) fn find_existing_logical_group(
+    memo: &Memo,
+    op: &Operator,
+    children: &[usize],
+) -> Option<usize> {
     let op_debug = format!("{op:?}");
     memo.groups.iter().position(|group| {
         group
