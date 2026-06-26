@@ -22,53 +22,6 @@ use crate::thrift::exprs;
 use crate::thrift::opcodes;
 use crate::thrift::types;
 
-fn common_decimal_compare_type(left: &DataType, right: &DataType) -> Result<DataType, String> {
-    let (lp, ls, left_is_256) = match left {
-        DataType::Decimal128(p, s) => (*p, *s, false),
-        DataType::Decimal256(p, s) => (*p, *s, true),
-        _ => {
-            return Err(format!(
-                "BINARY_PRED decimal child_type requires decimal children (left={:?}, right={:?})",
-                left, right
-            ));
-        }
-    };
-    let (rp, rs, right_is_256) = match right {
-        DataType::Decimal128(p, s) => (*p, *s, false),
-        DataType::Decimal256(p, s) => (*p, *s, true),
-        _ => {
-            return Err(format!(
-                "BINARY_PRED decimal child_type requires decimal children (left={:?}, right={:?})",
-                left, right
-            ));
-        }
-    };
-
-    let target_scale: i8 = ls.max(rs);
-    let lhs_int_digits: i16 = (lp as i16) - (ls as i16);
-    let rhs_int_digits: i16 = (rp as i16) - (rs as i16);
-    let int_digits: i16 = lhs_int_digits.max(rhs_int_digits).max(0);
-    let target_precision: i16 = int_digits + (target_scale as i16);
-    if target_precision <= 0 {
-        return Err(format!(
-            "BINARY_PRED invalid decimal precision (left={:?}, right={:?})",
-            left, right
-        ));
-    }
-    let target_precision_u8 = target_precision as u8;
-    let need_decimal256 = left_is_256 || right_is_256 || target_precision > 38;
-    if need_decimal256 {
-        if target_precision > 76 {
-            return Err(format!(
-                "BINARY_PRED decimal precision overflow (left={:?}, right={:?}, target=Decimal256({}, {}))",
-                left, right, target_precision, target_scale
-            ));
-        }
-        return Ok(DataType::Decimal256(target_precision_u8, target_scale));
-    }
-    Ok(DataType::Decimal128(target_precision_u8, target_scale))
-}
-
 /// Lower BINARY_PRED expression to comparison ExprNode.
 pub(crate) fn lower_binary_pred(
     node: &exprs::TExprNode,
@@ -115,7 +68,7 @@ pub(crate) fn lower_binary_pred(
             let right_type = arena
                 .data_type(right)
                 .ok_or_else(|| "BINARY_PRED right child type missing".to_string())?;
-            common_decimal_compare_type(left_type, right_type)?
+            crate::types::coercion::decimal_compare_type(left_type, right_type)?
         } else {
             return Err(format!(
                 "BINARY_PRED unsupported child_type from FE plan: {:?}",
