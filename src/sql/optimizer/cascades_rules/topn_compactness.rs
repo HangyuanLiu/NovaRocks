@@ -187,72 +187,6 @@ impl Rule for PushTopNIntoScan {
     }
 }
 
-pub(crate) struct PushTopNThroughJoin;
-
-impl Rule for PushTopNThroughJoin {
-    fn name(&self) -> &str {
-        stringify!(PushTopNThroughJoin)
-    }
-
-    fn rule_type(&self) -> RuleType {
-        RuleType::Transformation
-    }
-
-    fn matches(&self, op: &Operator) -> bool {
-        matches!(op, Operator::LogicalTopN(_))
-    }
-
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
-        push_topn_through_join(expr, memo)
-    }
-
-    fn pattern(&self) -> Pattern {
-        Pattern::Op {
-            kind: OpKind::TopN,
-            children: vec![Pattern::Leaf],
-        }
-    }
-
-    fn apply_bound(&self, _binding: &Binding, _memo: &mut Memo) -> Vec<NewExpr> {
-        // Stub: TopN-through-join pushdown is not yet implemented (fails closed
-        // until join multiplicity is proven). See `push_topn_through_join`.
-        Vec::new()
-    }
-}
-
-pub(crate) struct PushTopNThroughAggregate;
-
-impl Rule for PushTopNThroughAggregate {
-    fn name(&self) -> &str {
-        stringify!(PushTopNThroughAggregate)
-    }
-
-    fn rule_type(&self) -> RuleType {
-        RuleType::Transformation
-    }
-
-    fn matches(&self, op: &Operator) -> bool {
-        matches!(op, Operator::LogicalTopN(_))
-    }
-
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
-        push_topn_through_aggregate(expr, memo)
-    }
-
-    fn pattern(&self) -> Pattern {
-        Pattern::Op {
-            kind: OpKind::TopN,
-            children: vec![Pattern::Leaf],
-        }
-    }
-
-    fn apply_bound(&self, _binding: &Binding, _memo: &mut Memo) -> Vec<NewExpr> {
-        // Stub: TopN-through-aggregate pushdown is not yet implemented (fails
-        // closed for ordered aggregates). See `push_topn_through_aggregate`.
-        Vec::new()
-    }
-}
-
 pub(crate) struct PushTopNThroughSetOp;
 
 impl Rule for PushTopNThroughSetOp {
@@ -555,14 +489,6 @@ fn push_one_scan(topn: &TopNOp, topn_children: &[GroupId]) -> Vec<NewExpr> {
     }
 }
 
-fn push_topn_through_join(_expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
-    Vec::new()
-}
-
-fn push_topn_through_aggregate(_expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
-    Vec::new()
-}
-
 fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
     let Operator::LogicalTopN(topn) = &expr.op else {
         return vec![];
@@ -772,22 +698,17 @@ fn topn_phase_can_merge(outer: &TopNOp, inner: &TopNOp) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{
-        ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr,
-    };
+    use crate::sql::analysis::{ExprKind, LiteralValue, ProjectItem, SortItem, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
     use crate::sql::optimizer::operator::{
-        LogicalAggregateOp, LogicalJoinOp, ProjectOp, ScanOp, SortOp, TopNOp, TopNPhase, UnionOp,
-        ValuesOp,
+        ProjectOp, ScanOp, SortOp, TopNOp, TopNPhase, UnionOp, ValuesOp,
     };
     use crate::sql::optimizer::rule::NewExpr;
     use crate::sql::planner::optimizer_bridge::scalar::{
-        intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
-        materialize_sort_key,
+        intern_exprs, intern_project_items, intern_sort_items, materialize_sort_key,
     };
-    use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
 
     fn col(id: u32) -> TypedExpr {
@@ -880,41 +801,6 @@ mod tests {
         });
         memo.groups[group].logical_props = Some(LogicalProperties::new(columns, 0.0));
         group
-    }
-
-    fn join_group(memo: &mut Memo, left_group: usize, right_group: usize) -> usize {
-        memo.new_group(MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: None,
-            }),
-            children: vec![left_group, right_group],
-        })
-    }
-
-    fn aggregate_group(memo: &mut Memo, child_group: usize) -> usize {
-        let group_by = intern_exprs(&mut memo.scalars, &[col(1)]);
-        let aggregates = intern_aggregate_calls(
-            &mut memo.scalars,
-            &[AggregateCall {
-                name: "array_agg".to_string(),
-                args: vec![col(2)],
-                distinct: false,
-                result_type: DataType::Int64,
-                order_by: vec![sort_item(2)],
-                output_column_id: ColumnId(10),
-            }],
-        );
-        memo.new_group(MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-                group_by,
-                aggregates,
-                vec![output_column(1, "c1"), output_column(10, "array_agg")],
-            )),
-            children: vec![child_group],
-        })
     }
 
     fn union_group(memo: &mut Memo, all: bool, inputs: Vec<usize>) -> usize {
@@ -1606,45 +1492,6 @@ mod tests {
         assert!(
             out.is_empty(),
             "default scan capability must not produce TopN pushdown candidates"
-        );
-    }
-
-    #[test]
-    fn join_pushdown_fails_closed_for_inner_join_without_multiplicity_proof() {
-        let mut memo = Memo::new();
-        let left_group = values_group(&mut memo, &[1]);
-        let right_group = values_group(&mut memo, &[2]);
-        let join_group = join_group(&mut memo, left_group, right_group);
-        let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, join_group);
-
-        let out = rule_by_name("PushTopNThroughJoin").apply(&topn, &mut memo);
-
-        assert!(
-            out.is_empty(),
-            "join TopN pushdown must fail closed until multiplicity is proven"
-        );
-    }
-
-    #[test]
-    fn aggregate_pushdown_fails_closed_for_aggregate_function_order() {
-        let mut memo = Memo::new();
-        let input_group = values_group(&mut memo, &[1, 2]);
-        let aggregate_group = aggregate_group(&mut memo, input_group);
-        let topn = topn_with_item(
-            &mut memo,
-            sort_item(10),
-            10,
-            0,
-            TopNPhase::Final,
-            false,
-            aggregate_group,
-        );
-
-        let out = rule_by_name("PushTopNThroughAggregate").apply(&topn, &mut memo);
-
-        assert!(
-            out.is_empty(),
-            "aggregate TopN pushdown must fail closed for ordered aggregate functions"
         );
     }
 

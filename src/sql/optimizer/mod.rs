@@ -779,8 +779,18 @@ mod is_known_rule_name_tests {
     }
 
     #[test]
+    fn is_known_rule_name_recognizes_push_topn_through_join_rule() {
+        assert!(is_known_rule_name("PushTopNThroughJoin"));
+    }
+
+    #[test]
     fn is_known_rule_name_recognizes_mv_rewrite() {
         assert!(is_known_rule_name("MvRewrite"));
+    }
+
+    #[test]
+    fn is_known_rule_name_does_not_recognize_removed_push_topn_through_aggregate_rule() {
+        assert!(!is_known_rule_name("PushTopNThroughAggregate"));
     }
 
     #[test]
