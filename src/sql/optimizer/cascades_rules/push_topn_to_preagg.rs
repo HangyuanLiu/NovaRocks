@@ -1,11 +1,12 @@
-use std::collections::HashSet;
-
+use crate::sql::column_id::ColumnId;
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::binder::Binding;
-use crate::sql::optimizer::memo::{MExpr, Memo};
-use crate::sql::optimizer::operator::{LogicalAggregateOp, Operator};
+use crate::sql::optimizer::cascades_rules::split_aggregate::find_existing_logical_group;
+use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
+use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator, TopNOp, TopNPhase};
 use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::optimizer::scalar::{ScalarArena, ScalarNode, SortKey};
+use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarArena, ScalarNode, SortKey};
 
 pub(crate) struct PushDownTopNToPreAgg;
 
@@ -22,8 +23,48 @@ impl Rule for PushDownTopNToPreAgg {
         matches!(op, Operator::LogicalTopN(_))
     }
 
-    fn apply(&self, _expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
-        Vec::new()
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalTopN(topn) = &expr.op else {
+            return Vec::new();
+        };
+        if expr.children.len() != 1 {
+            return Vec::new();
+        }
+
+        let Some(global_group) = memo.groups.get(expr.children[0]) else {
+            return Vec::new();
+        };
+        let mut candidates = Vec::new();
+        for global_expr in &global_group.logical_exprs {
+            let Operator::LogicalAggregate(global) = &global_expr.op else {
+                continue;
+            };
+            if global_expr.children.len() != 1 {
+                continue;
+            }
+            let local_group_id = global_expr.children[0];
+            let Some(local_group) = memo.groups.get(local_group_id) else {
+                continue;
+            };
+            for local_expr in &local_group.logical_exprs {
+                let Operator::LogicalAggregate(local) = &local_expr.op else {
+                    continue;
+                };
+                candidates.push((global.clone(), local.clone(), local_group_id));
+            }
+        }
+
+        let mut results = Vec::new();
+        for (global, local, local_group_id) in candidates {
+            results.extend(rewrite_topn_preagg(
+                topn,
+                &global,
+                &local,
+                local_group_id,
+                memo,
+            ));
+        }
+        results
     }
 
     fn pattern(&self) -> Pattern {
@@ -39,12 +80,100 @@ impl Rule for PushDownTopNToPreAgg {
         }
     }
 
-    fn apply_bound(&self, _binding: &Binding, _memo: &mut Memo) -> Vec<NewExpr> {
-        Vec::new()
+    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+        // interior 0 = TopN, 1 = global Aggregate, 2 = local Aggregate.
+        let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
+            return Vec::new();
+        };
+        let Operator::LogicalAggregate(global) = binding.op(memo, 1).clone() else {
+            return Vec::new();
+        };
+        let Operator::LogicalAggregate(local) = binding.op(memo, 2).clone() else {
+            return Vec::new();
+        };
+        let local_group_id = binding.children(1)[0];
+        rewrite_topn_preagg(&topn, &global, &local, local_group_id, memo)
     }
 }
 
-#[allow(dead_code)]
+fn rewrite_topn_preagg(
+    topn: &TopNOp,
+    global: &LogicalAggregateOp,
+    local: &LogicalAggregateOp,
+    local_group_id: GroupId,
+    memo: &mut Memo,
+) -> Vec<NewExpr> {
+    if topn.phase != TopNPhase::Final || topn.is_split {
+        return Vec::new();
+    }
+    let Some(limit) = topn.limit else {
+        return Vec::new();
+    };
+    if limit < 0 || topn.offset.unwrap_or(0) != 0 {
+        return Vec::new();
+    }
+    if global.stage != AggStage::Global || local.stage != AggStage::Local {
+        return Vec::new();
+    }
+    if !global.is_split || !local.is_split {
+        return Vec::new();
+    }
+    if global.aggregates.iter().any(|agg| agg.distinct)
+        || local.aggregates.iter().any(|agg| agg.distinct)
+    {
+        return Vec::new();
+    }
+    if !order_by_subset_of_group_by(&topn.items, global, &memo.scalars) {
+        return Vec::new();
+    }
+    let Some(partial_items) =
+        partial_order_by_for_local_group_by(&topn.items, global, local, &mut memo.scalars)
+    else {
+        return Vec::new();
+    };
+
+    let partial_op = Operator::LogicalTopN(TopNOp {
+        items: partial_items,
+        limit: topn.limit,
+        offset: Some(0),
+        phase: TopNPhase::Partial,
+        // This partial TopN is introduced as one half of this pre-aggregate
+        // pruning shape. Current property derivation ignores `is_split` for
+        // Partial nodes, but keeping the marker explicit makes the intent
+        // visible to later TopN rules.
+        is_split: true,
+    });
+    let partial_children = vec![local_group_id];
+    let partial_group_id = find_existing_logical_group(memo, &partial_op, &partial_children)
+        .unwrap_or_else(|| {
+            let partial_id = memo.next_expr_id();
+            memo.new_group(MExpr {
+                id: partial_id,
+                op: partial_op,
+                children: partial_children,
+            })
+        });
+
+    let new_global_op = Operator::LogicalAggregate(global.clone());
+    let new_global_children = vec![partial_group_id];
+    let new_global_group_id =
+        find_existing_logical_group(memo, &new_global_op, &new_global_children).unwrap_or_else(
+            || {
+                let global_id = memo.next_expr_id();
+                memo.new_group(MExpr {
+                    id: global_id,
+                    op: new_global_op,
+                    children: new_global_children,
+                })
+            },
+        );
+
+    vec![NewExpr {
+        op: Operator::LogicalTopN(topn.clone()),
+        children: vec![new_global_group_id],
+    }]
+}
+
 fn order_by_subset_of_group_by(
     items: &[SortKey],
     global: &LogicalAggregateOp,
@@ -53,18 +182,76 @@ fn order_by_subset_of_group_by(
     if items.is_empty() {
         return false;
     }
+    let Some(global_group_outputs) = group_key_outputs(global) else {
+        return false;
+    };
 
-    let group_key_output_ids: HashSet<_> = global
-        .output_columns
-        .iter()
-        .take(global.group_by.len())
-        .map(|column| column.column_id)
-        .collect();
-
-    items.iter().all(|item| match arena.node(item.expr) {
-        ScalarNode::ColumnRef(column_id) => group_key_output_ids.contains(column_id),
-        _ => false,
+    items.iter().all(|item| {
+        let ScalarNode::ColumnRef(column_id) = arena.node(item.expr) else {
+            return false;
+        };
+        global_group_outputs
+            .iter()
+            .any(|column| column.column_id == *column_id)
     })
+}
+
+fn partial_order_by_for_local_group_by(
+    items: &[SortKey],
+    global: &LogicalAggregateOp,
+    local: &LogicalAggregateOp,
+    arena: &mut ScalarArena,
+) -> Option<Vec<SortKey>> {
+    if items.is_empty() {
+        return None;
+    }
+    if global.group_by.len() != local.group_by.len() {
+        return None;
+    }
+    let global_group_outputs = group_key_outputs(global)?;
+    let local_group_outputs = group_key_outputs(local)?;
+
+    let mut local_outputs_for_items = Vec::with_capacity(items.len());
+    for item in items {
+        let global_column_id = match arena.node(item.expr) {
+            ScalarNode::ColumnRef(column_id) => *column_id,
+            _ => return None,
+        };
+        let position = global_group_outputs
+            .iter()
+            .position(|column| column.column_id == global_column_id)?;
+        local_outputs_for_items.push(&local_group_outputs[position]);
+    }
+
+    let mut remapped = Vec::with_capacity(items.len());
+    for (item, local_output) in items.iter().zip(local_outputs_for_items) {
+        let local_expr = arena.intern(
+            ScalarNode::ColumnRef(local_output.column_id),
+            local_output.data_type.clone(),
+            local_output.nullable,
+        );
+        remapped.push(SortKey {
+            expr: local_expr,
+            asc: item.asc,
+            nulls_first: item.nulls_first,
+            display: Some(ColumnDisplay::new(None, local_output.name.clone())),
+        });
+    }
+    Some(remapped)
+}
+
+fn group_key_outputs(agg: &LogicalAggregateOp) -> Option<&[OutputColumn]> {
+    if agg.output_columns.len() < agg.group_by.len() {
+        return None;
+    }
+    let outputs = &agg.output_columns[..agg.group_by.len()];
+    if outputs
+        .iter()
+        .any(|column| column.column_id == ColumnId::UNSET)
+    {
+        return None;
+    }
+    Some(outputs)
 }
 
 #[cfg(test)]
@@ -72,13 +259,20 @@ mod tests {
     use super::*;
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::OutputColumn;
-    use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp};
-    use crate::sql::optimizer::scalar::{ScalarArena, ScalarNode, SortKey};
+    use crate::sql::optimizer::binder::bind;
+    use crate::sql::optimizer::memo::{MExpr, Memo};
+    use crate::sql::optimizer::operator::{
+        AggStage, LogicalAggregateOp, ScalarAggregateSpec, TopNOp, TopNPhase, ValuesOp,
+    };
     use arrow::datatypes::DataType;
 
     fn output_column(id: u32, name: &str) -> OutputColumn {
+        output_column_with_id(ColumnId::new_for_test(id), name)
+    }
+
+    fn output_column_with_id(id: ColumnId, name: &str) -> OutputColumn {
         OutputColumn {
-            column_id: ColumnId::new_for_test(id),
+            column_id: id,
             name: name.to_string(),
             data_type: DataType::Int64,
             nullable: false,
@@ -103,6 +297,15 @@ mod tests {
         }
     }
 
+    fn sum_spec(sales: crate::sql::optimizer::scalar::ScalarId) -> ScalarAggregateSpec {
+        ScalarAggregateSpec {
+            name: "sum".to_string(),
+            args: vec![sales],
+            distinct: false,
+            order_by: vec![],
+        }
+    }
+
     fn global_agg(arena: &mut ScalarArena) -> LogicalAggregateOp {
         LogicalAggregateOp::staged(
             AggStage::Global,
@@ -116,6 +319,130 @@ mod tests {
             vec![],
             true,
         )
+    }
+
+    struct PreAggMemo {
+        memo: Memo,
+        root_group: usize,
+        global_group: usize,
+        local_group: usize,
+        local_sort_column: ColumnId,
+    }
+
+    fn preagg_memo() -> PreAggMemo {
+        let mut memo = Memo::new();
+        let city = col_ref(&mut memo.scalars, 1);
+        let sales = col_ref(&mut memo.scalars, 2);
+        let local_city_output = output_column(1, "city");
+        let global_city_output = output_column(101, "city");
+        let sum_output = output_column(201, "sum_sales");
+        let sum = sum_spec(sales);
+
+        let values_id = memo.next_expr_id();
+        let values_group = memo.new_group(MExpr {
+            id: values_id,
+            op: Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![output_column(1, "city"), output_column(2, "sales")],
+            }),
+            children: vec![],
+        });
+
+        let local_id = memo.next_expr_id();
+        let local_group = memo.new_group(MExpr {
+            id: local_id,
+            op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
+                AggStage::Local,
+                vec![city],
+                vec![sum.clone()],
+                vec![local_city_output.clone(), sum_output.clone()],
+                vec![false],
+                true,
+            )),
+            children: vec![values_group],
+        });
+
+        let global_id = memo.next_expr_id();
+        let global_group = memo.new_group(MExpr {
+            id: global_id,
+            op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
+                AggStage::Global,
+                vec![city],
+                vec![sum],
+                vec![global_city_output, sum_output],
+                vec![true],
+                true,
+            )),
+            children: vec![local_group],
+        });
+
+        let topn_id = memo.next_expr_id();
+        let topn_items = vec![sort_key(&mut memo.scalars, 101)];
+        let root_group = memo.new_group(MExpr {
+            id: topn_id,
+            op: Operator::LogicalTopN(TopNOp {
+                items: topn_items,
+                limit: Some(10),
+                offset: None,
+                phase: TopNPhase::Final,
+                is_split: false,
+            }),
+            children: vec![global_group],
+        });
+
+        PreAggMemo {
+            memo,
+            root_group,
+            global_group,
+            local_group,
+            local_sort_column: ColumnId::new_for_test(1),
+        }
+    }
+
+    fn assert_preagg_rewrite_shape(out: &[NewExpr], memo: &Memo, original: &PreAggMemo) {
+        assert_eq!(out.len(), 1);
+        let Operator::LogicalTopN(root_topn) = &out[0].op else {
+            panic!("expected root LogicalTopN");
+        };
+        assert_eq!(root_topn.phase, TopNPhase::Final);
+        assert_eq!(root_topn.limit, Some(10));
+        assert_eq!(root_topn.offset, None);
+        assert!(!root_topn.is_split);
+        assert_eq!(out[0].children.len(), 1);
+
+        let new_global_group = out[0].children[0];
+        assert_ne!(new_global_group, original.global_group);
+        let new_global_expr = memo.groups[new_global_group]
+            .logical_exprs
+            .iter()
+            .find(|expr| matches!(expr.op, Operator::LogicalAggregate(_)))
+            .expect("expected new global aggregate group");
+        let Operator::LogicalAggregate(new_global) = &new_global_expr.op else {
+            unreachable!();
+        };
+        assert_eq!(new_global.stage, AggStage::Global);
+        assert_eq!(new_global_expr.children.len(), 1);
+
+        let partial_group = new_global_expr.children[0];
+        let partial_expr = memo.groups[partial_group]
+            .logical_exprs
+            .iter()
+            .find(|expr| matches!(expr.op, Operator::LogicalTopN(_)))
+            .expect("expected partial TopN group");
+        let Operator::LogicalTopN(partial) = &partial_expr.op else {
+            unreachable!();
+        };
+        assert_eq!(partial.phase, TopNPhase::Partial);
+        assert_eq!(partial.limit, Some(10));
+        assert_eq!(partial.offset.unwrap_or(0), 0);
+        assert!(partial.is_split);
+        assert_eq!(partial.items.len(), 1);
+        let ScalarNode::ColumnRef(partial_sort_column) = memo.scalars.node(partial.items[0].expr)
+        else {
+            panic!("expected partial TopN sort key to be a ColumnRef");
+        };
+        assert_eq!(*partial_sort_column, original.local_sort_column);
+        assert_eq!(partial_expr.children, vec![original.local_group]);
     }
 
     #[test]
@@ -134,5 +461,80 @@ mod tests {
         let items = vec![sort_key(&mut arena, 201)];
 
         assert!(!order_by_subset_of_group_by(&items, &global, &arena));
+    }
+
+    #[test]
+    fn order_by_rejects_malformed_group_output_prefix() {
+        let mut arena = ScalarArena::new();
+        let mut global = global_agg(&mut arena);
+        global.output_columns.truncate(global.group_by.len() - 1);
+        let items = vec![sort_key(&mut arena, 101)];
+
+        assert!(!order_by_subset_of_group_by(&items, &global, &arena));
+    }
+
+    #[test]
+    fn order_by_rejects_unset_group_output() {
+        let mut arena = ScalarArena::new();
+        let mut global = global_agg(&mut arena);
+        global.output_columns[0] = output_column_with_id(ColumnId::UNSET, "bad");
+        let items = vec![sort_key(&mut arena, 102)];
+
+        assert!(!order_by_subset_of_group_by(&items, &global, &arena));
+    }
+
+    #[test]
+    fn pattern_matches_topn_over_two_aggregates() {
+        let pattern = PushDownTopNToPreAgg.pattern();
+
+        let Pattern::Op { kind, children } = pattern else {
+            panic!("expected TopN root pattern");
+        };
+        assert_eq!(kind, OpKind::TopN);
+        assert_eq!(children.len(), 1);
+        let Pattern::Op {
+            kind,
+            children: global_children,
+        } = &children[0]
+        else {
+            panic!("expected Aggregate child pattern");
+        };
+        assert_eq!(*kind, OpKind::Aggregate);
+        assert_eq!(global_children.len(), 1);
+        let Pattern::Op {
+            kind,
+            children: local_children,
+        } = &global_children[0]
+        else {
+            panic!("expected nested Aggregate child pattern");
+        };
+        assert_eq!(*kind, OpKind::Aggregate);
+        assert_eq!(local_children, &vec![Pattern::Leaf]);
+    }
+
+    #[test]
+    fn apply_pushes_partial_topn_between_global_and_local_aggregates() {
+        let mut fixture = preagg_memo();
+        let expr = fixture.memo.groups[fixture.root_group].logical_exprs[0].clone();
+
+        let out = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+
+        assert_preagg_rewrite_shape(&out, &fixture.memo, &fixture);
+    }
+
+    #[test]
+    fn apply_bound_pushes_partial_topn_between_global_and_local_aggregates() {
+        let mut fixture = preagg_memo();
+        let bindings = bind(
+            &PushDownTopNToPreAgg.pattern(),
+            &fixture.memo,
+            fixture.root_group,
+            0,
+        );
+        assert_eq!(bindings.len(), 1);
+
+        let out = PushDownTopNToPreAgg.apply_bound(&bindings[0], &mut fixture.memo);
+
+        assert_preagg_rewrite_shape(&out, &fixture.memo, &fixture);
     }
 }
