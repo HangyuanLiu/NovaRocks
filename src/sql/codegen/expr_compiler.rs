@@ -2942,18 +2942,26 @@ fn is_state_combinator_aggregate_function(name: &str) -> bool {
             | "sum_state_merge"
             | "sum_state_signed"
             | "avg_state"
+            | "avg_state_merge"
             | "avg_state_signed"
+            | "count_state_merge"
             | "min_state"
+            | "min_state_merge"
             | "min_state_signed"
             | "max_state"
+            | "max_state_merge"
             | "max_state_signed"
             | "bool_or_state"
+            | "bool_or_state_merge"
             | "bool_or_state_signed"
             | "bool_and_state"
+            | "bool_and_state_merge"
             | "bool_and_state_signed"
             | "count_distinct_state"
+            | "count_distinct_state_merge"
             | "count_distinct_state_signed"
             | "approx_count_distinct_state"
+            | "approx_count_distinct_state_merge"
             | "approx_count_distinct_state_signed"
     )
 }
@@ -4046,22 +4054,30 @@ mod tests {
         for name in [
             "count_state",
             "count_state_signed",
+            "count_state_merge",
             "sum_state",
             "sum_state_merge",
             "sum_state_signed",
             "avg_state",
+            "avg_state_merge",
             "avg_state_signed",
             "min_state",
+            "min_state_merge",
             "min_state_signed",
             "max_state",
+            "max_state_merge",
             "max_state_signed",
             "bool_or_state",
+            "bool_or_state_merge",
             "bool_or_state_signed",
             "bool_and_state",
+            "bool_and_state_merge",
             "bool_and_state_signed",
             "count_distinct_state",
+            "count_distinct_state_merge",
             "count_distinct_state_signed",
             "approx_count_distinct_state",
+            "approx_count_distinct_state_merge",
             "approx_count_distinct_state_signed",
         ] {
             let (output, intermediate) =

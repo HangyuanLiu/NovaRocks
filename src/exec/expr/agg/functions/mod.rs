@@ -41,6 +41,14 @@ pub(super) enum AggKind {
     SumDecimal256,
     SumStateInt64,
     SumStateDecimal128,
+    CountStateMerge,
+    AvgStateMerge,
+    MinStateMerge,
+    MaxStateMerge,
+    BoolAndStateMerge,
+    BoolOrStateMerge,
+    CountDistinctStateMerge,
+    ApproxCountDistinctStateMerge,
     SumStateMerge,
     SumStateSignedInt64,
     SumStateSignedDecimal128,
@@ -189,6 +197,7 @@ use state_combinators::bool_or_and::{BoolStateAgg, BoolStateSignedAgg};
 use state_combinators::count::{CountStateAgg, CountStateSignedAgg};
 use state_combinators::count_distinct::{CountDistinctStateAgg, CountDistinctStateSignedAgg};
 use state_combinators::min_max::{MinMaxStateAgg, MinMaxStateSignedAgg};
+use state_combinators::opaque_merge::OpaqueStateMergeAgg;
 use state_combinators::sum::{SumStateAgg, SumStateMergeAgg, SumStateSignedAgg};
 use sum::SumAgg;
 use sum_map::SumMapAgg;
@@ -261,6 +270,46 @@ static COUNT_DISTINCT: CountDistinctAgg = CountDistinctAgg;
 static COUNT_IF: CountIfAgg = CountIfAgg;
 static GROUP_CONCAT: GroupConcatAgg = GroupConcatAgg;
 static SUM: SumAgg = SumAgg;
+static COUNT_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "count_state_merge",
+    AggKind::CountStateMerge,
+    crate::exec::expr::function::mv_state::count_state_union,
+);
+static AVG_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "avg_state_merge",
+    AggKind::AvgStateMerge,
+    crate::exec::expr::function::mv_state::avg_state_union,
+);
+static MIN_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "min_state_merge",
+    AggKind::MinStateMerge,
+    crate::exec::expr::function::mv_state::min_state_union,
+);
+static MAX_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "max_state_merge",
+    AggKind::MaxStateMerge,
+    crate::exec::expr::function::mv_state::max_state_union,
+);
+static BOOL_AND_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "bool_and_state_merge",
+    AggKind::BoolAndStateMerge,
+    crate::exec::expr::function::mv_state::bool_and_state_union,
+);
+static BOOL_OR_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "bool_or_state_merge",
+    AggKind::BoolOrStateMerge,
+    crate::exec::expr::function::mv_state::bool_or_state_union,
+);
+static COUNT_DISTINCT_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "count_distinct_state_merge",
+    AggKind::CountDistinctStateMerge,
+    crate::exec::expr::function::mv_state::count_distinct_state_union,
+);
+static APPROX_COUNT_DISTINCT_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "approx_count_distinct_state_merge",
+    AggKind::ApproxCountDistinctStateMerge,
+    crate::exec::expr::function::mv_state::approx_count_distinct_state_union,
+);
 static SUM_STATE: SumStateAgg = SumStateAgg;
 static SUM_STATE_MERGE: SumStateMergeAgg = SumStateMergeAgg;
 static SUM_STATE_SIGNED: SumStateSignedAgg = SumStateSignedAgg;
@@ -311,6 +360,14 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "count_if" => Ok(&COUNT_IF),
         "group_concat" | "string_agg" => Ok(&GROUP_CONCAT),
         "sum" => Ok(&SUM),
+        "count_state_merge" => Ok(&COUNT_STATE_MERGE),
+        "avg_state_merge" => Ok(&AVG_STATE_MERGE),
+        "min_state_merge" => Ok(&MIN_STATE_MERGE),
+        "max_state_merge" => Ok(&MAX_STATE_MERGE),
+        "bool_and_state_merge" => Ok(&BOOL_AND_STATE_MERGE),
+        "bool_or_state_merge" => Ok(&BOOL_OR_STATE_MERGE),
+        "count_distinct_state_merge" => Ok(&COUNT_DISTINCT_STATE_MERGE),
+        "approx_count_distinct_state_merge" => Ok(&APPROX_COUNT_DISTINCT_STATE_MERGE),
         "sum_state" => Ok(&SUM_STATE),
         "sum_state_merge" => Ok(&SUM_STATE_MERGE),
         "sum_state_signed" => Ok(&SUM_STATE_SIGNED),
@@ -374,6 +431,14 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         | AggKind::SumFloat
         | AggKind::SumDecimal128
         | AggKind::SumDecimal256 => &SUM,
+        AggKind::CountStateMerge => &COUNT_STATE_MERGE,
+        AggKind::AvgStateMerge => &AVG_STATE_MERGE,
+        AggKind::MinStateMerge => &MIN_STATE_MERGE,
+        AggKind::MaxStateMerge => &MAX_STATE_MERGE,
+        AggKind::BoolAndStateMerge => &BOOL_AND_STATE_MERGE,
+        AggKind::BoolOrStateMerge => &BOOL_OR_STATE_MERGE,
+        AggKind::CountDistinctStateMerge => &COUNT_DISTINCT_STATE_MERGE,
+        AggKind::ApproxCountDistinctStateMerge => &APPROX_COUNT_DISTINCT_STATE_MERGE,
         AggKind::SumStateInt64 | AggKind::SumStateDecimal128 => &SUM_STATE,
         AggKind::SumStateMerge => &SUM_STATE_MERGE,
         AggKind::SumStateSignedInt64 | AggKind::SumStateSignedDecimal128 => &SUM_STATE_SIGNED,
