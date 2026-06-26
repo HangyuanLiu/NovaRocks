@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::{data_sinks, exprs, types};
+use crate::thrift::{data_sinks, exprs, types};
 
 pub(crate) const ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = 2_147_483_546;
 pub(crate) const ICEBERG_POSITION_DELETE_POS_FIELD_ID: i32 = 2_147_483_545;
@@ -326,10 +326,10 @@ mod tests {
     fn field(
         index: i32,
         name: &str,
-        primitive: crate::types::TPrimitiveType,
+        primitive: crate::thrift::types::TPrimitiveType,
         field_id: i32,
-    ) -> crate::data_sinks::TIcebergPositionDeleteOutputField {
-        crate::data_sinks::TIcebergPositionDeleteOutputField::new(
+    ) -> crate::thrift::data_sinks::TIcebergPositionDeleteOutputField {
+        crate::thrift::data_sinks::TIcebergPositionDeleteOutputField::new(
             Some(index),
             Some(name.to_string()),
             Some(scalar_type_desc(primitive)),
@@ -339,8 +339,8 @@ mod tests {
 
     fn partition_source(
         index: i32,
-    ) -> crate::data_sinks::TIcebergPositionDeletePartitionSourceField {
-        crate::data_sinks::TIcebergPositionDeletePartitionSourceField::new(
+    ) -> crate::thrift::data_sinks::TIcebergPositionDeletePartitionSourceField {
+        crate::thrift::data_sinks::TIcebergPositionDeletePartitionSourceField::new(
             Some(index),
             Some("id".to_string()),
             Some("id_bucket".to_string()),
@@ -349,18 +349,18 @@ mod tests {
         )
     }
 
-    fn valid_descriptor() -> crate::data_sinks::TIcebergPositionDeleteOutputDescriptor {
-        crate::data_sinks::TIcebergPositionDeleteOutputDescriptor::new(
+    fn valid_descriptor() -> crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor {
+        crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor::new(
             Some(field(
                 0,
                 ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
-                crate::types::TPrimitiveType::VARCHAR,
+                crate::thrift::types::TPrimitiveType::VARCHAR,
                 ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
             )),
             Some(field(
                 1,
                 ICEBERG_POSITION_DELETE_POS_COLUMN,
-                crate::types::TPrimitiveType::BIGINT,
+                crate::thrift::types::TPrimitiveType::BIGINT,
                 ICEBERG_POSITION_DELETE_POS_FIELD_ID,
             )),
             Some(vec![partition_source(2)]),
@@ -368,30 +368,30 @@ mod tests {
         )
     }
 
-    fn empty_output_exprs(count: usize) -> Vec<crate::exprs::TExpr> {
+    fn empty_output_exprs(count: usize) -> Vec<crate::thrift::exprs::TExpr> {
         (0..count)
-            .map(|_| crate::exprs::TExpr::new(Vec::new()))
+            .map(|_| crate::thrift::exprs::TExpr::new(Vec::new()))
             .collect()
     }
 
-    fn typed_expr(primitive: crate::types::TPrimitiveType) -> crate::exprs::TExpr {
+    fn typed_expr(primitive: crate::thrift::types::TPrimitiveType) -> crate::thrift::exprs::TExpr {
         let (node_type, int_literal, string_literal) =
-            if primitive == crate::types::TPrimitiveType::VARCHAR {
+            if primitive == crate::thrift::types::TPrimitiveType::VARCHAR {
                 (
-                    crate::exprs::TExprNodeType::STRING_LITERAL,
+                    crate::thrift::exprs::TExprNodeType::STRING_LITERAL,
                     None,
-                    Some(crate::exprs::TStringLiteral {
+                    Some(crate::thrift::exprs::TStringLiteral {
                         value: "value".to_string(),
                     }),
                 )
             } else {
                 (
-                    crate::exprs::TExprNodeType::INT_LITERAL,
-                    Some(crate::exprs::TIntLiteral { value: 1 }),
+                    crate::thrift::exprs::TExprNodeType::INT_LITERAL,
+                    Some(crate::thrift::exprs::TIntLiteral { value: 1 }),
                     None,
                 )
             };
-        crate::exprs::TExpr::new(vec![crate::exprs::TExprNode {
+        crate::thrift::exprs::TExpr::new(vec![crate::thrift::exprs::TExprNode {
             node_type,
             type_: scalar_type_desc(primitive),
             opcode: None,
@@ -437,20 +437,20 @@ mod tests {
         }])
     }
 
-    fn valid_output_exprs() -> Vec<crate::exprs::TExpr> {
+    fn valid_output_exprs() -> Vec<crate::thrift::exprs::TExpr> {
         vec![
-            typed_expr(crate::types::TPrimitiveType::VARCHAR),
-            typed_expr(crate::types::TPrimitiveType::BIGINT),
-            typed_expr(crate::types::TPrimitiveType::INT),
+            typed_expr(crate::thrift::types::TPrimitiveType::VARCHAR),
+            typed_expr(crate::thrift::types::TPrimitiveType::BIGINT),
+            typed_expr(crate::thrift::types::TPrimitiveType::INT),
         ]
     }
 
     fn malformed_non_scalar_type_desc(
-        primitive: crate::types::TPrimitiveType,
-    ) -> crate::types::TTypeDesc {
-        crate::types::TTypeDesc::new(vec![crate::types::TTypeNode::new(
-            crate::types::TTypeNodeType::ARRAY,
-            crate::types::TScalarType::new(primitive, None, None, None, None),
+        primitive: crate::thrift::types::TPrimitiveType,
+    ) -> crate::thrift::types::TTypeDesc {
+        crate::thrift::types::TTypeDesc::new(vec![crate::thrift::types::TTypeNode::new(
+            crate::thrift::types::TTypeNodeType::ARRAY,
+            crate::thrift::types::TScalarType::new(primitive, None, None, None, None),
             None,
             None,
         )])
@@ -484,7 +484,7 @@ mod tests {
     fn descriptor_non_scalar_type_desc_fails() {
         let mut desc = valid_descriptor();
         desc.file_path.as_mut().unwrap().type_desc = Some(malformed_non_scalar_type_desc(
-            crate::types::TPrimitiveType::VARCHAR,
+            crate::thrift::types::TPrimitiveType::VARCHAR,
         ));
         let err = validate_required_fields(&desc).unwrap_err();
         assert_eq!(
@@ -609,7 +609,7 @@ mod tests {
     fn descriptor_empty_required_output_expr_fails() {
         let desc = valid_descriptor();
         let mut output_exprs = valid_output_exprs();
-        output_exprs[0] = crate::exprs::TExpr::new(Vec::new());
+        output_exprs[0] = crate::thrift::exprs::TExpr::new(Vec::new());
         let err = bind_position_delete_descriptor(
             Some(&desc),
             &output_exprs,
@@ -631,7 +631,7 @@ mod tests {
     fn descriptor_wrong_required_output_expr_type_fails() {
         let desc = valid_descriptor();
         let mut output_exprs = valid_output_exprs();
-        output_exprs[1] = typed_expr(crate::types::TPrimitiveType::VARCHAR);
+        output_exprs[1] = typed_expr(crate::thrift::types::TPrimitiveType::VARCHAR);
         let err = bind_position_delete_descriptor(
             Some(&desc),
             &output_exprs,
@@ -654,7 +654,7 @@ mod tests {
         let desc = valid_descriptor();
         let mut output_exprs = valid_output_exprs();
         output_exprs[2].nodes[0].type_ =
-            malformed_non_scalar_type_desc(crate::types::TPrimitiveType::INT);
+            malformed_non_scalar_type_desc(crate::thrift::types::TPrimitiveType::INT);
         let err = bind_position_delete_descriptor(
             Some(&desc),
             &output_exprs,

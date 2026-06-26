@@ -579,7 +579,7 @@ fn position_delete_sink_input_columns(
 fn build_position_delete_output_descriptor(
     metadata: &iceberg::spec::TableMetadata,
     target_columns: &[ColumnDef],
-) -> Result<crate::data_sinks::TIcebergPositionDeleteOutputDescriptor, String> {
+) -> Result<crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor, String> {
     use crate::connector::iceberg::position_delete_descriptor::{
         ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
         ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
@@ -612,7 +612,7 @@ fn build_position_delete_output_descriptor(
                 "[UnsupportedPositionDeleteDescriptor] position-delete partition source index overflow"
                     .to_string()
             })?;
-            Ok(crate::data_sinks::TIcebergPositionDeletePartitionSourceField::new(
+            Ok(crate::thrift::data_sinks::TIcebergPositionDeletePartitionSourceField::new(
                 Some(output_expr_index),
                 Some(source.name.clone()),
                 Some(field.name.clone()),
@@ -625,19 +625,27 @@ fn build_position_delete_output_descriptor(
         .collect::<Result<Vec<_>, String>>()?;
 
     Ok(
-        crate::data_sinks::TIcebergPositionDeleteOutputDescriptor::new(
-            Some(crate::data_sinks::TIcebergPositionDeleteOutputField::new(
-                Some(0),
-                Some(ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string()),
-                Some(scalar_type_desc(crate::types::TPrimitiveType::VARCHAR)),
-                Some(ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID),
-            )),
-            Some(crate::data_sinks::TIcebergPositionDeleteOutputField::new(
-                Some(1),
-                Some(ICEBERG_POSITION_DELETE_POS_COLUMN.to_string()),
-                Some(scalar_type_desc(crate::types::TPrimitiveType::BIGINT)),
-                Some(ICEBERG_POSITION_DELETE_POS_FIELD_ID),
-            )),
+        crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor::new(
+            Some(
+                crate::thrift::data_sinks::TIcebergPositionDeleteOutputField::new(
+                    Some(0),
+                    Some(ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string()),
+                    Some(scalar_type_desc(
+                        crate::thrift::types::TPrimitiveType::VARCHAR,
+                    )),
+                    Some(ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID),
+                ),
+            ),
+            Some(
+                crate::thrift::data_sinks::TIcebergPositionDeleteOutputField::new(
+                    Some(1),
+                    Some(ICEBERG_POSITION_DELETE_POS_COLUMN.to_string()),
+                    Some(scalar_type_desc(
+                        crate::thrift::types::TPrimitiveType::BIGINT,
+                    )),
+                    Some(ICEBERG_POSITION_DELETE_POS_FIELD_ID),
+                ),
+            ),
             Some(partition_source_fields),
             Some(metadata.default_partition_spec_id()),
         ),
@@ -1541,10 +1549,10 @@ mod tests {
     }
 
     fn assert_position_delete_output_field(
-        field: Option<&crate::data_sinks::TIcebergPositionDeleteOutputField>,
+        field: Option<&crate::thrift::data_sinks::TIcebergPositionDeleteOutputField>,
         output_expr_index: i32,
         name: &str,
-        primitive: crate::types::TPrimitiveType,
+        primitive: crate::thrift::types::TPrimitiveType,
         field_id: i32,
     ) {
         let field = field.expect("position delete output field");
@@ -1561,7 +1569,7 @@ mod tests {
     }
 
     fn assert_position_delete_descriptor_contract(
-        desc: &crate::data_sinks::TIcebergPositionDeleteOutputDescriptor,
+        desc: &crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor,
     ) {
         use crate::connector::iceberg::position_delete_descriptor::{
             ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
@@ -1573,14 +1581,14 @@ mod tests {
             desc.file_path.as_ref(),
             0,
             ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
-            crate::types::TPrimitiveType::VARCHAR,
+            crate::thrift::types::TPrimitiveType::VARCHAR,
             ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
         );
         assert_position_delete_output_field(
             desc.pos.as_ref(),
             1,
             ICEBERG_POSITION_DELETE_POS_COLUMN,
-            crate::types::TPrimitiveType::BIGINT,
+            crate::thrift::types::TPrimitiveType::BIGINT,
             ICEBERG_POSITION_DELETE_POS_FIELD_ID,
         );
         let partition_field = desc
