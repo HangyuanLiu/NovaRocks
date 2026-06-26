@@ -15,6 +15,7 @@ use super::type_infer::{arithmetic_result_type_with_op, arrow_type_to_type_desc,
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::plan::AggregateCall;
+use crate::types::comparison_common_type;
 
 /// Shared counter used to allocate fresh slot ids for lambda parameters. The
 /// counter is owned by the fragment builder so that ids stay globally unique
@@ -353,6 +354,32 @@ impl<'a> ExprCompiler<'a> {
         }
     }
 
+    /// Compile a comparison operand, inserting a CAST to `compare_type` when
+    /// required. `authority_decided` means the authority chose the type and both
+    /// non-matching operands are cast to it; otherwise preserve the legacy
+    /// whitelist gate.
+    fn compile_comparison_operand(
+        &mut self,
+        operand: &TypedExpr,
+        compare_type: &DataType,
+        authority_decided: bool,
+    ) -> Result<(), String> {
+        let needs = operand.data_type != *compare_type
+            && (authority_decided || needs_comparison_cast(&operand.data_type, compare_type));
+        if needs {
+            let cast_type_desc = arrow_type_to_type_desc(compare_type)?;
+            self.nodes.push(exprs::TExprNode {
+                node_type: exprs::TExprNodeType::CAST_EXPR,
+                type_: cast_type_desc,
+                num_children: 1,
+                opcode: None,
+                ..default_expr_node()
+            });
+        }
+        self.compile_typed_inner(operand)?;
+        Ok(())
+    }
+
     fn compile_aggregate_arg_typed(
         &mut self,
         agg_name: &str,
@@ -570,11 +597,12 @@ impl<'a> ExprCompiler<'a> {
                         ..default_expr_node()
                     });
                     // LT: expr < low
-                    let lt_child_type = wider_type(&inner.data_type, &low.data_type);
+                    let (lt_child_type, lt_authority_decided) =
+                        comparison_compare_type(&inner.data_type, &low.data_type)?;
                     let lt_idx = self.nodes.len();
                     self.nodes.push(default_expr_node());
-                    self.compile_with_cast_if_needed(inner, &lt_child_type)?;
-                    self.compile_with_cast_if_needed(low, &lt_child_type)?;
+                    self.compile_comparison_operand(inner, &lt_child_type, lt_authority_decided)?;
+                    self.compile_comparison_operand(low, &lt_child_type, lt_authority_decided)?;
                     self.nodes[lt_idx] = exprs::TExprNode {
                         node_type: exprs::TExprNodeType::BINARY_PRED,
                         type_: type_desc.clone(),
@@ -584,11 +612,12 @@ impl<'a> ExprCompiler<'a> {
                         ..default_expr_node()
                     };
                     // GT: expr > high
-                    let gt_child_type = wider_type(&inner.data_type, &high.data_type);
+                    let (gt_child_type, gt_authority_decided) =
+                        comparison_compare_type(&inner.data_type, &high.data_type)?;
                     let gt_idx = self.nodes.len();
                     self.nodes.push(default_expr_node());
-                    self.compile_with_cast_if_needed(inner, &gt_child_type)?;
-                    self.compile_with_cast_if_needed(high, &gt_child_type)?;
+                    self.compile_comparison_operand(inner, &gt_child_type, gt_authority_decided)?;
+                    self.compile_comparison_operand(high, &gt_child_type, gt_authority_decided)?;
                     self.nodes[gt_idx] = exprs::TExprNode {
                         node_type: exprs::TExprNodeType::BINARY_PRED,
                         type_: type_desc,
@@ -607,11 +636,12 @@ impl<'a> ExprCompiler<'a> {
                         ..default_expr_node()
                     });
                     // GE: expr >= low
-                    let ge_child_type = wider_type(&inner.data_type, &low.data_type);
+                    let (ge_child_type, ge_authority_decided) =
+                        comparison_compare_type(&inner.data_type, &low.data_type)?;
                     let ge_idx = self.nodes.len();
                     self.nodes.push(default_expr_node());
-                    self.compile_with_cast_if_needed(inner, &ge_child_type)?;
-                    self.compile_with_cast_if_needed(low, &ge_child_type)?;
+                    self.compile_comparison_operand(inner, &ge_child_type, ge_authority_decided)?;
+                    self.compile_comparison_operand(low, &ge_child_type, ge_authority_decided)?;
                     self.nodes[ge_idx] = exprs::TExprNode {
                         node_type: exprs::TExprNodeType::BINARY_PRED,
                         type_: type_desc.clone(),
@@ -621,11 +651,12 @@ impl<'a> ExprCompiler<'a> {
                         ..default_expr_node()
                     };
                     // LE: expr <= high
-                    let le_child_type = wider_type(&inner.data_type, &high.data_type);
+                    let (le_child_type, le_authority_decided) =
+                        comparison_compare_type(&inner.data_type, &high.data_type)?;
                     let le_idx = self.nodes.len();
                     self.nodes.push(default_expr_node());
-                    self.compile_with_cast_if_needed(inner, &le_child_type)?;
-                    self.compile_with_cast_if_needed(high, &le_child_type)?;
+                    self.compile_comparison_operand(inner, &le_child_type, le_authority_decided)?;
+                    self.compile_comparison_operand(high, &le_child_type, le_authority_decided)?;
                     self.nodes[le_idx] = exprs::TExprNode {
                         node_type: exprs::TExprNodeType::BINARY_PRED,
                         type_: type_desc,
@@ -869,36 +900,13 @@ impl<'a> ExprCompiler<'a> {
             BinOp::EqForNull => opcodes::TExprOpcode::EQ_FOR_NULL,
             _ => unreachable!(),
         };
-        let compare_type = wider_type(&left.data_type, &right.data_type);
+        let (compare_type, authority_decided) =
+            comparison_compare_type(&left.data_type, &right.data_type)?;
         let parent_idx = self.nodes.len();
         self.nodes.push(default_expr_node()); // placeholder
 
-        // Compile left, inserting cast if needed
-        if left.data_type != compare_type && needs_comparison_cast(&left.data_type, &compare_type) {
-            let cast_type_desc = arrow_type_to_type_desc(&compare_type)?;
-            self.nodes.push(exprs::TExprNode {
-                node_type: exprs::TExprNodeType::CAST_EXPR,
-                type_: cast_type_desc,
-                num_children: 1,
-                opcode: None,
-                ..default_expr_node()
-            });
-        }
-        self.compile_typed_inner(left)?;
-
-        // Compile right, inserting cast if needed
-        if right.data_type != compare_type && needs_comparison_cast(&right.data_type, &compare_type)
-        {
-            let cast_type_desc = arrow_type_to_type_desc(&compare_type)?;
-            self.nodes.push(exprs::TExprNode {
-                node_type: exprs::TExprNodeType::CAST_EXPR,
-                type_: cast_type_desc,
-                num_children: 1,
-                opcode: None,
-                ..default_expr_node()
-            });
-        }
-        self.compile_typed_inner(right)?;
+        self.compile_comparison_operand(left, &compare_type, authority_decided)?;
+        self.compile_comparison_operand(right, &compare_type, authority_decided)?;
 
         let child_type_desc = arrow_type_to_type_desc(&compare_type).ok();
         let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
@@ -2004,6 +2012,20 @@ fn needs_comparison_cast(source: &DataType, target: &DataType) -> bool {
         )
 }
 
+/// Comparison common type: the shared authority first, `wider_type` fallback.
+/// Returns the type both operands compare at, and whether the authority decided
+/// it (`true` => both operands must be cast to it; `false` => keep the legacy
+/// `needs_comparison_cast` gate).
+fn comparison_compare_type(
+    left_dt: &DataType,
+    right_dt: &DataType,
+) -> Result<(DataType, bool), String> {
+    Ok(match comparison_common_type(left_dt, right_dt)? {
+        Some(t) => (t, true),
+        None => (wider_type(left_dt, right_dt), false),
+    })
+}
+
 fn needs_largeint_cast(source: &DataType, target: &DataType) -> bool {
     source != target
         && matches!(
@@ -3098,7 +3120,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
-    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::AggregateCall;
@@ -3212,6 +3234,139 @@ mod tests {
             data_type,
             nullable: false,
         }
+    }
+
+    #[test]
+    fn binary_pred_int_vs_string_uses_numeric_compare_type() {
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            ColumnId(1),
+            None,
+            "c".to_string(),
+            test_binding(10, DataType::Int32),
+        );
+        let left = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(1),
+                qualifier: None,
+                column: "c".to_string(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        };
+        let right = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String("123".to_string())),
+            data_type: DataType::Utf8,
+            nullable: false,
+        };
+        let expr = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Eq,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let slot_alloc = Rc::new(RefCell::new(100));
+        let mut compiler = ExprCompiler::new(slot_alloc, &scope);
+
+        let compiled = compiler.compile_typed(&expr).unwrap();
+
+        let binary_pred = compiled
+            .nodes
+            .iter()
+            .find(|node| node.node_type == crate::thrift::exprs::TExprNodeType::BINARY_PRED)
+            .expect("comparison should compile to BINARY_PRED");
+        let child_type = binary_pred
+            .child_type_desc
+            .as_ref()
+            .and_then(crate::lower::type_lowering::arrow_type_from_desc);
+        assert_eq!(child_type, Some(DataType::Int32));
+        assert_ne!(child_type, Some(DataType::Utf8));
+
+        let has_int32_cast = compiled.nodes.iter().any(|node| {
+            node.node_type == crate::thrift::exprs::TExprNodeType::CAST_EXPR
+                && crate::lower::type_lowering::arrow_type_from_desc(&node.type_)
+                    == Some(DataType::Int32)
+        });
+        assert!(
+            has_int32_cast,
+            "string comparison side should cast to Int32"
+        );
+    }
+
+    #[test]
+    fn between_int_vs_string_bounds_uses_numeric_compare_type() {
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            ColumnId(1),
+            None,
+            "c".to_string(),
+            test_binding(10, DataType::Int32),
+        );
+        let inner = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(1),
+                qualifier: None,
+                column: "c".to_string(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        };
+        let low = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String("10".to_string())),
+            data_type: DataType::Utf8,
+            nullable: false,
+        };
+        let high = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String("20".to_string())),
+            data_type: DataType::Utf8,
+            nullable: false,
+        };
+        let expr = TypedExpr {
+            kind: ExprKind::Between {
+                expr: Box::new(inner),
+                negated: false,
+                low: Box::new(low),
+                high: Box::new(high),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let slot_alloc = Rc::new(RefCell::new(100));
+        let mut compiler = ExprCompiler::new(slot_alloc, &scope);
+
+        let compiled = compiler.compile_typed(&expr).unwrap();
+
+        let binary_child_types: Vec<_> = compiled
+            .nodes
+            .iter()
+            .filter(|node| node.node_type == crate::thrift::exprs::TExprNodeType::BINARY_PRED)
+            .map(|node| {
+                node.child_type_desc
+                    .as_ref()
+                    .and_then(crate::lower::type_lowering::arrow_type_from_desc)
+            })
+            .collect();
+        assert_eq!(
+            binary_child_types,
+            vec![Some(DataType::Int32), Some(DataType::Int32)]
+        );
+
+        let int32_cast_count = compiled
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.node_type == crate::thrift::exprs::TExprNodeType::CAST_EXPR
+                    && crate::lower::type_lowering::arrow_type_from_desc(&node.type_)
+                        == Some(DataType::Int32)
+            })
+            .count();
+        assert_eq!(
+            int32_cast_count, 2,
+            "both string BETWEEN bounds should cast to Int32"
+        );
     }
 
     #[test]
