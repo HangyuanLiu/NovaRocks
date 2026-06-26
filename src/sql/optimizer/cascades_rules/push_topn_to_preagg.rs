@@ -399,6 +399,17 @@ mod tests {
         }
     }
 
+    fn root_expr(fixture: &PreAggMemo) -> MExpr {
+        fixture.memo.groups[fixture.root_group].logical_exprs[0].clone()
+    }
+
+    fn assert_does_not_fire(fixture: &mut PreAggMemo) {
+        let expr = root_expr(fixture);
+        let out = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+
+        assert!(out.is_empty(), "expected PushDownTopNToPreAgg not to fire");
+    }
+
     fn assert_preagg_rewrite_shape(out: &[NewExpr], memo: &Memo, original: &PreAggMemo) {
         assert_eq!(out.len(), 1);
         let Operator::LogicalTopN(root_topn) = &out[0].op else {
@@ -515,11 +526,138 @@ mod tests {
     #[test]
     fn apply_pushes_partial_topn_between_global_and_local_aggregates() {
         let mut fixture = preagg_memo();
-        let expr = fixture.memo.groups[fixture.root_group].logical_exprs[0].clone();
+        let expr = root_expr(&fixture);
 
         let out = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
 
         assert_preagg_rewrite_shape(&out, &fixture.memo, &fixture);
+    }
+
+    #[test]
+    fn order_by_aggregate_output_does_not_fire() {
+        let mut fixture = preagg_memo();
+        let aggregate_output_sort_key = sort_key(&mut fixture.memo.scalars, 201);
+        let Operator::LogicalTopN(topn) =
+            &mut fixture.memo.groups[fixture.root_group].logical_exprs[0].op
+        else {
+            panic!("expected root LogicalTopN");
+        };
+        topn.items = vec![aggregate_output_sort_key];
+
+        assert_does_not_fire(&mut fixture);
+    }
+
+    #[test]
+    fn offset_does_not_fire() {
+        let mut fixture = preagg_memo();
+        let Operator::LogicalTopN(topn) =
+            &mut fixture.memo.groups[fixture.root_group].logical_exprs[0].op
+        else {
+            panic!("expected root LogicalTopN");
+        };
+        topn.offset = Some(1);
+
+        assert_does_not_fire(&mut fixture);
+    }
+
+    #[test]
+    fn no_limit_does_not_fire() {
+        let mut fixture = preagg_memo();
+        let Operator::LogicalTopN(topn) =
+            &mut fixture.memo.groups[fixture.root_group].logical_exprs[0].op
+        else {
+            panic!("expected root LogicalTopN");
+        };
+        topn.limit = None;
+
+        assert_does_not_fire(&mut fixture);
+    }
+
+    #[test]
+    fn wrong_stage_does_not_fire() {
+        let mut fixture = preagg_memo();
+        let Operator::LogicalAggregate(agg) =
+            &mut fixture.memo.groups[fixture.global_group].logical_exprs[0].op
+        else {
+            panic!("expected global LogicalAggregate");
+        };
+        agg.stage = AggStage::Single;
+
+        assert_does_not_fire(&mut fixture);
+    }
+
+    #[test]
+    fn single_stage_aggregate_does_not_fire() {
+        let mut memo = Memo::new();
+        let city = col_ref(&mut memo.scalars, 1);
+        let sales = col_ref(&mut memo.scalars, 2);
+        let sum = sum_spec(sales);
+
+        let values_id = memo.next_expr_id();
+        let values_group = memo.new_group(MExpr {
+            id: values_id,
+            op: Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![output_column(1, "city"), output_column(2, "sales")],
+            }),
+            children: vec![],
+        });
+
+        let single_id = memo.next_expr_id();
+        let single_group = memo.new_group(MExpr {
+            id: single_id,
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![city],
+                vec![sum],
+                vec![output_column(1, "city"), output_column(201, "sum_sales")],
+            )),
+            children: vec![values_group],
+        });
+
+        let topn = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalTopN(TopNOp {
+                items: vec![sort_key(&mut memo.scalars, 1)],
+                limit: Some(10),
+                offset: None,
+                phase: TopNPhase::Final,
+                is_split: false,
+            }),
+            children: vec![single_group],
+        };
+
+        let out = PushDownTopNToPreAgg.apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "expected single-stage aggregate not to fire"
+        );
+    }
+
+    #[test]
+    fn distinct_aggregate_does_not_fire() {
+        let mut fixture = preagg_memo();
+        let Operator::LogicalAggregate(agg) =
+            &mut fixture.memo.groups[fixture.global_group].logical_exprs[0].op
+        else {
+            panic!("expected global LogicalAggregate");
+        };
+        agg.aggregates[0].distinct = true;
+
+        assert_does_not_fire(&mut fixture);
+    }
+
+    #[test]
+    fn local_group_key_output_mismatch_does_not_fire() {
+        let mut fixture = preagg_memo();
+        let Operator::LogicalAggregate(agg) =
+            &mut fixture.memo.groups[fixture.local_group].logical_exprs[0].op
+        else {
+            panic!("expected local LogicalAggregate");
+        };
+        agg.output_columns[0] = output_column_with_id(ColumnId::UNSET, "bad");
+
+        assert_does_not_fire(&mut fixture);
     }
 
     #[test]
