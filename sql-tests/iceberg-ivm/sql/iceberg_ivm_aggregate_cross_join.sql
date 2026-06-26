@@ -73,7 +73,7 @@ INSERT INTO ice_ivm_xjoin_${uuid0}.ns_${uuid0}.amounts VALUES
 
 -- query 6
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=UNION
 -- @explain_contains=IcebergVersionTable
 -- @explain_contains=sum_state_signed
@@ -98,7 +98,7 @@ DELETE FROM ice_ivm_xjoin_${uuid0}.ns_${uuid0}.regions WHERE id = 2;
 
 -- query 10
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=UNION
 -- @explain_contains=IcebergVersionTable
 -- @explain_contains=sum_state_signed

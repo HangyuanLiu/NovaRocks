@@ -1,6 +1,7 @@
 use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem};
+use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -364,14 +365,75 @@ pub(crate) struct UnsupportedJoinKindCheckRule;
 /// Returns true if `plan` contains any Join node whose kind is not supported
 /// for incremental delta rewrite (i.e., anything other than Inner/Cross).
 fn plan_contains_unsupported_join(plan: &LogicalPlanNode) -> bool {
+    if is_aggregate_change_stream_union(plan) {
+        return false;
+    }
     match &plan.kind {
         PlanNodeKind::Join(join) => {
+            if is_aggregate_change_stream_merge_join(plan) {
+                return false;
+            }
             if !join_delta_kind_supported(join.join_type) {
                 return true;
             }
             plan.children.iter().any(plan_contains_unsupported_join)
         }
         _ => plan.children.iter().any(plan_contains_unsupported_join),
+    }
+}
+
+fn is_aggregate_change_stream_merge_join(plan: &LogicalPlanNode) -> bool {
+    matches!(&plan.kind, PlanNodeKind::Join(_))
+        && contains_target_state_scan(plan)
+        && contains_signed_state_aggregate(plan)
+}
+
+fn is_aggregate_change_stream_union(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        PlanNodeKind::Union(_) => {
+            has_change_stream_union_output(plan)
+                && contains_target_state_scan(plan)
+                && contains_signed_state_aggregate(plan)
+        }
+        PlanNodeKind::CTEAnchor(_) if plan.children.len() == 2 => {
+            has_change_stream_union_output(plan.child(1))
+                && contains_target_state_scan(plan.child(0))
+                && contains_signed_state_aggregate(plan.child(0))
+        }
+        _ => false,
+    }
+}
+
+fn has_change_stream_union_output(plan: &LogicalPlanNode) -> bool {
+    matches!(
+        &plan.kind,
+        PlanNodeKind::Union(union)
+            if union
+                .output_columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+    )
+}
+
+fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        PlanNodeKind::Scan(scan) => {
+            matches!(scan.table.source, ScanSource::IcebergMvTargetState(_))
+        }
+        _ => plan.children.iter().any(contains_target_state_scan),
+    }
+}
+
+fn contains_signed_state_aggregate(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        PlanNodeKind::Aggregate(node) => {
+            !node.aggregates.is_empty()
+                && node
+                    .aggregates
+                    .iter()
+                    .any(|call| call.name.ends_with("_state_signed"))
+        }
+        _ => plan.children.iter().any(contains_signed_state_aggregate),
     }
 }
 

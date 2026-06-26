@@ -41,7 +41,9 @@ impl InjectApplyKeyProjectRule {
 
 /// Find the propagated `_row_id` column id from the plan's effective output,
 /// walking Project items first then descendant scans.
-fn root_row_id_ref(plan: &LogicalPlanNode) -> Option<(ColumnId, String)> {
+fn root_row_id_ref(
+    plan: &LogicalPlanNode,
+) -> Option<(ColumnId, String, arrow::datatypes::DataType, bool)> {
     if let PlanNodeKind::Project(p) = &plan.kind {
         if let Some(item) = p
             .items
@@ -52,7 +54,12 @@ fn root_row_id_ref(plan: &LogicalPlanNode) -> Option<(ColumnId, String)> {
                 column_id, column, ..
             } = &item.expr.kind
             {
-                return Some((*column_id, column.clone()));
+                return Some((
+                    *column_id,
+                    column.clone(),
+                    item.expr.data_type.clone(),
+                    item.expr.nullable,
+                ));
             }
         }
     }
@@ -63,14 +70,19 @@ fn root_row_id_ref(plan: &LogicalPlanNode) -> Option<(ColumnId, String)> {
                 .iter()
                 .find(|column| ImvRowIdColumn::matches(column))
             {
-                return Some((column.column_id, column.name.clone()));
+                return Some((
+                    column.column_id,
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                ));
             }
         }
     }
     descendant_internal_columns(plan)
         .into_iter()
         .find(|c| ImvRowIdColumn::matches(c))
-        .map(|c| (c.column_id, c.name))
+        .map(|c| (c.column_id, c.name, c.data_type, c.nullable))
 }
 
 fn is_branch_delta_union(plan: &LogicalPlanNode) -> bool {
@@ -128,7 +140,9 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         self.fired.store(true, Ordering::SeqCst);
         bridge_apply_result(expr, ctx, |plan, ctx| {
-            let Some((row_id_col, row_id_name)) = root_row_id_ref(&plan) else {
+            let Some((row_id_col, row_id_name, row_id_type, row_id_nullable)) =
+                root_row_id_ref(&plan)
+            else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
             let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
@@ -142,8 +156,8 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
                         qualifier: None,
                         column: row_id_name,
                     },
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
+                    data_type: row_id_type,
+                    nullable: row_id_nullable,
                 },
                 output_name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
                 output_column_id: apply_key_col,
@@ -206,10 +220,6 @@ fn project_item_for_output_column(column: &OutputColumn) -> ProjectItem {
         output_name: column.name.clone(),
         output_column_id: column.column_id,
     }
-}
-
-fn plan_kind(plan: &LogicalPlanNode) -> &'static str {
-    plan_kind_from_kind(&plan.kind)
 }
 
 fn plan_kind_from_kind(kind: &PlanNodeKind) -> &'static str {

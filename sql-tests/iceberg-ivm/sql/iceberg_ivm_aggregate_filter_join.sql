@@ -85,7 +85,7 @@ INSERT INTO ice_ivm_fjoin_${uuid0}.ns_${uuid0}.fact VALUES
 
 -- query 6
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=FILTER
 -- @explain_contains=UNION
 -- @explain_contains=sum_state_signed
@@ -111,7 +111,7 @@ DELETE FROM ice_ivm_fjoin_${uuid0}.ns_${uuid0}.fact WHERE id = 1;
 
 -- query 10
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=FILTER
 -- @explain_contains=UNION
 -- @explain_contains=sum_state_signed

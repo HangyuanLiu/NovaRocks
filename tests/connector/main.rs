@@ -26,7 +26,7 @@ use novarocks::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use novarocks::exec::node::scan::ScanOp;
 use novarocks::formats::parquet::ParquetReadCachePolicy;
 use novarocks::novarocks_connector_jdbc::{JdbcScanConfig, JdbcScanOp};
-use novarocks::types;
+use novarocks::thrift::types;
 use std::sync::Arc;
 
 #[path = "../common/mod.rs"]

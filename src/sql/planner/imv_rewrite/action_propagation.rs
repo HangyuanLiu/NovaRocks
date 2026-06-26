@@ -84,6 +84,12 @@ pub(crate) fn find_action_column(plan: &LogicalPlanNode) -> Option<OutputColumn>
 
 /// Whether any descendant of the plan exposes an action column.
 pub(crate) fn subtree_has_action_column(plan: &LogicalPlanNode) -> bool {
+    if is_aggregate_change_stream_union(plan) {
+        return false;
+    }
+    if matches!(&plan.kind, PlanNodeKind::Aggregate(node) if is_signed_state_aggregate(node)) {
+        return false;
+    }
     output_has_action_column(plan) || plan.children.iter().any(subtree_has_action_column)
 }
 
@@ -153,6 +159,67 @@ fn is_hidden_retraction_count_call(call: &crate::sql::planner::plan::AggregateCa
             &call.args[0].kind,
             ExprKind::ColumnRef { column, .. } if column.eq_ignore_ascii_case(ImvActionColumn::NAME)
         )
+}
+
+fn is_aggregate_change_stream_union(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        PlanNodeKind::Union(_) => {
+            (has_change_stream_union_output(plan)
+                && contains_target_state_scan(plan)
+                && contains_signed_state_aggregate(plan))
+                || is_aggregate_change_stream_cte_consumer_union(plan)
+        }
+        PlanNodeKind::CTEAnchor(_) if plan.children.len() == 2 => {
+            has_change_stream_union_output(plan.child(1))
+                && contains_target_state_scan(plan.child(0))
+                && contains_signed_state_aggregate(plan.child(0))
+        }
+        _ => false,
+    }
+}
+
+fn is_aggregate_change_stream_cte_consumer_union(plan: &LogicalPlanNode) -> bool {
+    matches!(&plan.kind, PlanNodeKind::Union(_))
+        && has_change_stream_union_output(plan)
+        && !plan.children.is_empty()
+        && plan.children.iter().all(change_stream_branch_consumes_cte)
+}
+
+fn change_stream_branch_consumes_cte(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        PlanNodeKind::Project(_) | PlanNodeKind::Filter(_) => {
+            change_stream_branch_consumes_cte(plan.unary_input())
+        }
+        PlanNodeKind::CTEConsume(_) => true,
+        _ => false,
+    }
+}
+
+fn has_change_stream_union_output(plan: &LogicalPlanNode) -> bool {
+    matches!(
+        &plan.kind,
+        PlanNodeKind::Union(union)
+            if union
+                .output_columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+    )
+}
+
+fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        PlanNodeKind::Scan(scan) => {
+            matches!(scan.table.source, ScanSource::IcebergMvTargetState(_))
+        }
+        _ => plan.children.iter().any(contains_target_state_scan),
+    }
+}
+
+fn contains_signed_state_aggregate(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        PlanNodeKind::Aggregate(node) => is_signed_state_aggregate(node),
+        _ => plan.children.iter().any(contains_signed_state_aggregate),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +322,9 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                     && !is_supported_join_delta_branch(&plan)
             }
             PlanNodeKind::Union(_) => {
-                if branch_delta_union_needs_row_id_output(&plan) {
+                if is_aggregate_change_stream_union(&plan) {
+                    false
+                } else if branch_delta_union_needs_row_id_output(&plan) {
                     true
                 } else {
                     plan.children.iter().any(subtree_has_action_column)

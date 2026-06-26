@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use arrow::datatypes::DataType;
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
-use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn};
+use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -118,6 +118,7 @@ fn validate(plan: &LogicalPlanNode) -> Result<(), String> {
     }
     // V6: if a delta subtree exists, root output must carry the apply key.
     if !matches!(&plan.kind, PlanNodeKind::AggregateStateMerge(_))
+        && !is_aggregate_change_stream_plan(plan)
         && !(matches!(&plan.kind, PlanNodeKind::Union(_)) && is_supported_branch_union(plan))
         && subtree_has_delta(plan)
         && !output_has_apply_key(plan)
@@ -135,6 +136,9 @@ fn validate(plan: &LogicalPlanNode) -> Result<(), String> {
 // UnresolvedMarkerCheckRule precedes ActionColumnValidation in the
 // imv-validation stage and rejects any surviving marker.
 fn validate_node(plan: &LogicalPlanNode) -> Result<(), String> {
+    if is_aggregate_change_stream_plan(plan) {
+        return Ok(());
+    }
     match &plan.kind {
         PlanNodeKind::Scan(scan) => validate_scan(scan),
         PlanNodeKind::Filter(_) => validate_node(plan.unary_input()),
@@ -212,6 +216,103 @@ fn validate_node(plan: &LogicalPlanNode) -> Result<(), String> {
             ))
         }
         _ => Ok(()),
+    }
+}
+
+fn is_aggregate_change_stream_plan(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        PlanNodeKind::Union(_) => {
+            has_change_stream_union_output(plan)
+                && contains_target_state_scan(plan)
+                && contains_signed_state_aggregate(plan)
+        }
+        PlanNodeKind::CTEAnchor(_) if plan.children.len() == 2 => {
+            has_change_stream_union_output(plan.child(1))
+                && contains_target_state_scan(plan.child(0))
+                && contains_signed_state_aggregate(plan.child(0))
+        }
+        PlanNodeKind::Project(_) => {
+            has_change_stream_project_output(plan) && is_branch_marker_change_stream(plan)
+        }
+        _ => false,
+    }
+}
+
+fn has_change_stream_union_output(plan: &LogicalPlanNode) -> bool {
+    matches!(
+        &plan.kind,
+        PlanNodeKind::Union(union)
+            if union
+                .output_columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+    )
+}
+
+fn has_change_stream_project_output(plan: &LogicalPlanNode) -> bool {
+    matches!(
+        &plan.kind,
+        PlanNodeKind::Project(project)
+            if project
+                .items
+                .iter()
+                .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+    )
+}
+
+fn is_branch_marker_change_stream(plan: &LogicalPlanNode) -> bool {
+    let PlanNodeKind::Project(_) = &plan.kind else {
+        return false;
+    };
+    let filter = plan.unary_input();
+    let PlanNodeKind::Filter(_) = &filter.kind else {
+        return false;
+    };
+    let expanded = filter.unary_input();
+    let PlanNodeKind::Join(join) = &expanded.kind else {
+        return false;
+    };
+    if join.join_type != JoinKind::Cross || expanded.children.len() != 2 {
+        return false;
+    }
+
+    let left = expanded.left();
+    let right = expanded.right();
+    let (core, marker) = if is_change_branch_values(left) {
+        (right, left)
+    } else if is_change_branch_values(right) {
+        (left, right)
+    } else {
+        return false;
+    };
+    let _ = marker;
+    contains_target_state_scan(core) && contains_signed_state_aggregate(core)
+}
+
+fn is_change_branch_values(plan: &LogicalPlanNode) -> bool {
+    matches!(
+        &plan.kind,
+        PlanNodeKind::Values(values)
+            if values
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case("__imv_change_branch"))
+    )
+}
+
+fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        PlanNodeKind::Scan(scan) => {
+            matches!(scan.table.source, ScanSource::IcebergMvTargetState(_))
+        }
+        _ => plan.children.iter().any(contains_target_state_scan),
+    }
+}
+
+fn contains_signed_state_aggregate(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        PlanNodeKind::Aggregate(node) => is_signed_state_aggregate(node),
+        _ => plan.children.iter().any(contains_signed_state_aggregate),
     }
 }
 

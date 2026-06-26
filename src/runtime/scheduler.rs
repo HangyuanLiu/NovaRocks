@@ -726,7 +726,6 @@ mod tests {
             output_sink: minimal_noop_sink(),
             output_exprs: None,
             output_columns: vec![],
-            direct_exec: None,
             boundary_schemas: vec![],
             cte_id: None,
             cte_exchange_nodes: vec![],

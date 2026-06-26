@@ -70,7 +70,7 @@ INSERT INTO imv_afj_cut_${uuid0}.ns_${uuid0}.fact VALUES
 
 -- query 4
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=FILTER
 -- @explain_contains=UNION
 -- @explain_contains=sum_state_signed

@@ -509,14 +509,26 @@ fn extract_utf8_apply_key_values_from_record_batch(
     batch: &RecordBatch,
     apply_key_column: &str,
 ) -> Result<Vec<String>, String> {
+    extract_utf8_values_from_record_batch(batch, apply_key_column)
+}
+
+fn extract_utf8_values_from_record_batch(
+    batch: &RecordBatch,
+    apply_key_column: &str,
+) -> Result<Vec<String>, String> {
     let idx = batch.schema().index_of(apply_key_column).map_err(|_| {
         format!("merge sink: DELETE batch missing apply-key column {apply_key_column}")
     })?;
-    let arr = batch
-        .column(idx)
+    let casted = arrow::compute::cast(batch.column(idx), &arrow::datatypes::DataType::Utf8)
+        .map_err(|e| {
+            format!("merge sink: cast apply-key column {apply_key_column} to Utf8 failed: {e}")
+        })?;
+    let arr = casted
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
-        .ok_or_else(|| format!("merge sink: apply-key column {apply_key_column} must be Utf8"))?;
+        .ok_or_else(|| {
+            format!("merge sink: apply-key column {apply_key_column} must be Utf8 after cast")
+        })?;
     arr.iter()
         .map(|v| {
             v.map(str::to_string).ok_or_else(|| {
@@ -576,36 +588,21 @@ fn extract_branch_utf8_apply_key_values_from_record_batch(
     let branch_idx = schema.index_of(branch_column).map_err(|_| {
         format!("merge sink: DELETE batch missing branch-id column {branch_column}")
     })?;
-    let key_idx = schema.index_of(apply_key_column).map_err(|_| {
-        format!("merge sink: DELETE batch missing apply-key column {apply_key_column}")
-    })?;
     let branches = batch
         .column(branch_idx)
         .as_any()
         .downcast_ref::<arrow::array::Int32Array>()
         .ok_or_else(|| format!("merge sink: branch-id column {branch_column} must be Int32"))?;
-    let keys = batch
-        .column(key_idx)
-        .as_any()
-        .downcast_ref::<arrow::array::StringArray>()
-        .ok_or_else(|| format!("merge sink: apply-key column {apply_key_column} must be Utf8"))?;
+    let keys = extract_utf8_values_from_record_batch(batch, apply_key_column)?;
 
     branches
         .iter()
-        .zip(keys.iter())
+        .zip(keys)
         .map(|(branch_id, key)| {
             let branch_id = branch_id.ok_or_else(|| {
                 format!("merge sink: null value in branch-id column {branch_column}")
             })?;
-            let key = key.ok_or_else(|| {
-                format!("merge sink: null value in apply-key column {apply_key_column}")
-            })?;
-            Ok(
-                crate::engine::mv::iceberg_target_apply::BranchStringApplyKey {
-                    branch_id,
-                    key: key.to_string(),
-                },
-            )
+            Ok(crate::engine::mv::iceberg_target_apply::BranchStringApplyKey { branch_id, key })
         })
         .collect()
 }
@@ -613,7 +610,7 @@ fn extract_branch_utf8_apply_key_values_from_record_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Int8Array, Int32Array, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, BinaryArray, Int8Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -823,6 +820,28 @@ mod tests {
     }
 
     #[test]
+    fn extract_utf8_apply_key_values_accepts_binary_backed_strings() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "__row_id__",
+            DataType::Binary,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(BinaryArray::from_iter_values([
+                b"g1".as_slice(),
+                b"g2".as_slice(),
+            ])) as ArrayRef],
+        )
+        .unwrap();
+
+        let values = extract_utf8_apply_key_values_from_record_batch(&batch, "__row_id__")
+            .expect("binary-backed utf8 keys");
+
+        assert_eq!(values, vec!["g1".to_string(), "g2".to_string()]);
+    }
+
+    #[test]
     fn int64_apply_key_column_rejects_non_base_row_id_column() {
         let err = validate_i64_apply_key_column("__some_other_i64").unwrap_err();
 
@@ -963,6 +982,46 @@ mod tests {
 
         let values = extract_branch_utf8_apply_key_values_from_record_batch(&batch, "__row_id__")
             .expect("branch string apply keys");
+
+        assert_eq!(
+            values,
+            vec![
+                crate::engine::mv::iceberg_target_apply::BranchStringApplyKey {
+                    branch_id: 0,
+                    key: "group-1".to_string(),
+                },
+                crate::engine::mv::iceberg_target_apply::BranchStringApplyKey {
+                    branch_id: 1,
+                    key: "group-1".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_branch_utf8_apply_key_values_accepts_binary_backed_keys() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN,
+                DataType::Int32,
+                false,
+            ),
+            Field::new("__row_id__", DataType::Binary, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef,
+                Arc::new(BinaryArray::from_iter_values([
+                    b"group-1".as_slice(),
+                    b"group-1".as_slice(),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let values = extract_branch_utf8_apply_key_values_from_record_batch(&batch, "__row_id__")
+            .expect("branch binary-backed string apply keys");
 
         assert_eq!(
             values,

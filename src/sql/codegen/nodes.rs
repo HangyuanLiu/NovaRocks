@@ -663,26 +663,6 @@ pub(crate) fn build_aggregation_node(
     node
 }
 
-pub(crate) fn build_aggregate_state_merge_exec_node(
-    old_input: crate::exec::node::ExecNode,
-    delta_input: crate::exec::node::ExecNode,
-    layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
-    branch_id: Option<i32>,
-    pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits,
-) -> crate::exec::node::ExecNode {
-    crate::exec::node::ExecNode {
-        kind: crate::exec::node::ExecNodeKind::AggregateStateMerge(
-            crate::exec::operators::aggregate_state_merge::AggregateStateMergePlan {
-                old_input: Box::new(old_input),
-                delta_input: Box::new(delta_input),
-                layout,
-                branch_id,
-                pruning_limits,
-            },
-        ),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Sort node
 // ---------------------------------------------------------------------------

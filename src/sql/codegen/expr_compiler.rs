@@ -2939,20 +2939,29 @@ fn is_state_combinator_aggregate_function(name: &str) -> bool {
         "count_state"
             | "count_state_signed"
             | "sum_state"
+            | "sum_state_merge"
             | "sum_state_signed"
             | "avg_state"
+            | "avg_state_merge"
             | "avg_state_signed"
+            | "count_state_merge"
             | "min_state"
+            | "min_state_merge"
             | "min_state_signed"
             | "max_state"
+            | "max_state_merge"
             | "max_state_signed"
             | "bool_or_state"
+            | "bool_or_state_merge"
             | "bool_or_state_signed"
             | "bool_and_state"
+            | "bool_and_state_merge"
             | "bool_and_state_signed"
             | "count_distinct_state"
+            | "count_distinct_state_merge"
             | "count_distinct_state_signed"
             | "approx_count_distinct_state"
+            | "approx_count_distinct_state_merge"
             | "approx_count_distinct_state_signed"
     )
 }
@@ -3092,6 +3101,7 @@ mod tests {
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::plan::AggregateCall;
 
     #[test]
     fn infer_agg_decimal_uses_canonical_widening() {
@@ -3359,6 +3369,64 @@ mod tests {
             err.contains("ColumnRef 'a' has no ColumnId"),
             "unexpected err={err}"
         );
+    }
+
+    #[test]
+    fn sum_state_merge_binary_codegen_signature_builds_execution_kernel() {
+        let state_arg = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(7),
+                qualifier: None,
+                column: "sum_state_col".to_string(),
+            },
+            data_type: DataType::Binary,
+            nullable: false,
+        };
+        let agg_call = AggregateCall {
+            name: "sum_state_merge".to_string(),
+            args: vec![state_arg],
+            distinct: false,
+            result_type: DataType::Binary,
+            order_by: vec![],
+            output_column_id: ColumnId::UNSET,
+        };
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            ColumnId(7),
+            None,
+            "sum_state_col".to_string(),
+            test_binding(12, DataType::Binary),
+        );
+        let slot_alloc = Rc::new(RefCell::new(100));
+        let mut compiler = ExprCompiler::new(slot_alloc, &scope);
+
+        let compiled = compiler
+            .compile_aggregate_call_typed(&agg_call)
+            .expect("sum_state_merge aggregate should compile");
+        let root = compiled.nodes.first().expect("aggregate root");
+        let fn_ = root.fn_.as_ref().expect("aggregate function");
+        let intermediate_type = fn_.aggregate_fn.as_ref().and_then(|agg_fn| {
+            crate::lower::type_lowering::arrow_type_from_desc(&agg_fn.intermediate_type)
+        });
+        let input_arg_type = fn_
+            .arg_types
+            .first()
+            .and_then(crate::lower::type_lowering::arrow_type_from_desc);
+        let output_type = crate::lower::type_lowering::arrow_type_from_desc(&fn_.ret_type);
+        let function = crate::exec::node::aggregate::AggFunction {
+            name: fn_.name.function_name.clone(),
+            inputs: vec![],
+            input_is_intermediate: false,
+            types: Some(crate::exec::node::aggregate::AggTypeSignature {
+                intermediate_type,
+                output_type,
+                input_arg_type,
+            }),
+            order: Default::default(),
+        };
+
+        crate::exec::expr::agg::build_kernel_set(&[function], &[Some(DataType::Binary)])
+            .expect("lowered sum_state_merge(Binary) signature should build kernel");
     }
 
     /// Cross-validation: for every (function, arg_types) probe in this
@@ -3986,21 +4054,30 @@ mod tests {
         for name in [
             "count_state",
             "count_state_signed",
+            "count_state_merge",
             "sum_state",
+            "sum_state_merge",
             "sum_state_signed",
             "avg_state",
+            "avg_state_merge",
             "avg_state_signed",
             "min_state",
+            "min_state_merge",
             "min_state_signed",
             "max_state",
+            "max_state_merge",
             "max_state_signed",
             "bool_or_state",
+            "bool_or_state_merge",
             "bool_or_state_signed",
             "bool_and_state",
+            "bool_and_state_merge",
             "bool_and_state_signed",
             "count_distinct_state",
+            "count_distinct_state_merge",
             "count_distinct_state_signed",
             "approx_count_distinct_state",
+            "approx_count_distinct_state_merge",
             "approx_count_distinct_state_signed",
         ] {
             let (output, intermediate) =

@@ -12,11 +12,13 @@ use crate::connector::starrocks::table::state_codec::{
     decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
 };
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
+use crate::exec::expr::function::mv_state::sum_state_union;
 use crate::exec::node::aggregate::AggFunction;
 
 use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
 
 pub(in crate::exec::expr::agg::functions) struct SumStateAgg;
+pub(in crate::exec::expr::agg::functions) struct SumStateMergeAgg;
 pub(in crate::exec::expr::agg::functions) struct SumStateSignedAgg;
 
 #[derive(Default)]
@@ -31,8 +33,10 @@ pub(in crate::exec::expr::agg::functions) struct SumDecimal128State {
     sum: i128,
 }
 
-#[cfg(test)]
-type SumState = SumDecimal128State;
+#[derive(Default)]
+pub(in crate::exec::expr::agg::functions) struct SumStateMergeState {
+    state: Vec<u8>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SumStateKind {
@@ -174,6 +178,92 @@ impl AggregateFunction for SumStateSignedAgg {
     }
 }
 
+impl AggregateFunction for SumStateMergeAgg {
+    fn build_spec_from_type(
+        &self,
+        func: &AggFunction,
+        input_type: Option<&DataType>,
+        _input_is_intermediate: bool,
+    ) -> Result<AggSpec, String> {
+        build_sum_state_merge_spec(func, input_type)
+    }
+
+    fn state_layout_for(&self, kind: &AggKind) -> (usize, usize) {
+        match kind {
+            AggKind::SumStateMerge => (
+                std::mem::size_of::<SumStateMergeState>(),
+                std::mem::align_of::<SumStateMergeState>(),
+            ),
+            other => unreachable!("unexpected kind for sum_state_merge: {:?}", other),
+        }
+    }
+
+    fn build_input_view<'a>(
+        &self,
+        _spec: &AggSpec,
+        array: &'a Option<ArrayRef>,
+    ) -> Result<AggInputView<'a>, String> {
+        build_sum_state_merge_view("sum_state_merge", array)
+    }
+
+    fn build_merge_view<'a>(
+        &self,
+        _spec: &AggSpec,
+        array: &'a Option<ArrayRef>,
+    ) -> Result<AggInputView<'a>, String> {
+        build_sum_state_merge_view("sum_state_merge", array)
+    }
+
+    fn init_state(&self, spec: &AggSpec, ptr: *mut u8) {
+        if matches!(spec.kind, AggKind::SumStateMerge) {
+            unsafe {
+                std::ptr::write(
+                    ptr as *mut SumStateMergeState,
+                    SumStateMergeState::default(),
+                );
+            }
+        }
+    }
+
+    fn drop_state(&self, spec: &AggSpec, ptr: *mut u8) {
+        if matches!(spec.kind, AggKind::SumStateMerge) {
+            unsafe {
+                std::ptr::drop_in_place(ptr as *mut SumStateMergeState);
+            }
+        }
+    }
+
+    fn update_batch(
+        &self,
+        spec: &AggSpec,
+        offset: usize,
+        state_ptrs: &[AggStatePtr],
+        input: &AggInputView,
+    ) -> Result<(), String> {
+        merge_sum_state_opaque("sum_state_merge", spec, offset, state_ptrs, input)
+    }
+
+    fn merge_batch(
+        &self,
+        spec: &AggSpec,
+        offset: usize,
+        state_ptrs: &[AggStatePtr],
+        input: &AggInputView,
+    ) -> Result<(), String> {
+        merge_sum_state_opaque("sum_state_merge", spec, offset, state_ptrs, input)
+    }
+
+    fn build_array(
+        &self,
+        spec: &AggSpec,
+        offset: usize,
+        group_states: &[AggStatePtr],
+        _output_intermediate: bool,
+    ) -> Result<ArrayRef, String> {
+        build_sum_state_merge_array(spec, offset, group_states)
+    }
+}
+
 fn build_sum_state_spec(
     func: &AggFunction,
     input_type: Option<&DataType>,
@@ -204,6 +294,27 @@ fn build_sum_state_spec(
 
     Ok(AggSpec {
         kind,
+        output_type: DataType::Binary,
+        intermediate_type: DataType::Binary,
+        input_arg_type: func.types.as_ref().and_then(|t| t.input_arg_type.clone()),
+        count_all: false,
+    })
+}
+
+fn build_sum_state_merge_spec(
+    func: &AggFunction,
+    input_type: Option<&DataType>,
+) -> Result<AggSpec, String> {
+    let input_type = input_type.ok_or_else(|| "sum_state_merge input type missing".to_string())?;
+    if input_type != &DataType::Binary {
+        return Err(format!(
+            "sum_state_merge input must be Binary, got {:?}",
+            input_type
+        ));
+    }
+
+    Ok(AggSpec {
+        kind: AggKind::SumStateMerge,
         output_type: DataType::Binary,
         intermediate_type: DataType::Binary,
         input_arg_type: func.types.as_ref().and_then(|t| t.input_arg_type.clone()),
@@ -366,6 +477,10 @@ fn int_state_slot(base: AggStatePtr, offset: usize) -> *mut SumInt64State {
 
 fn decimal_state_slot(base: AggStatePtr, offset: usize) -> *mut SumDecimal128State {
     unsafe { (base as *mut u8).add(offset) as *mut SumDecimal128State }
+}
+
+fn state_merge_slot(base: AggStatePtr, offset: usize) -> *mut SumStateMergeState {
+    unsafe { (base as *mut u8).add(offset) as *mut SumStateMergeState }
 }
 
 fn add_int_delta(
@@ -674,9 +789,49 @@ fn build_sum_state_array(
     Ok(Arc::new(builder.finish()))
 }
 
+fn merge_sum_state_opaque(
+    name: &str,
+    spec: &AggSpec,
+    offset: usize,
+    state_ptrs: &[AggStatePtr],
+    input: &AggInputView,
+) -> Result<(), String> {
+    if !matches!(spec.kind, AggKind::SumStateMerge) {
+        return Err(format!("{name} merge kind mismatch"));
+    }
+    let AggInputView::Binary(array) = input else {
+        return Err(format!("{name} merge input type mismatch"));
+    };
+    for (row, &base) in state_ptrs.iter().enumerate() {
+        if array.is_null(row) {
+            continue;
+        }
+        let state = unsafe { &mut *state_merge_slot(base, offset) };
+        state.state = sum_state_union(&state.state, array.value(row))?;
+    }
+    Ok(())
+}
+
+fn build_sum_state_merge_array(
+    spec: &AggSpec,
+    offset: usize,
+    group_states: &[AggStatePtr],
+) -> Result<ArrayRef, String> {
+    if !matches!(spec.kind, AggKind::SumStateMerge) {
+        return Err("sum_state_merge build array kind mismatch".to_string());
+    }
+    let mut builder = BinaryBuilder::new();
+    for &base in group_states {
+        let state = unsafe { &*state_merge_slot(base, offset) };
+        builder.append_value(&state.state);
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::mem::MaybeUninit;
+    use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+    use std::ptr::NonNull;
     use std::sync::Arc;
 
     use arrow::array::{
@@ -690,6 +845,7 @@ mod tests {
         decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
     };
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
+    use crate::exec::expr::function::mv_state::sum_state_union;
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
     use super::super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
@@ -760,19 +916,28 @@ mod tests {
 
     struct StateCell {
         spec: AggSpec,
-        cell: Box<MaybeUninit<SumState>>,
+        ptr: NonNull<u8>,
+        layout: Layout,
     }
 
     impl StateCell {
         fn new(spec: AggSpec) -> Self {
-            let mut cell = Box::new(MaybeUninit::<SumState>::uninit());
             let agg = super::super::super::resolve_by_kind(&spec.kind);
-            agg.init_state(&spec, cell.as_mut_ptr() as *mut u8);
-            Self { spec, cell }
+            let (size, align) = agg.state_layout_for(&spec.kind);
+            let layout = Layout::from_size_align(size.max(1), align).unwrap();
+            let ptr = unsafe {
+                let raw = alloc(layout);
+                if raw.is_null() {
+                    handle_alloc_error(layout);
+                }
+                NonNull::new_unchecked(raw)
+            };
+            agg.init_state(&spec, ptr.as_ptr());
+            Self { spec, ptr, layout }
         }
 
         fn ptr(&mut self) -> AggStatePtr {
-            self.cell.as_mut_ptr() as AggStatePtr
+            self.ptr.as_ptr() as AggStatePtr
         }
 
         fn update(&mut self, input: AggInputView<'_>, rows: usize) {
@@ -813,7 +978,10 @@ mod tests {
 
     impl Drop for StateCell {
         fn drop(&mut self) {
-            super::super::super::drop_state(&self.spec, self.cell.as_mut_ptr() as *mut u8);
+            super::super::super::drop_state(&self.spec, self.ptr.as_ptr());
+            unsafe {
+                dealloc(self.ptr.as_ptr(), self.layout);
+            }
         }
     }
 
@@ -1043,6 +1211,63 @@ mod tests {
         cell.merge(input);
 
         assert_eq!(final_int_state(&cell.finalize()), (1, 25));
+    }
+
+    #[test]
+    fn state_merge_sum_matches_sequential_union() {
+        let states = [
+            encode_sum_int64(2, 30),
+            encode_sum_int64(-1, -10),
+            Vec::new(),
+            encode_sum_int64(3, 7),
+        ];
+        let expected = states
+            .iter()
+            .try_fold(Vec::new(), |acc, state| sum_state_union(&acc, state))
+            .unwrap();
+        let spec = super::super::super::build_spec_from_type(
+            &sum_func_with_arg("sum_state_merge", DataType::Int64),
+            Some(&DataType::Binary),
+            false,
+        )
+        .unwrap();
+        let mut cell = StateCell::new(spec);
+        let input = Arc::new(BinaryArray::from_iter_values(
+            states.iter().map(Vec::as_slice),
+        )) as ArrayRef;
+        let input_slot = Some(input);
+        let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
+
+        cell.update(view, states.len());
+
+        assert_eq!(final_bytes(&cell.finalize()), expected.as_slice());
+    }
+
+    #[test]
+    fn state_merge_sum_merge_batch_matches_sequential_union() {
+        let states = [
+            encode_sum_int64(2, 30),
+            encode_sum_int64(-1, -10),
+            encode_sum_int64(4, 6),
+        ];
+        let expected = states
+            .iter()
+            .try_fold(Vec::new(), |acc, state| sum_state_union(&acc, state))
+            .unwrap();
+        let spec = super::super::super::build_spec_from_type(
+            &sum_func_with_arg("sum_state_merge", DataType::Binary),
+            Some(&DataType::Binary),
+            false,
+        )
+        .unwrap();
+        let mut cell = StateCell::new(spec);
+        let input = Arc::new(BinaryArray::from_iter_values(
+            states.iter().map(Vec::as_slice),
+        )) as ArrayRef;
+
+        cell.merge(input);
+
+        assert_eq!(final_bytes(&cell.finalize()), expected.as_slice());
     }
 
     #[test]

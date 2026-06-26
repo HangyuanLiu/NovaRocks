@@ -193,11 +193,20 @@ fn is_mv_state_scalar_function(name: &str) -> bool {
             | "bool_or_state_visible"
             | "bool_and_state_union"
             | "bool_and_state_visible"
+            | "state_all_zero"
+            | "mv_group_row_id"
     )
 }
 
 fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Result<(), String> {
     let binary_arg = |ty: &DataType| matches!(ty, DataType::Binary | DataType::LargeBinary);
+    let zero_check_arg = |ty: &DataType| binary_arg(ty) || matches!(ty, DataType::Int64);
+    if name == "mv_group_row_id" {
+        if arg_types.is_empty() {
+            return Err(no_matching_signature(name, arg_types));
+        }
+        return Ok(());
+    }
     let expected = match name {
         "count_state_union"
         | "count_distinct_state_union"
@@ -216,10 +225,16 @@ fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Resu
         | "min_state_visible"
         | "max_state_visible"
         | "bool_or_state_visible"
-        | "bool_and_state_visible" => 1,
+        | "bool_and_state_visible"
+        | "state_all_zero" => 1,
         _ => return Ok(()),
     };
-    if arg_types.len() != expected || arg_types.iter().any(|ty| !binary_arg(ty)) {
+    let valid_args = if name == "state_all_zero" {
+        arg_types.iter().all(zero_check_arg)
+    } else {
+        arg_types.iter().all(binary_arg)
+    };
+    if arg_types.len() != expected || !valid_args {
         return Err(no_matching_signature(name, arg_types));
     }
     Ok(())
@@ -671,20 +686,29 @@ fn is_state_combinator_aggregate_function(name: &str) -> bool {
         "count_state"
             | "count_state_signed"
             | "sum_state"
+            | "sum_state_merge"
             | "sum_state_signed"
             | "avg_state"
+            | "avg_state_merge"
             | "avg_state_signed"
+            | "count_state_merge"
             | "min_state"
+            | "min_state_merge"
             | "min_state_signed"
             | "max_state"
+            | "max_state_merge"
             | "max_state_signed"
             | "bool_or_state"
+            | "bool_or_state_merge"
             | "bool_or_state_signed"
             | "bool_and_state"
+            | "bool_and_state_merge"
             | "bool_and_state_signed"
             | "count_distinct_state"
+            | "count_distinct_state_merge"
             | "count_distinct_state_signed"
             | "approx_count_distinct_state"
+            | "approx_count_distinct_state_merge"
             | "approx_count_distinct_state_signed"
     )
 }
@@ -974,6 +998,8 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "min_state_visible"
         | "max_state_visible" => DataType::Int64,
         "bool_or_state_visible" | "bool_and_state_visible" => DataType::Boolean,
+        "mv_group_row_id" => DataType::Utf8,
+        "state_all_zero" => DataType::Boolean,
         "bitmap_to_array" => DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
             DataType::Int64,
@@ -1598,6 +1624,32 @@ mod tests {
     }
 
     #[test]
+    fn state_all_zero_scalar_function_accepts_binary_or_int64_count_input() {
+        assert_eq!(
+            crate::sql::functions::resolve_scalar_function("state_all_zero", &[DataType::Binary]),
+            Ok(DataType::Boolean)
+        );
+        assert_eq!(
+            crate::sql::functions::resolve_scalar_function("state_all_zero", &[DataType::Int64]),
+            Ok(DataType::Boolean)
+        );
+        assert_eq!(
+            infer_scalar_return_type("state_all_zero", &[DataType::LargeBinary]),
+            DataType::Boolean
+        );
+        validate_scalar_function_call("state_all_zero", &[DataType::Binary]).unwrap();
+        validate_scalar_function_call("state_all_zero", &[DataType::LargeBinary]).unwrap();
+        validate_scalar_function_call("state_all_zero", &[DataType::Int64]).unwrap();
+
+        let err = validate_scalar_function_call("state_all_zero", &[DataType::Utf8])
+            .expect_err("state_all_zero should reject non-state/count input");
+        assert_eq!(
+            err,
+            "No matching function with signature: state_all_zero(varchar(255))."
+        );
+    }
+
+    #[test]
     fn bool_state_scalar_functions_require_binary_inputs() {
         for name in ["bool_or_state_union", "bool_and_state_union"] {
             assert_eq!(
@@ -1925,21 +1977,30 @@ mod tests {
         for name in [
             "count_state",
             "count_state_signed",
+            "count_state_merge",
             "sum_state",
+            "sum_state_merge",
             "sum_state_signed",
             "avg_state",
+            "avg_state_merge",
             "avg_state_signed",
             "min_state",
+            "min_state_merge",
             "min_state_signed",
             "max_state",
+            "max_state_merge",
             "max_state_signed",
             "bool_or_state",
+            "bool_or_state_merge",
             "bool_or_state_signed",
             "bool_and_state",
+            "bool_and_state_merge",
             "bool_and_state_signed",
             "count_distinct_state",
+            "count_distinct_state_merge",
             "count_distinct_state_signed",
             "approx_count_distinct_state",
+            "approx_count_distinct_state_merge",
             "approx_count_distinct_state_signed",
         ] {
             assert!(is_aggregate_function(name), "{name}");

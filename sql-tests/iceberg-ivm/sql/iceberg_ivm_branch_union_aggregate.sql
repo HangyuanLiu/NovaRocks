@@ -72,7 +72,7 @@ DELETE FROM ice_ivm_bunion_${uuid0}.ns_${uuid0}.t2 WHERE region = 'k1';
 
 -- query 5
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergMvTargetState
 REFRESH MATERIALIZED VIEW branch_union_mv_${uuid0};
 
@@ -88,7 +88,7 @@ INSERT INTO ice_ivm_bunion_${uuid0}.ns_${uuid0}.t1 VALUES
 
 -- query 8
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergMvTargetState
 REFRESH MATERIALIZED VIEW branch_union_mv_${uuid0};
 

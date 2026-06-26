@@ -119,7 +119,6 @@ pub(crate) fn lower_distributed_plan(
             output_sink,
             output_exprs,
             output_columns,
-            direct_exec: None,
             boundary_schemas,
             cte_id: fragment.cte_id,
             cte_exchange_nodes: fragment.cte_exchange_nodes.clone(),

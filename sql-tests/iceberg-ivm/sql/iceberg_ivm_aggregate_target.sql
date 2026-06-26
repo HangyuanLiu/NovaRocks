@@ -54,7 +54,7 @@ INSERT INTO ice_ivm_agg_${uuid0}.ns_${uuid0}.orders VALUES ('east', 30);
 
 -- query 5
 -- @skip_result_check=true
--- @explain_contains=AggregateStateMerge
+-- @explain_contains=LEFT OUTER JOIN
 -- @explain_contains=IcebergMvTargetState
 -- @explain_contains=__change_op
 REFRESH MATERIALIZED VIEW agg_mv_${uuid0};
