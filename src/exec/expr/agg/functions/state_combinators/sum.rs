@@ -17,6 +17,7 @@ use crate::exec::node::aggregate::AggFunction;
 use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
 
 pub(in crate::exec::expr::agg::functions) struct SumStateAgg;
+pub(in crate::exec::expr::agg::functions) struct SumStateMergeAgg;
 pub(in crate::exec::expr::agg::functions) struct SumStateSignedAgg;
 
 #[derive(Default)]
@@ -174,6 +175,73 @@ impl AggregateFunction for SumStateSignedAgg {
     }
 }
 
+impl AggregateFunction for SumStateMergeAgg {
+    fn build_spec_from_type(
+        &self,
+        func: &AggFunction,
+        input_type: Option<&DataType>,
+        _input_is_intermediate: bool,
+    ) -> Result<AggSpec, String> {
+        build_sum_state_merge_spec(func, input_type)
+    }
+
+    fn state_layout_for(&self, kind: &AggKind) -> (usize, usize) {
+        sum_state_layout_for(kind)
+    }
+
+    fn build_input_view<'a>(
+        &self,
+        _spec: &AggSpec,
+        array: &'a Option<ArrayRef>,
+    ) -> Result<AggInputView<'a>, String> {
+        build_sum_state_merge_view("sum_state_merge", array)
+    }
+
+    fn build_merge_view<'a>(
+        &self,
+        _spec: &AggSpec,
+        array: &'a Option<ArrayRef>,
+    ) -> Result<AggInputView<'a>, String> {
+        build_sum_state_merge_view("sum_state_merge", array)
+    }
+
+    fn init_state(&self, spec: &AggSpec, ptr: *mut u8) {
+        init_sum_state(&spec.kind, ptr);
+    }
+
+    fn drop_state(&self, _spec: &AggSpec, _ptr: *mut u8) {}
+
+    fn update_batch(
+        &self,
+        spec: &AggSpec,
+        offset: usize,
+        state_ptrs: &[AggStatePtr],
+        input: &AggInputView,
+    ) -> Result<(), String> {
+        merge_sum_state("sum_state_merge", spec, offset, state_ptrs, input)
+    }
+
+    fn merge_batch(
+        &self,
+        spec: &AggSpec,
+        offset: usize,
+        state_ptrs: &[AggStatePtr],
+        input: &AggInputView,
+    ) -> Result<(), String> {
+        merge_sum_state("sum_state_merge", spec, offset, state_ptrs, input)
+    }
+
+    fn build_array(
+        &self,
+        spec: &AggSpec,
+        offset: usize,
+        group_states: &[AggStatePtr],
+        _output_intermediate: bool,
+    ) -> Result<ArrayRef, String> {
+        build_sum_state_array(spec, offset, group_states)
+    }
+}
+
 fn build_sum_state_spec(
     func: &AggFunction,
     input_type: Option<&DataType>,
@@ -207,6 +275,36 @@ fn build_sum_state_spec(
         output_type: DataType::Binary,
         intermediate_type: DataType::Binary,
         input_arg_type: func.types.as_ref().and_then(|t| t.input_arg_type.clone()),
+        count_all: false,
+    })
+}
+
+fn build_sum_state_merge_spec(
+    func: &AggFunction,
+    input_type: Option<&DataType>,
+) -> Result<AggSpec, String> {
+    let input_type = input_type.ok_or_else(|| "sum_state_merge input type missing".to_string())?;
+    if input_type != &DataType::Binary {
+        return Err(format!(
+            "sum_state_merge input must be Binary, got {:?}",
+            input_type
+        ));
+    }
+    let arg_type = func
+        .types
+        .as_ref()
+        .and_then(|t| t.input_arg_type.as_ref())
+        .ok_or_else(|| "sum_state_merge requires original logical input type".to_string())?;
+    let kind = match sum_state_kind_from_value_type("sum_state_merge", arg_type)? {
+        SumStateKind::Int64 => AggKind::SumStateMergeInt64,
+        SumStateKind::Decimal128 => AggKind::SumStateMergeDecimal128,
+    };
+
+    Ok(AggSpec {
+        kind,
+        output_type: DataType::Binary,
+        intermediate_type: DataType::Binary,
+        input_arg_type: Some(arg_type.clone()),
         count_all: false,
     })
 }
@@ -278,11 +376,13 @@ fn sum_state_kind_from_value_type(
 
 fn sum_state_layout_for(kind: &AggKind) -> (usize, usize) {
     match kind {
-        AggKind::SumStateInt64 | AggKind::SumStateSignedInt64 => (
+        AggKind::SumStateInt64 | AggKind::SumStateMergeInt64 | AggKind::SumStateSignedInt64 => (
             std::mem::size_of::<SumInt64State>(),
             std::mem::align_of::<SumInt64State>(),
         ),
-        AggKind::SumStateDecimal128 | AggKind::SumStateSignedDecimal128 => (
+        AggKind::SumStateDecimal128
+        | AggKind::SumStateMergeDecimal128
+        | AggKind::SumStateSignedDecimal128 => (
             std::mem::size_of::<SumDecimal128State>(),
             std::mem::align_of::<SumDecimal128State>(),
         ),
@@ -318,8 +418,12 @@ fn ensure_expected_state_kind(
     actual: SumStateKind,
 ) -> Result<(), String> {
     let expected = match kind {
-        AggKind::SumStateInt64 | AggKind::SumStateSignedInt64 => SumStateKind::Int64,
-        AggKind::SumStateDecimal128 | AggKind::SumStateSignedDecimal128 => SumStateKind::Decimal128,
+        AggKind::SumStateInt64 | AggKind::SumStateMergeInt64 | AggKind::SumStateSignedInt64 => {
+            SumStateKind::Int64
+        }
+        AggKind::SumStateDecimal128
+        | AggKind::SumStateMergeDecimal128
+        | AggKind::SumStateSignedDecimal128 => SumStateKind::Decimal128,
         other => return Err(format!("{name} input kind mismatch: {other:?}")),
     };
     if expected != actual {
@@ -347,10 +451,12 @@ fn build_sum_state_merge_view<'a>(
 
 fn init_sum_state(kind: &AggKind, ptr: *mut u8) {
     match kind {
-        AggKind::SumStateInt64 | AggKind::SumStateSignedInt64 => unsafe {
+        AggKind::SumStateInt64 | AggKind::SumStateMergeInt64 | AggKind::SumStateSignedInt64 => unsafe {
             std::ptr::write(ptr as *mut SumInt64State, SumInt64State::default());
         },
-        AggKind::SumStateDecimal128 | AggKind::SumStateSignedDecimal128 => unsafe {
+        AggKind::SumStateDecimal128
+        | AggKind::SumStateMergeDecimal128
+        | AggKind::SumStateSignedDecimal128 => unsafe {
             std::ptr::write(
                 ptr as *mut SumDecimal128State,
                 SumDecimal128State::default(),
@@ -630,11 +736,13 @@ fn merge_sum_state(
             continue;
         }
         match spec.kind {
-            AggKind::SumStateInt64 | AggKind::SumStateSignedInt64 => {
+            AggKind::SumStateInt64 | AggKind::SumStateMergeInt64 | AggKind::SumStateSignedInt64 => {
                 let (row_count, sum) = decode_sum_int64(array.value(row))?;
                 add_int_delta(int_state_slot(base, offset), row_count, sum, name)?;
             }
-            AggKind::SumStateDecimal128 | AggKind::SumStateSignedDecimal128 => {
+            AggKind::SumStateDecimal128
+            | AggKind::SumStateMergeDecimal128
+            | AggKind::SumStateSignedDecimal128 => {
                 let (row_count, sum) = decode_sum_decimal128(array.value(row))?;
                 add_decimal_delta(decimal_state_slot(base, offset), row_count, sum, name)?;
             }
@@ -652,7 +760,7 @@ fn build_sum_state_array(
     let mut builder = BinaryBuilder::new();
     for &base in group_states {
         match spec.kind {
-            AggKind::SumStateInt64 | AggKind::SumStateSignedInt64 => {
+            AggKind::SumStateInt64 | AggKind::SumStateMergeInt64 | AggKind::SumStateSignedInt64 => {
                 let state = unsafe { &*int_state_slot(base, offset) };
                 if state.row_count == 0 && state.sum == 0 {
                     builder.append_value([]);
@@ -660,7 +768,9 @@ fn build_sum_state_array(
                     builder.append_value(encode_sum_int64(state.row_count, state.sum));
                 }
             }
-            AggKind::SumStateDecimal128 | AggKind::SumStateSignedDecimal128 => {
+            AggKind::SumStateDecimal128
+            | AggKind::SumStateMergeDecimal128
+            | AggKind::SumStateSignedDecimal128 => {
                 let state = unsafe { &*decimal_state_slot(base, offset) };
                 if state.row_count == 0 && state.sum == 0 {
                     builder.append_value([]);
@@ -690,6 +800,7 @@ mod tests {
         decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
     };
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
+    use crate::exec::expr::function::mv_state::sum_state_union;
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
     use super::super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
@@ -1043,6 +1154,36 @@ mod tests {
         cell.merge(input);
 
         assert_eq!(final_int_state(&cell.finalize()), (1, 25));
+    }
+
+    #[test]
+    fn state_merge_sum_matches_sequential_union() {
+        let states = [
+            encode_sum_int64(2, 30),
+            encode_sum_int64(-1, -10),
+            Vec::new(),
+            encode_sum_int64(3, 7),
+        ];
+        let expected = states
+            .iter()
+            .try_fold(Vec::new(), |acc, state| sum_state_union(&acc, state))
+            .unwrap();
+        let spec = super::super::super::build_spec_from_type(
+            &sum_func_with_arg("sum_state_merge", DataType::Int64),
+            Some(&DataType::Binary),
+            false,
+        )
+        .unwrap();
+        let mut cell = StateCell::new(spec);
+        let input = Arc::new(BinaryArray::from_iter_values(
+            states.iter().map(Vec::as_slice),
+        )) as ArrayRef;
+        let input_slot = Some(input);
+        let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
+
+        cell.update(view, states.len());
+
+        assert_eq!(final_bytes(&cell.finalize()), expected.as_slice());
     }
 
     #[test]

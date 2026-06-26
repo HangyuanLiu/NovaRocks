@@ -2939,6 +2939,7 @@ fn is_state_combinator_aggregate_function(name: &str) -> bool {
         "count_state"
             | "count_state_signed"
             | "sum_state"
+            | "sum_state_merge"
             | "sum_state_signed"
             | "avg_state"
             | "avg_state_signed"
@@ -3987,6 +3988,7 @@ mod tests {
             "count_state",
             "count_state_signed",
             "sum_state",
+            "sum_state_merge",
             "sum_state_signed",
             "avg_state",
             "avg_state_signed",

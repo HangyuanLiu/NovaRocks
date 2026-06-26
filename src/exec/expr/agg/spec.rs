@@ -135,6 +135,8 @@ fn is_opaque_state_combinator_kind(kind: &AggKind) -> bool {
             | AggKind::SumStateDecimal128
             | AggKind::SumStateSignedInt64
             | AggKind::SumStateSignedDecimal128
+            | AggKind::SumStateMergeInt64
+            | AggKind::SumStateMergeDecimal128
     )
 }
 

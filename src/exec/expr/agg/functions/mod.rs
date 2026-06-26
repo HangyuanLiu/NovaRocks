@@ -41,6 +41,8 @@ pub(super) enum AggKind {
     SumDecimal256,
     SumStateInt64,
     SumStateDecimal128,
+    SumStateMergeInt64,
+    SumStateMergeDecimal128,
     SumStateSignedInt64,
     SumStateSignedDecimal128,
     MinInt,
@@ -188,7 +190,7 @@ use state_combinators::bool_or_and::{BoolStateAgg, BoolStateSignedAgg};
 use state_combinators::count::{CountStateAgg, CountStateSignedAgg};
 use state_combinators::count_distinct::{CountDistinctStateAgg, CountDistinctStateSignedAgg};
 use state_combinators::min_max::{MinMaxStateAgg, MinMaxStateSignedAgg};
-use state_combinators::sum::{SumStateAgg, SumStateSignedAgg};
+use state_combinators::sum::{SumStateAgg, SumStateMergeAgg, SumStateSignedAgg};
 use sum::SumAgg;
 use sum_map::SumMapAgg;
 use variance::VarStdAgg;
@@ -261,6 +263,7 @@ static COUNT_IF: CountIfAgg = CountIfAgg;
 static GROUP_CONCAT: GroupConcatAgg = GroupConcatAgg;
 static SUM: SumAgg = SumAgg;
 static SUM_STATE: SumStateAgg = SumStateAgg;
+static SUM_STATE_MERGE: SumStateMergeAgg = SumStateMergeAgg;
 static SUM_STATE_SIGNED: SumStateSignedAgg = SumStateSignedAgg;
 static MIN: MinAgg = MinAgg;
 static MAX: MaxAgg = MaxAgg;
@@ -310,6 +313,7 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "group_concat" | "string_agg" => Ok(&GROUP_CONCAT),
         "sum" => Ok(&SUM),
         "sum_state" => Ok(&SUM_STATE),
+        "sum_state_merge" => Ok(&SUM_STATE_MERGE),
         "sum_state_signed" => Ok(&SUM_STATE_SIGNED),
         "min" => Ok(&MIN),
         "max" => Ok(&MAX),
@@ -372,6 +376,7 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         | AggKind::SumDecimal128
         | AggKind::SumDecimal256 => &SUM,
         AggKind::SumStateInt64 | AggKind::SumStateDecimal128 => &SUM_STATE,
+        AggKind::SumStateMergeInt64 | AggKind::SumStateMergeDecimal128 => &SUM_STATE_MERGE,
         AggKind::SumStateSignedInt64 | AggKind::SumStateSignedDecimal128 => &SUM_STATE_SIGNED,
         AggKind::MinInt
         | AggKind::MinFloat
