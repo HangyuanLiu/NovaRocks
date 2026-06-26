@@ -456,6 +456,28 @@ mod tests {
         assert_eq!(partial_expr.children, vec![original.local_group]);
     }
 
+    fn partial_group_under_global(memo: &Memo, global_group: usize) -> usize {
+        let global_expr = memo.groups[global_group]
+            .logical_exprs
+            .iter()
+            .find(|expr| matches!(expr.op, Operator::LogicalAggregate(_)))
+            .expect("expected global aggregate group");
+        assert_eq!(global_expr.children.len(), 1);
+
+        let partial_group = global_expr.children[0];
+        let partial_expr = memo.groups[partial_group]
+            .logical_exprs
+            .iter()
+            .find(|expr| matches!(expr.op, Operator::LogicalTopN(_)))
+            .expect("expected partial TopN group");
+        let Operator::LogicalTopN(partial) = &partial_expr.op else {
+            unreachable!();
+        };
+        assert_eq!(partial.phase, TopNPhase::Partial);
+
+        partial_group
+    }
+
     #[test]
     fn order_by_group_key_is_subset() {
         let mut arena = ScalarArena::new();
@@ -531,6 +553,27 @@ mod tests {
         let out = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
 
         assert_preagg_rewrite_shape(&out, &fixture.memo, &fixture);
+    }
+
+    #[test]
+    fn repeated_apply_reuses_intermediate_groups() {
+        let mut fixture = preagg_memo();
+        let expr = root_expr(&fixture);
+
+        let first = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+        assert_eq!(first.len(), 1);
+        let groups_after_first = fixture.memo.groups.len();
+        let first_global_group = first[0].children[0];
+        let first_partial_group = partial_group_under_global(&fixture.memo, first_global_group);
+
+        let second = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+        assert_eq!(second.len(), 1);
+        let second_global_group = second[0].children[0];
+        let second_partial_group = partial_group_under_global(&fixture.memo, second_global_group);
+
+        assert_eq!(fixture.memo.groups.len(), groups_after_first);
+        assert_eq!(second_global_group, first_global_group);
+        assert_eq!(second_partial_group, first_partial_group);
     }
 
     #[test]
