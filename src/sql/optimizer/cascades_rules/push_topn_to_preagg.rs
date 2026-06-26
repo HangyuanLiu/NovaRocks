@@ -123,7 +123,7 @@ fn rewrite_topn_preagg(
     {
         return Vec::new();
     }
-    if !order_by_subset_of_group_by(&topn.items, global, &memo.scalars) {
+    if !order_by_covers_group_by(&topn.items, global, &memo.scalars) {
         return Vec::new();
     }
     let Some(partial_items) =
@@ -174,7 +174,7 @@ fn rewrite_topn_preagg(
     }]
 }
 
-fn order_by_subset_of_group_by(
+fn order_by_covers_group_by(
     items: &[SortKey],
     global: &LogicalAggregateOp,
     arena: &ScalarArena,
@@ -186,14 +186,27 @@ fn order_by_subset_of_group_by(
         return false;
     };
 
-    items.iter().all(|item| {
+    if items.len() != global_group_outputs.len() {
+        return false;
+    }
+
+    let mut item_columns = Vec::with_capacity(items.len());
+    for item in items {
         let ScalarNode::ColumnRef(column_id) = arena.node(item.expr) else {
             return false;
         };
-        global_group_outputs
+        if !global_group_outputs
             .iter()
             .any(|column| column.column_id == *column_id)
-    })
+        {
+            return false;
+        }
+        item_columns.push(*column_id);
+    }
+
+    global_group_outputs
+        .iter()
+        .all(|column| item_columns.contains(&column.column_id))
 }
 
 fn partial_order_by_for_local_group_by(
@@ -479,21 +492,30 @@ mod tests {
     }
 
     #[test]
-    fn order_by_group_key_is_subset() {
+    fn order_by_group_keys_cover_all_group_by() {
         let mut arena = ScalarArena::new();
         let global = global_agg(&mut arena);
         let items = vec![sort_key(&mut arena, 101), sort_key(&mut arena, 102)];
 
-        assert!(order_by_subset_of_group_by(&items, &global, &arena));
+        assert!(order_by_covers_group_by(&items, &global, &arena));
     }
 
     #[test]
-    fn order_by_aggregate_output_is_not_subset() {
+    fn order_by_proper_group_key_subset_is_not_safe() {
+        let mut arena = ScalarArena::new();
+        let global = global_agg(&mut arena);
+        let items = vec![sort_key(&mut arena, 101)];
+
+        assert!(!order_by_covers_group_by(&items, &global, &arena));
+    }
+
+    #[test]
+    fn order_by_aggregate_output_does_not_cover_group_by() {
         let mut arena = ScalarArena::new();
         let global = global_agg(&mut arena);
         let items = vec![sort_key(&mut arena, 201)];
 
-        assert!(!order_by_subset_of_group_by(&items, &global, &arena));
+        assert!(!order_by_covers_group_by(&items, &global, &arena));
     }
 
     #[test]
@@ -503,7 +525,7 @@ mod tests {
         global.output_columns.truncate(global.group_by.len() - 1);
         let items = vec![sort_key(&mut arena, 101)];
 
-        assert!(!order_by_subset_of_group_by(&items, &global, &arena));
+        assert!(!order_by_covers_group_by(&items, &global, &arena));
     }
 
     #[test]
@@ -513,7 +535,7 @@ mod tests {
         global.output_columns[0] = output_column_with_id(ColumnId::UNSET, "bad");
         let items = vec![sort_key(&mut arena, 102)];
 
-        assert!(!order_by_subset_of_group_by(&items, &global, &arena));
+        assert!(!order_by_covers_group_by(&items, &global, &arena));
     }
 
     #[test]
@@ -588,6 +610,84 @@ mod tests {
         topn.items = vec![aggregate_output_sort_key];
 
         assert_does_not_fire(&mut fixture);
+    }
+
+    #[test]
+    fn proper_group_key_subset_does_not_fire() {
+        let mut memo = Memo::new();
+        let city = col_ref(&mut memo.scalars, 1);
+        let sku = col_ref(&mut memo.scalars, 2);
+        let sales = col_ref(&mut memo.scalars, 3);
+        let sum = sum_spec(sales);
+
+        let values_id = memo.next_expr_id();
+        let values_group = memo.new_group(MExpr {
+            id: values_id,
+            op: Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![
+                    output_column(1, "city"),
+                    output_column(2, "sku"),
+                    output_column(3, "sales"),
+                ],
+            }),
+            children: vec![],
+        });
+
+        let local_id = memo.next_expr_id();
+        let local_group = memo.new_group(MExpr {
+            id: local_id,
+            op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
+                AggStage::Local,
+                vec![city, sku],
+                vec![sum.clone()],
+                vec![
+                    output_column(1, "city"),
+                    output_column(2, "sku"),
+                    output_column(201, "sum_sales"),
+                ],
+                vec![false],
+                true,
+            )),
+            children: vec![values_group],
+        });
+
+        let global_id = memo.next_expr_id();
+        let global_group = memo.new_group(MExpr {
+            id: global_id,
+            op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
+                AggStage::Global,
+                vec![city, sku],
+                vec![sum],
+                vec![
+                    output_column(101, "city"),
+                    output_column(102, "sku"),
+                    output_column(201, "sum_sales"),
+                ],
+                vec![true],
+                true,
+            )),
+            children: vec![local_group],
+        });
+
+        let topn = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalTopN(TopNOp {
+                items: vec![sort_key(&mut memo.scalars, 101)],
+                limit: Some(10),
+                offset: None,
+                phase: TopNPhase::Final,
+                is_split: false,
+            }),
+            children: vec![global_group],
+        };
+
+        let out = PushDownTopNToPreAgg.apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "expected partial group-key ORDER BY not to fire"
+        );
     }
 
     #[test]

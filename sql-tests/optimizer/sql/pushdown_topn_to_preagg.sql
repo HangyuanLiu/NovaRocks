@@ -55,4 +55,18 @@ GROUP BY city
 ORDER BY s DESC
 LIMIT 10;
 
+-- Negative: ORDER BY a proper subset of group keys is not safe. Local
+-- per-shard TopN may prune different tied groups and leave the global
+-- aggregate with partial inputs.
+EXPLAIN VERBOSE
+SELECT city, sales, SUM(sales) AS s
+FROM (
+    SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg
+    UNION ALL
+    SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg
+) o
+GROUP BY city, sales
+ORDER BY city
+LIMIT 10;
+
 SET disable_optimizer_rules = '';
