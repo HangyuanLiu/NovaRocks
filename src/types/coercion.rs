@@ -208,10 +208,12 @@ pub(crate) fn decimal_compare_type(left: &DataType, right: &DataType) -> Result<
 
 /// Comparison operand common type. Single authority shared by analyzer,
 /// execution `normalize_comparison_types`, and lower binary_pred / join-key.
-/// `Ok(None)`: operands already equal, OR pair is out of scope (int x decimal —
-/// handled in S3 —, string, temporal, cross-family) and is left to the caller.
-/// `Ok(Some(t))`: numeric / decimal pair -> cast BOTH operands to `t`.
-/// `Err`: decimal pair whose common precision exceeds Decimal256 (> 76).
+/// `Ok(None)`: operands already equal, OR pair is out of scope (temporal,
+/// largeint, cross-family) and is left to the caller.
+/// `Ok(Some(t))`: numeric / decimal / string-numeric pair -> cast BOTH operands
+/// to `t`.
+/// `Err`: decimal-compatible pair whose common precision exceeds Decimal256
+/// (> 76).
 pub(crate) fn comparison_common_type(
     left: &DataType,
     right: &DataType,
@@ -226,6 +228,17 @@ pub(crate) fn comparison_common_type(
         )
     };
     let is_float = |dt: &DataType| matches!(dt, DataType::Float32 | DataType::Float64);
+    let int_as_zero_scale_decimal = |dt: &DataType| -> Option<DataType> {
+        match dt {
+            DataType::Int8 => Some(DataType::Decimal128(3, 0)),
+            DataType::Int16 => Some(DataType::Decimal128(5, 0)),
+            DataType::Int32 => Some(DataType::Decimal128(10, 0)),
+            DataType::Int64 => Some(DataType::Decimal128(19, 0)),
+            _ => None,
+        }
+    };
+    let is_decimal =
+        |dt: &DataType| matches!(dt, DataType::Decimal128(_, _) | DataType::Decimal256(_, _));
 
     if is_int(left) && is_int(right) {
         return Ok(Some(DataType::Int64));
@@ -236,16 +249,31 @@ pub(crate) fn comparison_common_type(
     if is_float(left) && is_float(right) {
         return Ok(Some(DataType::Float64));
     }
-    if matches!(
-        left,
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
-    ) && matches!(
-        right,
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
-    ) {
+    if is_decimal(left) && is_decimal(right) {
         return Ok(Some(decimal_compare_type(left, right)?));
     }
-    // int x decimal (S3), string, temporal, cross-family: not this layer's job.
+    if let Some(left_decimal) = int_as_zero_scale_decimal(left) {
+        if is_decimal(right) {
+            return Ok(Some(decimal_compare_type(&left_decimal, right)?));
+        }
+    }
+    if let Some(right_decimal) = int_as_zero_scale_decimal(right) {
+        if is_decimal(left) {
+            return Ok(Some(decimal_compare_type(left, &right_decimal)?));
+        }
+    }
+    if (is_float(left) && is_decimal(right)) || (is_decimal(left) && is_float(right)) {
+        return Ok(Some(DataType::Float64));
+    }
+    let is_string = |dt: &DataType| matches!(dt, DataType::Utf8 | DataType::LargeUtf8);
+    let is_numeric = |dt: &DataType| is_int(dt) || is_float(dt) || is_decimal(dt);
+    if is_string(left) && is_numeric(right) {
+        return Ok(Some(right.clone()));
+    }
+    if is_numeric(left) && is_string(right) {
+        return Ok(Some(left.clone()));
+    }
+
     Ok(None)
 }
 
@@ -288,13 +316,64 @@ mod tests {
             comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Decimal128(10, 2)),
             Ok(None)
         );
-        // out of scope (int x decimal handled in S3; string / cross-family) -> Ok(None)
+        // int x decimal: int modeled as zero-scale decimal -> common decimal
+        // Int32 -> Decimal128(10,0); scale=2, int_digits=max(10,8)=10, prec=12
         assert_eq!(
             comparison_common_type(&DataType::Int32, &DataType::Decimal128(10, 2)),
-            Ok(None)
+            Ok(Some(DataType::Decimal128(12, 2)))
+        );
+        // string x numeric -> numeric operand's type
+        assert_eq!(
+            comparison_common_type(&DataType::Utf8, &DataType::Int32),
+            Ok(Some(DataType::Int32))
+        );
+    }
+
+    #[test]
+    fn comparison_common_type_new_arms_s3() {
+        assert_eq!(
+            comparison_common_type(&DataType::Int64, &DataType::Decimal128(10, 2)),
+            Ok(Some(DataType::Decimal128(21, 2)))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Int32),
+            Ok(Some(DataType::Decimal128(12, 2)))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Float64, &DataType::Decimal128(10, 2)),
+            Ok(Some(DataType::Float64))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Float32),
+            Ok(Some(DataType::Float64))
         );
         assert_eq!(
             comparison_common_type(&DataType::Utf8, &DataType::Int32),
+            Ok(Some(DataType::Int32))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::LargeUtf8, &DataType::Int32),
+            Ok(Some(DataType::Int32))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Decimal128(10, 2), &DataType::Utf8),
+            Ok(Some(DataType::Decimal128(10, 2)))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Utf8, &DataType::Float64),
+            Ok(Some(DataType::Float64))
+        );
+        let largeint = DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH);
+        assert_eq!(
+            comparison_common_type(&largeint, &DataType::Decimal128(10, 2)),
+            Ok(None)
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Utf8, &DataType::Utf8),
+            Ok(None)
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Utf8, &DataType::Date32),
             Ok(None)
         );
     }
