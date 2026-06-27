@@ -131,23 +131,50 @@ pub(crate) fn rewrite_join_delta_coalesce_query(
         })
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
-    let coalesced_select = coalesced_select_list(&payload_columns);
+    let payload_coalesced_select = payload_coalesced_select_list(&payload_columns);
+    let payload_group_by = payload_group_by_list(&payload_columns);
+    let key_shape_select = key_shape_select_list();
+    let valid_payload_select = valid_payload_select_list(&payload_columns);
     let final_select = final_coalesced_select_list(&payload_columns);
     let change_stream_cte = format!("__nr_join_delta_change_stream AS ({change_stream})");
-    let coalesced_cte = format!(
-        "__nr_join_delta_coalesced AS (\
-         SELECT {coalesced_select} \
+    let payload_coalesced_cte = format!(
+        "__nr_join_delta_payload_coalesced AS (\
+         SELECT {payload_coalesced_select} \
          FROM __nr_join_delta_change_stream \
-         GROUP BY {} \
+         GROUP BY {payload_group_by} \
          HAVING SUM({}) <> 0 \
-         AND assert_true(abs(SUM({})) <= 1, 'join delta per-key net change exceeds 1'))",
-        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+         AND assert_true(abs(SUM({})) <= 1, 'join delta per-payload net change exceeds 1'))",
         crate::exec::change_op::CHANGE_OP_COLUMN,
         crate::exec::change_op::CHANGE_OP_COLUMN,
     );
+    let key_shape_cte = format!(
+        "__nr_join_delta_key_shape AS (\
+         SELECT {key_shape_select} \
+         FROM __nr_join_delta_payload_coalesced \
+         GROUP BY {} \
+         HAVING assert_true(\
+         SUM(CASE WHEN net > 0 THEN 1 ELSE 0 END) <= 1 \
+         AND SUM(CASE WHEN net < 0 THEN 1 ELSE 0 END) <= 1, \
+         'join delta multiple pending payloads for key'))",
+        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+    );
+    let coalesced_cte = format!(
+        "__nr_join_delta_coalesced AS (\
+         SELECT {valid_payload_select} \
+         FROM __nr_join_delta_payload_coalesced pc \
+         JOIN __nr_join_delta_key_shape ks \
+         ON pc.{} = ks.{})",
+        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+    );
     let ctes = branch_ctes
         .into_iter()
-        .chain([change_stream_cte, coalesced_cte])
+        .chain([
+            change_stream_cte,
+            payload_coalesced_cte,
+            key_shape_cte,
+            coalesced_cte,
+        ])
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!("WITH {ctes} SELECT {final_select} FROM __nr_join_delta_coalesced");
@@ -229,7 +256,13 @@ fn validate_payload_projection_column(
 fn is_reserved_payload_projection_name(normalized: &str) -> bool {
     matches!(
         normalized,
-        "net" | "__nr_join_delta_change_stream" | "__nr_join_delta_coalesced"
+        "net"
+            | "pending_inserts"
+            | "pending_deletes"
+            | "__nr_join_delta_change_stream"
+            | "__nr_join_delta_payload_coalesced"
+            | "__nr_join_delta_key_shape"
+            | "__nr_join_delta_coalesced"
     ) || normalized == crate::exec::change_op::CHANGE_OP_COLUMN
         || normalized == JOIN_LEFT_ROW_ID_COLUMN
         || normalized == JOIN_RIGHT_ROW_ID_COLUMN
@@ -262,16 +295,41 @@ fn change_stream_select_list(
     items.join(", ")
 }
 
-fn coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
-    let mut items = vec![
+fn payload_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
+    let mut items =
+        vec![crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string()];
+    items.extend(payload_columns.iter().map(|ident| ident.to_string()));
+    items.push(format!(
+        "SUM({}) AS net",
+        crate::exec::change_op::CHANGE_OP_COLUMN
+    ));
+    items.join(", ")
+}
+
+fn payload_group_by_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
+    let mut items =
+        vec![crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string()];
+    items.extend(payload_columns.iter().map(|ident| ident.to_string()));
+    items.join(", ")
+}
+
+fn key_shape_select_list() -> String {
+    [
         crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
-        format!("SUM({}) AS net", crate::exec::change_op::CHANGE_OP_COLUMN),
-    ];
-    items.extend(
-        payload_columns
-            .iter()
-            .map(|ident| format!("any_value({ident}) AS {ident}")),
-    );
+        "SUM(CASE WHEN net > 0 THEN 1 ELSE 0 END) AS pending_inserts".to_string(),
+        "SUM(CASE WHEN net < 0 THEN 1 ELSE 0 END) AS pending_deletes".to_string(),
+    ]
+    .join(", ")
+}
+
+fn valid_payload_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
+    let mut items = payload_columns
+        .iter()
+        .map(|ident| format!("pc.{ident} AS {ident}"))
+        .collect::<Vec<_>>();
+    let key = crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN;
+    items.push(format!("pc.{key} AS {key}"));
+    items.push("pc.net AS net".to_string());
     items.join(", ")
 }
 
@@ -685,18 +743,54 @@ mod tests {
         );
         assert_sql_contains(&rendered, "GROUP BY __nova_join_row_key");
         assert_sql_contains(&rendered, "SUM(__change_op)");
-        assert_sql_contains(&rendered, "any_value(id) AS id");
-        assert_sql_contains(&rendered, "any_value(label) AS label");
+        assert_sql_contains(&rendered, "__nr_join_delta_payload_coalesced");
+        assert_sql_contains(&rendered, "GROUP BY __nova_join_row_key, id, label");
+        assert_sql_contains(&rendered, "__nr_join_delta_key_shape");
+        assert_sql_contains(&rendered, "pc.id AS id");
+        assert_sql_contains(&rendered, "pc.label AS label");
         assert_sql_contains(&rendered, "HAVING SUM(__change_op) <> 0");
         assert_sql_contains(
             &rendered,
-            "assert_true(abs(SUM(__change_op)) <= 1, 'join delta per-key net change exceeds 1')",
+            "assert_true(abs(SUM(__change_op)) <= 1, 'join delta per-payload net change exceeds 1')",
+        );
+        assert_sql_contains(
+            &rendered,
+            "assert_true(SUM(CASE WHEN net > 0 THEN 1 ELSE 0 END) <= 1 AND SUM(CASE WHEN net < 0 THEN 1 ELSE 0 END) <= 1, 'join delta multiple pending payloads for key')",
         );
         assert_sql_contains(
             &rendered,
             "CAST(CASE WHEN net > 0 THEN 1 ELSE -1 END AS TINYINT) AS __change_op",
         );
         assert_sql_contains(&rendered, "__nova_join_row_key");
+    }
+
+    #[test]
+    fn join_delta_coalesce_groups_by_payload_before_key_shape_check() {
+        let rendered = rewrite_simple_join_delta_coalesce(
+            "select l.id, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id",
+        )
+        .expect("coalesce rewrite")
+        .to_string();
+
+        assert_sql_contains(&rendered, "__nr_join_delta_payload_coalesced");
+        assert_sql_contains(&rendered, "GROUP BY __nova_join_row_key, id, label");
+        assert_sql_contains(
+            &rendered,
+            "assert_true(abs(SUM(__change_op)) <= 1, 'join delta per-payload net change exceeds 1')",
+        );
+        assert_sql_contains(&rendered, "__nr_join_delta_key_shape");
+        assert_sql_contains(
+            &rendered,
+            "SUM(CASE WHEN net > 0 THEN 1 ELSE 0 END) AS pending_inserts",
+        );
+        assert_sql_contains(
+            &rendered,
+            "SUM(CASE WHEN net < 0 THEN 1 ELSE 0 END) AS pending_deletes",
+        );
+        assert!(
+            !rendered.contains("any_value(id) AS id"),
+            "payload must not be chosen with any_value: sql={rendered}"
+        );
     }
 
     #[test]
@@ -728,8 +822,11 @@ mod tests {
         assert_sql_contains(&rendered, "__nr_join_delta_change_stream");
         assert_sql_contains(&rendered, "GROUP BY __nova_join_row_key");
         assert_sql_contains(&rendered, "SUM(__change_op)");
-        assert_sql_contains(&rendered, "any_value(id) AS id");
-        assert_sql_contains(&rendered, "any_value(label) AS label");
+        assert_sql_contains(&rendered, "__nr_join_delta_payload_coalesced");
+        assert_sql_contains(&rendered, "GROUP BY __nova_join_row_key, id, label");
+        assert_sql_contains(&rendered, "__nr_join_delta_key_shape");
+        assert_sql_contains(&rendered, "pc.id AS id");
+        assert_sql_contains(&rendered, "pc.label AS label");
         assert_sql_contains(&rendered, "HAVING SUM(__change_op) <> 0");
         assert_sql_contains(
             &rendered,
@@ -815,7 +912,11 @@ mod tests {
         .expect("coalesce rewrite")
         .to_string();
 
-        assert_sql_contains(&rendered, "any_value(`payload id`) AS `payload id`");
+        assert_sql_contains(
+            &rendered,
+            "GROUP BY __nova_join_row_key, `payload id`, label",
+        );
+        assert_sql_contains(&rendered, "pc.`payload id` AS `payload id`");
         assert_sql_contains(&rendered, "`payload id` AS `payload id`");
     }
 
