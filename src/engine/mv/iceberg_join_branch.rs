@@ -185,6 +185,69 @@ pub(crate) fn rewrite_join_delta_coalesce_query(
     Ok(parsed)
 }
 
+pub(crate) fn rewrite_join_delta_append_only_query(
+    query: &sqlparser::ast::Query,
+    branch_query: sqlparser::ast::Query,
+    left_uuid: &str,
+    right_uuid: &str,
+) -> Result<sqlparser::ast::Query, String> {
+    let payload_columns = payload_projection_columns(query)?;
+    let mut items = payload_columns
+        .iter()
+        .map(|ident| format!("{ident} AS {ident}"))
+        .collect::<Vec<_>>();
+    items.push(format!(
+        "join_row_key({}, {}, {}, {}) AS {}",
+        sql_string_literal(left_uuid),
+        JOIN_LEFT_ROW_ID_COLUMN,
+        sql_string_literal(right_uuid),
+        JOIN_RIGHT_ROW_ID_COLUMN,
+        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+    ));
+    items.push(format!(
+        "CAST({} AS TINYINT) AS {}",
+        crate::exec::change_op::CHANGE_OP_COLUMN,
+        crate::exec::change_op::CHANGE_OP_COLUMN,
+    ));
+    let sql = format!(
+        "SELECT {} FROM (SELECT 1 AS __nr_join_delta_append_only_placeholder) \
+         AS __nr_join_delta_append_only_branch",
+        items.join(", ")
+    );
+    let mut parsed = parse_query_from_sql(&sql).map_err(|err| {
+        format!("join delta append-only rewrite generated invalid SQL: {err}; sql={sql}")
+    })?;
+    let sqlparser::ast::SetExpr::Select(select) = parsed.body.as_mut() else {
+        return Err("join delta append-only rewrite generated non-SELECT body".to_string());
+    };
+    let [from] = select.from.as_mut_slice() else {
+        return Err("join delta append-only rewrite generated invalid FROM".to_string());
+    };
+    let sqlparser::ast::TableFactor::Derived { subquery, .. } = &mut from.relation else {
+        return Err("join delta append-only rewrite generated non-derived FROM".to_string());
+    };
+    *subquery = Box::new(branch_query);
+    Ok(parsed)
+}
+
+pub(crate) fn is_append_only_join_delta_eligible(query: &sqlparser::ast::Query) -> bool {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    let [from] = select.from.as_slice() else {
+        return false;
+    };
+    let [join] = from.joins.as_slice() else {
+        return false;
+    };
+    matches!(
+        join.join_operator,
+        sqlparser::ast::JoinOperator::Join(_)
+            | sqlparser::ast::JoinOperator::Inner(_)
+            | sqlparser::ast::JoinOperator::CrossJoin(_)
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BranchRewrite {
     alias: sqlparser::ast::Ident,
@@ -932,8 +995,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn join_delta_append_only_wraps_branch_without_coalesce_grouping() {
+        let branch_query = rewrite_left_delta_branch_query();
+        let wrapped = rewrite_join_delta_append_only_query(
+            &simple_join_query(),
+            branch_query,
+            "left-uuid",
+            "right-uuid",
+        )
+        .expect("append-only rewrite");
+        let rendered = wrapped.to_string();
+
+        assert_sql_contains(&rendered, "join_row_key");
+        assert_sql_contains(&rendered, "'left-uuid'");
+        assert_sql_contains(&rendered, JOIN_LEFT_ROW_ID_COLUMN);
+        assert_sql_contains(&rendered, "'right-uuid'");
+        assert_sql_contains(&rendered, JOIN_RIGHT_ROW_ID_COLUMN);
+        assert_sql_contains(&rendered, "AS __nova_join_row_key");
+        assert_sql_contains(&rendered, "CAST(__change_op AS TINYINT) AS __change_op");
+        assert!(
+            !rendered.contains("GROUP BY"),
+            "append-only fast path must not coalesce with GROUP BY: sql={rendered}"
+        );
+        assert!(
+            !rendered.contains("__nr_join_delta_coalesced"),
+            "append-only fast path must not use coalesce CTEs: sql={rendered}"
+        );
+        assert_final_select_excludes_row_id_columns(&wrapped);
+    }
+
+    #[test]
+    fn join_delta_append_only_join_type_eligibility() {
+        assert!(is_append_only_join_delta_eligible(&parse_query(
+            "select l.id from ice.ns.left l join ice.ns.right r on l.id = r.id"
+        )));
+        assert!(is_append_only_join_delta_eligible(&parse_query(
+            "select l.id from ice.ns.left l inner join ice.ns.right r on l.id = r.id"
+        )));
+        assert!(is_append_only_join_delta_eligible(&parse_query(
+            "select l.id from ice.ns.left l cross join ice.ns.right r"
+        )));
+
+        assert!(!is_append_only_join_delta_eligible(&parse_query(
+            "select l.id from ice.ns.left l left join ice.ns.right r on l.id = r.id"
+        )));
+        assert!(!is_append_only_join_delta_eligible(&parse_query(
+            "select l.id from ice.ns.left l right join ice.ns.right r on l.id = r.id"
+        )));
+        assert!(!is_append_only_join_delta_eligible(&parse_query(
+            "select l.id from ice.ns.left l full outer join ice.ns.right r on l.id = r.id"
+        )));
+    }
+
     fn simple_join_query() -> sqlparser::ast::Query {
         parse_query("select l.id, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id")
+    }
+
+    fn rewrite_left_delta_branch_query() -> sqlparser::ast::Query {
+        let query = simple_join_query();
+        let left = base("left");
+        let right = base("right");
+        let plan = JoinDeltaBranchPlan {
+            left_base: left,
+            right_base: right,
+            left: BranchSide::Delta(SnapshotWindow { from: 10, to: 11 }),
+            right: BranchSide::Snapshot(20),
+        };
+        rewrite_join_branch_query(&query, &plan, "l", "r").expect("branch rewrite")
+    }
+
+    fn assert_final_select_excludes_row_id_columns(query: &sqlparser::ast::Query) {
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT body");
+        };
+        for item in &select.projection {
+            let alias = match item {
+                sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => {
+                    Some(alias.value.as_str())
+                }
+                sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(
+                    ident,
+                )) => Some(ident.value.as_str()),
+                _ => None,
+            };
+            assert!(
+                alias != Some(JOIN_LEFT_ROW_ID_COLUMN) && alias != Some(JOIN_RIGHT_ROW_ID_COLUMN),
+                "final select must not project row-id column alias: {item}"
+            );
+        }
     }
 
     fn rewrite_simple_join_delta_coalesce(sql: &str) -> Result<sqlparser::ast::Query, String> {

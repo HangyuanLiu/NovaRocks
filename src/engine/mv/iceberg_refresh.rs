@@ -10485,6 +10485,51 @@ mod aggregate_refresh_rewrite_validation_tests {
     }
 }
 
+#[cfg(test)]
+mod join_delta_append_only_fast_path_tests {
+    use super::*;
+
+    #[test]
+    fn join_delta_append_only_fast_path_requires_append_only_inner_or_cross_join() {
+        assert!(should_use_join_delta_append_only_fast_path(
+            &parse_query("select l.id from ice.ns.left l join ice.ns.right r on l.id = r.id"),
+            false,
+            false,
+        ));
+        assert!(should_use_join_delta_append_only_fast_path(
+            &parse_query("select l.id from ice.ns.left l cross join ice.ns.right r"),
+            false,
+            false,
+        ));
+
+        assert!(!should_use_join_delta_append_only_fast_path(
+            &parse_query("select l.id from ice.ns.left l join ice.ns.right r on l.id = r.id"),
+            true,
+            false,
+        ));
+        assert!(!should_use_join_delta_append_only_fast_path(
+            &parse_query("select l.id from ice.ns.left l join ice.ns.right r on l.id = r.id"),
+            false,
+            true,
+        ));
+        assert!(!should_use_join_delta_append_only_fast_path(
+            &parse_query("select l.id from ice.ns.left l left join ice.ns.right r on l.id = r.id"),
+            false,
+            false,
+        ));
+    }
+
+    fn parse_query(sql: &str) -> sqlparser::ast::Query {
+        let normalized =
+            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        *query
+    }
+}
+
 pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -10666,10 +10711,10 @@ fn incremental_refresh_iceberg_join_mv(
         )
         .into());
     }
-    let left_has_changes =
-        !left_batch.inserts.is_empty() || iceberg_change_batch_has_row_deletes(&left_batch);
-    let right_has_changes =
-        !right_batch.inserts.is_empty() || iceberg_change_batch_has_row_deletes(&right_batch);
+    let left_has_delete_changes = iceberg_change_batch_has_row_deletes(&left_batch);
+    let right_has_delete_changes = iceberg_change_batch_has_row_deletes(&right_batch);
+    let left_has_changes = !left_batch.inserts.is_empty() || left_has_delete_changes;
+    let right_has_changes = !right_batch.inserts.is_empty() || right_has_delete_changes;
     let branches = crate::engine::mv::iceberg_join_branch::plan_join_delta_branches(
         left_ref,
         right_ref,
@@ -10696,6 +10741,14 @@ fn incremental_refresh_iceberg_join_mv(
             )?,
         );
     }
+    let base_query = parse_mv_select_query(&mv_definition.select_sql)?;
+    if should_use_join_delta_append_only_fast_path(
+        &base_query,
+        left_has_delete_changes,
+        right_has_delete_changes,
+    ) {
+        return execute_append_only_join_delta_branches(state, ctx, aliases, &base_query, branches);
+    }
     execute_join_delta_branches(
         state,
         target,
@@ -10709,6 +10762,292 @@ fn incremental_refresh_iceberg_join_mv(
         &ctx.affected_partitions,
         branches,
     )
+}
+
+fn should_use_join_delta_append_only_fast_path(
+    query: &sqlparser::ast::Query,
+    left_has_delete_changes: bool,
+    right_has_delete_changes: bool,
+) -> bool {
+    !left_has_delete_changes
+        && !right_has_delete_changes
+        && crate::engine::mv::iceberg_join_branch::is_append_only_join_delta_eligible(query)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_append_only_join_delta_branches(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
+    base_query: &sqlparser::ast::Query,
+    branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
+    let pin = &*ctx.rewrite.pin;
+    let first_branch = branches.first().ok_or_else(|| {
+        "append-only join delta execution requires at least one branch".to_string()
+    })?;
+    let left_uuid = pin
+        .uuid(&first_branch.left_base)
+        .ok_or_else(|| format!("missing uuid for {}", first_branch.left_base.fqn()))?
+        .to_string();
+    let right_uuid = pin
+        .uuid(&first_branch.right_base)
+        .ok_or_else(|| format!("missing uuid for {}", first_branch.right_base.fqn()))?
+        .to_string();
+    let snapshots = pin.to_snapshot_map();
+    let table_uuids = pin.to_table_uuid_map();
+    let staging_branch = format!(
+        "__nova_mv_refresh_{}_{}",
+        mv_definition.mv_id,
+        uuid::Uuid::new_v4().simple()
+    );
+    let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+        state,
+        target,
+        mv_definition.mv_id,
+        expected_main_snapshot_id,
+        snapshots.clone(),
+        &staging_branch,
+    )?;
+    let ident = iceberg_mv_table_ident(target)?;
+    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)?
+        .to_summary_properties();
+    if let Err(err) = ensure_iceberg_mv_staging_branch(
+        iceberg_catalog,
+        target,
+        &staging_branch,
+        expected_main_snapshot_id,
+    ) {
+        abort_iceberg_mv_refresh(state, refresh_id)?;
+        return Err(err.into());
+    }
+    let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
+        Ok(table) => table,
+        Err(err) => {
+            return Err(handle_iceberg_mv_definite_pre_publish_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+    };
+    let collector = new_iceberg_mv_commit_collector(
+        &target_table,
+        &ident,
+        &staging_branch,
+        CommitOpKind::FastAppend,
+    );
+    for branch in branches {
+        let mut branch_query = crate::engine::mv::iceberg_join_branch::rewrite_join_branch_query(
+            base_query,
+            &branch,
+            &aliases.left_alias,
+            &aliases.right_alias,
+        )
+        .map_err(|err| {
+            handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            )
+        })?;
+        normalize_join_branch_snapshot_tables(&mut branch_query, &branch).map_err(|err| {
+            handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            )
+        })?;
+        let query = crate::engine::mv::iceberg_join_branch::rewrite_join_delta_append_only_query(
+            base_query,
+            branch_query,
+            &left_uuid,
+            &right_uuid,
+        )
+        .map_err(|err| {
+            handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            )
+        })?;
+        let branch_catalog = build_join_branch_catalog(state, &branch).map_err(|err| {
+            handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            )
+        })?;
+        let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
+            target_table: target_table.clone(),
+            collector: Arc::clone(&collector),
+            locator_state: None,
+            apply_key_column: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+            apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
+            partition_filter: ctx.affected_partitions_to_target_partition_filter(),
+            pruning_limits: ctx.pruning_limits,
+            partition_derivation: merge_sink_partition_derivation(&ctx.rewrite.schema_contract),
+        };
+        let merge_sink =
+            crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
+        let connectors_snapshot = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
+        let catalogs_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        if let Err(err) = crate::engine::execute_query_with_options(
+            &query,
+            &branch_catalog,
+            &connectors_snapshot,
+            current_database,
+            state.exchange_port,
+            None,
+            Some(Box::new(merge_sink)),
+            Some(&*catalogs_guard),
+            None,
+        ) {
+            drop(catalogs_guard);
+            return Err(handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+        drop(catalogs_guard);
+    }
+
+    let added_rows = collector.injected_data_record_count();
+    if added_rows == 0 {
+        tracing::info!(
+            snapshots = ?snapshots,
+            "iceberg join mv {}.{}.{}: append-only fast path produced 0 effective rows; \
+             advancing lineage without new iceberg snapshot",
+            target.catalog,
+            target.namespace,
+            target.table
+        );
+        drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
+        abort_iceberg_mv_refresh(state, refresh_id)?;
+        let target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
+        let metadata_refresh_id =
+            begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
+        finalize_iceberg_mv_refresh_with_partition_state(
+            state,
+            metadata_refresh_id,
+            mv_definition.last_refresh_rows.unwrap_or(0),
+            snapshots,
+            table_uuids,
+            target_snapshot_id,
+            IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+        )?;
+        return Ok(StatementResult::Ok);
+    }
+    let new_total_rows = mv_definition
+        .last_refresh_rows
+        .unwrap_or(0)
+        .checked_add(added_rows)
+        .ok_or_else(|| {
+            handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                format!(
+                    "iceberg join MV append-only row-count overflow: current={:?}, inserts={added_rows}",
+                    mv_definition.last_refresh_rows
+                ),
+            )
+        })?;
+    let commit_outcome = match data_block_on(commit_iceberg_mv_with_populated_collector(
+        &target_table,
+        iceberg_catalog,
+        target_entry,
+        &ident,
+        Arc::clone(&collector),
+        &staging_branch,
+        marker,
+    )) {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(err)) => {
+            return Err(handle_iceberg_mv_commit_service_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+        Err(err) => {
+            return Err(handle_iceberg_mv_definite_pre_publish_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+    };
+
+    record_iceberg_mv_staging_commit(
+        state,
+        refresh_id,
+        commit_outcome.new_snapshot_id,
+        new_total_rows,
+        table_uuids.clone(),
+    )?;
+    let published_snapshot_id = publish_iceberg_mv_refresh(
+        state,
+        target,
+        target_entry,
+        &staging_branch,
+        expected_main_snapshot_id,
+        commit_outcome.new_snapshot_id,
+        refresh_id,
+        mv_definition.mv_id,
+    )?;
+    record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
+    drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
+    finalize_iceberg_mv_refresh_with_partition_state(
+        state,
+        refresh_id,
+        new_total_rows,
+        snapshots,
+        table_uuids,
+        published_snapshot_id,
+        IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+    )?;
+    Ok(StatementResult::Ok)
 }
 
 #[allow(clippy::too_many_arguments)]
