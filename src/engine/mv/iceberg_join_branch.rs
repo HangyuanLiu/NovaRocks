@@ -104,25 +104,43 @@ pub(crate) fn rewrite_join_delta_coalesce_query(
     if branches.is_empty() {
         return Err("join delta coalesce rewrite requires at least one branch".to_string());
     }
-    let payload_columns = payload_projection_columns(query)?;
     let mut branch_queries = Vec::with_capacity(branches.len());
-    let mut branch_ctes = Vec::with_capacity(branches.len());
-    for (index, branch) in branches.iter().enumerate() {
+    for branch in branches {
         branch_queries.push(rewrite_join_branch_query(
             query,
             branch,
             left_alias,
             right_alias,
         )?);
-        branch_ctes.push(format!(
-            "{} AS (SELECT 1 AS __nr_join_delta_branch_placeholder)",
-            join_delta_branch_cte_name(index),
-        ));
     }
-    let change_stream = branches
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
+    rewrite_join_delta_coalesce_query_with_branch_queries(
+        query,
+        branch_queries,
+        left_uuid,
+        right_uuid,
+    )
+}
+
+pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries(
+    query: &sqlparser::ast::Query,
+    branch_queries: Vec<sqlparser::ast::Query>,
+    left_uuid: &str,
+    right_uuid: &str,
+) -> Result<sqlparser::ast::Query, String> {
+    if branch_queries.is_empty() {
+        return Err("join delta coalesce rewrite requires at least one branch".to_string());
+    }
+    let payload_columns = payload_projection_columns(query)?;
+    let branch_ctes = (0..branch_queries.len())
+        .map(|index| {
+            format!(
+                "{} AS (SELECT 1 AS __nr_join_delta_branch_placeholder)",
+                join_delta_branch_cte_name(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    let change_stream = (0..branch_queries.len())
+        .map(|index| {
             format!(
                 "SELECT {} FROM {}",
                 change_stream_select_list(&payload_columns, left_uuid, right_uuid),
@@ -185,11 +203,45 @@ pub(crate) fn rewrite_join_delta_coalesce_query(
     Ok(parsed)
 }
 
+pub(crate) fn rewrite_join_full_refresh_apply_query(
+    query: &sqlparser::ast::Query,
+    full_refresh_query: sqlparser::ast::Query,
+    left_uuid: &str,
+    right_uuid: &str,
+) -> Result<sqlparser::ast::Query, String> {
+    wrap_join_apply_key_query(
+        query,
+        full_refresh_query,
+        left_uuid,
+        right_uuid,
+        "__nr_join_full_refresh_branch",
+        "__nr_join_full_refresh_placeholder",
+    )
+}
+
 pub(crate) fn rewrite_join_delta_append_only_query(
     query: &sqlparser::ast::Query,
     branch_query: sqlparser::ast::Query,
     left_uuid: &str,
     right_uuid: &str,
+) -> Result<sqlparser::ast::Query, String> {
+    wrap_join_apply_key_query(
+        query,
+        branch_query,
+        left_uuid,
+        right_uuid,
+        "__nr_join_delta_append_only_branch",
+        "__nr_join_delta_append_only_placeholder",
+    )
+}
+
+fn wrap_join_apply_key_query(
+    query: &sqlparser::ast::Query,
+    source_query: sqlparser::ast::Query,
+    left_uuid: &str,
+    right_uuid: &str,
+    source_alias: &str,
+    placeholder_name: &str,
 ) -> Result<sqlparser::ast::Query, String> {
     let payload_columns = payload_projection_columns(query)?;
     let mut items = payload_columns
@@ -210,23 +262,21 @@ pub(crate) fn rewrite_join_delta_append_only_query(
         crate::exec::change_op::CHANGE_OP_COLUMN,
     ));
     let sql = format!(
-        "SELECT {} FROM (SELECT 1 AS __nr_join_delta_append_only_placeholder) \
-         AS __nr_join_delta_append_only_branch",
-        items.join(", ")
+        "SELECT {} FROM (SELECT 1 AS {placeholder_name}) AS {source_alias}",
+        items.join(", "),
     );
-    let mut parsed = parse_query_from_sql(&sql).map_err(|err| {
-        format!("join delta append-only rewrite generated invalid SQL: {err}; sql={sql}")
-    })?;
+    let mut parsed = parse_query_from_sql(&sql)
+        .map_err(|err| format!("join apply-key rewrite generated invalid SQL: {err}; sql={sql}"))?;
     let sqlparser::ast::SetExpr::Select(select) = parsed.body.as_mut() else {
-        return Err("join delta append-only rewrite generated non-SELECT body".to_string());
+        return Err("join apply-key rewrite generated non-SELECT body".to_string());
     };
     let [from] = select.from.as_mut_slice() else {
-        return Err("join delta append-only rewrite generated invalid FROM".to_string());
+        return Err("join apply-key rewrite generated invalid FROM".to_string());
     };
     let sqlparser::ast::TableFactor::Derived { subquery, .. } = &mut from.relation else {
-        return Err("join delta append-only rewrite generated non-derived FROM".to_string());
+        return Err("join apply-key rewrite generated non-derived FROM".to_string());
     };
-    *subquery = Box::new(branch_query);
+    *subquery = Box::new(source_query);
     Ok(parsed)
 }
 
@@ -1022,6 +1072,32 @@ mod tests {
             !rendered.contains("__nr_join_delta_coalesced"),
             "append-only fast path must not use coalesce CTEs: sql={rendered}"
         );
+        assert_final_select_excludes_row_id_columns(&wrapped);
+    }
+
+    #[test]
+    fn join_full_refresh_apply_wrapper_outputs_target_shape() {
+        let full_refresh_query = parse_query(
+            "select l.id, r.label, CAST(1 AS TINYINT) as __change_op, \
+             l._row_id as __nova_left_row_id, r._row_id as __nova_right_row_id \
+             from ns.left__at_11 l join ns.right__at_22 r on l.id = r.id",
+        );
+        let wrapped = rewrite_join_full_refresh_apply_query(
+            &simple_join_query(),
+            full_refresh_query,
+            "left-uuid",
+            "right-uuid",
+        )
+        .expect("full refresh apply rewrite");
+        let rendered = wrapped.to_string();
+
+        assert_sql_contains(&rendered, "join_row_key");
+        assert_sql_contains(&rendered, "'left-uuid'");
+        assert_sql_contains(&rendered, JOIN_LEFT_ROW_ID_COLUMN);
+        assert_sql_contains(&rendered, "'right-uuid'");
+        assert_sql_contains(&rendered, JOIN_RIGHT_ROW_ID_COLUMN);
+        assert_sql_contains(&rendered, "AS __nova_join_row_key");
+        assert_sql_contains(&rendered, "CAST(__change_op AS TINYINT) AS __change_op");
         assert_final_select_excludes_row_id_columns(&wrapped);
     }
 
