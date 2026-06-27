@@ -98,28 +98,20 @@ impl OperatorFactory for IcebergMergeSinkFactory {
         &self.name
     }
 
-    fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        // A1 single-driver: only driver 0 owns the writer. Other drivers
-        // produce no-op sinks. Multi-driver morsel allocation is deferred
-        // to a later A1 phase.
-        let writer = if driver_id == 0 {
-            match IcebergStreamingDataFileWriter::new(self.plan.target_table.clone()) {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    return Box::new(FailedSinkOperator {
-                        name: self.name.clone(),
-                        error: e,
-                    });
-                }
+    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
+        let writer = match IcebergStreamingDataFileWriter::new(self.plan.target_table.clone()) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                return Box::new(FailedSinkOperator {
+                    name: self.name.clone(),
+                    error: e,
+                });
             }
-        } else {
-            None
         };
         Box::new(IcebergMergeSinkOperator {
             name: self.name.clone(),
             plan: Arc::clone(&self.plan),
             writer,
-            driver_id,
             finished: false,
         })
     }
@@ -133,7 +125,6 @@ struct IcebergMergeSinkOperator {
     name: String,
     plan: Arc<IcebergMergeSinkPlan>,
     writer: Option<IcebergStreamingDataFileWriter>,
-    driver_id: i32,
     finished: bool,
 }
 
@@ -165,9 +156,6 @@ impl ProcessorOperator for IcebergMergeSinkOperator {
     }
 
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
-        if self.driver_id != 0 {
-            return Ok(());
-        }
         let (insert_batch, delete_batch) = partition_chunk_by_change_op(&chunk)?;
         if let Some(batch) = insert_batch {
             let writer = self
@@ -1097,5 +1085,62 @@ mod tests {
                 crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN,
             ]
         );
+    }
+
+    #[test]
+    fn nonzero_driver_writes_insert_rows_to_collector() {
+        let fixture = data_block_on(
+            crate::connector::iceberg::commit::test_helpers::empty_v3_iceberg_table(),
+        )
+        .expect("iceberg fixture");
+        let metadata = fixture.table.metadata();
+        let collector = Arc::new(
+            IcebergCommitCollector::new(
+                crate::connector::iceberg::commit::CommitOpKind::RowDeltaDv,
+                fixture.table_ident.clone(),
+                metadata.current_snapshot().map(|s| s.snapshot_id()),
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                format!("{}/staging", metadata.location()),
+                crate::common::types::UniqueId { hi: 1, lo: 2 },
+            )
+            .with_table_metadata(metadata.clone()),
+        );
+        let plan = IcebergMergeSinkPlan {
+            target_table: fixture.table.clone(),
+            collector: Arc::clone(&collector),
+            locator_state: None,
+            apply_key_column: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN
+                .to_string(),
+            apply_key_value_type: ApplyKeyValueType::Int64,
+            partition_filter: crate::engine::mv::partition::TargetPartitionFilter::None,
+            partition_derivation: None,
+            pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(),
+        };
+        let factory = IcebergMergeSinkFactory::new(plan);
+        let mut op = factory.create(4, 2);
+        let processor = op.as_processor_mut().expect("processor");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            crate::exec::change_op::change_op_field(),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![101])) as ArrayRef,
+                Arc::new(Int8Array::from(vec![CHANGE_OP_INSERT])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        processor
+            .push_chunk(&RuntimeState::default(), chunk_with(batch))
+            .expect("push insert chunk");
+        processor
+            .set_finishing(&RuntimeState::default())
+            .expect("finish writer");
+
+        assert_eq!(collector.injected_data_record_count(), 1);
     }
 }
