@@ -93,10 +93,203 @@ pub(crate) fn rewrite_join_branch_query(
     Ok(query)
 }
 
+pub(crate) fn rewrite_join_delta_coalesce_query(
+    query: &sqlparser::ast::Query,
+    branches: &[JoinDeltaBranchPlan],
+    left_alias: &str,
+    right_alias: &str,
+    left_uuid: &str,
+    right_uuid: &str,
+) -> Result<sqlparser::ast::Query, String> {
+    if branches.is_empty() {
+        return Err("join delta coalesce rewrite requires at least one branch".to_string());
+    }
+    let payload_columns = payload_projection_columns(query)?;
+    let mut branch_queries = Vec::with_capacity(branches.len());
+    let mut branch_ctes = Vec::with_capacity(branches.len());
+    for (index, branch) in branches.iter().enumerate() {
+        branch_queries.push(rewrite_join_branch_query(
+            query,
+            branch,
+            left_alias,
+            right_alias,
+        )?);
+        branch_ctes.push(format!(
+            "{} AS (SELECT 1 AS __nr_join_delta_branch_placeholder)",
+            join_delta_branch_cte_name(index),
+        ));
+    }
+    let change_stream = branches
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            format!(
+                "SELECT {} FROM {}",
+                change_stream_select_list(&payload_columns, left_uuid, right_uuid),
+                join_delta_branch_cte_name(index)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let coalesced_select = coalesced_select_list(&payload_columns);
+    let final_select = final_coalesced_select_list(&payload_columns);
+    let change_stream_cte = format!("__nr_join_delta_change_stream AS ({change_stream})");
+    let coalesced_cte = format!(
+        "__nr_join_delta_coalesced AS (\
+         SELECT {coalesced_select} \
+         FROM __nr_join_delta_change_stream \
+         GROUP BY {} \
+         HAVING SUM({}) <> 0 \
+         AND assert_true(abs(SUM({})) <= 1, 'join delta per-key net change exceeds 1'))",
+        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        crate::exec::change_op::CHANGE_OP_COLUMN,
+        crate::exec::change_op::CHANGE_OP_COLUMN,
+    );
+    let ctes = branch_ctes
+        .into_iter()
+        .chain([change_stream_cte, coalesced_cte])
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("WITH {ctes} SELECT {final_select} FROM __nr_join_delta_coalesced");
+    let mut parsed = parse_query_from_sql(&sql).map_err(|err| {
+        format!("join delta coalesce rewrite generated invalid SQL: {err}; sql={sql}")
+    })?;
+    replace_branch_cte_queries(&mut parsed, branch_queries)?;
+    Ok(parsed)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BranchRewrite {
     alias: sqlparser::ast::Ident,
     is_delta: bool,
+}
+
+fn payload_projection_columns(
+    query: &sqlparser::ast::Query,
+) -> Result<Vec<sqlparser::ast::Ident>, String> {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err("join delta coalesce rewrite requires SELECT body".to_string());
+    };
+    select
+        .projection
+        .iter()
+        .map(payload_projection_column)
+        .collect()
+}
+
+fn payload_projection_column(
+    item: &sqlparser::ast::SelectItem,
+) -> Result<sqlparser::ast::Ident, String> {
+    match item {
+        sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => Ok(alias.clone()),
+        sqlparser::ast::SelectItem::UnnamedExpr(expr) => projection_expr_default_name(expr)
+            .ok_or_else(|| {
+                "join delta coalesce rewrite requires aliases for non-column payload expressions"
+                    .to_string()
+            }),
+        sqlparser::ast::SelectItem::Wildcard(_)
+        | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => Err(
+            "join delta coalesce rewrite requires explicit payload projection columns".to_string(),
+        ),
+    }
+}
+
+fn projection_expr_default_name(expr: &sqlparser::ast::Expr) -> Option<sqlparser::ast::Ident> {
+    match expr {
+        sqlparser::ast::Expr::Identifier(ident) => Some(ident.clone()),
+        sqlparser::ast::Expr::CompoundIdentifier(parts) => parts.last().cloned(),
+        sqlparser::ast::Expr::Nested(inner) => projection_expr_default_name(inner),
+        _ => None,
+    }
+}
+
+fn join_delta_branch_cte_name(index: usize) -> String {
+    format!("__nr_join_delta_branch_{index}")
+}
+
+fn change_stream_select_list(
+    payload_columns: &[sqlparser::ast::Ident],
+    left_uuid: &str,
+    right_uuid: &str,
+) -> String {
+    let mut items = payload_columns
+        .iter()
+        .map(|ident| ident.to_string())
+        .collect::<Vec<_>>();
+    items.push(format!(
+        "join_row_key({}, {}, {}, {}) AS {}",
+        sql_string_literal(left_uuid),
+        JOIN_LEFT_ROW_ID_COLUMN,
+        sql_string_literal(right_uuid),
+        JOIN_RIGHT_ROW_ID_COLUMN,
+        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+    ));
+    items.push(crate::exec::change_op::CHANGE_OP_COLUMN.to_string());
+    items.join(", ")
+}
+
+fn coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
+    let mut items = vec![
+        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+        format!("SUM({}) AS net", crate::exec::change_op::CHANGE_OP_COLUMN),
+    ];
+    items.extend(
+        payload_columns
+            .iter()
+            .map(|ident| format!("any_value({ident}) AS {ident}")),
+    );
+    items.join(", ")
+}
+
+fn final_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
+    let mut items = payload_columns
+        .iter()
+        .map(|ident| format!("{ident} AS {ident}"))
+        .collect::<Vec<_>>();
+    items.push(
+        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+    );
+    items.push(format!(
+        "CASE WHEN net > 0 THEN {} ELSE {} END AS {}",
+        crate::exec::change_op::CHANGE_OP_INSERT,
+        crate::exec::change_op::CHANGE_OP_DELETE,
+        crate::exec::change_op::CHANGE_OP_COLUMN,
+    ));
+    items.join(", ")
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn parse_query_from_sql(sql: &str) -> Result<sqlparser::ast::Query, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)?;
+    let sqlparser::ast::Statement::Query(query) = stmt else {
+        return Err("expected generated SQL to parse as query".to_string());
+    };
+    Ok(*query)
+}
+
+fn replace_branch_cte_queries(
+    query: &mut sqlparser::ast::Query,
+    branch_queries: Vec<sqlparser::ast::Query>,
+) -> Result<(), String> {
+    let branch_count = branch_queries.len();
+    let with = query
+        .with
+        .as_mut()
+        .ok_or_else(|| "join delta coalesce rewrite generated query without WITH".to_string())?;
+    if with.cte_tables.len() < branch_count {
+        return Err(format!(
+            "join delta coalesce rewrite generated {} CTEs for {branch_count} branches",
+            with.cte_tables.len()
+        ));
+    }
+    for (cte, branch_query) in with.cte_tables.iter_mut().zip(branch_queries) {
+        cte.query = Box::new(branch_query);
+    }
+    Ok(())
 }
 
 fn rewrite_branch_factor(
@@ -410,6 +603,118 @@ mod tests {
             !rendered.contains("fallback_left") && !rendered.contains("fallback_right"),
             "sql={rendered}"
         );
+    }
+
+    #[test]
+    fn join_delta_coalesce_two_branches_builds_grouped_change_stream() {
+        let query = simple_join_query();
+        let left = base("left");
+        let right = base("right");
+        let branches = plan_join_delta_branches(
+            &left,
+            &right,
+            SnapshotWindow { from: 10, to: 11 },
+            SnapshotWindow { from: 20, to: 21 },
+            true,
+            true,
+        );
+
+        let rewritten = rewrite_join_delta_coalesce_query(
+            &query,
+            &branches,
+            "l",
+            "r",
+            "left-uuid",
+            "right-uuid",
+        )
+        .expect("coalesce rewrite");
+        let rendered = rewritten.to_string();
+
+        assert_sql_contains(&rendered, "__nr_join_delta_branch_0");
+        assert_sql_contains(&rendered, "__nr_join_delta_branch_1");
+        assert_sql_contains(&rendered, "UNION ALL");
+        assert_sql_contains(&rendered, "join_row_key");
+        assert_sql_contains(&rendered, "'left-uuid'");
+        assert_sql_contains(&rendered, JOIN_LEFT_ROW_ID_COLUMN);
+        assert_sql_contains(&rendered, "'right-uuid'");
+        assert_sql_contains(&rendered, JOIN_RIGHT_ROW_ID_COLUMN);
+        assert_sql_contains(
+            &rendered,
+            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        );
+        assert_sql_contains(&rendered, "GROUP BY __nova_join_row_key");
+        assert_sql_contains(&rendered, "SUM(__change_op)");
+        assert_sql_contains(&rendered, "any_value(id) AS id");
+        assert_sql_contains(&rendered, "any_value(label) AS label");
+        assert_sql_contains(&rendered, "HAVING SUM(__change_op) <> 0");
+        assert_sql_contains(
+            &rendered,
+            "assert_true(abs(SUM(__change_op)) <= 1, 'join delta per-key net change exceeds 1')",
+        );
+        assert_sql_contains(
+            &rendered,
+            "CASE WHEN net > 0 THEN 1 ELSE -1 END AS __change_op",
+        );
+        assert_sql_contains(&rendered, "__nova_join_row_key");
+    }
+
+    #[test]
+    fn join_delta_coalesce_one_branch_builds_grouped_change_stream() {
+        let query = simple_join_query();
+        let left = base("left");
+        let right = base("right");
+        let branches = plan_join_delta_branches(
+            &left,
+            &right,
+            SnapshotWindow { from: 10, to: 11 },
+            SnapshotWindow { from: 20, to: 20 },
+            true,
+            false,
+        );
+
+        let rewritten = rewrite_join_delta_coalesce_query(
+            &query,
+            &branches,
+            "l",
+            "r",
+            "left-uuid",
+            "right-uuid",
+        )
+        .expect("coalesce rewrite");
+        let rendered = rewritten.to_string();
+
+        assert_sql_contains(&rendered, "__nr_join_delta_branch_0");
+        assert_sql_contains(&rendered, "__nr_join_delta_change_stream");
+        assert_sql_contains(&rendered, "GROUP BY __nova_join_row_key");
+        assert_sql_contains(&rendered, "SUM(__change_op)");
+        assert_sql_contains(&rendered, "any_value(id) AS id");
+        assert_sql_contains(&rendered, "any_value(label) AS label");
+        assert_sql_contains(&rendered, "HAVING SUM(__change_op) <> 0");
+        assert_sql_contains(
+            &rendered,
+            "CASE WHEN net > 0 THEN 1 ELSE -1 END AS __change_op",
+        );
+    }
+
+    #[test]
+    fn join_delta_coalesce_empty_branch_list_returns_error() {
+        let query = simple_join_query();
+        let err =
+            rewrite_join_delta_coalesce_query(&query, &[], "l", "r", "left-uuid", "right-uuid")
+                .expect_err("empty branch list must be rejected");
+
+        assert!(
+            err.contains("requires at least one branch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn simple_join_query() -> sqlparser::ast::Query {
+        parse_query("select l.id, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id")
+    }
+
+    fn assert_sql_contains(sql: &str, expected: &str) {
+        assert!(sql.contains(expected), "expected `{expected}` in sql={sql}");
     }
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
