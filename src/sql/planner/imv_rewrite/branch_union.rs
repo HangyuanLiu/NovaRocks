@@ -521,21 +521,34 @@ mod tests {
     }
 
     fn assert_aggregate_change_stream_branch(branch: &LogicalPlanNode) {
-        let union = aggregate_change_stream_union(branch);
-        assert!(union.all);
+        let output_names = aggregate_change_stream_output_names(branch);
         assert!(
-            union
-                .output_columns
+            output_names
                 .iter()
-                .any(|c| c.name.eq_ignore_ascii_case("__branch_id__")),
+                .any(|name| name.eq_ignore_ascii_case("__branch_id__")),
             "change-stream branch output must expose __branch_id__"
         );
         assert!(
-            union
-                .output_columns
+            output_names
                 .iter()
-                .any(|c| c.name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
+                .any(|name| name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
             "change-stream branch output must expose __change_op"
+        );
+        assert!(
+            contains_join_kind(branch, JoinKind::LeftOuter),
+            "relational change-stream branch must merge delta and old target state once"
+        );
+        assert!(
+            contains_join_kind(branch, JoinKind::Cross),
+            "relational change-stream branch must expand DELETE/INSERT branches once"
+        );
+        assert!(
+            contains_branch_marker_values(branch),
+            "relational change-stream branch must generate a branch marker VALUES source"
+        );
+        assert!(
+            project_filter_contains_state_all_zero(branch),
+            "relational change-stream branch must guard INSERT output with state_all_zero"
         );
         assert!(
             contains_target_state_scan(branch),
@@ -551,16 +564,127 @@ mod tests {
         );
     }
 
-    fn aggregate_change_stream_union(branch: &LogicalPlanNode) -> &LogicalUnionNode {
+    fn aggregate_change_stream_output_names(branch: &LogicalPlanNode) -> Vec<&str> {
         match &branch.kind {
-            PlanNodeKind::Union(union) => union,
-            PlanNodeKind::CTEAnchor(_) => {
-                let PlanNodeKind::Union(union) = &branch.child(1).kind else {
-                    panic!("expected CTEAnchor consumer to be aggregate change-stream Union");
-                };
-                union
+            PlanNodeKind::Project(project) => project
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect(),
+            PlanNodeKind::Union(union) => union
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect(),
+            PlanNodeKind::CTEAnchor(_) => aggregate_change_stream_output_names(branch.child(1)),
+            other => panic!("expected aggregate change-stream branch, got {other:?}"),
+        }
+    }
+
+    fn contains_join_kind(plan: &LogicalPlanNode, join_type: JoinKind) -> bool {
+        matches!(
+            &plan.kind,
+            PlanNodeKind::Join(join) if join.join_type == join_type
+        ) || plan
+            .children
+            .iter()
+            .any(|child| contains_join_kind(child, join_type))
+    }
+
+    fn contains_branch_marker_values(plan: &LogicalPlanNode) -> bool {
+        matches!(&plan.kind, PlanNodeKind::Values(values)
+            if values.columns.iter().any(|column| {
+                column.name.eq_ignore_ascii_case("__imv_change_branch")
+            })
+        ) || plan.children.iter().any(contains_branch_marker_values)
+    }
+
+    fn project_filter_contains_state_all_zero(plan: &LogicalPlanNode) -> bool {
+        let PlanNodeKind::Project(_) = &plan.kind else {
+            return plan
+                .children
+                .iter()
+                .any(project_filter_contains_state_all_zero);
+        };
+        let Some(filter_plan) = plan.children.first() else {
+            return false;
+        };
+        let PlanNodeKind::Filter(filter) = &filter_plan.kind else {
+            return false;
+        };
+        expr_contains_function(&filter.predicate, "state_all_zero")
+    }
+
+    fn expr_contains_function(expr: &TypedExpr, name: &str) -> bool {
+        match &expr.kind {
+            ExprKind::FunctionCall {
+                name: func, args, ..
             }
-            other => panic!("expected aggregate change-stream Union branch, got {other:?}"),
+            | ExprKind::AggregateCall {
+                name: func, args, ..
+            } => {
+                func.eq_ignore_ascii_case(name)
+                    || args.iter().any(|arg| expr_contains_function(arg, name))
+            }
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_contains_function(left, name) || expr_contains_function(right, name)
+            }
+            ExprKind::UnaryOp { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::IsTruthValue { expr, .. } => expr_contains_function(expr, name),
+            ExprKind::InList { expr, list, .. } => {
+                expr_contains_function(expr, name)
+                    || list.iter().any(|item| expr_contains_function(item, name))
+            }
+            ExprKind::Between {
+                expr, low, high, ..
+            } => {
+                expr_contains_function(expr, name)
+                    || expr_contains_function(low, name)
+                    || expr_contains_function(high, name)
+            }
+            ExprKind::Like { expr, pattern, .. } => {
+                expr_contains_function(expr, name) || expr_contains_function(pattern, name)
+            }
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand
+                    .as_deref()
+                    .is_some_and(|expr| expr_contains_function(expr, name))
+                    || when_then.iter().any(|(when_expr, then_expr)| {
+                        expr_contains_function(when_expr, name)
+                            || expr_contains_function(then_expr, name)
+                    })
+                    || else_expr
+                        .as_deref()
+                        .is_some_and(|expr| expr_contains_function(expr, name))
+            }
+            ExprKind::LambdaFunction { body, .. } => expr_contains_function(body, name),
+            ExprKind::Nested(expr) | ExprKind::Lambda { body: expr, .. } => {
+                expr_contains_function(expr, name)
+            }
+            ExprKind::WindowCall {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                args.iter().any(|arg| expr_contains_function(arg, name))
+                    || partition_by
+                        .iter()
+                        .any(|expr| expr_contains_function(expr, name))
+                    || order_by
+                        .iter()
+                        .any(|item| expr_contains_function(&item.expr, name))
+            }
+            ExprKind::ColumnRef { .. }
+            | ExprKind::LambdaParamRef { .. }
+            | ExprKind::Literal(_)
+            | ExprKind::SubqueryPlaceholder { .. } => false,
         }
     }
 

@@ -1631,8 +1631,8 @@ mod tests {
 
     fn assert_aggregate_change_stream_plan(plan: &LogicalPlanNode) {
         assert!(
-            contains_aggregate_change_stream_union(plan),
-            "expected aggregate change-stream Union in plan: {plan:?}"
+            contains_aggregate_change_stream(plan),
+            "expected aggregate change-stream plan: {plan:?}"
         );
         assert!(
             contains_target_state_scan(plan),
@@ -1648,17 +1648,140 @@ mod tests {
         );
     }
 
+    fn contains_aggregate_change_stream(plan: &LogicalPlanNode) -> bool {
+        contains_aggregate_change_stream_union(plan) || contains_relational_change_stream(plan)
+    }
+
     fn contains_aggregate_change_stream_union(plan: &LogicalPlanNode) -> bool {
-        matches!(
-            &plan.kind,
-            PlanNodeKind::Union(union)
-                if union.output_columns.iter().any(|column| {
-                    column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)
-                })
+        matches!(&plan.kind, PlanNodeKind::Union(union)
+            if union.output_columns.iter().any(|column| {
+                column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)
+            })
         ) || plan
             .children
             .iter()
             .any(contains_aggregate_change_stream_union)
+    }
+
+    fn contains_relational_change_stream(plan: &LogicalPlanNode) -> bool {
+        let matched = match &plan.kind {
+            PlanNodeKind::Project(project) => {
+                project
+                    .items
+                    .iter()
+                    .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+                    && project_filter_contains_state_all_zero(plan)
+                    && contains_join_kind(plan, JoinKind::LeftOuter)
+                    && contains_join_kind(plan, JoinKind::Cross)
+                    && contains_branch_marker_values(plan)
+            }
+            _ => false,
+        };
+        matched || plan.children.iter().any(contains_relational_change_stream)
+    }
+
+    fn project_filter_contains_state_all_zero(plan: &LogicalPlanNode) -> bool {
+        let PlanNodeKind::Project(_) = &plan.kind else {
+            return false;
+        };
+        let Some(filter_plan) = plan.children.first() else {
+            return false;
+        };
+        let PlanNodeKind::Filter(filter) = &filter_plan.kind else {
+            return false;
+        };
+        expr_contains_function(&filter.predicate, "state_all_zero")
+    }
+
+    fn contains_join_kind(plan: &LogicalPlanNode, join_type: JoinKind) -> bool {
+        matches!(
+            &plan.kind,
+            PlanNodeKind::Join(join) if join.join_type == join_type
+        ) || plan
+            .children
+            .iter()
+            .any(|child| contains_join_kind(child, join_type))
+    }
+
+    fn contains_branch_marker_values(plan: &LogicalPlanNode) -> bool {
+        matches!(&plan.kind, PlanNodeKind::Values(values)
+            if values.columns.iter().any(|column| {
+                column.name.eq_ignore_ascii_case("__imv_change_branch")
+            })
+        ) || plan.children.iter().any(contains_branch_marker_values)
+    }
+
+    fn expr_contains_function(expr: &TypedExpr, name: &str) -> bool {
+        match &expr.kind {
+            ExprKind::FunctionCall {
+                name: func, args, ..
+            }
+            | ExprKind::AggregateCall {
+                name: func, args, ..
+            } => {
+                func.eq_ignore_ascii_case(name)
+                    || args.iter().any(|arg| expr_contains_function(arg, name))
+            }
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_contains_function(left, name) || expr_contains_function(right, name)
+            }
+            ExprKind::UnaryOp { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::IsTruthValue { expr, .. } => expr_contains_function(expr, name),
+            ExprKind::InList { expr, list, .. } => {
+                expr_contains_function(expr, name)
+                    || list.iter().any(|item| expr_contains_function(item, name))
+            }
+            ExprKind::Between {
+                expr, low, high, ..
+            } => {
+                expr_contains_function(expr, name)
+                    || expr_contains_function(low, name)
+                    || expr_contains_function(high, name)
+            }
+            ExprKind::Like { expr, pattern, .. } => {
+                expr_contains_function(expr, name) || expr_contains_function(pattern, name)
+            }
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand
+                    .as_deref()
+                    .is_some_and(|expr| expr_contains_function(expr, name))
+                    || when_then.iter().any(|(when_expr, then_expr)| {
+                        expr_contains_function(when_expr, name)
+                            || expr_contains_function(then_expr, name)
+                    })
+                    || else_expr
+                        .as_deref()
+                        .is_some_and(|expr| expr_contains_function(expr, name))
+            }
+            ExprKind::LambdaFunction { body, .. } => expr_contains_function(body, name),
+            ExprKind::Nested(expr) | ExprKind::Lambda { body: expr, .. } => {
+                expr_contains_function(expr, name)
+            }
+            ExprKind::WindowCall {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                args.iter().any(|arg| expr_contains_function(arg, name))
+                    || partition_by
+                        .iter()
+                        .any(|expr| expr_contains_function(expr, name))
+                    || order_by
+                        .iter()
+                        .any(|item| expr_contains_function(&item.expr, name))
+            }
+            ExprKind::ColumnRef { .. }
+            | ExprKind::LambdaParamRef { .. }
+            | ExprKind::Literal(_)
+            | ExprKind::SubqueryPlaceholder { .. } => false,
+        }
     }
 
     fn find_signed_delta_project(plan: &LogicalPlanNode) -> &LogicalPlanNode {

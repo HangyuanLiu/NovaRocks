@@ -3942,19 +3942,32 @@ mod tests {
 
     struct TestCatalog;
 
-    fn test_iceberg_table_info() -> IcebergTableInfo {
+    fn test_iceberg_table_info_for(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> IcebergTableInfo {
         IcebergTableInfo {
-            catalog: "test_catalog".to_string(),
-            namespace: "test_db".to_string(),
-            table: "test_table".to_string(),
+            catalog: catalog.to_string(),
+            namespace: namespace.to_string(),
+            table: table.to_string(),
             table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
             current_snapshot_id: Some(7),
             schema_id: 1,
-            location: "file:///tmp/test_table".to_string(),
+            location: format!("file:///tmp/{catalog}/{namespace}/{table}"),
             schema: IcebergSchemaDef { fields: vec![] },
-            serialized_metadata: None,
+            serialized_metadata: Some(
+                serde_json::to_string(
+                    &crate::sql::analyzer::iceberg_ref::test_utils::metadata_empty(),
+                )
+                .expect("serialize test iceberg metadata"),
+            ),
             serialized_metadata_rows: None,
         }
+    }
+
+    fn test_iceberg_table_info() -> IcebergTableInfo {
+        test_iceberg_table_info_for("test_catalog", "test_db", "test_table")
     }
 
     impl crate::sql::catalog::CatalogProvider for TestCatalog {
@@ -4377,6 +4390,29 @@ mod tests {
                 }),
                 _ => Err(format!("table not found: {table}")),
             }
+        }
+
+        fn get_table_with_mode(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+            mode: TableLookupMode,
+        ) -> Result<TableDef, String> {
+            let mut table_def = self.get_table(database, table)?;
+            if matches!(mode, TableLookupMode::IcebergMetadata { .. }) {
+                table_def.source = ScanSource::IcebergDataFiles {
+                    table: test_iceberg_table_info_for(
+                        catalog.unwrap_or("default_catalog"),
+                        database,
+                        table,
+                    ),
+                    files: vec![],
+                    cloud_properties: Default::default(),
+                    binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                };
+            }
+            Ok(table_def)
         }
     }
 
@@ -6386,19 +6422,10 @@ mod tests {
 
     struct CatalogAwareTestCatalog;
 
-    impl crate::sql::catalog::CatalogProvider for CatalogAwareTestCatalog {
-        fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
-            self.get_table_in_catalog(None, database, table)
-        }
-
-        fn get_table_in_catalog(
-            &self,
-            catalog: Option<&str>,
-            database: &str,
-            table: &str,
-        ) -> Result<TableDef, String> {
+    impl CatalogAwareTestCatalog {
+        fn starrocks_table_def(catalog: Option<&str>, database: &str, table: &str) -> TableDef {
             let catalog_name = catalog.unwrap_or("default_catalog");
-            Ok(TableDef {
+            TableDef {
                 name: format!("{catalog_name}_{database}_{table}"),
                 columns: vec![ColumnDef {
                     name: "id".to_string(),
@@ -6412,7 +6439,51 @@ mod tests {
                     db_id: if catalog == Some("ice") { 100 } else { 1 },
                     table_id: 2,
                 },
-            })
+            }
+        }
+
+        fn iceberg_table_def(catalog: Option<&str>, database: &str, table: &str) -> TableDef {
+            let mut table_def = Self::starrocks_table_def(catalog, database, table);
+            table_def.source = ScanSource::IcebergDataFiles {
+                table: test_iceberg_table_info_for(
+                    catalog.unwrap_or("default_catalog"),
+                    database,
+                    table,
+                ),
+                files: vec![],
+                cloud_properties: Default::default(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            };
+            table_def
+        }
+    }
+
+    impl crate::sql::catalog::CatalogProvider for CatalogAwareTestCatalog {
+        fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
+            self.get_table_in_catalog(None, database, table)
+        }
+
+        fn get_table_in_catalog(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<TableDef, String> {
+            Ok(Self::starrocks_table_def(catalog, database, table))
+        }
+
+        fn get_table_with_mode(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+            mode: TableLookupMode,
+        ) -> Result<TableDef, String> {
+            if matches!(mode, TableLookupMode::IcebergMetadata { .. }) {
+                Ok(Self::iceberg_table_def(catalog, database, table))
+            } else {
+                self.get_table_in_catalog(catalog, database, table)
+            }
         }
     }
 
@@ -6479,7 +6550,7 @@ mod tests {
                         metadata_table_type: IcebergMetadataTableType::Partitions,
                     }
                 ));
-                CatalogAwareTestCatalog.get_table_in_catalog(catalog, database, table)
+                CatalogAwareTestCatalog.get_table_with_mode(catalog, database, table, mode)
             }
         }
 
@@ -6522,7 +6593,7 @@ mod tests {
                         metadata_table_type: IcebergMetadataTableType::Partitions,
                     }
                 ));
-                CatalogAwareTestCatalog.get_table_in_catalog(catalog, database, table)
+                CatalogAwareTestCatalog.get_table_with_mode(catalog, database, table, mode)
             }
         }
 
