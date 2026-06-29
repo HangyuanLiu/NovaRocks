@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::fs::opendal::OpendalRangeReaderFactory;
+use opendal::Operator;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FsScheme {
     Local,
@@ -146,6 +149,104 @@ impl FsLocation {
 
         ensure_non_empty_path(original, "file", rest)?;
         Ok(Self::local(original, Some(uri_scheme), rest))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedFsPath {
+    location: FsLocation,
+    operator_relative_path: String,
+}
+
+impl ResolvedFsPath {
+    pub fn new(
+        location: FsLocation,
+        operator_relative_path: impl Into<String>,
+    ) -> Result<Self, String> {
+        let operator_relative_path = operator_relative_path.into();
+        if operator_relative_path.trim().is_empty() {
+            return Err("operator-relative path is empty".to_string());
+        }
+        Ok(Self {
+            location,
+            operator_relative_path,
+        })
+    }
+
+    pub fn location(&self) -> &FsLocation {
+        &self.location
+    }
+
+    pub fn operator_relative_path(&self) -> &str {
+        &self.operator_relative_path
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FsAccessHandle {
+    scheme: FsScheme,
+    operator: Operator,
+    root: Option<String>,
+    paths: Vec<ResolvedFsPath>,
+}
+
+impl FsAccessHandle {
+    pub fn new(
+        scheme: FsScheme,
+        operator: Operator,
+        root: Option<String>,
+        paths: Vec<ResolvedFsPath>,
+    ) -> Self {
+        Self {
+            scheme,
+            operator,
+            root,
+            paths,
+        }
+    }
+
+    pub fn scheme(&self) -> FsScheme {
+        self.scheme
+    }
+
+    pub fn operator(&self) -> Operator {
+        self.operator.clone()
+    }
+
+    pub fn root(&self) -> Option<&str> {
+        self.root.as_deref()
+    }
+
+    pub fn paths(&self) -> &[ResolvedFsPath] {
+        &self.paths
+    }
+
+    pub fn reader_factory(&self) -> Result<OpendalRangeReaderFactory, String> {
+        OpendalRangeReaderFactory::from_operator(self.operator.clone()).map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FsAccessResolver;
+
+impl FsAccessResolver {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn parse_location(&self, raw: impl AsRef<str>) -> Result<FsLocation, String> {
+        FsLocation::parse(raw)
+    }
+
+    pub fn parse_locations<I, S>(&self, locations: I) -> Result<Vec<FsLocation>, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        locations
+            .into_iter()
+            .map(|location| self.parse_location(location))
+            .collect()
     }
 }
 
@@ -350,6 +451,80 @@ mod tests {
     fn rejects_unsupported_scheme() {
         let err = FsLocation::parse("ftp://host/path").expect_err("ftp is unsupported");
         assert!(err.contains("unsupported fs location scheme"), "{err}");
+    }
+
+    #[test]
+    fn resolved_path_keeps_location_and_operator_relative_path() {
+        let loc = FsLocation::parse("s3://bucket/warehouse/t/a.parquet")
+            .expect("parse object-store location");
+        let resolved =
+            ResolvedFsPath::new(loc.clone(), "warehouse/t/a.parquet").expect("resolved path");
+
+        assert_eq!(resolved.location(), &loc);
+        assert_eq!(resolved.operator_relative_path(), "warehouse/t/a.parquet");
+    }
+
+    #[test]
+    fn resolved_path_rejects_empty_relative_path() {
+        let loc = FsLocation::parse("/tmp/a.parquet").expect("parse local path");
+        let err = ResolvedFsPath::new(loc, "").expect_err("empty relative path is invalid");
+        assert!(err.contains("operator-relative path is empty"), "{err}");
+    }
+
+    #[test]
+    fn resolver_parses_multiple_locations() {
+        let resolver = FsAccessResolver::new();
+        let parsed = resolver
+            .parse_locations([
+                "s3://bucket/warehouse/t/a.parquet",
+                "s3a://bucket/warehouse/t/b.parquet",
+            ])
+            .expect("parse locations");
+
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().all(|loc| loc.scheme().is_object_store()));
+        assert_eq!(parsed[0].authority(), Some("bucket"));
+        assert_eq!(parsed[1].path(), "warehouse/t/b.parquet");
+    }
+
+    #[test]
+    fn object_store_config_keeps_bucket_root_for_fs1_compatibility() {
+        let cfg = crate::fs::object_store::ObjectStoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            bucket: "bucket-a".to_string(),
+            root: "warehouse/root".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            session_token: None,
+            enable_path_style_access: Some(true),
+            region: Some("us-east-1".to_string()),
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        };
+
+        assert_eq!(cfg.bucket, "bucket-a");
+        assert_eq!(cfg.root, "warehouse/root");
+    }
+
+    #[test]
+    fn handle_binds_operator_to_resolved_paths() {
+        let root = std::env::temp_dir();
+        let root = root.to_string_lossy().to_string();
+        let op = crate::fs::local::build_fs_operator(&root).expect("local operator");
+        let loc =
+            FsLocation::parse(format!("file://{root}/a.parquet")).expect("parse local file URI");
+        let path = ResolvedFsPath::new(loc, "a.parquet").expect("resolved path");
+
+        let handle = FsAccessHandle::new(FsScheme::Local, op, Some(root.clone()), vec![path]);
+
+        assert_eq!(handle.scheme(), FsScheme::Local);
+        assert_eq!(handle.root(), Some(root.as_str()));
+        assert_eq!(handle.paths().len(), 1);
+        let _op = handle.operator();
+        let _factory = handle.reader_factory().expect("range reader factory");
     }
 
     #[test]
