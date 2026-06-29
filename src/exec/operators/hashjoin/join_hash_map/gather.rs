@@ -346,6 +346,31 @@ mod tests {
     }
 
     #[test]
+    fn gather_probe_build_batches_preserves_output_order_when_probe_is_right() {
+        let probe = one_column_chunk("r", SlotId::new(2), vec![10, 20, 30]);
+        let build = one_column_chunk("l", SlotId::new(1), vec![1, 2, 3]);
+        let output_schema = join_schema("l", "r");
+        let probe_indices = vec![0, 1, 2];
+        let build_indices = vec![2, 0, 1];
+
+        let out = super::gather_probe_build_batches(
+            &probe,
+            &build,
+            &probe_indices,
+            &build_indices,
+            &output_schema,
+            false,
+            true,
+        )
+        .expect("gather");
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].num_rows(), 3);
+        assert_eq!(int32_values(&out[0], 0), vec![Some(3), Some(1), Some(2)]);
+        assert_eq!(int32_values(&out[0], 1), vec![Some(10), Some(20), Some(30)]);
+    }
+
+    #[test]
     fn gather_join_batches_splits_large_candidate_output() {
         let rows = MAX_JOIN_OUTPUT_ROWS_PER_BATCH + 1;
         let left = one_column_chunk("l", SlotId::new(1), (0..rows).map(|i| i as i32).collect());
