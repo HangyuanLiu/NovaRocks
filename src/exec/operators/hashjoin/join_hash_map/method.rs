@@ -145,8 +145,6 @@ pub(crate) struct DirectIntJoinHashMap {
     len: usize,
     first: Vec<u32>,
     next: Vec<u32>,
-    group_offsets: Vec<u32>,
-    group_rows: Vec<u32>,
     row_count: usize,
     indexed_rows: usize,
     not_null: bool,
@@ -370,16 +368,6 @@ impl JoinHashMap {
             }
         }
     }
-
-    pub(crate) fn group_build_rows(&self, group_id: usize) -> Result<&[u32], String> {
-        match self {
-            Self::Chained(map) => map.table.group_build_rows(group_id),
-            Self::DirectInt(map) => map.group_build_rows(group_id),
-            Self::DirectIntSet(_) => {
-                Err("presence-only direct integer join set cannot return build rows".to_string())
-            }
-        }
-    }
 }
 
 impl ChainedJoinHashMap {
@@ -565,8 +553,6 @@ impl DirectIntJoinHashMap {
             len,
             first: vec![ROW_NONE; len],
             next: vec![ROW_NONE; stats.row_count],
-            group_offsets: Vec::new(),
-            group_rows: Vec::new(),
             row_count: stats.row_count,
             indexed_rows: stats.indexed_rows,
             not_null: stats.not_null,
@@ -578,7 +564,6 @@ impl DirectIntJoinHashMap {
             map.set_mem_tracker(tracker);
         }
         map.fill_from_batches(batches)?;
-        map.build_group_rows()?;
         Ok(Some(map))
     }
 
@@ -614,35 +599,6 @@ impl DirectIntJoinHashMap {
         if base_row != self.row_count {
             return Err("direct integer join row count mismatch".to_string());
         }
-        Ok(())
-    }
-
-    fn build_group_rows(&mut self) -> Result<(), String> {
-        let mut group_offsets = Vec::with_capacity(
-            self.len
-                .checked_add(1)
-                .ok_or_else(|| "direct integer join group offset overflow".to_string())?,
-        );
-        let mut group_rows = Vec::with_capacity(self.indexed_rows);
-        for bucket in 0..self.len {
-            let offset = u32::try_from(group_rows.len())
-                .map_err(|_| "direct integer join group rows overflow".to_string())?;
-            group_offsets.push(offset);
-            let mut row = self.first[bucket];
-            while row != ROW_NONE {
-                group_rows.push(row);
-                row = self.next_row(row)?;
-            }
-        }
-        let final_offset = u32::try_from(group_rows.len())
-            .map_err(|_| "direct integer join group rows overflow".to_string())?;
-        group_offsets.push(final_offset);
-        if group_rows.len() != self.indexed_rows {
-            return Err("direct integer join indexed row count mismatch".to_string());
-        }
-        self.group_offsets = group_offsets;
-        self.group_rows = group_rows;
-        self.refresh_accounting();
         Ok(())
     }
 
@@ -805,26 +761,6 @@ impl DirectIntJoinHashMap {
             .ok_or_else(|| "direct integer join row id out of bounds".to_string())
     }
 
-    fn group_build_rows(&self, group_id: usize) -> Result<&[u32], String> {
-        if group_id >= self.len {
-            return Err("direct integer join group id out of bounds".to_string());
-        }
-        let start = *self
-            .group_offsets
-            .get(group_id)
-            .ok_or_else(|| "direct integer join group offset missing".to_string())?
-            as usize;
-        let end = *self
-            .group_offsets
-            .get(group_id + 1)
-            .ok_or_else(|| "direct integer join group offset missing".to_string())?
-            as usize;
-        if start > end || end > self.group_rows.len() {
-            return Err("direct integer join group row offset out of bounds".to_string());
-        }
-        Ok(&self.group_rows[start..end])
-    }
-
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
         if let Some(current) = self.mem_tracker.as_ref() {
             if Arc::ptr_eq(current, &tracker) {
@@ -838,30 +774,13 @@ impl DirectIntJoinHashMap {
         self.accounted_bytes = bytes;
     }
 
-    fn refresh_accounting(&mut self) {
-        let Some(tracker) = self.mem_tracker.as_ref() else {
-            return;
-        };
-        let bytes = self.tracked_bytes();
-        let delta = bytes - self.accounted_bytes;
-        if delta > 0 {
-            tracker.consume(delta);
-        } else if delta < 0 {
-            tracker.release(-delta);
-        }
-        self.accounted_bytes = bytes;
-    }
-
     fn tracked_bytes(&self) -> i64 {
         fn vec_bytes<T>(v: &Vec<T>) -> i64 {
             let bytes = v.capacity().saturating_mul(mem::size_of::<T>());
             i64::try_from(bytes).unwrap_or(i64::MAX)
         }
 
-        vec_bytes(&self.first)
-            .saturating_add(vec_bytes(&self.next))
-            .saturating_add(vec_bytes(&self.group_offsets))
-            .saturating_add(vec_bytes(&self.group_rows))
+        vec_bytes(&self.first).saturating_add(vec_bytes(&self.next))
     }
 }
 
@@ -1335,8 +1254,13 @@ mod tests {
         assert!(group_ids[3].is_some());
         assert_eq!(selection.probe, vec![0, 0, 3]);
         assert_eq!(selection.build, vec![2, 0, 1]);
+        let JoinHashMap::Chained(chained) = &map else {
+            panic!("expected chained map");
+        };
         assert_eq!(
-            map.group_build_rows(group_ids[0].expect("group"))
+            chained
+                .table
+                .group_build_rows(group_ids[0].expect("group"))
                 .expect("group rows"),
             &[2, 0]
         );
@@ -1950,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_map_group_build_rows_matches_returned_group_id() {
+    fn direct_map_lookup_group_ids_do_not_require_group_row_slices() {
         let build = int32_chunk(vec![Some(10), None, Some(10)]);
         let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
         let map = JoinHashMap::build_from_key_batches(
@@ -1966,10 +1890,14 @@ mod tests {
         let probe = int32_chunk(vec![Some(10)]);
         let group_ids = map
             .lookup_group_ids(&arena, &[probe_key], &probe)
-            .expect("lookup");
-        let group_id = group_ids[0].expect("group id");
+            .expect("lookup ids");
+        let (_lookup_ids, selection) = map
+            .lookup_selection(&arena, &[probe_key], &probe)
+            .expect("lookup selection");
 
-        assert_eq!(map.group_build_rows(group_id).expect("group rows"), &[2, 0]);
+        assert!(group_ids[0].is_some());
+        assert_eq!(selection.probe, vec![0, 0]);
+        assert_eq!(selection.build, vec![2, 0]);
     }
 
     #[test]
@@ -1988,8 +1916,8 @@ mod tests {
 
             map.set_mem_tracker(Arc::clone(&root));
 
-            let min_expected = ((4 + build.len()) * mem::size_of::<u32>()) as i64;
-            assert!(root.current() >= min_expected);
+            let expected = ((4 + build.len()) * mem::size_of::<u32>()) as i64;
+            assert_eq!(root.current(), expected);
         }
         assert_eq!(root.current(), 0);
     }
@@ -2100,7 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_map_group_storage_uses_flat_offsets() {
+    fn direct_map_direct_storage_is_exposed_through_selection_only() {
         let build = int32_chunk(vec![Some(0), Some(15)]);
         let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
         let map = JoinHashMap::build_from_key_batches(
@@ -2111,10 +2039,14 @@ mod tests {
         )
         .expect("map");
 
-        let JoinHashMap::DirectInt(direct) = &map else {
-            panic!("expected direct map");
-        };
-        assert_eq!(direct.group_offsets.len(), 17);
-        assert_eq!(direct.group_rows, vec![0, 1]);
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
+        let probe = int32_chunk(vec![Some(15), Some(1), Some(0)]);
+        let (_group_ids, selection) = map
+            .lookup_selection(&arena, &[probe_key], &probe)
+            .expect("lookup");
+
+        assert_eq!(selection.probe, vec![0, 2]);
+        assert_eq!(selection.build, vec![1, 0]);
     }
 }
