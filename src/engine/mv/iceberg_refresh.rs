@@ -10876,7 +10876,13 @@ fn register_join_snapshot_side(
 fn plan_canonical_select_for_imv(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
-) -> Result<(crate::sql::planner::plan::LogicalPlanNode, u32), RefreshError> {
+) -> Result<
+    (
+        crate::sql::planner::plan::LogicalPlanNode,
+        crate::sql::column_id::ColumnRefFactory,
+    ),
+    RefreshError,
+> {
     let catalog = build_iceberg_mv_planning_catalog(state, ctx).map_err(|e| {
         RefreshError::user(format!(
             "imv plan failed for {}.{}.{}: build planning catalog: {e}",
@@ -10903,8 +10909,7 @@ fn plan_canonical_select_for_imv(
                 ctx.rewrite.target.catalog, ctx.rewrite.target.namespace, ctx.rewrite.target.table
             ))
         })?;
-    let next_column_id = factory.peek_next_id();
-    Ok((normalize_imv_rewrite_root_project(plan), next_column_id))
+    Ok((normalize_imv_rewrite_root_project(plan), factory))
 }
 
 pub(crate) fn normalize_imv_rewrite_root_project(
@@ -10975,24 +10980,28 @@ fn run_imv_rewrite_for_refresh_explain(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
 ) -> Result<crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome, String> {
-    let (plan, next_column_id) =
-        plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
+    let (plan, factory) = plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
+    let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
     // Thread the active session's disable_optimizer_rules into IMV. When
     // refresh runs outside a user session (e.g. background scheduler),
     // the thread-local default is empty, so this is a safe no-op.
     let disabled_rules = crate::sql::optimizer::options::current_session_optimizer_settings()
         .disabled_rules
         .clone();
-    crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
+    let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
         crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
             plan,
             mv_ctx: Arc::clone(&ctx.rewrite),
             disabled_rules,
             deadline: None,
-            next_column_id,
+            column_ref_factory: std::rc::Rc::clone(&factory_cell),
         },
     )
-    .map_err(|e| format!("run_imv_rewrite: {e}"))
+    .map_err(|e| format!("run_imv_rewrite: {e}"))?;
+    let _factory = std::rc::Rc::try_unwrap(factory_cell)
+        .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
+        .into_inner();
+    Ok(outcome)
 }
 
 fn validate_aggregate_refresh_rewrite_outcome(
@@ -11492,7 +11501,6 @@ mod aggregate_refresh_rewrite_validation_tests {
             plan,
             trace,
             annotation: ImvPlanAnnotation::default(),
-            next_column_id: 1,
         }
     }
 

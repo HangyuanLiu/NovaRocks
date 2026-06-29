@@ -20,7 +20,6 @@ use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal}
 use crate::sql::planner::imv_rewrite::action_propagation::{
     descendant_internal_columns, is_supported_fan_in_delta_union,
 };
-use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{LogicalPlanNode, LogicalProjectNode, PlanNodeKind};
@@ -145,10 +144,13 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
             else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
-            let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
-                "InjectApplyKeyProject requires ImvExtension in RewriteContext".to_string()
-            })?;
-            let apply_key_col = ext.allocate_column_id();
+            let apply_key_col =
+                crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column(
+                    ctx,
+                    ICEBERG_MV_APPLY_KEY_COLUMN,
+                    row_id_type.clone(),
+                    row_id_nullable,
+                )?;
             let apply_item = ProjectItem {
                 expr: TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -229,8 +231,6 @@ fn plan_kind_from_kind(kind: &PlanNodeKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use crate::sql::planner::plan::*;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
 
     use arrow::datatypes::DataType;
 
@@ -261,11 +261,13 @@ mod tests {
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
+        let factory = Rc::new(RefCell::new(crate::sql::column_id::ColumnRefFactory::new()));
+        factory.borrow_mut().reserve_until(200);
+        ctx.set_column_ref_factory(Rc::clone(&factory));
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
-            next_column_id: Arc::new(AtomicU32::new(200)),
         });
         ctx
     }

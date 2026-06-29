@@ -1,10 +1,12 @@
+use arrow::datatypes::DataType;
+
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
-use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column;
 use crate::sql::planner::imv_rewrite::join_delta::{
     mark_delta_scan, normalize_branch_output, plan_output_columns,
 };
@@ -80,13 +82,7 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
 
             let action_column = match delta.action_column {
                 Some(action_column) => action_column,
-                None => ctx
-                    .extension::<ImvExtension>()
-                    .ok_or_else(|| {
-                        "RewriteUnionAggregateDelta requires ImvExtension in RewriteContext"
-                            .to_string()
-                    })?
-                    .allocate_column_id(),
+                None => allocate_imv_column(ctx, ImvActionColumn::NAME, DataType::Int8, false)?,
             };
             let action_output = ImvActionColumn::output_column(action_column);
 
@@ -277,13 +273,12 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
                 );
             }
 
-            let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
-                "RewriteTopLevelUnionDelta requires ImvExtension in RewriteContext".to_string()
-            })?;
-            let action_column = delta
-                .action_column
-                .unwrap_or_else(|| ext.allocate_column_id());
-            let branch_id_column = ext.allocate_column_id();
+            let action_column = match delta.action_column {
+                Some(action_column) => action_column,
+                None => allocate_imv_column(ctx, ImvActionColumn::NAME, DataType::Int8, false)?,
+            };
+            let branch_id_column =
+                allocate_imv_column(ctx, ICEBERG_MV_BRANCH_ID_COLUMN, DataType::Int32, false)?;
 
             let action_output = ImvActionColumn::output_column(action_column);
             let branch_output = branch_id_output_column(branch_id_column);
@@ -435,8 +430,6 @@ fn take_unary_child(children: &mut Vec<LogicalPlanNode>) -> LogicalPlanNode {
 mod tests {
     use crate::sql::planner::plan::*;
     use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
 
     use arrow::datatypes::DataType;
 
@@ -448,7 +441,7 @@ mod tests {
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
-    use crate::sql::column_id::ColumnId;
+    use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
@@ -670,10 +663,12 @@ mod tests {
         ctx.set_scalar_arena(std::rc::Rc::new(
             std::cell::RefCell::new(ScalarArena::new()),
         ));
+        let factory = std::rc::Rc::new(std::cell::RefCell::new(ColumnRefFactory::new()));
+        factory.borrow_mut().reserve_until(100);
+        ctx.set_column_ref_factory(std::rc::Rc::clone(&factory));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
-            next_column_id: Arc::new(AtomicU32::new(100)),
         });
         ctx
     }

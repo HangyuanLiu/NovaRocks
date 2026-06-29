@@ -237,8 +237,6 @@ mod tests {
     use crate::sql::planner::imv_rewrite::action_propagation::InjectActionColumnRule;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
 
     fn iceberg_table_info(uuid: Option<&str>) -> IcebergTableInfo {
         IcebergTableInfo {
@@ -338,7 +336,6 @@ mod tests {
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
-            next_column_id: Arc::new(AtomicU32::new(1000)),
         });
         let plan = LogicalPlanNode::new(
             PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
@@ -390,7 +387,6 @@ mod tests {
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
-            next_column_id: Arc::new(AtomicU32::new(1000)),
         });
         let mut scan = iceberg_scan(Some("uuid-b"));
         scan.columns.push(OutputColumn {

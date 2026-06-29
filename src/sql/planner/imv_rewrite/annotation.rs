@@ -5,11 +5,9 @@
 //! both ride inside `ImvExtension` so the single slot is sufficient.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
 
 use crate::engine::mv::partition::PartitionDerivationSpec;
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
-use crate::sql::column_id::ColumnId;
 
 /// IMV-pipeline-level plan annotations, populated by rewrite rules and
 /// returned to the refresh driver via `ImvRewriteOutcome.annotation`.
@@ -59,20 +57,4 @@ mod tests {
 pub(crate) struct ImvExtension {
     pub mv_ctx: Arc<IcebergMvRewriteContext>,
     pub annotation: ImvPlanAnnotation,
-    /// Shared counter for allocating new `ColumnId`s during IMV rewrite.
-    /// Initialized at entrypoint to one past the largest existing ColumnId
-    /// in the input plan, so rules never collide with analyzer-assigned ids.
-    pub next_column_id: Arc<AtomicU32>,
-}
-
-impl ImvExtension {
-    /// Allocate a fresh `ColumnId` from the shared counter. Called by
-    /// `InjectActionColumnRule::apply` (action_propagation.rs), which is
-    /// registered in the IMV rewrite pipeline.
-    pub(crate) fn allocate_column_id(&self) -> ColumnId {
-        let raw = self
-            .next_column_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        ColumnId(raw)
-    }
 }

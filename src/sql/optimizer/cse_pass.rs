@@ -30,7 +30,13 @@ pub(crate) fn rewrite(
     if !options.is_enabled(CSE_RULE) {
         return;
     }
-    factory.reserve_until(max_existing_column_id(root).saturating_add(1));
+    let max_existing = max_existing_column_id(root);
+    debug_assert!(
+        max_existing < factory.peek_next_id(),
+        "ColumnRefFactory is behind physical plan columns: max_existing={}, next_id={}",
+        max_existing,
+        factory.peek_next_id()
+    );
     rewrite_node(root, scalars, factory);
 }
 
@@ -41,11 +47,21 @@ fn max_existing_column_id(node: &PhysicalPlanNode) -> u32 {
         .map(|column| column.column_id.0)
         .max()
         .unwrap_or(0);
+    let operator_owned = match &node.op {
+        Operator::PhysicalRepeat(repeat) => repeat
+            .grouping_fn_ids
+            .iter()
+            .map(|(_, column_id)| column_id.0)
+            .max()
+            .unwrap_or(0),
+        _ => 0,
+    };
     node.children
         .iter()
         .map(max_existing_column_id)
         .max()
         .unwrap_or(0)
+        .max(operator_owned)
         .max(local)
 }
 
@@ -1186,7 +1202,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields};
     use std::sync::Arc;
 
-    use crate::sql::column_id::ColumnId;
+    use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::common::OutputColumn;
     use crate::sql::common::{BinOp, JoinKind, LiteralValue};
     use crate::sql::optimizer::operator::{
@@ -1330,6 +1346,14 @@ mod tests {
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
+        }
+    }
+
+    fn seed_factory_above_plan(factory: &mut ColumnRefFactory, root: &PhysicalPlanNode) {
+        let next_id = super::max_existing_column_id(root).saturating_add(1);
+        while factory.peek_next_id() < next_id {
+            let raw = factory.peek_next_id();
+            factory.create(None, format!("__test_seed_{raw}"), DataType::Null, true);
         }
     }
 
@@ -1699,14 +1723,99 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_reserves_factory_above_existing_plan_column_ids() {
+    #[should_panic(expected = "ColumnRefFactory is behind physical plan columns")]
+    fn rewrite_panics_in_debug_when_factory_is_behind_plan_columns() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 1);
+        let child = values_node(vec![output_column(10, "stale")]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items: vec![project_item(a, 10, "stale")],
+                output_qualifier: None,
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(10, "stale")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::options::OptimizerOptions::default_settings(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ColumnRefFactory is behind physical plan columns")]
+    fn rewrite_panics_when_factory_is_behind_repeat_grouping_output_ids() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let values = values_node(vec![output_column(1, "a"), output_column(2, "b")]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalRepeat(RepeatOp {
+                repeat_column_ref_list: vec![vec!["a".to_string()]],
+                repeat_column_ref_ids: vec![vec![ColumnId(1)]],
+                grouping_ids: vec![0, 1],
+                all_rollup_columns: vec!["a".to_string()],
+                all_rollup_column_ids: vec![ColumnId(1)],
+                grouping_key_aliases: vec![],
+                grouping_fn_args: vec![("__grouping_fn_0".to_string(), vec!["a".to_string()])],
+                grouping_fn_arg_ids: vec![vec![ColumnId(1)]],
+                grouping_fn_ids: vec![("__grouping_fn_0".to_string(), ColumnId(50))],
+            }),
+            children: vec![values],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(1, "a"), output_column(2, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        while factory.peek_next_id() < 3 {
+            let raw = factory.peek_next_id();
+            factory.create(None, format!("__visible_seed_{raw}"), DataType::Null, true);
+        }
+
+        super::rewrite(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::options::OptimizerOptions::default_settings(),
+        );
+    }
+
+    #[test]
+    fn rewrite_uses_seeded_factory_for_new_cse_columns() {
         let mut arena = ScalarArena::new();
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 1);
         let b = col(&mut arena, 2);
         let a_plus_b = add(&mut arena, a, b);
         let doubled = add(&mut arena, a_plus_b, a_plus_b);
-        let child = values_node(vec![output_column(1, "a"), output_column(2, "b")]);
+        let values = values_node(vec![output_column(1, "a"), output_column(2, "b")]);
+        let child = PhysicalPlanNode {
+            op: Operator::PhysicalRepeat(RepeatOp {
+                repeat_column_ref_list: vec![vec!["a".to_string()]],
+                repeat_column_ref_ids: vec![vec![ColumnId(1)]],
+                grouping_ids: vec![0, 1],
+                all_rollup_columns: vec!["a".to_string()],
+                all_rollup_column_ids: vec![ColumnId(1)],
+                grouping_key_aliases: vec![],
+                grouping_fn_args: vec![("__grouping_fn_0".to_string(), vec!["a".to_string()])],
+                grouping_fn_arg_ids: vec![vec![ColumnId(1)]],
+                grouping_fn_ids: vec![("__grouping_fn_0".to_string(), ColumnId(50))],
+            }),
+            children: vec![values],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(1, "a"), output_column(2, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
         let mut node = PhysicalPlanNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: vec![
@@ -1723,6 +1832,7 @@ mod tests {
             probe_runtime_filters: vec![],
         };
 
+        seed_factory_above_plan(&mut factory, &node);
         super::rewrite(
             &mut node,
             &mut arena,
@@ -1740,7 +1850,7 @@ mod tests {
             .expect("CSE project item")
             .output_column_id;
         assert!(
-            cse_id.0 > 4,
+            cse_id.0 > 50,
             "CSE output id {cse_id:?} must not collide with existing plan ids"
         );
     }

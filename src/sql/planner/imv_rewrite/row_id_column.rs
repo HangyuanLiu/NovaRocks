@@ -15,7 +15,6 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{LogicalPlanNode, PlanNodeKind};
 
@@ -78,10 +77,12 @@ impl LogicalRewriteRule for InjectRowIdRule {
             let PlanNodeKind::Scan(mut scan) = kind else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
-            let ext = ctx
-                .extension::<ImvExtension>()
-                .ok_or_else(|| "InjectRowId requires ImvExtension in RewriteContext".to_string())?;
-            let column_id = ext.allocate_column_id();
+            let column_id = crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column(
+                ctx,
+                ImvRowIdColumn::NAME,
+                DataType::Int64,
+                false,
+            )?;
             scan.columns
                 .retain(|column| !column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME));
             scan.columns.push(ImvRowIdColumn::output_column(column_id));
@@ -97,8 +98,6 @@ impl LogicalRewriteRule for InjectRowIdRule {
 #[cfg(test)]
 mod tests {
     use crate::sql::planner::plan::*;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
 
     use arrow::datatypes::DataType;
 
@@ -122,11 +121,13 @@ mod tests {
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
+        let factory = Rc::new(RefCell::new(crate::sql::column_id::ColumnRefFactory::new()));
+        factory.borrow_mut().reserve_until(100);
+        ctx.set_column_ref_factory(Rc::clone(&factory));
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
-            next_column_id: Arc::new(AtomicU32::new(100)),
         });
         ctx
     }
@@ -211,6 +212,33 @@ mod tests {
             panic!("expected Changed(Scan)");
         };
         assert!(scan.columns.iter().any(ImvRowIdColumn::matches));
+    }
+
+    #[test]
+    fn inject_row_id_records_factory_metadata() {
+        let rule = InjectRowIdRule;
+        let mut ctx = build_ctx();
+        let factory = ctx
+            .column_ref_factory()
+            .cloned()
+            .expect("build_ctx must install ColumnRefFactory");
+        let plan = scan_plan(delta_scan());
+        let expr = logical_plan_to_opt_expr(&plan, &mut ctx.scalar_arena().borrow_mut());
+
+        let result = rule.apply(expr, &mut ctx).expect("apply");
+        assert!(matches!(result, RewriteResult::Changed(_)));
+
+        let next_id = factory.borrow().peek_next_id();
+        let found = (1..next_id).any(|raw| {
+            let meta = factory.borrow().get(ColumnId(raw)).clone();
+            meta.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
+                && meta.data_type == DataType::Int64
+                && !meta.nullable
+        });
+        assert!(
+            found,
+            "row-id allocation must be recorded in ColumnRefFactory"
+        );
     }
 
     #[test]

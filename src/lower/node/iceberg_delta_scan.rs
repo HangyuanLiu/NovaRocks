@@ -100,8 +100,9 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         })?;
     let change_files = explicit.change_files;
     let delete_side_payload = explicit.delete_side;
-    let base_table = build_base_table_from_explicit_metadata(payload, metadata)?;
     let object_store_config = explicit.object_store_config;
+    let base_table =
+        build_base_table_from_explicit_metadata(payload, metadata, object_store_config.as_ref())?;
     let object_store_factory =
         Arc::new(crate::connector::iceberg::changes::build_factory_for_table(
             &base_table,
@@ -153,12 +154,9 @@ pub(crate) fn lower_iceberg_delta_scan_node(
 fn build_base_table_from_explicit_metadata(
     payload: &plan_nodes::TIcebergDeltaScanNode,
     metadata: iceberg::spec::TableMetadata,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<iceberg::table::Table, String> {
-    let file_io = if metadata.location().starts_with("memory://") {
-        iceberg::io::FileIO::new_with_memory()
-    } else {
-        iceberg::io::FileIO::new_with_fs()
-    };
+    let file_io = file_io_for_explicit_metadata(metadata.location(), object_store_config)?;
     iceberg::table::Table::builder()
         .file_io(file_io)
         .metadata(metadata)
@@ -173,6 +171,37 @@ fn build_base_table_from_explicit_metadata(
                 payload.catalog, payload.iceberg_namespace, payload.table
             )
         })
+}
+
+fn file_io_for_explicit_metadata(
+    location: &str,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<iceberg::io::FileIO, String> {
+    if location.starts_with("memory://") {
+        return Ok(iceberg::io::FileIO::new_with_memory());
+    }
+    if location.starts_with("s3://")
+        || location.starts_with("s3a://")
+        || location.starts_with("oss://")
+    {
+        let cfg = object_store_config.ok_or_else(|| {
+            format!(
+                "ICEBERG_DELTA_SCAN_NODE explicit metadata location {location} requires object_store_config"
+            )
+        })?;
+        let factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory {
+            endpoint: cfg.endpoint.clone(),
+            access_key_id: cfg.access_key_id.clone(),
+            access_key_secret: cfg.access_key_secret.clone(),
+            region: cfg
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_string()),
+            enable_path_style: cfg.enable_path_style_access.unwrap_or(false),
+        };
+        return Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build());
+    }
+    Ok(iceberg::io::FileIO::new_with_fs())
 }
 
 fn build_delete_side_from_payload(
@@ -217,6 +246,10 @@ mod tests {
     use super::*;
 
     fn serialized_test_table_metadata() -> String {
+        serialized_test_table_metadata_with_location("file:///tmp/iceberg_delta_payload_table")
+    }
+
+    fn serialized_test_table_metadata_with_location(location: &str) -> String {
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
                 1,
@@ -229,7 +262,7 @@ mod tests {
             schema,
             PartitionSpec::unpartition_spec().into_unbound(),
             SortOrder::unsorted_order(),
-            "file:///tmp/iceberg_delta_payload_table".to_string(),
+            location.to_string(),
             FormatVersion::V3,
             HashMap::new(),
         )
@@ -289,5 +322,100 @@ mod tests {
         assert_eq!(scan.change_files.len(), 1);
         assert_eq!(scan.change_files[0].path, "file:///tmp/added.parquet");
         assert_eq!(scan.base_table_ident.catalog, "ice");
+    }
+
+    #[test]
+    fn delta_scan_s3_explicit_metadata_requires_object_store_config() {
+        let payload = serde_json::json!({
+            "version": 1,
+            "serialized_table_metadata": serialized_test_table_metadata_with_location("s3://bucket/table"),
+            "object_store_config": null,
+            "change_files": [],
+            "delete_side": null
+        });
+        let mut node = crate::sql::codegen::nodes::default_plan_node();
+        node.node_id = 43;
+        node.node_type = plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE;
+        node.num_children = 0;
+        node.row_tuples = vec![];
+        node.iceberg_delta_scan_node = Some(plan_nodes::TIcebergDeltaScanNode {
+            catalog: "ice".to_string(),
+            iceberg_namespace: "db".to_string(),
+            table: "orders".to_string(),
+            from_snapshot_id: 10,
+            to_snapshot_id: 11,
+            explicit_payload_json: Some(payload.to_string()),
+        });
+
+        let err = lower_iceberg_delta_scan_node(
+            &node,
+            None,
+            Layout {
+                order: Vec::new(),
+                index: HashMap::new(),
+            },
+        )
+        .expect_err("s3 explicit metadata requires object-store config");
+        assert!(
+            err.contains("requires object_store_config"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn delta_scan_s3_explicit_metadata_uses_object_store_file_io() {
+        let payload = serde_json::json!({
+            "version": 1,
+            "serialized_table_metadata": serialized_test_table_metadata_with_location("s3://bucket/table"),
+            "object_store_config": {
+                "endpoint": "http://127.0.0.1:9000",
+                "bucket": "bucket",
+                "root": "",
+                "access_key_id": "ak",
+                "access_key_secret": "sk",
+                "session_token": null,
+                "enable_path_style_access": true,
+                "region": "us-east-1",
+                "retry_max_times": null,
+                "retry_min_delay_ms": null,
+                "retry_max_delay_ms": null,
+                "timeout_ms": null,
+                "io_timeout_ms": null
+            },
+            "change_files": [],
+            "delete_side": null
+        });
+        let mut node = crate::sql::codegen::nodes::default_plan_node();
+        node.node_id = 44;
+        node.node_type = plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE;
+        node.num_children = 0;
+        node.row_tuples = vec![];
+        node.iceberg_delta_scan_node = Some(plan_nodes::TIcebergDeltaScanNode {
+            catalog: "ice".to_string(),
+            iceberg_namespace: "db".to_string(),
+            table: "orders".to_string(),
+            from_snapshot_id: 10,
+            to_snapshot_id: 11,
+            explicit_payload_json: Some(payload.to_string()),
+        });
+
+        let lowered = lower_iceberg_delta_scan_node(
+            &node,
+            None,
+            Layout {
+                order: Vec::new(),
+                index: HashMap::new(),
+            },
+        )
+        .expect("s3 explicit metadata lowers with object-store config");
+        let ExecNodeKind::IcebergDeltaScan(scan) = lowered.node.kind else {
+            panic!("expected iceberg delta scan");
+        };
+        assert_eq!(
+            scan.object_store_config
+                .as_ref()
+                .map(|cfg| cfg.endpoint.as_str()),
+            Some("http://127.0.0.1:9000")
+        );
     }
 }

@@ -17,7 +17,6 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
-use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::join_delta_shape::{
     is_supported_join_delta_branch, is_supported_join_delta_union,
 };
@@ -258,10 +257,12 @@ impl LogicalRewriteRule for InjectActionColumnRule {
             let PlanNodeKind::Scan(scan) = &mut plan.kind else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
-            let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
-                "InjectActionColumn requires ImvExtension in RewriteContext".to_string()
-            })?;
-            let column_id = ext.allocate_column_id();
+            let column_id = crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column(
+                ctx,
+                ImvActionColumn::NAME,
+                arrow::datatypes::DataType::Int8,
+                false,
+            )?;
             scan.columns
                 .retain(|column| !is_action_column_name(&column.name));
             scan.columns.push(ImvActionColumn::output_column(column_id));
@@ -383,10 +384,13 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
             }
 
             if branch_delta_union_needs_row_id_output(&plan) {
-                let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
-                    "PropagateActionColumn requires ImvExtension in RewriteContext".to_string()
-                })?;
-                let row_id_column = ext.allocate_column_id();
+                let row_id_column =
+                    crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column(
+                        ctx,
+                        crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn::NAME,
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    )?;
                 for input in &mut plan.children {
                     normalize_branch_row_id_output(input, row_id_column)?;
                 }
@@ -465,10 +469,12 @@ fn promote_project_union_row_id_output(
     if !project_over_union_needs_row_id_output(plan) {
         return Ok(false);
     }
-    let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
-        "PropagateActionColumn requires ImvExtension in RewriteContext".to_string()
-    })?;
-    let row_id_column = ext.allocate_column_id();
+    let row_id_column = crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column(
+        ctx,
+        crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn::NAME,
+        arrow::datatypes::DataType::Int64,
+        false,
+    )?;
     let Some(union_plan) = plan.children.get_mut(0) else {
         return Ok(false);
     };
@@ -649,8 +655,6 @@ fn subtree_has_version_scan(plan: &LogicalPlanNode) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::sql::planner::plan::*;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
 
     use arrow::datatypes::DataType;
 
@@ -678,11 +682,13 @@ mod tests {
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
+        let factory = Rc::new(RefCell::new(crate::sql::column_id::ColumnRefFactory::new()));
+        factory.borrow_mut().reserve_until(100);
+        ctx.set_column_ref_factory(Rc::clone(&factory));
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
-            next_column_id: Arc::new(AtomicU32::new(100)),
         });
         ctx
     }

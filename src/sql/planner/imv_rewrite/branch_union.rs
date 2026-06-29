@@ -10,6 +10,7 @@ use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_output_column;
 use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{
@@ -100,7 +101,7 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                     "RewriteBranchUnion requires ImvExtension in RewriteContext".to_string()
                 })?
                 .clone();
-            let output_columns = branch_union_aggregate_change_stream_output_columns(&ext)?;
+            let output_columns = branch_union_aggregate_change_stream_output_columns(&ext, ctx)?;
             let mut rewritten_inputs = Vec::with_capacity(inputs.len());
             for (idx, branch) in inputs.into_iter().enumerate() {
                 let branch_id = i32::try_from(idx)
@@ -212,46 +213,58 @@ fn single_child(children: &mut Vec<LogicalPlanNode>) -> Option<LogicalPlanNode> 
 
 fn branch_union_aggregate_change_stream_output_columns(
     ext: &ImvExtension,
+    ctx: &RewriteContext,
 ) -> Result<Vec<OutputColumn>, String> {
     let (_shape, layout) = ext.mv_ctx.aggregate_shape_and_layout_for_execution()?;
     let mut columns =
         Vec::with_capacity(1 + layout.visible_columns.len() + layout.state_columns.len() + 2);
-    columns.push(OutputColumn {
-        column_id: ext.allocate_column_id(),
-        name: layout.row_id_column.column.name.clone(),
-        data_type: DataType::Utf8,
-        nullable: false,
-        is_internal: true,
-    });
-    columns.extend(layout.visible_columns.iter().map(|column| OutputColumn {
-        column_id: ext.allocate_column_id(),
-        name: column.name.clone(),
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
-        is_internal: false,
-    }));
-    columns.extend(layout.state_columns.iter().map(|column| OutputColumn {
-        column_id: ext.allocate_column_id(),
-        name: column.name.clone(),
-        data_type: match column.state_role {
+    columns.push(allocate_imv_output_column(
+        ctx,
+        &layout.row_id_column.column.name,
+        DataType::Utf8,
+        false,
+        true,
+    )?);
+    for column in &layout.visible_columns {
+        columns.push(allocate_imv_output_column(
+            ctx,
+            &column.name,
+            column.data_type.clone(),
+            column.nullable,
+            false,
+        )?);
+    }
+    for column in &layout.state_columns {
+        let data_type = match column.state_role {
             crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::Single => {
                 DataType::Binary
             }
             crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::RetractionCount => {
                 column.data_type.clone()
             }
-        },
-        nullable: column.nullable,
-        is_internal: true,
-    }));
-    columns.push(OutputColumn {
-        column_id: ext.allocate_column_id(),
-        name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
-        data_type: DataType::Int32,
-        nullable: false,
-        is_internal: true,
-    });
-    columns.push(ImvActionColumn::output_column(ext.allocate_column_id()));
+        };
+        columns.push(allocate_imv_output_column(
+            ctx,
+            &column.name,
+            data_type,
+            column.nullable,
+            true,
+        )?);
+    }
+    columns.push(allocate_imv_output_column(
+        ctx,
+        ICEBERG_MV_BRANCH_ID_COLUMN,
+        DataType::Int32,
+        false,
+        true,
+    )?);
+    columns.push(allocate_imv_output_column(
+        ctx,
+        ImvActionColumn::NAME,
+        DataType::Int8,
+        false,
+        true,
+    )?);
     Ok(columns)
 }
 
@@ -272,7 +285,6 @@ mod tests {
     use crate::sql::planner::plan::*;
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
 
     use arrow::datatypes::DataType;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -292,7 +304,7 @@ mod tests {
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
-    use crate::sql::column_id::ColumnId;
+    use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
@@ -826,10 +838,12 @@ mod tests {
         ctx.set_scalar_arena(std::rc::Rc::new(
             std::cell::RefCell::new(ScalarArena::new()),
         ));
+        let factory = std::rc::Rc::new(std::cell::RefCell::new(ColumnRefFactory::new()));
+        factory.borrow_mut().reserve_until(100);
+        ctx.set_column_ref_factory(std::rc::Rc::clone(&factory));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx,
             annotation: ImvPlanAnnotation::default(),
-            next_column_id: Arc::new(AtomicU32::new(100)),
         });
         ctx
     }
