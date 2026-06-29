@@ -35,11 +35,11 @@ use crate::formats::{
     parquet::ParquetScanConfig,
 };
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
-use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_desc};
 use crate::novarocks_connectors::{StarRocksScanConfig, StarRocksScanOp};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::thrift::descriptors;
 use crate::thrift::types;
+use crate::types::arrow_thrift::{thrift_desc_to_arrow_type, thrift_desc_to_primitive};
 
 #[derive(Clone, Debug)]
 pub struct GlobalLateMaterializationContext {
@@ -94,8 +94,8 @@ fn build_slot_meta_map(
             continue;
         }
         let primitive =
-            primitive_type_from_desc(slot_type).unwrap_or(types::TPrimitiveType::INVALID_TYPE);
-        let arrow_type = arrow_type_from_desc(slot_type)
+            thrift_desc_to_primitive(slot_type).unwrap_or(types::TPrimitiveType::INVALID_TYPE);
+        let arrow_type = thrift_desc_to_arrow_type(slot_type)
             .ok_or_else(|| format!("unsupported slot_type for tuple_id={parent} slot_id={id}"))?;
         let slot_id = SlotId::try_from(id)?;
         desc_by_tuple_slot.insert(

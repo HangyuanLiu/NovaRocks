@@ -33,8 +33,8 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::Layout;
-use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_node};
-use crate::thrift::{data_sinks, descriptors, exprs, types};
+use crate::thrift::{data_sinks, descriptors, exprs};
+use crate::types::arrow_thrift::thrift_desc_to_arrow_type;
 
 #[derive(Clone)]
 pub(crate) enum PartitionKeySource {
@@ -376,7 +376,7 @@ fn parse_partition_key_node(node: &exprs::TExprNode) -> Result<PartitionKeyValue
                 .ok_or_else(|| "DECIMAL_LITERAL missing decimal_literal payload".to_string())?
                 .value
                 .clone();
-            let DataType::Decimal128(precision, scale) = arrow_type_from_desc(&node.type_)
+            let DataType::Decimal128(precision, scale) = thrift_desc_to_arrow_type(&node.type_)
                 .ok_or_else(|| {
                     "DECIMAL_LITERAL missing or unsupported type descriptor".to_string()
                 })?
@@ -402,23 +402,14 @@ fn parse_partition_key_node(node: &exprs::TExprNode) -> Result<PartitionKeyValue
                     .value
                     .clone()
             };
-            match primitive_type_from_node(node) {
-                Some(p) if p == types::TPrimitiveType::DATE => {
+            match thrift_desc_to_arrow_type(&node.type_) {
+                Some(DataType::Date32) => {
                     Ok(PartitionKeyValue::Date32(parse_date_literal_days(&value)?))
                 }
-                Some(p)
-                    if p == types::TPrimitiveType::DATETIME || p == types::TPrimitiveType::TIME =>
-                {
-                    Ok(PartitionKeyValue::TimestampMicros(
-                        parse_datetime_literal_micros(&value)?,
-                    ))
-                }
-                Some(p)
-                    if p == types::TPrimitiveType::BINARY
-                        || p == types::TPrimitiveType::VARBINARY =>
-                {
-                    Ok(PartitionKeyValue::Binary(value.into_bytes()))
-                }
+                Some(DataType::Timestamp(_, _)) | Some(DataType::Time64(_)) => Ok(
+                    PartitionKeyValue::TimestampMicros(parse_datetime_literal_micros(&value)?),
+                ),
+                Some(DataType::Binary) => Ok(PartitionKeyValue::Binary(value.into_bytes())),
                 _ => Ok(PartitionKeyValue::Utf8(value)),
             }
         }

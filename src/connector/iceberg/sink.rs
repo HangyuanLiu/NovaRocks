@@ -1687,7 +1687,7 @@ fn build_equality_delete_output_schema(
         let data_type = column
             .type_desc
             .as_ref()
-            .and_then(crate::lower::type_lowering::arrow_type_from_desc)
+            .and_then(crate::types::arrow_thrift::thrift_desc_to_arrow_type)
             .ok_or_else(|| {
                 format!(
                     "iceberg equality-delete column {} missing type_desc",

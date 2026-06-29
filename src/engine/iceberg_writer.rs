@@ -1563,7 +1563,7 @@ mod tests {
             field
                 .type_desc
                 .as_ref()
-                .and_then(crate::lower::type_lowering::primitive_type_from_desc),
+                .and_then(crate::types::arrow_thrift::thrift_desc_to_primitive),
             Some(primitive)
         );
     }

@@ -42,7 +42,7 @@ fn descriptor_error(message: impl Into<String>) -> crate::common::engine_error::
 }
 
 fn primitive_type(type_desc: &types::TTypeDesc) -> Option<types::TPrimitiveType> {
-    crate::lower::type_lowering::primitive_type_from_desc(type_desc)
+    crate::types::arrow_thrift::thrift_desc_to_primitive(type_desc)
 }
 
 fn validate_output_field(
