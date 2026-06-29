@@ -99,6 +99,13 @@ fn file_content_to_thrift(content: IcebergFileContent) -> types::TIcebergFileCon
 }
 
 #[cfg(test)]
+pub(crate) fn expected_file_content_for_test(
+    content: IcebergFileContent,
+) -> types::TIcebergFileContent {
+    file_content_to_thrift(content)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
