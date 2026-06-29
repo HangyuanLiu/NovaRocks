@@ -53,8 +53,9 @@ pub(crate) use scan_planner::{
     IcebergConnectorScanPlanner, IcebergScanHandle, IcebergSplit, IcebergTableHandle,
 };
 pub use schema::{
-    IcebergArrowColumn, apply_field_id_recursive, build_full_output_schema,
-    build_projected_output_schema,
+    IcebergArrowColumn, IcebergPartitionInfo, IcebergSchemaDescriptor,
+    IcebergSchemaFieldDescriptor, IcebergTableColumn, IcebergTableDescriptor,
+    apply_field_id_recursive, build_full_output_schema, build_projected_output_schema,
 };
 pub use sink::IcebergTableSinkFactory;
 pub(crate) use state::{

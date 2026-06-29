@@ -53,8 +53,13 @@ use super::data_writer::{
     StagedWriteContext, StagedWriteOptions, partition_path_from_struct, to_sink_commit_info,
     write_record_batches, written_file_to_sink_commit_info_for_metadata,
 };
-use super::position_delete_descriptor::bind_position_delete_descriptor;
-use super::schema::{apply_field_id_recursive, build_full_output_schema};
+use super::position_delete_descriptor::{
+    PositionDeleteExpectedBinding, bind_position_delete_descriptor,
+};
+use super::schema::{
+    IcebergPartitionInfo, IcebergSchemaDescriptor, IcebergSchemaFieldDescriptor,
+    IcebergTableColumn, IcebergTableDescriptor, apply_field_id_recursive, build_full_output_schema,
+};
 use super::write_descriptor::encode_partition_descriptor;
 use crate::common::config;
 use crate::connector::iceberg::commit::{
@@ -70,6 +75,7 @@ use crate::exec::row_position::{
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
 };
 use crate::lower::expr::lower_t_expr;
+use crate::lower::iceberg_sink_descriptor::position_delete_descriptor_input_from_thrift;
 use crate::lower::layout::Layout;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::runtime_state::RuntimeState;
@@ -178,16 +184,21 @@ impl IcebergTableSinkFactory {
             })?;
             let partition_source_field_ids =
                 partition_source_field_ids_from_metadata(metadata, &partition_source_column_names)?;
-            let binding = bind_position_delete_descriptor(
+            let desc = position_delete_descriptor_input_from_thrift(
                 sink.position_delete_output_descriptor.as_ref(),
                 output_exprs,
-                target_partition_spec_id,
-                &partition_source_column_names,
-                &partition_column_names,
-                &transform_exprs,
-                &partition_source_field_ids,
             )
             .map_err(|err| err.to_bracketed_user_message())?;
+            let expected = PositionDeleteExpectedBinding {
+                target_partition_spec_id,
+                partition_source_column_names: partition_source_column_names.clone(),
+                partition_column_names: partition_column_names.clone(),
+                partition_transform_exprs: transform_exprs.clone(),
+                partition_source_field_ids,
+                output_expr_count: output_exprs.len(),
+            };
+            let binding = bind_position_delete_descriptor(&desc, &expected)
+                .map_err(|err| err.to_bracketed_user_message())?;
             Some((target_schema, binding))
         } else {
             None
@@ -1647,24 +1658,129 @@ fn resolve_iceberg_table(
     ))
 }
 
+fn iceberg_schema_field_descriptor_from_thrift(
+    field: &descriptors::TIcebergSchemaField,
+) -> Result<IcebergSchemaFieldDescriptor, String> {
+    let name = field
+        .name
+        .clone()
+        .ok_or_else(|| "iceberg schema field missing name".to_string())?;
+    let children = field
+        .children
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|child| iceberg_schema_field_descriptor_from_thrift(child.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(IcebergSchemaFieldDescriptor {
+        name,
+        field_id: field.field_id,
+        children,
+        initial_default_json: field.initial_default_json.clone(),
+    })
+}
+
+fn iceberg_schema_descriptor_from_thrift(
+    schema: &descriptors::TIcebergSchema,
+) -> Result<IcebergSchemaDescriptor, String> {
+    let fields = schema
+        .fields
+        .as_ref()
+        .ok_or_else(|| "iceberg schema missing fields".to_string())?
+        .iter()
+        .map(iceberg_schema_field_descriptor_from_thrift)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(IcebergSchemaDescriptor { fields })
+}
+
+fn iceberg_table_descriptor_from_thrift(
+    iceberg: &descriptors::TIcebergTable,
+) -> Result<IcebergTableDescriptor, String> {
+    let columns = iceberg
+        .columns
+        .as_ref()
+        .ok_or_else(|| "iceberg table missing columns".to_string())?
+        .iter()
+        .map(|column| {
+            let data_type = column
+                .type_desc
+                .as_ref()
+                .and_then(crate::types::arrow_thrift::thrift_desc_to_arrow_type)
+                .ok_or_else(|| {
+                    format!("iceberg column {} missing type_desc", column.column_name)
+                })?;
+            Ok(IcebergTableColumn {
+                name: column.column_name.clone(),
+                data_type,
+                nullable: column.is_allow_null.unwrap_or(true),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let iceberg_schema = iceberg
+        .iceberg_schema
+        .as_ref()
+        .map(iceberg_schema_descriptor_from_thrift)
+        .transpose()?;
+    let equality_delete_schema = iceberg
+        .iceberg_equal_delete_schema
+        .as_ref()
+        .map(iceberg_schema_descriptor_from_thrift)
+        .transpose()?;
+    let partition_info = iceberg
+        .partition_info
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|info| {
+            Ok(IcebergPartitionInfo {
+                source_column_name: info.source_column_name.clone().ok_or_else(|| {
+                    "iceberg partition_info missing source_column_name".to_string()
+                })?,
+                partition_column_name: info.partition_column_name.clone().ok_or_else(|| {
+                    "iceberg partition_info missing partition_column_name".to_string()
+                })?,
+                transform_expr: info
+                    .transform_expr
+                    .clone()
+                    .ok_or_else(|| "iceberg partition_info missing transform_expr".to_string())?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(IcebergTableDescriptor {
+        columns,
+        iceberg_schema,
+        equality_delete_schema,
+        partition_info,
+        current_snapshot_id: iceberg.current_snapshot_id,
+        serialized_metadata: iceberg.serialized_metadata.clone(),
+    })
+}
+
 fn build_output_schema(iceberg: &descriptors::TIcebergTable) -> Result<SchemaRef, String> {
-    build_full_output_schema(iceberg)
+    build_full_output_schema(&iceberg_table_descriptor_from_thrift(iceberg)?)
 }
 
 fn build_equality_delete_output_schema(
     iceberg: &descriptors::TIcebergTable,
 ) -> Result<(SchemaRef, Vec<EqualityDeleteColumn>), String> {
-    let columns = iceberg
-        .columns
-        .as_ref()
-        .ok_or_else(|| "iceberg equality-delete sink missing columns".to_string())?;
+    let iceberg = iceberg_table_descriptor_from_thrift(iceberg)?;
+    let columns = &iceberg.columns;
     if columns.is_empty() {
         return Err(
             "iceberg equality-delete sink requires at least one equality column".to_string(),
         );
     }
 
-    let key_fields = equality_delete_schema_fields(iceberg)?;
+    let key_fields = iceberg
+        .equality_delete_schema
+        .as_ref()
+        .ok_or_else(|| {
+            "iceberg equality-delete sink requires iceberg_equal_delete_schema projected key fields"
+                .to_string()
+        })?
+        .fields
+        .as_slice();
     if key_fields.is_empty() {
         return Err(
             "iceberg equality-delete sink requires at least one equality column".to_string(),
@@ -1674,28 +1790,20 @@ fn build_equality_delete_output_schema(
     let mut fields = Vec::with_capacity(key_fields.len());
     let mut equality_columns = Vec::with_capacity(key_fields.len());
     for schema_field in key_fields {
-        let name = schema_field
-            .name
-            .as_ref()
-            .ok_or_else(|| "iceberg equality-delete schema field missing name".to_string())?;
         let column = columns
             .iter()
-            .find(|column| column.column_name == *name)
-            .ok_or_else(|| {
-                format!("iceberg equality-delete column {name} missing column descriptor")
-            })?;
-        let data_type = column
-            .type_desc
-            .as_ref()
-            .and_then(crate::types::arrow_thrift::thrift_desc_to_arrow_type)
+            .find(|column| column.name == schema_field.name)
             .ok_or_else(|| {
                 format!(
-                    "iceberg equality-delete column {} missing type_desc",
-                    column.column_name
+                    "iceberg equality-delete column {} missing column descriptor",
+                    schema_field.name
                 )
             })?;
-        let nullable = column.is_allow_null.unwrap_or(true);
-        let field = Field::new(column.column_name.clone(), data_type, nullable);
+        let field = Field::new(
+            column.name.clone(),
+            column.data_type.clone(),
+            column.nullable,
+        );
         let field = apply_field_id_recursive(field, schema_field)?;
         let field_id = arrow_field_id(&field)?;
         equality_columns.push(EqualityDeleteColumn {
@@ -1708,23 +1816,6 @@ fn build_equality_delete_output_schema(
     }
 
     Ok((Arc::new(Schema::new(fields)), equality_columns))
-}
-
-fn equality_delete_schema_fields(
-    iceberg: &descriptors::TIcebergTable,
-) -> Result<Vec<&descriptors::TIcebergSchemaField>, String> {
-    let schema = iceberg
-        .iceberg_equal_delete_schema
-        .as_ref()
-        .ok_or_else(|| {
-            "iceberg equality-delete sink requires iceberg_equal_delete_schema projected key fields"
-                .to_string()
-        })?;
-    let fields = schema
-        .fields
-        .as_deref()
-        .ok_or_else(|| "iceberg equality-delete schema missing fields".to_string())?;
-    Ok(fields.iter().collect())
 }
 
 fn iceberg_schema_from_arrow_schema(schema: &Schema) -> Result<iceberg::spec::Schema, String> {
@@ -3114,8 +3205,24 @@ mod tests {
     use crate::{common::ids::SlotId, common::types::UniqueId};
 
     fn position_delete_required_schema_for_tests() -> SchemaRef {
+        let descriptor = crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput {
+            file_path: crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField {
+                output_expr_index: 0,
+                name: "file_path".to_string(),
+                data_type: DataType::Utf8,
+                field_id: crate::connector::iceberg::position_delete_descriptor::ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+            },
+            pos: crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField {
+                output_expr_index: 1,
+                name: "pos".to_string(),
+                data_type: DataType::Int64,
+                field_id: crate::connector::iceberg::position_delete_descriptor::ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+            },
+            partition_source_fields: Vec::new(),
+            target_partition_spec_id: 0,
+        };
         crate::connector::iceberg::position_delete_descriptor::output_schema_from_descriptor(
-            &crate::connector::iceberg::position_delete_descriptor::required_position_delete_descriptor_for_tests(0),
+            &descriptor,
         )
         .expect("required position delete schema")
     }
@@ -3565,10 +3672,26 @@ mod tests {
         target_partition_spec_id: i32,
         include_partition_source: bool,
     ) -> crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor {
-        let mut descriptor =
-            crate::connector::iceberg::position_delete_descriptor::required_position_delete_descriptor_for_tests(
-                target_partition_spec_id,
-            );
+        let mut descriptor = crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor::new(
+            Some(crate::thrift::data_sinks::TIcebergPositionDeleteOutputField::new(
+                Some(0),
+                Some("file_path".to_string()),
+                Some(crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+                    crate::thrift::types::TPrimitiveType::VARCHAR,
+                )),
+                Some(crate::connector::iceberg::position_delete_descriptor::ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID),
+            )),
+            Some(crate::thrift::data_sinks::TIcebergPositionDeleteOutputField::new(
+                Some(1),
+                Some("pos".to_string()),
+                Some(crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+                    crate::thrift::types::TPrimitiveType::BIGINT,
+                )),
+                Some(crate::connector::iceberg::position_delete_descriptor::ICEBERG_POSITION_DELETE_POS_FIELD_ID),
+            )),
+            Some(Vec::new()),
+            Some(target_partition_spec_id),
+        );
         let partitions = if include_partition_source {
             vec![
                 crate::thrift::data_sinks::TIcebergPositionDeletePartitionSourceField::new(

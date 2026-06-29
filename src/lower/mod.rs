@@ -16,6 +16,7 @@
 // under the License.
 pub(crate) mod expr;
 pub(crate) mod fragment;
+pub(crate) mod iceberg_sink_descriptor;
 pub(crate) mod layout;
 pub(crate) mod node;
 pub(crate) mod type_lowering;
