@@ -4674,12 +4674,58 @@ fn refresh_scan_table_for_codegen(
                         logical_type: None,
                     });
             }
+            ensure_iceberg_metadata_column(
+                &mut out,
+                &projected,
+                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                DataType::Utf8,
+                false,
+            );
+            ensure_iceberg_metadata_column(
+                &mut out,
+                &projected,
+                crate::exec::row_position::ICEBERG_ROW_POS_COL,
+                DataType::Int64,
+                false,
+            );
             out.source = refresh_ctx.target_state_scan_source(scan)?;
             nodes::reject_target_state_equality_deletes(&out.source)?;
             Ok(out)
         }
         _ => Ok(table.clone()),
     }
+}
+
+fn ensure_iceberg_metadata_column(
+    table: &mut crate::sql::catalog::TableDef,
+    projected: &[String],
+    name: &str,
+    data_type: DataType,
+    nullable: bool,
+) {
+    if !projected
+        .iter()
+        .any(|projected_name| projected_name.eq_ignore_ascii_case(name))
+    {
+        return;
+    }
+    if table
+        .columns
+        .iter()
+        .chain(table.iceberg_row_lineage_metadata_columns.iter())
+        .any(|column| column.name.eq_ignore_ascii_case(name))
+    {
+        return;
+    }
+    table
+        .iceberg_row_lineage_metadata_columns
+        .push(crate::sql::catalog::ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable,
+            write_default: None,
+            logical_type: None,
+        });
 }
 
 #[cfg(test)]

@@ -1277,7 +1277,6 @@ mod tests {
             layout,
             branch_id,
             pruning_limits,
-            target_position_locator,
             ..
         } = direct_exec
         else {
@@ -1299,72 +1298,7 @@ mod tests {
                 "{case_name}: branch aggregate merge must use default pruning limits"
             );
         }
-        if ctx.rewrite.target_snapshot_id.is_some() {
-            assert!(
-                target_position_locator.is_some(),
-                "{case_name}: aggregate merge must carry target position locator for pinned target snapshot"
-            );
-        }
-        let locator = target_position_locator
-            .as_ref()
-            .unwrap_or_else(|| panic!("{case_name}: aggregate merge target locator missing"));
-        assert_target_position_locator_matches_ctx(case_name, locator, ctx);
         assert_aggregate_merge_layout_matches_ctx(case_name, layout, ctx);
-    }
-
-    fn assert_target_position_locator_matches_ctx(
-        case_name: &str,
-        locator: &crate::sql::codegen::AggregateStateTargetPositionLocator,
-        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
-    ) {
-        assert_eq!(
-            locator.target_entry.kind, ctx.target_entry.kind,
-            "{case_name}: target locator catalog kind"
-        );
-        assert_eq!(
-            locator.target_entry.properties, ctx.target_entry.properties,
-            "{case_name}: target locator catalog properties"
-        );
-        assert_eq!(
-            locator.target_entry.warehouse_uri, ctx.target_entry.warehouse_uri,
-            "{case_name}: target locator warehouse URI"
-        );
-        assert_eq!(
-            locator.target_entry.rest_uri, ctx.target_entry.rest_uri,
-            "{case_name}: target locator REST URI"
-        );
-        assert_eq!(
-            locator.target_entry.hms_uris, ctx.target_entry.hms_uris,
-            "{case_name}: target locator HMS URIs"
-        );
-        assert_eq!(
-            locator.target_entry.warehouse_path, ctx.target_entry.warehouse_path,
-            "{case_name}: target locator warehouse path"
-        );
-        assert_eq!(
-            locator.target_table.identifier().to_string(),
-            ctx.target_table.identifier().to_string(),
-            "{case_name}: target locator table identifier"
-        );
-        assert_eq!(
-            locator.target_table.metadata().uuid(),
-            ctx.target_table.metadata().uuid(),
-            "{case_name}: target locator table uuid"
-        );
-        assert_eq!(
-            locator.target_table.metadata().current_snapshot_id(),
-            ctx.target_table.metadata().current_snapshot_id(),
-            "{case_name}: target locator table snapshot"
-        );
-        assert_eq!(
-            locator.partition_filter,
-            ctx.affected_partitions_to_target_partition_filter(),
-            "{case_name}: target locator partition filter"
-        );
-        assert_eq!(
-            locator.apply_key_column, "__row_id__",
-            "{case_name}: target locator apply key column"
-        );
     }
 
     fn assert_aggregate_merge_layout_matches_ctx(

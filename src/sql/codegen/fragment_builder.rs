@@ -152,16 +152,25 @@ fn validate_aggregate_state_merge_child_output(
     input_name: &str,
     actual: &[OutputColumn],
     expected: &[OutputColumn],
+    allow_locator_metadata: bool,
 ) -> Result<(), String> {
-    if actual.len() != expected.len()
-        || actual.iter().zip(expected).any(|(actual, expected)| {
-            !actual.name.eq_ignore_ascii_case(&expected.name)
-                || actual.data_type != expected.data_type
-                || actual.nullable != expected.nullable
-        })
-    {
+    let prefix_matches = actual.len() >= expected.len()
+        && actual.iter().zip(expected).all(|(actual, expected)| {
+            actual.name.eq_ignore_ascii_case(&expected.name)
+                && actual.data_type == expected.data_type
+                && actual.nullable == expected.nullable
+        });
+    let trailing_matches = actual.len() == expected.len()
+        || (allow_locator_metadata
+            && aggregate_state_merge_locator_metadata_matches(&actual[expected.len()..]));
+    if !prefix_matches || !trailing_matches {
+        let expected_label = if allow_locator_metadata {
+            "physical aggregate columns with optional trailing _file/_pos"
+        } else {
+            "physical aggregate columns"
+        };
         return Err(format!(
-            "AggregateStateMerge {input_name} input must output physical aggregate columns: got [{}], expected [{}]",
+            "AggregateStateMerge {input_name} input must output {expected_label}: got [{}], expected [{}]",
             actual
                 .iter()
                 .map(|column| format!("{}:{:?}:{}", column.name, column.data_type, column.nullable))
@@ -175,6 +184,35 @@ fn validate_aggregate_state_merge_child_output(
         ));
     }
     Ok(())
+}
+
+fn aggregate_state_merge_locator_metadata_matches(trailing: &[OutputColumn]) -> bool {
+    if trailing.is_empty() {
+        return true;
+    }
+    if trailing.len() != 2 {
+        return false;
+    }
+    let expected = [
+        (
+            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            DataType::Utf8,
+            false,
+        ),
+        (
+            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            DataType::Int64,
+            false,
+        ),
+    ];
+    trailing
+        .iter()
+        .zip(expected)
+        .all(|(actual, (name, data_type, nullable))| {
+            actual.name.eq_ignore_ascii_case(name)
+                && actual.data_type == data_type
+                && actual.nullable == nullable
+        })
 }
 
 fn aggregate_state_shaped_output_columns(
@@ -541,12 +579,14 @@ impl PlanFragmentBuilder {
             "old",
             &old_input.output_columns,
             &physical_columns,
+            true,
         )?;
         let delta_state_columns = aggregate_state_shaped_output_columns(&layout)?;
         validate_aggregate_state_merge_child_output(
             "delta state-shaped",
             &delta_state_input.output_columns,
             &delta_state_columns,
+            false,
         )?;
         let delta_input = Box::new(crate::sql::codegen::PlanBuildResult {
             plan: plan_nodes::TPlan::new(Vec::new()),
@@ -572,15 +612,6 @@ impl PlanFragmentBuilder {
         let pruning_limits = mv_refresh_ctx
             .map(|ctx| ctx.pruning_limits)
             .unwrap_or_default();
-        let target_position_locator =
-            mv_refresh_ctx.map(
-                |ctx| crate::sql::codegen::AggregateStateTargetPositionLocator {
-                    target_entry: std::sync::Arc::clone(&ctx.target_entry),
-                    target_table: ctx.target_table.clone(),
-                    partition_filter: ctx.affected_partitions_to_target_partition_filter(),
-                    apply_key_column: layout.row_id_column.column.name.clone(),
-                },
-            );
         let boundary_schemas = vec![result_root_boundary_schema_report(0, -1, &output_columns)];
         let fragment = FragmentBuildResult {
             fragment_id: 0,
@@ -596,7 +627,6 @@ impl PlanFragmentBuilder {
                 layout,
                 branch_id,
                 pruning_limits,
-                target_position_locator,
             })),
             boundary_schemas,
             cte_id: None,
@@ -1486,6 +1516,23 @@ mod tests {
         ]
     }
 
+    fn aggregate_physical_columns_with_locator_metadata_for_test() -> Vec<OutputColumn> {
+        let mut columns = aggregate_physical_columns_for_test();
+        columns.push(output_col_for_test(
+            16,
+            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            DataType::Utf8,
+            false,
+        ));
+        columns.push(output_col_for_test(
+            17,
+            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            DataType::Int64,
+            false,
+        ));
+        columns
+    }
+
     fn aggregate_delta_state_columns_for_test() -> Vec<OutputColumn> {
         vec![
             output_col_for_test(21, "region", DataType::Utf8, true),
@@ -1941,6 +1988,73 @@ mod tests {
                 "s",
                 "__agg_state_c",
                 "__agg_state_s"
+            ]
+        );
+        assert!(matches!(
+            delta_input.direct_exec.as_deref(),
+            Some(DirectExecPlan::AggregateStatePhysicalize { .. })
+        ));
+    }
+
+    #[test]
+    fn aggregate_state_merge_direct_codegen_allows_old_input_locator_metadata() {
+        let ctx = aggregate_refresh_context_for_test();
+        let layout = ctx
+            .rewrite
+            .aggregate_shape_and_layout_for_execution()
+            .expect("layout")
+            .1;
+        let state_names = layout
+            .state_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let plan = aggregate_merge_plan_for_test(
+            values_plan_for_test(aggregate_physical_columns_with_locator_metadata_for_test()),
+            values_plan_for_test(aggregate_delta_state_columns_for_test()),
+            state_names,
+        );
+
+        let build = PlanFragmentBuilder::build_aggregate_state_merge_direct_with_layout_via_ir(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::default(),
+            "db",
+            None,
+            layout,
+            None,
+        )
+        .expect("direct aggregate merge build with old locator metadata");
+        let root = build
+            .fragment_results
+            .into_iter()
+            .next()
+            .expect("root fragment");
+        let Some(direct) = root.direct_exec else {
+            panic!("expected direct exec plan");
+        };
+        let DirectExecPlan::AggregateStateMerge {
+            old_input,
+            delta_input,
+            ..
+        } = *direct
+        else {
+            panic!("expected aggregate state merge direct plan");
+        };
+        assert_eq!(
+            old_input
+                .output_columns
+                .iter()
+                .rev()
+                .take(2)
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>(),
+            vec![
+                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                crate::exec::row_position::ICEBERG_ROW_POS_COL
             ]
         );
         assert!(matches!(

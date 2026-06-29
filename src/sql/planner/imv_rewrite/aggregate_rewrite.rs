@@ -211,7 +211,8 @@ fn target_state_old_scan(
     old_source: crate::sql::catalog::ScanSource,
     ext: &ImvExtension,
 ) -> LogicalPlanNode {
-    let old_columns = target_columns
+    let locator_metadata_columns = target_state_locator_metadata_columns();
+    let mut old_columns = target_columns
         .iter()
         .map(|column| crate::sql::analysis::OutputColumn {
             column_id: ext.allocate_column_id(),
@@ -223,14 +224,29 @@ fn target_state_old_scan(
                 .any(|name| name.eq_ignore_ascii_case(&column.name))
                 || column.name.eq_ignore_ascii_case(row_id_column_name),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    for column in &locator_metadata_columns {
+        if old_columns
+            .iter()
+            .any(|existing| existing.name.eq_ignore_ascii_case(&column.name))
+        {
+            continue;
+        }
+        old_columns.push(crate::sql::analysis::OutputColumn {
+            column_id: ext.allocate_column_id(),
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+            is_internal: true,
+        });
+    }
     LogicalPlanNode::new(
         PlanNodeKind::Scan(LogicalScanNode {
             database: target.namespace.clone(),
             table: TableDef {
                 name: target.table.clone(),
                 columns: target_columns,
-                iceberg_row_lineage_metadata_columns: Vec::new(),
+                iceberg_row_lineage_metadata_columns: locator_metadata_columns,
                 source: old_source,
             },
             alias: None,
@@ -244,6 +260,25 @@ fn target_state_old_scan(
         vec![],
         None,
     )
+}
+
+fn target_state_locator_metadata_columns() -> Vec<ColumnDef> {
+    vec![
+        ColumnDef {
+            name: crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+            data_type: DataType::Utf8,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        ColumnDef {
+            name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+    ]
 }
 
 fn branch_scoped_old_input(
@@ -304,7 +339,7 @@ fn aggregate_physical_passthrough_items(
     layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     outputs: &[OutputColumn],
 ) -> Result<Vec<ProjectItem>, String> {
-    layout
+    let mut items = layout
         .physical_columns
         .iter()
         .map(|physical| {
@@ -324,7 +359,27 @@ fn aggregate_physical_passthrough_items(
                 output_column_id: source.column_id,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    for name in [
+        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+    ] {
+        let source = find_output_column_by_name(outputs, name)?;
+        items.push(ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: source.column_id,
+                    qualifier: None,
+                    column: source.name.clone(),
+                },
+                data_type: source.data_type.clone(),
+                nullable: source.nullable,
+            },
+            output_name: source.name.clone(),
+            output_column_id: source.column_id,
+        });
+    }
+    Ok(items)
 }
 
 fn find_output_column_by_name<'a>(
@@ -1799,6 +1854,34 @@ mod tests {
             target_state.aggregate_state_names,
             vec!["__agg_state_s", "__agg_state___ivm_row_count"]
         );
+        assert_eq!(
+            old_scan
+                .columns
+                .iter()
+                .rev()
+                .take(2)
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>(),
+            vec![
+                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                crate::exec::row_position::ICEBERG_ROW_POS_COL
+            ]
+        );
+        assert_eq!(
+            old_scan
+                .table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                crate::exec::row_position::ICEBERG_ROW_POS_COL
+            ]
+        );
 
         let delta_input = changed.right();
         let PlanNodeKind::Project(project) = &delta_input.kind else {
@@ -1974,6 +2057,22 @@ mod tests {
                 .items
                 .iter()
                 .all(|item| !item.output_name.eq_ignore_ascii_case("__branch_id__"))
+        );
+        assert_eq!(
+            project
+                .items
+                .iter()
+                .rev()
+                .take(2)
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>(),
+            vec![
+                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                crate::exec::row_position::ICEBERG_ROW_POS_COL
+            ]
         );
         for item in &project.items {
             let source = find_output_column_by_name(old_scan.columns.as_slice(), &item.output_name)
