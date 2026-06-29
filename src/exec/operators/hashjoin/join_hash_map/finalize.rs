@@ -25,11 +25,23 @@ pub(crate) struct ProbeFinalize {
     pub(crate) selected: Vec<u32>,
 }
 
+fn validate_selection_pair_lengths(selection: &JoinSelection) -> Result<(), String> {
+    if selection.probe.len() != selection.build.len() {
+        return Err(format!(
+            "join selection length mismatch: probe={} build={}",
+            selection.probe.len(),
+            selection.build.len()
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn probe_matched_flags(
     probe_len: usize,
     selection: &JoinSelection,
     context: &str,
 ) -> Result<Vec<bool>, String> {
+    validate_selection_pair_lengths(selection)?;
     let mut matched = vec![false; probe_len];
     for &probe_row in &selection.probe {
         let row = probe_row as usize;
@@ -69,6 +81,7 @@ pub(crate) fn mark_build_matches(
     flags: &mut BuildMatchFlags,
     selection: &JoinSelection,
 ) -> Result<u64, String> {
+    validate_selection_pair_lengths(selection)?;
     let mut newly_marked = 0u64;
     for &build_row in &selection.build {
         if flags.mark(build_row)? {
@@ -123,6 +136,19 @@ mod tests {
     }
 
     #[test]
+    fn finalize_probe_rows_rejects_mismatched_selection_lengths() {
+        let selection = JoinSelection {
+            probe: vec![0],
+            build: vec![10, 11],
+        };
+
+        let err =
+            finalize_probe_rows(2, &selection, true, "left semi").expect_err("length mismatch");
+
+        assert_eq!(err, "join selection length mismatch: probe=1 build=2");
+    }
+
+    #[test]
     fn mark_build_matches_returns_unique_new_marks() {
         let mut flags = BuildMatchFlags::new(5);
         let selection = JoinSelection {
@@ -139,6 +165,19 @@ mod tests {
         let marked_again =
             mark_build_matches(&mut flags, &selection).expect("mark duplicate build matches");
         assert_eq!(marked_again, 0);
+    }
+
+    #[test]
+    fn mark_build_matches_rejects_mismatched_selection_lengths() {
+        let mut flags = BuildMatchFlags::new(5);
+        let selection = JoinSelection {
+            probe: vec![0],
+            build: vec![1, 2],
+        };
+
+        let err = mark_build_matches(&mut flags, &selection).expect_err("length mismatch");
+
+        assert_eq!(err, "join selection length mismatch: probe=1 build=2");
     }
 
     #[test]
