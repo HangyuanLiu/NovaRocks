@@ -1224,8 +1224,13 @@ impl HashJoinProbeCore {
                 let probe_finalize =
                     finalize_probe_rows(probe.len(), &selection, is_semi, "semi/anti join")?;
                 if let Some(residual_matched_rows_before) = residual_matched_rows_before {
-                    self.residual_matched_rows = residual_matched_rows_before
-                        .saturating_add(probe_finalize.selected.len() as u64);
+                    let matched_probe_rows = probe_finalize
+                        .matched
+                        .iter()
+                        .filter(|matched| **matched)
+                        .count();
+                    self.residual_matched_rows =
+                        residual_matched_rows_before.saturating_add(matched_probe_rows as u64);
                 }
 
                 let keep = probe_finalize
@@ -2254,6 +2259,67 @@ mod tests {
         assert_eq!(core.lookup_hit_rows(), 2);
         assert_eq!(core.lookup_miss_rows(), 1);
         assert_eq!(core.residual_group_rows_total(), 3);
+    }
+
+    #[test]
+    fn left_anti_with_residual_counts_matched_probe_rows_not_output_rows() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let left_v = arena.push_typed(ExprNode::SlotId(LEFT_V_SLOT_ID), DataType::Int32);
+        let right_w = arena.push_typed(ExprNode::SlotId(RIGHT_W_SLOT_ID), DataType::Int32);
+        let residual = arena.push_typed(ExprNode::Lt(left_v, right_w), DataType::Boolean);
+        let arena = Arc::new(arena);
+
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[100, 100, 102],
+            &[0, 10, 30],
+        );
+        let artifact = Arc::new(direct_build_artifact_from_build_chunk(build_chunk));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::LeftAnti,
+            vec![probe_key],
+            Some(residual),
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        core.set_build_artifact(artifact, 3, false)
+            .expect("set build");
+
+        let probe_chunk = chunk_of_two(
+            Arc::clone(&left_schema),
+            &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID],
+            &[100, 101, 102],
+            &[5, 2, 40],
+        );
+
+        let out = core
+            .join_probe_chunks(vec![probe_chunk])
+            .expect("probe")
+            .expect("left anti output");
+        assert_eq!(out.len(), 2);
+        assert_eq!(int32_values(&out, 0), vec![Some(101), Some(102)]);
+        assert_eq!(core.lookup_hit_rows(), 2);
+        assert_eq!(core.lookup_miss_rows(), 1);
+        assert_eq!(core.residual_group_rows_total(), 3);
+        assert_eq!(core.residual_matched_rows(), 1);
     }
 
     #[test]
