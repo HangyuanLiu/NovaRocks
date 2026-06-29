@@ -50,8 +50,8 @@ use crate::runtime::query_context::{
 };
 use crate::runtime::result_buffer;
 use crate::service::fe_report;
-use crate::sql::codegen::type_infer::arrow_field_to_primitive;
 use crate::thrift::{data, data_sinks, descriptors, exprs, internal_service, planner, types};
+use crate::types::arrow_thrift::arrow_field_to_primitive;
 
 const STATISTIC_DATA_VERSION_V1: i32 = 1;
 const STATISTIC_HISTOGRAM_VERSION: i32 = 2;

@@ -30,8 +30,8 @@ use std::cmp::Ordering;
 
 use crate::common::largeint;
 use crate::exec::variant::VariantValue;
-use crate::sql::codegen::type_infer::arrow_field_to_primitive;
 use crate::thrift::types;
+use crate::types::arrow_thrift::arrow_field_to_primitive;
 use crate::types::logical::{LogicalType, logical_type_of_field};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

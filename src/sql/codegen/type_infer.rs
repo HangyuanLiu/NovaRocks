@@ -2,7 +2,7 @@ use arrow::datatypes::{DataType, Field};
 
 use crate::lower::thrift::type_lowering::scalar_type_desc;
 use crate::thrift::types;
-use crate::types::logical::{LogicalType, logical_type_of_field};
+use crate::types::arrow_thrift::{arrow_type_to_primitive, field_logical_primitive};
 
 /// Convert Arrow DataType to Thrift TTypeDesc.
 pub(crate) fn arrow_type_to_type_desc(data_type: &DataType) -> Result<types::TTypeDesc, String> {
@@ -26,7 +26,7 @@ fn append_arrow_type_nodes(
 ) -> Result<(), String> {
     // If the enclosing `Field` carries a logical-type tag, override the
     // inferred primitive so the child reports e.g. JSON instead of VARCHAR.
-    if let Some(primitive) = logical_type_override(parent_field) {
+    if let Some(primitive) = parent_field.and_then(field_logical_primitive) {
         nodes.extend(scalar_type_desc(primitive).types.unwrap_or_default());
         return Ok(());
     }
@@ -148,55 +148,13 @@ fn append_arrow_type_nodes(
     }
 }
 
-fn logical_type_override(field: Option<&Field>) -> Option<types::TPrimitiveType> {
-    match logical_type_of_field(field?)? {
-        LogicalType::Json => Some(types::TPrimitiveType::JSON),
-        LogicalType::Hll => Some(types::TPrimitiveType::HLL),
-        LogicalType::Bitmap | LogicalType::Object => Some(types::TPrimitiveType::OBJECT),
-        LogicalType::Percentile => Some(types::TPrimitiveType::PERCENTILE),
-    }
-}
-
-#[allow(dead_code)] // Staged M2 boundary helper; callers migrate in later slices.
-pub(crate) fn arrow_field_to_primitive(field: &Field) -> Option<types::TPrimitiveType> {
-    logical_type_override(Some(field)).or_else(|| arrow_type_to_primitive(field.data_type()).ok())
-}
-
-pub(crate) fn arrow_type_to_primitive(
-    data_type: &DataType,
-) -> Result<types::TPrimitiveType, String> {
-    match data_type {
-        DataType::Boolean => Ok(types::TPrimitiveType::BOOLEAN),
-        DataType::Int8 => Ok(types::TPrimitiveType::TINYINT),
-        DataType::Int16 => Ok(types::TPrimitiveType::SMALLINT),
-        DataType::Int32 => Ok(types::TPrimitiveType::INT),
-        DataType::Int64 => Ok(types::TPrimitiveType::BIGINT),
-        DataType::Float32 => Ok(types::TPrimitiveType::FLOAT),
-        DataType::Float64 => Ok(types::TPrimitiveType::DOUBLE),
-        DataType::Utf8 | DataType::LargeUtf8 => Ok(types::TPrimitiveType::VARCHAR),
-        DataType::Binary => Ok(types::TPrimitiveType::VARBINARY),
-        // NovaRocks reserves arrow `LargeBinary` for the v3 variant payload
-        // (see src/lower/type_lowering.rs:170). Plain BINARY uses `Binary`.
-        DataType::LargeBinary => Ok(types::TPrimitiveType::VARIANT),
-        DataType::Date32 => Ok(types::TPrimitiveType::DATE),
-        DataType::Timestamp(_, _) => Ok(types::TPrimitiveType::DATETIME),
-        DataType::Decimal128(_, _) => Ok(types::TPrimitiveType::DECIMAL128),
-        DataType::Decimal256(_, _) => Ok(types::TPrimitiveType::DECIMAL256),
-        DataType::FixedSizeBinary(16) => Ok(types::TPrimitiveType::LARGEINT),
-        DataType::Time64(_) => Ok(types::TPrimitiveType::TIME),
-        DataType::Null => Ok(types::TPrimitiveType::NULL_TYPE),
-        other => Err(format!(
-            "ThriftPlanBuilder does not support data type {:?}",
-            other
-        )),
-    }
-}
-
 pub(crate) use crate::types::{arithmetic_result_type_with_op, wider_type};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::arrow_thrift::arrow_field_to_primitive;
+    use crate::types::logical::LogicalType;
 
     fn primitive_from_desc(desc: &types::TTypeDesc) -> Option<types::TPrimitiveType> {
         crate::lower::type_lowering::primitive_type_from_desc(desc)
