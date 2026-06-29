@@ -40,6 +40,7 @@ use super::build_artifact::{BuildView, JoinBuildArtifact};
 #[cfg(test)]
 use super::build_requirements;
 use super::build_requirements::{BuildComponentRequirements, required_build_components};
+use super::join_hash_map::finalize::{finalize_probe_rows, mark_build_matches};
 use super::join_hash_map::match_flags::BuildMatchFlags;
 use super::join_hash_map::method::JoinHashMap;
 use super::join_hash_map::search::{JoinSelection, SearchStats, append_cross_selection};
@@ -1018,13 +1019,11 @@ impl HashJoinProbeCore {
             let table = table_opt.as_ref().expect("build table");
             let build_chunk = build_chunk_opt.as_ref().expect("build chunk");
             let search_start = std::time::Instant::now();
-            let (group_ids, mut selection) =
-                table.lookup_selection(&self.arena, &self.probe_keys, &probe)?;
+            let (mut selection, stats) =
+                table.search_pairs(&self.arena, &self.probe_keys, &probe)?;
             self.record_search_ns(search_start);
-            let stats = SearchStats::from_group_ids(&group_ids);
             self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(stats.lookup_hit_rows);
             self.lookup_miss_rows = self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
-            let mut probe_matched = vec![false; probe.len()];
             if !selection.is_empty() {
                 if let Some(pred) = self.residual_predicate {
                     self.residual_rows_checked = self
@@ -1035,43 +1034,37 @@ impl HashJoinProbeCore {
                         .saturating_add(selection.len() as u64);
                     self.compact_selection_by_residual(&probe, build_chunk, &mut selection, pred)?;
                 }
-                for (&probe_row, &build_row) in selection.probe.iter().zip(selection.build.iter()) {
-                    probe_matched[probe_row as usize] = true;
-                    if track_build_matches && let Some(flags) = self.build_matched.as_mut() {
-                        flags.mark(build_row)?;
-                    }
-                }
-                if !selection.is_empty() {
-                    let output_start = std::time::Instant::now();
-                    let batches = if self.probe_is_left {
-                        crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batches(
-                            &probe,
-                            build_chunk,
-                            &selection.probe,
-                            &selection.build,
-                            &output_schema,
-                        )?
-                    } else {
-                        crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batches(
-                            build_chunk,
-                            &probe,
-                            &selection.build,
-                            &selection.probe,
-                            &output_schema,
-                        )?
-                    };
-                    self.record_output_ns(output_start);
-                    output_batches.extend(batches);
-                }
+            }
+
+            let probe_finalize = finalize_probe_rows(probe.len(), &selection, false, "outer join")?;
+            let unmatched = probe_finalize.selected;
+            if track_build_matches && let Some(flags) = self.build_matched.as_mut() {
+                mark_build_matches(flags, &selection)?;
+            }
+            if !selection.is_empty() {
+                let output_start = std::time::Instant::now();
+                let batches = if self.probe_is_left {
+                    crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batches(
+                        &probe,
+                        build_chunk,
+                        &selection.probe,
+                        &selection.build,
+                        &output_schema,
+                    )?
+                } else {
+                    crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batches(
+                        build_chunk,
+                        &probe,
+                        &selection.build,
+                        &selection.probe,
+                        &output_schema,
+                    )?
+                };
+                self.record_output_ns(output_start);
+                output_batches.extend(batches);
             }
 
             if output_unmatched_probe {
-                let mut unmatched = Vec::new();
-                for (row, matched) in probe_matched.iter().enumerate() {
-                    if !*matched {
-                        unmatched.push(row as u32);
-                    }
-                }
                 if !unmatched.is_empty() {
                     let output_start = std::time::Instant::now();
                     let batch = if self.probe_is_left {
@@ -1684,8 +1677,17 @@ mod tests {
     }
 
     fn join_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
-        let mut fields = left.fields().to_vec();
-        fields.extend(right.fields().to_vec());
+        let mut fields = left
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>();
+        fields.extend(
+            right
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone().with_nullable(true)),
+        );
         Arc::new(Schema::new(fields))
     }
 
@@ -1985,6 +1987,67 @@ mod tests {
             .expect("probe")
             .expect("inner join output");
         assert_eq!(out.len(), 2);
+        assert_eq!(core.lookup_hit_rows(), 1);
+        assert_eq!(core.lookup_miss_rows(), 1);
+    }
+
+    #[test]
+    fn full_outer_search_pairs_marks_build_and_probe_unmatched() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let arena = Arc::new(arena);
+
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[100, 101, 103],
+            &[10, 11, 13],
+        );
+        let artifact = Arc::new(direct_build_artifact_from_build_chunk(build_chunk));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::FullOuter,
+            vec![probe_key],
+            None,
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        core.set_build_artifact(artifact, 3, false)
+            .expect("set build");
+
+        let probe_chunk = chunk_of_two(
+            Arc::clone(&left_schema),
+            &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID],
+            &[100, 102],
+            &[1, 2],
+        );
+
+        let probe_out = core
+            .join_probe_chunks(vec![probe_chunk])
+            .expect("probe")
+            .expect("full outer probe output");
+        assert_eq!(probe_out.len(), 2);
+
+        let finish_out = core
+            .finish_from_probe_output(Some(probe_out), None, true)
+            .expect("finish")
+            .expect("full outer final output");
+        assert_eq!(finish_out.len(), 4);
         assert_eq!(core.lookup_hit_rows(), 1);
         assert_eq!(core.lookup_miss_rows(), 1);
     }
