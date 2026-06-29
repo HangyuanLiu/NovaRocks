@@ -41,15 +41,18 @@ use crate::connector::starrocks::table::catalog::{
     StarRocksTableCatalog, register_starrocks_table_in_catalog,
 };
 use crate::connector::starrocks::table::ddl::{
-    StarRocksPhysicalColumn, build_create_tablet_request, build_tablet_schema, keys_type_name,
-    patch_tablet_schema_column_flags, starrocks_physical_column,
-    stored_columns_from_physical_columns, table_columns_from_physical_columns,
+    StarRocksPhysicalColumn, keys_type_name, patch_tablet_schema_column_flags,
+    starrocks_physical_column, stored_columns_from_physical_columns,
+    table_columns_from_physical_columns,
 };
 use crate::connector::starrocks::table::model::{
     IcebergTableRef, StarRocksMvStorageEngine, StarRocksTableKind, StarRocksTableState,
 };
 use crate::connector::starrocks::table::mv_shape::{
     AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, VisibleAggregateOutput,
+};
+use crate::connector::starrocks::table::schema_adapter::{
+    build_create_tablet_request, build_tablet_schema,
 };
 use crate::engine::mv::lifecycle::{MvListRow, MvStorageEngine};
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
@@ -278,7 +281,7 @@ pub(crate) fn create_mv(
         .map_err(|e| format!("create StarRocks materialized view metadata failed: {e}"))?;
     let request_schema = build_tablet_schema(&table_columns, &key_desc, created.schema.schema_id)?;
     let mut tablet_schema_pb =
-        crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift(
+        crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_pb_from_thrift(
             &request_schema,
         )?;
     patch_tablet_schema_column_flags(&mut tablet_schema_pb, &physical_columns)?;
@@ -2327,7 +2330,7 @@ mod tests {
         )
         .expect("build request schema");
         let tablet_schema_pb =
-            crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift(
+            crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_pb_from_thrift(
                 &request_schema,
             )
             .expect("build tablet schema pb")
@@ -3369,7 +3372,7 @@ GROUP BY k1",
             crate::thrift::types::TKeysType::PRIMARY_KEYS
         );
         let mut tablet_schema =
-            crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift(
+            crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_pb_from_thrift(
                 &request_schema,
             )
             .expect("tablet schema pb");

@@ -32,14 +32,13 @@ use crate::exec::node::scan::ScanMorsel;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::formats::{
     FileFormatConfig, build_format_iter, parquet::ParquetReadCachePolicy,
-    parquet::ParquetScanConfig,
+    parquet::ParquetScanConfig, parquet::ParquetSlotKind,
 };
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
 use crate::novarocks_connectors::{StarRocksScanConfig, StarRocksScanOp};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::thrift::descriptors;
-use crate::thrift::types;
-use crate::types::arrow_thrift::{thrift_desc_to_arrow_type, thrift_desc_to_primitive};
+use crate::types::arrow_thrift::thrift_desc_to_arrow_type;
 
 #[derive(Clone, Debug)]
 pub struct GlobalLateMaterializationContext {
@@ -71,7 +70,6 @@ impl GlobalLateMaterializationContext {
 #[derive(Clone, Debug)]
 struct SlotMeta {
     name: String,
-    primitive: types::TPrimitiveType,
     arrow_type: arrow::datatypes::DataType,
 }
 
@@ -93,8 +91,6 @@ fn build_slot_meta_map(
         if parent != tuple_id {
             continue;
         }
-        let primitive =
-            thrift_desc_to_primitive(slot_type).unwrap_or(types::TPrimitiveType::INVALID_TYPE);
         let arrow_type = thrift_desc_to_arrow_type(slot_type)
             .ok_or_else(|| format!("unsupported slot_type for tuple_id={parent} slot_id={id}"))?;
         let slot_id = SlotId::try_from(id)?;
@@ -102,7 +98,6 @@ fn build_slot_meta_map(
             slot_id,
             SlotMeta {
                 name: crate::lower::layout::slot_display_name_from_desc(s),
-                primitive,
                 arrow_type,
             },
         );
@@ -117,6 +112,14 @@ fn build_slot_meta_map(
         map.insert(*slot, meta);
     }
     Ok(map)
+}
+
+fn parquet_slot_kind_from_arrow_type(data_type: &arrow::datatypes::DataType) -> ParquetSlotKind {
+    if matches!(data_type, arrow::datatypes::DataType::LargeBinary) {
+        ParquetSlotKind::Variant
+    } else {
+        ParquetSlotKind::Regular
+    }
 }
 
 fn lookup_output_slots(
@@ -288,7 +291,10 @@ pub(crate) fn execute_lookup_request(
             .collect::<Result<Vec<_>, _>>()?;
 
         let columns = lookup_metas.iter().map(|m| m.name.clone()).collect();
-        let slot_types = lookup_metas.iter().map(|m| m.primitive).collect();
+        let slot_kinds = lookup_metas
+            .iter()
+            .map(|meta| parquet_slot_kind_from_arrow_type(&meta.arrow_type))
+            .collect::<Vec<_>>();
         let chunk_schema = Arc::new(ChunkSchema::try_new(
             lookup_slots
                 .iter()
@@ -312,7 +318,7 @@ pub(crate) fn execute_lookup_request(
         let parquet_cfg = ParquetScanConfig {
             columns,
             chunk_schema,
-            slot_types,
+            slot_kinds,
             case_sensitive: scan_cfg.case_sensitive,
             enable_page_index: false,
             min_max_predicates: Vec::new(),

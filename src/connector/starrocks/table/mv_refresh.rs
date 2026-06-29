@@ -30,11 +30,12 @@ use crate::connector::starrocks::table::catalog::{
     StarRocksTableCatalog, StarRocksTableRuntime, register_starrocks_tables_in_catalog,
 };
 use crate::connector::starrocks::table::config::StarRocksTableConfig;
-use crate::connector::starrocks::table::ddl::{
-    bootstrap_empty_partition_for_tablets, build_create_tablet_request, request_schema_from_runtime,
-};
+use crate::connector::starrocks::table::ddl::bootstrap_empty_partition_for_tablets;
 use crate::connector::starrocks::table::model::{
     IcebergTableRef, StarRocksMvStorageEngine, StarRocksPartitionState, StarRocksTableKind,
+};
+use crate::connector::starrocks::table::schema_adapter::{
+    build_create_tablet_request, request_schema_from_runtime,
 };
 use crate::connector::starrocks::table::txn::{
     MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, load_physical_insert_plan,
@@ -1845,13 +1846,11 @@ mod tests {
 
     use crate::connector::starrocks::ObjectStoreProfile;
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
-    use crate::connector::starrocks::lake::schema::{
-        build_tablet_schema_pb_from_thrift, create_lake_tablet_from_req_with_schema_patch,
-    };
+    use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
+    use crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_pb_from_thrift;
     use crate::connector::starrocks::table::StarRocksTableConfig;
     use crate::connector::starrocks::table::ddl::{
-        build_create_tablet_request, build_tablet_schema, keys_type_name,
-        patch_tablet_schema_column_flags, stored_columns_from_physical_columns,
+        keys_type_name, patch_tablet_schema_column_flags, stored_columns_from_physical_columns,
         table_columns_from_physical_columns,
     };
     use crate::connector::starrocks::table::model::{
@@ -1863,6 +1862,9 @@ mod tests {
     use crate::connector::starrocks::table::mv_refresh_strategy::FullRefreshReason;
     use crate::connector::starrocks::table::refresh_pin::{
         AfterCaptureHook, lock_after_capture_hook_for_test,
+    };
+    use crate::connector::starrocks::table::schema_adapter::{
+        build_create_tablet_request, build_tablet_schema,
     };
     use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::{QueryResult, QueryResultColumn, record_batch_to_chunk};

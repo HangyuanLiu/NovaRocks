@@ -37,8 +37,7 @@ use crate::common::ids::SlotId;
 use crate::exec::variant::{
     VariantMetadata, VariantPathSegment, VariantValue, parse_variant_path, split_serialized,
 };
-use crate::formats::parquet::VariantPathSpec;
-use crate::thrift::types;
+use crate::formats::parquet::{ParquetSlotKind, VariantPathSpec};
 
 fn is_binary_like(dt: &DataType) -> bool {
     matches!(
@@ -175,21 +174,21 @@ pub(crate) fn collapse_variant_struct_to_largebinary(
 /// variant struct with the engine-internal LargeBinary form. Non-variant
 /// slots and already-LargeBinary variant slots pass through untouched.
 pub(crate) fn convert_variant_columns(
-    slot_types: &[types::TPrimitiveType],
+    slot_kinds: &[ParquetSlotKind],
     batch: RecordBatch,
 ) -> Result<RecordBatch, String> {
-    if slot_types.is_empty() {
+    if slot_kinds.is_empty() {
         return Ok(batch);
     }
-    if !slot_types.contains(&types::TPrimitiveType::VARIANT) {
+    if !slot_kinds.iter().any(|kind| kind.is_variant()) {
         return Ok(batch);
     }
 
-    if batch.num_columns() != slot_types.len() {
+    if batch.num_columns() != slot_kinds.len() {
         return Err(format!(
-            "parquet scan slot_types mismatch: columns={} slot_types={}",
+            "parquet scan slot_kinds mismatch: columns={} slot_kinds={}",
             batch.num_columns(),
-            slot_types.len()
+            slot_kinds.len()
         ));
     }
 
@@ -199,7 +198,7 @@ pub(crate) fn convert_variant_columns(
 
     for (idx, field) in schema.fields().iter().enumerate() {
         let col = batch.column(idx);
-        if slot_types[idx] != types::TPrimitiveType::VARIANT {
+        if !slot_kinds[idx].is_variant() {
             new_fields.push(field.clone());
             new_columns.push(col.clone());
             continue;
@@ -611,6 +610,7 @@ mod tests {
     use arrow::array::{Float64Array, Int64Array, LargeBinaryArray, StringArray};
     use parquet::variant::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
+    use super::{ParquetSlotKind, VariantPathSpec};
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::function::variant::{eval_try_variant_get, eval_variant_get};
@@ -618,7 +618,6 @@ mod tests {
     use crate::exec::variant::{
         parse_variant_path, variant_query, variant_to_i64, variant_to_string,
     };
-    use crate::formats::parquet::VariantPathSpec;
 
     fn variant_struct_from_json(shredded: bool, rows: Vec<Option<&str>>) -> ArrayRef {
         let json: ArrayRef = Arc::new(StringArray::from(rows));
@@ -1045,8 +1044,7 @@ mod tests {
     #[test]
     fn convert_variant_columns_handles_shredded_struct() {
         let batch = batch_with_variant_struct(true);
-        let out =
-            convert_variant_columns(&[types::TPrimitiveType::VARIANT], batch).expect("convert");
+        let out = convert_variant_columns(&[ParquetSlotKind::Variant], batch).expect("convert");
         assert_eq!(out.column(0).data_type(), &DataType::LargeBinary);
         let col = out
             .column(0)
@@ -1065,8 +1063,8 @@ mod tests {
         let field = Field::new("x", DataType::Int64, false);
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![col]).expect("batch");
-        let out = convert_variant_columns(&[types::TPrimitiveType::BIGINT], batch.clone())
-            .expect("convert");
+        let out =
+            convert_variant_columns(&[ParquetSlotKind::Regular], batch.clone()).expect("convert");
         assert_eq!(out.column(0).as_ref(), batch.column(0).as_ref());
     }
 
@@ -1114,7 +1112,7 @@ mod tests {
 
         // The file's variant column comes back as the shredded struct; the
         // engine conversion must reconstruct full variant rows from it.
-        let out = convert_variant_columns(&[types::TPrimitiveType::VARIANT], read_batch)
+        let out = convert_variant_columns(&[ParquetSlotKind::Variant], read_batch)
             .expect("convert from file");
         let col = out
             .column(0)

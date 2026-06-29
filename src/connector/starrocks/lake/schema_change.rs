@@ -30,7 +30,7 @@ use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, get_tablet_runtime, register_tablet_runtime,
     update_tablet_runtime_schema, with_txn_log_append_lock,
 };
-use crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift;
+use crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_pb_from_thrift;
 use crate::connector::starrocks::lake::txn_log::{
     build_tablet_output_schema, load_rowset_batch_for_partial_update_with_delete_predicates,
     parse_default_literal_to_singleton_array, read_txn_log_if_exists, write_txn_log_file,

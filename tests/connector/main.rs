@@ -24,9 +24,8 @@ use novarocks::common::ids::SlotId;
 use novarocks::connector::{self, FileFormatConfig, ParquetScanConfig};
 use novarocks::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use novarocks::exec::node::scan::ScanOp;
-use novarocks::formats::parquet::ParquetReadCachePolicy;
+use novarocks::formats::parquet::{ParquetReadCachePolicy, ParquetSlotKind};
 use novarocks::novarocks_connector_jdbc::{JdbcScanConfig, JdbcScanOp};
-use novarocks::thrift::types;
 use std::sync::Arc;
 
 #[path = "../common/mod.rs"]
@@ -107,7 +106,7 @@ fn test_iceberg_connector_module() {
             )])
             .expect("chunk schema"),
         ),
-        slot_types: vec![types::TPrimitiveType::INT],
+        slot_kinds: vec![ParquetSlotKind::Regular],
         case_sensitive: false,
         enable_page_index: false,
         min_max_predicates: vec![],

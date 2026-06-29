@@ -60,7 +60,6 @@ use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
 use crate::thrift::metrics;
-use crate::thrift::types;
 use page_selection::build_row_selection_for_row_groups;
 pub(crate) use reader::ParquetCachedReader;
 use row_group_selector::select_row_groups_for_range;
@@ -228,11 +227,23 @@ pub struct VariantPathSpec {
     pub strict: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParquetSlotKind {
+    Regular,
+    Variant,
+}
+
+impl ParquetSlotKind {
+    pub(crate) fn is_variant(self) -> bool {
+        self == Self::Variant
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ParquetScanConfig {
     pub columns: Vec<String>,
     pub chunk_schema: ChunkSchemaRef,
-    pub slot_types: Vec<types::TPrimitiveType>,
+    pub slot_kinds: Vec<ParquetSlotKind>,
     pub case_sensitive: bool,
     pub enable_page_index: bool,
     pub min_max_predicates: Vec<MinMaxPredicate>,
@@ -249,17 +260,17 @@ pub struct ParquetScanConfig {
     pub query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
 }
 
-fn materialized_variant_path_schema_and_slot_types(
+fn materialized_variant_path_schema_and_slot_kinds(
     cfg: &ParquetScanConfig,
-) -> Result<(ChunkSchemaRef, Vec<types::TPrimitiveType>), String> {
+) -> Result<(ChunkSchemaRef, Vec<ParquetSlotKind>), String> {
     if cfg.variant_path_columns.is_empty() {
-        return Ok((cfg.chunk_schema.clone(), cfg.slot_types.clone()));
+        return Ok((cfg.chunk_schema.clone(), cfg.slot_kinds.clone()));
     }
-    if cfg.chunk_schema.slot_ids().len() != cfg.slot_types.len() {
+    if cfg.chunk_schema.slot_ids().len() != cfg.slot_kinds.len() {
         return Err(format!(
-            "variant path scan schema/slot_types mismatch: slots={} slot_types={}",
+            "variant path scan schema/slot_kinds mismatch: slots={} slot_kinds={}",
             cfg.chunk_schema.slot_ids().len(),
-            cfg.slot_types.len()
+            cfg.slot_kinds.len()
         ));
     }
 
@@ -271,15 +282,15 @@ fn materialized_variant_path_schema_and_slot_types(
         })
         .collect::<HashSet<_>>();
 
-    let slot_type_by_id = cfg
+    let slot_kind_by_id = cfg
         .chunk_schema
         .slot_ids()
         .iter()
         .copied()
-        .zip(cfg.slot_types.iter().copied())
+        .zip(cfg.slot_kinds.iter().copied())
         .collect::<HashMap<_, _>>();
     let mut materialized_slots = Vec::new();
-    let mut materialized_slot_types = Vec::new();
+    let mut materialized_slot_kinds = Vec::new();
     let mut seen = HashSet::new();
 
     for slot in cfg.chunk_schema.slots() {
@@ -289,10 +300,10 @@ fn materialized_variant_path_schema_and_slot_types(
         }
         seen.insert(slot_id);
         materialized_slots.push(slot.clone());
-        materialized_slot_types.push(
-            *slot_type_by_id
+        materialized_slot_kinds.push(
+            *slot_kind_by_id
                 .get(&slot_id)
-                .unwrap_or(&types::TPrimitiveType::INVALID_TYPE),
+                .unwrap_or(&ParquetSlotKind::Regular),
         );
     }
 
@@ -309,12 +320,12 @@ fn materialized_variant_path_schema_and_slot_types(
             None,
             None,
         )?);
-        materialized_slot_types.push(types::TPrimitiveType::INVALID_TYPE);
+        materialized_slot_kinds.push(ParquetSlotKind::Regular);
     }
 
     Ok((
         Arc::new(ChunkSchema::try_new(materialized_slots)?),
-        materialized_slot_types,
+        materialized_slot_kinds,
     ))
 }
 
@@ -458,7 +469,7 @@ struct ParquetScanIter {
     runtime_filters: Option<RuntimeFilterContext>,
     scan_read_chunk_schema: ChunkSchemaRef,
     materialized_chunk_schema: ChunkSchemaRef,
-    materialized_slot_types: Vec<types::TPrimitiveType>,
+    materialized_slot_kinds: Vec<ParquetSlotKind>,
     has_dict_encoded_output: bool,
 }
 
@@ -612,8 +623,8 @@ impl ParquetScanIter {
         runtime_filters: Option<RuntimeFilterContext>,
     ) -> Result<Self, String> {
         let remaining = limit.unwrap_or(usize::MAX);
-        let (materialized_chunk_schema, materialized_slot_types) =
-            materialized_variant_path_schema_and_slot_types(&cfg)?;
+        let (materialized_chunk_schema, materialized_slot_kinds) =
+            materialized_variant_path_schema_and_slot_kinds(&cfg)?;
         let (scan_read_chunk_schema, has_dict_encoded_output) = if cfg.query_global_dicts.is_empty()
         {
             (materialized_chunk_schema.clone(), false)
@@ -647,7 +658,7 @@ impl ParquetScanIter {
             runtime_filters,
             scan_read_chunk_schema,
             materialized_chunk_schema,
-            materialized_slot_types,
+            materialized_slot_kinds,
             has_dict_encoded_output,
         })
     }
@@ -1165,7 +1176,7 @@ impl Iterator for ParquetScanIter {
                                 &self.cfg.variant_path_columns,
                             )
                         })
-                        .and_then(|b| convert_variant_columns(&self.materialized_slot_types, b))
+                        .and_then(|b| convert_variant_columns(&self.materialized_slot_kinds, b))
                         .and_then(|b| {
                             normalize_batch_to_chunk_schema(b, &self.scan_read_chunk_schema)
                         })
@@ -2201,7 +2212,7 @@ mod tests {
 
     use super::{
         MinMaxPredicate, MinMaxPredicateValue, ParquetReadCachePolicy, ParquetScanConfig,
-        ParquetScanIter, VariantPathPruningPredicate, VariantPathSpec,
+        ParquetScanIter, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
         bind_variant_path_pruning_predicates, build_active_projection_columns,
         build_delayed_output_sources, build_delayed_projection_plan, build_parquet_iter,
         build_row_selection_for_row_groups, collect_parquet_coalesce_io_ranges,
@@ -2250,7 +2261,16 @@ mod tests {
                 &slot_ids,
             )
             .expect("chunk schema"),
-            slot_types,
+            slot_kinds: slot_types
+                .iter()
+                .map(|primitive| {
+                    if *primitive == types::TPrimitiveType::VARIANT {
+                        ParquetSlotKind::Variant
+                    } else {
+                        ParquetSlotKind::Regular
+                    }
+                })
+                .collect(),
             case_sensitive: true,
             enable_page_index: false,
             min_max_predicates: Vec::new(),
@@ -2435,7 +2455,7 @@ mod tests {
         ParquetScanConfig {
             columns: vec!["payload".to_string()],
             chunk_schema,
-            slot_types: vec![types::TPrimitiveType::VARIANT],
+            slot_kinds: vec![ParquetSlotKind::Variant],
             case_sensitive: true,
             enable_page_index: false,
             min_max_predicates: Vec::new(),
@@ -2635,10 +2655,10 @@ mod tests {
         let mut cfg = ParquetScanConfig {
             columns: vec!["id".to_string(), "payload".to_string()],
             chunk_schema,
-            slot_types: vec![
-                types::TPrimitiveType::INT,
-                types::TPrimitiveType::BIGINT,
-                types::TPrimitiveType::VARIANT,
+            slot_kinds: vec![
+                ParquetSlotKind::Regular,
+                ParquetSlotKind::Regular,
+                ParquetSlotKind::Variant,
             ],
             case_sensitive: true,
             enable_page_index: false,
@@ -2703,7 +2723,7 @@ mod tests {
         let cfg = ParquetScanConfig {
             columns: vec!["id".to_string(), "payload".to_string()],
             chunk_schema,
-            slot_types: vec![types::TPrimitiveType::INT, types::TPrimitiveType::VARIANT],
+            slot_kinds: vec![ParquetSlotKind::Regular, ParquetSlotKind::Variant],
             case_sensitive: true,
             enable_page_index: false,
             min_max_predicates: vec![MinMaxPredicate::Gt {
@@ -2797,10 +2817,10 @@ mod tests {
         let cfg = ParquetScanConfig {
             columns: vec!["id".to_string(), "payload".to_string()],
             chunk_schema,
-            slot_types: vec![
-                types::TPrimitiveType::INT,
-                types::TPrimitiveType::BIGINT,
-                types::TPrimitiveType::VARIANT,
+            slot_kinds: vec![
+                ParquetSlotKind::Regular,
+                ParquetSlotKind::Regular,
+                ParquetSlotKind::Variant,
             ],
             case_sensitive: true,
             enable_page_index: false,
