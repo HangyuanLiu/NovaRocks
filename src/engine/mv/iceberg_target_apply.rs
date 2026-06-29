@@ -1282,7 +1282,7 @@ fn framework_locator_loaded_table(
     })
 }
 
-fn expose_physical_apply_key_for_locator_registration(
+pub(crate) fn expose_physical_apply_key_for_locator_registration(
     mut table_def: crate::sql::catalog::TableDef,
     target_table: &iceberg::table::Table,
     apply_key_column: &str,

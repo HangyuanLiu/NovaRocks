@@ -11187,12 +11187,17 @@ fn execute_join_delta_branches(
         })?;
         branch_queries.push(branch_query);
     }
+    let target_locator_relation =
+        crate::engine::mv::iceberg_join_branch::join_delta_target_locator_relation(
+            &target.namespace,
+        );
     let query =
-        crate::engine::mv::iceberg_join_branch::rewrite_join_delta_coalesce_query_with_branch_queries(
+        crate::engine::mv::iceberg_join_branch::rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
             &base_query,
             branch_queries,
             &left_uuid,
             &right_uuid,
+            &target_locator_relation,
         )
         .map_err(|err| {
             handle_iceberg_mv_commit_error(
@@ -11204,7 +11209,14 @@ fn execute_join_delta_branches(
                 err,
             )
         })?;
-    let branch_catalog = build_join_delta_coalesce_catalog(state, &branches).map_err(|err| {
+    let branch_catalog = build_join_delta_coalesce_catalog(
+        state,
+        &branches,
+        target,
+        &target_table,
+        expected_main_snapshot_id,
+    )
+    .map_err(|err| {
         handle_iceberg_mv_commit_error(
             state,
             target,
@@ -11432,6 +11444,9 @@ fn build_join_branch_catalog(
 fn build_join_delta_coalesce_catalog(
     state: &Arc<StandaloneState>,
     branches: &[crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan],
+    target: &IcebergMvTarget,
+    target_table: &iceberg::table::Table,
+    target_snapshot_id: Option<i64>,
 ) -> Result<crate::engine::catalog::InMemoryCatalog, String> {
     let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
     let mut registered_delta_tables = BTreeSet::new();
@@ -11454,7 +11469,78 @@ fn build_join_delta_coalesce_catalog(
             &mut registered_snapshot_tables,
         )?;
     }
+    register_join_delta_target_locator(
+        &mut catalog,
+        state,
+        target,
+        target_table,
+        target_snapshot_id,
+    )?;
     Ok(catalog)
+}
+
+fn register_join_delta_target_locator(
+    catalog: &mut crate::engine::catalog::InMemoryCatalog,
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_table: &iceberg::table::Table,
+    target_snapshot_id: Option<i64>,
+) -> Result<(), String> {
+    catalog.create_database(&target.namespace)?;
+    let table_def =
+        build_join_delta_target_locator_table_def(state, target, target_table, target_snapshot_id)?;
+    catalog
+        .register(&target.namespace, table_def)
+        .map_err(|e| format!("register join coalesce target locator table: {e}"))
+}
+
+fn build_join_delta_target_locator_table_def(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_table: &iceberg::table::Table,
+    target_snapshot_id: Option<i64>,
+) -> Result<crate::sql::catalog::TableDef, String> {
+    let base = IcebergTableRef {
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+    };
+    let mut table_def = match target_snapshot_id {
+        Some(snapshot_id) => build_iceberg_table_def_for_snapshot_scan(state, &base, snapshot_id)?,
+        None => build_empty_join_delta_target_locator_table_def(state, target)?,
+    };
+    table_def.name =
+        crate::engine::mv::iceberg_join_branch::JOIN_DELTA_TARGET_LOCATOR_TABLE.to_string();
+    crate::engine::mv::iceberg_target_apply::expose_physical_apply_key_for_locator_registration(
+        table_def,
+        target_table,
+        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+    )
+}
+
+fn build_empty_join_delta_target_locator_table_def(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+) -> Result<crate::sql::catalog::TableDef, String> {
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        registry.get(&target.catalog)?
+    };
+    let loaded =
+        crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)?;
+    let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_for_delta_scan(
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        loaded,
+    )?;
+    table_def
+        .iceberg_row_lineage_metadata_columns
+        .retain(|column| column.name != crate::exec::change_op::CHANGE_OP_COLUMN);
+    Ok(table_def)
 }
 
 fn register_join_delta_coalesce_side(
@@ -12502,6 +12588,105 @@ mod tests {
         assert_eq!(status.fqn, "ice.sales.orders");
         assert_eq!(status.previous_snapshot_id, Some(10));
         assert_eq!(status.current_snapshot_id_before_pin, Some(11));
+    }
+
+    #[test]
+    fn join_delta_coalesce_catalog_registers_target_locator_at_supplied_snapshot() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "sales");
+        create_base_table(&env.state, "ice", "sales", "left_orders");
+        create_base_table(&env.state, "ice", "sales", "right_orders");
+        insert_into_iceberg_table(&env.state, "ice", "sales", "left_orders", &[(1, "left")]);
+        insert_into_iceberg_table(&env.state, "ice", "sales", "right_orders", &[(1, "right")]);
+        let right_snapshot_id = load_iceberg_table(&env.state, "ice", "sales", "right_orders")
+            .metadata()
+            .current_snapshot()
+            .expect("right snapshot")
+            .snapshot_id();
+        create_join_mv_target_locator_table(&env.state, "ice", "sales", "mv_join");
+        insert_into_join_mv_target_locator_table(
+            &env.state,
+            "ice",
+            "sales",
+            "mv_join",
+            &[(1, "sku-1", "join-key-1")],
+        );
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "sales".to_string(),
+            table: "mv_join".to_string(),
+        };
+        let target_table = load_iceberg_table(&env.state, "ice", "sales", "mv_join");
+        let target_snapshot_id = target_table
+            .metadata()
+            .current_snapshot()
+            .expect("target snapshot")
+            .snapshot_id();
+        let branches = vec![
+            crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan {
+                left_base: iceberg_ref("ice", "sales", "left_orders"),
+                right_base: iceberg_ref("ice", "sales", "right_orders"),
+                left: crate::engine::mv::iceberg_join_branch::BranchSide::Delta(
+                    crate::engine::mv::iceberg_join_branch::SnapshotWindow { from: 10, to: 11 },
+                ),
+                right: crate::engine::mv::iceberg_join_branch::BranchSide::Snapshot(
+                    right_snapshot_id,
+                ),
+            },
+        ];
+
+        let catalog = build_join_delta_coalesce_catalog(
+            &env.state,
+            &branches,
+            &target,
+            &target_table,
+            Some(target_snapshot_id),
+        )
+        .expect("join coalesce catalog");
+        let locator = catalog
+            .get("sales", "__nr_join_delta_target_locator")
+            .expect("target locator table");
+
+        assert!(
+            locator
+                .columns
+                .iter()
+                .any(|column| column.name == ICEBERG_MV_JOIN_APPLY_KEY_COLUMN),
+            "locator columns={:?}",
+            locator.columns
+        );
+        assert!(
+            locator
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|column| column.name == "_file"),
+            "locator metadata columns={:?}",
+            locator.iceberg_row_lineage_metadata_columns
+        );
+        assert!(
+            locator
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|column| column.name == "_pos"),
+            "locator metadata columns={:?}",
+            locator.iceberg_row_lineage_metadata_columns
+        );
+        let crate::sql::catalog::ScanSource::IcebergDataFiles {
+            table,
+            files,
+            binding,
+            ..
+        } = &locator.source
+        else {
+            panic!("expected iceberg data-file locator source");
+        };
+        assert_eq!(table.catalog, "ice");
+        assert_eq!(table.namespace, "sales");
+        assert_eq!(table.table, "mv_join");
+        assert_eq!(
+            *binding,
+            crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles
+        );
+        assert_eq!(files.len(), 1, "locator must use supplied snapshot files");
     }
 
     #[test]
@@ -13971,6 +14156,98 @@ mod tests {
             ],
         )
         .expect("create aggregate dim iceberg table");
+    }
+
+    fn create_join_mv_target_locator_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let columns = vec![
+            crate::sql::TableColumnDef {
+                name: "id".to_string(),
+                data_type: crate::sql::SqlType::Int,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            },
+            crate::sql::TableColumnDef {
+                name: "label".to_string(),
+                data_type: crate::sql::SqlType::String,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            },
+            crate::sql::TableColumnDef {
+                name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                data_type: crate::sql::SqlType::String,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            },
+        ];
+        crate::connector::iceberg::catalog::registry::create_table(
+            &entry,
+            namespace,
+            table,
+            &columns,
+            None,
+            &[],
+            &[
+                ("format-version".to_string(), "3".to_string()),
+                ("write.row-lineage".to_string(), "true".to_string()),
+                (
+                    ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
+                    ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                ),
+            ],
+        )
+        .expect("create join MV target locator table");
+    }
+
+    fn insert_into_join_mv_target_locator_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        rows: &[(i32, &str, &str)],
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let rows = rows
+            .iter()
+            .map(|(id, label, join_key)| {
+                vec![
+                    crate::sql::Literal::Int(i64::from(*id)),
+                    crate::sql::Literal::String((*label).to_string()),
+                    crate::sql::Literal::String((*join_key).to_string()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
+            .expect("insert join MV target locator rows");
+    }
+
+    fn load_iceberg_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> iceberg::table::Table {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
+            .expect("load iceberg table")
+            .table
     }
 
     fn create_identity_partitioned_base_table(
