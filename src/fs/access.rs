@@ -46,6 +46,9 @@ impl FsLocation {
         }
 
         let Some((uri_scheme, rest)) = split_uri_scheme(original) else {
+            if original.contains("://") {
+                return Err(format!("unsupported fs location scheme: {original}"));
+            }
             return Ok(Self::local(original, None, original));
         };
         let uri_scheme = uri_scheme.to_ascii_lowercase();
@@ -347,5 +350,13 @@ mod tests {
     fn rejects_unsupported_scheme() {
         let err = FsLocation::parse("ftp://host/path").expect_err("ftp is unsupported");
         assert!(err.contains("unsupported fs location scheme"), "{err}");
+    }
+
+    #[test]
+    fn rejects_malformed_uri_schemes() {
+        for raw in ["bad_scheme://host/path", "1://host/path"] {
+            let err = FsLocation::parse(raw).expect_err("malformed URI scheme is unsupported");
+            assert!(err.contains("unsupported fs location scheme"), "{err}");
+        }
     }
 }
