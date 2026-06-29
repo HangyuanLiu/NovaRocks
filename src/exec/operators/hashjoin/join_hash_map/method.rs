@@ -25,7 +25,7 @@ use std::sync::Arc;
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 
-use super::search::{JoinSelection, SearchStats};
+use super::search::{JoinSelection, ProbeMask, SearchStats};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::agg::IntArrayView;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -322,18 +322,22 @@ impl JoinHashMap {
         probe_keys: &[ExprId],
         probe: &Chunk,
     ) -> Result<Vec<bool>, String> {
+        Ok(self
+            .search_membership(arena, probe_keys, probe)?
+            .0
+            .into_vec())
+    }
+
+    pub(crate) fn search_membership(
+        &self,
+        arena: &ExprArena,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+    ) -> Result<(ProbeMask, SearchStats), String> {
         match self {
-            Self::Chained(map) => Ok(map
-                .lookup_group_ids(arena, probe_keys, probe)?
-                .into_iter()
-                .map(|group_id| group_id.is_some())
-                .collect()),
-            Self::DirectInt(map) => Ok(map
-                .lookup_group_ids(arena, probe_keys, probe)?
-                .into_iter()
-                .map(|group_id| group_id.is_some())
-                .collect()),
-            Self::DirectIntSet(map) => map.lookup_membership(arena, probe_keys, probe),
+            Self::Chained(map) => map.search_membership(arena, probe_keys, probe),
+            Self::DirectInt(map) => map.search_membership(arena, probe_keys, probe),
+            Self::DirectIntSet(map) => map.search_membership(arena, probe_keys, probe),
         }
     }
 
@@ -418,6 +422,23 @@ impl ChainedJoinHashMap {
             }
         }
         Ok((selection, stats))
+    }
+
+    fn search_membership(
+        &self,
+        arena: &ExprArena,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+    ) -> Result<(ProbeMask, SearchStats), String> {
+        let group_ids = self.lookup_group_ids(arena, probe_keys, probe)?;
+        let stats = SearchStats::from_group_ids(&group_ids);
+        let mut mask = ProbeMask::new(group_ids.len(), false);
+        for (row, group_id) in group_ids.iter().enumerate() {
+            if group_id.is_some() {
+                mask.set(row, true)?;
+            }
+        }
+        Ok((mask, stats))
     }
 
     pub(crate) fn lookup_group_ids(
@@ -730,6 +751,38 @@ impl DirectIntJoinHashMap {
         ))
     }
 
+    fn search_membership(
+        &self,
+        arena: &ExprArena,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+    ) -> Result<(ProbeMask, SearchStats), String> {
+        let probe_len = probe.len();
+        let probe_array = eval_single_probe_int_key(arena, probe_keys, probe, &self.data_type)?;
+        let probe_view = IntArrayView::new(&probe_array)?;
+        let mut mask = ProbeMask::new(probe_len, false);
+        let mut hit_rows = 0u64;
+        for row in 0..probe_len {
+            let matches = match probe_view.value_at(row) {
+                Some(value) => direct_bucket(value, self.min, self.max, self.len)
+                    .map(|bucket| self.first[bucket] != ROW_NONE)
+                    .unwrap_or(false),
+                None => false,
+            };
+            if matches {
+                mask.set(row, true)?;
+                hit_rows += 1;
+            }
+        }
+        Ok((
+            mask,
+            SearchStats {
+                lookup_hit_rows: hit_rows,
+                lookup_miss_rows: probe_len as u64 - hit_rows,
+            },
+        ))
+    }
+
     fn lookup_existing_bucket(&self, value: i64) -> Option<usize> {
         let bucket = direct_bucket(value, self.min, self.max, self.len)?;
         let row = self.first[bucket];
@@ -910,27 +963,34 @@ impl DirectIntJoinHashSet {
         Ok(())
     }
 
-    fn lookup_membership(
+    fn search_membership(
         &self,
         arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<Vec<bool>, String> {
+    ) -> Result<(ProbeMask, SearchStats), String> {
         let probe_len = probe.len();
-        if probe_len == 0 {
-            return Ok(Vec::new());
-        }
         let probe_array = eval_single_probe_int_key(arena, probe_keys, probe, &self.data_type)?;
         let probe_view = IntArrayView::new(&probe_array)?;
-        let mut membership = Vec::with_capacity(probe_len);
+        let mut mask = ProbeMask::new(probe_len, false);
+        let mut hit_rows = 0u64;
         for row in 0..probe_len {
             let matches = match probe_view.value_at(row) {
                 Some(value) => self.contains_value(value),
                 None => false,
             };
-            membership.push(matches);
+            if matches {
+                mask.set(row, true)?;
+                hit_rows += 1;
+            }
         }
-        Ok(membership)
+        Ok((
+            mask,
+            SearchStats {
+                lookup_hit_rows: hit_rows,
+                lookup_miss_rows: probe_len as u64 - hit_rows,
+            },
+        ))
     }
 
     fn set_bucket(&mut self, bucket: usize) -> Result<(), String> {
@@ -1444,11 +1504,55 @@ mod tests {
         let mut arena = ExprArena::default();
         let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
         let probe = int32_chunk(vec![Some(10), Some(11), None, Some(12)]);
+        let (mask, stats) = map
+            .search_membership(&arena, &[probe_key], &probe)
+            .expect("search membership");
         let membership = map
             .lookup_membership(&arena, &[probe_key], &probe)
             .expect("membership");
 
+        assert_eq!(mask.as_slice(), &[true, false, false, true]);
+        assert_eq!(stats.lookup_hit_rows, 2);
+        assert_eq!(stats.lookup_miss_rows, 2);
         assert_eq!(membership, vec![true, false, false, true]);
+    }
+
+    #[test]
+    fn search_membership_matches_lookup_membership_for_chained_and_direct() {
+        let mut chained =
+            JoinHashMap::new_chained(vec![DataType::Int32], vec![false]).expect("map");
+        let build = int32_chunk(vec![Some(1), Some(2), Some(1), None]);
+        chained
+            .add_build_rows(build.columns(), build.len())
+            .expect("add build");
+        chained.finalize().expect("finalize");
+
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let direct = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("direct");
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
+        let probe = int32_chunk(vec![Some(1), Some(3), None, Some(2)]);
+
+        for map in [&chained, &direct] {
+            let (mask, stats) = map
+                .search_membership(&arena, &[probe_key], &probe)
+                .expect("membership");
+            assert_eq!(mask.as_slice(), &[true, false, false, true]);
+            assert_eq!(stats.lookup_hit_rows, 2);
+            assert_eq!(stats.lookup_miss_rows, 2);
+            assert_eq!(
+                map.lookup_membership(&arena, &[probe_key], &probe)
+                    .expect("compat"),
+                vec![true, false, false, true]
+            );
+        }
     }
 
     #[test]
