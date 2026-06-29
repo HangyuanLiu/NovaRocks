@@ -106,6 +106,34 @@ impl ExprScope {
         self.by_id.iter()
     }
 
+    pub fn debug_id_bindings(&self) -> Vec<String> {
+        self.by_id
+            .iter()
+            .map(|(column_id, binding)| {
+                let name = self
+                    .ordered
+                    .iter()
+                    .find(|(_, ordered_binding)| {
+                        ordered_binding.tuple_id == binding.tuple_id
+                            && ordered_binding.slot_id == binding.slot_id
+                            && ordered_binding.data_type == binding.data_type
+                            && ordered_binding.nullable == binding.nullable
+                    })
+                    .map(|(name, _)| name.as_str())
+                    .unwrap_or("<unnamed>");
+                format!(
+                    "{}:{}=>tuple{}.slot{}:{:?}:nullable={}",
+                    column_id,
+                    name,
+                    binding.tuple_id,
+                    binding.slot_id,
+                    binding.data_type,
+                    binding.nullable
+                )
+            })
+            .collect()
+    }
+
     /// Merge another scope into this one. Used for building JOIN output scopes.
     /// ColumnId entries use left-wins semantics, which keeps self-join sides
     /// distinct because each side mints different ColumnIds.

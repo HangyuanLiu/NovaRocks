@@ -265,6 +265,9 @@ impl LogicalRewriteRule for InjectActionColumnRule {
             scan.columns
                 .retain(|column| !is_action_column_name(&column.name));
             scan.columns.push(ImvActionColumn::output_column(column_id));
+            ImvActionColumn::ensure_metadata_column(
+                &mut scan.table.iceberg_row_lineage_metadata_columns,
+            );
             Ok(PlanRewriteResult::Changed(plan))
         })
     }
@@ -788,6 +791,17 @@ mod tests {
         assert!(!action.nullable);
         assert!(action.is_internal);
         assert_eq!(action.column_id, ColumnId(100));
+        assert!(
+            scan.table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(
+                    |column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)
+                        && column.data_type == DataType::Int8
+                        && !column.nullable
+                ),
+            "delta scan table metadata must expose the action pseudo-column for codegen"
+        );
     }
 
     #[test]

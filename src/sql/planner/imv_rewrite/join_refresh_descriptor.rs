@@ -172,17 +172,6 @@ impl JoinRefreshDescriptor {
                     pair.right_column.data_type
                 ));
             }
-            if self.mode != JoinRefreshMode::Full
-                && pair.left_column.nullable != pair.right_column.nullable
-            {
-                return Err(format!(
-                    "join refresh descriptor join key pair nullability mismatch: left {} nullable={}, right {} nullable={}",
-                    pair.left_column.column_id,
-                    pair.left_column.nullable,
-                    pair.right_column.column_id,
-                    pair.right_column.nullable
-                ));
-            }
         }
         Ok(())
     }
@@ -708,10 +697,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_join_key_pair_with_nullability_mismatch() {
+    fn allows_join_key_pair_with_nullability_mismatch() {
         let mut desc = valid_descriptor();
         desc.join_key_pairs[0].right_column.nullable = true;
-        assert_invalid(desc, "join key pair nullability mismatch");
+
+        desc.validate()
+            .expect("join key nullability follows SQL equality semantics");
     }
 
     #[test]

@@ -3769,7 +3769,6 @@ pub(crate) fn execute_logical_plan_with_options(
         None,
         Vec::new(),
     )?;
-
     if let Some(reason) = direct_execution_reason(
         terminal_sink.is_some(),
         iceberg_catalogs.is_some(),

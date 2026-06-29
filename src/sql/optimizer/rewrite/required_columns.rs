@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::CteId;
-use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::operator::{Operator, UnionOp};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -55,6 +55,9 @@ pub(crate) fn tag_required_columns(
         Operator::LogicalAggregate(_) => tag_aggregate(expr, arena, parent_needed),
         Operator::LogicalJoin(_) => tag_join(expr, arena, parent_needed),
         Operator::LogicalUnion(_) => tag_union(expr, arena, parent_needed),
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
+            tag_passthrough(expr, arena, parent_needed)
+        }
         Operator::LogicalIntersect(_) => tag_intersect(expr, arena, parent_needed),
         Operator::LogicalExcept(_) => tag_except(expr, arena, parent_needed),
         Operator::LogicalCTEAnchor(_) => tag_cte_anchor(expr, arena, parent_needed),
@@ -80,6 +83,23 @@ pub(crate) fn tag_required_columns(
                 required_output_columns: None,
             }
         }
+    }
+}
+
+fn tag_passthrough(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    expr.required_output_columns = parent_needed.clone();
+    let children = expr.children;
+    OptExpr {
+        op: expr.op,
+        children: children
+            .into_iter()
+            .map(|child| tag_required_columns(child, arena, parent_needed.clone()))
+            .collect(),
+        required_output_columns: parent_needed,
     }
 }
 
@@ -587,6 +607,7 @@ fn tag_union(
     let Operator::LogicalUnion(node) = &expr.op else {
         unreachable!()
     };
+    let node = node.clone();
 
     if !node.all {
         let children = expr.children;
@@ -599,6 +620,10 @@ fn tag_union(
             required_output_columns: parent_needed,
         };
     }
+
+    let join_refresh_protocol_ids = join_refresh_union_protocol_ids(&node);
+    let parent_needed =
+        require_join_refresh_union_protocol_columns(join_refresh_protocol_ids, parent_needed);
 
     // Resolve which positions in the output schema are needed.
     let outputs: Vec<ColumnId> = node.output_columns.iter().map(|c| c.column_id).collect();
@@ -617,17 +642,102 @@ fn tag_union(
         op: expr.op,
         children: children
             .into_iter()
-            .map(|child| {
-                let child_outputs = collect_output_ids_ordered_opt(&child);
-                let child_needed: HashSet<ColumnId> = needed_positions
+            .enumerate()
+            .map(|(child_idx, child)| {
+                let child_outputs = node
+                    .child_output_columns
+                    .get(child_idx)
+                    .filter(|columns| columns.len() == outputs.len())
+                    .map(|columns| {
+                        columns
+                            .iter()
+                            .map(|column| column.column_id)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| collect_output_ids_ordered_opt(&child));
+                let mut child_needed: HashSet<ColumnId> = needed_positions
                     .iter()
                     .filter_map(|&i| child_outputs.get(i).copied())
                     .collect();
+                require_join_refresh_branch_protocol_columns(&node, child_idx, &mut child_needed);
                 tag_required_columns(child, arena, Some(child_needed))
             })
             .collect(),
         required_output_columns: parent_needed,
     }
+}
+
+fn join_refresh_union_protocol_ids(node: &UnionOp) -> Option<(ColumnId, ColumnId)> {
+    let action_id = node
+        .output_columns
+        .iter()
+        .find(|column| is_join_refresh_action_column(column))
+        .map(|column| column.column_id);
+    let join_apply_key_id = node
+        .output_columns
+        .iter()
+        .find(|column| is_join_refresh_apply_key_column(column))
+        .map(|column| column.column_id);
+
+    action_id.zip(join_apply_key_id)
+}
+
+fn require_join_refresh_union_protocol_columns(
+    protocol_ids: Option<(ColumnId, ColumnId)>,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> Option<HashSet<ColumnId>> {
+    let Some((action_id, join_apply_key_id)) = protocol_ids else {
+        return parent_needed;
+    };
+
+    match parent_needed {
+        None => None,
+        Some(mut needed) => {
+            needed.insert(action_id);
+            needed.insert(join_apply_key_id);
+            Some(needed)
+        }
+    }
+}
+
+fn require_join_refresh_branch_protocol_columns(
+    node: &UnionOp,
+    child_idx: usize,
+    child_needed: &mut HashSet<ColumnId>,
+) {
+    let Some(child_outputs) = node.child_output_columns.get(child_idx) else {
+        return;
+    };
+    let has_join_refresh_protocol = node
+        .output_columns
+        .iter()
+        .any(is_join_refresh_action_column)
+        && node
+            .output_columns
+            .iter()
+            .any(is_join_refresh_apply_key_column);
+    if !has_join_refresh_protocol {
+        return;
+    }
+
+    for column in child_outputs {
+        if is_join_refresh_action_column(column) || is_join_refresh_apply_key_column(column) {
+            child_needed.insert(column.column_id);
+        }
+    }
+}
+
+fn is_join_refresh_action_column(column: &crate::sql::analysis::OutputColumn) -> bool {
+    column.is_internal
+        && column
+            .name
+            .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+}
+
+fn is_join_refresh_apply_key_column(column: &crate::sql::analysis::OutputColumn) -> bool {
+    column.name.eq_ignore_ascii_case(
+        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+    )
 }
 
 fn tag_intersect(
@@ -899,12 +1009,12 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::optimizer::operator::{
-        CTEAnchorOp, CTEConsumeOp, CTEProduceOp, ExceptOp, FilterOp, GenerateSeriesOp, IntersectOp,
-        LimitOp, LogicalAggregateOp, LogicalJoinOp, ProjectOp, RepeatOp, ScalarAggregateSpec,
-        ScalarProjectItem, ScalarWindowSpec, ScanOp, SortOp, TableFunctionOp, UnionOp, ValuesOp,
-        WindowOp,
+        CTEAnchorOp, CTEConsumeOp, CTEProduceOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp,
+        IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp, ProjectOp, RepeatOp,
+        ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec, ScanOp, SortOp, TableFunctionOp,
+        UnionOp, ValuesOp, WindowOp,
     };
-    use crate::sql::optimizer::scalar::{self, ScalarArena, SortKey};
+    use crate::sql::optimizer::scalar::{ScalarArena, SortKey};
     use arrow::datatypes::DataType;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1033,6 +1143,37 @@ mod tests {
 
     fn scan_with_3_cols(arena_rc: &Rc<RefCell<ScalarArena>>) -> OptExpr {
         make_scan_with_ids(arena_rc, 1, 2, 3)
+    }
+
+    fn make_values_with_columns(columns: Vec<OutputColumn>) -> OptExpr {
+        OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns,
+        }))
+    }
+
+    fn make_project_with_columns(
+        arena_rc: &Rc<RefCell<ScalarArena>>,
+        columns: Vec<OutputColumn>,
+    ) -> OptExpr {
+        let mut arena = arena_rc.borrow_mut();
+        let items = columns
+            .iter()
+            .map(|column| ScalarProjectItem {
+                expr: col_ref_scalar(&mut arena, column.column_id),
+                output_name: column.name.clone(),
+                output_column_id: column.column_id,
+                expr_display: None,
+            })
+            .collect::<Vec<_>>();
+        drop(arena);
+        OptExpr::new(
+            Operator::LogicalProject(ProjectOp {
+                items,
+                output_qualifier: None,
+            }),
+            vec![make_values_with_columns(columns)],
+        )
     }
 
     fn needed_set(ids: &[u32]) -> HashSet<ColumnId> {
@@ -1413,6 +1554,132 @@ mod tests {
             b_req.contains(&ColumnId::new_for_test(5)),
             "position 1 = e@5"
         );
+    }
+
+    #[test]
+    fn tag_union_preserves_join_refresh_protocol_columns() {
+        let arena_rc = make_arena();
+        let mut action = make_output_column(
+            ColumnId::new_for_test(14),
+            crate::exec::change_op::CHANGE_OP_COLUMN,
+        );
+        action.data_type = DataType::Int8;
+        action.is_internal = true;
+        let mut join_apply_key = make_output_column(
+            ColumnId::new_for_test(15),
+            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        );
+        join_apply_key.data_type = DataType::Utf8;
+        join_apply_key.is_internal = true;
+        let output_columns = vec![
+            make_output_column(ColumnId::new_for_test(1), "id"),
+            make_output_column(ColumnId::new_for_test(2), "region"),
+            make_output_column(ColumnId::new_for_test(3), "amount"),
+            make_output_column(ColumnId::new_for_test(9), "category"),
+            action,
+            join_apply_key,
+        ];
+        let left_columns = output_columns.clone();
+        let right_columns = output_columns.clone();
+        let union = OptExpr::new(
+            Operator::LogicalUnion(UnionOp {
+                all: true,
+                output_columns,
+                child_output_columns: vec![],
+            }),
+            vec![
+                make_values_with_columns(left_columns),
+                make_values_with_columns(right_columns),
+            ],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(union, &arena, Some(needed_set(&[1, 2, 3, 9])));
+
+        assert_eq!(
+            required_columns(&tagged),
+            &needed_set(&[1, 2, 3, 9, 14, 15]),
+            "join refresh UNION must keep internal protocol columns in its own required set"
+        );
+        for child in &tagged.children {
+            assert_eq!(
+                required_columns(child),
+                &needed_set(&[1, 2, 3, 9, 14, 15]),
+                "join refresh UNION must pass protocol columns to each branch by position"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_union_maps_join_refresh_protocol_columns_through_child_output_metadata() {
+        let arena_rc = make_arena();
+        let mut action = make_output_column(
+            ColumnId::new_for_test(14),
+            crate::exec::change_op::CHANGE_OP_COLUMN,
+        );
+        action.data_type = DataType::Int8;
+        action.is_internal = true;
+        let mut join_apply_key = make_output_column(
+            ColumnId::new_for_test(20),
+            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        );
+        join_apply_key.data_type = DataType::Utf8;
+        join_apply_key.is_internal = false;
+        let output_columns = vec![
+            make_output_column(ColumnId::new_for_test(1), "id"),
+            make_output_column(ColumnId::new_for_test(2), "region"),
+            make_output_column(ColumnId::new_for_test(3), "amount"),
+            make_output_column(ColumnId::new_for_test(9), "category"),
+            action.clone(),
+            join_apply_key.clone(),
+        ];
+        let branch_columns = vec![
+            make_output_column(ColumnId::new_for_test(1), "id"),
+            make_output_column(ColumnId::new_for_test(2), "region"),
+            make_output_column(ColumnId::new_for_test(3), "amount"),
+            make_output_column(ColumnId::new_for_test(90), "_file"),
+            make_output_column(ColumnId::new_for_test(9), "category"),
+            action.clone(),
+            join_apply_key.clone(),
+        ];
+        let branch_union_columns = vec![
+            branch_columns[0].clone(),
+            branch_columns[1].clone(),
+            branch_columns[2].clone(),
+            branch_columns[4].clone(),
+            branch_columns[5].clone(),
+            branch_columns[6].clone(),
+        ];
+        let union = OptExpr::new(
+            Operator::LogicalUnion(UnionOp {
+                all: true,
+                output_columns,
+                child_output_columns: vec![branch_union_columns.clone(), branch_union_columns],
+            }),
+            vec![
+                make_project_with_columns(&arena_rc, branch_columns.clone()),
+                make_project_with_columns(&arena_rc, branch_columns),
+            ],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(union, &arena, Some(needed_set(&[1, 2, 3, 9])));
+
+        assert_eq!(
+            required_columns(&tagged),
+            &needed_set(&[1, 2, 3, 9, 14, 20]),
+            "join refresh UNION must keep action and join row key"
+        );
+        for child in &tagged.children {
+            assert!(
+                required_columns(child).contains(&ColumnId::new_for_test(20)),
+                "branch project must keep join row key even when its wide output position differs from the UNION output"
+            );
+            assert!(
+                !required_columns(child).contains(&ColumnId::new_for_test(90)),
+                "branch project should use child_output_columns mapping instead of wide child positions"
+            );
+        }
     }
 
     #[test]
@@ -1951,6 +2218,42 @@ mod tests {
         assert!(rreq.contains(&ColumnId::new_for_test(4)));
         assert!(rreq.contains(&ColumnId::new_for_test(5)));
         assert!(rreq.contains(&ColumnId::new_for_test(6)));
+    }
+
+    #[test]
+    fn tag_join_splits_needed_columns_through_imv_delta_marker() {
+        let arena_rc = make_arena();
+        let delta_action = ColumnId::new_for_test(14);
+        let left_scan = make_scan_with_ids(&arena_rc, 1, delta_action.0, 3);
+        let left_delta = OptExpr::new(
+            Operator::LogicalImvDelta(ImvDeltaOp {
+                is_root: false,
+                action_column: Some(delta_action),
+                branch_scope: None,
+            }),
+            vec![left_scan],
+        );
+        let right_scan = make_scan_with_ids(&arena_rc, 4, 5, 6);
+        let join = OptExpr::new(
+            Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            vec![left_delta, right_scan],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(join, &arena, Some(needed_set(&[14])));
+        let left_marker = tagged.left();
+        let left_scan = left_marker.unary_input();
+        let right_scan = tagged.right();
+
+        assert_eq!(required_columns(left_marker), &needed_set(&[14]));
+        assert_eq!(required_columns(left_scan), &needed_set(&[14]));
+        assert!(
+            required_columns(right_scan).is_empty(),
+            "right side should not receive left delta action requirement"
+        );
     }
 
     // -----------------------------------------------------------------------

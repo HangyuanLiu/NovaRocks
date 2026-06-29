@@ -534,6 +534,9 @@ fn uses_declared_node_outputs(op: &Operator) -> bool {
     !matches!(
         op,
         Operator::PhysicalFilter(_)
+            | Operator::PhysicalProject(_)
+            | Operator::PhysicalHashJoin(_)
+            | Operator::PhysicalNestLoopJoin(_)
             | Operator::PhysicalSort(_)
             | Operator::PhysicalTopN(_)
             | Operator::PhysicalLimit(_)

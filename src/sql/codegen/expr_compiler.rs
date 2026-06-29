@@ -429,9 +429,10 @@ impl<'a> ExprCompiler<'a> {
                         format!("ColumnRef '{}' has no ColumnId in executable plan.", column)
                     })?
                 } else {
+                    let available_ids = self.scope.debug_id_bindings().join(", ");
                     return Err(format!(
-                        "ColumnId({}) for column '{}' cannot be resolved in current scope.",
-                        column_id.0, column
+                        "ColumnId({}) for column '{}' cannot be resolved in current scope. available ids: [{}]",
+                        column_id.0, column, available_ids
                     ));
                 };
                 let type_desc = binding_type_desc(binding)?;

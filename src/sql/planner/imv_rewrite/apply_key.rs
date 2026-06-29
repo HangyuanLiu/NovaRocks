@@ -20,6 +20,7 @@ use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal}
 use crate::sql::planner::imv_rewrite::action_propagation::{
     descendant_internal_columns, is_supported_fan_in_delta_union,
 };
+use crate::sql::planner::imv_rewrite::join_delta_shape::is_supported_join_delta_union;
 use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{LogicalPlanNode, LogicalProjectNode, PlanNodeKind};
@@ -133,6 +134,9 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
         ) {
             return false;
         }
+        if contains_join_delta_union(&plan) {
+            return false;
+        }
         root_row_id_ref(&plan).is_some() && !output_has_apply_key(&plan)
     }
 
@@ -206,6 +210,10 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
             }
         })
     }
+}
+
+fn contains_join_delta_union(plan: &LogicalPlanNode) -> bool {
+    is_supported_join_delta_union(plan) || plan.children.iter().any(contains_join_delta_union)
 }
 
 fn project_item_for_output_column(column: &OutputColumn) -> ProjectItem {

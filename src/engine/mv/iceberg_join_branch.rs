@@ -66,6 +66,7 @@ pub(crate) fn plan_join_delta_branches(
     plans
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_join_branch_query(
     query: &sqlparser::ast::Query,
     plan: &JoinDeltaBranchPlan,
@@ -94,6 +95,7 @@ pub(crate) fn rewrite_join_branch_query(
     Ok(query)
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_join_delta_coalesce_query(
     query: &sqlparser::ast::Query,
     branches: &[JoinDeltaBranchPlan],
@@ -122,6 +124,7 @@ pub(crate) fn rewrite_join_delta_coalesce_query(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries(
     query: &sqlparser::ast::Query,
     branch_queries: Vec<sqlparser::ast::Query>,
@@ -137,6 +140,7 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
     query: &sqlparser::ast::Query,
     branch_queries: Vec<sqlparser::ast::Query>,
@@ -247,6 +251,7 @@ pub(crate) fn rewrite_join_full_refresh_apply_query(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_join_delta_append_only_query(
     query: &sqlparser::ast::Query,
     branch_query: sqlparser::ast::Query,
@@ -308,6 +313,7 @@ fn wrap_join_apply_key_query(
     Ok(parsed)
 }
 
+#[cfg(test)]
 pub(crate) fn is_append_only_join_delta_eligible(query: &sqlparser::ast::Query) -> bool {
     let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;

@@ -12750,6 +12750,7 @@ fn execute_join_delta_branches_logical(
     Ok(StatementResult::Ok)
 }
 
+#[cfg(test)]
 fn should_use_join_delta_append_only_fast_path(
     query: &sqlparser::ast::Query,
     left_has_delete_changes: bool,
@@ -12760,6 +12761,7 @@ fn should_use_join_delta_append_only_fast_path(
         && crate::engine::mv::iceberg_join_branch::is_append_only_join_delta_eligible(query)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn execute_append_only_join_delta_branches(
     state: &Arc<StandaloneState>,
@@ -13030,6 +13032,7 @@ fn execute_append_only_join_delta_branches(
     Ok(StatementResult::Ok)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn execute_join_delta_branches(
     state: &Arc<StandaloneState>,

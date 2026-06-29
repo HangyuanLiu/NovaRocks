@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use arrow::datatypes::DataType;
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN;
-use crate::meta::repository::mv_contract::{BaseContract, JoinContractKind, QualifiedFieldLineage};
+use crate::meta::repository::mv_contract::{
+    BaseContract, ExpressionKind, JoinContractKind, MvSchemaContract, QualifiedFieldLineage,
+};
 use crate::sql::analysis::{
     ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };
@@ -164,10 +166,16 @@ impl LogicalRewriteRule for InjectJoinApplyKeyRule {
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         let plan = opt_expr_to_plan(expr.clone(), ctx);
         is_join_refresh_union_without_apply_key(&plan)
+            || project_needs_join_refresh_internal_outputs(&plan)
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         bridge_apply_result_mut(expr, ctx, |plan, ctx| {
+            if project_needs_join_refresh_internal_outputs(&plan) {
+                return Ok(PlanRewriteResult::Changed(
+                    propagate_join_refresh_internal_outputs_through_project(plan)?,
+                ));
+            }
             Ok(PlanRewriteResult::Changed(inject_join_apply_key(
                 plan, ctx,
             )?))
@@ -243,7 +251,6 @@ struct JoinDeltaUnionEvidence {
     right_row_id_column: OutputColumn,
     action_column: OutputColumn,
     join_apply_key_column: OutputColumn,
-    payload_columns: Vec<OutputColumn>,
     branches: Vec<JoinRefreshBranchDescriptor>,
 }
 
@@ -296,6 +303,66 @@ fn inject_join_apply_key(
     }
     union.output_columns.push(join_apply_key_column);
     Ok(plan)
+}
+
+fn project_needs_join_refresh_internal_outputs(plan: &LogicalPlanNode) -> bool {
+    let PlanNodeKind::Project(project) = &plan.kind else {
+        return false;
+    };
+    let required = join_refresh_internal_output_columns(plan.unary_input());
+    !required.is_empty()
+        && required.iter().any(|required| {
+            !project
+                .items
+                .iter()
+                .any(|item| item.output_column_id == required.column_id)
+        })
+}
+
+fn propagate_join_refresh_internal_outputs_through_project(
+    mut plan: LogicalPlanNode,
+) -> Result<LogicalPlanNode, String> {
+    let required = join_refresh_internal_output_columns(plan.unary_input());
+    if required.is_empty() {
+        return Err(
+            "join refresh internal output propagation expected child output columns".to_string(),
+        );
+    }
+    let PlanNodeKind::Project(project) = &mut plan.kind else {
+        return Ok(plan);
+    };
+    for column in required {
+        if project
+            .items
+            .iter()
+            .any(|item| item.output_column_id == column.column_id)
+        {
+            continue;
+        }
+        project.items.push(ProjectItem {
+            expr: column_ref_expr(&column),
+            output_name: column.name.clone(),
+            output_column_id: column.column_id,
+        });
+    }
+    Ok(plan)
+}
+
+fn join_refresh_internal_output_columns(plan: &LogicalPlanNode) -> Vec<OutputColumn> {
+    let columns = plan_output_columns(plan).unwrap_or_default();
+    let join_apply_key = columns.iter().find(|column| {
+        column
+            .name
+            .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+    });
+    let action = columns
+        .iter()
+        .find(|column| ImvActionColumn::matches(column));
+    match (join_apply_key, action) {
+        (Some(join_apply_key), Some(action)) => vec![join_apply_key.clone(), action.clone()],
+        (Some(join_apply_key), None) => vec![join_apply_key.clone()],
+        _ => Vec::new(),
+    }
 }
 
 fn inject_join_apply_key_into_branch(
@@ -398,18 +465,6 @@ fn collect_join_delta_union_evidence(
         ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
         "join apply-key",
     )?;
-    let payload_columns = union
-        .output_columns
-        .iter()
-        .filter(|column| {
-            !ImvActionColumn::matches(column)
-                && !ImvRowIdColumn::matches(column)
-                && !column
-                    .name
-                    .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
     let branches = branch_evidence
         .iter()
         .map(|branch| JoinRefreshBranchDescriptor {
@@ -427,7 +482,6 @@ fn collect_join_delta_union_evidence(
         right_row_id_column: left_delta_branch.right_row_id_column.clone(),
         action_column,
         join_apply_key_column,
-        payload_columns,
         branches,
     })
 }
@@ -683,8 +737,17 @@ fn build_join_refresh_descriptor(
         &evidence.left_output_columns,
         &evidence.right_output_columns,
     )?;
+    let payload_columns = build_join_payload_columns(
+        &mv_ctx.schema_contract,
+        left_base_contract,
+        right_base_contract,
+        &evidence.left_base_fqn,
+        &evidence.right_base_fqn,
+        &evidence.left_output_columns,
+        &evidence.right_output_columns,
+    )?;
     let output_mappings = join_refresh_output_mappings(
-        &evidence.payload_columns,
+        &payload_columns,
         &evidence.action_column,
         &evidence.join_apply_key_column,
     );
@@ -702,12 +765,66 @@ fn build_join_refresh_descriptor(
         right_row_id_column: evidence.right_row_id_column,
         action_column: evidence.action_column,
         join_apply_key_column: evidence.join_apply_key_column,
-        payload_columns: evidence.payload_columns,
+        payload_columns,
         join_key_pairs,
         output_mappings,
         branches: evidence.branches,
         needs_target_locator: true,
     })
+}
+
+fn build_join_payload_columns(
+    schema_contract: &MvSchemaContract,
+    left_base_contract: &BaseContract,
+    right_base_contract: &BaseContract,
+    left_base_fqn: &str,
+    right_base_fqn: &str,
+    left_output_columns: &[OutputColumn],
+    right_output_columns: &[OutputColumn],
+) -> Result<Vec<OutputColumn>, String> {
+    if schema_contract.output.columns.len() != schema_contract.target.visible_columns.len() {
+        return Err(format!(
+            "join refresh descriptor output/target column count mismatch: output has {}, target has {}",
+            schema_contract.output.columns.len(),
+            schema_contract.target.visible_columns.len()
+        ));
+    }
+
+    schema_contract
+        .output
+        .columns
+        .iter()
+        .zip(schema_contract.target.visible_columns.iter())
+        .enumerate()
+        .map(|(idx, (lineage, target))| {
+            if lineage.expression.kind != ExpressionKind::Column {
+                return Err(format!(
+                    "join refresh descriptor payload column {idx} `{}` must be a direct column reference, got {:?}",
+                    target.output_name, lineage.expression.kind
+                ));
+            }
+            let [field] = lineage.expression.referenced_base_fields.as_slice() else {
+                return Err(format!(
+                    "join refresh descriptor payload column {idx} `{}` must reference exactly one base field, got {}",
+                    target.output_name,
+                    lineage.expression.referenced_base_fields.len()
+                ));
+            };
+            let (base_contract, output_columns, role) =
+                if field.table_fqn.eq_ignore_ascii_case(left_base_fqn) {
+                    (left_base_contract, left_output_columns, "left payload")
+                } else if field.table_fqn.eq_ignore_ascii_case(right_base_fqn) {
+                    (right_base_contract, right_output_columns, "right payload")
+                } else {
+                    return Err(format!(
+                        "join refresh descriptor payload column {idx} `{}` references base {} outside actual join bases {}, {}",
+                        target.output_name, field.table_fqn, left_base_fqn, right_base_fqn
+                    ));
+                };
+            let field_name = field_name_for_lineage(base_contract, field)?;
+            find_unique_output_column(output_columns, field_name, role)
+        })
+        .collect()
 }
 
 fn build_join_key_pairs(
@@ -914,12 +1031,27 @@ fn join_output_columns(
     }
     let left_cols = plan_output_columns(left)?;
     let right_cols = plan_output_columns(right)?;
-    let mut out = left_cols
-        .into_iter()
-        .filter(|column| !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
-        .collect::<Vec<_>>();
-    out.extend(right_cols);
-    out.retain(|column| !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME));
+    let mut out = Vec::new();
+    let mut action_output: Option<OutputColumn> = None;
+    for column in left_cols.into_iter().chain(right_cols) {
+        if ImvActionColumn::matches(&column) {
+            match &action_output {
+                Some(existing) if existing.column_id != column.column_id => {
+                    return Err(format!(
+                        "Iceberg IMV join delta rewrite found multiple action columns in join inputs: {:?} and {:?}",
+                        existing.column_id, column.column_id
+                    ));
+                }
+                Some(_) => {}
+                None => action_output = Some(column),
+            }
+        } else {
+            out.push(column);
+        }
+    }
+    if let Some(action_output) = action_output {
+        out.push(action_output);
+    }
     Ok(out)
 }
 
@@ -953,7 +1085,25 @@ fn mark_scan(plan: LogicalPlanNode, marker: MarkerKind) -> Result<LogicalPlanNod
             LogicalPlanNode::new(kind, children, required_output_columns),
             marker,
         ),
-        PlanNodeKind::Project(_) | PlanNodeKind::Filter(_) => {
+        PlanNodeKind::Project(mut project) => {
+            if let MarkerKind::Delta(action_column) = &marker {
+                let action_output = ImvActionColumn::output_column(*action_column);
+                if !project
+                    .items
+                    .iter()
+                    .any(|item| item.output_column_id == action_output.column_id)
+                {
+                    project.items.push(action_project_item(&action_output));
+                }
+            }
+            let input = take_unary_child(&mut children);
+            LogicalPlanNode::new(
+                PlanNodeKind::Project(project),
+                vec![mark_scan(input, marker)?],
+                required_output_columns,
+            )
+        }
+        PlanNodeKind::Filter(_) => {
             let input = take_unary_child(&mut children);
             LogicalPlanNode::new(
                 kind,
@@ -988,6 +1138,22 @@ fn mark_scan(plan: LogicalPlanNode, marker: MarkerKind) -> Result<LogicalPlanNod
             ));
         }
     })
+}
+
+fn action_project_item(action_output: &OutputColumn) -> ProjectItem {
+    ProjectItem {
+        expr: TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: action_output.column_id,
+                qualifier: None,
+                column: action_output.name.clone(),
+            },
+            data_type: action_output.data_type.clone(),
+            nullable: action_output.nullable,
+        },
+        output_name: action_output.name.clone(),
+        output_column_id: action_output.column_id,
+    }
 }
 
 fn wrap_scan_marker(scan: LogicalPlanNode, marker: MarkerKind) -> LogicalPlanNode {
@@ -1085,7 +1251,15 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
             out
         }
         PlanNodeKind::AssertOneRow(_) => plan_output_columns(plan.unary_input())?,
-        PlanNodeKind::ImvDelta(_) => plan_output_columns(plan.unary_input())?,
+        PlanNodeKind::ImvDelta(delta) => {
+            let mut out = plan_output_columns(plan.unary_input())?;
+            if let Some(action_column) = delta.action_column
+                && !out.iter().any(|column| column.column_id == action_column)
+            {
+                out.push(ImvActionColumn::output_column(action_column));
+            }
+            out
+        }
         PlanNodeKind::ImvVersion(_) => plan_output_columns(plan.unary_input())?,
         PlanNodeKind::TopN(_)
         | PlanNodeKind::Exchange(_)
@@ -1450,6 +1624,69 @@ mod tests {
     }
 
     #[test]
+    fn join_apply_key_rule_propagates_key_through_project() {
+        let rule = InjectJoinApplyKeyRule;
+        let mut ctx = build_ctx();
+        let plan = project_payload_only(join_apply_key_union());
+
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(
+            rule.matches(&expr, &ctx),
+            "Project above a join apply-key union must expose the key for coalescing"
+        );
+
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("propagate")
+        else {
+            panic!("join apply-key propagation must change the Project");
+        };
+        let arena = ctx.scalar_arena();
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            changed_expr,
+            &arena.borrow(),
+        );
+        let PlanNodeKind::Project(project) = &changed.kind else {
+            panic!("expected Project");
+        };
+        assert!(project.items.iter().any(|item| {
+            item.output_name
+                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+                && item.output_column_id == ColumnId(21)
+        }));
+    }
+
+    #[test]
+    fn join_apply_key_rule_propagates_action_through_project() {
+        let rule = InjectJoinApplyKeyRule;
+        let mut ctx = build_ctx();
+        let plan = project_payload_only(join_apply_key_union());
+
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(
+            rule.matches(&expr, &ctx),
+            "Project above a join apply-key union must expose action for coalescing"
+        );
+
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("propagate")
+        else {
+            panic!("join action propagation must change the Project");
+        };
+        let arena = ctx.scalar_arena();
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            changed_expr,
+            &arena.borrow(),
+        );
+        let PlanNodeKind::Project(project) = &changed.kind else {
+            panic!("expected Project");
+        };
+        assert!(project.items.iter().any(|item| {
+            item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)
+                && item.output_column_id == ColumnId(20)
+        }));
+    }
+
+    #[test]
     fn mark_delta_scan_wraps_nested_join_whole() {
         // Delta marker over a Join must wrap the entire join (pending recursive join-delta expansion),
         // NOT push into the two sides.
@@ -1461,6 +1698,51 @@ mod tests {
         assert!(!delta.is_root, "nested join delta marker is not root");
         assert_eq!(delta.action_column, Some(ColumnId(100)));
         assert!(matches!(&marked.children[0].kind, PlanNodeKind::Join(_)));
+    }
+
+    #[test]
+    fn mark_delta_scan_propagates_action_through_project_side() {
+        let marked =
+            mark_delta_scan(project_over(scan("a", 1)), ColumnId(100)).expect("mark delta");
+
+        let PlanNodeKind::Project(project) = &marked.kind else {
+            panic!("expected Project, got {marked:?}");
+        };
+        let Some(action_item) = project
+            .items
+            .iter()
+            .find(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+        else {
+            panic!("delta-marked Project must expose the action column");
+        };
+        assert_eq!(action_item.output_column_id, ColumnId(100));
+        assert!(matches!(
+            &action_item.expr.kind,
+            ExprKind::ColumnRef {
+                column_id,
+                column,
+                ..
+            } if *column_id == ColumnId(100) && column.eq_ignore_ascii_case(ImvActionColumn::NAME)
+        ));
+    }
+
+    #[test]
+    fn join_output_columns_keep_delta_side_action_for_normalized_branch() {
+        let left =
+            mark_delta_scan(project_over(scan("a", 1)), ColumnId(100)).expect("mark left delta");
+        let right = mark_version_scan(project_over(scan("b", 10)), ImvVersionRef::from_snapshot())
+            .expect("mark right version");
+        let join = join_of(left, right);
+
+        let columns = plan_output_columns(&join).expect("join output columns");
+
+        assert!(
+            columns
+                .iter()
+                .any(|column| ImvActionColumn::matches(column)
+                    && column.column_id == ColumnId(100)),
+            "normalized join-delta branch Join must expose the shared action column"
+        );
     }
 
     #[test]
@@ -1606,6 +1888,58 @@ mod tests {
 
     fn join_of_with_left(left: LogicalPlanNode, right: LogicalPlanNode) -> LogicalPlanNode {
         join_of(left, right)
+    }
+
+    fn project_payload_only(input: LogicalPlanNode) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            PlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: col_expr(1, "payload"),
+                    output_name: "payload".to_string(),
+                    output_column_id: ColumnId(1),
+                }],
+                output_qualifier: None,
+            }),
+            vec![input],
+            None,
+        )
+    }
+
+    fn join_apply_key_union() -> LogicalPlanNode {
+        let payload = output_column(1, "payload");
+        let action = ImvActionColumn::output_column(ColumnId(20));
+        let join_apply_key = OutputColumn {
+            column_id: ColumnId(21),
+            name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+            data_type: DataType::Utf8,
+            nullable: false,
+            is_internal: true,
+        };
+        LogicalPlanNode::new(
+            PlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![payload.clone(), action.clone(), join_apply_key.clone()],
+            }),
+            vec![
+                LogicalPlanNode::new(
+                    PlanNodeKind::Values(LogicalValuesNode {
+                        rows: Vec::new(),
+                        columns: vec![payload.clone(), action.clone(), join_apply_key.clone()],
+                    }),
+                    Vec::new(),
+                    None,
+                ),
+                LogicalPlanNode::new(
+                    PlanNodeKind::Values(LogicalValuesNode {
+                        rows: Vec::new(),
+                        columns: vec![payload, action, join_apply_key],
+                    }),
+                    Vec::new(),
+                    None,
+                ),
+            ],
+            None,
+        )
     }
 
     fn project_over(input: LogicalPlanNode) -> LogicalPlanNode {

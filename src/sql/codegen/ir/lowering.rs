@@ -1986,10 +1986,20 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             merged.merge(&right_scope);
             let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &merged);
             for demoted in &demoted_eq_exprs {
-                other_join_conjuncts.push(compiler.compile_typed(demoted)?);
+                other_join_conjuncts.push(compiler.compile_typed(demoted).map_err(|err| {
+                    format!(
+                        "failed to compile demoted HashJoin node_id={} equality conjunct: {}",
+                        join_node_id, err
+                    )
+                })?);
             }
             if let Some(ref cond) = op.other_condition {
-                other_join_conjuncts.push(compiler.compile_typed(cond)?);
+                other_join_conjuncts.push(compiler.compile_typed(cond).map_err(|err| {
+                    format!(
+                        "failed to compile HashJoin node_id={} other conjunct: {}",
+                        join_node_id, err
+                    )
+                })?);
             }
         }
 
@@ -2803,7 +2813,12 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
         for item in &op.items {
             let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
-            let texpr = compiler.compile_typed(&item.expr)?;
+            let texpr = compiler.compile_typed(&item.expr).map_err(|err| {
+                format!(
+                    "failed to compile Project node_id={} item `{}` output_id={}: {}",
+                    project_node_id, item.output_name, item.output_column_id, err
+                )
+            })?;
             let data_type = item.expr.data_type.clone();
             let nullable = item.expr.nullable;
             let name = item.output_name.clone();
@@ -2982,11 +2997,26 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                         .map(|(name, _)| name.clone())
                         .collect::<Vec<_>>()
                         .join(", ");
+                    let available_ids = child_scope
+                        .iter_id_bindings()
+                        .map(|(column_id, binding)| {
+                            format!(
+                                "{}=>tuple{}.slot{}:{:?}:nullable={}",
+                                column_id,
+                                binding.tuple_id,
+                                binding.slot_id,
+                                binding.data_type,
+                                binding.nullable
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     format!(
-                        "failed to compile aggregate `{}` in {:?} mode against child scope [{}]: {}",
+                        "failed to compile aggregate `{}` in {:?} mode against child scope names [{}], ids [{}]: {}",
                         agg_call_display_name(agg_call),
                         op.mode,
                         available,
+                        available_ids,
                         err
                     )
                 })?
@@ -4270,10 +4300,52 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             .collect();
 
         if first_child_cols.len() != output_columns.len() {
+            let child_names = first_child_cols
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+                .join(",");
+            let output_names = output_columns
+                .iter()
+                .map(|column| format!("{}:{}", column.column_id, column.name))
+                .collect::<Vec<_>>()
+                .join(",");
+            let child_debug = first_child_cols
+                .iter()
+                .map(|(name, binding)| {
+                    format!(
+                        "{}=>tuple{}.slot{}:{:?}:nullable={}",
+                        name,
+                        binding.tuple_id,
+                        binding.slot_id,
+                        binding.data_type,
+                        binding.nullable
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let output_debug = output_columns
+                .iter()
+                .map(|column| {
+                    format!(
+                        "{}:{}:{:?}:nullable={}:internal={}",
+                        column.column_id,
+                        column.name,
+                        column.data_type,
+                        column.nullable,
+                        column.is_internal
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(format!(
-                "set operation column count mismatch during codegen: child has {}, output has {}",
+                "set operation column count mismatch during codegen: child has {}, output has {}; child_names=[{}]; output_names=[{}]; child=[{}]; output=[{}]",
                 first_child_cols.len(),
-                output_columns.len()
+                output_columns.len(),
+                child_names,
+                output_names,
+                child_debug,
+                output_debug
             ));
         }
 

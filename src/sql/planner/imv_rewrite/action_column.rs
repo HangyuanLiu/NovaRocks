@@ -9,9 +9,11 @@ use std::sync::atomic::AtomicBool;
 
 use arrow::datatypes::DataType;
 
-use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
+use crate::engine::mv::iceberg_target_apply::{
+    ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+};
 use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn};
-use crate::sql::catalog::ScanSource;
+use crate::sql::catalog::{ColumnDef, ScanSource};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -58,6 +60,22 @@ impl ImvActionColumn {
     /// Returns true iff `column` is the IMV action column.
     pub(crate) fn matches(column: &OutputColumn) -> bool {
         column.is_internal && column.name.eq_ignore_ascii_case(Self::NAME)
+    }
+
+    pub(crate) fn ensure_metadata_column(columns: &mut Vec<ColumnDef>) {
+        if columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(Self::NAME))
+        {
+            return;
+        }
+        columns.push(ColumnDef {
+            name: Self::NAME.to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        });
     }
 }
 
@@ -141,7 +159,15 @@ fn validate_with_change_stream(
         );
     }
     // V6: if a delta subtree exists, root output must carry the apply key.
-    if !matches!(&plan.kind, PlanNodeKind::AggregateStateMerge(_))
+    if contains_join_delta_union(plan) {
+        if !output_has_join_apply_key(plan) {
+            let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
+            return Err(format!(
+                "join refresh plan above delta-bound scan {fqn} is missing join apply-key column \
+                 {ICEBERG_MV_JOIN_APPLY_KEY_COLUMN}"
+            ));
+        }
+    } else if !matches!(&plan.kind, PlanNodeKind::AggregateStateMerge(_))
         && !(matches!(&plan.kind, PlanNodeKind::Union(_)) && is_supported_branch_union(plan))
         && subtree_has_delta(plan)
         && !output_has_apply_key(plan)
@@ -426,6 +452,25 @@ fn output_has_apply_key(plan: &LogicalPlanNode) -> bool {
     }
 }
 
+fn output_has_join_apply_key(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        PlanNodeKind::Project(p) => p.items.iter().any(|i| {
+            i.output_name
+                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+        }),
+        PlanNodeKind::Union(u) => u.output_columns.iter().any(|c| {
+            c.name
+                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+        }),
+        PlanNodeKind::Filter(_) => output_has_join_apply_key(plan.unary_input()),
+        _ => false,
+    }
+}
+
+fn contains_join_delta_union(plan: &LogicalPlanNode) -> bool {
+    is_supported_join_delta_union(plan) || plan.children.iter().any(contains_join_delta_union)
+}
+
 fn subtree_has_delta(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
         PlanNodeKind::Scan(scan) => {
@@ -445,6 +490,9 @@ fn has_visible_output(plan: &LogicalPlanNode) -> bool {
                 && !item
                     .output_name
                     .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
+                && !item
+                    .output_name
+                    .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
         }),
         PlanNodeKind::Aggregate(node) => node.output_columns.iter().any(|c| !c.is_internal),
         PlanNodeKind::AggregateStateMerge(node) => {

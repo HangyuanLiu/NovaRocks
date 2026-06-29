@@ -1398,6 +1398,84 @@ mod tests {
         plan
     }
 
+    #[test]
+    fn project_codegen_uses_project_item_output_ids_not_stale_node_outputs() {
+        let mut scalars = ScalarArena::new();
+        let source = output_col_for_test(1, "__change_op_source", DataType::Int8, false);
+        let action_id = ColumnId::new_for_test(14);
+        let stale_id = ColumnId::new_for_test(13);
+        let parent_id = ColumnId::new_for_test(20);
+        let values = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: Vec::new(),
+                columns: vec![source.clone()],
+            }),
+            children: Vec::new(),
+            stats: stats_for_test(),
+            output_columns: vec![source.clone()],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let child_item = ProjectItem {
+            expr: column_ref_expr_for_test(source.column_id, &source.name, DataType::Int8, false),
+            output_name: "__change_op".to_string(),
+            output_column_id: action_id,
+        };
+        let stale_child_output = OutputColumn {
+            column_id: stale_id,
+            name: "__change_op".to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal: true,
+        };
+        let child_project = PhysicalPlanNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items: intern_project_items(&mut scalars, &[child_item]),
+                output_qualifier: None,
+            }),
+            children: vec![values],
+            stats: stats_for_test(),
+            output_columns: vec![stale_child_output],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let parent_item = ProjectItem {
+            expr: column_ref_expr_for_test(action_id, "__change_op", DataType::Int8, false),
+            output_name: "__change_op".to_string(),
+            output_column_id: parent_id,
+        };
+        let parent_output = OutputColumn {
+            column_id: parent_id,
+            name: "__change_op".to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal: true,
+        };
+        let mut plan = PhysicalPlanNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items: intern_project_items(&mut scalars, &[parent_item]),
+                output_qualifier: None,
+            }),
+            children: vec![child_project],
+            stats: stats_for_test(),
+            output_columns: vec![parent_output],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+
+        PlanFragmentBuilder::build_via_distributed_plan(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::new(),
+            "default",
+        )
+        .expect("Project codegen must keep ProjectOp item output ids as the scope contract");
+    }
+
     fn aggregate_merge_shape_for_test()
     -> crate::connector::starrocks::table::mv_shape::AggregateMvShape {
         aggregate_merge_shape_for_sql(

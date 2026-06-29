@@ -131,19 +131,25 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
 
     let input_columns = crate::sql::planner::plan_output_columns(&branch_union)
         .map_err(|err| format!("join refresh coalesce cannot derive input columns: {err}"))?;
-    let payload_outputs = payload_output_columns(desc)?;
+    let payload_mappings = payload_source_output_columns(desc)?;
+    let payload_inputs = payload_mappings
+        .iter()
+        .map(|(input, _)| input.clone())
+        .collect::<Vec<_>>();
+    let payload_outputs = payload_mappings
+        .iter()
+        .map(|(_, output)| output.clone())
+        .collect::<Vec<_>>();
     validate_coalesce_payload_output_names(&payload_outputs)?;
+    let apply_key_input = desc.join_apply_key_column.clone();
+    let action_input = desc.action_column.clone();
     let apply_key_output = mapped_output_column(
         desc,
         JoinRefreshOutputSource::JoinApplyKey(desc.join_apply_key_column.column_id),
     )?;
-    let action_output = mapped_output_column(
-        desc,
-        JoinRefreshOutputSource::Action(desc.action_column.column_id),
-    )?;
-    for column in payload_outputs
+    for column in payload_inputs
         .iter()
-        .chain([&apply_key_output, &action_output])
+        .chain([&apply_key_input, &action_input])
     {
         validate_input_column(&input_columns, column)?;
     }
@@ -190,15 +196,15 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
     let locator_apply_key_id = allocator.allocate();
     let aggregate = build_payload_coalesce_aggregate(
         branch_union,
-        &payload_outputs,
-        &apply_key_output,
-        &action_output,
+        &payload_inputs,
+        &apply_key_input,
+        &action_input,
         &net_column,
     );
     let payload_checked = build_payload_coalesce_assert_filter(aggregate, &net_column);
     let key_shape_checked = build_key_shape_assert_join(
         payload_checked,
-        &apply_key_output,
+        &apply_key_input,
         &net_column,
         &key_shape_apply_key,
         &pending_insert_count,
@@ -208,7 +214,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         key_shape_checked,
         desc,
         locator,
-        &apply_key_output,
+        &apply_key_input,
         &net_column,
         locator_apply_key_id,
         ColumnId(locator_file_column_id),
@@ -223,7 +229,8 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
     Ok(build_final_coalesce_project(
         locator_checked,
         desc,
-        &payload_outputs,
+        &payload_mappings,
+        &apply_key_input,
         &apply_key_output,
         &net_column,
         ColumnId(locator_file_column_id),
@@ -233,24 +240,24 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
 
 fn build_payload_coalesce_aggregate(
     branch_union: LogicalPlanNode,
-    payload_outputs: &[OutputColumn],
-    apply_key_output: &OutputColumn,
-    action_output: &OutputColumn,
+    payload_inputs: &[OutputColumn],
+    apply_key_input: &OutputColumn,
+    action_input: &OutputColumn,
     net_column: &OutputColumn,
 ) -> LogicalPlanNode {
-    let mut group_by = payload_outputs.iter().map(column_ref).collect::<Vec<_>>();
-    group_by.push(column_ref(apply_key_output));
-    let output_columns = payload_outputs
+    let mut group_by = payload_inputs.iter().map(column_ref).collect::<Vec<_>>();
+    group_by.push(column_ref(apply_key_input));
+    let output_columns = payload_inputs
         .iter()
         .cloned()
-        .chain([apply_key_output.clone(), net_column.clone()])
+        .chain([apply_key_input.clone(), net_column.clone()])
         .collect::<Vec<_>>();
     LogicalPlanNode::new(
         PlanNodeKind::Aggregate(LogicalAggregateNode {
             group_by,
             aggregates: vec![AggregateCall {
                 name: "sum".to_string(),
-                args: vec![column_ref(action_output)],
+                args: vec![column_ref(action_input)],
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: Vec::new(),
@@ -609,7 +616,8 @@ fn build_locator_assert_filter(
 fn build_final_coalesce_project(
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
-    payload_outputs: &[OutputColumn],
+    payload_mappings: &[(OutputColumn, OutputColumn)],
+    apply_key_input: &OutputColumn,
     apply_key_output: &OutputColumn,
     net_column: &OutputColumn,
     locator_file_column_id: ColumnId,
@@ -619,11 +627,14 @@ fn build_final_coalesce_project(
         desc,
         JoinRefreshOutputSource::Action(desc.action_column.column_id),
     )?;
-    let mut items = payload_outputs
+    let mut items = payload_mappings
         .iter()
-        .map(project_item_for_output_column)
+        .map(|(input, output)| project_item_from_source_to_output(input, output))
         .collect::<Vec<_>>();
-    items.push(project_item_for_output_column(apply_key_output));
+    items.push(project_item_from_source_to_output(
+        apply_key_input,
+        apply_key_output,
+    ));
     items.push(ProjectItem {
         expr: coalesced_action_expr(net_column),
         output_name: action_output.name,
@@ -690,15 +701,28 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
     }
 }
 
-fn payload_output_columns(desc: &JoinRefreshDescriptor) -> Result<Vec<OutputColumn>, String> {
+fn payload_source_output_columns(
+    desc: &JoinRefreshDescriptor,
+) -> Result<Vec<(OutputColumn, OutputColumn)>, String> {
     let columns = desc
         .output_mappings
         .iter()
         .filter_map(|mapping| match mapping.source {
-            JoinRefreshOutputSource::Payload(_) => Some(mapping.mv_output_column.clone()),
+            JoinRefreshOutputSource::Payload(column_id) => Some(
+                desc.payload_columns
+                    .iter()
+                    .find(|column| column.column_id == column_id)
+                    .cloned()
+                    .map(|source| (source, mapping.mv_output_column.clone()))
+                    .ok_or_else(|| {
+                        format!(
+                            "join refresh coalesce references unknown payload column {column_id}"
+                        )
+                    }),
+            ),
             JoinRefreshOutputSource::Action(_) | JoinRefreshOutputSource::JoinApplyKey(_) => None,
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     if columns.is_empty() {
         return Err("join refresh coalesce requires payload output columns".to_string());
     }
@@ -748,11 +772,11 @@ fn mapped_output_column(
         })
 }
 
-fn project_item_for_output_column(column: &OutputColumn) -> ProjectItem {
+fn project_item_from_source_to_output(source: &OutputColumn, output: &OutputColumn) -> ProjectItem {
     ProjectItem {
-        expr: column_ref(column),
-        output_name: column.name.clone(),
-        output_column_id: column.column_id,
+        expr: column_ref(source),
+        output_name: output.name.clone(),
+        output_column_id: output.column_id,
     }
 }
 
@@ -1060,14 +1084,24 @@ fn string_literal(value: &str) -> TypedExpr {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+    use std::rc::Rc;
+
     use arrow::datatypes::DataType;
 
     use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
         JoinRefreshBranchDescriptor, JoinRefreshBranchSide, JoinRefreshDescriptor,
         JoinRefreshJoinKeyPair, JoinRefreshMode, JoinRefreshMvIdentity, JoinRefreshOutputMapping,
         JoinRefreshOutputSource,
+    };
+    use crate::sql::planner::optimizer_bridge::plan::{
+        logical_plan_to_opt_expr, opt_expr_to_logical_plan,
     };
     use crate::sql::planner::plan::{
         LogicalPlanNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,
@@ -1217,6 +1251,60 @@ mod tests {
         ));
         assert_final_coalesce_output(&plan);
         assert_target_locator_binding(&plan);
+    }
+
+    #[test]
+    fn coalesce_plan_query_rewrite_keeps_aggregate_args_in_child_scope() {
+        let desc = test_coalesce_descriptor();
+        let branch_union = test_branch_union(&desc);
+
+        let plan = super::build_join_delta_coalesce_plan_with_locator(
+            branch_union,
+            &desc,
+            &test_locator_binding(),
+            100,
+            101,
+            102,
+        )
+        .expect("coalesce plan");
+
+        let rewritten = run_query_rewrite_pipeline(plan);
+
+        assert_aggregate_args_resolve_to_child_outputs(&rewritten);
+    }
+
+    #[test]
+    fn coalesce_plan_lowers_after_physical_optimization() {
+        let desc = test_coalesce_descriptor();
+        let branch_union = test_branch_union(&desc);
+
+        let plan = super::build_join_delta_coalesce_plan_with_locator(
+            branch_union,
+            &desc,
+            &test_locator_binding(),
+            100,
+            101,
+            102,
+        )
+        .expect("coalesce plan");
+        let physical = optimize_for_test(plan);
+        let catalog = crate::engine::catalog::InMemoryCatalog::default();
+        let connectors = crate::connector::ConnectorRegistry::default();
+
+        let result =
+            crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
+                &physical,
+                &catalog,
+                &connectors,
+                "default",
+            );
+
+        if let Err(err) = result {
+            assert!(
+                !err.contains("ColumnId") && !err.contains("cannot be resolved"),
+                "coalesce plan must not fail aggregate argument binding after physical optimization: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1428,12 +1516,159 @@ mod tests {
         }
     }
 
+    fn run_query_rewrite_pipeline(plan: LogicalPlanNode) -> LogicalPlanNode {
+        let pipeline = query_rewrite_pipeline();
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_query_stats_input(
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+                &HashMap::new(),
+            ),
+        );
+        let mut scalars = ScalarArena::new();
+        let opt_plan = logical_plan_to_opt_expr(&plan, &mut scalars);
+        let arena_rc = Rc::new(RefCell::new(scalars));
+        ctx.set_scalar_arena(arena_rc.clone());
+        let opt_result = pipeline
+            .rewrite(opt_plan, &mut ctx)
+            .expect("query rewrite pipeline");
+        let arena = arena_rc.borrow();
+        opt_expr_to_logical_plan(opt_result, &arena)
+    }
+
+    fn optimize_for_test(plan: LogicalPlanNode) -> crate::sql::optimizer::PhysicalPlanNode {
+        let mut scalar_arena = ScalarArena::new();
+        let opt_expr = logical_plan_to_opt_expr(&plan, &mut scalar_arena);
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        factory.reserve_until(200);
+        crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+            opt_expr,
+            scalar_arena,
+            &HashMap::new(),
+            factory,
+            None,
+            Vec::new(),
+        )
+        .expect("physical optimization")
+    }
+
+    fn assert_aggregate_args_resolve_to_child_outputs(plan: &LogicalPlanNode) {
+        if let PlanNodeKind::Aggregate(aggregate) = &plan.kind {
+            let child_output_ids = crate::sql::planner::plan_output_columns(plan.unary_input())
+                .expect("aggregate child output columns")
+                .into_iter()
+                .map(|column| column.column_id)
+                .collect::<HashSet<_>>();
+            for call in &aggregate.aggregates {
+                let mut refs = HashSet::new();
+                for arg in &call.args {
+                    collect_column_refs(arg, &mut refs);
+                }
+                for sort_item in &call.order_by {
+                    collect_column_refs(&sort_item.expr, &mut refs);
+                }
+                for column_id in refs {
+                    assert!(
+                        child_output_ids.contains(&column_id),
+                        "aggregate `{}` references {column_id}, but child outputs are {:?}",
+                        call.name,
+                        child_output_ids
+                    );
+                }
+            }
+        }
+        for child in &plan.children {
+            assert_aggregate_args_resolve_to_child_outputs(child);
+        }
+    }
+
+    fn collect_column_refs(expr: &crate::sql::analysis::TypedExpr, refs: &mut HashSet<ColumnId>) {
+        match &expr.kind {
+            ExprKind::ColumnRef { column_id, .. } => {
+                if *column_id != ColumnId::UNSET {
+                    refs.insert(*column_id);
+                }
+            }
+            ExprKind::BinaryOp { left, right, .. } => {
+                collect_column_refs(left, refs);
+                collect_column_refs(right, refs);
+            }
+            ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+                for arg in args {
+                    collect_column_refs(arg, refs);
+                }
+                if let ExprKind::AggregateCall { order_by, .. } = &expr.kind {
+                    for item in order_by {
+                        collect_column_refs(&item.expr, refs);
+                    }
+                }
+            }
+            ExprKind::Cast { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::UnaryOp { expr, .. }
+            | ExprKind::Nested(expr) => collect_column_refs(expr, refs),
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                if let Some(operand) = operand {
+                    collect_column_refs(operand, refs);
+                }
+                for (when, then) in when_then {
+                    collect_column_refs(when, refs);
+                    collect_column_refs(then, refs);
+                }
+                if let Some(else_expr) = else_expr {
+                    collect_column_refs(else_expr, refs);
+                }
+            }
+            ExprKind::InList { expr, list, .. } => {
+                collect_column_refs(expr, refs);
+                for item in list {
+                    collect_column_refs(item, refs);
+                }
+            }
+            ExprKind::Between {
+                expr, low, high, ..
+            } => {
+                collect_column_refs(expr, refs);
+                collect_column_refs(low, refs);
+                collect_column_refs(high, refs);
+            }
+            ExprKind::Like { expr, pattern, .. } => {
+                collect_column_refs(expr, refs);
+                collect_column_refs(pattern, refs);
+            }
+            ExprKind::WindowCall {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for arg in args {
+                    collect_column_refs(arg, refs);
+                }
+                for expr in partition_by {
+                    collect_column_refs(expr, refs);
+                }
+                for item in order_by {
+                    collect_column_refs(&item.expr, refs);
+                }
+            }
+            ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+                collect_column_refs(body, refs);
+            }
+            ExprKind::IsTruthValue { expr, .. } => collect_column_refs(expr, refs),
+            ExprKind::LambdaParamRef { .. }
+            | ExprKind::Literal(_)
+            | ExprKind::SubqueryPlaceholder { .. } => {}
+        }
+    }
+
     fn test_branch_union(desc: &JoinRefreshDescriptor) -> LogicalPlanNode {
-        let output_columns = desc
-            .output_mappings
-            .iter()
-            .map(|mapping| mapping.mv_output_column.clone())
-            .collect::<Vec<_>>();
+        let mut output_columns = desc.payload_columns.clone();
+        output_columns.push(desc.action_column.clone());
+        output_columns.push(desc.join_apply_key_column.clone());
         let branch = test_values_plan(output_columns.clone());
         LogicalPlanNode::new(
             PlanNodeKind::Union(LogicalUnionNode {
