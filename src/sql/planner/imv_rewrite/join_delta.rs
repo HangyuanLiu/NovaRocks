@@ -9,7 +9,7 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
-use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column;
 use crate::sql::planner::imv_rewrite::marker::ImvVersionRef;
 use crate::sql::planner::imv_rewrite::target_locator::is_target_locator_join;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
@@ -75,12 +75,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
 
             let action_column = match delta.action_column {
                 Some(action_column) => action_column,
-                None => ctx
-                    .extension::<ImvExtension>()
-                    .ok_or_else(|| {
-                        "RewriteJoinDelta requires ImvExtension in RewriteContext".to_string()
-                    })?
-                    .allocate_column_id(),
+                None => allocate_imv_column(ctx, ImvActionColumn::NAME, DataType::Int8, false)?,
             };
 
             let (left, right) = take_binary_children(&mut join_children);
@@ -479,7 +474,7 @@ mod tests {
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
-    use crate::sql::column_id::ColumnId;
+    use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
@@ -775,6 +770,9 @@ mod tests {
         ctx.set_scalar_arena(std::rc::Rc::new(
             std::cell::RefCell::new(ScalarArena::new()),
         ));
+        let factory = std::rc::Rc::new(std::cell::RefCell::new(ColumnRefFactory::new()));
+        factory.borrow_mut().reserve_until(100);
+        ctx.set_column_ref_factory(std::rc::Rc::clone(&factory));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
