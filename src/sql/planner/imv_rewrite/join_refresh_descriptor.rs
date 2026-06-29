@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use arrow::datatypes::DataType;
 
 use crate::sql::analysis::OutputColumn;
@@ -118,28 +120,15 @@ impl JoinRefreshDescriptor {
             return Err("join refresh descriptor requires at least one payload column".to_string());
         }
         self.validate_identity()?;
+        validate_row_id_column("left", &self.left_row_id_column)?;
+        validate_row_id_column("right", &self.right_row_id_column)?;
         if self.join_key_pairs.is_empty() {
             return Err("join refresh descriptor requires at least one join key pair".to_string());
         }
+        self.validate_join_key_pairs()?;
+        self.validate_action_column()?;
+        self.validate_join_apply_key_column()?;
         self.validate_output_mappings()?;
-        if !self
-            .action_column
-            .name
-            .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
-            || self.action_column.data_type != DataType::Int8
-            || self.action_column.nullable
-            || !self.action_column.is_internal
-        {
-            return Err("join refresh descriptor has invalid action column".to_string());
-        }
-        if !self.join_apply_key_column.name.eq_ignore_ascii_case(
-            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
-        ) || self.join_apply_key_column.data_type != DataType::Utf8
-            || self.join_apply_key_column.nullable
-            || !self.join_apply_key_column.is_internal
-        {
-            return Err("join refresh descriptor has invalid join apply-key column".to_string());
-        }
         if matches!(self.mode, JoinRefreshMode::Coalesce) && !self.needs_target_locator {
             return Err("coalescing join refresh requires target locator".to_string());
         }
@@ -160,23 +149,102 @@ impl JoinRefreshDescriptor {
         Ok(())
     }
 
+    fn validate_join_key_pairs(&self) -> Result<(), String> {
+        for pair in &self.join_key_pairs {
+            if pair.left_column.column_id == pair.right_column.column_id {
+                return Err(format!(
+                    "join refresh descriptor join key pair cannot use the same column id on both sides: {}",
+                    pair.left_column.column_id
+                ));
+            }
+            if pair.left_column.data_type != pair.right_column.data_type {
+                return Err(format!(
+                    "join refresh descriptor join key pair type mismatch: left {} is {:?}, right {} is {:?}",
+                    pair.left_column.column_id,
+                    pair.left_column.data_type,
+                    pair.right_column.column_id,
+                    pair.right_column.data_type
+                ));
+            }
+            if pair.left_column.nullable != pair.right_column.nullable {
+                return Err(format!(
+                    "join refresh descriptor join key pair nullability mismatch: left {} nullable={}, right {} nullable={}",
+                    pair.left_column.column_id,
+                    pair.left_column.nullable,
+                    pair.right_column.column_id,
+                    pair.right_column.nullable
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_action_column(&self) -> Result<(), String> {
+        if !self
+            .action_column
+            .name
+            .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+            || self.action_column.data_type != DataType::Int8
+            || self.action_column.nullable
+            || !self.action_column.is_internal
+        {
+            return Err("join refresh descriptor has invalid action column".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_join_apply_key_column(&self) -> Result<(), String> {
+        if !self.join_apply_key_column.name.eq_ignore_ascii_case(
+            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        ) || self.join_apply_key_column.data_type != DataType::Utf8
+            || self.join_apply_key_column.nullable
+            || !self.join_apply_key_column.is_internal
+        {
+            return Err("join refresh descriptor has invalid join apply-key column".to_string());
+        }
+        Ok(())
+    }
+
     fn validate_output_mappings(&self) -> Result<(), String> {
         if self.output_mappings.is_empty() {
             return Err("join refresh descriptor requires at least one output mapping".to_string());
         }
 
+        let mut seen_mv_output_ids = HashSet::new();
+        let mut seen_mv_output_names = HashSet::new();
+        let mut mapped_payload_columns = HashSet::new();
+        let mut has_action_mapping = false;
+        let mut has_join_apply_key_mapping = false;
+
         for mapping in &self.output_mappings {
-            match mapping.source {
+            if !seen_mv_output_ids.insert(mapping.mv_output_column.column_id) {
+                return Err(format!(
+                    "join refresh descriptor has duplicate MV output column id {}",
+                    mapping.mv_output_column.column_id
+                ));
+            }
+
+            let normalized_name = mapping.mv_output_column.name.to_ascii_lowercase();
+            if !seen_mv_output_names.insert(normalized_name) {
+                return Err(format!(
+                    "join refresh descriptor has duplicate MV output column name {}",
+                    mapping.mv_output_column.name
+                ));
+            }
+
+            let source_column = match mapping.source {
                 JoinRefreshOutputSource::Payload(column_id) => {
-                    if !self
+                    let Some(column) = self
                         .payload_columns
                         .iter()
-                        .any(|column| column.column_id == column_id)
-                    {
+                        .find(|column| column.column_id == column_id)
+                    else {
                         return Err(format!(
                             "join refresh descriptor output mapping references unknown payload column {column_id}"
                         ));
-                    }
+                    };
+                    mapped_payload_columns.insert(column_id);
+                    column
                 }
                 JoinRefreshOutputSource::Action(column_id) => {
                     if column_id != self.action_column.column_id {
@@ -184,6 +252,8 @@ impl JoinRefreshDescriptor {
                             "join refresh descriptor output mapping references unknown action column {column_id}"
                         ));
                     }
+                    has_action_mapping = true;
+                    &self.action_column
                 }
                 JoinRefreshOutputSource::JoinApplyKey(column_id) => {
                     if column_id != self.join_apply_key_column.column_id {
@@ -191,8 +261,38 @@ impl JoinRefreshDescriptor {
                             "join refresh descriptor output mapping references unknown join apply-key column {column_id}"
                         ));
                     }
+                    has_join_apply_key_mapping = true;
+                    &self.join_apply_key_column
                 }
+            };
+
+            if !output_column_shape_matches(&mapping.mv_output_column, source_column) {
+                return Err(format!(
+                    "join refresh descriptor output mapping for MV output column {} does not match source column {}",
+                    mapping.mv_output_column.column_id, source_column.column_id
+                ));
             }
+        }
+
+        for column in &self.payload_columns {
+            if !mapped_payload_columns.contains(&column.column_id) {
+                return Err(format!(
+                    "join refresh descriptor missing output mapping for payload column {}",
+                    column.column_id
+                ));
+            }
+        }
+        if !has_action_mapping {
+            return Err(format!(
+                "join refresh descriptor missing output mapping for action column {}",
+                self.action_column.column_id
+            ));
+        }
+        if !has_join_apply_key_mapping {
+            return Err(format!(
+                "join refresh descriptor missing output mapping for join apply-key column {}",
+                self.join_apply_key_column.column_id
+            ));
         }
 
         Ok(())
@@ -238,6 +338,27 @@ impl JoinRefreshDescriptor {
 
         Ok(())
     }
+}
+
+fn validate_row_id_column(side: &str, column: &OutputColumn) -> Result<(), String> {
+    if !column
+        .name
+        .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+        || column.data_type != DataType::Int64
+        || column.nullable
+        || !column.is_internal
+    {
+        return Err(format!(
+            "join refresh descriptor has invalid {side} row-id column"
+        ));
+    }
+    Ok(())
+}
+
+fn output_column_shape_matches(output: &OutputColumn, source: &OutputColumn) -> bool {
+    output.data_type == source.data_type
+        && output.nullable == source.nullable
+        && output.is_internal == source.is_internal
 }
 
 fn output_columns_eq(left: &[OutputColumn], right: &[OutputColumn]) -> bool {
@@ -286,8 +407,20 @@ mod tests {
             },
             left_base_fqn: "ice.db.left_t".to_string(),
             right_base_fqn: "ice.db.right_t".to_string(),
-            left_row_id_column: out(1, "_row_id", DataType::Int64, false, true),
-            right_row_id_column: out(2, "_row_id", DataType::Int64, false, true),
+            left_row_id_column: out(
+                1,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+                true,
+            ),
+            right_row_id_column: out(
+                2,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+                true,
+            ),
             action_column: out(
                 3,
                 crate::exec::change_op::CHANGE_OP_COLUMN,
@@ -424,6 +557,107 @@ mod tests {
         let mut desc = valid_descriptor();
         desc.output_mappings[2].source = JoinRefreshOutputSource::JoinApplyKey(ColumnId(99));
         assert_invalid(desc, "unknown join apply-key column");
+    }
+
+    #[test]
+    fn rejects_output_mappings_missing_payload_column_mapping() {
+        let mut desc = valid_descriptor();
+        desc.output_mappings.remove(0);
+        assert_invalid(desc, "missing output mapping for payload column");
+    }
+
+    #[test]
+    fn rejects_output_mappings_missing_action_column_mapping() {
+        let mut desc = valid_descriptor();
+        desc.output_mappings.remove(1);
+        assert_invalid(desc, "missing output mapping for action column");
+    }
+
+    #[test]
+    fn rejects_output_mappings_missing_join_apply_key_column_mapping() {
+        let mut desc = valid_descriptor();
+        desc.output_mappings.pop();
+        assert_invalid(desc, "missing output mapping for join apply-key column");
+    }
+
+    #[test]
+    fn rejects_output_mappings_with_duplicate_mv_output_column_id() {
+        let mut desc = valid_descriptor();
+        desc.output_mappings[1].mv_output_column.column_id =
+            desc.output_mappings[0].mv_output_column.column_id;
+        assert_invalid(desc, "duplicate MV output column id");
+    }
+
+    #[test]
+    fn rejects_output_mappings_with_duplicate_mv_output_column_name() {
+        let mut desc = valid_descriptor();
+        desc.output_mappings[1].mv_output_column.name =
+            desc.output_mappings[0].mv_output_column.name.to_uppercase();
+        assert_invalid(desc, "duplicate MV output column name");
+    }
+
+    #[test]
+    fn rejects_output_mapping_with_type_mismatch() {
+        let mut desc = valid_descriptor();
+        desc.output_mappings[0].mv_output_column.data_type = DataType::Utf8;
+        assert_invalid(desc, "does not match source column");
+    }
+
+    #[test]
+    fn rejects_output_mapping_with_nullability_mismatch() {
+        let mut desc = valid_descriptor();
+        desc.output_mappings[0].mv_output_column.nullable = true;
+        assert_invalid(desc, "does not match source column");
+    }
+
+    #[test]
+    fn rejects_output_mapping_with_internal_flag_mismatch() {
+        let mut desc = valid_descriptor();
+        desc.output_mappings[2].mv_output_column.is_internal = false;
+        assert_invalid(desc, "does not match source column");
+    }
+
+    #[test]
+    fn rejects_descriptor_with_invalid_left_row_id_column() {
+        let mut desc = valid_descriptor();
+        desc.left_row_id_column.data_type = DataType::Utf8;
+        assert_invalid(desc, "invalid left row-id column");
+    }
+
+    #[test]
+    fn rejects_descriptor_with_invalid_right_row_id_column() {
+        let mut desc = valid_descriptor();
+        desc.right_row_id_column.nullable = true;
+        assert_invalid(desc, "invalid right row-id column");
+    }
+
+    #[test]
+    fn rejects_descriptor_with_non_internal_row_id_column() {
+        let mut desc = valid_descriptor();
+        desc.left_row_id_column.is_internal = false;
+        assert_invalid(desc, "invalid left row-id column");
+    }
+
+    #[test]
+    fn rejects_join_key_pair_with_type_mismatch() {
+        let mut desc = valid_descriptor();
+        desc.join_key_pairs[0].right_column.data_type = DataType::Utf8;
+        assert_invalid(desc, "join key pair type mismatch");
+    }
+
+    #[test]
+    fn rejects_join_key_pair_with_nullability_mismatch() {
+        let mut desc = valid_descriptor();
+        desc.join_key_pairs[0].right_column.nullable = true;
+        assert_invalid(desc, "join key pair nullability mismatch");
+    }
+
+    #[test]
+    fn rejects_join_key_pair_with_same_column_id_on_both_sides() {
+        let mut desc = valid_descriptor();
+        desc.join_key_pairs[0].right_column.column_id =
+            desc.join_key_pairs[0].left_column.column_id;
+        assert_invalid(desc, "join key pair cannot use the same column id");
     }
 
     #[test]
