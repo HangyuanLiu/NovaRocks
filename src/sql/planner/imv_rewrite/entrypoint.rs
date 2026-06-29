@@ -87,15 +87,16 @@ mod tests {
     use std::rc::Rc;
 
     use crate::engine::mv::iceberg_target_apply::{
-        ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN,
+        ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
     };
     use crate::engine::mv::refresh_context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, JoinContract,
-        JoinContractKind, JoinPredicateLineage, QualifiedFieldLineage,
+        ApplyKeySource, BRANCH_ID_COLUMN_NAME, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
+        BranchIdColumnContract, BranchUnionContract, JoinContract, JoinContractKind,
+        JoinPredicateLineage, MvSchemaContract, QualifiedFieldLineage,
     };
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
@@ -118,7 +119,6 @@ mod tests {
         JoinRefreshBranchSide, JoinRefreshMode, JoinRefreshOutputSource,
     };
     use crate::sql::planner::imv_rewrite::marker::{ImvVersionRef, plan_contains_imv_marker};
-    use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,
@@ -549,6 +549,12 @@ mod tests {
     }
 
     fn join_aggregate_mv_ctx() -> Arc<IcebergMvRewriteContext> {
+        join_aggregate_mv_ctx_customized(|_| {})
+    }
+
+    fn join_aggregate_mv_ctx_customized(
+        mutate: impl FnOnce(&mut MvSchemaContract),
+    ) -> Arc<IcebergMvRewriteContext> {
         let mut mv_def = make_mv_definition();
         mv_def.base_table_refs = vec!["ice.db.l".to_string(), "ice.db.r".to_string()];
         mv_def.last_refresh_snapshots = [
@@ -612,37 +618,46 @@ mod tests {
                 },
             ],
         });
+        mutate(&mut contract);
         mv_def.schema_contract = Some(contract.clone());
+        let mut target_fields = vec![
+            Arc::new(NestedField::required(
+                100,
+                "k",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                101,
+                "s",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::required(
+                999,
+                "__row_id__",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                200,
+                "__agg_state_s",
+                Type::Primitive(PrimitiveType::Binary),
+            )),
+            Arc::new(NestedField::required(
+                201,
+                "__agg_state___ivm_row_count",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+        ];
+        if let Some(branch) = &contract.branch {
+            target_fields.push(Arc::new(NestedField::required(
+                branch.branch_id_column.target_field_id,
+                branch.branch_id_column.column_name.clone(),
+                Type::Primitive(PrimitiveType::Int),
+            )));
+        }
         let target_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "k",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "s",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        999,
-                        "__row_id__",
-                        Type::Primitive(PrimitiveType::String),
-                    )),
-                    Arc::new(NestedField::optional(
-                        200,
-                        "__agg_state_s",
-                        Type::Primitive(PrimitiveType::Binary),
-                    )),
-                    Arc::new(NestedField::required(
-                        201,
-                        "__agg_state___ivm_row_count",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                ])
+                .with_fields(target_fields)
                 .build()
                 .expect("build target schema"),
         );
@@ -761,7 +776,6 @@ mod tests {
                         nullable: true,
                         is_internal: false,
                     },
-                    ImvRowIdColumn::output_column(ColumnId(first_id + 2)),
                 ],
                 predicates: Vec::new(),
                 required_columns: None,
@@ -787,11 +801,6 @@ mod tests {
                         expr: column_expr(first_id + 1, "v", true),
                         output_name: "v".to_string(),
                         output_column_id: ColumnId(first_id + 1),
-                    },
-                    ProjectItem {
-                        expr: column_expr(first_id + 2, ImvRowIdColumn::NAME, false),
-                        output_name: ImvRowIdColumn::NAME.to_string(),
-                        output_column_id: ColumnId(first_id + 2),
                     },
                 ],
                 output_qualifier: None,
@@ -1814,6 +1823,18 @@ mod tests {
             panic!("expected join delta UnionAll under signed aggregate");
         };
         assert_join_delta_union_shape(union_plan, signed_action_id);
+        let union_columns = match &union_plan.kind {
+            PlanNodeKind::Union(union) => &union.output_columns,
+            _ => unreachable!(),
+        };
+        let join_apply_key_from_plan = union_columns
+            .iter()
+            .find(|column| {
+                column
+                    .name
+                    .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+            })
+            .expect("join delta UnionAll must produce join apply-key before descriptor recording");
 
         let descriptor = outcome
             .annotation
@@ -1830,6 +1851,10 @@ mod tests {
         assert_eq!(descriptor.join_key_pairs.len(), 1);
         assert_eq!(descriptor.join_key_pairs[0].left_column.name, "k");
         assert_eq!(descriptor.join_key_pairs[0].right_column.name, "k");
+        assert_eq!(
+            descriptor.join_apply_key_column.column_id, join_apply_key_from_plan.column_id,
+            "descriptor join apply-key source must be produced by the plan"
+        );
         assert_eq!(descriptor.branches.len(), 2);
         assert!(descriptor.branches.iter().any(|branch| {
             branch.side == JoinRefreshBranchSide::LeftDeltaRightSnapshot
@@ -1865,6 +1890,35 @@ mod tests {
         descriptor
             .validate()
             .expect("recorded join refresh descriptor must validate");
+    }
+
+    #[test]
+    fn imv_pipeline_rejects_join_descriptor_recording_without_join_contract() {
+        let ctx = join_aggregate_mv_ctx_customized(|contract| {
+            contract.join = None;
+            contract.branch = Some(BranchUnionContract {
+                branch_id_column: BranchIdColumnContract {
+                    column_name: BRANCH_ID_COLUMN_NAME.to_string(),
+                    target_field_id: 4242,
+                },
+                branch_count: 2,
+                inner_apply_key_source: ApplyKeySource::GroupRowId,
+            });
+        });
+
+        let err = run_imv_rewrite(ImvRewriteInput {
+            plan: join_aggregate_plan(),
+            mv_ctx: ctx,
+            disabled_rules: Vec::new(),
+            deadline: None,
+            column_ref_factory: test_column_ref_factory(),
+        })
+        .expect_err("join delta descriptor recording must fail closed without join contract");
+
+        assert!(
+            err.contains("schema_contract.join"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

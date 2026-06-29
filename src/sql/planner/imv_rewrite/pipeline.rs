@@ -22,7 +22,8 @@ use crate::sql::planner::imv_rewrite::change_stream::{
 };
 use crate::sql::planner::imv_rewrite::delta_pushdown::PushDeltaThroughUnaryRule;
 use crate::sql::planner::imv_rewrite::join_delta::{
-    RewriteJoinDeltaRule, UnsupportedJoinKindCheckRule,
+    InjectJoinApplyKeyRule, RecordJoinRefreshDescriptorRule, RewriteJoinDeltaRule,
+    UnsupportedJoinKindCheckRule,
 };
 use crate::sql::planner::imv_rewrite::marker::{UnresolvedMarkerCheckRule, WrapRootInImvDeltaRule};
 use crate::sql::planner::imv_rewrite::partition_derivation::DerivePartitionSpecRule;
@@ -88,7 +89,11 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
         RewriteStage::new(
             "imv-apply-key",
             RewritePhase::SemanticRewrite,
-            vec![Box::new(InjectApplyKeyProjectRule::new()) as Box<dyn LogicalRewriteRule>],
+            vec![
+                Box::new(InjectApplyKeyProjectRule::new()) as Box<dyn LogicalRewriteRule>,
+                Box::new(InjectJoinApplyKeyRule) as Box<dyn LogicalRewriteRule>,
+                Box::new(RecordJoinRefreshDescriptorRule) as Box<dyn LogicalRewriteRule>,
+            ],
         ),
         RewriteStage::new(
             "imv-target-locator",
