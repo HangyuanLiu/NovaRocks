@@ -37,6 +37,8 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use super::build_artifact::{BuildView, JoinBuildArtifact};
+#[cfg(test)]
+use super::build_requirements;
 use super::build_requirements::{BuildComponentRequirements, required_build_components};
 use super::join_hash_map::match_flags::BuildMatchFlags;
 use super::join_hash_map::method::JoinHashMap;
@@ -1663,11 +1665,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
 
+    use super::build_requirements::required_build_components;
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::ExprNode;
-    use crate::exec::operators::hashjoin::build_requirements::required_build_components;
     use crate::exec::operators::hashjoin::join_hash_map::build_store::BuildStore;
 
     const LEFT_K_SLOT_ID: SlotId = SlotId::new(1);
@@ -1808,6 +1810,128 @@ mod tests {
             .set_build_artifact(artifact, 1, false)
             .expect_err("probe core must validate build artifact contract");
         assert!(err.contains("component contract mismatch"), "err={err}");
+    }
+
+    #[test]
+    fn residual_left_semi_rejects_missing_row_payload_at_load() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let left_v = arena.push_typed(ExprNode::SlotId(LEFT_V_SLOT_ID), DataType::Int32);
+        let right_w = arena.push_typed(ExprNode::SlotId(RIGHT_W_SLOT_ID), DataType::Int32);
+        let residual = arena.push_typed(ExprNode::Lt(left_v, right_w), DataType::Boolean);
+        let arena = Arc::new(arena);
+
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[10, 20],
+            &[100, 200],
+        );
+        let mut table =
+            JoinHashMap::new_chained(vec![DataType::Int32], vec![false]).expect("build table");
+        table
+            .add_build_rows(
+                &[build_chunk.column_by_slot_id(RIGHT_K_SLOT_ID).expect("key")],
+                build_chunk.len(),
+            )
+            .expect("add rows");
+        table.finalize().expect("finalize table");
+
+        let artifact = Arc::new(JoinBuildArtifact::new(
+            required_build_components(JoinType::LeftSemi, true, true, true),
+            None,
+            Some(table),
+            build_chunk.len(),
+            false,
+            None,
+            None,
+        ));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::LeftSemi,
+            vec![probe_key],
+            Some(residual),
+            true,
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        let err = core
+            .set_build_artifact(artifact, build_chunk.len(), false)
+            .expect_err("residual semi must require row payload");
+        assert!(err.contains("row payload required"));
+    }
+
+    #[test]
+    fn inner_cross_join_allows_missing_lookup_table() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let arena = Arc::new(ExprArena::default());
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[10, 20],
+            &[100, 200],
+        );
+        let artifact = Arc::new(JoinBuildArtifact::new(
+            required_build_components(JoinType::Inner, false, true, false),
+            Some(BuildStore::new(build_chunk.clone())),
+            None,
+            build_chunk.len(),
+            false,
+            None,
+            None,
+        ));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::Inner,
+            Vec::new(),
+            None,
+            true,
+            false,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        core.set_build_artifact(artifact, build_chunk.len(), false)
+            .expect("cross join build artifact should not require lookup table");
+
+        let probe_chunk = chunk_of_two(
+            Arc::clone(&left_schema),
+            &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID],
+            &[1, 2],
+            &[11, 22],
+        );
+        let out = core
+            .join_probe_chunks(vec![probe_chunk])
+            .expect("cross join probe")
+            .expect("cross join output");
+        assert_eq!(out.len(), 4);
     }
 
     #[test]
