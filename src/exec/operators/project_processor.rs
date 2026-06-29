@@ -568,9 +568,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::lower::type_lowering::scalar_type_desc;
-    use crate::thrift::types::TPrimitiveType;
-    use crate::types::logical::{LogicalType, logical_type_of_field};
+    use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> Arc<ChunkSchema> {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
@@ -592,18 +590,16 @@ mod tests {
             output_indices: None,
             output_chunk_schema: Arc::new(
                 ChunkSchema::try_new(vec![
-                    ChunkSlotSchema::new(
+                    ChunkSlotSchema::new_with_field(
                         SlotId::new(17),
-                        "s17",
-                        true,
-                        Some(scalar_type_desc(TPrimitiveType::INT)),
+                        Field::new("s17", DataType::Int32, true),
+                        None,
                         None,
                     ),
-                    ChunkSlotSchema::new(
+                    ChunkSlotSchema::new_with_field(
                         SlotId::new(19),
-                        "s19",
-                        true,
-                        Some(scalar_type_desc(TPrimitiveType::INT)),
+                        Field::new("s19", DataType::Int32, true),
+                        None,
                         None,
                     ),
                 ])
@@ -662,9 +658,12 @@ mod tests {
         let mut arena = ExprArena::default();
         let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Binary);
         let output_slot = SlotId::new(2);
-        let output_desc = scalar_type_desc(TPrimitiveType::HLL);
-        let output_slot_schema =
-            ChunkSlotSchema::new(output_slot, "out", false, Some(output_desc.clone()), None);
+        let output_slot_schema = ChunkSlotSchema::new_with_field(
+            output_slot,
+            field_with_logical_type(Field::new("out", DataType::Binary, false), LogicalType::Hll),
+            None,
+            None,
+        );
         let output_chunk_schema =
             Arc::new(ChunkSchema::try_new(vec![output_slot_schema.clone()]).expect("schema"));
         let mut op = ProjectProcessorOperator {
@@ -714,11 +713,10 @@ mod tests {
         let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
         let output_slot = SlotId::new(2);
         let output_chunk_schema = Arc::new(
-            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                 output_slot,
-                "out",
-                false,
-                Some(scalar_type_desc(TPrimitiveType::INT)),
+                Field::new("out", DataType::Int32, false),
+                None,
                 None,
             )])
             .expect("schema"),

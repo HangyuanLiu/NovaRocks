@@ -709,7 +709,9 @@ mod tests {
     fn int_expr(value: i64) -> exprs::TExpr {
         exprs::TExpr::new(vec![exprs::TExprNode {
             node_type: exprs::TExprNodeType::INT_LITERAL,
-            type_: crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT),
+            type_: crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+                types::TPrimitiveType::BIGINT,
+            ),
             opcode: None,
             num_children: 0,
             agg_expr: None,

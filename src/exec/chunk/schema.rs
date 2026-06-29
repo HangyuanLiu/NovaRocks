@@ -616,8 +616,8 @@ mod tests {
     use super::{ChunkSchema, ChunkSlotSchema};
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
-    use crate::lower::type_lowering::scalar_type_desc;
     use crate::thrift::types::TPrimitiveType;
+    use crate::types::arrow_thrift::thrift_type_desc_from_primitive;
     use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     #[test]
@@ -642,8 +642,9 @@ mod tests {
 
     #[test]
     fn chunk_schema_recovers_logical_metadata_and_unique_id() {
-        let desc = scalar_type_desc(TPrimitiveType::HLL);
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Binary, true)]));
+        let hll_field =
+            field_with_logical_type(Field::new("a", DataType::Binary, true), LogicalType::Hll);
+        let schema = Arc::new(Schema::new(vec![hll_field.clone()]));
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(BinaryArray::from(vec![Some(b"x".as_slice())]))],
@@ -652,11 +653,10 @@ mod tests {
         let chunk = Chunk::try_new_with_chunk_schema(
             batch,
             Arc::new(
-                ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+                ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                     SlotId::new(7),
-                    "a",
-                    true,
-                    Some(desc.clone()),
+                    hll_field,
+                    None,
                     Some(77),
                 )])
                 .expect("chunk schema"),
@@ -696,7 +696,7 @@ mod tests {
                 SlotId::new(9),
                 "payload",
                 true,
-                scalar_type_desc(primitive),
+                thrift_type_desc_from_primitive(primitive),
                 None,
             )
             .expect("slot from type desc");

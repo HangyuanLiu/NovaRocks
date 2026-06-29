@@ -1734,8 +1734,6 @@ mod tests {
     #[test]
     fn decode_chunks_for_sender_rejects_numeric_for_opaque_descriptor() {
         use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-        use crate::lower::type_lowering::scalar_type_desc;
-        use crate::thrift::types::TPrimitiveType;
 
         let key = ExchangeKey {
             finst_id_hi: 501,
@@ -1761,11 +1759,10 @@ mod tests {
         let wire_chunk = Chunk::new_with_chunk_schema(wire_batch, wire_chunk_schema);
 
         let expected_schema = Arc::new(
-            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                 SlotId::new(41),
-                "__opaque_state",
-                true,
-                Some(scalar_type_desc(TPrimitiveType::VARBINARY)),
+                Field::new("__opaque_state", DataType::Binary, true),
+                None,
                 Some(41),
             )])
             .expect("expected chunk schema"),

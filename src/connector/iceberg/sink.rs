@@ -3122,7 +3122,7 @@ mod tests {
 
     #[test]
     fn build_column_slot_map_uses_sink_output_column_names() {
-        let int_type = crate::lower::type_lowering::scalar_type_desc(
+        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::INT,
         );
         let id_expr =
@@ -3250,7 +3250,7 @@ mod tests {
     }
 
     fn test_int_column(name: &str) -> crate::thrift::descriptors::TColumn {
-        let int_type = crate::lower::type_lowering::scalar_type_desc(
+        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::INT,
         );
         crate::thrift::descriptors::TColumn::new(
@@ -3273,7 +3273,7 @@ mod tests {
     }
 
     fn test_varchar_column(name: &str) -> crate::thrift::descriptors::TColumn {
-        let varchar_type = crate::lower::type_lowering::scalar_type_desc(
+        let varchar_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::VARCHAR,
         );
         crate::thrift::descriptors::TColumn::new(
@@ -3488,7 +3488,7 @@ mod tests {
         metadata: &iceberg::spec::TableMetadata,
         current_snapshot_id: Option<i64>,
     ) -> crate::thrift::descriptors::TDescriptorTable {
-        let int_type = crate::lower::type_lowering::scalar_type_desc(
+        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::INT,
         );
         let partition_expr =
@@ -3589,13 +3589,13 @@ mod tests {
     fn test_delete_output_exprs(
         include_partition_source: bool,
     ) -> Vec<crate::thrift::exprs::TExpr> {
-        let varchar_type = crate::lower::type_lowering::scalar_type_desc(
+        let varchar_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::VARCHAR,
         );
-        let bigint_type = crate::lower::type_lowering::scalar_type_desc(
+        let bigint_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::BIGINT,
         );
-        let int_type = crate::lower::type_lowering::scalar_type_desc(
+        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::INT,
         );
         let mut exprs = vec![
@@ -3630,10 +3630,10 @@ mod tests {
         };
         let id_slot = SlotId::new(1);
         let category_slot = SlotId::new(2);
-        let int_type = crate::lower::type_lowering::scalar_type_desc(
+        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::INT,
         );
-        let varchar_type = crate::lower::type_lowering::scalar_type_desc(
+        let varchar_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::VARCHAR,
         );
         let output_exprs = vec![
@@ -3749,10 +3749,10 @@ mod tests {
             order: Vec::new(),
             index: HashMap::new(),
         };
-        let int_type = crate::lower::type_lowering::scalar_type_desc(
+        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::INT,
         );
-        let varchar_type = crate::lower::type_lowering::scalar_type_desc(
+        let varchar_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::VARCHAR,
         );
         let output_exprs = vec![
@@ -3803,7 +3803,7 @@ mod tests {
             order: Vec::new(),
             index: HashMap::new(),
         };
-        let int_type = crate::lower::type_lowering::scalar_type_desc(
+        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::INT,
         );
         let output_exprs = vec![crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
@@ -4077,7 +4077,7 @@ mod tests {
             order: Vec::new(),
             index: HashMap::new(),
         };
-        let int_type = crate::lower::type_lowering::scalar_type_desc(
+        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             crate::thrift::types::TPrimitiveType::INT,
         );
         let output_exprs = vec![crate::sql::codegen::expr_compiler::build_slot_ref_texpr(

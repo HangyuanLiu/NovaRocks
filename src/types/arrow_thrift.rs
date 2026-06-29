@@ -20,6 +20,17 @@ pub(crate) fn thrift_time_unit_for_arrow(unit: TimeUnit) -> Result<Option<i32>, 
     }
 }
 
+pub(crate) fn thrift_type_desc_from_primitive(
+    primitive: types::TPrimitiveType,
+) -> types::TTypeDesc {
+    types::TTypeDesc::new(vec![types::TTypeNode::new(
+        types::TTypeNodeType::SCALAR,
+        types::TScalarType::new(primitive, None, None, None, None),
+        None,
+        None,
+    )])
+}
+
 pub(crate) fn logical_type_to_primitive(logical_type: LogicalType) -> types::TPrimitiveType {
     match logical_type {
         LogicalType::Json => types::TPrimitiveType::JSON,

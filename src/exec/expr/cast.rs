@@ -3867,7 +3867,6 @@ mod tests {
     use crate::common::largeint;
     use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
-    use crate::lower::type_lowering::scalar_type_desc;
     use crate::thrift::types;
     use arrow::array::{
         ArrayRef, BinaryArray, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Int8Array,
@@ -3983,11 +3982,10 @@ mod tests {
         let chunk = Chunk::new_with_chunk_schema(
             batch,
             Arc::new(
-                ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+                ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                     SlotId::new(1),
-                    "src",
-                    true,
-                    Some(scalar_type_desc(types::TPrimitiveType::VARCHAR)),
+                    Field::new("src", DataType::Utf8, true),
+                    None,
                     None,
                 )])
                 .expect("chunk schema"),

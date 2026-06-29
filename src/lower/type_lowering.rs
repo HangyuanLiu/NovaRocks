@@ -19,7 +19,7 @@ use crate::thrift::types;
 pub(crate) use crate::types::arrow_thrift::{THRIFT_TIME_UNIT_NANOS, thrift_time_unit_for_arrow};
 use crate::types::arrow_thrift::{
     thrift_desc_to_arrow_field, thrift_desc_to_arrow_type, thrift_desc_to_primitive,
-    thrift_node_to_primitive,
+    thrift_node_to_primitive, thrift_type_desc_from_primitive,
 };
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
@@ -35,12 +35,7 @@ pub(crate) fn primitive_type_from_desc(desc: &types::TTypeDesc) -> Option<types:
 }
 
 pub(crate) fn scalar_type_desc(primitive: types::TPrimitiveType) -> types::TTypeDesc {
-    types::TTypeDesc::new(vec![types::TTypeNode::new(
-        types::TTypeNodeType::SCALAR,
-        types::TScalarType::new(primitive, None, None, None, None),
-        None,
-        None,
-    )])
+    thrift_type_desc_from_primitive(primitive)
 }
 
 /// Convert TPrimitiveType to Arrow DataType when precision/scale is not required.

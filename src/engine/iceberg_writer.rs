@@ -584,7 +584,7 @@ fn build_position_delete_output_descriptor(
         ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
         ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
     };
-    use crate::lower::type_lowering::scalar_type_desc;
+    use crate::types::arrow_thrift::thrift_type_desc_from_primitive;
 
     let schema = metadata.current_schema();
     let partition_source_fields = metadata
@@ -630,7 +630,7 @@ fn build_position_delete_output_descriptor(
                 crate::thrift::data_sinks::TIcebergPositionDeleteOutputField::new(
                     Some(0),
                     Some(ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string()),
-                    Some(scalar_type_desc(
+                    Some(thrift_type_desc_from_primitive(
                         crate::thrift::types::TPrimitiveType::VARCHAR,
                     )),
                     Some(ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID),
@@ -640,7 +640,7 @@ fn build_position_delete_output_descriptor(
                 crate::thrift::data_sinks::TIcebergPositionDeleteOutputField::new(
                     Some(1),
                     Some(ICEBERG_POSITION_DELETE_POS_COLUMN.to_string()),
-                    Some(scalar_type_desc(
+                    Some(thrift_type_desc_from_primitive(
                         crate::thrift::types::TPrimitiveType::BIGINT,
                     )),
                     Some(ICEBERG_POSITION_DELETE_POS_FIELD_ID),

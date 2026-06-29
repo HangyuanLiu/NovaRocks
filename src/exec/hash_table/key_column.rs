@@ -1166,8 +1166,7 @@ mod tests {
     use super::{KeyColumn, build_output_schema_from_kernels};
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-    use crate::lower::type_lowering::scalar_type_desc;
-    use crate::thrift::types::TPrimitiveType;
+    use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
 
     #[test]
@@ -1177,11 +1176,10 @@ mod tests {
             nulls: vec![0, 1],
         }];
         let output_chunk_schema = Arc::new(
-            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                 SlotId::new(13),
-                "col_5_13",
-                false,
-                Some(scalar_type_desc(TPrimitiveType::TINYINT)),
+                Field::new("col_5_13", DataType::Int8, false),
+                None,
                 None,
             )])
             .expect("chunk schema"),
