@@ -25,6 +25,7 @@ use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{
     LogicalJoinNode, LogicalPlanNode, LogicalProjectNode, LogicalScanNode, PlanNodeKind,
@@ -180,10 +181,36 @@ fn build_target_locator_join(
     let ext = ctx
         .extension::<ImvExtension>()
         .ok_or_else(|| "InjectTargetLocatorJoin requires ImvExtension".to_string())?;
-    let right_apply_key_id = ext.allocate_column_id();
-    let right_branch_id = input.branch.as_ref().map(|_| ext.allocate_column_id());
-    let right_file_id = ext.allocate_column_id();
-    let right_pos_id = ext.allocate_column_id();
+    let right_apply_key_id = allocate_imv_column(
+        ctx,
+        &input.target_apply_key_column,
+        input.left_apply_key.data_type.clone(),
+        input.left_apply_key.nullable,
+    )?;
+    let right_branch_id = input
+        .branch
+        .as_ref()
+        .map(|branch| {
+            allocate_imv_column(
+                ctx,
+                &branch.target_column,
+                branch.left.data_type.clone(),
+                branch.left.nullable,
+            )
+        })
+        .transpose()?;
+    let right_file_id = allocate_imv_column(
+        ctx,
+        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        DataType::Utf8,
+        false,
+    )?;
+    let right_pos_id = allocate_imv_column(
+        ctx,
+        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        DataType::Int64,
+        false,
+    )?;
 
     let right_scan = build_target_locator_scan(
         ext,

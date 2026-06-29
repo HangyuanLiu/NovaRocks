@@ -143,6 +143,12 @@ mod tests {
         Rc::new(RefCell::new(ColumnRefFactory::new()))
     }
 
+    fn test_column_ref_factory_reserved_until(next_id: u32) -> Rc<RefCell<ColumnRefFactory>> {
+        let factory = test_column_ref_factory();
+        factory.borrow_mut().reserve_until(next_id);
+        factory
+    }
+
     fn empty_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
             PlanNodeKind::Values(LogicalValuesNode {
@@ -1383,7 +1389,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
-            next_column_id: 100,
+            column_ref_factory: test_column_ref_factory_reserved_until(100),
         })
         .expect("projection/filter rewrite must carry target locator metadata");
 
@@ -1450,7 +1456,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
-            next_column_id: 100,
+            column_ref_factory: test_column_ref_factory_reserved_until(100),
         })
         .expect_err("preexisting _file/_pos names must not bypass target locator injection");
 
