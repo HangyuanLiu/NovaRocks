@@ -185,6 +185,19 @@ impl HashJoinProbeCore {
         Self::record_timer_ns(self.output_timer.as_ref(), start);
     }
 
+    fn build_view(&self) -> Result<&BuildView, String> {
+        self.build_view
+            .as_ref()
+            .ok_or_else(|| "hash join build artifact not loaded".to_string())
+    }
+
+    fn require_build_chunk(&self, context: &'static str) -> Result<Option<Arc<Chunk>>, String> {
+        if self.build_partition_row_count == 0 {
+            return Ok(None);
+        }
+        self.build_view()?.build_chunk(context).map(Some)
+    }
+
     pub(crate) fn join_type(&self) -> JoinType {
         self.join_type
     }
@@ -693,7 +706,7 @@ impl HashJoinProbeCore {
         &mut self,
         flags: &[bool],
     ) -> Result<Option<RecordBatch>, String> {
-        let Some(build_chunk) = self.build_chunk.as_ref() else {
+        let Some(build_chunk) = self.require_build_chunk("unmatched build output")? else {
             return Ok(None);
         };
         if flags.len() != build_chunk.len() {
@@ -711,14 +724,14 @@ impl HashJoinProbeCore {
         let output_start = std::time::Instant::now();
         let out = if self.probe_is_left {
             crate::exec::operators::hashjoin::join_hash_map::gather::gather_null_left_with_right(
-                build_chunk,
+                &build_chunk,
                 &indices,
                 &self.left_chunk_schema.arrow_schema_ref(),
                 &self.join_scope_schema,
             )?
         } else {
             crate::exec::operators::hashjoin::join_hash_map::gather::gather_left_with_null_right(
-                build_chunk,
+                &build_chunk,
                 &indices,
                 &self.right_chunk_schema.arrow_schema_ref(),
                 &self.join_scope_schema,
@@ -1197,10 +1210,11 @@ impl HashJoinProbeCore {
                 let residual_matched_rows_before = if let Some(pred) = self.residual_predicate
                     && !selection.is_empty()
                 {
-                    let build_chunk = self
-                        .build_chunk
-                        .clone()
-                        .ok_or_else(|| "semi/anti join build chunk missing".to_string())?;
+                    let Some(build_chunk) =
+                        self.require_build_chunk("semi/anti residual evaluation")?
+                    else {
+                        return Ok(None);
+                    };
                     self.residual_rows_checked = self
                         .residual_rows_checked
                         .saturating_add(stats.lookup_hit_rows);
@@ -1275,6 +1289,10 @@ impl HashJoinProbeCore {
         table: &JoinHashMap,
         is_semi: bool,
     ) -> Result<Option<Chunk>, String> {
+        if let Some(requirements) = self.build_requirements {
+            debug_assert!(!requirements.requires_row_payload());
+        }
+
         let mut output_batches = Vec::new();
         for probe in probe_chunks {
             let search_start = std::time::Instant::now();
@@ -1373,11 +1391,6 @@ impl HashJoinProbeCore {
             .as_ref()
             .map(|rows| rows.as_slice())
             .unwrap_or(&[]);
-        let build_chunk_for_residual = if has_residual {
-            self.build_chunk.clone()
-        } else {
-            None
-        };
 
         let mut output_batches = Vec::new();
         for probe in probe_chunks {
@@ -1424,12 +1437,14 @@ impl HashJoinProbeCore {
                         .residual_group_rows_total
                         .saturating_add(equal_selection.len() as u64);
                     if !equal_selection.is_empty() {
-                        let build_chunk = build_chunk_for_residual.as_ref().ok_or_else(|| {
-                            "null-aware anti join build chunk missing".to_string()
-                        })?;
+                        let Some(build_chunk) =
+                            self.require_build_chunk("null-aware anti residual evaluation")?
+                        else {
+                            return Ok(None);
+                        };
                         self.compact_null_aware_selection(
                             &probe,
-                            build_chunk,
+                            &build_chunk,
                             &mut equal_selection,
                             pred,
                             &mut matched_equal,
@@ -1440,13 +1455,15 @@ impl HashJoinProbeCore {
                 }
 
                 if !flat_build_null_key_rows.is_empty() {
-                    let build_chunk = build_chunk_for_residual
-                        .as_ref()
-                        .ok_or_else(|| "null-aware anti join build chunk missing".to_string())?;
+                    let Some(build_chunk) =
+                        self.require_build_chunk("null-aware anti residual evaluation")?
+                    else {
+                        return Ok(None);
+                    };
                     let probe_rows = (0..probe.len()).map(|row| row as u32).collect::<Vec<_>>();
                     self.compact_cross_selection_in_chunks(
                         &probe,
-                        build_chunk,
+                        &build_chunk,
                         &probe_rows,
                         flat_build_null_key_rows,
                         pred,
@@ -1456,14 +1473,13 @@ impl HashJoinProbeCore {
                     )?;
                 }
 
-                let has_local_build_rows = build_chunk_for_residual
-                    .as_ref()
-                    .map(|chunk| !chunk.is_empty())
-                    .unwrap_or(self.build_partition_row_count > 0);
+                let has_local_build_rows = self.build_partition_row_count > 0;
                 if has_local_build_rows && probe_null_rows.iter().any(|is_null| *is_null) {
-                    let build_chunk = build_chunk_for_residual
-                        .as_ref()
-                        .ok_or_else(|| "null-aware anti join build chunk missing".to_string())?;
+                    let Some(build_chunk) =
+                        self.require_build_chunk("null-aware anti residual evaluation")?
+                    else {
+                        return Ok(None);
+                    };
                     let all_build_rows = (0..build_chunk.len())
                         .map(|row| {
                             u32::try_from(row)
@@ -1477,7 +1493,7 @@ impl HashJoinProbeCore {
                         .collect::<Vec<_>>();
                     self.compact_cross_selection_in_chunks(
                         &probe,
-                        build_chunk,
+                        &build_chunk,
                         &probe_rows,
                         &all_build_rows,
                         pred,
