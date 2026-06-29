@@ -34,9 +34,7 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::lower::type_lowering::scalar_type_desc;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::thrift::types;
 use arrow::array::{Int64Array, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema};
 
@@ -187,13 +185,7 @@ impl ProcessorOperator for RepeatProcessorOperator {
             }
             let field = Field::new(format!("repeat_grouping_{i}"), DataType::Int64, true);
             fields.push(Arc::new(field.clone()));
-            slot_schemas.push(ChunkSlotSchema::new(
-                *slot_id,
-                field.name().clone(),
-                true,
-                Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
-                None,
-            ));
+            slot_schemas.push(ChunkSlotSchema::new_with_field(*slot_id, field, None, None));
         }
         self.output_schema = Some(Arc::new(Schema::new(fields)));
         self.output_chunk_schema = Some(Arc::new(crate::exec::chunk::ChunkSchema::try_new(
