@@ -33,8 +33,9 @@ use hashbrown::HashSet;
 use crate::common::ids::SlotId;
 
 use super::{
-    RuntimeBitsetFilter, RuntimeBloomFilter, RuntimeEmptyFilter, RuntimeInFilter,
-    RuntimeInFilterValues, RuntimeMembershipFilter, RuntimeMinMaxFilter, SimdBlockFilter,
+    RuntimeBitsetFilter, RuntimeBloomFilter, RuntimeDecimalWidth, RuntimeEmptyFilter,
+    RuntimeFilterType, RuntimeInFilter, RuntimeInFilterValues, RuntimeMembershipFilter,
+    RuntimeMinMaxFilter, SimdBlockFilter,
 };
 
 const RF_VERSION_V2: u8 = 0x3;
@@ -53,6 +54,102 @@ pub(crate) enum StarrocksRuntimeFilterType {
     Bloom,
     Bitset,
     In,
+}
+
+fn runtime_type_from_starrocks_primitive(
+    primitive: crate::thrift::types::TPrimitiveType,
+    data_type: Option<&arrow::datatypes::DataType>,
+) -> Result<RuntimeFilterType, String> {
+    use crate::thrift::types::TPrimitiveType;
+    let runtime_type = if primitive == TPrimitiveType::BOOLEAN {
+        RuntimeFilterType::Boolean
+    } else if primitive == TPrimitiveType::TINYINT {
+        RuntimeFilterType::Int8
+    } else if primitive == TPrimitiveType::SMALLINT {
+        RuntimeFilterType::Int16
+    } else if primitive == TPrimitiveType::INT {
+        RuntimeFilterType::Int32
+    } else if primitive == TPrimitiveType::BIGINT {
+        RuntimeFilterType::Int64
+    } else if primitive == TPrimitiveType::LARGEINT {
+        RuntimeFilterType::LargeInt
+    } else if primitive == TPrimitiveType::FLOAT {
+        RuntimeFilterType::Float32
+    } else if primitive == TPrimitiveType::DOUBLE {
+        RuntimeFilterType::Float64
+    } else if primitive == TPrimitiveType::DATE {
+        RuntimeFilterType::Date32
+    } else if primitive == TPrimitiveType::DATETIME {
+        RuntimeFilterType::TimestampMicros
+    } else if primitive == TPrimitiveType::TIME {
+        RuntimeFilterType::TimeMicros
+    } else if primitive == TPrimitiveType::VARCHAR || primitive == TPrimitiveType::CHAR {
+        RuntimeFilterType::Utf8
+    } else if primitive == TPrimitiveType::DECIMAL32 {
+        decimal_runtime_type(RuntimeDecimalWidth::Decimal32, data_type)?
+    } else if primitive == TPrimitiveType::DECIMAL64 {
+        decimal_runtime_type(RuntimeDecimalWidth::Decimal64, data_type)?
+    } else if primitive == TPrimitiveType::DECIMAL128
+        || primitive == TPrimitiveType::DECIMAL
+        || primitive == TPrimitiveType::DECIMALV2
+    {
+        decimal_runtime_type(RuntimeDecimalWidth::Decimal128, data_type)?
+    } else {
+        return Err(format!(
+            "unsupported runtime filter primitive type: {:?}",
+            primitive
+        ));
+    };
+    Ok(runtime_type)
+}
+
+fn decimal_runtime_type(
+    width: RuntimeDecimalWidth,
+    data_type: Option<&arrow::datatypes::DataType>,
+) -> Result<RuntimeFilterType, String> {
+    let (precision, scale) = match data_type {
+        Some(arrow::datatypes::DataType::Decimal128(precision, scale)) => {
+            (Some(*precision), Some(*scale))
+        }
+        _ => (None, None),
+    };
+    Ok(RuntimeFilterType::Decimal {
+        width,
+        precision,
+        scale,
+    })
+}
+
+fn starrocks_primitive_from_runtime_type(
+    runtime_type: RuntimeFilterType,
+) -> crate::thrift::types::TPrimitiveType {
+    use crate::thrift::types::TPrimitiveType;
+    match runtime_type {
+        RuntimeFilterType::Boolean => TPrimitiveType::BOOLEAN,
+        RuntimeFilterType::Int8 => TPrimitiveType::TINYINT,
+        RuntimeFilterType::Int16 => TPrimitiveType::SMALLINT,
+        RuntimeFilterType::Int32 => TPrimitiveType::INT,
+        RuntimeFilterType::Int64 => TPrimitiveType::BIGINT,
+        RuntimeFilterType::LargeInt => TPrimitiveType::LARGEINT,
+        RuntimeFilterType::Float32 => TPrimitiveType::FLOAT,
+        RuntimeFilterType::Float64 => TPrimitiveType::DOUBLE,
+        RuntimeFilterType::Date32 => TPrimitiveType::DATE,
+        RuntimeFilterType::TimestampMicros => TPrimitiveType::DATETIME,
+        RuntimeFilterType::TimeMicros => TPrimitiveType::TIME,
+        RuntimeFilterType::Utf8 => TPrimitiveType::VARCHAR,
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal32,
+            ..
+        } => TPrimitiveType::DECIMAL32,
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal64,
+            ..
+        } => TPrimitiveType::DECIMAL64,
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal128,
+            ..
+        } => TPrimitiveType::DECIMAL128,
+    }
 }
 
 /// Read runtime filter type tag from a StarRocks wire payload without full decoding.
@@ -447,8 +544,9 @@ pub(crate) fn decode_starrocks_membership_filter(
     if rf_type == RF_TYPE_IN_FILTER {
         return Err("runtime filter type is IN_FILTER".to_string());
     }
-    let ltype = read_i32_le(data, &mut offset)?;
-    let ltype = crate::thrift::types::TPrimitiveType(ltype);
+    let primitive = read_i32_le(data, &mut offset)?;
+    let primitive = crate::thrift::types::TPrimitiveType(primitive);
+    let ltype = runtime_type_from_starrocks_primitive(primitive, None)?;
 
     match rf_type {
         RF_TYPE_BLOOM_FILTER => {
@@ -518,7 +616,8 @@ pub(crate) fn encode_starrocks_bloom_filter(
     let mut buf = Vec::new();
     buf.push(RF_VERSION_V3);
     buf.push(RF_TYPE_BLOOM_FILTER);
-    buf.extend_from_slice(&filter.ltype().0.to_le_bytes());
+    let primitive = starrocks_primitive_from_runtime_type(filter.ltype());
+    buf.extend_from_slice(&primitive.0.to_le_bytes());
     buf.push(if filter.has_null() { 1 } else { 0 });
     buf.extend_from_slice(&filter.size().to_le_bytes());
     buf.extend_from_slice(&(0u64).to_le_bytes()); // num_partitions
@@ -540,7 +639,8 @@ pub(crate) fn encode_starrocks_bitset_filter(
     let mut buf = Vec::new();
     buf.push(RF_VERSION_V3);
     buf.push(RF_TYPE_BITSET_FILTER);
-    buf.extend_from_slice(&filter.ltype().0.to_le_bytes());
+    let primitive = starrocks_primitive_from_runtime_type(filter.ltype());
+    buf.extend_from_slice(&primitive.0.to_le_bytes());
     buf.push(if filter.has_null() { 1 } else { 0 });
     buf.extend_from_slice(&filter.size().to_le_bytes());
     buf.push(filter.join_mode() as u8);
@@ -564,7 +664,8 @@ pub(crate) fn encode_starrocks_empty_filter(
     let mut buf = Vec::new();
     buf.push(RF_VERSION_V3);
     buf.push(RF_TYPE_EMPTY_FILTER);
-    buf.extend_from_slice(&filter.ltype().0.to_le_bytes());
+    let primitive = starrocks_primitive_from_runtime_type(filter.ltype());
+    buf.extend_from_slice(&primitive.0.to_le_bytes());
     buf.push(if filter.has_null() { 1 } else { 0 });
     buf.extend_from_slice(&filter.size().to_le_bytes());
     buf.push(filter.join_mode() as u8);
@@ -675,13 +776,12 @@ fn read_varchar(data: &[u8], offset: &mut usize) -> Result<String, String> {
 }
 
 fn write_min_max_i64(
-    ltype: &crate::thrift::types::TPrimitiveType,
+    ltype: &RuntimeFilterType,
     min_value: i64,
     max_value: i64,
     buf: &mut Vec<u8>,
 ) -> Result<(), String> {
-    use crate::thrift::types;
-    if *ltype == types::TPrimitiveType::BOOLEAN {
+    if *ltype == RuntimeFilterType::Boolean {
         if !(0..=1).contains(&min_value) || !(0..=1).contains(&max_value) {
             return Err("runtime bitset filter boolean min/max out of range".to_string());
         }
@@ -689,7 +789,7 @@ fn write_min_max_i64(
         buf.push(max_value as u8);
         return Ok(());
     }
-    if *ltype == types::TPrimitiveType::TINYINT {
+    if *ltype == RuntimeFilterType::Int8 {
         let min = i8::try_from(min_value)
             .map_err(|_| "runtime bitset filter tinyint min out of range".to_string())?;
         let max = i8::try_from(max_value)
@@ -698,7 +798,7 @@ fn write_min_max_i64(
         buf.push(max as u8);
         return Ok(());
     }
-    if *ltype == types::TPrimitiveType::SMALLINT {
+    if *ltype == RuntimeFilterType::Int16 {
         let min = i16::try_from(min_value)
             .map_err(|_| "runtime bitset filter smallint min out of range".to_string())?;
         let max = i16::try_from(max_value)
@@ -707,7 +807,7 @@ fn write_min_max_i64(
         buf.extend_from_slice(&max.to_le_bytes());
         return Ok(());
     }
-    if *ltype == types::TPrimitiveType::INT {
+    if *ltype == RuntimeFilterType::Int32 {
         let min = i32::try_from(min_value)
             .map_err(|_| "runtime bitset filter int min out of range".to_string())?;
         let max = i32::try_from(max_value)
@@ -716,7 +816,13 @@ fn write_min_max_i64(
         buf.extend_from_slice(&max.to_le_bytes());
         return Ok(());
     }
-    if *ltype == types::TPrimitiveType::DECIMAL32 {
+    if matches!(
+        *ltype,
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal32,
+            ..
+        }
+    ) {
         let min = i32::try_from(min_value)
             .map_err(|_| "runtime bitset filter decimal32 min out of range".to_string())?;
         let max = i32::try_from(max_value)
@@ -725,26 +831,23 @@ fn write_min_max_i64(
         buf.extend_from_slice(&max.to_le_bytes());
         return Ok(());
     }
-    if *ltype == types::TPrimitiveType::BIGINT {
+    if *ltype == RuntimeFilterType::Int64 {
         buf.extend_from_slice(&min_value.to_le_bytes());
         buf.extend_from_slice(&max_value.to_le_bytes());
         return Ok(());
     }
-    if *ltype == types::TPrimitiveType::DECIMAL64 {
+    if matches!(
+        *ltype,
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal64,
+            ..
+        }
+    ) {
         buf.extend_from_slice(&min_value.to_le_bytes());
         buf.extend_from_slice(&max_value.to_le_bytes());
         return Ok(());
     }
-    if *ltype == types::TPrimitiveType::LARGEINT {
-        return Err(unsupported_runtime_bitset_filter_type(ltype));
-    }
-    if *ltype == types::TPrimitiveType::DECIMAL128
-        || *ltype == types::TPrimitiveType::DECIMAL
-        || *ltype == types::TPrimitiveType::DECIMALV2
-    {
-        return Err(unsupported_runtime_bitset_filter_type(ltype));
-    }
-    if *ltype == types::TPrimitiveType::DATE {
+    if *ltype == RuntimeFilterType::Date32 {
         let min = i32::try_from(min_value)
             .map_err(|_| "runtime bitset filter date min out of range".to_string())?;
         let max = i32::try_from(max_value)
@@ -753,100 +856,90 @@ fn write_min_max_i64(
         buf.extend_from_slice(&max.to_le_bytes());
         return Ok(());
     }
-    if *ltype == types::TPrimitiveType::DATETIME || *ltype == types::TPrimitiveType::TIME {
-        buf.extend_from_slice(&min_value.to_le_bytes());
-        buf.extend_from_slice(&max_value.to_le_bytes());
-        return Ok(());
-    }
-    Err(format!(
-        "unsupported runtime bitset filter primitive type: {:?}",
-        ltype
-    ))
+    Err(unsupported_runtime_bitset_filter_type(ltype))
 }
 
 fn read_min_max_i64(
-    ltype: &crate::thrift::types::TPrimitiveType,
+    ltype: &RuntimeFilterType,
     data: &[u8],
     offset: &mut usize,
 ) -> Result<(i64, i64), String> {
-    use crate::thrift::types;
-    if *ltype == types::TPrimitiveType::BOOLEAN {
+    if *ltype == RuntimeFilterType::Boolean {
         let min = read_u8(data, offset)? as i64;
         let max = read_u8(data, offset)? as i64;
         return Ok((min, max));
     }
-    if *ltype == types::TPrimitiveType::TINYINT {
+    if *ltype == RuntimeFilterType::Int8 {
         let min = read_i8(data, offset)? as i64;
         let max = read_i8(data, offset)? as i64;
         return Ok((min, max));
     }
-    if *ltype == types::TPrimitiveType::SMALLINT {
+    if *ltype == RuntimeFilterType::Int16 {
         let min = read_i16_le(data, offset)? as i64;
         let max = read_i16_le(data, offset)? as i64;
         return Ok((min, max));
     }
-    if *ltype == types::TPrimitiveType::INT {
+    if *ltype == RuntimeFilterType::Int32 {
         let min = read_i32_le(data, offset)? as i64;
         let max = read_i32_le(data, offset)? as i64;
         return Ok((min, max));
     }
-    if *ltype == types::TPrimitiveType::DECIMAL32 {
+    if matches!(
+        *ltype,
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal32,
+            ..
+        }
+    ) {
         let min = read_i32_le(data, offset)? as i64;
         let max = read_i32_le(data, offset)? as i64;
         return Ok((min, max));
     }
-    if *ltype == types::TPrimitiveType::BIGINT {
+    if *ltype == RuntimeFilterType::Int64 {
         let min = read_i64_le(data, offset)?;
         let max = read_i64_le(data, offset)?;
         return Ok((min, max));
     }
-    if *ltype == types::TPrimitiveType::DECIMAL64 {
+    if matches!(
+        *ltype,
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal64,
+            ..
+        }
+    ) {
         let min = read_i64_le(data, offset)?;
         let max = read_i64_le(data, offset)?;
         return Ok((min, max));
     }
-    if *ltype == types::TPrimitiveType::LARGEINT {
-        return Err(unsupported_runtime_bitset_filter_type(ltype));
-    }
-    if *ltype == types::TPrimitiveType::DECIMAL128
-        || *ltype == types::TPrimitiveType::DECIMAL
-        || *ltype == types::TPrimitiveType::DECIMALV2
-    {
-        return Err(unsupported_runtime_bitset_filter_type(ltype));
-    }
-    if *ltype == types::TPrimitiveType::DATE {
+    if *ltype == RuntimeFilterType::Date32 {
         let min = read_i32_le(data, offset)? as i64;
         let max = read_i32_le(data, offset)? as i64;
         return Ok((min, max));
     }
-    if *ltype == types::TPrimitiveType::DATETIME || *ltype == types::TPrimitiveType::TIME {
-        let min = read_i64_le(data, offset)?;
-        let max = read_i64_le(data, offset)?;
-        return Ok((min, max));
-    }
-    Err(format!(
-        "unsupported runtime bitset filter primitive type: {:?}",
-        ltype
-    ))
+    Err(unsupported_runtime_bitset_filter_type(ltype))
 }
 
-fn unsupported_runtime_bitset_filter_type(ltype: &crate::thrift::types::TPrimitiveType) -> String {
-    use crate::thrift::types;
-    let name = if *ltype == types::TPrimitiveType::LARGEINT {
-        "LARGEINT"
-    } else if *ltype == types::TPrimitiveType::DECIMAL128 {
-        "DECIMAL128"
-    } else if *ltype == types::TPrimitiveType::DECIMAL {
-        "DECIMAL"
-    } else if *ltype == types::TPrimitiveType::DECIMALV2 {
-        "DECIMALV2"
-    } else {
-        return format!(
-            "unsupported runtime bitset filter primitive type: {:?}",
-            ltype
-        );
+fn unsupported_runtime_bitset_filter_type(ltype: &RuntimeFilterType) -> String {
+    let name = match *ltype {
+        RuntimeFilterType::LargeInt => Some("LARGEINT"),
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal128,
+            ..
+        } => Some("DECIMAL128"),
+        RuntimeFilterType::TimestampMicros => Some("DATETIME"),
+        RuntimeFilterType::TimeMicros => Some("TIME"),
+        RuntimeFilterType::Utf8 => Some("VARCHAR"),
+        RuntimeFilterType::Float32 => Some("FLOAT"),
+        RuntimeFilterType::Float64 => Some("DOUBLE"),
+        _ => None,
     };
-    format!("runtime bitset filter does not support {name}")
+    if let Some(name) = name {
+        return format!("runtime bitset filter does not support {name}");
+    }
+    format!(
+        "unsupported runtime bitset filter primitive type: {:?}",
+        ltype
+    )
 }
 
 #[cfg(test)]
@@ -861,8 +954,8 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::runtime_filter::min_max::MinMaxValue;
     use crate::exec::runtime_filter::{
-        RuntimeBitsetFilter, RuntimeInFilter, RuntimeInFilterValues, RuntimeMembershipFilter,
-        RuntimeMinMaxFilter,
+        RuntimeBitsetFilter, RuntimeDecimalWidth, RuntimeFilterType, RuntimeInFilter,
+        RuntimeInFilterValues, RuntimeMembershipFilter, RuntimeMinMaxFilter,
     };
 
     #[test]
@@ -1027,7 +1120,11 @@ mod tests {
 
     #[test]
     fn decimal64_bitset_filter_round_trips() {
-        let ltype = crate::thrift::types::TPrimitiveType::DECIMAL64;
+        let ltype = RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal64,
+            precision: Some(18),
+            scale: Some(2),
+        };
         let min_value = -123_456_789i64;
         let max_value = 987_654_321i64;
         let bitset = vec![0b1010_0101, 0b0101_1010, 0xff];
@@ -1056,7 +1153,14 @@ mod tests {
 
         match decoded {
             RuntimeMembershipFilter::Bitset(decoded) => {
-                assert_eq!(decoded.ltype(), ltype);
+                assert_eq!(
+                    decoded.ltype(),
+                    RuntimeFilterType::Decimal {
+                        width: RuntimeDecimalWidth::Decimal64,
+                        precision: None,
+                        scale: None,
+                    }
+                );
                 assert!(decoded.has_null());
                 assert_eq!(decoded.size(), 123);
                 assert_eq!(decoded.join_mode(), 7);

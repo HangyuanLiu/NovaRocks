@@ -20,6 +20,7 @@ use crate::exec::node::aggregate::{
     TopNRuntimeFilterSpec,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
+use crate::exec::runtime_filter::RuntimeFilterType;
 
 use crate::lower::expr::{lower_expr_node, lower_t_expr};
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
@@ -145,17 +146,27 @@ pub(crate) fn lower_aggregate_node(
                 .ok_or_else(|| format!("topn runtime filter {} missing expr_order", filter_id))?
                 as usize;
 
-            // Extract the build primitive type from build_expr.
-            let build_type = desc
+            // Convert the build expression type at the lowering boundary.
+            let build_type_desc = desc
                 .build_expr
                 .as_ref()
                 .and_then(|expr| expr.nodes.first())
-                .and_then(|node| node.type_.types.as_ref())
-                .and_then(|type_nodes| type_nodes.first())
-                .and_then(|tn| tn.scalar_type.as_ref())
-                .map(|st| st.type_)
+                .map(|node| &node.type_)
                 .ok_or_else(|| {
                     format!("topn runtime filter {} missing build_expr type", filter_id)
+                })?;
+            let build_data_type = arrow_type_from_desc(build_type_desc).ok_or_else(|| {
+                format!(
+                    "topn runtime filter {} unsupported build_expr type descriptor: {:?}",
+                    filter_id, build_type_desc
+                )
+            })?;
+            let build_type =
+                RuntimeFilterType::from_arrow_data_type(&build_data_type).map_err(|e| {
+                    format!(
+                        "topn runtime filter {} unsupported build_expr type: data_type={:?} err={}",
+                        filter_id, build_data_type, e
+                    )
                 })?;
 
             // Resolve probe column name from plan_node_id_to_target_expr.

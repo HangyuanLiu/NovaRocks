@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
 
+use crate as nr;
 use crate::common::ids::SlotId;
 use crate::exec::runtime_filter::{
     RuntimeInFilter, RuntimeMembershipFilter, StarrocksRuntimeFilterType,
@@ -31,11 +32,11 @@ use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::service::exchange_sender;
 use crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams;
-use crate::thrift::runtime_filter;
+use nr::thrift::runtime_filter::TRuntimeFilterParams;
 
 pub(crate) struct RuntimeFilterWorker {
     query_id: QueryId,
-    params: runtime_filter::TRuntimeFilterParams,
+    params: TRuntimeFilterParams,
     hub: Arc<RuntimeFilterHub>,
     merge_states: Mutex<HashMap<i32, MergeState>>,
 }
@@ -59,7 +60,7 @@ impl MergeState {
 impl RuntimeFilterWorker {
     pub(crate) fn new(
         query_id: QueryId,
-        params: runtime_filter::TRuntimeFilterParams,
+        params: TRuntimeFilterParams,
         hub: Arc<RuntimeFilterHub>,
     ) -> Self {
         Self {

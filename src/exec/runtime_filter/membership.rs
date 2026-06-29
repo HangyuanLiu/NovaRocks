@@ -34,6 +34,7 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 
+use super::RuntimeFilterType;
 use super::bitset::RuntimeBitsetFilter;
 use super::bloom::RuntimeBloomFilter;
 use super::min_max::RuntimeMinMaxFilter;
@@ -51,7 +52,7 @@ pub(crate) enum RuntimeMembershipFilter {
 pub(crate) struct RuntimeEmptyFilter {
     filter_id: i32,
     slot_id: SlotId,
-    ltype: crate::thrift::types::TPrimitiveType,
+    ltype: RuntimeFilterType,
     has_null: bool,
     join_mode: i8,
     size: u64,
@@ -62,7 +63,7 @@ impl RuntimeEmptyFilter {
     pub(crate) fn new(
         filter_id: i32,
         slot_id: SlotId,
-        ltype: crate::thrift::types::TPrimitiveType,
+        ltype: RuntimeFilterType,
         has_null: bool,
         join_mode: i8,
         size: u64,
@@ -87,7 +88,7 @@ impl RuntimeEmptyFilter {
         self.slot_id
     }
 
-    pub(crate) fn ltype(&self) -> crate::thrift::types::TPrimitiveType {
+    pub(crate) fn ltype(&self) -> RuntimeFilterType {
         self.ltype
     }
 
@@ -149,7 +150,7 @@ impl RuntimeMembershipFilter {
         }
     }
 
-    pub(crate) fn ltype(&self) -> crate::thrift::types::TPrimitiveType {
+    pub(crate) fn ltype(&self) -> RuntimeFilterType {
         match self {
             RuntimeMembershipFilter::Bloom(filter) => filter.ltype(),
             RuntimeMembershipFilter::Bitset(filter) => filter.ltype(),

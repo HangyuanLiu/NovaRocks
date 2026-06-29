@@ -36,6 +36,7 @@ use super::build_requirements::{NullKeyRequirement, required_build_components};
 use super::build_state::JoinBuildSinkState;
 use super::join_hash_map::build_store::BuildStoreBuilder;
 use super::join_hash_map::method::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions};
+use crate as nr;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::{JoinDistributionMode, JoinRuntimeFilterSpec, JoinType};
@@ -45,9 +46,9 @@ use crate::exec::runtime_filter::{
     LocalRuntimeFilterSet, LocalRuntimeInFilterSet, MAX_RUNTIME_IN_FILTER_CONDITIONS,
     PartialRuntimeInFilterMerger, RUNTIME_FILTER_JOIN_MODE_BROADCAST,
     RUNTIME_FILTER_JOIN_MODE_PARTITIONED, RuntimeBloomFilter, RuntimeEmptyFilter,
-    RuntimeFilterMergeDropCounters, RuntimeInFilter, RuntimeMembershipBuildOptions,
-    RuntimeMembershipFilter, RuntimeMembershipFilterBuildParam, RuntimeMinMaxFilter,
-    arrow_type_to_proto_type_desc, data_type_to_tprimitive, encode_starrocks_bitset_filter,
+    RuntimeFilterMergeDropCounters, RuntimeFilterType, RuntimeInFilter,
+    RuntimeMembershipBuildOptions, RuntimeMembershipFilter, RuntimeMembershipFilterBuildParam,
+    RuntimeMinMaxFilter, arrow_type_to_proto_type_desc, encode_starrocks_bitset_filter,
     encode_starrocks_bloom_filter, encode_starrocks_empty_filter,
     maybe_build_runtime_bitset_filter,
 };
@@ -57,7 +58,7 @@ use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::exchange_sender;
-use crate::thrift::metrics;
+use nr::thrift::metrics;
 use std::collections::{HashMap, HashSet};
 
 /// Factory for hash-join build sinks that construct build-side hash structures.
@@ -985,32 +986,22 @@ impl HashJoinBuildSinkOperator {
         };
         let mut params = Vec::with_capacity(self.runtime_filter_specs.len());
         for spec in &self.runtime_filter_specs {
-            let expr = self.build_keys.get(spec.expr_order).copied();
-            if expr.is_none() {
-                warn!(
-                    "runtime membership filter missing build key: filter_id={}",
-                    spec.filter_id
-                );
-            }
-            let ltype = match expr.and_then(|id| self.arena.data_type(id)) {
-                Some(data_type) => match data_type_to_tprimitive(data_type) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!(
-                            "runtime membership filter unsupported type: filter_id={} err={}",
-                            spec.filter_id, e
-                        );
-                        crate::thrift::types::TPrimitiveType::INT
-                    }
-                },
-                None => {
-                    warn!(
-                        "runtime membership filter missing build key type: filter_id={}",
-                        spec.filter_id
-                    );
-                    crate::thrift::types::TPrimitiveType::INT
-                }
+            let Some(data_type) = self
+                .build_keys
+                .get(spec.expr_order)
+                .and_then(|id| self.arena.data_type(*id))
+            else {
+                return Err(format!(
+                    "runtime membership filter missing build key type: filter_id={} expr_order={}",
+                    spec.filter_id, spec.expr_order
+                ));
             };
+            let ltype = RuntimeFilterType::from_arrow_data_type(data_type).map_err(|e| {
+                format!(
+                    "runtime membership filter unsupported build key type: filter_id={} expr_order={} err={}",
+                    spec.filter_id, spec.expr_order, e
+                )
+            })?;
             params.push(RuntimeMembershipFilterBuildParam::new(
                 spec.filter_id,
                 spec.probe_slot_id,
@@ -1177,14 +1168,22 @@ impl HashJoinBuildSinkOperator {
         };
         let mut filters = Vec::new();
         for spec in specs {
-            let expr = self.build_keys.get(spec.expr_order).copied();
-            let ltype = match expr.and_then(|id| self.arena.data_type(id)) {
-                Some(data_type) => match data_type_to_tprimitive(data_type) {
-                    Ok(t) => t,
-                    Err(_) => crate::thrift::types::TPrimitiveType::INT,
-                },
-                None => crate::thrift::types::TPrimitiveType::INT,
+            let Some(data_type) = self
+                .build_keys
+                .get(spec.expr_order)
+                .and_then(|id| self.arena.data_type(*id))
+            else {
+                return Err(format!(
+                    "runtime membership filter missing build key type: filter_id={} expr_order={}",
+                    spec.filter_id, spec.expr_order
+                ));
             };
+            let ltype = RuntimeFilterType::from_arrow_data_type(data_type).map_err(|e| {
+                format!(
+                    "runtime membership filter unsupported build key type: filter_id={} expr_order={} err={}",
+                    spec.filter_id, spec.expr_order, e
+                )
+            })?;
             let min_max = if self.build_row_count == 0 {
                 RuntimeMinMaxFilter::empty_range(ltype)?
             } else {
