@@ -21,6 +21,7 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check};
 use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_desc};
 use crate::thrift::types;
+use crate::types::logical::{LogicalType, logical_type_of_field};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -392,17 +393,12 @@ pub struct ChunkSchema {
 
 pub type ChunkSchemaRef = Arc<ChunkSchema>;
 
-/// Metadata key set by the analyzer's `sql_type_to_arrow` for nested children
-/// whose StarRocks logical type would otherwise be lost in the Arrow type
-/// system (today: `JSON` collapsed to `Utf8`). Mirrored in
-/// `src/sql/analyzer/helpers.rs` and `src/sql/codegen/type_infer.rs`.
-const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
-
 fn logical_type_desc_from_field(field: &Field) -> Option<types::TTypeDesc> {
-    let logical = field.metadata().get(NR_LOGICAL_TYPE_KEY)?;
-    let primitive = match logical.as_str() {
-        "json" => types::TPrimitiveType::JSON,
-        _ => return None,
+    let primitive = match logical_type_of_field(field)? {
+        LogicalType::Json => types::TPrimitiveType::JSON,
+        LogicalType::Hll => types::TPrimitiveType::HLL,
+        LogicalType::Bitmap | LogicalType::Object => types::TPrimitiveType::OBJECT,
+        LogicalType::Percentile => types::TPrimitiveType::PERCENTILE,
     };
     Some(crate::lower::type_lowering::scalar_type_desc(primitive))
 }

@@ -1,28 +1,14 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
 use sqlparser::ast as sqlast;
 
 use crate::sql::analysis::JoinKind;
+use crate::types::logical::{LogicalType, field_with_logical_type};
 
 // ---------------------------------------------------------------------------
 // SQL type -> Arrow type conversion
 // ---------------------------------------------------------------------------
-
-/// Metadata key attached to a `Field` so downstream type-desc construction can
-/// recover the StarRocks logical type (JSON, BITMAP, …) once the Arrow type
-/// system has collapsed it to a generic storage type such as `Utf8` or
-/// `Binary`. Without this side channel a nested cast like
-/// `cast(x AS map<string, json>)` would render its values as plain strings
-/// because the JSON-ness is no longer recoverable from the Arrow type alone.
-pub(crate) const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
-
-fn json_logical_metadata() -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert(NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string());
-    m
-}
 
 /// Build the `Field` for a nested JSON cell, tagging its metadata so the
 /// downstream type-desc walker can re-emit `TPrimitiveType::JSON`.
@@ -34,7 +20,7 @@ fn nested_field_with_logical_type(
     let arrow = sql_type_to_arrow(sql_type)?;
     let mut field = Field::new(name, arrow, nullable);
     if is_json_sql_type(sql_type) {
-        field = field.with_metadata(json_logical_metadata());
+        field = field_with_logical_type(field, LogicalType::Json);
     }
     Ok(field)
 }
@@ -239,7 +225,7 @@ fn custom_field_with_logical_type(name: &str, modifier: &str) -> Result<Field, S
     let inner = parse_custom_type_string(modifier)?;
     let mut field = Field::new(name, inner, true);
     if is_json_modifier(modifier) {
-        field = field.with_metadata(json_logical_metadata());
+        field = field_with_logical_type(field, LogicalType::Json);
     }
     Ok(field)
 }

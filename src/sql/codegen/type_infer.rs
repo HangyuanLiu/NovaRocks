@@ -2,14 +2,7 @@ use arrow::datatypes::{DataType, Field};
 
 use crate::lower::thrift::type_lowering::scalar_type_desc;
 use crate::thrift::types;
-
-/// Metadata key on a `Field` that overrides the inferred StarRocks primitive.
-/// Mirrors `crate::sql::analyzer::helpers::NR_LOGICAL_TYPE_KEY` (kept duplicated
-/// to avoid pulling the analyzer module into codegen). Today only "json" is
-/// emitted; the analyzer attaches it when a CAST target is `json` nested
-/// inside `map<…>`/`array<…>`/`struct<…>` so the JSON-ness survives the
-/// JSON-to-`Utf8` collapse in `sql_type_to_arrow`.
-const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
+use crate::types::logical::{LogicalType, logical_type_of_field};
 
 /// Convert Arrow DataType to Thrift TTypeDesc.
 pub(crate) fn arrow_type_to_type_desc(data_type: &DataType) -> Result<types::TTypeDesc, String> {
@@ -148,10 +141,11 @@ fn append_arrow_type_nodes(
 }
 
 fn logical_type_override(field: Option<&Field>) -> Option<types::TPrimitiveType> {
-    let logical = field?.metadata().get(NR_LOGICAL_TYPE_KEY)?;
-    match logical.as_str() {
-        "json" => Some(types::TPrimitiveType::JSON),
-        _ => None,
+    match logical_type_of_field(field?)? {
+        LogicalType::Json => Some(types::TPrimitiveType::JSON),
+        LogicalType::Hll | LogicalType::Bitmap | LogicalType::Object | LogicalType::Percentile => {
+            None
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 mod arithmetic;
 pub(crate) mod coercion;
+pub(crate) mod logical;
 mod predicate;
 
 #[allow(unused_imports)]
