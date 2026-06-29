@@ -60,38 +60,45 @@ fn runtime_type_from_starrocks_primitive(
     primitive: crate::thrift::types::TPrimitiveType,
     data_type: Option<&arrow::datatypes::DataType>,
 ) -> Result<RuntimeFilterType, String> {
-    use crate::thrift::types::TPrimitiveType;
-    let runtime_type = if primitive == TPrimitiveType::BOOLEAN {
+    use crate::thrift::types::TPrimitiveType as StarrocksPrimitive;
+    let runtime_type = if primitive == StarrocksPrimitive::BOOLEAN {
         RuntimeFilterType::Boolean
-    } else if primitive == TPrimitiveType::TINYINT {
+    } else if primitive == StarrocksPrimitive::TINYINT {
         RuntimeFilterType::Int8
-    } else if primitive == TPrimitiveType::SMALLINT {
+    } else if primitive == StarrocksPrimitive::SMALLINT {
         RuntimeFilterType::Int16
-    } else if primitive == TPrimitiveType::INT {
+    } else if primitive == StarrocksPrimitive::INT {
         RuntimeFilterType::Int32
-    } else if primitive == TPrimitiveType::BIGINT {
+    } else if primitive == StarrocksPrimitive::BIGINT {
         RuntimeFilterType::Int64
-    } else if primitive == TPrimitiveType::LARGEINT {
+    } else if primitive == StarrocksPrimitive::LARGEINT {
         RuntimeFilterType::LargeInt
-    } else if primitive == TPrimitiveType::FLOAT {
+    } else if primitive == StarrocksPrimitive::FLOAT {
         RuntimeFilterType::Float32
-    } else if primitive == TPrimitiveType::DOUBLE {
+    } else if primitive == StarrocksPrimitive::DOUBLE {
         RuntimeFilterType::Float64
-    } else if primitive == TPrimitiveType::DATE {
+    } else if primitive == StarrocksPrimitive::DATE {
         RuntimeFilterType::Date32
-    } else if primitive == TPrimitiveType::DATETIME {
+    } else if primitive == StarrocksPrimitive::DATETIME {
         RuntimeFilterType::TimestampMicros
-    } else if primitive == TPrimitiveType::TIME {
+    } else if primitive == StarrocksPrimitive::TIME {
         RuntimeFilterType::TimeMicros
-    } else if primitive == TPrimitiveType::VARCHAR || primitive == TPrimitiveType::CHAR {
+    } else if primitive == StarrocksPrimitive::VARCHAR
+        || primitive == StarrocksPrimitive::CHAR
+        || primitive == StarrocksPrimitive::JSON
+        || primitive == StarrocksPrimitive::HLL
+        || primitive == StarrocksPrimitive::OBJECT
+        || primitive == StarrocksPrimitive::PERCENTILE
+        || primitive == StarrocksPrimitive::FUNCTION
+    {
         RuntimeFilterType::Utf8
-    } else if primitive == TPrimitiveType::DECIMAL32 {
+    } else if primitive == StarrocksPrimitive::DECIMAL32 {
         decimal_runtime_type(RuntimeDecimalWidth::Decimal32, data_type)?
-    } else if primitive == TPrimitiveType::DECIMAL64 {
+    } else if primitive == StarrocksPrimitive::DECIMAL64 {
         decimal_runtime_type(RuntimeDecimalWidth::Decimal64, data_type)?
-    } else if primitive == TPrimitiveType::DECIMAL128
-        || primitive == TPrimitiveType::DECIMAL
-        || primitive == TPrimitiveType::DECIMALV2
+    } else if primitive == StarrocksPrimitive::DECIMAL128
+        || primitive == StarrocksPrimitive::DECIMAL
+        || primitive == StarrocksPrimitive::DECIMALV2
     {
         decimal_runtime_type(RuntimeDecimalWidth::Decimal128, data_type)?
     } else {
@@ -949,7 +956,7 @@ mod tests {
     use super::{
         RF_TYPE_BITSET_FILTER, RF_TYPE_IN_FILTER, RF_VERSION_V3, decode_starrocks_in_filter,
         decode_starrocks_membership_filter, encode_starrocks_bitset_filter,
-        encode_starrocks_in_filter,
+        encode_starrocks_in_filter, runtime_type_from_starrocks_primitive,
     };
     use crate::common::ids::SlotId;
     use crate::exec::runtime_filter::min_max::MinMaxValue;
@@ -957,6 +964,36 @@ mod tests {
         RuntimeBitsetFilter, RuntimeDecimalWidth, RuntimeFilterType, RuntimeInFilter,
         RuntimeInFilterValues, RuntimeMembershipFilter, RuntimeMinMaxFilter,
     };
+    use crate::thrift::types::TPrimitiveType as StarrocksPrimitive;
+
+    #[test]
+    fn legacy_string_family_primitives_map_to_utf8_runtime_type() {
+        for primitive in [
+            StarrocksPrimitive::VARCHAR,
+            StarrocksPrimitive::CHAR,
+            StarrocksPrimitive::JSON,
+            StarrocksPrimitive::HLL,
+            StarrocksPrimitive::OBJECT,
+            StarrocksPrimitive::PERCENTILE,
+            StarrocksPrimitive::FUNCTION,
+        ] {
+            assert_eq!(
+                runtime_type_from_starrocks_primitive(primitive, None).unwrap(),
+                RuntimeFilterType::Utf8
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_wire_primitives_still_error() {
+        let err = runtime_type_from_starrocks_primitive(StarrocksPrimitive::INVALID_TYPE, None)
+            .unwrap_err();
+        assert!(err.contains("unsupported runtime filter primitive type"));
+
+        let err =
+            runtime_type_from_starrocks_primitive(StarrocksPrimitive::VARBINARY, None).unwrap_err();
+        assert!(err.contains("unsupported runtime filter primitive type"));
+    }
 
     #[test]
     fn test_largeint_in_filter_roundtrip() {

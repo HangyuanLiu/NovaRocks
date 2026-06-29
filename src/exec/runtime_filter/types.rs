@@ -51,9 +51,6 @@ impl RuntimeFilterType {
             | DataType::Timestamp(TimeUnit::Millisecond, _)
             | DataType::Timestamp(TimeUnit::Microsecond, _)
             | DataType::Timestamp(TimeUnit::Nanosecond, _) => Self::TimestampMicros,
-            DataType::Time64(TimeUnit::Microsecond) | DataType::Time64(TimeUnit::Nanosecond) => {
-                Self::TimeMicros
-            }
             DataType::Utf8 => Self::Utf8,
             DataType::Decimal128(precision, scale) => Self::Decimal {
                 width: RuntimeDecimalWidth::for_precision(*precision)?,
@@ -180,6 +177,17 @@ mod tests {
     fn rejects_fixed_size_binary_that_is_not_largeint() {
         let err =
             RuntimeFilterType::from_arrow_data_type(&DataType::FixedSizeBinary(15)).unwrap_err();
+        assert!(err.contains("unsupported runtime filter data type"));
+    }
+
+    #[test]
+    fn rejects_time64_until_runtime_filters_support_time_arrays() {
+        let err = RuntimeFilterType::from_arrow_data_type(&DataType::Time64(TimeUnit::Microsecond))
+            .unwrap_err();
+        assert!(err.contains("unsupported runtime filter data type"));
+
+        let err = RuntimeFilterType::from_arrow_data_type(&DataType::Time64(TimeUnit::Nanosecond))
+            .unwrap_err();
         assert!(err.contains("unsupported runtime filter data type"));
     }
 
