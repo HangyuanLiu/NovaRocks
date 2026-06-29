@@ -4692,6 +4692,40 @@ fn refresh_scan_table_for_codegen(
             nodes::reject_target_state_equality_deletes(&out.source)?;
             Ok(out)
         }
+        ScanSource::IcebergMvTargetLocator(scan) => {
+            let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
+                "Iceberg target-locator scan requires MV refresh context".to_string()
+            })?;
+            let mut out = table.clone();
+            let projected = nodes::projected_target_locator_column_names(scan);
+            out.columns.retain(|column| {
+                projected
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&column.name))
+            });
+            out.iceberg_row_lineage_metadata_columns.retain(|column| {
+                projected
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&column.name))
+            });
+            ensure_iceberg_metadata_column(
+                &mut out,
+                &projected,
+                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                DataType::Utf8,
+                false,
+            );
+            ensure_iceberg_metadata_column(
+                &mut out,
+                &projected,
+                crate::exec::row_position::ICEBERG_ROW_POS_COL,
+                DataType::Int64,
+                false,
+            );
+            out.source = refresh_ctx.target_locator_scan_source(scan)?;
+            nodes::reject_target_state_equality_deletes(&out.source)?;
+            Ok(out)
+        }
         _ => Ok(table.clone()),
     }
 }

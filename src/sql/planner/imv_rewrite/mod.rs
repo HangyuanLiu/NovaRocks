@@ -79,5 +79,6 @@ pub(crate) mod partition_derivation;
 pub(crate) mod pipeline;
 pub(crate) mod row_id_column;
 pub(crate) mod scan_binding;
+pub(crate) mod target_locator;
 pub(crate) mod target_state;
 pub(crate) mod union_delta;

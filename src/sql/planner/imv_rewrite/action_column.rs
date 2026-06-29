@@ -26,6 +26,7 @@ use crate::sql::planner::imv_rewrite::join_delta_shape::{
 };
 use crate::sql::planner::imv_rewrite::opt_expr_to_plan;
 use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
+use crate::sql::planner::imv_rewrite::target_locator::is_target_locator_join;
 use crate::sql::planner::plan::{
     LogicalAggregateNode, LogicalPlanNode, LogicalScanNode, PlanNodeKind,
 };
@@ -169,6 +170,10 @@ fn validate_node(plan: &LogicalPlanNode) -> Result<(), String> {
             Err(format!(
                 "Iceberg IMV rewrite does not support this aggregate shape above delta-bound scan {fqn}"
             ))
+        }
+        PlanNodeKind::Join(_) if is_target_locator_join(plan) => {
+            validate_node(plan.left())?;
+            validate_node(plan.right())
         }
         PlanNodeKind::Join(_) if subtree_has_delta(plan) => {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());

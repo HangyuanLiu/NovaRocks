@@ -2,8 +2,9 @@
 //!
 //! Stages run in order: logical normalize, delta marker, branch union, union
 //! delta, aggregate state, delta pushdown, scan binding, action propagation,
-//! apply key, partition derivation, marker cleanup, validation. Each stage's
-//! name is part of the trace contract and is asserted in pipeline tests.
+//! apply key, target locator, partition derivation, marker cleanup, validation.
+//! Each stage's name is part of the trace contract and is asserted in pipeline
+//! tests.
 
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
@@ -23,6 +24,7 @@ use crate::sql::planner::imv_rewrite::marker::{UnresolvedMarkerCheckRule, WrapRo
 use crate::sql::planner::imv_rewrite::partition_derivation::DerivePartitionSpecRule;
 use crate::sql::planner::imv_rewrite::row_id_column::InjectRowIdRule;
 use crate::sql::planner::imv_rewrite::scan_binding::BindIcebergScanRule;
+use crate::sql::planner::imv_rewrite::target_locator::InjectTargetLocatorJoinRule;
 use crate::sql::planner::imv_rewrite::union_delta::{
     RewriteTopLevelUnionDeltaRule, RewriteUnionAggregateDeltaRule,
 };
@@ -83,6 +85,11 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             "imv-apply-key",
             RewritePhase::SemanticRewrite,
             vec![Box::new(InjectApplyKeyProjectRule::new()) as Box<dyn LogicalRewriteRule>],
+        ),
+        RewriteStage::new(
+            "imv-target-locator",
+            RewritePhase::SemanticRewrite,
+            vec![Box::new(InjectTargetLocatorJoinRule::new()) as Box<dyn LogicalRewriteRule>],
         ),
         RewriteStage::new(
             "imv-partition-derivation",

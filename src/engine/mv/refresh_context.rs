@@ -21,8 +21,9 @@ use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
 use crate::meta::repository::mv::StoredMvDefinition;
 use crate::meta::repository::mv_contract::MvSchemaContract;
 use crate::sql::catalog::{
-    IcebergDataFileInfo, IcebergMvTargetStateScan, IcebergPartitionFieldValue,
-    IcebergPartitionValue, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo, ScanSource,
+    IcebergDataFileInfo, IcebergMvTargetLocatorScan, IcebergMvTargetStateScan,
+    IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef, IcebergSchemaFieldDef,
+    IcebergTableInfo, ScanSource,
 };
 
 use super::iceberg_refresh::IcebergMvTarget;
@@ -946,6 +947,89 @@ impl IcebergMvRefreshContext {
         })
     }
 
+    pub(crate) fn target_locator_scan_source(
+        &self,
+        scan: &IcebergMvTargetLocatorScan,
+    ) -> Result<ScanSource, String> {
+        let target = &self.rewrite.target;
+        if !scan.catalog.eq_ignore_ascii_case(&target.catalog)
+            || !scan.database.eq_ignore_ascii_case(&target.namespace)
+            || !scan.table.eq_ignore_ascii_case(&target.table)
+        {
+            return Err(format!(
+                "Iceberg target-locator scan {} does not match MV refresh target {}.{}.{}",
+                scan.fqn(),
+                target.catalog,
+                target.namespace,
+                target.table
+            ));
+        }
+        if scan.target_table_uuid != self.rewrite.target_table_uuid {
+            return Err(format!(
+                "Iceberg target-locator scan {} target uuid mismatch: scan={} context={}",
+                scan.fqn(),
+                scan.target_table_uuid,
+                self.rewrite.target_table_uuid
+            ));
+        }
+        if scan.target_snapshot_id != self.rewrite.target_snapshot_id {
+            return Err(format!(
+                "Iceberg target-locator scan {} target snapshot mismatch: scan={:?} context={:?}",
+                scan.fqn(),
+                scan.target_snapshot_id,
+                self.rewrite.target_snapshot_id
+            ));
+        }
+        let expected_apply_key = &self
+            .rewrite
+            .schema_contract
+            .target
+            .hidden_apply_key
+            .column_name;
+        if !scan
+            .apply_key_column
+            .eq_ignore_ascii_case(expected_apply_key)
+        {
+            return Err(format!(
+                "Iceberg target-locator scan {} apply-key column mismatch: scan={} contract={}",
+                scan.fqn(),
+                scan.apply_key_column,
+                expected_apply_key
+            ));
+        }
+        match (
+            scan.branch_id_column.as_deref(),
+            self.rewrite
+                .schema_contract
+                .branch
+                .as_ref()
+                .map(|branch| branch.branch_id_column.column_name.as_str()),
+        ) {
+            (Some(scan_branch), Some(contract_branch))
+                if scan_branch.eq_ignore_ascii_case(contract_branch) => {}
+            (None, None) => {}
+            (scan_branch, contract_branch) => {
+                return Err(format!(
+                    "Iceberg target-locator scan {} branch column mismatch: scan={:?} contract={:?}",
+                    scan.fqn(),
+                    scan_branch,
+                    contract_branch
+                ));
+            }
+        }
+
+        let files = match self.rewrite.target_snapshot_id {
+            Some(snapshot_id) => data_files_at_snapshot(&self.target_table, snapshot_id)?,
+            None => Vec::new(),
+        };
+        Ok(ScanSource::IcebergDataFiles {
+            table: target_locator_table_info(self, scan)?,
+            files,
+            cloud_properties: self.target_entry.cloud_properties_map(),
+            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+        })
+    }
+
     fn target_state_partition_allow_list(
         &self,
         scan: &IcebergMvTargetStateScan,
@@ -1288,11 +1372,27 @@ fn target_table_info(
     ctx: &IcebergMvRefreshContext,
     scan: &IcebergMvTargetStateScan,
 ) -> Result<IcebergTableInfo, String> {
+    target_table_info_for_target(ctx, &scan.catalog, &scan.database, &scan.table)
+}
+
+fn target_locator_table_info(
+    ctx: &IcebergMvRefreshContext,
+    scan: &IcebergMvTargetLocatorScan,
+) -> Result<IcebergTableInfo, String> {
+    target_table_info_for_target(ctx, &scan.catalog, &scan.database, &scan.table)
+}
+
+fn target_table_info_for_target(
+    ctx: &IcebergMvRefreshContext,
+    catalog: &str,
+    database: &str,
+    table: &str,
+) -> Result<IcebergTableInfo, String> {
     let metadata = ctx.target_table.metadata();
     Ok(IcebergTableInfo {
-        catalog: scan.catalog.clone(),
-        namespace: scan.database.clone(),
-        table: scan.table.clone(),
+        catalog: catalog.to_string(),
+        namespace: database.to_string(),
+        table: table.to_string(),
         table_uuid: Some(metadata.uuid().to_string()),
         current_snapshot_id: metadata.current_snapshot_id(),
         schema_id: metadata.current_schema_id(),
@@ -2360,6 +2460,221 @@ mod tests {
             cloud.get("aws.s3.endpoint").map(String::as_str),
             Some("base-endpoint")
         );
+    }
+
+    struct TargetLocatorRefreshFixture {
+        _warehouse: tempfile::TempDir,
+        target_entry: Arc<IcebergCatalogEntry>,
+        iceberg_catalog: Arc<dyn iceberg::Catalog>,
+        target_table: iceberg::table::Table,
+        target_snapshot_id: i64,
+    }
+
+    fn target_locator_refresh_fixture(test_name: &str) -> TargetLocatorRefreshFixture {
+        let warehouse = tempfile::Builder::new()
+            .prefix(&format!("novarocks_target_locator_{test_name}_"))
+            .tempdir()
+            .expect("warehouse tempdir");
+        let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
+        let target_entry = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "tgt",
+                &[
+                    ("type".to_string(), "iceberg".to_string()),
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse_uri),
+                ],
+            )
+            .expect("target catalog entry"),
+        );
+        crate::connector::iceberg::catalog::registry::create_namespace(&target_entry, "db")
+            .expect("create target namespace");
+        crate::connector::iceberg::catalog::registry::create_table(
+            &target_entry,
+            "db",
+            "mv",
+            &[
+                crate::sql::TableColumnDef {
+                    name: "k".to_string(),
+                    data_type: crate::sql::SqlType::BigInt,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                },
+                crate::sql::TableColumnDef {
+                    name: "v".to_string(),
+                    data_type: crate::sql::SqlType::BigInt,
+                    nullable: true,
+                    aggregation: None,
+                    default: None,
+                },
+            ],
+            None,
+            &[],
+            &[],
+        )
+        .expect("create target table");
+        crate::connector::iceberg::catalog::registry::insert_rows(
+            &target_entry,
+            "db",
+            "mv",
+            &[
+                vec![crate::sql::Literal::Int(10), crate::sql::Literal::Int(100)],
+                vec![crate::sql::Literal::Int(20), crate::sql::Literal::Int(200)],
+            ],
+        )
+        .expect("insert target rows");
+        let loaded =
+            crate::connector::iceberg::catalog::registry::load_table(&target_entry, "db", "mv")
+                .expect("load target table");
+        let target_snapshot_id = loaded
+            .table
+            .metadata()
+            .current_snapshot_id()
+            .expect("target snapshot");
+        let iceberg_catalog =
+            crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&target_entry)
+                .expect("build target iceberg catalog");
+
+        TargetLocatorRefreshFixture {
+            _warehouse: warehouse,
+            target_entry,
+            iceberg_catalog,
+            target_table: loaded.table,
+            target_snapshot_id,
+        }
+    }
+
+    fn target_field_id(schema: &Schema, name: &str) -> i32 {
+        schema
+            .as_struct()
+            .fields()
+            .iter()
+            .find(|field| field.name == name)
+            .unwrap_or_else(|| panic!("missing target field {name}"))
+            .id
+    }
+
+    fn rewrite_context_for_target_fixture(
+        target_table: &iceberg::table::Table,
+        target_snapshot_id: i64,
+    ) -> Arc<IcebergMvRewriteContext> {
+        let metadata = target_table.metadata();
+        let target_schema = metadata.current_schema().clone();
+        let mut contract = make_schema_contract();
+        let k_id = target_field_id(target_schema.as_ref(), "k");
+        let v_id = target_field_id(target_schema.as_ref(), "v");
+        contract.target.table_uuid = metadata.uuid().to_string();
+        contract.target.schema_id_at_create = metadata.current_schema_id();
+        contract.target.visible_columns[0].target_field_id = k_id;
+        contract.target.visible_columns[1].target_field_id = v_id;
+        contract.target.hidden_apply_key.target_field_id = k_id;
+        let target = make_target();
+        let mv_def = Arc::new(make_mv_definition());
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
+
+        Arc::new(
+            IcebergMvRewriteContext::from_parts(
+                target,
+                42,
+                Some("sess_cat".to_string()),
+                "sess_db".to_string(),
+                mv_def,
+                query,
+                base_refs,
+                pin,
+                Some(target_snapshot_id),
+                metadata.uuid().to_string(),
+                target_schema,
+                Some(Arc::new(contract)),
+            )
+            .expect("target fixture rewrite context"),
+        )
+    }
+
+    fn refresh_context_for_target_fixture(
+        fixture: &TargetLocatorRefreshFixture,
+    ) -> IcebergMvRefreshContext {
+        IcebergMvRefreshContext {
+            rewrite: rewrite_context_for_target_fixture(
+                &fixture.target_table,
+                fixture.target_snapshot_id,
+            ),
+            target_entry: fixture.target_entry.clone(),
+            base_catalog_entries: BTreeMap::new(),
+            iceberg_catalog: fixture.iceberg_catalog.clone(),
+            target_table: fixture.target_table.clone(),
+            affected_partitions:
+                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            pruning_limits: MvRefreshPruningLimits::default(),
+        }
+    }
+
+    #[test]
+    fn target_locator_scan_source_loads_snapshot_pinned_explicit_files() {
+        let fixture = target_locator_refresh_fixture("explicit_files");
+        let ctx = refresh_context_for_target_fixture(&fixture);
+        let scan = IcebergMvTargetLocatorScan {
+            catalog: "tgt".to_string(),
+            database: "db".to_string(),
+            table: "mv".to_string(),
+            target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
+            target_snapshot_id: Some(fixture.target_snapshot_id),
+            apply_key_column: "k".to_string(),
+            branch_id_column: None,
+        };
+
+        let source = ctx
+            .target_locator_scan_source(&scan)
+            .expect("target locator source");
+
+        let ScanSource::IcebergDataFiles {
+            table,
+            files,
+            binding,
+            ..
+        } = source
+        else {
+            panic!("expected target locator explicit IcebergDataFiles");
+        };
+        assert_eq!(
+            binding,
+            crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles
+        );
+        assert_eq!(table.catalog, "tgt");
+        assert_eq!(table.namespace, "db");
+        assert_eq!(table.table, "mv");
+        assert_eq!(
+            table.table_uuid.as_deref(),
+            Some(ctx.rewrite.target_table_uuid.as_str())
+        );
+        assert_eq!(table.current_snapshot_id, Some(fixture.target_snapshot_id));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].row_count, Some(2));
+        assert!(files[0].path.ends_with(".parquet"));
+    }
+
+    #[test]
+    fn target_locator_scan_source_rejects_apply_key_mismatch() {
+        let fixture = target_locator_refresh_fixture("apply_key_mismatch");
+        let ctx = refresh_context_for_target_fixture(&fixture);
+        let scan = IcebergMvTargetLocatorScan {
+            catalog: "tgt".to_string(),
+            database: "db".to_string(),
+            table: "mv".to_string(),
+            target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
+            target_snapshot_id: Some(fixture.target_snapshot_id),
+            apply_key_column: "wrong_apply_key".to_string(),
+            branch_id_column: None,
+        };
+
+        let err = ctx
+            .target_locator_scan_source(&scan)
+            .expect_err("apply-key mismatch should fail");
+
+        assert!(err.contains("apply-key column mismatch"), "got: {err}");
     }
 
     fn target_state_source_for_binding_test() -> ScanSource {
