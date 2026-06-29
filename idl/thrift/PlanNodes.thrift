@@ -1498,21 +1498,211 @@ struct TLookUpNode {
 // This is essentially a union of all messages corresponding to subclasses
 // of PlanNode.
 // NovaRocks-only: IVM-A1 Iceberg incremental delta scan source. Carries the
-// base table identity, snapshot range, and a NovaRocks-private explicit JSON
-// payload produced at refresh/codegen time. The payload contains the planned
-// change files and runtime descriptors needed by lower_plan, so lower does
-// not read connector catalog state.
+// base table identity, snapshot range, and a NovaRocks-private typed plan
+// produced at refresh/codegen time. The typed plan contains table descriptors,
+// planned change files, equality-delete targets, and delete-side runtime
+// descriptors needed by lower_plan, so lower does not read connector catalog
+// state or deserialize full Iceberg table metadata.
+// Data column descriptor for the base Iceberg table. The delta scan uses
+// Iceberg field ids, not display names, when aligning stored row-id lineage
+// and equality-delete keys with projected data columns.
+struct TIcebergDeltaDataColumn {
+  // Current table column name used to build scan projections.
+  1: required string name
+  // Stable Iceberg field id for the column. This survives column rename and
+  // is the authority for equality-delete key matching.
+  2: required i32 field_id
+}
+
+// Role of a planned source file in the delta scan interval.
+enum TIcebergDeltaSourceRole {
+  // Added or still-visible data file to be scanned as data rows.
+  DATA_FILE,
+  // Position-delete file that hides rows from a referenced data file.
+  POSITION_DELETE,
+  // Equality-delete file; codegen pre-plans the data-file targets below.
+  EQUALITY_DELETE,
+  // Data file deleted by the delta interval and reverse-projected as deletes.
+  DELETED_DATA_FILE,
+}
+
+// File format for a position-delete source. Puffin is used for deletion-vector
+// blobs; Parquet is the regular Iceberg position-delete file format.
+enum TIcebergDeltaPositionDeleteFileFormat {
+  PARQUET,
+  PUFFIN,
+}
+
+// Planned position-delete source attached to a delta source file.
+struct TIcebergDeltaPositionDeleteSource {
+  // Physical delete file or Puffin blob path.
+  1: required string delete_file_path
+  // File size in bytes, used by scan accounting and file opening.
+  2: required i64 delete_file_size
+  // Optional Iceberg referenced_data_file. When absent, runtime resolves the
+  // target through manifest/planning context carried elsewhere in the source.
+  3: optional string referenced_data_file
+  // Determines whether runtime reads Parquet rows or a Puffin deletion vector.
+  4: required TIcebergDeltaPositionDeleteFileFormat file_format
+  // Puffin blob offset. Only meaningful when file_format is PUFFIN.
+  5: optional i64 content_offset
+  // Puffin blob length. Only meaningful when file_format is PUFFIN.
+  6: optional i64 content_size_in_bytes
+}
+
+// A data file that an equality-delete file can affect. Codegen computes this
+// from Iceberg metadata so lower/runtime do not reconstruct read snapshots.
+struct TIcebergDeltaEqualityDeleteTarget {
+  // Target data file path.
+  1: required string data_file_path
+  // Target data file size in bytes.
+  2: required i64 data_file_size
+  // First row id of the target data file when Iceberg row lineage is present.
+  3: optional i64 data_file_first_row_id
+  // Data sequence number used to decide equality-delete applicability.
+  4: optional i64 data_file_sequence_number
+}
+
+// Visibility state for a data file that was deleted in the delta interval.
+struct TIcebergDeltaDeletedFileVisibility {
+  // Row positions already hidden before this interval; reverse projection must
+  // not emit these rows as newly deleted.
+  1: required list<i64> already_deleted_positions
+}
+
+// One planned file-like input for the delta scan. `role` selects which
+// role-specific optional fields are valid; lower rejects incompatible payloads.
+struct TIcebergDeltaSourceFile {
+  // Physical file path or delete-vector blob owner path.
+  1: required string path
+  // File size in bytes.
+  2: required i64 size
+  // How this file participates in the delta scan.
+  3: required TIcebergDeltaSourceRole role
+  // Iceberg partition spec id, used for partition-aware equality deletes.
+  4: optional i32 partition_spec_id
+  // Canonical partition key string used for equality-delete target matching.
+  5: optional string partition_key
+  // First row id for data files with Iceberg row lineage.
+  6: optional i64 first_row_id
+  // Data sequence number used by delete applicability rules.
+  7: optional i64 data_sequence_number
+  // Optional row-id filter. When present, the scan emits only these base row ids.
+  8: optional set<i64> row_id_allow_list
+  // Valid only for POSITION_DELETE. Carries the concrete delete sources.
+  9: optional list<TIcebergDeltaPositionDeleteSource> position_deletes
+  // Valid only for EQUALITY_DELETE. Iceberg field ids forming the delete key.
+  10: optional list<i32> equality_field_ids
+  // Valid only for EQUALITY_DELETE. Data files preselected by codegen as
+  // possible matches for this equality-delete file.
+  11: optional list<TIcebergDeltaEqualityDeleteTarget> equality_targets
+  // Valid only for DELETED_DATA_FILE. Prevents reverse projection from
+  // reporting rows that were already invisible before this refresh interval.
+  12: optional TIcebergDeltaDeletedFileVisibility deleted_file_visibility
+}
+
+// Delete file format used by delete-side visibility reconstruction.
+enum TIcebergDeltaDeleteFileFormat {
+  PARQUET,
+  PUFFIN,
+}
+
+// Delete file content type used by delete-side visibility reconstruction.
+enum TIcebergDeltaDeleteFileContent {
+  POSITION,
+  EQUALITY,
+}
+
+// Delete file descriptor needed to rebuild previous-snapshot visibility.
+struct TIcebergDeltaDeleteVisibilityDeleteFile {
+  // Physical delete file or Puffin blob path.
+  1: required string path
+  // How runtime should read this delete descriptor.
+  2: required TIcebergDeltaDeleteFileFormat file_format
+  // Whether the descriptor contains position or equality deletes.
+  3: required TIcebergDeltaDeleteFileContent file_content
+  // Delete file length in bytes when available from Iceberg metadata.
+  4: optional i64 length
+  // Puffin blob offset. Only meaningful when file_format is PUFFIN.
+  5: optional i64 content_offset
+  // Puffin blob length. Only meaningful when file_format is PUFFIN.
+  6: optional i64 content_size_in_bytes
+}
+
+// Previous-snapshot data file plus its delete files. Used to rebuild which
+// rows were already invisible before applying the current delta interval.
+struct TIcebergDeltaDeleteVisibilityDataFile {
+  // Data file path.
+  1: required string path
+  // Data file size in bytes.
+  2: required i64 size
+  // First row id for row-lineage-aware reverse projection.
+  3: optional i64 first_row_id
+  // Data sequence number used by delete applicability rules.
+  4: optional i64 data_sequence_number
+  // Delete files that may already hide rows in this data file.
+  5: required list<TIcebergDeltaDeleteVisibilityDeleteFile> delete_files
+}
+
+// Row-lineage attributes for a base data file.
+struct TIcebergDeltaBaseDataFileLineage {
+  // First row id assigned to this data file.
+  1: required i64 first_row_id
+  // Data sequence number associated with the file.
+  2: required i64 data_sequence_number
+}
+
+// Delete-side plan for materialized view refresh. This is precomputed by
+// codegen from Iceberg metadata and consumed by lower/runtime without catalog
+// access.
+struct TIcebergDeltaDeleteSidePlan {
+  // Current/base snapshot data-file lineage keyed by normalized data file path.
+  1: required map<string, TIcebergDeltaBaseDataFileLineage> base_data_file_lineage
+  // Previous snapshot data-file lineage keyed by normalized data file path.
+  2: required map<string, TIcebergDeltaBaseDataFileLineage> previous_data_file_lineage
+  // Previous-snapshot data/delete descriptors used to reconstruct old visibility.
+  3: required list<TIcebergDeltaDeleteVisibilityDataFile> previous_delete_visibility_data_files
+  // Positions already deleted before this interval, keyed by data file path.
+  4: required map<string, list<i64>> previously_deleted_positions_per_file
+  // Data files deleted by the current interval.
+  5: required set<string> deleted_data_file_paths
+}
+
+// NovaRocks-private typed plan for `TIcebergDeltaScanNode`. This replaces JSON
+// or serialized Iceberg TableMetadata in the execution protocol.
+struct TIcebergDeltaScanPlan {
+  // Base Iceberg table location. Runtime uses this to build file access handles.
+  1: required string table_location
+  // Current data columns with Iceberg field ids.
+  2: required list<TIcebergDeltaDataColumn> data_columns
+  // Cloud properties supplied by the planner/FE side. Execution uses this to
+  // build object-store access; it is not a catalog lookup contract.
+  3: optional CloudConfiguration.TCloudConfiguration cloud_configuration
+  // Change files planned for the snapshot interval (from_snapshot_id, to_snapshot_id].
+  4: required list<TIcebergDeltaSourceFile> change_files
+  // Optional delete-side state. Present when the refresh needs deleted-row
+  // reverse projection or previous-delete visibility reconstruction.
+  5: optional TIcebergDeltaDeleteSidePlan delete_side
+}
+
 struct TIcebergDeltaScanNode {
   // `namespace` is a C++ reserved keyword and thrift's C++ codegen emits the
   // field name verbatim (no escaping), so we have to spell it differently
   // here to keep `--features compat` building. Field id 2 stays the same so
   // the on-wire encoding is unchanged.
+  // Iceberg catalog name.
   1: required string catalog
+  // Iceberg namespace/database name.
   2: required string iceberg_namespace
+  // Iceberg table name.
   3: required string table
+  // Exclusive lower snapshot boundary for the delta interval.
   4: required i64 from_snapshot_id
+  // Inclusive upper snapshot boundary for the delta interval.
   5: required i64 to_snapshot_id
-  6: optional string explicit_payload_json
+  // Typed refresh/codegen-time plan. Lowering must consume this payload and
+  // must not read connector catalog state or deserialize full table metadata.
+  6: required TIcebergDeltaScanPlan delta_plan
 }
 
 struct TPlanNode {

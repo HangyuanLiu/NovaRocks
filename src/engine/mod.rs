@@ -3544,8 +3544,8 @@ pub(crate) fn execute_query_with_catalog_provider(
 /// Extended `execute_query` entry that accepts an optional custom terminal
 /// sink factory and an optional Iceberg catalog registry. Used by IVM-A1
 /// refresh paths: the merge sink intercepts pipeline output (no result
-/// rows are produced), and lower_plan needs the registry to resolve
-/// `ICEBERG_DELTA_SCAN_NODE` runtime handles.
+/// rows are produced), while refresh/codegen uses the registry to build the
+/// typed `ICEBERG_DELTA_SCAN_NODE` payload before lower_plan runs.
 ///
 /// `terminal_sink = None` falls back to the default `ResultSinkFactory`.
 /// `iceberg_catalogs = None` matches the legacy behaviour for non-IVM

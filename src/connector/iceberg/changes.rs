@@ -4,6 +4,8 @@
 //! error enum so that CREATE-time PRIMARY KEY validation has a stable type
 //! to return.
 
+use std::sync::Arc;
+
 use crate::exec::node::iceberg_delta_scan::{
     DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat,
     PositionDeleteSourceData,
@@ -192,6 +194,7 @@ pub(crate) enum ChangePartitionValue {
 }
 
 impl ChangePartitionValue {
+    #[cfg(test)]
     pub(crate) fn as_primitive_str(&self) -> Option<&str> {
         match self {
             ChangePartitionValue::Primitive(value) => Some(value.as_str()),
@@ -444,8 +447,22 @@ pub(crate) struct IcebergChangeBatch {
     pub deleted_data_files: Vec<DeletedDataFileRef>,
 }
 
+#[allow(dead_code)]
 pub(crate) fn delta_source_files_from_change_batch(
     batch: &IcebergChangeBatch,
+) -> Result<Vec<DeltaSourceFile>, String> {
+    delta_source_files_from_change_batch_with_equality_targets(
+        batch,
+        &std::collections::HashMap::new(),
+    )
+}
+
+pub(crate) fn delta_source_files_from_change_batch_with_equality_targets(
+    batch: &IcebergChangeBatch,
+    equality_targets_by_delete_file: &std::collections::HashMap<
+        String,
+        Vec<EqualityDeleteTargetData>,
+    >,
 ) -> Result<Vec<DeltaSourceFile>, String> {
     let mut out = Vec::with_capacity(
         batch.inserts.len()
@@ -506,7 +523,10 @@ pub(crate) fn delta_source_files_from_change_batch(
             size: eq.delete_file_size,
             role: DeltaSourceRole::EqualityDelete {
                 equality_field_ids: eq.equality_ids.clone(),
-                targets: Vec::<EqualityDeleteTargetData>::new(),
+                targets: equality_targets_by_delete_file
+                    .get(&eq.delete_file_path)
+                    .cloned()
+                    .unwrap_or_default(),
             },
             partition_spec_id: eq.partition_spec_id,
             partition_key: eq.partition_key.clone(),
@@ -528,6 +548,36 @@ pub(crate) fn delta_source_files_from_change_batch(
             data_sequence_number: d.data_sequence_number,
             row_id_allow_list: None,
         });
+    }
+    Ok(out)
+}
+
+pub(crate) fn equality_delete_targets_at(
+    table: &iceberg::table::Table,
+    snapshot_id: i64,
+    equality_deletes: &[EqualityDeleteRef],
+) -> Result<std::collections::HashMap<String, Vec<EqualityDeleteTargetData>>, String> {
+    if equality_deletes.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let read_snapshot =
+        crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
+    let mut out = std::collections::HashMap::new();
+    for delete in equality_deletes {
+        let delete_file = equality_change_to_read_delete(delete);
+        let targets = crate::connector::iceberg::read::data_files_matching_delete(
+            &read_snapshot,
+            &delete_file,
+        )
+        .into_iter()
+        .map(|data_file| EqualityDeleteTargetData {
+            data_file_path: data_file.path.clone(),
+            data_file_size: data_file.size,
+            data_file_first_row_id: data_file.first_row_id,
+            data_file_sequence_number: data_file.data_sequence_number,
+        })
+        .collect::<Vec<_>>();
+        out.insert(delete.delete_file_path.clone(), targets);
     }
     Ok(out)
 }
@@ -896,7 +946,6 @@ pub(crate) fn plan_changes(
 /// not yet had `__change_op` injected — the operator will add it.
 #[allow(dead_code)]
 pub(crate) fn scan_position_delete_rows_for_targets(
-    base_table: &iceberg::table::Table,
     deletes: &[PositionDeleteRef],
     base_data_file_lineage: &std::collections::HashMap<
         String,
@@ -908,13 +957,14 @@ pub(crate) fn scan_position_delete_rows_for_targets(
         roaring::RoaringTreemap,
     >,
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    file_io: &iceberg::io::FileIO,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let size_lookup = |_path: &str| -> Option<u64> { None };
     crate::connector::iceberg::scan_deletes::scan_deletes_with_lineage_lookup_and_path_normalizer(
         deletes,
         factory,
-        base_table.file_io(),
+        file_io,
         size_lookup,
         |path| base_data_file_lineage.get(path).copied(),
         suppressed_data_files,
@@ -963,6 +1013,50 @@ pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage_at(
     )
 }
 
+pub(crate) fn scan_equality_delete_rows_for_targets_with_v3_lineage(
+    delete: &EqualityDeleteRef,
+    targets: &[EqualityDeleteTargetData],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let delete_specs = vec![equality_change_to_delete_spec(delete, object_store_config)?];
+    let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
+        &delete_specs,
+        factory,
+    )?;
+    let mut out = Vec::new();
+    for target in targets {
+        let first_row_id = target.data_file_first_row_id.ok_or_else(|| {
+            format!(
+                "iceberg MV equality-delete reverse projection requires first_row_id for data file {}; rebuild the MV after enabling Iceberg v3 row-lineage metadata",
+                target.data_file_path
+            )
+        })?;
+        let data_sequence_number = target.data_file_sequence_number.ok_or_else(|| {
+            format!(
+                "iceberg MV equality-delete reverse projection requires data_sequence_number for data file {}; rebuild the MV after enabling Iceberg v3 row-lineage metadata",
+                target.data_file_path
+            )
+        })?;
+        out.extend(read_data_file_matching_equality_deletes_with_v3_lineage(
+            &target.data_file_path,
+            u64::try_from(target.data_file_size).ok(),
+            &sets,
+            first_row_id,
+            data_sequence_number,
+            factory,
+            |path| {
+                normalize_delete_projection_path(path, object_store_config)
+                    .map_err(|e| e.to_string())
+            },
+        )?);
+    }
+    Ok(out)
+}
+
 /// Helper for `IcebergDeltaScanOperator`: scan one freshly-added data file
 /// (snapshot diff INSERT side). Returns raw rows with the base-table physical
 /// projection. `__change_op` is injected by the operator.
@@ -974,10 +1068,19 @@ pub(crate) fn scan_one_added_data_file(
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let factory = build_factory_for_table(base_table, object_store_config)?;
+    scan_one_added_data_file_with_factory(path, size, &factory, object_store_config)
+}
+
+pub(crate) fn scan_one_added_data_file_with_factory(
+    path: &str,
+    size: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let normalized = normalize_delete_projection_path(path, object_store_config)
         .map_err(|e| format!("normalize added data file `{path}`: {e}"))?;
     let len = u64::try_from(size).ok();
-    read_full_data_file(&normalized, len, &factory)
+    read_full_data_file(&normalized, len, factory)
 }
 
 /// Helper for `IcebergDeltaScanOperator`: scan one deleted data file
@@ -993,9 +1096,24 @@ pub(crate) fn scan_one_deleted_data_file(
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
     previous_delete_visibility: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    let factory = build_factory_for_table(base_table, object_store_config)?;
+    scan_one_deleted_data_file_with_factory(
+        deleted_file,
+        &factory,
+        object_store_config,
+        previous_delete_visibility,
+    )
+}
+
+pub(crate) fn scan_one_deleted_data_file_with_factory(
+    deleted_file: &DeletedDataFileRef,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    previous_delete_visibility: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     scan_deleted_data_file_rows_with_visibility_and_v3_lineage(
-        base_table,
         std::slice::from_ref(deleted_file),
+        factory,
         object_store_config,
         previous_delete_visibility,
     )
@@ -1384,21 +1502,8 @@ where
     Ok(out)
 }
 
-/// Build a path -> v3 row-lineage index over the base table's current
-/// snapshot. Current-snapshot callers keep legacy behavior; historical
-/// delta-scan callers should use `base_data_file_lineage_index_at`.
-pub(crate) fn base_data_file_lineage_index(
-    table: &iceberg::table::Table,
-) -> Result<
-    std::collections::HashMap<String, crate::exec::node::iceberg_delta_scan::BaseDataFileLineage>,
-    String,
-> {
-    let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
-    build_data_file_lineage_index_from_snapshot(&read_snapshot)
-}
-
 /// Build a path -> v3 row-lineage index over a specific base table snapshot.
-/// Used by the `IcebergDeltaScanOperator` delete-side scanners to look up
+/// Used while planning the typed delta-scan payload to look up
 /// `first_row_id` and `data_sequence_number` for each target data file
 /// referenced by a position/equality/deleted-data-file role,
 /// so the operator can synthesize the four v3 row-lineage virtual columns
@@ -1530,15 +1635,14 @@ pub(crate) fn scan_deleted_data_file_rows(
 /// IVM-A1 variant of `scan_deleted_data_file_rows_with_visibility` that
 /// emits the full Iceberg v3 row-lineage virtual column set on each batch.
 fn scan_deleted_data_file_rows_with_visibility_and_v3_lineage(
-    base_table: &iceberg::table::Table,
     deleted_data_files: &[DeletedDataFileRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
     existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     if deleted_data_files.is_empty() {
         return Ok(Vec::new());
     }
-    let factory = build_factory_for_table(base_table, object_store_config)?;
     let mut out = Vec::new();
     // Group by logical path (in iceberg manifests the same path could occur
     // in multiple `DeletedDataFileRef`s if a follow-up snapshot also touched
@@ -1571,7 +1675,7 @@ fn scan_deleted_data_file_rows_with_visibility_and_v3_lineage(
             size,
             first_row_id,
             data_sequence_number,
-            &factory,
+            factory,
             Some(existing_deletes_by_file),
         )?;
         out.extend(batches);
@@ -1814,16 +1918,14 @@ fn read_full_data_file_with_base_row_id_and_visibility(
     Ok(out)
 }
 
-/// Build a filesystem factory that can read both data files and
-/// position-delete files for the given iceberg base table. We use the
-/// same `OpendalRangeReaderFactory` shape as the HDFS scan path
-/// (`build_fs_operator` for local FS, S3/cloud-credentialled operator
-/// when the catalog has cloud properties).
-pub(crate) fn build_factory_for_table(
-    table: &iceberg::table::Table,
+/// Build a filesystem factory that can read planned delta-scan data/delete
+/// files for a table location. We use the same `OpendalRangeReaderFactory`
+/// shape as the HDFS scan path (`build_fs_operator` for local FS,
+/// S3/cloud-credentialled operator when the catalog has cloud properties).
+pub(crate) fn build_factory_for_table_location(
+    location: &str,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<crate::fs::opendal::OpendalRangeReaderFactory, String> {
-    let location = table.metadata().location();
     let scheme = crate::fs::path::classify_scan_paths(std::iter::once(location))
         .map_err(|e| format!("classify iceberg delete reverse projection path: {e}"))?;
     let operator = match scheme {
@@ -1849,6 +1951,48 @@ pub(crate) fn build_factory_for_table(
     };
     crate::fs::opendal::OpendalRangeReaderFactory::from_operator(operator)
         .map_err(|e| format!("build opendal range reader factory: {e}"))
+}
+
+pub(crate) fn file_io_for_table_location(
+    location: &str,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<iceberg::io::FileIO, String> {
+    if location.starts_with("memory://") {
+        return Ok(iceberg::io::FileIO::new_with_memory());
+    }
+    if location.starts_with("s3://")
+        || location.starts_with("s3a://")
+        || location.starts_with("oss://")
+    {
+        let cfg = object_store_config.ok_or_else(|| {
+            format!(
+                "ICEBERG_DELTA_SCAN_NODE table location {location} requires object_store_config"
+            )
+        })?;
+        let factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory {
+            endpoint: cfg.endpoint.clone(),
+            access_key_id: cfg.access_key_id.clone(),
+            access_key_secret: cfg.access_key_secret.clone(),
+            region: cfg
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_string()),
+            enable_path_style: cfg.enable_path_style_access.unwrap_or(false),
+        };
+        return Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build());
+    }
+    Ok(iceberg::io::FileIO::new_with_fs())
+}
+
+/// Build a filesystem factory that can read both data files and
+/// position-delete files for the given iceberg base table. Existing callers
+/// outside delta scan still pass a loaded table; delta scan uses
+/// `build_factory_for_table_location` to avoid runtime TableMetadata handles.
+pub(crate) fn build_factory_for_table(
+    table: &iceberg::table::Table,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<crate::fs::opendal::OpendalRangeReaderFactory, String> {
+    build_factory_for_table_location(table.metadata().location(), object_store_config)
 }
 
 pub(crate) fn normalize_delete_projection_path(
@@ -2299,8 +2443,10 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     use super::{
-        ChangeError, DeletedDataFileRef, IcebergChangePolicySignal, LineageAction,
-        classify_snapshot, normalize_delete_projection_path, policy_signal_from_change_error,
+        ChangeError, DeletedDataFileRef, EqualityDeleteRef, IcebergChangeBatch,
+        IcebergChangePolicySignal, LineageAction, classify_snapshot,
+        delta_source_files_from_change_batch_with_equality_targets,
+        normalize_delete_projection_path, policy_signal_from_change_error,
         scan_deleted_data_file_rows_with_factory, validate_replace_snapshot,
     };
 
@@ -2316,6 +2462,57 @@ mod tests {
     use crate::sql::{Literal, SqlType, TableColumnDef};
 
     use super::plan_changes;
+
+    #[test]
+    fn delta_source_files_carries_preplanned_equality_delete_targets() {
+        let batch = IcebergChangeBatch {
+            previous_snapshot_id: 10,
+            current_snapshot_id: 11,
+            inserts: Vec::new(),
+            deletes: Vec::new(),
+            equality_deletes: vec![EqualityDeleteRef {
+                delete_file_path: "eq-delete.parquet".to_string(),
+                delete_file_size: 123,
+                record_count: None,
+                equality_ids: vec![1],
+                sequence_number: Some(7),
+                partition_spec_id: None,
+                partition_key: None,
+                partition_values: Vec::new(),
+            }],
+            deleted_data_files: Vec::new(),
+        };
+        let mut equality_targets = HashMap::new();
+        equality_targets.insert(
+            "eq-delete.parquet".to_string(),
+            vec![
+                crate::exec::node::iceberg_delta_scan::EqualityDeleteTargetData {
+                    data_file_path: "data.parquet".to_string(),
+                    data_file_size: 456,
+                    data_file_first_row_id: Some(1000),
+                    data_file_sequence_number: Some(6),
+                },
+            ],
+        );
+
+        let files =
+            delta_source_files_from_change_batch_with_equality_targets(&batch, &equality_targets)
+                .expect("delta source files");
+        assert_eq!(files.len(), 1);
+        let crate::exec::node::iceberg_delta_scan::DeltaSourceRole::EqualityDelete {
+            equality_field_ids,
+            targets,
+        } = &files[0].role
+        else {
+            panic!("expected equality-delete role");
+        };
+        assert_eq!(equality_field_ids, &vec![1]);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].data_file_path, "data.parquet");
+        assert_eq!(targets[0].data_file_size, 456);
+        assert_eq!(targets[0].data_file_first_row_id, Some(1000));
+        assert_eq!(targets[0].data_file_sequence_number, Some(6));
+    }
 
     #[test]
     fn replace_validation_policy_signal_is_full_refresh() {

@@ -3417,8 +3417,8 @@ fn build_iceberg_partitions_payload(files: &[IcebergDataFileInfo]) -> Result<Str
 /// `PlanNodeKind::Scan` whose `TableDef` carries the synthetic
 /// `ScanSource::IcebergDeltaTable` storage. Codegen recognizes this
 /// storage variant and emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`
-/// (rather than `HDFS_SCAN_NODE`); the lowering layer resolves the
-/// actual change file list via `connector::iceberg::changes::plan_changes`.
+/// (rather than `HDFS_SCAN_NODE`). Refresh/codegen expands the storage
+/// variant into a typed explicit payload; lower only consumes that payload.
 fn plan_iceberg_delta_scan(
     rel: IcebergDeltaScanRelation,
     factory: &mut ColumnRefFactory,

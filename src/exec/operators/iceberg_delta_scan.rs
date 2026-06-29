@@ -34,7 +34,8 @@ use arrow::record_batch::RecordBatch;
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::chunk::Chunk;
 use crate::exec::node::iceberg_delta_scan::{
-    DeltaSourceFile, DeltaSourceRole, IcebergDeltaScanNode, PositionDeleteSourceData,
+    DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, IcebergDeltaScanNode,
+    PositionDeleteSourceData,
 };
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -239,7 +240,6 @@ fn build_data_column_projection_plan(
     // __change_op) are synthesized at the operator level; only data slots
     // correspond to iceberg schema fields and need field-id projection.
     let slots = node.output_chunk_schema.slots();
-    let current_schema = node.iceberg_runtime.base_table.metadata().current_schema();
     let mut targets = Vec::new();
     for slot in slots {
         let name = slot.name();
@@ -251,20 +251,29 @@ fn build_data_column_projection_plan(
         {
             continue;
         }
-        let nested = current_schema
-            .field_by_name(name)
-            .or_else(|| current_schema.field_by_name_case_insensitive(name))
+        let column = node
+            .iceberg_runtime
+            .table
+            .data_columns
+            .iter()
+            .find(|column| column.name == name)
+            .or_else(|| {
+                node.iceberg_runtime
+                    .table
+                    .data_columns
+                    .iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(name))
+            })
             .ok_or_else(|| {
                 format!(
                     "iceberg delta-scan codegen tuple references column `{}` that is not in \
-                     the current iceberg schema (schema_id={})",
+                     the planned iceberg data-column descriptor",
                     name,
-                    current_schema.schema_id(),
                 )
             })?;
         targets.push(IcebergDataColumnTarget {
             name: name.to_string(),
-            field_id: nested.id,
+            field_id: column.field_id,
             expected_data_type: slot.data_type().clone(),
             nullable: slot.nullable(),
         });
@@ -447,8 +456,8 @@ fn open_scanner_for_role(
         }
         DeltaSourceRole::EqualityDelete {
             equality_field_ids,
-            targets: _,
-        } => open_equality_delete_scanner(node, &file, equality_field_ids),
+            targets,
+        } => open_equality_delete_scanner(node, &file, equality_field_ids, targets),
         DeltaSourceRole::DeletedDataFile {
             previous_data_file_visibility,
         } => open_deleted_data_file_scanner(node, &file, previous_data_file_visibility),
@@ -538,10 +547,10 @@ fn open_data_file_scanner(
     node: &IcebergDeltaScanNode,
     file: &DeltaSourceFile,
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
-    let batches = crate::connector::iceberg::changes::scan_one_added_data_file(
+    let batches = crate::connector::iceberg::changes::scan_one_added_data_file_with_factory(
         &file.path,
         file.size,
-        &node.iceberg_runtime.base_table,
+        node.iceberg_runtime.object_store_factory.as_ref(),
         node.object_store_config.as_ref(),
     )?;
     // Iceberg v3 row-lineage data files always carry `first_row_id` on the
@@ -715,12 +724,12 @@ fn open_position_delete_scanner(
     })?;
     let lineage = position_delete_lineage_lookup(delete_side);
     let rows = crate::connector::iceberg::changes::scan_position_delete_rows_for_targets(
-        &node.iceberg_runtime.base_table,
         &delete_refs,
         &lineage,
         &delete_side.deleted_data_file_paths,
         &delete_side.previously_deleted_positions_per_file,
         node.iceberg_runtime.object_store_factory.as_ref(),
+        &node.iceberg_runtime.file_io,
         node.object_store_config.as_ref(),
     )?;
     Ok(Box::new(PositionDeleteScanner {
@@ -756,6 +765,7 @@ fn open_equality_delete_scanner(
     node: &IcebergDeltaScanNode,
     file: &DeltaSourceFile,
     equality_field_ids: &[i32],
+    targets: &[EqualityDeleteTargetData],
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
     let delete = crate::connector::iceberg::changes::EqualityDeleteRef {
         delete_file_path: file.path.clone(),
@@ -768,10 +778,9 @@ fn open_equality_delete_scanner(
         partition_values: Vec::new(),
     };
     let rows =
-        crate::connector::iceberg::changes::scan_equality_delete_rows_for_one_with_v3_lineage_at(
-            &node.iceberg_runtime.base_table,
+        crate::connector::iceberg::changes::scan_equality_delete_rows_for_targets_with_v3_lineage(
             &delete,
-            node.to_snapshot_id,
+            targets,
             node.iceberg_runtime.object_store_factory.as_ref(),
             node.object_store_config.as_ref(),
         )?;
@@ -857,9 +866,9 @@ fn open_deleted_data_file_scanner(
         first_row_id: Some(resolved_first_row_id),
         data_sequence_number: Some(resolved_data_sequence_number),
     };
-    let rows = crate::connector::iceberg::changes::scan_one_deleted_data_file(
-        &node.iceberg_runtime.base_table,
+    let rows = crate::connector::iceberg::changes::scan_one_deleted_data_file_with_factory(
         &deleted_file,
+        node.iceberg_runtime.object_store_factory.as_ref(),
         node.object_store_config.as_ref(),
         &delete_side.previous_delete_visibility,
     )?;
