@@ -71,6 +71,7 @@ pub fn eval_string_function(
         "group_concat" => super::group_concat::eval_group_concat(arena, expr, args, chunk),
         "hex" => super::hex::eval_hex(arena, expr, args, chunk),
         "initcap" => super::initcap::eval_initcap(arena, expr, args, chunk),
+        "join_row_key" => super::join_row_key::eval_join_row_key(arena, expr, args, chunk),
         "instr" => super::locate_ops::eval_instr(arena, expr, args, chunk),
         "left" => super::left_right_ops::eval_left(arena, expr, args, chunk),
         "length" => super::length_ops::eval_length(arena, expr, args, chunk),
@@ -135,6 +136,7 @@ static STRING_FUNCTIONS: &[(&str, &str)] = &[
     ("group_concat", "group_concat"),
     ("hex", "hex"),
     ("initcap", "initcap"),
+    ("join_row_key", "join_row_key"),
     ("instr", "instr"),
     ("lcase", "lower"),
     ("left", "left"),
@@ -258,6 +260,11 @@ static STRING_METADATA: &[FunctionMeta] = &[
         name: "initcap",
         min_args: 1,
         max_args: 1,
+    },
+    FunctionMeta {
+        name: "join_row_key",
+        min_args: 4,
+        max_args: 4,
     },
     FunctionMeta {
         name: "instr",

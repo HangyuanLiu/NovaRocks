@@ -33,6 +33,7 @@ mod format_bytes;
 mod group_concat;
 mod hex;
 mod initcap;
+mod join_row_key;
 mod left_right_ops;
 mod length_ops;
 mod locate_ops;

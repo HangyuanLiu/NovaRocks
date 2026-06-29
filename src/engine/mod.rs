@@ -2794,7 +2794,10 @@ fn execute_query_direct_for_explicit_exception(
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     reason: DirectExecutionReason,
 ) -> Result<QueryResult, String> {
-    physical = collapse_distribution_enforcers_for_single_fragment(physical);
+    physical = collapse_distribution_enforcers_for_single_fragment(
+        physical,
+        matches!(reason, DirectExecutionReason::RuntimeLocalTerminalSink),
+    );
     let build_result = if let Some(mv_refresh_ctx) = mv_refresh_ctx {
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
             &physical,
@@ -2818,15 +2821,134 @@ fn execute_query_direct_for_explicit_exception(
 }
 
 fn collapse_distribution_enforcers_for_single_fragment(
+    node: crate::sql::optimizer::PhysicalPlanNode,
+    inline_ctes: bool,
+) -> crate::sql::optimizer::PhysicalPlanNode {
+    let mut scalar_arena = node.execution_props.scalar_arena.as_deref().cloned();
+    let mut cte_bindings = Vec::new();
+    let mut collapsed = collapse_distribution_enforcers_for_single_fragment_inner(
+        node,
+        inline_ctes,
+        &mut scalar_arena,
+        &mut cte_bindings,
+    );
+    if let Some(scalar_arena) = scalar_arena {
+        crate::sql::optimizer::physical_plan::attach_scalar_arena(
+            &mut collapsed,
+            std::sync::Arc::new(scalar_arena),
+        );
+    }
+    collapsed
+}
+
+#[derive(Clone)]
+struct DirectLocalCteBinding {
+    cte_id: crate::sql::analysis::cte::CteId,
+    plan: crate::sql::optimizer::PhysicalPlanNode,
+    output_columns: Vec<crate::sql::analysis::OutputColumn>,
+}
+
+fn collapse_distribution_enforcers_for_single_fragment_inner(
     mut node: crate::sql::optimizer::PhysicalPlanNode,
+    inline_ctes: bool,
+    scalar_arena: &mut Option<crate::sql::optimizer::scalar::ScalarArena>,
+    cte_bindings: &mut Vec<DirectLocalCteBinding>,
 ) -> crate::sql::optimizer::PhysicalPlanNode {
     use crate::sql::optimizer::operator::{JoinDistribution, Operator};
     use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 
+    if inline_ctes && matches!(&node.op, Operator::PhysicalCTEAnchor(_)) && node.children.len() == 2
+    {
+        let mut children = std::mem::take(&mut node.children).into_iter();
+        let produce = children.next().expect("cte produce child");
+        let consume = children.next().expect("cte consume child");
+        let original_produce = produce.clone();
+        let original_consume = consume.clone();
+        if let Operator::PhysicalCTEProduce(produce_op) = &produce.op
+            && produce.children.len() == 1
+        {
+            let produce_template = produce.clone();
+            let mut produce_children = produce.children.into_iter();
+            let produce_child = produce_children.next().expect("cte produce single child");
+            let produce_child = collapse_distribution_enforcers_for_single_fragment_inner(
+                produce_child,
+                inline_ctes,
+                scalar_arena,
+                cte_bindings,
+            );
+            let output_columns = if produce_op.output_columns.is_empty() {
+                produce_child.output_columns.clone()
+            } else {
+                produce_op.output_columns.clone()
+            };
+            if let Some(plan) = project_direct_local_columns(
+                produce_child,
+                &output_columns,
+                None,
+                &produce_template,
+                scalar_arena,
+            ) {
+                cte_bindings.push(DirectLocalCteBinding {
+                    cte_id: produce_op.cte_id,
+                    plan,
+                    output_columns,
+                });
+                let result = collapse_distribution_enforcers_for_single_fragment_inner(
+                    consume,
+                    inline_ctes,
+                    scalar_arena,
+                    cte_bindings,
+                );
+                cte_bindings.pop();
+                return result;
+            }
+        }
+        node.children = vec![original_produce, original_consume];
+    }
+
+    if inline_ctes
+        && let Operator::PhysicalCTEConsume(consume_op) = &node.op
+        && node.children.is_empty()
+        && let Some(binding) = cte_bindings
+            .iter()
+            .rev()
+            .find(|binding| binding.cte_id == consume_op.cte_id)
+    {
+        if let Some(plan) = project_direct_local_columns(
+            binding.plan.clone(),
+            &consume_op.output_columns,
+            Some(consume_op.alias.clone()),
+            &node,
+            scalar_arena,
+        ) {
+            return plan;
+        }
+    }
+
+    if inline_ctes
+        && let Operator::PhysicalCTEProduce(_) = &node.op
+        && node.children.len() == 1
+    {
+        let child = node.children.into_iter().next().expect("single child");
+        return collapse_distribution_enforcers_for_single_fragment_inner(
+            child,
+            inline_ctes,
+            scalar_arena,
+            cte_bindings,
+        );
+    }
+
     node.children = node
         .children
         .into_iter()
-        .map(collapse_distribution_enforcers_for_single_fragment)
+        .map(|child| {
+            collapse_distribution_enforcers_for_single_fragment_inner(
+                child,
+                inline_ctes,
+                scalar_arena,
+                cte_bindings,
+            )
+        })
         .collect();
 
     if let Operator::PhysicalHashJoin(join) = &mut node.op {
@@ -2842,6 +2964,64 @@ fn collapse_distribution_enforcers_for_single_fragment(
     }
 
     node
+}
+
+fn project_direct_local_columns(
+    mut child: crate::sql::optimizer::PhysicalPlanNode,
+    target_columns: &[crate::sql::analysis::OutputColumn],
+    output_qualifier: Option<String>,
+    template: &crate::sql::optimizer::PhysicalPlanNode,
+    scalar_arena: &mut Option<crate::sql::optimizer::scalar::ScalarArena>,
+) -> Option<crate::sql::optimizer::PhysicalPlanNode> {
+    use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
+    use crate::sql::optimizer::scalar::ScalarNode;
+
+    if child.output_columns.len() != target_columns.len() {
+        return None;
+    }
+    if child
+        .output_columns
+        .iter()
+        .zip(target_columns)
+        .all(|(source, target)| source.column_id == target.column_id)
+    {
+        child.output_columns = target_columns.to_vec();
+        return Some(child);
+    }
+
+    let arena = scalar_arena.as_mut()?;
+    let mut items = Vec::with_capacity(target_columns.len());
+    for (source, target) in child.output_columns.iter().zip(target_columns) {
+        let expr = arena.intern(
+            ScalarNode::ColumnRef(source.column_id),
+            source.data_type.clone(),
+            source.nullable,
+        );
+        arena.remember_project_output_display(
+            target.column_id,
+            output_qualifier.clone(),
+            target.name.clone(),
+        );
+        items.push(ScalarProjectItem {
+            expr,
+            output_name: target.name.clone(),
+            output_column_id: target.column_id,
+            expr_display: None,
+        });
+    }
+
+    Some(crate::sql::optimizer::PhysicalPlanNode {
+        op: Operator::PhysicalProject(ProjectOp {
+            items,
+            output_qualifier,
+        }),
+        children: vec![child],
+        stats: template.stats.clone(),
+        output_columns: target_columns.to_vec(),
+        execution_props: template.execution_props.clone(),
+        build_runtime_filters: template.build_runtime_filters.clone(),
+        probe_runtime_filters: template.probe_runtime_filters.clone(),
+    })
 }
 
 /// Live BE count for broadcast fanout (1 FE + N BE distributed baseline).
@@ -4927,7 +5107,7 @@ path = "{metadata_path}"
             probe_runtime_filters: Vec::new(),
         };
 
-        let collapsed = super::collapse_distribution_enforcers_for_single_fragment(plan);
+        let collapsed = super::collapse_distribution_enforcers_for_single_fragment(plan, false);
 
         assert!(matches!(
             &collapsed.op,
@@ -4950,6 +5130,203 @@ path = "{metadata_path}"
         assert!(matches!(
             &collapsed.children[1].op,
             Operator::PhysicalValues(_)
+        ));
+    }
+
+    #[test]
+    fn single_fragment_collapse_inlines_cte_anchors() {
+        use crate::sql::analysis::OutputColumn;
+        use crate::sql::column_id::ColumnId;
+        use crate::sql::optimizer::operator::{
+            CTEAnchorOp, CTEConsumeOp, CTEProduceOp, Operator, ValuesOp,
+        };
+        use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
+        use crate::sql::optimizer::statistics::Statistics;
+        use arrow::datatypes::DataType;
+
+        fn stats() -> Statistics {
+            Statistics {
+                output_row_count: 0.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            }
+        }
+
+        fn col(id: u32, name: &str) -> OutputColumn {
+            OutputColumn {
+                column_id: ColumnId::new_for_test(id),
+                name: name.to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            }
+        }
+
+        fn contains_cte(node: &PhysicalPlanNode) -> bool {
+            matches!(
+                node.op,
+                Operator::PhysicalCTEAnchor(_)
+                    | Operator::PhysicalCTEProduce(_)
+                    | Operator::PhysicalCTEConsume(_)
+            ) || node.children.iter().any(contains_cte)
+        }
+
+        let produced = col(1, "id");
+        let consumed = col(2, "id");
+        let values = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: Vec::new(),
+                columns: vec![produced.clone()],
+            }),
+            children: Vec::new(),
+            stats: stats(),
+            output_columns: vec![produced.clone()],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let produce = PhysicalPlanNode {
+            op: Operator::PhysicalCTEProduce(CTEProduceOp {
+                cte_id: 7,
+                output_columns: vec![produced.clone()],
+            }),
+            children: vec![values],
+            stats: stats(),
+            output_columns: vec![produced],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let consume = PhysicalPlanNode {
+            op: Operator::PhysicalCTEConsume(CTEConsumeOp {
+                cte_id: 7,
+                alias: "c".to_string(),
+                output_columns: vec![consumed.clone()],
+            }),
+            children: Vec::new(),
+            stats: stats(),
+            output_columns: vec![consumed.clone()],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id: 7 }),
+            children: vec![produce, consume],
+            stats: stats(),
+            output_columns: vec![consumed.clone()],
+            execution_props: PlanExecutionProps {
+                scalar_arena: Some(std::sync::Arc::new(
+                    crate::sql::optimizer::scalar::ScalarArena::new(),
+                )),
+                ..PlanExecutionProps::default()
+            },
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let collapsed = super::collapse_distribution_enforcers_for_single_fragment(plan, true);
+
+        assert!(!contains_cte(&collapsed));
+        assert_eq!(collapsed.output_columns.len(), 1);
+        assert_eq!(collapsed.output_columns[0].column_id, consumed.column_id);
+        assert_eq!(collapsed.output_columns[0].name, consumed.name);
+        assert!(matches!(&collapsed.op, Operator::PhysicalProject(_)));
+        assert!(matches!(
+            &collapsed.children[0].op,
+            Operator::PhysicalValues(_)
+        ));
+    }
+
+    #[test]
+    fn single_fragment_collapse_preserves_cte_when_inline_disabled() {
+        use crate::sql::analysis::OutputColumn;
+        use crate::sql::column_id::ColumnId;
+        use crate::sql::optimizer::operator::{
+            CTEAnchorOp, CTEConsumeOp, CTEProduceOp, Operator, ValuesOp,
+        };
+        use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
+        use crate::sql::optimizer::statistics::Statistics;
+        use arrow::datatypes::DataType;
+
+        fn stats() -> Statistics {
+            Statistics {
+                output_row_count: 0.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            }
+        }
+
+        let column = OutputColumn {
+            column_id: ColumnId::new_for_test(1),
+            name: "id".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            is_internal: false,
+        };
+        let values = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: Vec::new(),
+                columns: vec![column.clone()],
+            }),
+            children: Vec::new(),
+            stats: stats(),
+            output_columns: vec![column.clone()],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let produce = PhysicalPlanNode {
+            op: Operator::PhysicalCTEProduce(CTEProduceOp {
+                cte_id: 7,
+                output_columns: vec![column.clone()],
+            }),
+            children: vec![values],
+            stats: stats(),
+            output_columns: vec![column.clone()],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let consume = PhysicalPlanNode {
+            op: Operator::PhysicalCTEConsume(CTEConsumeOp {
+                cte_id: 7,
+                alias: "c".to_string(),
+                output_columns: vec![column.clone()],
+            }),
+            children: Vec::new(),
+            stats: stats(),
+            output_columns: vec![column.clone()],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id: 7 }),
+            children: vec![produce, consume],
+            stats: stats(),
+            output_columns: vec![column],
+            execution_props: PlanExecutionProps {
+                scalar_arena: Some(std::sync::Arc::new(
+                    crate::sql::optimizer::scalar::ScalarArena::new(),
+                )),
+                ..PlanExecutionProps::default()
+            },
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let collapsed = super::collapse_distribution_enforcers_for_single_fragment(plan, false);
+
+        assert!(matches!(&collapsed.op, Operator::PhysicalCTEAnchor(_)));
+        assert_eq!(collapsed.children.len(), 2);
+        assert!(matches!(
+            &collapsed.children[0].op,
+            Operator::PhysicalCTEProduce(_)
+        ));
+        assert!(matches!(
+            &collapsed.children[1].op,
+            Operator::PhysicalCTEConsume(_)
         ));
     }
 
