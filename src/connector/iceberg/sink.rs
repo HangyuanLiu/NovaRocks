@@ -63,7 +63,7 @@ use crate::connector::iceberg::report::{
 };
 use crate::connector::iceberg::report_wire::emit_iceberg_writer_report;
 use crate::connector::iceberg::sink_plan::{
-    IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkPlan, PositionDeleteDataFilePartition,
+    IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkPlan,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
