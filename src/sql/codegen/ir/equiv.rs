@@ -30,14 +30,14 @@ mod tests {
     };
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::{
-        FragmentBuildResult, FragmentEdgeKind, FragmentId, MultiFragmentBuildResult,
-        PlanBuildResult,
+        DirectExecPlan, FragmentBuildResult, FragmentEdgeKind, FragmentId,
+        MultiFragmentBuildResult, PlanBuildResult,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggMode, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, DecodeOp, ExceptOp,
-        FilterOp, GenerateSeriesOp, IntersectOp, JoinDistribution, LimitOp, Operator,
-        PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalHashJoinEqCondition,
+        AggMode, AggregateStateMergeOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
+        DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, IntersectOp, JoinDistribution, LimitOp,
+        Operator, PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalHashJoinEqCondition,
         PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp, ScanDictionaryColumn,
         ScanOp, SortOp, TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
     };
@@ -553,6 +553,30 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_state_merge_direct_exec_builds_ir_fragment_structure() {
+        let ctx = aggregate_refresh_context_for_test();
+        let plan = aggregate_state_merge_plan_for_context(&ctx);
+        let distributed = build_distributed_plan_with_mv_refresh_ctx(
+            "aggregate_state_merge_direct_exec",
+            plan,
+            &ConnectorRegistry::new(),
+            Some(&ctx),
+        );
+
+        let merge = root_aggregate_state_merge_direct_exec(
+            "aggregate_state_merge_direct_exec",
+            &distributed,
+        );
+        assert_aggregate_state_merge_payload(
+            "aggregate_state_merge_direct_exec",
+            merge,
+            &ctx,
+            None,
+        );
+        assert_multi_fragment_ir_structure("aggregate_state_merge_direct_exec", &distributed, 1);
+    }
+
+    #[test]
     fn mv_target_state_scan_builds_ir_fragment_structure() {
         let ctx = scan_refresh_context_for_test();
         let plan = target_state_scan_plan_for_context(&ctx);
@@ -565,6 +589,15 @@ mod tests {
             Some(&ctx),
         );
 
+        let root = fragment_by_id(
+            "mv_target_state_scan",
+            &distributed,
+            distributed.root_fragment_id,
+        );
+        assert!(
+            root.direct_exec.is_none(),
+            "target-state scan must exercise regular fragment build"
+        );
         assert_multi_fragment_ir_structure("mv_target_state_scan", &distributed, 1);
     }
 
@@ -585,7 +618,94 @@ mod tests {
             Some(&ctx),
         );
 
+        let root = fragment_by_id(
+            "mv_version_scan",
+            &distributed,
+            distributed.root_fragment_id,
+        );
+        assert!(
+            root.direct_exec.is_none(),
+            "version scan must exercise regular fragment build"
+        );
         assert_multi_fragment_ir_structure("mv_version_scan", &distributed, 1);
+    }
+
+    #[test]
+    fn branch_union_aggregate_direct_exec_builds_ir_fragment_structure() {
+        let ctx = aggregate_refresh_context_for_test();
+        let state_names = aggregate_state_names_for_context(&ctx);
+        let branch0 = branch_union_project_for_test(
+            aggregate_merge_plan_for_test(
+                values_plan_for_columns(aggregate_physical_columns_for_test()),
+                values_plan_for_columns(aggregate_delta_state_columns_for_test()),
+                state_names.clone(),
+            ),
+            0,
+            1000,
+            None,
+        );
+        let branch0_scalars = branch0
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("branch0 test plan must carry scalar arena")
+            .clone();
+        let branch1 = branch_union_project_for_test(
+            aggregate_merge_plan_for_test(
+                values_plan_for_columns(aggregate_physical_columns_for_test()),
+                values_plan_for_columns(aggregate_delta_state_columns_for_test()),
+                state_names,
+            ),
+            1,
+            1100,
+            Some(&branch0_scalars),
+        );
+        let output_columns = branch0.output_columns.clone();
+        let union_scalars = branch1
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("branch1 test plan must carry scalar arena")
+            .clone();
+        let plan = physical_node_with_scalars(
+            Operator::PhysicalUnion(UnionOp {
+                all: true,
+                output_columns: output_columns.clone(),
+                child_output_columns: vec![
+                    branch0.output_columns.clone(),
+                    branch1.output_columns.clone(),
+                ],
+            }),
+            vec![branch0, branch1],
+            output_columns,
+            union_scalars,
+        );
+        let distributed = build_distributed_plan_with_mv_refresh_ctx(
+            "branch_union_aggregate_direct_exec",
+            plan,
+            &ConnectorRegistry::new(),
+            Some(&ctx),
+        );
+
+        let inputs = root_union_all_direct_exec("branch_union_aggregate_direct_exec", &distributed);
+        assert_eq!(
+            inputs.len(),
+            2,
+            "branch_union_aggregate_direct_exec: branch union should keep both direct-exec inputs"
+        );
+        for (idx, (input, expected_branch_id)) in inputs.iter().zip([0, 1]).enumerate() {
+            let merge = plan_result_aggregate_state_merge_direct_exec(
+                &format!("branch_union_aggregate_direct_exec: input {idx}"),
+                input,
+            );
+            assert_aggregate_state_merge_payload(
+                &format!("branch_union_aggregate_direct_exec: input {idx}"),
+                merge,
+                &ctx,
+                Some(expected_branch_id),
+            );
+        }
+        assert_multi_fragment_ir_structure("branch_union_aggregate_direct_exec", &distributed, 1);
     }
 
     #[test]
@@ -791,6 +911,7 @@ mod tests {
         let node_ids = assert_plan_node_ids_unique(
             &format!("{case_name}: fragment {}", fragment.fragment_id),
             &fragment.plan,
+            fragment.direct_exec.is_some(),
         );
         for (cte_id, exchange_node_id) in &fragment.cte_exchange_nodes {
             assert!(
@@ -802,21 +923,33 @@ mod tests {
             );
             assert_exchange_node(case_name, fragment, *exchange_node_id, "cte exchange node");
         }
+        if let Some(direct_exec) = fragment.direct_exec.as_deref() {
+            assert_direct_exec_ir_structure(
+                &format!("{case_name}: fragment {} direct_exec", fragment.fragment_id),
+                direct_exec,
+            );
+        }
         node_ids
     }
 
     fn assert_plan_build_result_ir_structure(case_name: &str, result: &PlanBuildResult) {
-        assert_plan_node_ids_unique(case_name, &result.plan);
+        assert_plan_node_ids_unique(case_name, &result.plan, result.direct_exec.is_some());
+        if let Some(direct_exec) = result.direct_exec.as_deref() {
+            assert_direct_exec_ir_structure(&format!("{case_name}: direct_exec"), direct_exec);
+        }
     }
 
     fn assert_plan_node_ids_unique(
         case_name: &str,
         plan: &crate::thrift::plan_nodes::TPlan,
+        allows_direct_exec: bool,
     ) -> BTreeSet<i32> {
-        assert!(
-            !plan.nodes.is_empty(),
-            "{case_name}: normal fragment plan must contain nodes"
-        );
+        if !allows_direct_exec {
+            assert!(
+                !plan.nodes.is_empty(),
+                "{case_name}: normal fragment plan must contain nodes"
+            );
+        }
         assert_plan_node_ids_follow_preorder(case_name, plan);
         let mut node_ids = BTreeSet::new();
         for node in &plan.nodes {
@@ -1054,6 +1187,174 @@ mod tests {
         }
     }
 
+    fn assert_direct_exec_ir_structure(case_name: &str, direct_exec: &DirectExecPlan) {
+        match direct_exec {
+            DirectExecPlan::AggregateStateMerge {
+                old_input,
+                delta_input,
+                ..
+            } => {
+                assert_plan_build_result_ir_structure(
+                    &format!("{case_name}: aggregate merge old input"),
+                    old_input,
+                );
+                assert_plan_build_result_ir_structure(
+                    &format!("{case_name}: aggregate merge delta input"),
+                    delta_input,
+                );
+            }
+            DirectExecPlan::AggregateStatePhysicalize { input, .. } => {
+                assert_plan_build_result_ir_structure(
+                    &format!("{case_name}: aggregate physicalize input"),
+                    input,
+                );
+            }
+            DirectExecPlan::UnionAll { inputs } => {
+                assert!(
+                    !inputs.is_empty(),
+                    "{case_name}: direct union must contain child inputs"
+                );
+                for (idx, input) in inputs.iter().enumerate() {
+                    assert_plan_build_result_ir_structure(
+                        &format!("{case_name}: direct union input {idx}"),
+                        input,
+                    );
+                }
+            }
+        }
+    }
+
+    fn root_aggregate_state_merge_direct_exec<'a>(
+        case_name: &str,
+        result: &'a MultiFragmentBuildResult,
+    ) -> &'a DirectExecPlan {
+        let root = fragment_by_id(case_name, result, result.root_fragment_id);
+        let direct_exec = root
+            .direct_exec
+            .as_deref()
+            .unwrap_or_else(|| panic!("{case_name}: expected root direct_exec"));
+        assert_aggregate_state_merge_variant(case_name, direct_exec);
+        direct_exec
+    }
+
+    fn root_union_all_direct_exec<'a>(
+        case_name: &str,
+        result: &'a MultiFragmentBuildResult,
+    ) -> &'a [PlanBuildResult] {
+        let root = fragment_by_id(case_name, result, result.root_fragment_id);
+        let Some(DirectExecPlan::UnionAll { inputs }) = root.direct_exec.as_deref() else {
+            panic!("{case_name}: expected root UnionAll direct_exec");
+        };
+        inputs
+    }
+
+    fn plan_result_aggregate_state_merge_direct_exec<'a>(
+        case_name: &str,
+        result: &'a PlanBuildResult,
+    ) -> &'a DirectExecPlan {
+        let direct_exec = result
+            .direct_exec
+            .as_deref()
+            .unwrap_or_else(|| panic!("{case_name}: expected direct_exec"));
+        assert_aggregate_state_merge_variant(case_name, direct_exec);
+        direct_exec
+    }
+
+    fn assert_aggregate_state_merge_variant(case_name: &str, direct_exec: &DirectExecPlan) {
+        assert!(
+            matches!(direct_exec, DirectExecPlan::AggregateStateMerge { .. }),
+            "{case_name}: expected AggregateStateMerge direct_exec"
+        );
+    }
+
+    fn assert_aggregate_state_merge_payload(
+        case_name: &str,
+        direct_exec: &DirectExecPlan,
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+        expected_branch_id: Option<i32>,
+    ) {
+        let DirectExecPlan::AggregateStateMerge {
+            layout,
+            branch_id,
+            pruning_limits,
+            ..
+        } = direct_exec
+        else {
+            panic!("{case_name}: expected AggregateStateMerge direct_exec");
+        };
+
+        assert_eq!(
+            *branch_id, expected_branch_id,
+            "{case_name}: aggregate merge branch_id"
+        );
+        assert_eq!(
+            *pruning_limits, ctx.pruning_limits,
+            "{case_name}: aggregate merge pruning limits"
+        );
+        if expected_branch_id.is_some() {
+            assert_eq!(
+                *pruning_limits,
+                crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(),
+                "{case_name}: branch aggregate merge must use default pruning limits"
+            );
+        }
+        assert_aggregate_merge_layout_matches_ctx(case_name, layout, ctx);
+    }
+
+    fn assert_aggregate_merge_layout_matches_ctx(
+        case_name: &str,
+        layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) {
+        let expected_layout = ctx
+            .rewrite
+            .aggregate_shape_and_layout_for_execution()
+            .expect("aggregate layout")
+            .1;
+        assert_eq!(
+            layout.row_id_column, expected_layout.row_id_column,
+            "{case_name}: aggregate layout row-id column"
+        );
+        assert_eq!(
+            layout.visible_columns, expected_layout.visible_columns,
+            "{case_name}: aggregate layout visible columns"
+        );
+        assert_eq!(
+            layout.state_columns, expected_layout.state_columns,
+            "{case_name}: aggregate layout state columns"
+        );
+        assert_eq!(
+            layout.group_key_source_indexes, expected_layout.group_key_source_indexes,
+            "{case_name}: aggregate layout group-key source indexes"
+        );
+        assert_eq!(
+            layout.aggregate_input_types, expected_layout.aggregate_input_types,
+            "{case_name}: aggregate layout aggregate input types"
+        );
+        assert_eq!(
+            layout.physical_columns, expected_layout.physical_columns,
+            "{case_name}: aggregate layout physical columns"
+        );
+        assert_eq!(
+            layout
+                .visible_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["region", "c", "s"],
+            "{case_name}: aggregate layout visible column names"
+        );
+        assert_eq!(
+            layout
+                .state_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["__agg_state_c", "__agg_state_s"],
+            "{case_name}: aggregate layout state column names"
+        );
+    }
+
     fn assert_non_empty_scan_ranges(case_name: &str, result: &MultiFragmentBuildResult) {
         let root = fragment_by_id(case_name, result, result.root_fragment_id);
         let ranges = &root.exec_params.per_node_scan_ranges;
@@ -1139,6 +1440,29 @@ mod tests {
             }),
             Vec::new(),
             columns,
+        )
+    }
+
+    fn aggregate_state_names_for_context(
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) -> Vec<String> {
+        ctx.rewrite
+            .aggregate_shape_and_layout_for_execution()
+            .expect("aggregate layout")
+            .1
+            .state_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect()
+    }
+
+    fn aggregate_state_merge_plan_for_context(
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) -> PhysicalPlanNode {
+        aggregate_merge_plan_for_test(
+            values_plan_for_columns(aggregate_physical_columns_for_test()),
+            values_plan_for_columns(aggregate_delta_state_columns_for_test()),
+            aggregate_state_names_for_context(ctx),
         )
     }
 
@@ -1400,6 +1724,29 @@ mod tests {
         )
     }
 
+    fn aggregate_merge_plan_for_test(
+        old_child: PhysicalPlanNode,
+        delta_child: PhysicalPlanNode,
+        aggregate_state_names: Vec<String>,
+    ) -> PhysicalPlanNode {
+        let output_columns = vec![
+            output_col(1, "region", DataType::Utf8, true),
+            output_col(2, "c", DataType::Int64, false),
+            output_col(3, "s", DataType::Int64, true),
+            output_col(4, "__change_op", DataType::Int8, false),
+        ];
+        physical_node(
+            Operator::PhysicalAggregateStateMerge(AggregateStateMergeOp {
+                group_key_names: vec!["region".to_string()],
+                aggregate_state_names,
+                change_op_column: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                output_columns: output_columns.clone(),
+            }),
+            vec![old_child, delta_child],
+            output_columns,
+        )
+    }
+
     fn aggregate_physical_columns_for_test() -> Vec<OutputColumn> {
         vec![
             output_col(10, "__row_id__", DataType::Utf8, false),
@@ -1409,6 +1756,78 @@ mod tests {
             output_col(14, "__agg_state_c", DataType::Binary, false),
             output_col(15, "__agg_state_s", DataType::Binary, false),
         ]
+    }
+
+    fn aggregate_delta_state_columns_for_test() -> Vec<OutputColumn> {
+        vec![
+            output_col(21, "region", DataType::Utf8, true),
+            output_col(22, "__agg_state_c", DataType::Binary, false),
+            output_col(23, "__agg_state_s", DataType::Binary, false),
+        ]
+    }
+
+    fn branch_union_project_for_test(
+        merge: PhysicalPlanNode,
+        branch_id: i32,
+        output_id_base: u32,
+        seed_scalars: Option<&ScalarArena>,
+    ) -> PhysicalPlanNode {
+        let mut items = merge
+            .output_columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: column.column_id,
+                        qualifier: None,
+                        column: column.name.clone(),
+                    },
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                },
+                output_name: column.name.clone(),
+                output_column_id: ColumnId::new_for_test(output_id_base + idx as u32),
+            })
+            .collect::<Vec<_>>();
+        let branch_column_id = ColumnId::new_for_test(output_id_base + items.len() as u32);
+        items.push(ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            output_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
+                .to_string(),
+            output_column_id: branch_column_id,
+        });
+        let output_columns = items
+            .iter()
+            .map(|item| OutputColumn {
+                column_id: item.output_column_id,
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+                is_internal: false,
+            })
+            .collect::<Vec<_>>();
+        let mut scalars = seed_scalars
+            .cloned()
+            .unwrap_or_else(|| scalars_from_children(std::slice::from_ref(&merge)));
+        physical_node_with_scalars(
+            Operator::PhysicalProject(ProjectOp {
+                items: intern_project_items(&mut scalars, &items),
+                output_qualifier: None,
+            }),
+            vec![merge],
+            output_columns,
+            scalars,
+        )
+    }
+
+    fn aggregate_refresh_context_for_test()
+    -> crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+        mv_refresh_context_for_test(Some(99))
     }
 
     fn scan_refresh_context_for_test() -> crate::engine::mv::refresh_context::IcebergMvRefreshContext

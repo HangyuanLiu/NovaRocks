@@ -942,6 +942,17 @@ pub(crate) fn projected_target_state_column_names(
     {
         names.push(scope.branch_id_column_name.clone());
     }
+    for name in [
+        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+    ] {
+        if !names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(name))
+        {
+            names.push(name.to_string());
+        }
+    }
     names
 }
 
@@ -1946,6 +1957,8 @@ mod tests {
                 "k".to_string(),
                 "visible_sum".to_string(),
                 "sum_v".to_string(),
+                "_file".to_string(),
+                "_pos".to_string(),
             ]
         );
     }
