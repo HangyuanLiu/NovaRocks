@@ -45,7 +45,7 @@ use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID, ICEBERG_MV_PROP_APPLY_KEY_SOURCE,
     ICEBERG_MV_PROP_HIDDEN_COLUMNS, apply_key_table_column, branch_id_table_column,
     ensure_base_row_lineage_contract, find_apply_key_field_id_by_column,
-    iceberg_mv_physical_select_sql, join_apply_key_table_column, load_target_apply_locator_inputs,
+    iceberg_mv_physical_select_sql, join_apply_key_table_column,
 };
 use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, MvBaseRef, MvStorageEngine,
@@ -9531,12 +9531,6 @@ fn first_refresh_iceberg_join_mv(
     let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
         target_table: target_table.clone(),
         collector: Arc::clone(&collector),
-        locator_state: None,
-        apply_key_column: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
-        apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
-        partition_filter: ctx.affected_partitions_to_target_partition_filter(),
-        pruning_limits: ctx.pruning_limits,
-        partition_derivation: merge_sink_partition_derivation(&ctx.rewrite.schema_contract),
     };
     let merge_sink =
         crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
@@ -10960,12 +10954,6 @@ fn execute_append_only_join_delta_branches(
         let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
             target_table: target_table.clone(),
             collector: Arc::clone(&collector),
-            locator_state: None,
-            apply_key_column: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
-            apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
-            partition_filter: ctx.affected_partitions_to_target_partition_filter(),
-            pruning_limits: ctx.pruning_limits,
-            partition_derivation: merge_sink_partition_derivation(&ctx.rewrite.schema_contract),
         };
         let merge_sink =
             crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
@@ -11255,43 +11243,9 @@ fn execute_join_delta_branches(
         &staging_branch,
         CommitOpKind::RowDeltaDv,
     );
-    let (existing_deletes_by_file, referenced_data_file_partitions) =
-        load_target_apply_locator_inputs(target_entry, &target_table).map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            )
-        })?;
     let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
         target_table: target_table.clone(),
         collector: Arc::clone(&collector),
-        locator_state: Some(crate::engine::mv::iceberg_merge_sink::TargetLocatorState {
-            existing_deletes_by_file,
-            referenced_data_file_partitions,
-        }),
-        apply_key_column: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
-        apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
-        partition_filter: affected_partitions.to_target_partition_filter(),
-        pruning_limits: state.mv_refresh_pruning_limits,
-        partition_derivation: merge_sink_partition_derivation(
-            mv_definition.schema_contract.as_ref().ok_or_else(|| {
-                handle_iceberg_mv_commit_error(
-                    state,
-                    target,
-                    target_entry,
-                    &staging_branch,
-                    refresh_id,
-                    format!(
-                        "iceberg join MV {}.{}.{} missing schema contract for merge sink",
-                        target.catalog, target.namespace, target.table
-                    ),
-                )
-            })?,
-        ),
     };
     let merge_sink =
         crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
@@ -11607,9 +11561,9 @@ fn normalize_join_branch_snapshot_tables(
 /// in a one-shot `InMemoryCatalog` via `build_iceberg_table_def_for_delta_scan`,
 /// and execute the resulting `Query` through `execute_query_with_options`
 /// with a custom `IcebergMergeSinkFactory`. The sink fans inserts to a
-/// streaming data-file writer and routes DELETE rows through the A9 target
-/// locator, accumulating into a shared `IcebergCommitCollector`. After the
-/// pipeline completes, the refresh driver hands the populated collector to
+/// streaming data-file writer and routes DELETE rows carrying `_file` / `_pos`
+/// into a shared `IcebergCommitCollector`. After the pipeline completes, the
+/// refresh driver hands the populated collector to
 /// `commit_iceberg_mv_with_populated_collector` for the staging-branch commit,
 /// then publishes and finalizes.
 ///
@@ -11671,22 +11625,6 @@ fn rewrite_refresh_table_uuid_map(
         .iter()
         .map(|change| (change.base_ref.fqn(), change.current_table_uuid.to_string()))
         .collect()
-}
-
-fn merge_sink_partition_derivation(
-    contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-) -> Option<crate::engine::mv::iceberg_merge_sink::BoundTargetPartitionDerivation> {
-    let spec = crate::engine::mv::partition::resolve_partition_derivation_spec(contract)
-        .ok()
-        .flatten()?;
-    let bound_fields =
-        crate::engine::mv::partition::bind_spec_to_target_visible_columns(&spec, contract).ok()?;
-    Some(
-        crate::engine::mv::iceberg_merge_sink::BoundTargetPartitionDerivation {
-            target_spec_id: spec.target_spec_id,
-            bound_fields,
-        },
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11998,39 +11936,18 @@ fn incremental_refresh_iceberg_mv_with_changes(
     // any catalog qualifier before binding.
     crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
 
-    // 6. Pre-load the A9 target locator inputs when the base change batch
+    // 6. Use the RowDelta/DV commit path whenever the base change batch
     // carries DELETE-side rows or the IMV rewrite can emit change-stream
-    // DELETE rows while applying existing target groups.
-    let needs_locator_state =
+    // DELETE rows while applying existing target groups. Row location itself
+    // must be carried by the plan as `_file` / `_pos`.
+    let can_emit_delete_rows =
         has_delete_changes || apply_key.preload_locator_for_change_stream_deletes;
-    let locator_state = if needs_locator_state {
-        let inputs = match load_target_apply_locator_inputs(target_entry, &target_table) {
-            Ok(v) => v,
-            Err(err) => {
-                return Err(handle_iceberg_mv_commit_error(
-                    state,
-                    target,
-                    target_entry,
-                    &staging_branch,
-                    refresh_id,
-                    err,
-                ));
-            }
-        };
-        let (existing_deletes_by_file, referenced_data_file_partitions) = inputs;
-        Some(crate::engine::mv::iceberg_merge_sink::TargetLocatorState {
-            existing_deletes_by_file,
-            referenced_data_file_partitions,
-        })
-    } else {
-        None
-    };
 
     // 7. Build the shared commit collector + merge sink factory. The sink
     // injects WrittenFile / PositionDeleteGroup descriptors into the
     // collector during pipeline execution; the commit driver below
     // consumes the populated collector.
-    let op_kind = if needs_locator_state {
+    let op_kind = if can_emit_delete_rows {
         CommitOpKind::RowDeltaDv
     } else {
         CommitOpKind::FastAppend
@@ -12040,15 +11957,6 @@ fn incremental_refresh_iceberg_mv_with_changes(
     let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
         target_table: target_table.clone(),
         collector: Arc::clone(&collector),
-        locator_state,
-        apply_key_column: apply_key.column_name.to_string(),
-        apply_key_value_type: apply_key.value_type,
-        // Prune the delete-side locator to the same affected-partition
-        // allow-list the planner derived for the target-state read side.
-        // `Known` => AllowList; join/union/unpartitioned/NotDerived => None.
-        partition_filter: ctx.affected_partitions_to_target_partition_filter(),
-        pruning_limits: ctx.pruning_limits,
-        partition_derivation: merge_sink_partition_derivation(&ctx.rewrite.schema_contract),
     };
     let merge_sink =
         crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
