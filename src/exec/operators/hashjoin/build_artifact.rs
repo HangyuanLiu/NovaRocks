@@ -34,6 +34,7 @@ use super::build_requirements::{
 };
 use super::join_hash_map::build_store::BuildStore;
 use super::join_hash_map::method::JoinHashMap;
+use crate::exec::chunk::Chunk;
 use crate::exec::runtime_filter::LocalRuntimeFilterSet;
 
 #[derive(Clone)]
@@ -107,6 +108,59 @@ impl JoinBuildArtifact {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct BuildView {
+    artifact: Arc<JoinBuildArtifact>,
+    required: BuildComponentRequirements,
+}
+
+impl BuildView {
+    pub(crate) fn new(
+        artifact: Arc<JoinBuildArtifact>,
+        required: BuildComponentRequirements,
+    ) -> Result<Self, String> {
+        artifact.validate_components(required)?;
+        Ok(Self { artifact, required })
+    }
+
+    pub(crate) fn build_table(&self) -> Option<Arc<JoinHashMap>> {
+        self.artifact.build_table.clone()
+    }
+
+    pub(crate) fn build_chunk(&self, context: &'static str) -> Result<Arc<Chunk>, String> {
+        let store = self.artifact.build_store.as_ref().ok_or_else(|| {
+            format!(
+                "hash join row payload required for {context} but missing; required={:?} provided={:?}",
+                self.required, self.artifact.provided
+            )
+        })?;
+        Ok(store.chunk())
+    }
+
+    pub(crate) fn optional_build_chunk(&self) -> Option<Arc<Chunk>> {
+        self.artifact
+            .build_store
+            .as_ref()
+            .map(|store| store.chunk())
+    }
+
+    pub(crate) fn build_row_count(&self) -> usize {
+        self.artifact.build_row_count
+    }
+
+    pub(crate) fn build_has_null_key(&self) -> bool {
+        self.artifact.build_has_null_key
+    }
+
+    pub(crate) fn build_null_key_rows(&self) -> Option<Arc<Vec<u32>>> {
+        self.artifact.build_null_key_rows.clone()
+    }
+
+    pub(crate) fn runtime_filters(&self) -> Option<Arc<LocalRuntimeFilterSet>> {
+        self.artifact.runtime_filters.clone()
     }
 }
 
@@ -259,5 +313,29 @@ mod tests {
             .validate_components(null_key_rows_requirements())
             .expect_err("nonempty build must carry required null-key rows");
         assert!(err.contains("null-key rows required"));
+    }
+
+    #[test]
+    fn build_view_build_chunk_reports_missing_payload_context() {
+        let artifact = Arc::new(JoinBuildArtifact::new(
+            no_lookup_requirements(),
+            None,
+            None,
+            3,
+            false,
+            None,
+            None,
+        ));
+        let view = BuildView::new(artifact, no_lookup_requirements()).expect("build view");
+
+        let err = view
+            .build_chunk("test context")
+            .expect_err("missing payload should report context");
+        assert!(
+            err.contains("hash join row payload required for test context but missing"),
+            "err={err}"
+        );
+        assert!(err.contains("required="), "err={err}");
+        assert!(err.contains("provided="), "err={err}");
     }
 }
