@@ -18,6 +18,7 @@ pub(crate) enum BranchDeltaSide {
 
 pub(crate) const JOIN_LEFT_ROW_ID_COLUMN: &str = "__nova_left_row_id";
 pub(crate) const JOIN_RIGHT_ROW_ID_COLUMN: &str = "__nova_right_row_id";
+pub(crate) const JOIN_DELTA_TARGET_LOCATOR_TABLE: &str = "__nr_join_delta_target_locator";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JoinDeltaBranchPlan {
@@ -127,6 +128,22 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries(
     left_uuid: &str,
     right_uuid: &str,
 ) -> Result<sqlparser::ast::Query, String> {
+    rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
+        query,
+        branch_queries,
+        left_uuid,
+        right_uuid,
+        JOIN_DELTA_TARGET_LOCATOR_TABLE,
+    )
+}
+
+pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
+    query: &sqlparser::ast::Query,
+    branch_queries: Vec<sqlparser::ast::Query>,
+    left_uuid: &str,
+    right_uuid: &str,
+    target_locator_relation: &str,
+) -> Result<sqlparser::ast::Query, String> {
     if branch_queries.is_empty() {
         return Err("join delta coalesce rewrite requires at least one branch".to_string());
     }
@@ -195,7 +212,17 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries(
         ])
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!("WITH {ctes} SELECT {final_select} FROM __nr_join_delta_coalesced");
+    let key = crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN;
+    let sql = format!(
+        "WITH {ctes} \
+         SELECT {final_select} \
+         FROM __nr_join_delta_coalesced coalesced \
+         LEFT JOIN {target_locator_relation} tgt \
+         ON coalesced.net < 0 AND coalesced.{key} = tgt.{key} \
+         WHERE assert_true(\
+         coalesced.net >= 0 OR (tgt._file IS NOT NULL AND tgt._pos IS NOT NULL), \
+         'join delta DELETE row missing target locator')"
+    );
     let mut parsed = parse_query_from_sql(&sql).map_err(|err| {
         format!("join delta coalesce rewrite generated invalid SQL: {err}; sql={sql}")
     })?;
@@ -376,6 +403,9 @@ fn is_reserved_payload_projection_name(normalized: &str) -> bool {
             | "__nr_join_delta_payload_coalesced"
             | "__nr_join_delta_key_shape"
             | "__nr_join_delta_coalesced"
+            | "__nr_join_delta_target_locator"
+            | "_file"
+            | "_pos"
     ) || normalized == crate::exec::change_op::CHANGE_OP_COLUMN
         || normalized == JOIN_LEFT_ROW_ID_COLUMN
         || normalized == JOIN_RIGHT_ROW_ID_COLUMN
@@ -449,22 +479,35 @@ fn valid_payload_select_list(payload_columns: &[sqlparser::ast::Ident]) -> Strin
 fn final_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
     let mut items = payload_columns
         .iter()
-        .map(|ident| format!("{ident} AS {ident}"))
+        .map(|ident| format!("coalesced.{ident} AS {ident}"))
         .collect::<Vec<_>>();
-    items.push(
-        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
-    );
+    let key = crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN;
+    items.push(format!("coalesced.{key} AS {key}"));
     items.push(format!(
-        "CAST(CASE WHEN net > 0 THEN {} ELSE {} END AS TINYINT) AS {}",
+        "CAST(CASE WHEN coalesced.net > 0 THEN {} ELSE {} END AS TINYINT) AS {}",
         crate::exec::change_op::CHANGE_OP_INSERT,
         crate::exec::change_op::CHANGE_OP_DELETE,
         crate::exec::change_op::CHANGE_OP_COLUMN,
     ));
+    items.push("tgt._file AS _file".to_string());
+    items.push("tgt._pos AS _pos".to_string());
     items.join(", ")
+}
+
+pub(crate) fn join_delta_target_locator_relation(namespace: &str) -> String {
+    format!(
+        "{}.{}",
+        quote_sql_identifier(namespace),
+        quote_sql_identifier(JOIN_DELTA_TARGET_LOCATOR_TABLE)
+    )
 }
 
 fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("`{}`", identifier.replace('`', "``"))
 }
 
 fn parse_query_from_sql(sql: &str) -> Result<sqlparser::ast::Query, String> {
@@ -872,9 +915,31 @@ mod tests {
         );
         assert_sql_contains(
             &rendered,
-            "CAST(CASE WHEN net > 0 THEN 1 ELSE -1 END AS TINYINT) AS __change_op",
+            "CAST(CASE WHEN coalesced.net > 0 THEN 1 ELSE -1 END AS TINYINT) AS __change_op",
         );
         assert_sql_contains(&rendered, "__nova_join_row_key");
+    }
+
+    #[test]
+    fn join_delta_coalesce_final_select_joins_target_locator_for_delete_positions() {
+        let rendered = rewrite_simple_join_delta_coalesce(
+            "select l.id, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id",
+        )
+        .expect("coalesce rewrite")
+        .to_string();
+
+        assert_sql_contains(&rendered, "LEFT JOIN");
+        assert_sql_contains(&rendered, "__nr_join_delta_target_locator");
+        assert_sql_contains(
+            &rendered,
+            "coalesced.__nova_join_row_key = tgt.__nova_join_row_key",
+        );
+        assert_sql_contains(&rendered, "tgt._file AS _file");
+        assert_sql_contains(&rendered, "tgt._pos AS _pos");
+        assert_sql_contains(
+            &rendered,
+            "assert_true(coalesced.net >= 0 OR (tgt._file IS NOT NULL AND tgt._pos IS NOT NULL), 'join delta DELETE row missing target locator')",
+        );
     }
 
     #[test]
@@ -943,7 +1008,7 @@ mod tests {
         assert_sql_contains(&rendered, "HAVING SUM(__change_op) <> 0");
         assert_sql_contains(
             &rendered,
-            "CAST(CASE WHEN net > 0 THEN 1 ELSE -1 END AS TINYINT) AS __change_op",
+            "CAST(CASE WHEN coalesced.net > 0 THEN 1 ELSE -1 END AS TINYINT) AS __change_op",
         );
     }
 
