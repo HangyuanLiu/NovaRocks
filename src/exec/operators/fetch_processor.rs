@@ -36,7 +36,7 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::row_position::RowPositionDescriptor;
+use crate::exec::row_position::{RowPositionDescriptor, RowPositionType};
 use crate::proto as internal_proto;
 #[cfg(feature = "compat")]
 use crate::runtime::lookup::decode_column_ipc;
@@ -46,7 +46,6 @@ use crate::runtime::lookup::{
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::thrift::descriptors;
-use crate::thrift::descriptors::TRowPositionType;
 
 /// Factory for fetch processors that resolve deferred row/slot materialization.
 pub struct FetchProcessorFactory {
@@ -167,7 +166,7 @@ impl FetchProcessor {
                 continue;
             }
             let fetch_ref_slots = &row_pos_desc.fetch_ref_slots;
-            let is_lake = row_pos_desc.row_position_type == TRowPositionType::LAKE_ROW_POSITION;
+            let is_lake = row_pos_desc.row_position_type == RowPositionType::Lake;
             let expected_ref_slots = if is_lake { 3 } else { 2 };
             if fetch_ref_slots.len() != expected_ref_slots {
                 return Err(format!(

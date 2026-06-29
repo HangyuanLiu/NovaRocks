@@ -1317,22 +1317,22 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
             .map(|(resolved, original)| {
                 let file_format = match original.file_format {
                     crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat::Parquet => {
-                        crate::thrift::descriptors::THdfsFileFormat::PARQUET
+                        crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet
                     }
                     crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat::Puffin => {
-                        crate::thrift::descriptors::THdfsFileFormat::PARQUET
+                        crate::connector::iceberg::delete_file::IcebergFileFormat::Puffin
                     }
                 };
                 let file_content = match original.file_content {
                     crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Position => {
-                        crate::thrift::types::TIcebergFileContent::POSITION_DELETES
+                        crate::connector::iceberg::delete_file::IcebergFileContent::PositionDeletes
                     }
                     crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Equality => {
-                        crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES
+                        crate::connector::iceberg::delete_file::IcebergFileContent::EqualityDeletes
                     }
                 };
                 Ok(
-                    crate::connector::iceberg::position_delete::IcebergDeleteFileSpec {
+                    crate::connector::iceberg::delete_file::IcebergDeleteFileSpec {
                         path: resolved.path.clone(),
                         file_format,
                         file_content,
@@ -1437,22 +1437,22 @@ fn load_delete_visibility_from_data_files(
             .map(|(resolved, original)| {
                 let file_format = match original.file_format {
                     crate::sql::catalog::IcebergDeleteFileFormat::Parquet => {
-                        crate::thrift::descriptors::THdfsFileFormat::PARQUET
+                        crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet
                     }
                     crate::sql::catalog::IcebergDeleteFileFormat::Puffin => {
-                        crate::thrift::descriptors::THdfsFileFormat::PARQUET
+                        crate::connector::iceberg::delete_file::IcebergFileFormat::Puffin
                     }
                 };
                 let file_content = match original.file_content {
                     crate::sql::catalog::IcebergDeleteFileContent::Position => {
-                        crate::thrift::types::TIcebergFileContent::POSITION_DELETES
+                        crate::connector::iceberg::delete_file::IcebergFileContent::PositionDeletes
                     }
                     crate::sql::catalog::IcebergDeleteFileContent::Equality => {
-                        crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES
+                        crate::connector::iceberg::delete_file::IcebergFileContent::EqualityDeletes
                     }
                 };
                 Ok(
-                    crate::connector::iceberg::position_delete::IcebergDeleteFileSpec {
+                    crate::connector::iceberg::delete_file::IcebergDeleteFileSpec {
                         path: resolved.path.clone(),
                         file_format,
                         file_content,
@@ -1879,10 +1879,10 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use sqlparser::ast as sqlast;
 
-    use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
+    use crate::connector::iceberg::delete_file::{
+        IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
+    };
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
-    use crate::thrift::descriptors::THdfsFileFormat;
-    use crate::thrift::types::TIcebergFileContent;
 
     fn temp_dir_for(name: &str) -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();
@@ -2253,8 +2253,8 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string(),
-            file_format: THdfsFileFormat::PARQUET,
-            file_content: TIcebergFileContent::EQUALITY_DELETES,
+            file_format: IcebergFileFormat::Parquet,
+            file_content: IcebergFileContent::EqualityDeletes,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,

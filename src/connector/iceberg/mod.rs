@@ -23,6 +23,7 @@ pub mod commit;
 pub(crate) mod compact;
 pub(crate) mod data_writer;
 pub(crate) mod default_value;
+pub mod delete_file;
 pub mod equality_delete;
 pub mod metadata;
 pub(crate) mod metadata_read;

@@ -17,7 +17,6 @@
 use arrow::datatypes::Field;
 
 use crate::common::ids::SlotId;
-use crate::thrift::descriptors;
 
 // Iceberg virtual column names (no trailing underscore)
 pub const ROW_SOURCE_ID_COL: &str = "_row_source_id";
@@ -95,9 +94,15 @@ pub fn is_change_op(name: &str) -> bool {
     name.eq_ignore_ascii_case(CHANGE_OP_COL)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RowPositionType {
+    Iceberg,
+    Lake,
+}
+
 #[derive(Clone, Debug)]
 pub struct RowPositionDescriptor {
-    pub row_position_type: descriptors::TRowPositionType,
+    pub row_position_type: RowPositionType,
     pub row_source_slot: SlotId,
     pub fetch_ref_slots: Vec<SlotId>,
     pub lookup_ref_slots: Vec<SlotId>,
@@ -161,6 +166,27 @@ pub struct LakeRowPositionSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_position_type_is_thrift_free_domain_enum() {
+        assert_eq!(RowPositionType::Iceberg, RowPositionType::Iceberg);
+        assert_ne!(RowPositionType::Iceberg, RowPositionType::Lake);
+    }
+
+    #[test]
+    fn row_position_descriptor_carries_internal_type() {
+        let desc = RowPositionDescriptor {
+            row_position_type: RowPositionType::Lake,
+            row_source_slot: SlotId::new(1),
+            fetch_ref_slots: vec![SlotId::new(2)],
+            lookup_ref_slots: vec![SlotId::new(3)],
+        };
+
+        assert_eq!(desc.row_position_type, RowPositionType::Lake);
+        assert_eq!(desc.row_source_slot, SlotId::new(1));
+        assert_eq!(desc.fetch_ref_slots, vec![SlotId::new(2)]);
+        assert_eq!(desc.lookup_ref_slots, vec![SlotId::new(3)]);
+    }
 
     #[test]
     fn is_iceberg_row_id_recognizes_name_case_insensitive() {

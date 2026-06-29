@@ -19,9 +19,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::cache::ExternalDataCacheRangeOptions;
-use crate::connector::iceberg::position_delete::{
-    IcebergDeleteFileSpec, convert_scan_range_delete_files, load_position_deletes,
-};
+use crate::connector::iceberg::delete_file::{IcebergDeleteFileSpec, IcebergFileContent};
+use crate::connector::iceberg::position_delete::load_position_deletes;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp};
 use crate::formats::{FileFormatConfig, build_format_iter};
@@ -31,9 +30,9 @@ use crate::thrift::descriptors;
 use crate::thrift::internal_service;
 
 fn delete_files_have_position_deletes(delete_files: &[IcebergDeleteFileSpec]) -> bool {
-    delete_files.iter().any(|file| {
-        file.file_content == crate::thrift::types::TIcebergFileContent::POSITION_DELETES
-    })
+    delete_files
+        .iter()
+        .any(|file| file.file_content == IcebergFileContent::PositionDeletes)
 }
 
 fn apply_parquet_pruning_gate_for_delete_files(
@@ -108,6 +107,38 @@ impl HdfsScanOp {
 
     fn next_incremental_scan_range_id(&self) -> i32 {
         self.next_scan_range_id.fetch_add(1, Ordering::AcqRel)
+    }
+
+    fn lowered_delete_files_for_range(
+        &self,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<IcebergDeleteFileSpec>, String> {
+        if let Some(range) =
+            self.cfg.ranges.iter().find(|range| {
+                range.path == path && range.offset == offset && range.length == length
+            })
+        {
+            return Ok(range.delete_files.clone());
+        }
+
+        let same_path_delete_file_count = self
+            .cfg
+            .ranges
+            .iter()
+            .filter(|range| range.path == path && !range.delete_files.is_empty())
+            .count();
+        if same_path_delete_file_count > 0 {
+            return Err(format!(
+                "incremental HDFS range cannot safely reuse lowered Iceberg delete files for \
+                 path={path} offset={offset} length={length}; found \
+                 {same_path_delete_file_count} same-path lowered range(s) with delete files but \
+                 no exact match"
+            ));
+        }
+
+        Ok(Vec::new())
     }
 
     fn ordered_initial_ranges(&self) -> Vec<&FileScanRange> {
@@ -330,10 +361,7 @@ impl ScanOp for HdfsScanOp {
                 (-1, None)
             };
 
-            let delete_files = convert_scan_range_delete_files(
-                &format!("HDFS_SCAN incremental morsel (scan_range_id={scan_range_id})"),
-                hdfs_range,
-            )?;
+            let delete_files = self.lowered_delete_files_for_range(&path, offset, length)?;
             let ivm_change_op = extract_incremental_change_op(scan_range_id, hdfs_range)?;
             // data_sequence_number is not carried in THdfsScanRange (FE
             // incremental path). It is populated at initial lowering time from
@@ -464,9 +492,10 @@ impl ScanOp for HdfsScanOp {
         else {
             return Ok(None);
         };
-        if !delete_files.iter().any(|file| {
-            file.file_content == crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES
-        }) {
+        if !delete_files
+            .iter()
+            .any(|file| file.file_content == IcebergFileContent::EqualityDeletes)
+        {
             return Ok(None);
         }
         let mut loader_ranges: Vec<crate::fs::scan_context::FileScanRange> =
@@ -604,7 +633,9 @@ mod tests {
     use crate::cache::{CacheOptions, DataCacheManager};
     use crate::common::ids::SlotId;
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
-    use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
+    use crate::connector::iceberg::delete_file::{
+        IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
+    };
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::node::scan::{ScanMorsel, ScanOp};
     use crate::formats::parquet::{
@@ -760,10 +791,10 @@ mod tests {
         DataCacheManager::instance().external_context(cache_options)
     }
 
-    fn test_delete_file(file_content: types::TIcebergFileContent) -> IcebergDeleteFileSpec {
+    fn test_delete_file(file_content: IcebergFileContent) -> IcebergDeleteFileSpec {
         IcebergDeleteFileSpec {
             path: "delete.parquet".to_string(),
-            file_format: descriptors::THdfsFileFormat::PARQUET,
+            file_format: IcebergFileFormat::Parquet,
             file_content,
             length: Some(1),
             content_offset: None,
@@ -825,9 +856,7 @@ mod tests {
 
         apply_parquet_pruning_gate_for_delete_files(
             &mut parquet_cfg,
-            &[test_delete_file(
-                types::TIcebergFileContent::POSITION_DELETES,
-            )],
+            &[test_delete_file(IcebergFileContent::PositionDeletes)],
         );
 
         assert!(!parquet_cfg.enable_page_index);
@@ -841,9 +870,7 @@ mod tests {
 
         apply_parquet_pruning_gate_for_delete_files(
             &mut parquet_cfg,
-            &[test_delete_file(
-                types::TIcebergFileContent::EQUALITY_DELETES,
-            )],
+            &[test_delete_file(IcebergFileContent::EqualityDeletes)],
         );
 
         assert!(parquet_cfg.enable_page_index);
@@ -944,6 +971,128 @@ mod tests {
             } => {
                 assert_eq!(*scan_range_id, 9);
                 assert_eq!(*first_row_id, Some(2000));
+            }
+            other => panic!("unexpected morsel: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn incremental_hdfs_ranges_reuse_lowered_delete_files() {
+        let cfg = HdfsScanConfig {
+            ranges: vec![FileScanRange {
+                path: "s3://bucket/path/file.parquet".to_string(),
+                file_len: 100,
+                offset: 0,
+                length: 100,
+                scan_range_id: -1,
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+                included_positions: None,
+                external_datacache: None,
+                delete_files: vec![test_delete_file(IcebergFileContent::PositionDeletes)],
+            }],
+            original_range_count: 1,
+            has_more: true,
+            limit: None,
+            profile_label: None,
+            format: None,
+            object_store_config: None,
+            iceberg_table_locations: std::collections::HashMap::new(),
+            query_global_dicts: Default::default(),
+        };
+        let op = HdfsScanOp::new(cfg);
+
+        let morsels = op
+            .build_incremental_morsels(&[
+                make_hdfs_range("s3://bucket/path/file.parquet", None),
+                make_end_marker(false),
+            ])
+            .expect("build incremental morsels");
+
+        match &morsels.morsels[0] {
+            ScanMorsel::FileRange { delete_files, .. } => {
+                assert_eq!(delete_files.len(), 1);
+                assert_eq!(
+                    delete_files[0].file_content,
+                    IcebergFileContent::PositionDeletes
+                );
+            }
+            other => panic!("unexpected morsel: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn incremental_hdfs_ranges_reject_same_path_delete_files_without_exact_match() {
+        let cfg = HdfsScanConfig {
+            ranges: vec![FileScanRange {
+                path: "s3://bucket/path/file.parquet".to_string(),
+                file_len: 100,
+                offset: 64,
+                length: 100,
+                scan_range_id: -1,
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+                included_positions: None,
+                external_datacache: None,
+                delete_files: vec![test_delete_file(IcebergFileContent::PositionDeletes)],
+            }],
+            original_range_count: 1,
+            has_more: true,
+            limit: None,
+            profile_label: None,
+            format: None,
+            object_store_config: None,
+            iceberg_table_locations: std::collections::HashMap::new(),
+            query_global_dicts: Default::default(),
+        };
+        let op = HdfsScanOp::new(cfg);
+
+        let err = op
+            .build_incremental_morsels(&[make_hdfs_range("s3://bucket/path/file.parquet", None)])
+            .expect_err("same-path delete files without exact lowered range must fail closed");
+
+        assert!(err.contains("cannot safely reuse lowered Iceberg delete files"));
+        assert!(err.contains("s3://bucket/path/file.parquet"));
+        assert!(err.contains("offset=0"));
+        assert!(err.contains("length=100"));
+    }
+
+    #[test]
+    fn incremental_hdfs_ranges_allow_empty_delete_files_without_same_path_delete_files() {
+        let cfg = HdfsScanConfig {
+            ranges: vec![FileScanRange {
+                path: "s3://bucket/path/other.parquet".to_string(),
+                file_len: 100,
+                offset: 0,
+                length: 100,
+                scan_range_id: -1,
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+                included_positions: None,
+                external_datacache: None,
+                delete_files: vec![test_delete_file(IcebergFileContent::PositionDeletes)],
+            }],
+            original_range_count: 1,
+            has_more: true,
+            limit: None,
+            profile_label: None,
+            format: None,
+            object_store_config: None,
+            iceberg_table_locations: std::collections::HashMap::new(),
+            query_global_dicts: Default::default(),
+        };
+        let op = HdfsScanOp::new(cfg);
+
+        let morsels = op
+            .build_incremental_morsels(&[make_hdfs_range("s3://bucket/path/file.parquet", None)])
+            .expect("build incremental morsels");
+
+        match &morsels.morsels[0] {
+            ScanMorsel::FileRange { delete_files, .. } => {
+                assert!(delete_files.is_empty());
             }
             other => panic!("unexpected morsel: {:?}", other),
         }

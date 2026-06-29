@@ -18,8 +18,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
+use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
 use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
-use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
 use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;

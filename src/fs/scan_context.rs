@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::cache::ExternalDataCacheRangeOptions;
-use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
+use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 use crate::fs::path::{ScanPathScheme, classify_scan_paths, resolve_opendal_paths};
 use crate::novarocks_logging::debug;

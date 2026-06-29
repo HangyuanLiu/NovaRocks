@@ -29,11 +29,11 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, arrow_reader::ParquetRecordBatchReaderBuilder};
 
 use crate::cache::CachedRangeReader;
-use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
+use crate::connector::iceberg::delete_file::{
+    IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
+};
 use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
 use crate::fs::opendal::OpendalRangeReaderFactory;
-use crate::thrift::descriptors::THdfsFileFormat;
-use crate::thrift::types::TIcebergFileContent;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum EqualityValue {
@@ -68,10 +68,10 @@ pub(crate) fn load_equality_delete_sets(
 ) -> Result<Vec<EqualityDeleteSet>, String> {
     let mut sets = Vec::new();
     for spec in specs {
-        if spec.file_content != TIcebergFileContent::EQUALITY_DELETES {
+        if spec.file_content != IcebergFileContent::EqualityDeletes {
             continue;
         }
-        if spec.file_format != THdfsFileFormat::PARQUET {
+        if spec.file_format != IcebergFileFormat::Parquet {
             return Err(format!(
                 "iceberg equality-delete file {} has unsupported format {:?}; only PARQUET is supported",
                 spec.path, spec.file_format
@@ -453,10 +453,10 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
-    use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
+    use crate::connector::iceberg::delete_file::{
+        IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
+    };
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
-    use crate::thrift::descriptors::THdfsFileFormat;
-    use crate::thrift::types::TIcebergFileContent;
 
     fn temp_dir_for(name: &str) -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();
@@ -585,8 +585,8 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string(),
-            file_format: THdfsFileFormat::PARQUET,
-            file_content: TIcebergFileContent::EQUALITY_DELETES,
+            file_format: IcebergFileFormat::Parquet,
+            file_content: IcebergFileContent::EqualityDeletes,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,
@@ -624,8 +624,8 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string(),
-            file_format: THdfsFileFormat::PARQUET,
-            file_content: TIcebergFileContent::EQUALITY_DELETES,
+            file_format: IcebergFileFormat::Parquet,
+            file_content: IcebergFileContent::EqualityDeletes,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,
@@ -661,8 +661,8 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string(),
-            file_format: THdfsFileFormat::PARQUET,
-            file_content: TIcebergFileContent::EQUALITY_DELETES,
+            file_format: IcebergFileFormat::Parquet,
+            file_content: IcebergFileContent::EqualityDeletes,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,
@@ -694,8 +694,8 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string(),
-            file_format: THdfsFileFormat::PARQUET,
-            file_content: TIcebergFileContent::EQUALITY_DELETES,
+            file_format: IcebergFileFormat::Parquet,
+            file_content: IcebergFileContent::EqualityDeletes,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,
@@ -730,8 +730,8 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string(),
-            file_format: THdfsFileFormat::PARQUET,
-            file_content: TIcebergFileContent::EQUALITY_DELETES,
+            file_format: IcebergFileFormat::Parquet,
+            file_content: IcebergFileContent::EqualityDeletes,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,
@@ -768,8 +768,8 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string(),
-            file_format: THdfsFileFormat::PARQUET,
-            file_content: TIcebergFileContent::EQUALITY_DELETES,
+            file_format: IcebergFileFormat::Parquet,
+            file_content: IcebergFileContent::EqualityDeletes,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,
