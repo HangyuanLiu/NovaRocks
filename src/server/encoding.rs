@@ -539,31 +539,13 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{ListBuilder, StringBuilder, TimestampMicrosecondArray};
-    use arrow::datatypes::{Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-    use crate::thrift::types;
-
-    fn array_json_type_desc() -> types::TTypeDesc {
-        types::TTypeDesc::new(vec![
-            types::TTypeNode::new(types::TTypeNodeType::ARRAY, None, None, None),
-            types::TTypeNode::new(
-                types::TTypeNodeType::SCALAR,
-                Some(types::TScalarType::new(
-                    types::TPrimitiveType::JSON,
-                    None,
-                    None,
-                    None,
-                    None,
-                )),
-                None,
-                None,
-            ),
-        ])
-    }
+    use crate::types::logical::{LogicalType, field_with_logical_type};
 
     #[test]
     fn declared_date_timestamp_value_serializes_without_time_component() {
@@ -597,33 +579,38 @@ mod tests {
     }
 
     #[test]
-    fn build_mysql_row_uses_chunk_field_schema_for_array_json() {
+    fn build_mysql_row_uses_arrow_field_metadata_for_array_json() {
         let mut builder = ListBuilder::new(StringBuilder::new());
         builder.values().append_value(r#"{"2:3": null}"#);
         builder.append(true);
-        let array = Arc::new(builder.finish()) as ArrayRef;
+        let raw_array = Arc::new(builder.finish()) as ArrayRef;
+        let payload_field = Field::new(
+            "payload",
+            DataType::List(Arc::new(field_with_logical_type(
+                Field::new("item", DataType::Utf8, true),
+                LogicalType::Json,
+            ))),
+            true,
+        );
+        let array = crate::exec::chunk::type_compatibility::retag_column(
+            &raw_array,
+            payload_field.data_type(),
+        )
+        .expect("retag array with logical metadata");
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "payload",
-                array.data_type().clone(),
-                true,
-            )])),
+            Arc::new(Schema::new(vec![payload_field.clone()])),
             vec![Arc::clone(&array)],
         )
         .expect("batch");
         let chunk = Chunk::new_with_chunk_schema(
             batch,
             Arc::new(
-                ChunkSchema::try_new(vec![
-                    ChunkSlotSchema::try_from_type_desc(
-                        SlotId::new(1),
-                        "payload",
-                        true,
-                        array_json_type_desc(),
-                        None,
-                    )
-                    .expect("slot schema"),
-                ])
+                ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                    SlotId::new(1),
+                    payload_field,
+                    None,
+                    None,
+                )])
                 .expect("chunk schema"),
             ),
         );
