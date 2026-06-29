@@ -36,7 +36,10 @@ use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use super::build_artifact::JoinBuildArtifact;
+use super::build_artifact::{BuildView, JoinBuildArtifact};
+#[cfg(test)]
+use super::build_requirements;
+use super::build_requirements::{BuildComponentRequirements, required_build_components};
 use super::join_hash_map::match_flags::BuildMatchFlags;
 use super::join_hash_map::method::JoinHashMap;
 use super::join_hash_map::search::{JoinSelection, SearchStats, append_cross_selection};
@@ -81,11 +84,14 @@ pub(crate) struct HashJoinProbeCore {
     probe_keys: Vec<ExprId>,
     residual_predicate: Option<ExprId>,
     probe_is_left: bool,
+    has_equi_keys: bool,
     left_chunk_schema: ChunkSchemaRef,
     right_chunk_schema: ChunkSchemaRef,
     join_scope_chunk_schema: ChunkSchemaRef,
     join_scope_schema: SchemaRef,
     build_loaded: bool,
+    build_requirements: Option<BuildComponentRequirements>,
+    build_view: Option<BuildView>,
     build_chunk: Option<Arc<Chunk>>,
     build_null_key_rows: Option<Arc<Vec<u32>>>,
     build_table: Option<Arc<JoinHashMap>>,
@@ -116,6 +122,7 @@ impl HashJoinProbeCore {
         probe_keys: Vec<ExprId>,
         residual_predicate: Option<ExprId>,
         probe_is_left: bool,
+        has_equi_keys: bool,
         left_chunk_schema: ChunkSchemaRef,
         right_chunk_schema: ChunkSchemaRef,
         join_scope_chunk_schema: ChunkSchemaRef,
@@ -126,11 +133,14 @@ impl HashJoinProbeCore {
             probe_keys,
             residual_predicate,
             probe_is_left,
+            has_equi_keys,
             left_chunk_schema,
             right_chunk_schema,
             join_scope_schema: join_scope_chunk_schema.arrow_schema_ref(),
             join_scope_chunk_schema,
             build_loaded: false,
+            build_requirements: None,
+            build_view: None,
             build_chunk: None,
             build_null_key_rows: None,
             build_table: None,
@@ -177,6 +187,19 @@ impl HashJoinProbeCore {
         Self::record_timer_ns(self.output_timer.as_ref(), start);
     }
 
+    fn build_view(&self) -> Result<&BuildView, String> {
+        self.build_view
+            .as_ref()
+            .ok_or_else(|| "hash join build artifact not loaded".to_string())
+    }
+
+    fn require_build_chunk(&self, context: &'static str) -> Result<Option<Arc<Chunk>>, String> {
+        if self.build_partition_row_count == 0 {
+            return Ok(None);
+        }
+        self.build_view()?.build_chunk(context).map(Some)
+    }
+
     pub(crate) fn join_type(&self) -> JoinType {
         self.join_type
     }
@@ -219,20 +242,27 @@ impl HashJoinProbeCore {
         if self.build_loaded {
             return Ok(());
         }
-        self.build_chunk = artifact.build_store.as_ref().map(|store| store.chunk());
-        self.build_null_key_rows = artifact.build_null_key_rows.clone();
-        self.build_table = artifact.build_table.clone();
-        self.runtime_filters = artifact.runtime_filters.clone();
-        self.build_partition_row_count = artifact.build_row_count;
-        self.build_partition_has_null_key = artifact.build_has_null_key;
+        let requirements = required_build_components(
+            self.join_type,
+            self.residual_predicate.is_some(),
+            self.probe_is_left,
+            self.has_equi_keys,
+        );
+        let view = BuildView::new(Arc::clone(&artifact), requirements)?;
+
+        self.build_chunk = view.optional_build_chunk();
+        self.build_null_key_rows = view.build_null_key_rows();
+        self.build_table = view.build_table();
+        self.runtime_filters = view.runtime_filters();
+        self.build_partition_row_count = view.build_row_count();
+        self.build_partition_has_null_key = view.build_has_null_key();
         self.global_build_row_count = global_build_row_count;
         self.global_build_has_null_key = global_build_has_null_key;
-        if matches!(
-            self.join_type,
-            JoinType::FullOuter | JoinType::RightOuter | JoinType::RightSemi | JoinType::RightAnti
-        ) {
-            self.build_matched = Some(BuildMatchFlags::new(artifact.build_row_count));
+        if requirements.requires_match_flags() {
+            self.build_matched = Some(BuildMatchFlags::new(view.build_row_count()));
         }
+        self.build_requirements = Some(requirements);
+        self.build_view = Some(view);
         self.build_loaded = true;
         Ok(())
     }
@@ -678,7 +708,7 @@ impl HashJoinProbeCore {
         &mut self,
         flags: &[bool],
     ) -> Result<Option<RecordBatch>, String> {
-        let Some(build_chunk) = self.build_chunk.as_ref() else {
+        let Some(build_chunk) = self.require_build_chunk("unmatched build output")? else {
             return Ok(None);
         };
         if flags.len() != build_chunk.len() {
@@ -696,14 +726,14 @@ impl HashJoinProbeCore {
         let output_start = std::time::Instant::now();
         let out = if self.probe_is_left {
             crate::exec::operators::hashjoin::join_hash_map::gather::gather_null_left_with_right(
-                build_chunk,
+                &build_chunk,
                 &indices,
                 &self.left_chunk_schema.arrow_schema_ref(),
                 &self.join_scope_schema,
             )?
         } else {
             crate::exec::operators::hashjoin::join_hash_map::gather::gather_left_with_null_right(
-                build_chunk,
+                &build_chunk,
                 &indices,
                 &self.right_chunk_schema.arrow_schema_ref(),
                 &self.join_scope_schema,
@@ -1128,13 +1158,7 @@ impl HashJoinProbeCore {
             }
             return Ok(None);
         };
-        if table.is_empty()
-            || self
-                .build_chunk
-                .as_ref()
-                .map(|chunk| chunk.is_empty())
-                .unwrap_or(true)
-        {
+        if table.is_empty() {
             if is_anti {
                 let batches: Vec<_> = probe_chunks.into_iter().map(|c| c.batch).collect();
                 if batches.is_empty() {
@@ -1188,10 +1212,11 @@ impl HashJoinProbeCore {
                 let residual_matched_rows_before = if let Some(pred) = self.residual_predicate
                     && !selection.is_empty()
                 {
-                    let build_chunk = self
-                        .build_chunk
-                        .clone()
-                        .ok_or_else(|| "semi/anti join build chunk missing".to_string())?;
+                    let Some(build_chunk) =
+                        self.require_build_chunk("semi/anti residual evaluation")?
+                    else {
+                        return Ok(None);
+                    };
                     self.residual_rows_checked = self
                         .residual_rows_checked
                         .saturating_add(stats.lookup_hit_rows);
@@ -1266,6 +1291,10 @@ impl HashJoinProbeCore {
         table: &JoinHashMap,
         is_semi: bool,
     ) -> Result<Option<Chunk>, String> {
+        if let Some(requirements) = self.build_requirements {
+            debug_assert!(!requirements.requires_row_payload());
+        }
+
         let mut output_batches = Vec::new();
         for probe in probe_chunks {
             let search_start = std::time::Instant::now();
@@ -1364,11 +1393,6 @@ impl HashJoinProbeCore {
             .as_ref()
             .map(|rows| rows.as_slice())
             .unwrap_or(&[]);
-        let build_chunk_for_residual = if has_residual {
-            self.build_chunk.clone()
-        } else {
-            None
-        };
 
         let mut output_batches = Vec::new();
         for probe in probe_chunks {
@@ -1415,12 +1439,14 @@ impl HashJoinProbeCore {
                         .residual_group_rows_total
                         .saturating_add(equal_selection.len() as u64);
                     if !equal_selection.is_empty() {
-                        let build_chunk = build_chunk_for_residual.as_ref().ok_or_else(|| {
-                            "null-aware anti join build chunk missing".to_string()
-                        })?;
+                        let Some(build_chunk) =
+                            self.require_build_chunk("null-aware anti residual evaluation")?
+                        else {
+                            return Ok(None);
+                        };
                         self.compact_null_aware_selection(
                             &probe,
-                            build_chunk,
+                            &build_chunk,
                             &mut equal_selection,
                             pred,
                             &mut matched_equal,
@@ -1431,13 +1457,15 @@ impl HashJoinProbeCore {
                 }
 
                 if !flat_build_null_key_rows.is_empty() {
-                    let build_chunk = build_chunk_for_residual
-                        .as_ref()
-                        .ok_or_else(|| "null-aware anti join build chunk missing".to_string())?;
+                    let Some(build_chunk) =
+                        self.require_build_chunk("null-aware anti residual evaluation")?
+                    else {
+                        return Ok(None);
+                    };
                     let probe_rows = (0..probe.len()).map(|row| row as u32).collect::<Vec<_>>();
                     self.compact_cross_selection_in_chunks(
                         &probe,
-                        build_chunk,
+                        &build_chunk,
                         &probe_rows,
                         flat_build_null_key_rows,
                         pred,
@@ -1447,14 +1475,13 @@ impl HashJoinProbeCore {
                     )?;
                 }
 
-                let has_local_build_rows = build_chunk_for_residual
-                    .as_ref()
-                    .map(|chunk| !chunk.is_empty())
-                    .unwrap_or(self.build_partition_row_count > 0);
+                let has_local_build_rows = self.build_partition_row_count > 0;
                 if has_local_build_rows && probe_null_rows.iter().any(|is_null| *is_null) {
-                    let build_chunk = build_chunk_for_residual
-                        .as_ref()
-                        .ok_or_else(|| "null-aware anti join build chunk missing".to_string())?;
+                    let Some(build_chunk) =
+                        self.require_build_chunk("null-aware anti residual evaluation")?
+                    else {
+                        return Ok(None);
+                    };
                     let all_build_rows = (0..build_chunk.len())
                         .map(|row| {
                             u32::try_from(row)
@@ -1468,7 +1495,7 @@ impl HashJoinProbeCore {
                         .collect::<Vec<_>>();
                     self.compact_cross_selection_in_chunks(
                         &probe,
-                        build_chunk,
+                        &build_chunk,
                         &probe_rows,
                         &all_build_rows,
                         pred,
@@ -1638,6 +1665,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
 
+    use super::build_requirements::required_build_components;
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
@@ -1696,6 +1724,7 @@ mod tests {
             crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind::DirectInt { .. }
         ));
         JoinBuildArtifact::new(
+            required_build_components(JoinType::Inner, false, true, true),
             Some(BuildStore::new(build)),
             Some(build_table),
             3,
@@ -1729,13 +1758,180 @@ mod tests {
             crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind::DirectIntSet { .. }
         ));
         JoinBuildArtifact::new(
-            Some(BuildStore::new(build)),
+            required_build_components(JoinType::LeftSemi, false, true, true),
+            None,
             Some(build_table),
             build_row_count,
             false,
             None,
             None,
         )
+    }
+
+    #[test]
+    fn set_build_artifact_rejects_component_contract_mismatch() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let arena = Arc::new(arena);
+
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[100],
+            &[10],
+        );
+        let artifact = Arc::new(direct_set_build_artifact_from_build_chunk(build_chunk));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::Inner,
+            vec![probe_key],
+            None,
+            true,
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+
+        let err = core
+            .set_build_artifact(artifact, 1, false)
+            .expect_err("probe core must validate build artifact contract");
+        assert!(err.contains("component contract mismatch"), "err={err}");
+    }
+
+    #[test]
+    fn residual_left_semi_rejects_missing_row_payload_at_load() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let left_v = arena.push_typed(ExprNode::SlotId(LEFT_V_SLOT_ID), DataType::Int32);
+        let right_w = arena.push_typed(ExprNode::SlotId(RIGHT_W_SLOT_ID), DataType::Int32);
+        let residual = arena.push_typed(ExprNode::Lt(left_v, right_w), DataType::Boolean);
+        let arena = Arc::new(arena);
+
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[10, 20],
+            &[100, 200],
+        );
+        let mut table =
+            JoinHashMap::new_chained(vec![DataType::Int32], vec![false]).expect("build table");
+        table
+            .add_build_rows(
+                &[build_chunk.column_by_slot_id(RIGHT_K_SLOT_ID).expect("key")],
+                build_chunk.len(),
+            )
+            .expect("add rows");
+        table.finalize().expect("finalize table");
+
+        let artifact = Arc::new(JoinBuildArtifact::new(
+            required_build_components(JoinType::LeftSemi, true, true, true),
+            None,
+            Some(table),
+            build_chunk.len(),
+            false,
+            None,
+            None,
+        ));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::LeftSemi,
+            vec![probe_key],
+            Some(residual),
+            true,
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        let err = core
+            .set_build_artifact(artifact, build_chunk.len(), false)
+            .expect_err("residual semi must require row payload");
+        assert!(err.contains("row payload required"));
+    }
+
+    #[test]
+    fn inner_cross_join_allows_missing_lookup_table() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let arena = Arc::new(ExprArena::default());
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[10, 20],
+            &[100, 200],
+        );
+        let artifact = Arc::new(JoinBuildArtifact::new(
+            required_build_components(JoinType::Inner, false, true, false),
+            Some(BuildStore::new(build_chunk.clone())),
+            None,
+            build_chunk.len(),
+            false,
+            None,
+            None,
+        ));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::Inner,
+            Vec::new(),
+            None,
+            true,
+            false,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        core.set_build_artifact(artifact, build_chunk.len(), false)
+            .expect("cross join build artifact should not require lookup table");
+
+        let probe_chunk = chunk_of_two(
+            Arc::clone(&left_schema),
+            &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID],
+            &[1, 2],
+            &[11, 22],
+        );
+        let out = core
+            .join_probe_chunks(vec![probe_chunk])
+            .expect("cross join probe")
+            .expect("cross join output");
+        assert_eq!(out.len(), 4);
     }
 
     #[test]
@@ -1761,6 +1957,7 @@ mod tests {
             JoinType::Inner,
             vec![probe_key],
             None,
+            true,
             true,
             chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
             chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
@@ -1816,6 +2013,7 @@ mod tests {
             JoinType::LeftSemi,
             vec![probe_key],
             None,
+            true,
             true,
             chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
             chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
@@ -1873,6 +2071,7 @@ mod tests {
             JoinType::LeftAnti,
             vec![probe_key],
             None,
+            true,
             true,
             chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
             chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
@@ -1971,6 +2170,7 @@ mod tests {
             .expect("add build rows");
         build_table.finalize().expect("finalize build table");
         let artifact = Arc::new(JoinBuildArtifact::new(
+            required_build_components(JoinType::RightSemi, true, true, true),
             Some(BuildStore::new(build_chunk.clone())),
             Some(build_table),
             1,
@@ -1984,6 +2184,7 @@ mod tests {
             JoinType::RightSemi,
             vec![probe_key],
             Some(residual),
+            true,
             true,
             chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
             chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
@@ -2032,6 +2233,7 @@ mod tests {
         let arena = Arc::new(arena);
 
         let artifact = Arc::new(JoinBuildArtifact::new(
+            required_build_components(JoinType::NullAwareLeftAnti, true, true, true),
             None,
             None,
             0,
@@ -2044,6 +2246,7 @@ mod tests {
             JoinType::NullAwareLeftAnti,
             vec![probe_key],
             Some(residual),
+            true,
             true,
             chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
             chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),

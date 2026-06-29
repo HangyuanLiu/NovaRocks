@@ -32,11 +32,10 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef};
 
 use super::build_artifact::JoinBuildArtifact;
+use super::build_requirements::{NullKeyRequirement, required_build_components};
 use super::build_state::JoinBuildSinkState;
 use super::join_hash_map::build_store::BuildStoreBuilder;
-use super::join_hash_map::method::{
-    BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions, JoinHashMapBuildPurpose,
-};
+use super::join_hash_map::method::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::{JoinDistributionMode, JoinRuntimeFilterSpec, JoinType};
@@ -68,6 +67,8 @@ pub struct HashJoinBuildSinkFactory {
     arena: Arc<ExprArena>,
     join_type: JoinType,
     has_residual_predicate: bool,
+    probe_is_left: bool,
+    has_equi_keys: bool,
     build_keys: Vec<ExprId>,
     eq_null_safe: Vec<bool>,
     runtime_filters: Vec<JoinRuntimeFilterSpec>,
@@ -82,6 +83,8 @@ impl HashJoinBuildSinkFactory {
         arena: Arc<ExprArena>,
         join_type: JoinType,
         has_residual_predicate: bool,
+        probe_is_left: bool,
+        has_equi_keys: bool,
         build_keys: Vec<ExprId>,
         eq_null_safe: Vec<bool>,
         runtime_filters: Vec<JoinRuntimeFilterSpec>,
@@ -102,6 +105,8 @@ impl HashJoinBuildSinkFactory {
             arena,
             join_type,
             has_residual_predicate,
+            probe_is_left,
+            has_equi_keys,
             build_keys,
             eq_null_safe,
             runtime_filters,
@@ -124,6 +129,12 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             JoinDistributionMode::Broadcast => "BROADCAST",
             JoinDistributionMode::Partitioned => "PARTITIONED",
         };
+        let requirements = required_build_components(
+            self.join_type,
+            self.has_residual_predicate,
+            self.probe_is_left,
+            self.has_equi_keys,
+        );
         debug!(
             "HashJoinBuildSink create: node_id={} driver_id={} partition={} join_type={} residual_predicate={} dist={} build_keys={} null_safe_keys={} runtime_filters={}",
             self.node_id,
@@ -143,6 +154,8 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             arena: Arc::clone(&self.arena),
             join_type: self.join_type,
             has_residual_predicate: self.has_residual_predicate,
+            probe_is_left: self.probe_is_left,
+            has_equi_keys: self.has_equi_keys,
             build_keys: self.build_keys.clone(),
             eq_null_safe: self.eq_null_safe.clone(),
             runtime_filter_specs: self.runtime_filters.clone(),
@@ -163,10 +176,9 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             finished: false,
             build_row_count: 0,
             build_has_null_key: false,
-            build_null_key_rows: if self.join_type == JoinType::NullAwareLeftAnti {
-                Some(Vec::new())
-            } else {
-                None
+            build_null_key_rows: match requirements.null_keys {
+                NullKeyRequirement::NullKeyRows => Some(Vec::new()),
+                NullKeyRequirement::NotNeeded | NullKeyRequirement::HasAnyNullKey => None,
             },
             logged_first_input: false,
             profile_initialized: false,
@@ -190,6 +202,8 @@ struct HashJoinBuildSinkOperator {
     arena: Arc<ExprArena>,
     join_type: JoinType,
     has_residual_predicate: bool,
+    probe_is_left: bool,
+    has_equi_keys: bool,
     build_keys: Vec<ExprId>,
     eq_null_safe: Vec<bool>,
     runtime_filter_specs: Vec<JoinRuntimeFilterSpec>,
@@ -306,12 +320,21 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         self.input_chunks = self.input_chunks.saturating_add(1);
         let base_row_id = self.build_row_count;
         self.build_row_count = self.build_row_count.saturating_add(chunk.len());
-        self.build_store_builder.push_chunk(&chunk)?;
+        let requirements = required_build_components(
+            self.join_type,
+            self.has_residual_predicate,
+            self.probe_is_left,
+            self.has_equi_keys,
+        );
+        let retain_build_rows = requirements.requires_row_payload();
+        if retain_build_rows {
+            self.build_store_builder.push_chunk(&chunk)?;
 
-        if let Some(tracker) = self.build_input_chunks_mem_tracker.as_ref() {
-            chunk.transfer_to(tracker);
+            if let Some(tracker) = self.build_input_chunks_mem_tracker.as_ref() {
+                chunk.transfer_to(tracker);
+            }
+            self.build_input_chunks.push(chunk.clone());
         }
-        self.build_input_chunks.push(chunk.clone());
 
         if self.build_keys.is_empty() {
             return Ok(());
@@ -352,7 +375,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             }
         }
 
-        let retained_bytes = retained_key_arrays_bytes(&key_arrays, &chunk);
+        let retained_bytes = retained_key_arrays_bytes(&key_arrays, &chunk, retain_build_rows);
         self.build_key_batches
             .push(BuildKeyBatch::new(key_arrays.clone(), chunk.len())?);
         self.build_key_batches_retained_bytes = self
@@ -410,6 +433,13 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         );
         self.finished = true;
 
+        let requirements = required_build_components(
+            self.join_type,
+            self.has_residual_predicate,
+            self.probe_is_left,
+            self.has_equi_keys,
+        );
+        let retain_build_rows = requirements.requires_row_payload();
         let build_ht_timer = self
             .profiles
             .as_ref()
@@ -429,10 +459,9 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 self.eq_null_safe.clone(),
                 &self.build_key_batches,
                 JoinHashMapBuildOptions {
-                    purpose: join_hash_map_build_purpose(
-                        self.join_type,
-                        self.has_residual_predicate,
-                    ),
+                    purpose: requirements.join_hash_map_purpose().ok_or_else(|| {
+                        "hash join lookup purpose missing for keyed build".to_string()
+                    })?,
                     ..JoinHashMapBuildOptions::default()
                 },
                 self.build_table_mem_tracker.as_ref().map(Arc::clone),
@@ -467,12 +496,20 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         self.runtime_filter_hub
             .mark_local_filters_ready(self.node_id);
 
-        let build_store_rows = self.build_store_builder.row_count();
+        let build_store_rows = if retain_build_rows {
+            self.build_store_builder.row_count()
+        } else {
+            0
+        };
         let table_present = self.build_table.is_some();
         let input_chunks = std::mem::take(&mut self.build_input_chunks);
         let mut table = self.build_table.take();
-        let mut build_store =
-            std::mem::replace(&mut self.build_store_builder, BuildStoreBuilder::new()).finish()?;
+        let mut build_store = if retain_build_rows {
+            std::mem::replace(&mut self.build_store_builder, BuildStoreBuilder::new()).finish()?
+        } else {
+            self.build_store_builder = BuildStoreBuilder::new();
+            None
+        };
         drop(input_chunks);
 
         if let Some(root) = state.mem_tracker() {
@@ -495,6 +532,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             .map(|t| t.method_kind().as_profile_str())
             .unwrap_or("None");
         let artifact = Arc::new(JoinBuildArtifact::new(
+            requirements,
             build_store,
             table,
             self.build_row_count,
@@ -502,6 +540,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             build_null_key_rows,
             runtime_filters,
         ));
+        artifact.validate_components(requirements)?;
         self.state
             .set_build(self.partition, artifact)
             .map_err(|e| e.to_string())?;
@@ -1225,10 +1264,17 @@ fn parse_join_node_id_from_dep_key(dep_key: &str) -> i32 {
     node_id_str.parse::<i32>().unwrap_or(-1)
 }
 
-fn retained_key_arrays_bytes(key_arrays: &[ArrayRef], chunk: &Chunk) -> usize {
+fn retained_key_arrays_bytes(
+    key_arrays: &[ArrayRef],
+    chunk: &Chunk,
+    chunk_columns_are_retained: bool,
+) -> usize {
     key_arrays
         .iter()
         .filter(|key_array| {
+            if !chunk_columns_are_retained {
+                return true;
+            }
             !chunk
                 .columns()
                 .iter()
@@ -1249,22 +1295,6 @@ fn join_type_str(join_type: JoinType) -> &'static str {
         JoinType::LeftAnti => "LEFT_ANTI",
         JoinType::RightAnti => "RIGHT_ANTI",
         JoinType::NullAwareLeftAnti => "NULL_AWARE_LEFT_ANTI",
-    }
-}
-
-fn join_hash_map_build_purpose(
-    join_type: JoinType,
-    has_residual_predicate: bool,
-) -> JoinHashMapBuildPurpose {
-    // Presence-only maps are safe only when the join answer depends on key existence.
-    // A residual predicate can reference build-side columns and must be evaluated
-    // against concrete build rows, so those joins still need row-match storage.
-    // Right semi/anti joins also keep row-match storage because their current
-    // execution path marks build rows rather than filtering probe rows directly.
-    if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) && !has_residual_predicate {
-        JoinHashMapBuildPurpose::PresenceOnly
-    } else {
-        JoinHashMapBuildPurpose::RowMatches
     }
 }
 
@@ -1318,6 +1348,16 @@ mod tests {
         Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
     }
 
+    fn nullable_int32_chunk(values: Vec<Option<i32>>) -> Chunk {
+        let array = Arc::new(Int32Array::from(values)) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).expect("record batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema");
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+    }
+
     fn direct_int_build_operator(state: Arc<TestBuildState>) -> HashJoinBuildSinkOperator {
         let mut arena = ExprArena::default();
         let build_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
@@ -1328,6 +1368,8 @@ mod tests {
             arena: Arc::new(arena),
             join_type: JoinType::Inner,
             has_residual_predicate: false,
+            probe_is_left: true,
+            has_equi_keys: true,
             build_keys: vec![build_key],
             eq_null_safe: vec![false],
             runtime_filter_specs: Vec::new(),
@@ -1363,6 +1405,41 @@ mod tests {
         let mut operator = direct_int_build_operator(state);
         operator.join_type = JoinType::LeftSemi;
         operator.has_residual_predicate = false;
+        operator
+    }
+
+    fn null_aware_build_operator(
+        state: Arc<TestBuildState>,
+        has_residual_predicate: bool,
+    ) -> Box<dyn Operator> {
+        let mut arena = ExprArena::default();
+        let build_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let sink_state: Arc<dyn JoinBuildSinkState> = state;
+        let factory = HashJoinBuildSinkFactory::new(
+            Arc::new(arena),
+            JoinType::NullAwareLeftAnti,
+            has_residual_predicate,
+            true,
+            true,
+            vec![build_key],
+            vec![false],
+            Vec::new(),
+            JoinDistributionMode::Broadcast,
+            sink_state,
+            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
+            None,
+        );
+        factory.create(1, 0)
+    }
+
+    fn no_key_inner_build_operator(state: Arc<TestBuildState>) -> HashJoinBuildSinkOperator {
+        let mut operator = direct_int_build_operator(state);
+        operator.join_type = JoinType::Inner;
+        operator.has_residual_predicate = false;
+        operator.probe_is_left = true;
+        operator.has_equi_keys = false;
+        operator.build_keys.clear();
+        operator.eq_null_safe.clear();
         operator
     }
 
@@ -1419,7 +1496,7 @@ mod tests {
     #[test]
     fn records_direct_set_method_for_left_semi_without_residual() {
         let state = Arc::new(TestBuildState::default());
-        let mut operator = direct_set_build_operator(state);
+        let mut operator = direct_set_build_operator(Arc::clone(&state));
         let profiles = OperatorProfiles::new(RuntimeProfile::new("HASH_JOIN"));
         operator.set_profiles(profiles.clone());
 
@@ -1434,12 +1511,26 @@ mod tests {
             profiles.common.get_info_string("JoinHashMapMethod"),
             Some("DirectIntSetNotNull".to_string())
         );
+        let artifact = state
+            .artifact
+            .lock()
+            .expect("artifact lock")
+            .clone()
+            .expect("artifact");
+        assert_eq!(
+            artifact.provided,
+            required_build_components(JoinType::LeftSemi, false, true, true)
+        );
+        assert!(artifact.build_store.is_none());
+        assert_eq!(artifact.build_row_count, 2);
+        assert_eq!(operator.build_store_builder.row_count(), 0);
+        assert!(operator.build_input_chunks.is_empty());
     }
 
     #[test]
     fn records_row_match_method_for_left_semi_with_residual() {
         let state = Arc::new(TestBuildState::default());
-        let mut operator = direct_set_build_operator(state);
+        let mut operator = direct_set_build_operator(Arc::clone(&state));
         operator.has_residual_predicate = true;
         let profiles = OperatorProfiles::new(RuntimeProfile::new("HASH_JOIN"));
         operator.set_profiles(profiles.clone());
@@ -1455,6 +1546,170 @@ mod tests {
             profiles.common.get_info_string("JoinHashMapMethod"),
             Some("Chained".to_string())
         );
+        let artifact = state
+            .artifact
+            .lock()
+            .expect("artifact lock")
+            .clone()
+            .expect("artifact");
+        assert_eq!(
+            artifact.provided,
+            required_build_components(JoinType::LeftSemi, true, true, true)
+        );
+        assert!(artifact.build_store.is_some());
+        assert_eq!(artifact.build_store.as_ref().expect("build store").len(), 2);
+        assert_eq!(artifact.build_row_count, 2);
+    }
+
+    #[test]
+    fn records_row_match_method_for_right_probe_left_semi_without_residual() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = direct_set_build_operator(Arc::clone(&state));
+        operator.probe_is_left = false;
+        let profiles = OperatorProfiles::new(RuntimeProfile::new("HASH_JOIN"));
+        operator.set_profiles(profiles.clone());
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 1_000_000]))
+            .expect("push chunk");
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        assert_eq!(
+            profiles.common.get_info_string("JoinHashMapMethod"),
+            Some("Chained".to_string())
+        );
+        let artifact = state
+            .artifact
+            .lock()
+            .expect("artifact lock")
+            .clone()
+            .expect("artifact");
+        assert_eq!(
+            artifact.provided,
+            required_build_components(JoinType::LeftSemi, false, false, true)
+        );
+        assert!(artifact.build_store.is_some());
+        assert_eq!(artifact.build_store.as_ref().expect("build store").len(), 2);
+        assert_eq!(artifact.build_row_count, 2);
+    }
+
+    #[test]
+    fn publishes_no_key_inner_artifact_without_hash_map() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = no_key_inner_build_operator(Arc::clone(&state));
+        let profiles = OperatorProfiles::new(RuntimeProfile::new("HASH_JOIN"));
+        operator.set_profiles(profiles.clone());
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .expect("push chunk");
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        assert_eq!(profiles.common.get_info_string("JoinHashMapMethod"), None);
+        let artifact = state
+            .artifact
+            .lock()
+            .expect("artifact lock")
+            .clone()
+            .expect("artifact");
+        assert_eq!(
+            artifact.provided,
+            required_build_components(JoinType::Inner, false, true, false)
+        );
+        assert!(artifact.build_table.is_none());
+        assert_eq!(artifact.build_row_count, 3);
+        assert_eq!(artifact.build_store.as_ref().expect("build store").len(), 3);
+    }
+
+    #[test]
+    fn no_residual_null_aware_left_anti_tracks_has_null_key_without_null_key_rows() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = null_aware_build_operator(Arc::clone(&state), false);
+
+        let processor = operator.as_processor_mut().expect("processor");
+        processor
+            .push_chunk(
+                &RuntimeState::default(),
+                nullable_int32_chunk(vec![Some(1), None, Some(2)]),
+            )
+            .expect("push chunk");
+        processor
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        let artifact = state
+            .artifact
+            .lock()
+            .expect("artifact lock")
+            .clone()
+            .expect("artifact");
+        assert_eq!(
+            artifact.provided,
+            required_build_components(JoinType::NullAwareLeftAnti, false, true, true)
+        );
+        assert!(artifact.build_has_null_key);
+        assert!(artifact.build_null_key_rows.is_none());
+    }
+
+    #[test]
+    fn residual_null_aware_left_anti_tracks_null_key_rows() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = null_aware_build_operator(Arc::clone(&state), true);
+
+        let processor = operator.as_processor_mut().expect("processor");
+        processor
+            .push_chunk(
+                &RuntimeState::default(),
+                nullable_int32_chunk(vec![Some(1), None, Some(2)]),
+            )
+            .expect("push chunk");
+        processor
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        let artifact = state
+            .artifact
+            .lock()
+            .expect("artifact lock")
+            .clone()
+            .expect("artifact");
+        assert_eq!(
+            artifact.provided,
+            required_build_components(JoinType::NullAwareLeftAnti, true, true, true)
+        );
+        let null_key_rows = artifact
+            .build_null_key_rows
+            .as_ref()
+            .expect("null-key rows");
+        assert_eq!(null_key_rows.as_slice(), &[1]);
+    }
+
+    #[test]
+    fn publishes_empty_keyed_membership_build_without_artifacts() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = direct_set_build_operator(Arc::clone(&state));
+
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        let artifact = state
+            .artifact
+            .lock()
+            .expect("artifact lock")
+            .clone()
+            .expect("artifact");
+        assert_eq!(
+            artifact.provided,
+            required_build_components(JoinType::LeftSemi, false, true, true)
+        );
+        assert_eq!(artifact.build_row_count, 0);
+        assert!(artifact.build_store.is_none());
+        assert!(artifact.build_table.is_none());
     }
 
     #[test]
@@ -1474,6 +1729,8 @@ mod tests {
             arena,
             join_type: JoinType::Inner,
             has_residual_predicate: false,
+            probe_is_left: true,
+            has_equi_keys: true,
             build_keys: vec![build_key],
             eq_null_safe: vec![false],
             runtime_filter_specs: Vec::new(),
@@ -1531,6 +1788,41 @@ mod tests {
     }
 
     #[test]
+    fn presence_only_slot_key_batches_are_accounted_without_input_chunk_storage() {
+        let state = Arc::new(TestBuildState::default());
+        let root = MemTracker::new_root("presence-only-build-test");
+        let mut operator = direct_set_build_operator(state);
+
+        operator.set_mem_tracker(Arc::clone(&root));
+        let children = root.children();
+        let key_batches_tracker = children
+            .iter()
+            .find(|child| child.label() == "BuildKeyBatches")
+            .expect("BuildKeyBatches tracker")
+            .clone();
+        let input_chunks_tracker = children
+            .iter()
+            .find(|child| child.label() == "BuildInputChunks")
+            .expect("BuildInputChunks tracker")
+            .clone();
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .expect("push chunk");
+
+        assert_eq!(operator.build_store_builder.row_count(), 0);
+        assert!(operator.build_input_chunks.is_empty());
+        assert_eq!(input_chunks_tracker.current(), 0);
+        assert!(key_batches_tracker.current() > 0);
+
+        operator
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        assert_eq!(key_batches_tracker.current(), 0);
+    }
+
+    #[test]
     fn computed_build_key_batches_peak_is_not_inflated_across_pushes() {
         let mut arena = ExprArena::default();
         let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
@@ -1547,6 +1839,8 @@ mod tests {
             arena,
             join_type: JoinType::Inner,
             has_residual_predicate: false,
+            probe_is_left: true,
+            has_equi_keys: true,
             build_keys: vec![build_key],
             eq_null_safe: vec![false],
             runtime_filter_specs: Vec::new(),
@@ -1605,37 +1899,5 @@ mod tests {
             .expect("finish");
 
         assert_eq!(key_batches_tracker.current(), 0);
-    }
-
-    #[test]
-    fn build_purpose_uses_presence_only_for_left_semi_without_residual() {
-        assert_eq!(
-            join_hash_map_build_purpose(JoinType::LeftSemi, false),
-            JoinHashMapBuildPurpose::PresenceOnly
-        );
-    }
-
-    #[test]
-    fn build_purpose_uses_presence_only_for_left_anti_without_residual() {
-        assert_eq!(
-            join_hash_map_build_purpose(JoinType::LeftAnti, false),
-            JoinHashMapBuildPurpose::PresenceOnly
-        );
-    }
-
-    #[test]
-    fn build_purpose_uses_row_matches_for_left_semi_with_residual() {
-        assert_eq!(
-            join_hash_map_build_purpose(JoinType::LeftSemi, true),
-            JoinHashMapBuildPurpose::RowMatches
-        );
-    }
-
-    #[test]
-    fn build_purpose_uses_row_matches_for_right_semi_without_residual() {
-        assert_eq!(
-            join_hash_map_build_purpose(JoinType::RightSemi, false),
-            JoinHashMapBuildPurpose::RowMatches
-        );
     }
 }
