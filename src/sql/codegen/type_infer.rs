@@ -11,6 +11,14 @@ pub(crate) fn arrow_type_to_type_desc(data_type: &DataType) -> Result<types::TTy
     Ok(types::TTypeDesc::new(nodes))
 }
 
+/// Convert an Arrow Field to Thrift TTypeDesc at a protocol/codegen boundary.
+#[allow(dead_code)] // Staged M2 boundary helper; callers migrate in later slices.
+pub(crate) fn arrow_field_to_type_desc(field: &Field) -> Result<types::TTypeDesc, String> {
+    let mut nodes = Vec::new();
+    append_arrow_type_nodes(field.data_type(), Some(field), &mut nodes)?;
+    Ok(types::TTypeDesc::new(nodes))
+}
+
 fn append_arrow_type_nodes(
     data_type: &DataType,
     parent_field: Option<&Field>,
@@ -143,10 +151,15 @@ fn append_arrow_type_nodes(
 fn logical_type_override(field: Option<&Field>) -> Option<types::TPrimitiveType> {
     match logical_type_of_field(field?)? {
         LogicalType::Json => Some(types::TPrimitiveType::JSON),
-        LogicalType::Hll | LogicalType::Bitmap | LogicalType::Object | LogicalType::Percentile => {
-            None
-        }
+        LogicalType::Hll => Some(types::TPrimitiveType::HLL),
+        LogicalType::Bitmap | LogicalType::Object => Some(types::TPrimitiveType::OBJECT),
+        LogicalType::Percentile => Some(types::TPrimitiveType::PERCENTILE),
     }
+}
+
+#[allow(dead_code)] // Staged M2 boundary helper; callers migrate in later slices.
+pub(crate) fn arrow_field_to_primitive(field: &Field) -> Option<types::TPrimitiveType> {
+    logical_type_override(Some(field)).or_else(|| arrow_type_to_primitive(field.data_type()).ok())
 }
 
 pub(crate) fn arrow_type_to_primitive(
@@ -184,6 +197,115 @@ pub(crate) use crate::types::{arithmetic_result_type_with_op, wider_type};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn primitive_from_desc(desc: &types::TTypeDesc) -> Option<types::TPrimitiveType> {
+        crate::lower::type_lowering::primitive_type_from_desc(desc)
+    }
+
+    fn logical_field(name: &str, data_type: DataType, logical_type: LogicalType) -> Field {
+        crate::types::logical::field_with_logical_type(
+            Field::new(name, data_type, true),
+            logical_type,
+        )
+    }
+
+    #[test]
+    fn arrow_field_to_type_desc_honors_top_level_json_metadata() {
+        let field = logical_field("payload", DataType::Utf8, LogicalType::Json);
+
+        let desc = arrow_field_to_type_desc(&field).unwrap();
+
+        assert_eq!(
+            primitive_from_desc(&desc),
+            Some(types::TPrimitiveType::JSON)
+        );
+        assert_eq!(
+            arrow_field_to_primitive(&field),
+            Some(types::TPrimitiveType::JSON)
+        );
+    }
+
+    #[test]
+    fn arrow_field_to_primitive_honors_object_family_metadata() {
+        let cases = [
+            (
+                logical_field("hll", DataType::Binary, LogicalType::Hll),
+                types::TPrimitiveType::HLL,
+            ),
+            (
+                logical_field("bitmap", DataType::Binary, LogicalType::Bitmap),
+                types::TPrimitiveType::OBJECT,
+            ),
+            (
+                logical_field("object", DataType::LargeBinary, LogicalType::Object),
+                types::TPrimitiveType::OBJECT,
+            ),
+            (
+                logical_field("percentile", DataType::Binary, LogicalType::Percentile),
+                types::TPrimitiveType::PERCENTILE,
+            ),
+        ];
+
+        for (field, expected) in cases {
+            let desc = arrow_field_to_type_desc(&field).unwrap();
+
+            assert_eq!(primitive_from_desc(&desc), Some(expected));
+            assert_eq!(arrow_field_to_primitive(&field), Some(expected));
+        }
+    }
+
+    #[test]
+    fn arrow_field_to_primitive_falls_back_to_arrow_type_without_metadata() {
+        let field = Field::new("plain", DataType::Utf8, true);
+
+        assert_eq!(
+            arrow_field_to_primitive(&field),
+            Some(types::TPrimitiveType::VARCHAR)
+        );
+    }
+
+    #[test]
+    fn nested_json_metadata_survives_type_desc_conversion() {
+        use std::sync::Arc;
+
+        let array_json = DataType::List(Arc::new(logical_field(
+            "item",
+            DataType::Utf8,
+            LogicalType::Json,
+        )));
+        let array_desc = arrow_type_to_type_desc(&array_json).unwrap();
+        let array_nodes = array_desc.types.as_ref().unwrap();
+        assert_eq!(array_nodes[0].type_, types::TTypeNodeType::ARRAY);
+        assert_eq!(
+            array_nodes[1]
+                .scalar_type
+                .as_ref()
+                .map(|scalar| scalar.type_),
+            Some(types::TPrimitiveType::JSON)
+        );
+
+        let map_json = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Utf8, false)),
+                        Arc::new(logical_field("value", DataType::Utf8, LogicalType::Json)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let map_desc = arrow_type_to_type_desc(&map_json).unwrap();
+        let map_nodes = map_desc.types.as_ref().unwrap();
+        assert_eq!(map_nodes[0].type_, types::TTypeNodeType::MAP);
+        assert_eq!(
+            map_nodes[2].scalar_type.as_ref().map(|scalar| scalar.type_),
+            Some(types::TPrimitiveType::JSON)
+        );
+    }
 
     #[test]
     fn timestamp_unit_roundtrips_through_thrift_desc() {
