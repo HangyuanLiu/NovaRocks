@@ -24,6 +24,7 @@ use super::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::common::ids::SlotId;
 use crate::lower::type_lowering::scalar_type_desc;
 use crate::thrift::types::TPrimitiveType;
+use crate::types::logical::{LogicalType, logical_type_of_field};
 
 #[test]
 fn strict_requires_chunk_schema_metadata() {
@@ -45,7 +46,7 @@ fn strict_rejects_duplicate_slot_id() {
 }
 
 #[test]
-fn chunk_schema_sidecar_recovers_type_desc_and_unique_id() {
+fn chunk_schema_recovers_logical_metadata_and_unique_id() {
     let desc = scalar_type_desc(TPrimitiveType::HLL);
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Binary, true)]));
     let batch = RecordBatch::try_new(
@@ -71,8 +72,9 @@ fn chunk_schema_sidecar_recovers_type_desc_and_unique_id() {
         .chunk_schema()
         .slot(SlotId::new(7))
         .expect("slot schema");
-    assert_eq!(slot.type_desc(), Some(&desc));
-    assert_eq!(slot.primitive_type(), Some(TPrimitiveType::HLL));
+    assert_eq!(slot.data_type(), &DataType::Binary);
+    assert_eq!(slot.field_schema().logical_type(), Some(LogicalType::Hll));
+    assert_eq!(logical_type_of_field(slot.field()), Some(LogicalType::Hll));
     assert_eq!(slot.name(), "a");
     assert_eq!(slot.unique_id(), Some(77));
 }

@@ -875,23 +875,13 @@ mod tests {
             chunk_slot_schemas_for_layout(&desc_tbl, &layout).expect("layout chunk slot schemas");
         assert_eq!(slot_schemas.len(), 2);
         assert_eq!(slot_schemas[0].name(), "count_col");
-        assert_eq!(
-            slot_schemas[1]
-                .type_desc()
-                .and_then(crate::lower::type_lowering::primitive_type_from_desc),
-            Some(TPrimitiveType::VARBINARY)
-        );
+        assert_eq!(slot_schemas[1].data_type(), &DataType::Binary);
 
         let chunk_schema =
             chunk_schema_for_layout(&desc_tbl, &layout).expect("layout chunk schema");
         assert_eq!(chunk_schema.slots()[0].slot_id().as_u32(), 5);
         assert_eq!(chunk_schema.slots()[1].slot_id().as_u32(), 6);
-        assert_eq!(
-            chunk_schema.slots()[1]
-                .type_desc()
-                .and_then(crate::lower::type_lowering::primitive_type_from_desc),
-            Some(TPrimitiveType::VARBINARY)
-        );
+        assert_eq!(chunk_schema.slots()[1].data_type(), &DataType::Binary);
     }
 
     #[test]

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check};
-use crate::lower::type_lowering::{arrow_field_from_desc, primitive_type_from_desc};
+use crate::lower::type_lowering::arrow_field_from_desc;
 use crate::thrift::types;
 use crate::types::logical::{LogicalType, logical_type_of_field};
 use arrow::array::ArrayRef;
@@ -28,7 +28,7 @@ use arrow::record_batch::RecordBatch;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ChunkFieldSchema {
-    type_desc: Option<types::TTypeDesc>,
+    logical_type: Option<LogicalType>,
     children: Vec<ChunkFieldSchema>,
 }
 
@@ -45,22 +45,23 @@ impl ChunkFieldSchema {
         match type_desc {
             Some(desc) => Self::try_from_type_desc("", false, desc),
             None => Ok(Self {
-                type_desc: None,
+                logical_type: None,
                 children: Vec::new(),
             }),
         }
     }
 
     pub fn try_from_type_desc(
-        _name: impl Into<String>,
-        _nullable: bool,
+        name: impl Into<String>,
+        nullable: bool,
         desc: types::TTypeDesc,
     ) -> Result<Self, String> {
+        let name = name.into();
         let nodes = desc
             .types
             .as_ref()
             .ok_or_else(|| "field type desc missing nodes".to_string())?;
-        let (field_schema, next) = Self::from_desc_nodes(nodes, 0)?;
+        let next = type_desc_node_span(nodes, 0)?;
         if next != nodes.len() {
             return Err(format!(
                 "field type desc has trailing nodes: consumed={} total={}",
@@ -68,33 +69,26 @@ impl ChunkFieldSchema {
                 nodes.len()
             ));
         }
-        Ok(field_schema)
+        let field = arrow_field_from_desc(&name, nullable, &desc)
+            .ok_or_else(|| "field type desc has unsupported arrow mapping".to_string())?;
+        Self::from_field(&field)
     }
 
     pub fn from_field(field: &Field) -> Result<Self, String> {
-        // Honour the `nr_logical_type` metadata tag attached by the analyzer's
-        // `sql_type_to_arrow`. Without this override the JSON-ness of a
-        // nested cast (e.g. `cast(x AS map<string, json>)`) would be lost
-        // once `JSON` collapses to `Utf8` at the Arrow level, and the
-        // standalone MySQL renderer would quote the value as a plain string
-        // instead of the JSON spelling StarRocks emits.
-        if let Some(desc) = logical_type_desc_from_field(field) {
-            return Ok(Self {
-                type_desc: Some(desc),
-                children: Vec::new(),
-            });
-        }
-        Self::from_arrow_data_type(field.data_type())
+        Ok(Self {
+            logical_type: logical_type_of_field(field),
+            children: Self::children_from_arrow_data_type(field.data_type())?,
+        })
     }
 
-    fn from_arrow_data_type(data_type: &DataType) -> Result<Self, String> {
-        let children = match data_type {
+    fn children_from_arrow_data_type(data_type: &DataType) -> Result<Vec<Self>, String> {
+        match data_type {
             DataType::Struct(fields) => fields
                 .iter()
                 .map(|child| Self::from_field(child.as_ref()))
-                .collect::<Result<Vec<_>, _>>()?,
+                .collect::<Result<Vec<_>, _>>(),
             DataType::List(item) | DataType::LargeList(item) => {
-                vec![Self::from_field(item.as_ref())?]
+                Ok(vec![Self::from_field(item.as_ref())?])
             }
             DataType::Map(entries, _) => {
                 let DataType::Struct(entry_fields) = entries.data_type() else {
@@ -109,87 +103,22 @@ impl ChunkFieldSchema {
                         entry_fields.len()
                     ));
                 }
-                vec![
+                Ok(vec![
                     Self::from_field(entry_fields[0].as_ref())?,
                     Self::from_field(entry_fields[1].as_ref())?,
-                ]
+                ])
             }
-            _ => Vec::new(),
-        };
-        Ok(Self {
-            type_desc: None,
-            children,
-        })
-    }
-
-    fn from_desc_nodes(nodes: &[types::TTypeNode], start: usize) -> Result<(Self, usize), String> {
-        let node = nodes
-            .get(start)
-            .ok_or_else(|| format!("field type desc ended unexpectedly at node {}", start))?;
-
-        match node.type_ {
-            t if t == types::TTypeNodeType::SCALAR => Ok((
-                Self {
-                    type_desc: Some(types::TTypeDesc::new(vec![node.clone()])),
-                    children: Vec::new(),
-                },
-                start + 1,
-            )),
-            t if t == types::TTypeNodeType::STRUCT => {
-                let struct_fields = node
-                    .struct_fields
-                    .as_ref()
-                    .ok_or_else(|| "struct type desc missing struct_fields".to_string())?;
-                let mut cursor = start + 1;
-                let mut children = Vec::with_capacity(struct_fields.len());
-                for _ in struct_fields {
-                    let (child, next) = Self::from_desc_nodes(nodes, cursor)?;
-                    cursor = next;
-                    children.push(child);
-                }
-                Ok((
-                    Self {
-                        type_desc: Some(types::TTypeDesc::new(nodes[start..cursor].to_vec())),
-                        children,
-                    },
-                    cursor,
-                ))
-            }
-            t if t == types::TTypeNodeType::ARRAY => {
-                let (item, next) = Self::from_desc_nodes(nodes, start + 1)?;
-                Ok((
-                    Self {
-                        type_desc: Some(types::TTypeDesc::new(nodes[start..next].to_vec())),
-                        children: vec![item],
-                    },
-                    next,
-                ))
-            }
-            t if t == types::TTypeNodeType::MAP => {
-                let (key, next) = Self::from_desc_nodes(nodes, start + 1)?;
-                let (value, next) = Self::from_desc_nodes(nodes, next)?;
-                Ok((
-                    Self {
-                        type_desc: Some(types::TTypeDesc::new(nodes[start..next].to_vec())),
-                        children: vec![key, value],
-                    },
-                    next,
-                ))
-            }
-            other => Err(format!("unsupported type desc node {:?}", other)),
+            _ => Ok(Vec::new()),
         }
     }
 
-    pub fn type_desc(&self) -> Option<&types::TTypeDesc> {
-        self.type_desc.as_ref()
-    }
-
-    pub fn primitive_type(&self) -> Option<types::TPrimitiveType> {
-        self.type_desc.as_ref().and_then(primitive_type_from_desc)
+    #[cfg(test)]
+    pub(crate) fn logical_type(&self) -> Option<LogicalType> {
+        self.logical_type
     }
 
     pub fn json_semantic(&self) -> bool {
-        self.primitive_type() == Some(types::TPrimitiveType::JSON)
+        self.logical_type == Some(LogicalType::Json)
     }
 
     pub fn children(&self) -> &[ChunkFieldSchema] {
@@ -297,14 +226,13 @@ impl ChunkSlotSchema {
         unique_id: Option<i32>,
     ) -> Result<Self, String> {
         let name = name.into();
-        let field_schema = ChunkFieldSchema::try_from_type_desc("", false, type_desc.clone())?;
         let field = arrow_field_from_desc(&name, nullable, &type_desc).ok_or_else(|| {
             format!(
                 "chunk slot {} has unsupported type desc for arrow conversion",
                 slot_id
             )
         })?;
-        Self::try_new_with_field(slot_id, field, Some(field_schema), unique_id)
+        Self::try_new_with_field(slot_id, field, None, unique_id)
     }
 
     pub fn from_field(
@@ -362,16 +290,8 @@ impl ChunkSlotSchema {
         self.field.data_type()
     }
 
-    pub fn type_desc(&self) -> Option<&types::TTypeDesc> {
-        self.field_schema.type_desc()
-    }
-
     pub fn unique_id(&self) -> Option<i32> {
         self.unique_id
-    }
-
-    pub fn primitive_type(&self) -> Option<types::TPrimitiveType> {
-        self.field_schema.primitive_type()
     }
 
     pub fn field_schema(&self) -> &ChunkFieldSchema {
@@ -389,14 +309,31 @@ pub struct ChunkSchema {
 
 pub type ChunkSchemaRef = Arc<ChunkSchema>;
 
-fn logical_type_desc_from_field(field: &Field) -> Option<types::TTypeDesc> {
-    let primitive = match logical_type_of_field(field)? {
-        LogicalType::Json => types::TPrimitiveType::JSON,
-        LogicalType::Hll => types::TPrimitiveType::HLL,
-        LogicalType::Bitmap | LogicalType::Object => types::TPrimitiveType::OBJECT,
-        LogicalType::Percentile => types::TPrimitiveType::PERCENTILE,
-    };
-    Some(crate::lower::type_lowering::scalar_type_desc(primitive))
+fn type_desc_node_span(nodes: &[types::TTypeNode], start: usize) -> Result<usize, String> {
+    let node = nodes
+        .get(start)
+        .ok_or_else(|| format!("field type desc ended unexpectedly at node {}", start))?;
+
+    match node.type_ {
+        t if t == types::TTypeNodeType::SCALAR => Ok(start + 1),
+        t if t == types::TTypeNodeType::STRUCT => {
+            let struct_fields = node
+                .struct_fields
+                .as_ref()
+                .ok_or_else(|| "struct type desc missing struct_fields".to_string())?;
+            let mut cursor = start + 1;
+            for _ in struct_fields {
+                cursor = type_desc_node_span(nodes, cursor)?;
+            }
+            Ok(cursor)
+        }
+        t if t == types::TTypeNodeType::ARRAY => type_desc_node_span(nodes, start + 1),
+        t if t == types::TTypeNodeType::MAP => {
+            let next = type_desc_node_span(nodes, start + 1)?;
+            type_desc_node_span(nodes, next)
+        }
+        other => Err(format!("unsupported type desc node {:?}", other)),
+    }
 }
 
 fn is_compatible_chunk_field_type(expected: &DataType, actual: &DataType) -> bool {
@@ -704,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_schema_sidecar_recovers_type_desc_and_unique_id() {
+    fn chunk_schema_recovers_logical_metadata_and_unique_id() {
         let desc = scalar_type_desc(TPrimitiveType::HLL);
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Binary, true)]));
         let batch = RecordBatch::try_new(
@@ -730,8 +667,9 @@ mod tests {
             .chunk_schema()
             .slot(SlotId::new(7))
             .expect("slot schema");
-        assert_eq!(slot.type_desc(), Some(&desc));
-        assert_eq!(slot.primitive_type(), Some(TPrimitiveType::HLL));
+        assert_eq!(slot.data_type(), &DataType::Binary);
+        assert_eq!(slot.field_schema().logical_type(), Some(LogicalType::Hll));
+        assert_eq!(logical_type_of_field(slot.field()), Some(LogicalType::Hll));
         assert_eq!(slot.name(), "a");
         assert_eq!(slot.unique_id(), Some(77));
     }

@@ -44,7 +44,7 @@ pub(crate) fn arrow_type_to_primitive(
         DataType::Time64(_) => Ok(types::TPrimitiveType::TIME),
         DataType::Null => Ok(types::TPrimitiveType::NULL_TYPE),
         other => Err(format!(
-            "ThriftPlanBuilder does not support data type {:?}",
+            "Arrow-to-thrift primitive conversion does not support data type {:?}",
             other
         )),
     }
