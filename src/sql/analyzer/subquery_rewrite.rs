@@ -2689,14 +2689,24 @@ pub(super) struct CorrelationPred {
 /// (truthy when non-zero, FALSE when zero, NULL when NULL); our analyzer
 /// hands such an expression off to downstream AND-conjuncts that
 /// require boolean operands ("AND right operand must be boolean"). Wrap
-/// non-boolean truthy filters as `expr != 0` (numeric) so the
-/// three-valued logic matches.
+/// numeric truthy filters as `expr != 0`; Utf8 truthy filters need an explicit
+/// boolean cast so values like `"true"` keep their predicate meaning.
 pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
     use arrow::datatypes::DataType;
     if matches!(expr.data_type, DataType::Boolean) {
         return expr;
     }
     let nullable = expr.nullable;
+    if matches!(expr.data_type, DataType::Utf8) {
+        return TypedExpr {
+            data_type: DataType::Boolean,
+            nullable,
+            kind: ExprKind::Cast {
+                expr: Box::new(expr),
+                target: DataType::Boolean,
+            },
+        };
+    }
     let zero = TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Int(0)),
         data_type: DataType::Int64,
@@ -4783,4 +4793,56 @@ fn conjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
             right: Box::new(e),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coerce_where_to_bool_keeps_numeric_truthiness_as_ne_zero() {
+        let expr = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: crate::sql::column_id::ColumnId(1),
+                qualifier: None,
+                column: "flag".to_string(),
+            },
+            data_type: DataType::Int32,
+            nullable: true,
+        };
+
+        let coerced = coerce_where_to_bool(expr);
+
+        assert!(matches!(
+            coerced.kind,
+            ExprKind::BinaryOp { op: BinOp::Ne, .. }
+        ));
+        assert_eq!(coerced.data_type, DataType::Boolean);
+        assert!(coerced.nullable);
+    }
+
+    #[test]
+    fn coerce_where_to_bool_casts_string_truthiness_to_boolean() {
+        let expr = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: crate::sql::column_id::ColumnId(1),
+                qualifier: None,
+                column: "flag".to_string(),
+            },
+            data_type: DataType::Utf8,
+            nullable: true,
+        };
+
+        let coerced = coerce_where_to_bool(expr);
+
+        assert!(matches!(
+            coerced.kind,
+            ExprKind::Cast {
+                target: DataType::Boolean,
+                ..
+            }
+        ));
+        assert_eq!(coerced.data_type, DataType::Boolean);
+        assert!(coerced.nullable);
+    }
 }
