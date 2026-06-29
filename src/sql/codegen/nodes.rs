@@ -117,9 +117,8 @@ pub(crate) fn build_scan_node(
 
 /// Emit `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE` for an IVM-A1 delta scan.
 /// The Thrift payload carries identity, snapshot range, and an explicit JSON
-/// payload. The actual change-file enumeration happens here at
-/// refresh/codegen time via `connector::iceberg::changes::plan_changes`, and
-/// lower_plan only consumes the explicit payload.
+/// payload. Change-file enumeration and equality-delete target planning happen
+/// here at refresh/codegen time; lower_plan only consumes the typed payload.
 ///
 /// `conjuncts` is the predicate-pushdown output for this scan. We forward
 /// them on `node.conjuncts` so the shared `LowerNode::evaluate_conjuncts`
@@ -160,22 +159,22 @@ fn build_iceberg_delta_scan_node(
         table: table_info.table.clone(),
         from_snapshot_id,
         to_snapshot_id,
-        explicit_payload_json: Some(build_iceberg_delta_explicit_payload_json(
+        delta_plan: build_iceberg_delta_scan_plan(
             table_info,
             from_snapshot_id,
             to_snapshot_id,
             mv_refresh_ctx,
-        )?),
+        )?,
     });
     Ok(node)
 }
 
-fn build_iceberg_delta_explicit_payload_json(
+fn build_iceberg_delta_scan_plan(
     table: &crate::sql::catalog::IcebergTableInfo,
     from_snapshot_id: i64,
     to_snapshot_id: i64,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<String, String> {
+) -> Result<plan_nodes::TIcebergDeltaScanPlan, String> {
     let refresh_ctx = mv_refresh_ctx
         .ok_or_else(|| "Iceberg delta scan requires MV refresh context".to_string())?;
     let catalog_key = crate::engine::catalog::normalize_identifier(&table.catalog)?;
@@ -225,8 +224,22 @@ fn build_iceberg_delta_explicit_payload_json(
             table.catalog, table.namespace, table.table, from_snapshot_id, to_snapshot_id
         )
     })?;
+    let equality_targets_by_delete_file = crate::connector::iceberg::changes::equality_delete_targets_at(
+        &loaded,
+        batch.current_snapshot_id,
+        &batch.equality_deletes,
+    )
+    .map_err(|e| {
+        format!(
+            "ivm-a1 codegen delta-scan: plan equality-delete targets failed for {}.{}.{} at snapshot {}: {e}",
+            table.catalog, table.namespace, table.table, batch.current_snapshot_id
+        )
+    })?;
     let change_files =
-        crate::connector::iceberg::changes::delta_source_files_from_change_batch(&batch)?;
+        crate::connector::iceberg::changes::delta_source_files_from_change_batch_with_equality_targets(
+            &batch,
+            &equality_targets_by_delete_file,
+        )?;
     let has_delete = !batch.deletes.is_empty()
         || !batch.equality_deletes.is_empty()
         || !batch.deleted_data_files.is_empty();
@@ -301,24 +314,247 @@ fn build_iceberg_delta_explicit_payload_json(
     } else {
         None
     };
-    let explicit = crate::exec::node::iceberg_delta_scan::IcebergDeltaExplicitPayload {
-        version: crate::exec::node::iceberg_delta_scan::ICEBERG_DELTA_EXPLICIT_PAYLOAD_VERSION,
-        serialized_table_metadata: serde_json::to_string(loaded.metadata()).map_err(|e| {
-            format!(
-                "serialize iceberg delta scan table metadata for {}.{}.{} failed: {e}",
-                table.catalog, table.namespace, table.table
-            )
-        })?,
-        object_store_config: entry.object_store_config().cloned(),
-        change_files,
-        delete_side,
+    let current_schema = loaded.metadata().current_schema();
+    let data_columns = current_schema
+        .as_ref()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| plan_nodes::TIcebergDeltaDataColumn::new(field.name.clone(), field.id))
+        .collect();
+    Ok(plan_nodes::TIcebergDeltaScanPlan::new(
+        loaded.metadata().location().to_string(),
+        data_columns,
+        cloud_configuration_from_properties(entry.cloud_properties_map()),
+        change_files_to_thrift(&change_files)?,
+        delete_side_to_thrift(delete_side.as_ref())?,
+    ))
+}
+
+fn cloud_configuration_from_properties(
+    cloud_properties: BTreeMap<String, String>,
+) -> Option<crate::thrift::cloud_configuration::TCloudConfiguration> {
+    if cloud_properties.is_empty() {
+        return None;
+    }
+    Some(
+        crate::thrift::cloud_configuration::TCloudConfiguration::new(
+            None::<crate::thrift::cloud_configuration::TCloudType>,
+            None::<Vec<crate::thrift::cloud_configuration::TCloudProperty>>,
+            Some(cloud_properties),
+            None::<bool>,
+        ),
+    )
+}
+
+fn change_files_to_thrift(
+    files: &[crate::exec::node::iceberg_delta_scan::DeltaSourceFile],
+) -> Result<Vec<plan_nodes::TIcebergDeltaSourceFile>, String> {
+    files.iter().map(change_file_to_thrift).collect()
+}
+
+fn change_file_to_thrift(
+    file: &crate::exec::node::iceberg_delta_scan::DeltaSourceFile,
+) -> Result<plan_nodes::TIcebergDeltaSourceFile, String> {
+    use crate::exec::node::iceberg_delta_scan::DeltaSourceRole;
+
+    let (role, position_deletes, equality_field_ids, equality_targets, deleted_file_visibility) =
+        match &file.role {
+            DeltaSourceRole::DataFile => (
+                plan_nodes::TIcebergDeltaSourceRole::DATA_FILE,
+                None,
+                None,
+                None,
+                None,
+            ),
+            DeltaSourceRole::PositionDelete { deletes } => (
+                plan_nodes::TIcebergDeltaSourceRole::POSITION_DELETE,
+                Some(
+                    deletes
+                        .iter()
+                        .map(position_delete_source_to_thrift)
+                        .collect::<Vec<_>>(),
+                ),
+                None,
+                None,
+                None,
+            ),
+            DeltaSourceRole::EqualityDelete {
+                equality_field_ids,
+                targets,
+            } => (
+                plan_nodes::TIcebergDeltaSourceRole::EQUALITY_DELETE,
+                None,
+                Some(equality_field_ids.clone()),
+                Some(targets.iter().map(equality_target_to_thrift).collect()),
+                None,
+            ),
+            DeltaSourceRole::DeletedDataFile {
+                previous_data_file_visibility,
+            } => (
+                plan_nodes::TIcebergDeltaSourceRole::DELETED_DATA_FILE,
+                None,
+                None,
+                None,
+                previous_data_file_visibility
+                    .as_ref()
+                    .map(deleted_file_visibility_to_thrift),
+            ),
+        };
+
+    Ok(plan_nodes::TIcebergDeltaSourceFile::new(
+        file.path.clone(),
+        file.size,
+        role,
+        file.partition_spec_id,
+        file.partition_key.clone(),
+        file.first_row_id,
+        file.data_sequence_number,
+        file.row_id_allow_list.clone(),
+        position_deletes,
+        equality_field_ids,
+        equality_targets,
+        deleted_file_visibility,
+    ))
+}
+
+fn position_delete_source_to_thrift(
+    delete: &crate::exec::node::iceberg_delta_scan::PositionDeleteSourceData,
+) -> plan_nodes::TIcebergDeltaPositionDeleteSource {
+    plan_nodes::TIcebergDeltaPositionDeleteSource::new(
+        delete.delete_file_path.clone(),
+        delete.delete_file_size,
+        delete.referenced_data_file.clone(),
+        match delete.file_format {
+            crate::exec::node::iceberg_delta_scan::PositionDeleteFileFormat::Parquet => {
+                plan_nodes::TIcebergDeltaPositionDeleteFileFormat::PARQUET
+            }
+            crate::exec::node::iceberg_delta_scan::PositionDeleteFileFormat::Puffin => {
+                plan_nodes::TIcebergDeltaPositionDeleteFileFormat::PUFFIN
+            }
+        },
+        delete.content_offset,
+        delete.content_size_in_bytes,
+    )
+}
+
+fn equality_target_to_thrift(
+    target: &crate::exec::node::iceberg_delta_scan::EqualityDeleteTargetData,
+) -> plan_nodes::TIcebergDeltaEqualityDeleteTarget {
+    plan_nodes::TIcebergDeltaEqualityDeleteTarget::new(
+        target.data_file_path.clone(),
+        target.data_file_size,
+        target.data_file_first_row_id,
+        target.data_file_sequence_number,
+    )
+}
+
+fn deleted_file_visibility_to_thrift(
+    visibility: &crate::exec::node::iceberg_delta_scan::DeletedFileVisibility,
+) -> plan_nodes::TIcebergDeltaDeletedFileVisibility {
+    plan_nodes::TIcebergDeltaDeletedFileVisibility::new(
+        visibility.already_deleted_positions.clone(),
+    )
+}
+
+fn delete_side_to_thrift(
+    payload: Option<&crate::exec::node::iceberg_delta_scan::DeltaScanDeleteSidePayload>,
+) -> Result<Option<plan_nodes::TIcebergDeltaDeleteSidePlan>, String> {
+    let Some(payload) = payload else {
+        return Ok(None);
     };
-    serde_json::to_string(&explicit).map_err(|e| {
-        format!(
-            "serialize iceberg delta scan explicit payload for {}.{}.{} failed: {e}",
-            table.catalog, table.namespace, table.table
-        )
-    })
+    Ok(Some(plan_nodes::TIcebergDeltaDeleteSidePlan::new(
+        lineage_map_to_thrift(&payload.base_data_file_lineage),
+        lineage_map_to_thrift(&payload.previous_data_file_lineage),
+        payload
+            .previous_delete_visibility_data_files
+            .iter()
+            .map(delete_visibility_data_file_to_thrift)
+            .collect::<Vec<_>>(),
+        previous_deleted_positions_to_thrift(&payload.previously_deleted_positions_per_file)?,
+        payload.deleted_data_file_paths.iter().cloned().collect(),
+    )))
+}
+
+fn lineage_map_to_thrift(
+    input: &HashMap<String, crate::exec::node::iceberg_delta_scan::BaseDataFileLineage>,
+) -> BTreeMap<String, plan_nodes::TIcebergDeltaBaseDataFileLineage> {
+    input
+        .iter()
+        .map(|(path, lineage)| {
+            (
+                path.clone(),
+                plan_nodes::TIcebergDeltaBaseDataFileLineage::new(
+                    lineage.first_row_id,
+                    lineage.data_sequence_number,
+                ),
+            )
+        })
+        .collect()
+}
+
+fn previous_deleted_positions_to_thrift(
+    input: &HashMap<String, Vec<u64>>,
+) -> Result<BTreeMap<String, Vec<i64>>, String> {
+    input
+        .iter()
+        .map(|(path, positions)| {
+            let converted = positions
+                .iter()
+                .map(|position| {
+                    i64::try_from(*position).map_err(|_| {
+                        format!(
+                            "iceberg delta scan previous deleted position for {} exceeds i64: {}",
+                            path, position
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((path.clone(), converted))
+        })
+        .collect()
+}
+
+fn delete_visibility_data_file_to_thrift(
+    file: &crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor,
+) -> plan_nodes::TIcebergDeltaDeleteVisibilityDataFile {
+    plan_nodes::TIcebergDeltaDeleteVisibilityDataFile::new(
+        file.path.clone(),
+        file.size,
+        file.first_row_id,
+        file.data_sequence_number,
+        file.delete_files
+            .iter()
+            .map(delete_visibility_delete_file_to_thrift)
+            .collect(),
+    )
+}
+
+fn delete_visibility_delete_file_to_thrift(
+    file: &crate::connector::iceberg::changes::DeleteVisibilityDeleteFileDescriptor,
+) -> plan_nodes::TIcebergDeltaDeleteVisibilityDeleteFile {
+    plan_nodes::TIcebergDeltaDeleteVisibilityDeleteFile::new(
+        file.path.clone(),
+        match file.file_format {
+            crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat::Parquet => {
+                plan_nodes::TIcebergDeltaDeleteFileFormat::PARQUET
+            }
+            crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat::Puffin => {
+                plan_nodes::TIcebergDeltaDeleteFileFormat::PUFFIN
+            }
+        },
+        match file.file_content {
+            crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Position => {
+                plan_nodes::TIcebergDeltaDeleteFileContent::POSITION
+            }
+            crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Equality => {
+                plan_nodes::TIcebergDeltaDeleteFileContent::EQUALITY
+            }
+        },
+        file.length,
+        file.content_offset,
+        file.content_size_in_bytes,
+    )
 }
 
 fn build_hdfs_scan_node(

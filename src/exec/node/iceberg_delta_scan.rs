@@ -21,7 +21,7 @@
 //! products (data files / position-delete / equality-delete / deleted-data-file)
 //! and emits a unified chunk stream tagged with the A4 transparent
 //! `__change_op` column (+1 for INSERT, -1 for DELETE). Populated by
-//! `lower_iceberg_delta_scan` (in `src/lower/thrift/iceberg_delta_scan.rs`)
+//! `lower_iceberg_delta_scan` (in `src/lower/node/iceberg_delta_scan.rs`)
 //! when the Thrift plan carries `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`.
 
 use std::sync::Arc;
@@ -30,18 +30,19 @@ use crate::exec::chunk::ChunkSchemaRef;
 use crate::fs::object_store::ObjectStoreConfig;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 
-pub(crate) const ICEBERG_DELTA_EXPLICIT_PAYLOAD_VERSION: u16 = 1;
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub(crate) struct IcebergDeltaExplicitPayload {
-    pub version: u16,
-    pub serialized_table_metadata: String,
-    pub object_store_config: Option<ObjectStoreConfig>,
-    pub change_files: Vec<DeltaSourceFile>,
-    pub delete_side: Option<DeltaScanDeleteSidePayload>,
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergDeltaTablePayload {
+    pub table_location: String,
+    pub data_columns: Vec<IcebergDeltaDataColumnPayload>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergDeltaDataColumnPayload {
+    pub name: String,
+    pub field_id: i32,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct DeltaScanDeleteSidePayload {
     pub base_data_file_lineage: std::collections::HashMap<String, BaseDataFileLineage>,
     pub previous_data_file_lineage: std::collections::HashMap<String, BaseDataFileLineage>,
@@ -81,7 +82,7 @@ pub enum ApplyKeySource {
     BaseRowId,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug)]
 pub struct DeltaSourceFile {
     pub path: String,
     pub size: i64,
@@ -100,7 +101,7 @@ pub struct DeltaSourceFile {
     pub row_id_allow_list: Option<std::collections::BTreeSet<i64>>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug)]
 pub enum DeltaSourceRole {
     DataFile,
     PositionDelete {
@@ -122,7 +123,7 @@ pub enum DeltaSourceRole {
 /// `IcebergDeltaScanNode` does not need to leak the wider iceberg enum
 /// through its public type surface — and so adding new formats in the
 /// future is a single localized change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PositionDeleteFileFormat {
     /// v2 position-delete file (one row per (file, pos) pair, parquet-encoded).
     Parquet,
@@ -130,7 +131,7 @@ pub enum PositionDeleteFileFormat {
     Puffin,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug)]
 pub struct PositionDeleteSourceData {
     pub delete_file_path: String,
     pub delete_file_size: i64,
@@ -149,31 +150,32 @@ pub struct PositionDeleteSourceData {
     pub content_size_in_bytes: Option<i64>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug)]
 pub struct EqualityDeleteTargetData {
     pub data_file_path: String,
+    pub data_file_size: i64,
     pub data_file_first_row_id: Option<i64>,
+    pub data_file_sequence_number: Option<i64>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug)]
 pub struct DeletedFileVisibility {
     pub already_deleted_positions: Vec<i64>,
 }
 
 /// Iceberg per-table runtime handles required by `IcebergDeltaScanOperator`
-/// to open delete files and re-read target data files. Constructed by
-/// `lower_iceberg_delta_scan` when lowering `ICEBERG_DELTA_SCAN_NODE`:
-/// - `base_table` comes from `iceberg::Catalog::load_table`
-/// - `object_store_factory` is built once via `build_factory_for_table` and
-///   shared across role scanners
-/// - `delete_side` is populated via `base_data_file_lineage_index` +
-///   `load_existing_delete_visibility_by_data_file_at` only when the change
-///   batch contains DELETE-side roles (position / equality / deleted-data-file).
+/// to open planned data/delete files. Constructed by `lower_iceberg_delta_scan`
+/// when lowering `ICEBERG_DELTA_SCAN_NODE` from the typed Thrift payload:
+/// - `table` is the codegen-produced table descriptor, not full Iceberg metadata
+/// - `object_store_factory` is built once from table location and shared across role scanners
+/// - `file_io` is used only for Puffin deletion-vector blobs
+/// - `delete_side` is populated only when the change batch contains DELETE-side roles.
 #[derive(Debug)]
 pub struct IcebergRuntimeHandles {
-    pub base_table: iceberg::table::Table,
-    pub object_store_factory: Arc<OpendalRangeReaderFactory>,
-    pub delete_side: Option<DeltaScanDeleteSide>,
+    pub(crate) table: IcebergDeltaTablePayload,
+    pub(crate) object_store_factory: Arc<OpendalRangeReaderFactory>,
+    pub(crate) file_io: iceberg::io::FileIO,
+    pub(crate) delete_side: Option<DeltaScanDeleteSide>,
 }
 
 /// Per-target-data-file v3 row-lineage metadata required by the delete-side
@@ -181,7 +183,7 @@ pub struct IcebergRuntimeHandles {
 /// `_file` / `_pos` / `_row_id` / `_last_updated_sequence_number` virtual
 /// columns when reverse-projecting deleted rows. Filled in from the relevant
 /// snapshot read views.
-#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug)]
 pub struct BaseDataFileLineage {
     pub first_row_id: i64,
     pub data_sequence_number: i64,

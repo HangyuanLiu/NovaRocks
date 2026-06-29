@@ -353,9 +353,9 @@ pub enum ScanSource {
     /// analyzer/planner when it recognizes the
     /// `__nr_ivm_delta('cat.ns.tbl', from, to)` table function. Codegen
     /// emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE` with an explicit
-    /// payload produced by `connector::iceberg::changes::plan_changes`.
+    /// typed payload produced from refresh-time Iceberg metadata planning.
     /// Lowering consumes that payload and does not re-read connector catalog
-    /// state.
+    /// state or reconstruct full Iceberg table metadata.
     IcebergDeltaTable {
         table: IcebergTableInfo,
         from_snapshot_id: i64,
