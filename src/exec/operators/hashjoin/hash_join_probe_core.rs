@@ -1746,13 +1746,20 @@ mod tests {
             .collect()
     }
 
-    fn direct_build_artifact_from_build_chunk(build: Chunk) -> JoinBuildArtifact {
+    fn direct_build_artifact_with_contract(
+        build: Chunk,
+        join_type: JoinType,
+        has_residual_predicate: bool,
+        build_has_null_key: bool,
+        build_null_key_rows: Option<Arc<Vec<u32>>>,
+    ) -> JoinBuildArtifact {
         let key_arrays = vec![build.column_by_slot_id(RIGHT_K_SLOT_ID).expect("build key")];
         let batch = crate::exec::operators::hashjoin::join_hash_map::method::BuildKeyBatch::new(
             key_arrays,
             build.len(),
         )
         .expect("key batch");
+        let build_row_count = build.len();
         let build_table =
             crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMap::build_from_key_batches(
                 vec![DataType::Int32],
@@ -1766,13 +1773,23 @@ mod tests {
             crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind::DirectInt { .. }
         ));
         JoinBuildArtifact::new(
-            required_build_components(JoinType::Inner, false, true, true),
+            required_build_components(join_type, has_residual_predicate, true, true),
             Some(BuildStore::new(build)),
             Some(build_table),
-            3,
+            build_row_count,
+            build_has_null_key,
+            build_null_key_rows,
+            None,
+        )
+    }
+
+    fn direct_build_artifact_from_build_chunk(build: Chunk) -> JoinBuildArtifact {
+        direct_build_artifact_with_contract(
+            build,
+            JoinType::Inner,
+            false,
             false,
             Some(Arc::new(Vec::new())),
-            None,
         )
     }
 
@@ -2070,13 +2087,20 @@ mod tests {
             &[100, 101, 103],
             &[10, 11, 13],
         );
-        let artifact = Arc::new(direct_build_artifact_from_build_chunk(build_chunk));
+        let artifact = Arc::new(direct_build_artifact_with_contract(
+            build_chunk,
+            JoinType::FullOuter,
+            false,
+            false,
+            None,
+        ));
 
         let mut core = HashJoinProbeCore::new(
             Arc::clone(&arena),
             JoinType::FullOuter,
             vec![probe_key],
             None,
+            true,
             true,
             chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
             chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
@@ -2275,6 +2299,7 @@ mod tests {
             vec![probe_key],
             Some(residual),
             true,
+            true,
             chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
             chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
             chunk_schema_of(
@@ -2333,6 +2358,7 @@ mod tests {
             JoinType::LeftAnti,
             vec![probe_key],
             Some(residual),
+            true,
             true,
             chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
             chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
@@ -2500,13 +2526,20 @@ mod tests {
             &[100, 102, 103],
             &[10, 5, 99],
         );
-        let artifact = Arc::new(direct_build_artifact_from_build_chunk(build_chunk));
+        let artifact = Arc::new(direct_build_artifact_with_contract(
+            build_chunk,
+            JoinType::NullAwareLeftAnti,
+            true,
+            false,
+            Some(Arc::new(Vec::new())),
+        ));
 
         let mut core = HashJoinProbeCore::new(
             Arc::clone(&arena),
             JoinType::NullAwareLeftAnti,
             vec![probe_key],
             Some(residual),
+            true,
             true,
             chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
             chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
