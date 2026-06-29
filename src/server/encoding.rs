@@ -16,9 +16,9 @@ use mysql_common::value::Value as MySqlValue;
 use opensrv_mysql::{Column, ColumnFlags, ColumnType, QueryResultWriter, ToMysqlValue};
 use tokio::io::AsyncWrite;
 
-use crate::common::util::format_mysql_container_value_with_schema;
+use crate::common::util::{FieldRenderSchema, format_mysql_container_value_with_schema};
 use crate::engine::{QueryResult, QueryResultColumn};
-use crate::exec::chunk::{Chunk, ChunkFieldSchema};
+use crate::exec::chunk::Chunk;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum StandaloneMysqlValue {
@@ -198,7 +198,8 @@ pub(super) fn build_mysql_row(
         .zip(chunk.chunk_schema().slots().iter())
         .zip(columns.iter())
         .map(|((column, slot), declared)| {
-            array_value_to_mysql_value(column, declared, row_idx, Some(slot.field_schema()))
+            let field_schema = FieldRenderSchema::from_field(slot.field());
+            array_value_to_mysql_value(column, declared, row_idx, Some(&field_schema))
         })
         .collect()
 }
@@ -207,7 +208,7 @@ pub(super) fn array_value_to_mysql_value(
     column: &ArrayRef,
     declared: &QueryResultColumn,
     row_idx: usize,
-    field_schema: Option<&ChunkFieldSchema>,
+    field_schema: Option<&FieldRenderSchema>,
 ) -> Result<StandaloneMysqlValue, String> {
     if column.is_null(row_idx) {
         return Ok(StandaloneMysqlValue::Null);
