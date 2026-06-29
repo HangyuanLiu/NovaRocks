@@ -1,11 +1,14 @@
 //! Entrypoint for the IMV rewrite pipeline. See
 //! docs/design/specs/2026-05-26-incremental-mv-optimizer-foundation-design.md.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
+use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::scalar::ScalarArena;
@@ -21,6 +24,7 @@ pub(crate) struct ImvRewriteInput {
     pub mv_ctx: Arc<IcebergMvRewriteContext>,
     pub disabled_rules: Vec<String>,
     pub deadline: Option<Instant>,
+    pub column_ref_factory: Rc<RefCell<ColumnRefFactory>>,
     /// Next free `ColumnId` value, taken from the `ColumnRefFactory` that
     /// produced `plan`. Seeds the IMV rewrite's internal ColumnId allocator
     /// so new columns (e.g. the action column) never collide with existing ids.
@@ -41,10 +45,12 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         mv_ctx,
         disabled_rules,
         deadline,
+        column_ref_factory,
         next_column_id,
     } = input;
 
     let mut ctx_rw = RewriteContext::for_mv_refresh(disabled_rules);
+    ctx_rw.set_column_ref_factory(Rc::clone(&column_ref_factory));
     // Seed from the factory's next-free id (passed by the caller), guarding
     // against a degenerate 0 seed which would alias ColumnId::UNSET.
     let next_column_id = Arc::new(AtomicU32::new(next_column_id.max(1)));
@@ -89,6 +95,9 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use crate::engine::mv::iceberg_target_apply::{
         ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN,
     };
@@ -105,7 +114,7 @@ mod tests {
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
-    use crate::sql::column_id::ColumnId;
+    use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -140,6 +149,10 @@ mod tests {
 
     fn dummy_mv_ctx() -> Arc<IcebergMvRewriteContext> {
         crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context()
+    }
+
+    fn test_column_ref_factory() -> Rc<RefCell<ColumnRefFactory>> {
+        Rc::new(RefCell::new(ColumnRefFactory::new()))
     }
 
     fn empty_values_plan() -> LogicalPlanNode {
@@ -839,6 +852,24 @@ mod tests {
     }
 
     #[test]
+    fn run_imv_rewrite_accepts_column_ref_factory() {
+        let factory = test_column_ref_factory();
+
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: iceberg_scan_plan(),
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+            deadline: None,
+            column_ref_factory: std::rc::Rc::clone(&factory),
+            next_column_id: 100,
+        })
+        .expect("plain Iceberg scan should pass through IMV rewrite");
+
+        assert_eq!(factory.borrow().peek_next_id(), 1);
+        assert!(matches!(outcome.plan.kind, PlanNodeKind::Scan(_)));
+    }
+
+    #[test]
     fn annotation_is_default_initialized_in_extension_slot() {
         // Disable WrapRootInImvDelta so the pipeline succeeds and we can
         // inspect the annotation; annotation initialization is independent
@@ -848,6 +879,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .unwrap();
@@ -870,6 +902,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect_err("invalid logical scan must return a stage validation error");
@@ -986,6 +1019,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["NoSuchRule".to_string(), "WrapRootInImvDelta".to_string()],
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("unknown disabled rule must not break the pipeline");
@@ -1073,6 +1107,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect_err("PR-β pipeline rejects plain plans");
@@ -1092,6 +1127,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect_err("PR-β pipeline must Reject on plain plan");
@@ -1111,6 +1147,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("disabled wrap rule must let the pipeline succeed");
@@ -1126,6 +1163,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("pipeline must succeed when wrap rule is disabled");
@@ -1163,6 +1201,7 @@ mod tests {
                 "ActionColumnValidation".to_string(),
             ],
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("Delta(Scan) must bind successfully");
@@ -1197,6 +1236,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("Version(Scan, From) must bind and pass validation");
@@ -1226,6 +1266,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("Version(Scan, To) must bind and pass validation");
@@ -1254,6 +1295,7 @@ mod tests {
                 "ActionColumnValidation".to_string(),
             ],
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("pipeline must succeed");
@@ -1302,6 +1344,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("Project over delta scan must rewrite and pass validation");
@@ -1443,6 +1486,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("top-level projection/filter UNION ALL must rewrite through the full IMV pipeline");
@@ -1517,6 +1561,7 @@ mod tests {
             mv_ctx: partitioned_aggregate_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("aggregate IMV pipeline must rewrite and validate");
@@ -1547,6 +1592,7 @@ mod tests {
             mv_ctx: aggregate_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("aggregate IMV pipeline must rewrite and validate");
@@ -1583,6 +1629,7 @@ mod tests {
             mv_ctx: ctx,
             disabled_rules: Vec::new(),
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("NotDerivable must not fail the rewrite");
@@ -1618,6 +1665,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("projection/filter rewrite must succeed");
@@ -1631,6 +1679,7 @@ mod tests {
             mv_ctx: aggregate_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("aggregate IMV pipeline must rewrite and validate");
@@ -1684,6 +1733,7 @@ mod tests {
             mv_ctx: join_aggregate_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("join aggregate IMV pipeline must rewrite and validate");
@@ -1718,6 +1768,7 @@ mod tests {
             mv_ctx: join_aggregate_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            column_ref_factory: test_column_ref_factory(),
             next_column_id: 100,
         })
         .expect("join aggregate IMV pipeline must rewrite and validate");
