@@ -22,13 +22,15 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::cache::{CacheOptions, DataCacheManager, ExternalDataCacheRangeOptions};
 use crate::common::ids::SlotId;
 use crate::common::min_max_predicate::MinMaxPredicate;
-use crate::connector::iceberg::position_delete::{
-    IcebergDeleteFileSpec, convert_scan_range_delete_files,
+use crate::connector::iceberg::delete_file::{
+    IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
 use crate::connector::iceberg::{
     IcebergArrowColumn, IcebergMetadataOutputColumn, IcebergMetadataScanConfig,
-    IcebergMetadataScanRange, IcebergMetadataTableType, build_projected_output_schema,
-    lookup_iceberg_table_location, snapshot_iceberg_table_locations,
+    IcebergMetadataScanRange, IcebergMetadataTableType, IcebergPartitionInfo,
+    IcebergSchemaDescriptor, IcebergSchemaFieldDescriptor, IcebergTableColumn,
+    IcebergTableDescriptor, build_projected_output_schema, lookup_iceberg_table_location,
+    snapshot_iceberg_table_locations,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
@@ -49,6 +51,103 @@ use crate::novarocks_connectors::{
 };
 use crate::novarocks_logging::{debug, warn};
 use crate::thrift::{descriptors, exprs, internal_service, plan_nodes, types};
+
+fn iceberg_schema_field_descriptor_from_thrift(
+    field: &descriptors::TIcebergSchemaField,
+) -> Result<IcebergSchemaFieldDescriptor, String> {
+    let name = field
+        .name
+        .clone()
+        .ok_or_else(|| "iceberg schema field missing name".to_string())?;
+    let children = field
+        .children
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|child| iceberg_schema_field_descriptor_from_thrift(child.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(IcebergSchemaFieldDescriptor {
+        name,
+        field_id: field.field_id,
+        children,
+        initial_default_json: field.initial_default_json.clone(),
+    })
+}
+
+fn iceberg_schema_descriptor_from_thrift(
+    schema: &descriptors::TIcebergSchema,
+) -> Result<IcebergSchemaDescriptor, String> {
+    let fields = schema
+        .fields
+        .as_ref()
+        .ok_or_else(|| "iceberg schema missing fields".to_string())?
+        .iter()
+        .map(iceberg_schema_field_descriptor_from_thrift)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(IcebergSchemaDescriptor { fields })
+}
+
+fn iceberg_table_descriptor_from_thrift(
+    iceberg: &descriptors::TIcebergTable,
+) -> Result<IcebergTableDescriptor, String> {
+    let columns = iceberg
+        .columns
+        .as_ref()
+        .ok_or_else(|| "iceberg table missing columns".to_string())?
+        .iter()
+        .map(|column| {
+            let data_type = column
+                .type_desc
+                .as_ref()
+                .and_then(crate::types::arrow_thrift::thrift_desc_to_arrow_type)
+                .ok_or_else(|| {
+                    format!("iceberg column {} missing type_desc", column.column_name)
+                })?;
+            Ok(IcebergTableColumn {
+                name: column.column_name.clone(),
+                data_type,
+                nullable: column.is_allow_null.unwrap_or(true),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let partition_info = iceberg
+        .partition_info
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|info| {
+            Ok(IcebergPartitionInfo {
+                source_column_name: info.source_column_name.clone().ok_or_else(|| {
+                    "iceberg partition_info missing source_column_name".to_string()
+                })?,
+                partition_column_name: info.partition_column_name.clone().ok_or_else(|| {
+                    "iceberg partition_info missing partition_column_name".to_string()
+                })?,
+                transform_expr: info
+                    .transform_expr
+                    .clone()
+                    .ok_or_else(|| "iceberg partition_info missing transform_expr".to_string())?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(IcebergTableDescriptor {
+        columns,
+        iceberg_schema: iceberg
+            .iceberg_schema
+            .as_ref()
+            .map(iceberg_schema_descriptor_from_thrift)
+            .transpose()?,
+        equality_delete_schema: iceberg
+            .iceberg_equal_delete_schema
+            .as_ref()
+            .map(iceberg_schema_descriptor_from_thrift)
+            .transpose()?,
+        partition_info,
+        current_snapshot_id: iceberg.current_snapshot_id,
+        serialized_metadata: iceberg.serialized_metadata.clone(),
+    })
+}
 
 /// Cache Iceberg table locations from descriptor table for later use in HDFS scan lowering.
 pub(crate) fn cache_iceberg_table_locations(desc_tbl: Option<&descriptors::TDescriptorTable>) {
@@ -73,6 +172,81 @@ fn advance_hidden_slot_id(slot_id: SlotId) -> Result<SlotId, String> {
         .checked_add(1)
         .map(SlotId::new)
         .ok_or_else(|| "cannot allocate hidden HDFS scan slot id".to_string())
+}
+
+fn iceberg_file_content_from_thrift(
+    scan_node_label: &str,
+    file_content: crate::thrift::types::TIcebergFileContent,
+) -> Result<IcebergFileContent, String> {
+    match file_content {
+        crate::thrift::types::TIcebergFileContent::DATA => Ok(IcebergFileContent::Data),
+        crate::thrift::types::TIcebergFileContent::POSITION_DELETES => {
+            Ok(IcebergFileContent::PositionDeletes)
+        }
+        crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES => {
+            Ok(IcebergFileContent::EqualityDeletes)
+        }
+        other => Err(format!(
+            "{scan_node_label} received unexpected iceberg delete file_content {other:?}"
+        )),
+    }
+}
+
+fn iceberg_file_format_from_thrift(
+    format: crate::thrift::descriptors::THdfsFileFormat,
+) -> IcebergFileFormat {
+    match format {
+        crate::thrift::descriptors::THdfsFileFormat::PARQUET => IcebergFileFormat::Parquet,
+        crate::thrift::descriptors::THdfsFileFormat::UNKNOWN => IcebergFileFormat::Unknown,
+        _ => IcebergFileFormat::Unknown,
+    }
+}
+
+fn convert_scan_range_delete_files(
+    scan_node_label: &str,
+    hdfs_range: &crate::thrift::plan_nodes::THdfsScanRange,
+) -> Result<Vec<IcebergDeleteFileSpec>, String> {
+    let Some(delete_files) = hdfs_range.delete_files.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(delete_files.len());
+    for del in delete_files {
+        let file_content = del.file_content.ok_or_else(|| {
+            format!("{scan_node_label} iceberg delete file is missing file_content")
+        })?;
+        let file_content = iceberg_file_content_from_thrift(scan_node_label, file_content)?;
+        let path = del
+            .full_path
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                format!("{scan_node_label} iceberg position-delete file has empty full_path")
+            })?
+            .to_string();
+        let thrift_format = del
+            .file_format
+            .unwrap_or(crate::thrift::descriptors::THdfsFileFormat::PARQUET);
+        let file_format = iceberg_file_format_from_thrift(thrift_format);
+        if file_format != IcebergFileFormat::Parquet {
+            return Err(format!(
+                "{scan_node_label} iceberg position-delete file {path} has unsupported format \
+                 {file_format:?}; only PARQUET is supported"
+            ));
+        }
+        let length = del
+            .length
+            .and_then(|v| if v > 0 { Some(v as u64) } else { None });
+        out.push(IcebergDeleteFileSpec {
+            path,
+            file_format,
+            file_content,
+            length,
+            content_offset: None,
+            content_size_in_bytes: None,
+        });
+    }
+    Ok(out)
 }
 
 fn iceberg_reserved_field(name: &str, nullable: bool, field_id: i32) -> Field {
@@ -153,9 +327,10 @@ fn apply_path_rewrite(ranges: &mut [FileScanRange]) -> Result<(), String> {
 
 fn scan_ranges_have_position_delete_files(ranges: &[FileScanRange]) -> bool {
     ranges.iter().any(|range| {
-        range.delete_files.iter().any(|delete_file| {
-            delete_file.file_content == types::TIcebergFileContent::POSITION_DELETES
-        })
+        range
+            .delete_files
+            .iter()
+            .any(|delete_file| delete_file.file_content == IcebergFileContent::PositionDeletes)
     })
 }
 
@@ -1256,14 +1431,9 @@ pub(crate) fn lower_hdfs_scan_node(
                     node.node_id, path
                 )
             })?;
-            iceberg_delete_files.push(IcebergDeleteFileSpec {
-                path,
-                file_format: descriptors::THdfsFileFormat::UNKNOWN,
-                file_content: crate::thrift::types::TIcebergFileContent::POSITION_DELETES,
-                length: None,
-                content_offset: Some(offset),
-                content_size_in_bytes: Some(size),
-            });
+            iceberg_delete_files.push(IcebergDeleteFileSpec::puffin_position_delete(
+                path, None, offset, size,
+            ));
         }
         if hdfs_range
             .delete_column_slot_ids
@@ -1626,7 +1796,8 @@ pub(crate) fn lower_hdfs_scan_node(
     let iceberg_output_schema = iceberg_table
         .as_ref()
         .map(|iceberg| {
-            build_projected_output_schema(iceberg, &read_columns.iceberg_projected_columns)
+            let descriptor = iceberg_table_descriptor_from_thrift(iceberg)?;
+            build_projected_output_schema(&descriptor, &read_columns.iceberg_projected_columns)
         })
         .transpose()?
         .flatten();
@@ -1770,7 +1941,9 @@ mod tests {
 
     use crate::common::ids::SlotId;
     use crate::connector::FileScanRange;
-    use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
+    use crate::connector::iceberg::delete_file::{
+        IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
+    };
     use crate::lower::layout::layout_from_slot_ids;
     use crate::thrift::internal_service::TQueryOptions;
     use crate::thrift::{descriptors, exprs, plan_nodes, types};
@@ -2333,7 +2506,7 @@ mod tests {
         assert!(variant_path_predicates.is_empty());
     }
 
-    fn test_range_with_delete_file(file_content: types::TIcebergFileContent) -> FileScanRange {
+    fn test_range_with_delete_file(file_content: IcebergFileContent) -> FileScanRange {
         FileScanRange {
             path: "memory.parquet".to_string(),
             file_len: 1,
@@ -2347,7 +2520,7 @@ mod tests {
             external_datacache: None,
             delete_files: vec![IcebergDeleteFileSpec {
                 path: "delete.parquet".to_string(),
-                file_format: descriptors::THdfsFileFormat::PARQUET,
+                file_format: IcebergFileFormat::Parquet,
                 file_content,
                 length: Some(1),
                 content_offset: None,
@@ -2359,7 +2532,7 @@ mod tests {
     #[test]
     fn lower_hdfs_scan_position_delete_disables_variant_pruning() {
         let ranges = vec![test_range_with_delete_file(
-            types::TIcebergFileContent::POSITION_DELETES,
+            IcebergFileContent::PositionDeletes,
         )];
         assert!(scan_ranges_have_position_delete_files(&ranges));
 
@@ -2396,7 +2569,7 @@ mod tests {
     #[test]
     fn lower_hdfs_scan_equality_delete_keeps_variant_pruning_gate_open() {
         let ranges = vec![test_range_with_delete_file(
-            types::TIcebergFileContent::EQUALITY_DELETES,
+            IcebergFileContent::EqualityDeletes,
         )];
         assert!(!scan_ranges_have_position_delete_files(&ranges));
 

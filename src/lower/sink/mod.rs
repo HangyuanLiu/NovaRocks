@@ -14,16 +14,5 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub(crate) mod expr;
-pub(crate) mod fragment;
-pub(crate) mod layout;
-pub(crate) mod node;
-pub(crate) mod sink;
-pub(crate) mod type_lowering;
 
-pub(crate) mod thrift {
-    pub(crate) use super::layout;
-    pub(crate) use super::node::hdfs_scan::cache_iceberg_table_locations;
-    pub(crate) use super::node::{Lowered, lower_plan};
-    pub(crate) use super::type_lowering;
-}
+pub(crate) mod iceberg;

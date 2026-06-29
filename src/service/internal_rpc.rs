@@ -355,7 +355,7 @@ mod tests {
     use crate::exec::expr::ExprId;
     use crate::exec::node::RuntimeFilterProbeSpec;
     use crate::exec::node::scan::RowPositionScanConfig;
-    use crate::exec::row_position::RowPositionDescriptor;
+    use crate::exec::row_position::{RowPositionDescriptor, RowPositionType};
     use crate::exec::runtime_filter::{RuntimeInFilter, encode_starrocks_in_filter};
     #[cfg(feature = "compat")]
     use crate::exec::runtime_filter::{arrow_type_to_proto_type_desc, decode_starrocks_in_filter};
@@ -913,7 +913,7 @@ mod tests {
                 HashMap::from([(
                     tuple_id,
                     RowPositionDescriptor {
-                        row_position_type: descriptors::TRowPositionType::ICEBERG_V3_ROW_POSITION,
+                        row_position_type: RowPositionType::Iceberg,
                         row_source_slot: SlotId::new(1),
                         fetch_ref_slots: vec![SlotId::new(2), SlotId::new(3)],
                         lookup_ref_slots: Vec::new(),

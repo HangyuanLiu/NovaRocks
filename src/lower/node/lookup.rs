@@ -19,12 +19,26 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::common::ids::SlotId;
 use crate::exec::node::lookup::LookUpNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::exec::row_position::RowPositionDescriptor;
+use crate::exec::row_position::{RowPositionDescriptor, RowPositionType};
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::thrift::descriptors;
 use crate::thrift::plan_nodes;
 use crate::thrift::types;
+
+fn row_position_type_from_thrift(
+    value: crate::thrift::descriptors::TRowPositionType,
+) -> Result<crate::exec::row_position::RowPositionType, String> {
+    match value {
+        crate::thrift::descriptors::TRowPositionType::ICEBERG_V3_ROW_POSITION => {
+            Ok(RowPositionType::Iceberg)
+        }
+        crate::thrift::descriptors::TRowPositionType::LAKE_ROW_POSITION => {
+            Ok(RowPositionType::Lake)
+        }
+        other => Err(format!("unsupported row position type: {other:?}")),
+    }
+}
 
 fn lower_row_pos_descs(
     descs: &BTreeMap<i32, descriptors::TRowPositionDescriptor>,
@@ -34,6 +48,7 @@ fn lower_row_pos_descs(
         let row_position_type = desc
             .row_position_type
             .ok_or_else(|| "missing row_position_type".to_string())?;
+        let row_position_type = row_position_type_from_thrift(row_position_type)?;
         let row_source_slot = desc
             .row_source_slot
             .ok_or_else(|| "missing row_source_slot".to_string())?;

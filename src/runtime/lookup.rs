@@ -191,7 +191,7 @@ pub(crate) fn execute_lookup_request(
     let row_pos_desc = mgr
         .row_pos_desc(query_id, tuple_id)
         .ok_or_else(|| format!("row position descriptor missing for tuple_id={}", tuple_id))?;
-    if row_pos_desc.row_position_type != descriptors::TRowPositionType::ICEBERG_V3_ROW_POSITION {
+    if row_pos_desc.row_position_type != crate::exec::row_position::RowPositionType::Iceberg {
         return Err(format!(
             "unsupported row position type: {:?}",
             row_pos_desc.row_position_type

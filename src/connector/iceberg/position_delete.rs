@@ -33,91 +33,17 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use roaring::RoaringTreemap;
 
 use crate::cache::CachedRangeReader;
+use crate::connector::iceberg::delete_file::{
+    IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
+};
 use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
 use crate::fs::opendal::OpendalRangeReaderFactory;
-use crate::thrift::descriptors::THdfsFileFormat;
-use crate::thrift::plan_nodes::THdfsScanRange;
-use crate::thrift::types::TIcebergFileContent;
 
 /// The only two column names a position-delete Parquet file is allowed to
 /// have (equality-delete files carry a different schema and are rejected in
 /// lowering).
 const FILE_PATH_COLUMN: &str = "file_path";
 const POS_COLUMN: &str = "pos";
-
-/// Rust-side view of a single `TIcebergDeleteFile` filtered down to the
-/// fields we actually need for merge-on-read. Equality-delete files are
-/// rejected during lowering, so this struct always refers to a
-/// position-delete Parquet file.
-#[derive(Clone, Debug)]
-pub struct IcebergDeleteFileSpec {
-    pub path: String,
-    pub file_format: THdfsFileFormat,
-    pub file_content: TIcebergFileContent,
-    pub length: Option<u64>,
-    pub content_offset: Option<i64>,
-    pub content_size_in_bytes: Option<i64>,
-}
-
-/// Convert the `THdfsScanRange.delete_files` list attached to a scan range
-/// into [`IcebergDeleteFileSpec`]. Only POSITION_DELETES in PARQUET format
-/// are accepted today; anything else is rejected with a descriptive error
-/// that names the scan-node id so operators can trace the rejection back
-/// to the originating fragment.
-pub fn convert_scan_range_delete_files(
-    scan_node_label: &str,
-    hdfs_range: &THdfsScanRange,
-) -> Result<Vec<IcebergDeleteFileSpec>, String> {
-    let Some(delete_files) = hdfs_range.delete_files.as_ref() else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::with_capacity(delete_files.len());
-    for del in delete_files {
-        let file_content = del.file_content.ok_or_else(|| {
-            format!("{scan_node_label} iceberg delete file is missing file_content")
-        })?;
-        match file_content {
-            TIcebergFileContent::POSITION_DELETES => {}
-            TIcebergFileContent::EQUALITY_DELETES => {}
-            other => {
-                return Err(format!(
-                    "{scan_node_label} received unexpected iceberg delete file_content {other:?}"
-                ));
-            }
-        }
-        let path = del
-            .full_path
-            .as_ref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                format!("{scan_node_label} iceberg position-delete file has empty full_path")
-            })?
-            .to_string();
-        // The FE sometimes omits `file_format` because Iceberg writers emit
-        // delete files in Parquet by default. Fall back to PARQUET when the
-        // field is absent; the subsequent read still validates the schema.
-        let file_format = del.file_format.unwrap_or(THdfsFileFormat::PARQUET);
-        if file_format != THdfsFileFormat::PARQUET {
-            return Err(format!(
-                "{scan_node_label} iceberg position-delete file {path} has unsupported format \
-                 {file_format:?}; only PARQUET is supported"
-            ));
-        }
-        let length = del
-            .length
-            .and_then(|v| if v > 0 { Some(v as u64) } else { None });
-        out.push(IcebergDeleteFileSpec {
-            path,
-            file_format,
-            file_content,
-            length,
-            content_offset: None,
-            content_size_in_bytes: None,
-        });
-    }
-    Ok(out)
-}
 
 /// Load every position-delete Parquet file in `specs`, keep only the rows
 /// whose `file_path` equals `data_file_path`, and collect the matching `pos`
@@ -130,7 +56,7 @@ pub fn load_position_deletes(
 ) -> Result<RoaringTreemap, String> {
     let mut deleted = RoaringTreemap::new();
     for spec in specs {
-        if spec.file_content != TIcebergFileContent::POSITION_DELETES {
+        if spec.file_content != IcebergFileContent::PositionDeletes {
             continue;
         }
         accumulate_deletes_from_file(spec, data_file_path, factory, &mut deleted)?;
@@ -178,7 +104,7 @@ fn accumulate_deletes_from_file(
         *deleted |= dv.to_roaring_treemap();
         return Ok(());
     }
-    if spec.file_format != THdfsFileFormat::PARQUET {
+    if spec.file_format != IcebergFileFormat::Parquet {
         return Err(format!(
             "iceberg position-delete file {} has unsupported format {:?}; only PARQUET is supported",
             spec.path, spec.file_format
@@ -364,33 +290,6 @@ mod tests {
         OpendalRangeReaderFactory::from_operator(op).expect("factory")
     }
 
-    fn scan_range_with_delete_file(
-        path: &str,
-        file_content: TIcebergFileContent,
-    ) -> THdfsScanRange {
-        let mut range = THdfsScanRange::default();
-        range.delete_files = Some(vec![crate::thrift::plan_nodes::TIcebergDeleteFile::new(
-            Some(path.to_string()),
-            Some(THdfsFileFormat::PARQUET),
-            Some(file_content),
-            Some(128_i64),
-        )]);
-        range
-    }
-
-    #[test]
-    fn accepts_equality_delete_descriptors_for_reader_filtering() {
-        let range = scan_range_with_delete_file(
-            "s3://bucket/eq-delete.parquet",
-            TIcebergFileContent::EQUALITY_DELETES,
-        );
-
-        let specs = convert_scan_range_delete_files("HDFS_SCAN_NODE 7", &range).unwrap();
-
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].file_content, TIcebergFileContent::EQUALITY_DELETES);
-    }
-
     #[test]
     fn collects_positions_for_matching_file() {
         let dir = temp_dir_for("collects");
@@ -408,8 +307,8 @@ mod tests {
 
         let spec = IcebergDeleteFileSpec {
             path: del.file_name().unwrap().to_string_lossy().to_string(),
-            file_format: THdfsFileFormat::PARQUET,
-            file_content: TIcebergFileContent::POSITION_DELETES,
+            file_format: IcebergFileFormat::Parquet,
+            file_content: IcebergFileContent::PositionDeletes,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,
@@ -428,8 +327,8 @@ mod tests {
 
         let spec = IcebergDeleteFileSpec {
             path: del.file_name().unwrap().to_string_lossy().to_string(),
-            file_format: THdfsFileFormat::PARQUET,
-            file_content: TIcebergFileContent::POSITION_DELETES,
+            file_format: IcebergFileFormat::Parquet,
+            file_content: IcebergFileContent::PositionDeletes,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,
@@ -450,16 +349,16 @@ mod tests {
         let specs = vec![
             IcebergDeleteFileSpec {
                 path: del_a.file_name().unwrap().to_string_lossy().to_string(),
-                file_format: THdfsFileFormat::PARQUET,
-                file_content: TIcebergFileContent::POSITION_DELETES,
+                file_format: IcebergFileFormat::Parquet,
+                file_content: IcebergFileContent::PositionDeletes,
                 length: None,
                 content_offset: None,
                 content_size_in_bytes: None,
             },
             IcebergDeleteFileSpec {
                 path: del_b.file_name().unwrap().to_string_lossy().to_string(),
-                file_format: THdfsFileFormat::PARQUET,
-                file_content: TIcebergFileContent::POSITION_DELETES,
+                file_format: IcebergFileFormat::Parquet,
+                file_content: IcebergFileContent::PositionDeletes,
                 length: None,
                 content_offset: None,
                 content_size_in_bytes: None,
@@ -475,8 +374,8 @@ mod tests {
         let dir = temp_dir_for("rejects");
         let spec = IcebergDeleteFileSpec {
             path: "irrelevant".to_string(),
-            file_format: THdfsFileFormat::ORC,
-            file_content: TIcebergFileContent::POSITION_DELETES,
+            file_format: IcebergFileFormat::Unknown,
+            file_content: IcebergFileContent::PositionDeletes,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,

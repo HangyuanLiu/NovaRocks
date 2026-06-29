@@ -1592,13 +1592,14 @@ fn equality_change_to_read_delete(
 fn equality_change_to_delete_spec(
     delete: &EqualityDeleteRef,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
-) -> Result<crate::connector::iceberg::position_delete::IcebergDeleteFileSpec, String> {
+) -> Result<crate::connector::iceberg::delete_file::IcebergDeleteFileSpec, String> {
     Ok(
-        crate::connector::iceberg::position_delete::IcebergDeleteFileSpec {
+        crate::connector::iceberg::delete_file::IcebergDeleteFileSpec {
             path: normalize_delete_projection_path(&delete.delete_file_path, object_store_config)
                 .map_err(|e| e.to_string())?,
-            file_format: crate::thrift::descriptors::THdfsFileFormat::PARQUET,
-            file_content: crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES,
+            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            file_content:
+                crate::connector::iceberg::delete_file::IcebergFileContent::EqualityDeletes,
             length: if delete.delete_file_size > 0 {
                 Some(delete.delete_file_size as u64)
             } else {
@@ -2625,10 +2626,11 @@ mod tests {
                 .expect("fs operator"),
         )
         .expect("factory");
-        let spec = crate::connector::iceberg::position_delete::IcebergDeleteFileSpec {
+        let spec = crate::connector::iceberg::delete_file::IcebergDeleteFileSpec {
             path: "eq.parquet".to_string(),
-            file_format: crate::thrift::descriptors::THdfsFileFormat::PARQUET,
-            file_content: crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES,
+            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            file_content:
+                crate::connector::iceberg::delete_file::IcebergFileContent::EqualityDeletes,
             length: Some(std::fs::metadata(&equality_path).expect("metadata").len()),
             content_offset: None,
             content_size_in_bytes: None,

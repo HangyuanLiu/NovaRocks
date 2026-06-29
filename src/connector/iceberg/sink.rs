@@ -50,15 +50,20 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::{Statistics, ValueStatistics};
 
 use super::data_writer::{
-    StagedWriteContext, StagedWriteOptions, partition_path_from_struct, to_sink_commit_info,
-    write_record_batches, written_file_to_sink_commit_info_for_metadata,
+    StagedWriteContext, StagedWriteOptions, to_sink_commit_info, write_record_batches,
 };
-use super::position_delete_descriptor::bind_position_delete_descriptor;
-use super::schema::{apply_field_id_recursive, build_full_output_schema};
-use super::write_descriptor::encode_partition_descriptor;
 use crate::common::config;
 use crate::connector::iceberg::commit::{
-    EqualityDeleteColumn, write_equality_delete_file, write_single_deletion_vector_puffin,
+    write_equality_delete_file, write_single_deletion_vector_puffin,
+};
+use crate::connector::iceberg::delete_file::IcebergFileContent;
+use crate::connector::iceberg::report::{
+    IcebergColumnStats, IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
+    partition_path_from_struct,
+};
+use crate::connector::iceberg::report_wire::emit_iceberg_writer_report;
+use crate::connector::iceberg::sink_plan::{
+    IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkPlan,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -69,26 +74,9 @@ use crate::exec::row_position::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
 };
-use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::Layout;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
-use crate::thrift::{data_sinks, descriptors, exprs, types};
-
-/// Selects which kind of Iceberg file this sink writes. The caller picks the
-/// mode based on the upstream `TDataSinkType` (`ICEBERG_TABLE_SINK` →
-/// `Data`, `ICEBERG_DELETE_SINK` → `PositionDeletes`, `ICEBERG_DV_SINK` →
-/// `DeletionVectors`, `ICEBERG_EQUALITY_DELETE_SINK` → `EqualityDeletes`),
-/// so the sink struct doesn't have to parse anything extra out of the thrift
-/// payload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IcebergSinkMode {
-    Data,
-    PositionDeletes,
-    DeletionVectors,
-    EqualityDeletes,
-}
 
 #[derive(Clone)]
 /// Factory for Iceberg table sinks that write output chunks into committed table files.
@@ -98,237 +86,12 @@ pub struct IcebergTableSinkFactory {
     plan: Arc<IcebergSinkPlan>,
 }
 
-#[derive(Clone)]
-struct IcebergSinkPlan {
-    /// Chooses between data-file and position-delete write paths. Derived
-    /// from the upstream `TDataSinkType` by the caller of `try_new`.
-    mode: IcebergSinkMode,
-    table_location: String,
-    data_location: String,
-    target_partition_spec_id: i32,
-    target_table_metadata: Option<iceberg::spec::TableMetadata>,
-    target_snapshot_id: Option<i64>,
-    position_delete_data_file_partitions: HashMap<String, PositionDeleteDataFilePartition>,
-    object_store_s3: Option<S3StoreConfig>,
-    file_format: String,
-    compression: types::TCompressionType,
-    /// For `DATA` sinks this is the full iceberg column schema the writer
-    /// materializes. For delete-like sinks this is always the fixed
-    /// `[file_path, pos]` parquet schema the Iceberg v2 spec mandates; the
-    /// writer only materializes the first two entries of `output_exprs`.
-    output_schema: SchemaRef,
-    /// Full target table schema used for partition-spec binding and descriptor
-    /// encoding. For DATA sinks this matches `output_schema`; for delete-like
-    /// sinks `output_schema` is the delete-file parquet schema.
-    target_schema: SchemaRef,
-    /// Equality-key columns for `EqualityDeletes` sinks. Empty for all other
-    /// sink modes.
-    equality_delete_columns: Vec<EqualityDeleteColumn>,
-    /// True for DATA sinks whose synthetic target schema carries Iceberg v3
-    /// reserved row-lineage fields. Those files must be split by contiguous
-    /// `_row_id` runs and reported with `first_row_id`.
-    row_lineage_data: bool,
-    /// For `DATA` sinks: one expression per iceberg data column.
-    /// For delete-like sinks: `[file_path_expr, pos_expr,
-    /// partition_source_expr_0, partition_source_expr_1, ...]` — the partition
-    /// source columns remain available for transform evaluation routing even
-    /// though they never reach the output parquet file.
-    output_exprs: Vec<ExprId>,
-    partition_exprs: Vec<ExprId>,
-    partition_source_column_names: Vec<String>,
-    partition_column_names: Vec<String>,
-    transform_exprs: Vec<String>,
-}
-
 impl IcebergTableSinkFactory {
-    pub(crate) fn try_new(
-        sink: data_sinks::TIcebergTableSink,
-        mode: IcebergSinkMode,
-        output_exprs: &[exprs::TExpr],
-        layout: &Layout,
-        desc_tbl: &descriptors::TDescriptorTable,
-        last_query_id: Option<&str>,
-        fe_addr: Option<&types::TNetworkAddress>,
-    ) -> Result<Self, String> {
-        let mut arena = ExprArena::default();
-        let lowered_output_exprs =
-            lower_output_exprs(output_exprs, &mut arena, layout, last_query_id, fe_addr)?;
-
-        let iceberg_table = resolve_iceberg_table(desc_tbl, sink.target_table_id)?;
-        let target_partition_spec_id = sink.target_partition_spec_id.unwrap_or(0);
-
-        let (
-            partition_source_column_names,
-            partition_column_names,
-            transform_exprs,
-            mut partition_exprs,
-        ) = build_partition_exprs(&iceberg_table)?;
-
-        let target_table_metadata = parse_target_table_metadata(&iceberg_table, mode)?;
-        let position_delete_binding = if matches!(
-            mode,
-            IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors
-        ) {
-            let target_schema = build_output_schema(&iceberg_table)?;
-            let metadata = target_table_metadata.as_ref().ok_or_else(|| {
-                format!(
-                    "iceberg {:?} sink requires serialized target table metadata",
-                    mode
-                )
-            })?;
-            let partition_source_field_ids =
-                partition_source_field_ids_from_metadata(metadata, &partition_source_column_names)?;
-            let binding = bind_position_delete_descriptor(
-                sink.position_delete_output_descriptor.as_ref(),
-                output_exprs,
-                target_partition_spec_id,
-                &partition_source_column_names,
-                &partition_column_names,
-                &transform_exprs,
-                &partition_source_field_ids,
-            )
-            .map_err(|err| err.to_bracketed_user_message())?;
-            Some((target_schema, binding))
-        } else {
-            None
-        };
-
-        let (output_schema, target_schema, equality_delete_columns) = match mode {
-            IcebergSinkMode::Data => {
-                let target_schema = build_output_schema(&iceberg_table)?;
-                if output_exprs.len() != target_schema.fields().len() {
-                    return Err(format!(
-                        "iceberg sink output expr count mismatch: exprs={} columns={}",
-                        output_exprs.len(),
-                        target_schema.fields().len()
-                    ));
-                }
-                (Arc::clone(&target_schema), target_schema, Vec::new())
-            }
-            IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors => {
-                let (target_schema, binding) = position_delete_binding
-                    .as_ref()
-                    .expect("position delete binding must exist for delete-like sink");
-                (
-                    Arc::clone(&binding.output_schema),
-                    Arc::clone(target_schema),
-                    Vec::new(),
-                )
-            }
-            IcebergSinkMode::EqualityDeletes => {
-                if !partition_column_names.is_empty() {
-                    return Err(
-                        "iceberg equality-delete sink currently supports only unpartitioned tables"
-                            .to_string(),
-                    );
-                }
-                validate_equality_delete_unpartitioned_target_metadata(
-                    &iceberg_table,
-                    target_partition_spec_id,
-                )?;
-                let (schema, columns) = build_equality_delete_output_schema(&iceberg_table)?;
-                if output_exprs.len() != schema.fields().len() {
-                    return Err(format!(
-                        "iceberg equality-delete sink expects {} output exprs \
-                        (one per equality-key column); got {}",
-                        schema.fields().len(),
-                        output_exprs.len(),
-                    ));
-                }
-                (Arc::clone(&schema), schema, columns)
-            }
-        };
-        let row_lineage_data = mode == IcebergSinkMode::Data
-            && schema_has_reserved_row_lineage_columns(&target_schema)?;
-        let output_column_names = match mode {
-            IcebergSinkMode::Data => output_schema
-                .fields()
-                .iter()
-                .map(|field| field.name().to_string())
-                .collect::<Vec<_>>(),
-            IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors => {
-                position_delete_binding
-                    .as_ref()
-                    .expect("position delete binding must exist for delete-like sink")
-                    .1
-                    .output_column_names
-                    .clone()
-            }
-            IcebergSinkMode::EqualityDeletes => output_schema
-                .fields()
-                .iter()
-                .map(|field| field.name().to_string())
-                .collect::<Vec<_>>(),
-        };
-        if !partition_exprs.is_empty() {
-            let slot_map = build_column_slot_map(output_exprs, &output_column_names)?;
-            update_partition_expr_slot_refs(&mut partition_exprs, &slot_map, &iceberg_table)?;
-        }
-        let lowered_partition_exprs =
-            lower_partition_exprs(&partition_exprs, &mut arena, layout, last_query_id, fe_addr)?;
-
-        let table_location = sink
-            .location
-            .clone()
-            .ok_or_else(|| "iceberg sink missing table location".to_string())?;
-        let data_location = resolve_data_location(&sink)?;
-        let object_store_s3 = resolve_sink_s3_config(&sink, &data_location)?;
-        let target_snapshot_id = iceberg_table.current_snapshot_id;
-        let position_delete_data_file_partitions = if matches!(
-            mode,
-            IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors
-        ) {
-            let metadata = target_table_metadata
-                .as_ref()
-                .ok_or_else(|| "iceberg delete sink missing target table metadata".to_string())?;
-            build_position_delete_data_file_partition_index(
-                metadata,
-                target_snapshot_id,
-                &table_location,
-                object_store_s3.as_ref(),
-            )?
-        } else {
-            HashMap::new()
-        };
-        let file_format = sink
-            .file_format
-            .clone()
-            .ok_or_else(|| "iceberg sink missing file_format".to_string())?;
-        if file_format.to_lowercase() != "parquet" {
-            return Err(format!(
-                "iceberg sink does not support {} files; NovaRocks currently only supports Parquet for Iceberg writes",
-                file_format
-            ));
-        }
-
-        let plan = IcebergSinkPlan {
-            mode,
-            table_location,
-            data_location,
-            target_partition_spec_id,
-            target_table_metadata,
-            target_snapshot_id,
-            position_delete_data_file_partitions,
-            object_store_s3,
-            file_format,
-            compression: sink
-                .compression_type
-                .ok_or_else(|| "iceberg sink missing compression_type".to_string())?,
-            output_schema,
-            target_schema,
-            equality_delete_columns,
-            row_lineage_data,
-            output_exprs: lowered_output_exprs,
-            partition_exprs: lowered_partition_exprs,
-            partition_source_column_names,
-            partition_column_names,
-            transform_exprs,
-        };
-
+    pub(crate) fn try_new(input: IcebergSinkFactoryInput) -> Result<Self, String> {
         Ok(Self {
-            name: "ICEBERG_TABLE_SINK".to_string(),
-            arena: Arc::new(arena),
-            plan: Arc::new(plan),
+            name: input.name,
+            arena: Arc::new(input.arena),
+            plan: Arc::new(input.plan),
         })
     }
 }
@@ -401,144 +164,11 @@ impl IcebergSinkPlan {
     }
 }
 
-fn parse_target_table_metadata(
-    iceberg: &descriptors::TIcebergTable,
-    mode: IcebergSinkMode,
-) -> Result<Option<iceberg::spec::TableMetadata>, String> {
-    let serialized = match mode {
-        IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors => {
-            Some(iceberg.serialized_metadata.as_ref().ok_or_else(|| {
-                format!(
-                    "iceberg {:?} sink requires serialized target table metadata",
-                    mode
-                )
-            })?)
-        }
-        IcebergSinkMode::Data | IcebergSinkMode::EqualityDeletes => {
-            iceberg.serialized_metadata.as_ref()
-        }
-    };
-    let Some(serialized) = serialized else {
-        return Ok(None);
-    };
-    serde_json::from_str::<iceberg::spec::TableMetadata>(serialized)
-        .map(Some)
-        .map_err(|e| format!("parse iceberg {:?} target metadata failed: {e}", mode))
-}
-
-fn validate_equality_delete_unpartitioned_target_metadata(
-    iceberg: &descriptors::TIcebergTable,
-    target_partition_spec_id: i32,
-) -> Result<(), String> {
-    let Some(serialized) = iceberg.serialized_metadata.as_ref() else {
-        return Ok(());
-    };
-    let metadata = serde_json::from_str::<TableMetadata>(serialized)
-        .map_err(|e| format!("parse iceberg equality-delete target metadata failed: {e}"))?;
-    let spec = metadata
-        .partition_spec_by_id(target_partition_spec_id)
-        .ok_or_else(|| {
-            format!(
-                "iceberg equality-delete sink target partition spec id {target_partition_spec_id} \
-                not found in table metadata"
-            )
-        })?;
-    if !spec.fields().is_empty() {
-        return Err(format!(
-            "iceberg equality-delete sink currently supports only unpartitioned tables; \
-            target partition spec id {target_partition_spec_id} has {} fields",
-            spec.fields().len()
-        ));
-    }
-    Ok(())
-}
-
-fn build_position_delete_data_file_partition_index(
-    metadata: &iceberg::spec::TableMetadata,
-    target_snapshot_id: Option<i64>,
-    table_location: &str,
-    s3_config: Option<&S3StoreConfig>,
-) -> Result<HashMap<String, PositionDeleteDataFilePartition>, String> {
-    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
-
-    let Some(snapshot_id) = delete_target_snapshot_id(metadata, target_snapshot_id) else {
-        return Ok(HashMap::new());
-    };
-    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
-        format!("iceberg delete sink target snapshot id {snapshot_id} not found in table metadata")
-    })?;
-    let file_io = build_staged_file_io(table_location, s3_config)?;
-    data_block_on(async {
-        let manifest_list = snapshot
-            .load_manifest_list(&file_io, metadata)
-            .await
-            .map_err(|e| format!("load iceberg position-delete target manifest list: {e}"))?;
-        let mut index = HashMap::new();
-        for manifest_file in manifest_list.entries() {
-            if manifest_file.content != ManifestContentType::Data {
-                continue;
-            }
-            let manifest = manifest_file.load_manifest(&file_io).await.map_err(|e| {
-                format!(
-                    "load iceberg position-delete data manifest {} failed: {e}",
-                    manifest_file.manifest_path
-                )
-            })?;
-            for entry in manifest.entries() {
-                if entry.status == ManifestStatus::Deleted {
-                    continue;
-                }
-                let data_file = entry.data_file();
-                if data_file.content_type() != DataContentType::Data {
-                    continue;
-                }
-                let partition = PositionDeleteDataFilePartition {
-                    partition_spec_id: manifest_file.partition_spec_id,
-                    partition_values: data_file.partition().clone(),
-                };
-                insert_position_delete_data_file_partition(
-                    &mut index,
-                    data_file.file_path().to_string(),
-                    partition,
-                )?;
-            }
-        }
-        Ok(index)
-    })?
-}
-
 fn delete_target_snapshot_id(
     metadata: &iceberg::spec::TableMetadata,
     target_snapshot_id: Option<i64>,
 ) -> Option<i64> {
     target_snapshot_id.or_else(|| metadata.current_snapshot_id())
-}
-
-fn insert_position_delete_data_file_partition(
-    index: &mut HashMap<String, PositionDeleteDataFilePartition>,
-    path: String,
-    partition: PositionDeleteDataFilePartition,
-) -> Result<(), String> {
-    match index.entry(path) {
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(partition);
-            Ok(())
-        }
-        std::collections::hash_map::Entry::Occupied(entry) => {
-            let existing = entry.get();
-            if existing.partition_spec_id == partition.partition_spec_id
-                && existing.partition_values == partition.partition_values
-            {
-                return Ok(());
-            }
-            Err(format!(
-                "iceberg data file `{}` has conflicting partition metadata: old partition spec id {}, new partition spec id {}",
-                entry.key(),
-                existing.partition_spec_id,
-                partition.partition_spec_id
-            ))
-        }
-    }
 }
 
 fn retag_default_partition_spec_id(
@@ -776,8 +406,8 @@ impl IcebergTableSinkBackend {
                     &staged,
                     partition_path.clone(),
                     key.null_fingerprint.clone(),
-                    self.plan.file_format.clone(),
-                    types::TIcebergFileContent::DATA,
+                    self.plan.report_file_format.clone(),
+                    IcebergFileContent::Data,
                 )?;
                 if let Some(sketch_set) = sketch_set {
                     state.add_iceberg_sketch_set(sketch_set);
@@ -863,8 +493,8 @@ impl IcebergTableSinkBackend {
                         &staged,
                         partition_path.clone(),
                         key.null_fingerprint.clone(),
-                        self.plan.file_format.clone(),
-                        types::TIcebergFileContent::DATA,
+                        self.plan.report_file_format.clone(),
+                        IcebergFileContent::Data,
                     )?;
                     if let Some(data_file) = commit_info.iceberg_data_file.as_mut() {
                         data_file.first_row_id = Some(first_row_id_cursor);
@@ -979,42 +609,46 @@ impl IcebergTableSinkBackend {
             // when every position in this delete file points at the same data
             // file. Readers use it to prune delete files at plan time.
             let referenced_data_file = unique_file_path(&part_batch)?;
-            let partition_values_descriptor = encode_partition_descriptor(
-                &group.partition_values,
-                group.partition_spec_id,
-                &descriptor_metadata,
-            )
-            .map_err(|e| e.to_string())?;
+            let record_count = i64::try_from(part_batch.num_rows()).map_err(|_| {
+                format!(
+                    "iceberg position delete record_count {} overflows i64",
+                    part_batch.num_rows()
+                )
+            })?;
+            let file_size_in_bytes = i64::try_from(write_result.file_size).map_err(|_| {
+                format!(
+                    "iceberg position delete file_size_in_bytes {} overflows i64",
+                    write_result.file_size
+                )
+            })?;
 
-            let data_file = types::TIcebergDataFile {
-                path: Some(file_path),
-                format: Some(self.plan.file_format.clone()),
-                record_count: Some(part_batch.num_rows() as i64),
-                file_size_in_bytes: Some(write_result.file_size as i64),
-                partition_path: Some(partition_path),
-                split_offsets: write_result.split_offsets,
-                column_stats: write_result.column_stats,
-                partition_null_fingerprint: Some(key.null_fingerprint),
-                file_content: Some(types::TIcebergFileContent::POSITION_DELETES),
-                referenced_data_file,
-                first_row_id: None,
-                equality_ids: None,
-                key_metadata: None,
-                partition_values_descriptor: Some(partition_values_descriptor),
-                partition_spec_id: Some(group.partition_spec_id),
-                content_offset: None,
-                content_size_in_bytes: None,
-                cardinality: None,
-            };
-
-            let commit_info = types::TSinkCommitInfo {
-                iceberg_data_file: Some(data_file),
-                hive_file_info: None,
+            let report = IcebergWriterReport {
+                file: IcebergWrittenFileReport {
+                    path: file_path,
+                    format: self.plan.report_file_format.clone(),
+                    content: IcebergFileContent::PositionDeletes,
+                    record_count,
+                    file_size_in_bytes,
+                    partition: IcebergPartitionReport {
+                        partition_path,
+                        null_fingerprint: key.null_fingerprint.clone(),
+                        partition_spec_id: group.partition_spec_id,
+                        partition_values: group.partition_values.clone(),
+                    },
+                    split_offsets: write_result.split_offsets,
+                    column_stats: write_result.column_stats,
+                    referenced_data_file,
+                    first_row_id: None,
+                    equality_ids: None,
+                    key_metadata: None,
+                    content_offset: None,
+                    content_size_in_bytes: None,
+                    cardinality: None,
+                },
                 is_overwrite: None,
-                staging_dir: None,
                 is_rewrite: None,
             };
-            state.add_sink_commit_info(commit_info);
+            emit_iceberg_writer_report(state, report, &descriptor_metadata)?;
         }
 
         Ok(())
@@ -1066,14 +700,14 @@ impl IcebergTableSinkBackend {
             merge_existing_with_pending_deletion_vectors(existing, &self.pending_deletion_vectors);
 
         for (referenced_data_file, dv) in vectors {
-            let (partition_path, null_fingerprint, partition_spec_id, partition_values_descriptor) =
-                self.referenced_data_file_partition_report(
-                    &referenced_data_file,
-                    &metadata,
-                    "deletion-vector",
-                )?;
+            let mut partition_report = self.referenced_data_file_partition_report(
+                &referenced_data_file,
+                &metadata,
+                "deletion-vector",
+            )?;
             let (parquet_path, report_partition_path) =
-                self.build_file_path_with_prefix(&state, &partition_path, "dv")?;
+                self.build_file_path_with_prefix(&state, &partition_report.partition_path, "dv")?;
+            partition_report.partition_path = report_partition_path;
             let puffin_path = parquet_path
                 .strip_suffix(".parquet")
                 .ok_or_else(|| {
@@ -1104,34 +738,28 @@ impl IcebergTableSinkBackend {
                 )
             })?;
 
-            let data_file = types::TIcebergDataFile {
-                path: Some(written.path),
-                format: Some("puffin".to_string()),
-                record_count: Some(cardinality),
-                file_size_in_bytes: Some(file_size_in_bytes),
-                partition_path: Some(report_partition_path),
-                split_offsets: None,
-                column_stats: None,
-                partition_null_fingerprint: Some(null_fingerprint),
-                file_content: Some(types::TIcebergFileContent::POSITION_DELETES),
-                referenced_data_file: Some(written.referenced_data_file),
-                first_row_id: None,
-                equality_ids: None,
-                key_metadata: None,
-                partition_values_descriptor: Some(partition_values_descriptor),
-                partition_spec_id: Some(partition_spec_id),
-                content_offset: Some(written.content_offset),
-                content_size_in_bytes: Some(written.content_size_in_bytes),
-                cardinality: Some(cardinality),
-            };
-
-            state.add_sink_commit_info(types::TSinkCommitInfo {
-                iceberg_data_file: Some(data_file),
-                hive_file_info: None,
+            let report = IcebergWriterReport {
+                file: IcebergWrittenFileReport {
+                    path: written.path,
+                    format: "puffin".to_string(),
+                    content: IcebergFileContent::PositionDeletes,
+                    record_count: cardinality,
+                    file_size_in_bytes,
+                    partition: partition_report,
+                    split_offsets: None,
+                    column_stats: None,
+                    referenced_data_file: Some(written.referenced_data_file),
+                    first_row_id: None,
+                    equality_ids: None,
+                    key_metadata: None,
+                    content_offset: Some(written.content_offset),
+                    content_size_in_bytes: Some(written.content_size_in_bytes),
+                    cardinality: Some(cardinality),
+                },
                 is_overwrite: None,
-                staging_dir: None,
                 is_rewrite: None,
-            });
+            };
+            emit_iceberg_writer_report(&state, report, &metadata)?;
         }
 
         self.pending_deletion_vectors.clear();
@@ -1179,8 +807,10 @@ impl IcebergTableSinkBackend {
         };
 
         let metadata = self.build_equality_delete_report_metadata()?;
-        let commit_info = written_file_to_sink_commit_info_for_metadata(&written, &metadata)?;
-        state.add_sink_commit_info(commit_info);
+        let report = crate::connector::iceberg::report::writer_report_from_written_file(
+            &written, &metadata,
+        )?;
+        emit_iceberg_writer_report(state, report, &metadata)?;
         Ok(())
     }
 
@@ -1255,7 +885,7 @@ impl IcebergTableSinkBackend {
         referenced_data_file: &str,
         metadata: &iceberg::spec::TableMetadata,
         sink_label: &str,
-    ) -> Result<(String, String, i32, types::TIcebergPartitionDescriptor), String> {
+    ) -> Result<IcebergPartitionReport, String> {
         let partition = self
             .plan
             .position_delete_data_file_partitions
@@ -1275,18 +905,12 @@ impl IcebergTableSinkBackend {
             })?;
         let (partition_path, null_fingerprint) =
             partition_path_from_struct(&partition.partition_values, partition_spec)?;
-        let partition_values_descriptor = encode_partition_descriptor(
-            &partition.partition_values,
-            partition.partition_spec_id,
-            metadata,
-        )
-        .map_err(|e| e.to_string())?;
-        Ok((
+        Ok(IcebergPartitionReport {
             partition_path,
             null_fingerprint,
-            partition.partition_spec_id,
-            partition_values_descriptor,
-        ))
+            partition_spec_id: partition.partition_spec_id,
+            partition_values: partition.partition_values.clone(),
+        })
     }
 
     fn position_delete_partition_group_indices(
@@ -1503,16 +1127,10 @@ struct PartitionGroup {
     partition_values: iceberg::spec::Struct,
 }
 
-#[derive(Clone, Debug)]
-struct PositionDeleteDataFilePartition {
-    partition_spec_id: i32,
-    partition_values: iceberg::spec::Struct,
-}
-
 struct ParquetWriteResult {
     file_size: u64,
     split_offsets: Option<Vec<i64>>,
-    column_stats: Option<types::TIcebergColumnStats>,
+    column_stats: Option<IcebergColumnStats>,
     /// Per-primitive-column Theta sketches keyed by Iceberg field id. None
     /// when the sink could not compute sketches (e.g. schema lacks parquet
     /// field-id metadata). Wrapped in `Option` so the existing
@@ -1532,39 +1150,6 @@ struct ColumnStatsAccumulator {
     null_value_count: i64,
     has_statistics: bool,
     merged_statistics: Option<Statistics>,
-}
-
-fn lower_output_exprs(
-    output_exprs: &[exprs::TExpr],
-    arena: &mut ExprArena,
-    layout: &Layout,
-    last_query_id: Option<&str>,
-    fe_addr: Option<&types::TNetworkAddress>,
-) -> Result<Vec<ExprId>, String> {
-    if output_exprs.is_empty() {
-        return Err("iceberg sink missing output exprs".to_string());
-    }
-    let mut ids = Vec::with_capacity(output_exprs.len());
-    for expr in output_exprs {
-        let id = lower_t_expr(expr, arena, layout, last_query_id, fe_addr)?;
-        ids.push(id);
-    }
-    Ok(ids)
-}
-
-fn lower_partition_exprs(
-    partition_exprs: &[exprs::TExpr],
-    arena: &mut ExprArena,
-    layout: &Layout,
-    last_query_id: Option<&str>,
-    fe_addr: Option<&types::TNetworkAddress>,
-) -> Result<Vec<ExprId>, String> {
-    let mut ids = Vec::with_capacity(partition_exprs.len());
-    for expr in partition_exprs {
-        let id = lower_t_expr(expr, arena, layout, last_query_id, fe_addr)?;
-        ids.push(id);
-    }
-    Ok(ids)
 }
 
 fn eval_exprs(arena: &ExprArena, exprs: &[ExprId], chunk: &Chunk) -> Result<Vec<ArrayRef>, String> {
@@ -1624,109 +1209,6 @@ fn align_arrays_to_schema(
         .collect()
 }
 
-fn resolve_iceberg_table(
-    desc_tbl: &descriptors::TDescriptorTable,
-    table_id: Option<i64>,
-) -> Result<descriptors::TIcebergTable, String> {
-    let table_id = table_id.ok_or_else(|| "iceberg sink missing target_table_id".to_string())?;
-    let tables = desc_tbl
-        .table_descriptors
-        .as_ref()
-        .ok_or_else(|| "descriptor table missing table_descriptors".to_string())?;
-    for table in tables {
-        if table.id == table_id {
-            let iceberg = table
-                .iceberg_table
-                .as_ref()
-                .ok_or_else(|| "table descriptor missing iceberg_table".to_string())?;
-            return Ok(iceberg.clone());
-        }
-    }
-    Err(format!(
-        "iceberg table descriptor not found for table_id={table_id}"
-    ))
-}
-
-fn build_output_schema(iceberg: &descriptors::TIcebergTable) -> Result<SchemaRef, String> {
-    build_full_output_schema(iceberg)
-}
-
-fn build_equality_delete_output_schema(
-    iceberg: &descriptors::TIcebergTable,
-) -> Result<(SchemaRef, Vec<EqualityDeleteColumn>), String> {
-    let columns = iceberg
-        .columns
-        .as_ref()
-        .ok_or_else(|| "iceberg equality-delete sink missing columns".to_string())?;
-    if columns.is_empty() {
-        return Err(
-            "iceberg equality-delete sink requires at least one equality column".to_string(),
-        );
-    }
-
-    let key_fields = equality_delete_schema_fields(iceberg)?;
-    if key_fields.is_empty() {
-        return Err(
-            "iceberg equality-delete sink requires at least one equality column".to_string(),
-        );
-    }
-
-    let mut fields = Vec::with_capacity(key_fields.len());
-    let mut equality_columns = Vec::with_capacity(key_fields.len());
-    for schema_field in key_fields {
-        let name = schema_field
-            .name
-            .as_ref()
-            .ok_or_else(|| "iceberg equality-delete schema field missing name".to_string())?;
-        let column = columns
-            .iter()
-            .find(|column| column.column_name == *name)
-            .ok_or_else(|| {
-                format!("iceberg equality-delete column {name} missing column descriptor")
-            })?;
-        let data_type = column
-            .type_desc
-            .as_ref()
-            .and_then(crate::types::arrow_thrift::thrift_desc_to_arrow_type)
-            .ok_or_else(|| {
-                format!(
-                    "iceberg equality-delete column {} missing type_desc",
-                    column.column_name
-                )
-            })?;
-        let nullable = column.is_allow_null.unwrap_or(true);
-        let field = Field::new(column.column_name.clone(), data_type, nullable);
-        let field = apply_field_id_recursive(field, schema_field)?;
-        let field_id = arrow_field_id(&field)?;
-        equality_columns.push(EqualityDeleteColumn {
-            name: field.name().to_string(),
-            field_id,
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-        });
-        fields.push(field);
-    }
-
-    Ok((Arc::new(Schema::new(fields)), equality_columns))
-}
-
-fn equality_delete_schema_fields(
-    iceberg: &descriptors::TIcebergTable,
-) -> Result<Vec<&descriptors::TIcebergSchemaField>, String> {
-    let schema = iceberg
-        .iceberg_equal_delete_schema
-        .as_ref()
-        .ok_or_else(|| {
-            "iceberg equality-delete sink requires iceberg_equal_delete_schema projected key fields"
-                .to_string()
-        })?;
-    let fields = schema
-        .fields
-        .as_deref()
-        .ok_or_else(|| "iceberg equality-delete schema missing fields".to_string())?;
-    Ok(fields.iter().collect())
-}
-
 fn iceberg_schema_from_arrow_schema(schema: &Schema) -> Result<iceberg::spec::Schema, String> {
     let fields = schema
         .fields()
@@ -1769,26 +1251,6 @@ fn arrow_field_id(field: &Field) -> Result<i32, String> {
             field.name()
         )
     })
-}
-
-fn partition_source_field_ids_from_metadata(
-    metadata: &TableMetadata,
-    source_column_names: &[String],
-) -> Result<Vec<i32>, String> {
-    let target_schema = metadata.current_schema();
-    source_column_names
-        .iter()
-        .map(|source_name| {
-            target_schema
-                .field_by_name_case_insensitive(source_name)
-                .map(|field| field.id)
-                .ok_or_else(|| {
-                    format!(
-                        "iceberg sink partition source column {source_name} missing from target metadata schema"
-                    )
-                })
-        })
-        .collect()
 }
 
 fn schema_has_reserved_row_lineage_columns(schema: &Schema) -> Result<bool, String> {
@@ -1975,7 +1437,7 @@ fn parse_transform_arg(raw: &str, name: &str) -> Result<Option<u32>, String> {
     Ok(Some(value))
 }
 
-fn build_staged_file_io(
+pub(crate) fn build_staged_file_io(
     data_location: &str,
     s3_config: Option<&S3StoreConfig>,
 ) -> Result<iceberg::io::FileIO, String> {
@@ -1997,129 +1459,7 @@ fn build_staged_file_io(
     Ok(iceberg::io::FileIO::new_with_fs())
 }
 
-type PartitionExprs = (Vec<String>, Vec<String>, Vec<String>, Vec<exprs::TExpr>);
-
-fn build_partition_exprs(iceberg: &descriptors::TIcebergTable) -> Result<PartitionExprs, String> {
-    let mut partition_source_column_names = Vec::new();
-    let mut partition_column_names = Vec::new();
-    let mut transform_exprs = Vec::new();
-    let mut exprs = Vec::new();
-    if let Some(partition_info) = iceberg.partition_info.as_ref() {
-        for info in partition_info {
-            let name = info.partition_column_name.clone().ok_or_else(|| {
-                "iceberg partition_info missing partition_column_name".to_string()
-            })?;
-            let transform = info
-                .transform_expr
-                .clone()
-                .ok_or_else(|| "iceberg partition_info missing transform_expr".to_string())?;
-            let expr = info
-                .partition_expr
-                .clone()
-                .ok_or_else(|| "iceberg partition_info missing partition_expr".to_string())?;
-            let source_name = info
-                .source_column_name
-                .clone()
-                .ok_or_else(|| "iceberg partition_info missing source_column_name".to_string())?;
-            partition_source_column_names.push(source_name);
-            partition_column_names.push(name);
-            transform_exprs.push(transform);
-            exprs.push(expr);
-        }
-    }
-    Ok((
-        partition_source_column_names,
-        partition_column_names,
-        transform_exprs,
-        exprs,
-    ))
-}
-
-fn build_column_slot_map(
-    output_exprs: &[exprs::TExpr],
-    output_column_names: &[String],
-) -> Result<HashMap<String, exprs::TExprNode>, String> {
-    if output_column_names.len() != output_exprs.len() {
-        return Err(format!(
-            "iceberg sink output column count mismatch: columns={} output_exprs={}",
-            output_column_names.len(),
-            output_exprs.len()
-        ));
-    }
-
-    let mut map = HashMap::new();
-    for (col_name, expr) in output_column_names.iter().zip(output_exprs.iter()) {
-        let mut slot_ref = None;
-        for node in &expr.nodes {
-            if node.node_type == exprs::TExprNodeType::SLOT_REF {
-                slot_ref = Some(node.clone());
-                break;
-            }
-        }
-        let slot_ref = slot_ref
-            .ok_or_else(|| format!("output expr for column {col_name} missing SLOT_REF node"))?;
-        map.insert(col_name.clone(), slot_ref);
-    }
-    Ok(map)
-}
-
-fn update_partition_expr_slot_refs(
-    partition_exprs: &mut [exprs::TExpr],
-    column_slot_map: &HashMap<String, exprs::TExprNode>,
-    iceberg: &descriptors::TIcebergTable,
-) -> Result<(), String> {
-    let Some(partition_info) = iceberg.partition_info.as_ref() else {
-        return Ok(());
-    };
-    if partition_exprs.len() != partition_info.len() {
-        return Err(format!(
-            "partition expr count mismatch: exprs={} partition_info={}",
-            partition_exprs.len(),
-            partition_info.len()
-        ));
-    }
-    for (expr, info) in partition_exprs.iter_mut().zip(partition_info.iter()) {
-        let source_name = info
-            .source_column_name
-            .as_ref()
-            .ok_or_else(|| "partition_info missing source_column_name".to_string())?;
-        let slot_ref = column_slot_map.get(source_name).ok_or_else(|| {
-            format!(
-                "partition source column {} missing slot_ref in output exprs",
-                source_name
-            )
-        })?;
-        let mut replaced = false;
-        for node in &mut expr.nodes {
-            if node.node_type == exprs::TExprNodeType::SLOT_REF {
-                *node = slot_ref.clone();
-                replaced = true;
-                break;
-            }
-        }
-        if !replaced {
-            return Err(format!(
-                "partition expr for {} missing SLOT_REF node",
-                source_name
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn resolve_data_location(sink: &data_sinks::TIcebergTableSink) -> Result<String, String> {
-    if let Some(loc) = sink.data_location.as_ref().filter(|s| !s.is_empty()) {
-        return Ok(loc.clone());
-    }
-    let location = sink
-        .location
-        .as_ref()
-        .ok_or_else(|| "iceberg sink missing table location".to_string())?;
-    let base = location.trim_end_matches('/');
-    Ok(format!("{base}/data"))
-}
-
-fn parse_object_store_bucket_and_root(path: &str) -> Option<(String, String)> {
+pub(crate) fn parse_object_store_bucket_and_root(path: &str) -> Option<(String, String)> {
     for scheme in ["s3://", "oss://"] {
         if let Some(rest) = path.trim().strip_prefix(scheme) {
             let (bucket, key_prefix) = rest.split_once('/').unwrap_or((rest, ""));
@@ -2133,7 +1473,7 @@ fn parse_object_store_bucket_and_root(path: &str) -> Option<(String, String)> {
     None
 }
 
-fn parse_true_false(value: &str) -> Option<bool> {
+pub(crate) fn parse_true_false(value: &str) -> Option<bool> {
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("true") || trimmed == "1" {
         return Some(true);
@@ -2142,72 +1482,6 @@ fn parse_true_false(value: &str) -> Option<bool> {
         return Some(false);
     }
     None
-}
-
-fn resolve_sink_s3_config(
-    sink: &data_sinks::TIcebergTableSink,
-    data_location: &str,
-) -> Result<Option<S3StoreConfig>, String> {
-    // The bucket is the only part of `data_location` we put on the
-    // cluster-level S3 profile; the warehouse/table prefix stays in the
-    // data file path passed to `normalize_oss_path`, which derives the
-    // bucket-relative key directly.
-    let Some((bucket, _data_root)) = parse_object_store_bucket_and_root(data_location) else {
-        return Ok(None);
-    };
-    let cloud = sink.cloud_configuration.as_ref().ok_or_else(|| {
-        format!(
-            "iceberg sink object-store path requires cloud_configuration: data_location={data_location}"
-        )
-    })?;
-    let props = cloud
-        .cloud_properties
-        .as_ref()
-        .ok_or_else(|| "iceberg sink cloud_configuration.cloud_properties is empty".to_string())?;
-
-    let endpoint = props
-        .get("aws.s3.endpoint")
-        .or_else(|| props.get("aws.s3.endpoint_url"))
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| "iceberg sink cloud_properties missing aws.s3.endpoint".to_string())?
-        .to_string();
-    let access_key_id = props
-        .get("aws.s3.accessKeyId")
-        .or_else(|| props.get("aws.s3.access_key"))
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            "iceberg sink cloud_properties missing aws.s3.accessKeyId/aws.s3.access_key".to_string()
-        })?
-        .to_string();
-    let access_key_secret = props
-        .get("aws.s3.accessKeySecret")
-        .or_else(|| props.get("aws.s3.secret_key"))
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            "iceberg sink cloud_properties missing aws.s3.accessKeySecret/aws.s3.secret_key"
-                .to_string()
-        })?
-        .to_string();
-    let region = props
-        .get("aws.s3.region")
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string());
-    let enable_path_style_access = props
-        .get("aws.s3.enable_path_style_access")
-        .and_then(|v| parse_true_false(v));
-
-    Ok(Some(S3StoreConfig {
-        endpoint,
-        bucket,
-        access_key_id,
-        access_key_secret,
-        region,
-        enable_path_style_access,
-    }))
 }
 
 fn normalize_path(path: &str) -> Result<String, String> {
@@ -2226,9 +1500,8 @@ fn write_parquet_file(
     s3_config: Option<&S3StoreConfig>,
     schema: SchemaRef,
     batch: &RecordBatch,
-    compression: types::TCompressionType,
+    compression: Compression,
 ) -> Result<ParquetWriteResult, String> {
-    let compression = map_parquet_compression(compression)?;
     let props = WriterProperties::builder()
         .set_compression(compression)
         .build();
@@ -2337,7 +1610,7 @@ fn collect_split_offsets(metadata: &ParquetMetaData) -> Option<Vec<i64>> {
     (!offsets.is_empty()).then_some(offsets)
 }
 
-fn collect_iceberg_column_stats(metadata: &ParquetMetaData) -> Option<types::TIcebergColumnStats> {
+fn collect_iceberg_column_stats(metadata: &ParquetMetaData) -> Option<IcebergColumnStats> {
     let mut accumulators: BTreeMap<i32, ColumnStatsAccumulator> = BTreeMap::new();
 
     for row_group in metadata.row_groups() {
@@ -2375,8 +1648,6 @@ fn collect_iceberg_column_stats(metadata: &ParquetMetaData) -> Option<types::TIc
     let mut null_value_counts = BTreeMap::new();
     let mut lower_bounds = BTreeMap::new();
     let mut upper_bounds = BTreeMap::new();
-    let mut has_null_value_counts = false;
-    let mut has_bounds = false;
 
     for (field_id, acc) in accumulators {
         column_sizes.insert(field_id, acc.column_size);
@@ -2386,27 +1657,23 @@ fn collect_iceberg_column_stats(metadata: &ParquetMetaData) -> Option<types::TIc
 
         value_counts.insert(field_id, acc.value_count);
         null_value_counts.insert(field_id, acc.null_value_count);
-        has_null_value_counts = true;
 
         if let Some(stats) = acc.merged_statistics.as_ref() {
             if let Some(min) = stats.min_bytes_opt() {
                 lower_bounds.insert(field_id, min.to_vec());
-                has_bounds = true;
             }
             if let Some(max) = stats.max_bytes_opt() {
                 upper_bounds.insert(field_id, max.to_vec());
-                has_bounds = true;
             }
         }
     }
 
-    Some(types::TIcebergColumnStats {
-        column_sizes: Some(column_sizes),
-        value_counts: (!value_counts.is_empty()).then_some(value_counts),
-        null_value_counts: has_null_value_counts.then_some(null_value_counts),
-        nan_value_counts: None,
-        lower_bounds: has_bounds.then_some(lower_bounds),
-        upper_bounds: has_bounds.then_some(upper_bounds),
+    Some(IcebergColumnStats {
+        column_sizes,
+        value_counts,
+        null_value_counts,
+        lower_bounds,
+        upper_bounds,
     })
 }
 
@@ -2707,23 +1974,6 @@ where
         (Some(left), None) => Some(left.clone()),
         (None, Some(right)) => Some(right.clone()),
         (None, None) => None,
-    }
-}
-
-fn map_parquet_compression(compression: types::TCompressionType) -> Result<Compression, String> {
-    use types::TCompressionType as C;
-    match compression {
-        C::NO_COMPRESSION => Ok(Compression::UNCOMPRESSED),
-        C::SNAPPY => Ok(Compression::SNAPPY),
-        C::LZ4 | C::LZ4_FRAME => Ok(Compression::LZ4),
-        C::ZSTD => Ok(Compression::ZSTD(Default::default())),
-        C::GZIP | C::ZLIB | C::DEFLATE => Ok(Compression::GZIP(Default::default())),
-        C::BROTLI => Ok(Compression::BROTLI(Default::default())),
-        C::LZO => Ok(Compression::LZO),
-        other => Err(format!(
-            "unsupported compression type for iceberg parquet sink: {:?}",
-            other
-        )),
     }
 }
 
@@ -3100,43 +2350,44 @@ mod tests {
         ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
         ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL, IcebergSinkMode, IcebergSinkPlan,
         IcebergTableSinkBackend, IcebergTableSinkFactory, PositionDeleteDataFilePartition,
-        align_arrays_to_schema, build_column_slot_map, collect_theta_sketches_by_name,
-        iceberg_partition_key_for_row, iceberg_schema_from_arrow_schema,
-        merge_deletion_vectors_by_file, row_lineage_row_id_index,
+        align_arrays_to_schema, collect_theta_sketches_by_name, iceberg_partition_key_for_row,
+        iceberg_schema_from_arrow_schema, merge_deletion_vectors_by_file, row_lineage_row_id_index,
         schema_has_reserved_row_lineage_columns, unique_file_path, write_parquet_to_bytes,
     };
+    use crate::connector::iceberg::commit::EqualityDeleteColumn;
     use crate::connector::iceberg::data_writer::{StagedWriteOptions, write_record_batches};
+    use crate::connector::iceberg::delete_file::IcebergFileContent;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::ExprNode;
     use crate::exec::pipeline::async_sink::AsyncSinkBackend;
-    use crate::lower::layout::Layout;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::{common::ids::SlotId, common::types::UniqueId};
 
     fn position_delete_required_schema_for_tests() -> SchemaRef {
-        crate::connector::iceberg::position_delete_descriptor::output_schema_from_descriptor(
-            &crate::connector::iceberg::position_delete_descriptor::required_position_delete_descriptor_for_tests(0),
-        )
-        .expect("required position delete schema")
-    }
+        use crate::connector::iceberg::position_delete_descriptor::{
+            ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+            ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+            PositionDeleteDescriptorInput, PositionDeleteOutputField,
+            output_schema_from_descriptor,
+        };
 
-    #[test]
-    fn build_column_slot_map_uses_sink_output_column_names() {
-        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::INT,
-        );
-        let id_expr =
-            crate::sql::codegen::expr_compiler::build_slot_ref_texpr(10, 1, int_type.clone());
-        let region_expr = crate::sql::codegen::expr_compiler::build_slot_ref_texpr(11, 1, int_type);
-        let output_names = vec!["id".to_string(), "region".to_string()];
-
-        let map = build_column_slot_map(&[id_expr, region_expr], &output_names).expect("slot map");
-
-        let region_slot = map
-            .get("region")
-            .and_then(|node| node.slot_ref.as_ref())
-            .expect("region slot");
-        assert_eq!(region_slot.slot_id, 11);
+        let desc = PositionDeleteDescriptorInput {
+            file_path: PositionDeleteOutputField {
+                output_expr_index: 0,
+                name: ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string(),
+                data_type: DataType::Utf8,
+                field_id: ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+            },
+            pos: PositionDeleteOutputField {
+                output_expr_index: 1,
+                name: ICEBERG_POSITION_DELETE_POS_COLUMN.to_string(),
+                data_type: DataType::Int64,
+                field_id: ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+            },
+            partition_source_fields: Vec::new(),
+            target_partition_spec_id: 0,
+        };
+        output_schema_from_descriptor(&desc).expect("required position delete schema")
     }
 
     #[test]
@@ -3231,8 +2482,9 @@ mod tests {
                 target_snapshot_id: None,
                 position_delete_data_file_partitions: HashMap::new(),
                 object_store_s3: None,
-                file_format: "parquet".to_string(),
-                compression: crate::thrift::types::TCompressionType::SNAPPY,
+                file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+                report_file_format: "parquet".to_string(),
+                compression: Compression::SNAPPY,
                 output_schema: Arc::clone(&schema),
                 target_schema: schema,
                 equality_delete_columns: Vec::new(),
@@ -3242,372 +2494,12 @@ mod tests {
                 partition_source_column_names: Vec::new(),
                 partition_column_names: Vec::new(),
                 transform_exprs: Vec::new(),
+                position_delete_binding: None,
             }),
         };
         let op = factory.create_async_operator(0);
 
         assert_eq!(op.name(), "ICEBERG_TABLE_SINK");
-    }
-
-    fn test_int_column(name: &str) -> crate::thrift::descriptors::TColumn {
-        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::INT,
-        );
-        crate::thrift::descriptors::TColumn::new(
-            name.to_string(),
-            None::<crate::thrift::types::TColumnType>,
-            None::<crate::thrift::types::TAggregationType>,
-            None::<bool>,
-            Some(false),
-            None::<String>,
-            None::<bool>,
-            None::<crate::thrift::exprs::TExpr>,
-            None::<bool>,
-            None::<i32>,
-            None::<bool>,
-            None::<crate::thrift::types::TAggStateDesc>,
-            None::<i32>,
-            Some(int_type),
-            None::<crate::thrift::exprs::TExpr>,
-        )
-    }
-
-    fn test_varchar_column(name: &str) -> crate::thrift::descriptors::TColumn {
-        let varchar_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::VARCHAR,
-        );
-        crate::thrift::descriptors::TColumn::new(
-            name.to_string(),
-            None::<crate::thrift::types::TColumnType>,
-            None::<crate::thrift::types::TAggregationType>,
-            None::<bool>,
-            Some(true),
-            None::<String>,
-            None::<bool>,
-            None::<crate::thrift::exprs::TExpr>,
-            None::<bool>,
-            None::<i32>,
-            None::<bool>,
-            None::<crate::thrift::types::TAggStateDesc>,
-            None::<i32>,
-            Some(varchar_type),
-            None::<crate::thrift::exprs::TExpr>,
-        )
-    }
-
-    fn test_iceberg_schema_field(
-        name: &str,
-        field_id: i32,
-    ) -> crate::thrift::descriptors::TIcebergSchemaField {
-        crate::thrift::descriptors::TIcebergSchemaField::new(
-            Some(field_id),
-            Some(name.to_string()),
-            None::<String>,
-            None::<Vec<Box<crate::thrift::descriptors::TIcebergSchemaField>>>,
-        )
-    }
-
-    fn test_unpartitioned_desc_table_with_equality_delete_schema(
-        table_id: i64,
-        table_location: &str,
-    ) -> crate::thrift::descriptors::TDescriptorTable {
-        let iceberg_table = crate::thrift::descriptors::TIcebergTable::new(
-            Some(table_location.to_string()),
-            Some(vec![
-                test_int_column("id"),
-                test_varchar_column("category"),
-                test_int_column("amount"),
-            ]),
-            Some(crate::thrift::descriptors::TIcebergSchema::new(Some(vec![
-                test_iceberg_schema_field("id", 11),
-                test_iceberg_schema_field("category", 12),
-                test_iceberg_schema_field("amount", 13),
-            ]))),
-            None::<Vec<String>>,
-            None::<crate::thrift::descriptors::TCompressedPartitionMap>,
-            None::<std::collections::BTreeMap<i64, crate::thrift::descriptors::THdfsPartition>>,
-            Some(crate::thrift::descriptors::TIcebergSchema::new(Some(vec![
-                test_iceberg_schema_field("id", 11),
-                test_iceberg_schema_field("category", 12),
-            ]))),
-            None::<Vec<crate::thrift::descriptors::TIcebergPartitionInfo>>,
-            None::<crate::thrift::descriptors::TSortOrder>,
-            None::<String>,
-            None::<i64>,
-        );
-        let table = crate::thrift::descriptors::TTableDescriptor::new(
-            table_id,
-            crate::thrift::types::TTableType::ICEBERG_TABLE,
-            3,
-            0,
-            "orders".to_string(),
-            "db".to_string(),
-            None::<crate::thrift::descriptors::TMySQLTable>,
-            None::<crate::thrift::descriptors::TOlapTable>,
-            None::<crate::thrift::descriptors::TSchemaTable>,
-            None::<crate::thrift::descriptors::TBrokerTable>,
-            None::<crate::thrift::descriptors::TEsTable>,
-            None::<crate::thrift::descriptors::TJDBCTable>,
-            None::<crate::thrift::descriptors::THdfsTable>,
-            Some(iceberg_table),
-            None::<crate::thrift::descriptors::THudiTable>,
-            None::<crate::thrift::descriptors::TDeltaLakeTable>,
-            None::<crate::thrift::descriptors::TFileTable>,
-            None::<crate::thrift::descriptors::TTableFunctionTable>,
-            None::<crate::thrift::descriptors::TPaimonTable>,
-        );
-        crate::thrift::descriptors::TDescriptorTable::new(
-            None::<Vec<crate::thrift::descriptors::TSlotDescriptor>>,
-            Vec::new(),
-            Some(vec![table]),
-            None::<bool>,
-        )
-    }
-
-    fn test_unpartitioned_desc_table_without_equality_delete_schema(
-        table_id: i64,
-        table_location: &str,
-    ) -> crate::thrift::descriptors::TDescriptorTable {
-        let iceberg_table = crate::thrift::descriptors::TIcebergTable::new(
-            Some(table_location.to_string()),
-            Some(vec![
-                test_int_column("id"),
-                test_varchar_column("category"),
-                test_int_column("amount"),
-            ]),
-            Some(crate::thrift::descriptors::TIcebergSchema::new(Some(vec![
-                test_iceberg_schema_field("id", 11),
-                test_iceberg_schema_field("category", 12),
-                test_iceberg_schema_field("amount", 13),
-            ]))),
-            None::<Vec<String>>,
-            None::<crate::thrift::descriptors::TCompressedPartitionMap>,
-            None::<std::collections::BTreeMap<i64, crate::thrift::descriptors::THdfsPartition>>,
-            None::<crate::thrift::descriptors::TIcebergSchema>,
-            None::<Vec<crate::thrift::descriptors::TIcebergPartitionInfo>>,
-            None::<crate::thrift::descriptors::TSortOrder>,
-            None::<String>,
-            None::<i64>,
-        );
-        let table = crate::thrift::descriptors::TTableDescriptor::new(
-            table_id,
-            crate::thrift::types::TTableType::ICEBERG_TABLE,
-            3,
-            0,
-            "orders".to_string(),
-            "db".to_string(),
-            None::<crate::thrift::descriptors::TMySQLTable>,
-            None::<crate::thrift::descriptors::TOlapTable>,
-            None::<crate::thrift::descriptors::TSchemaTable>,
-            None::<crate::thrift::descriptors::TBrokerTable>,
-            None::<crate::thrift::descriptors::TEsTable>,
-            None::<crate::thrift::descriptors::TJDBCTable>,
-            None::<crate::thrift::descriptors::THdfsTable>,
-            Some(iceberg_table),
-            None::<crate::thrift::descriptors::THudiTable>,
-            None::<crate::thrift::descriptors::TDeltaLakeTable>,
-            None::<crate::thrift::descriptors::TFileTable>,
-            None::<crate::thrift::descriptors::TTableFunctionTable>,
-            None::<crate::thrift::descriptors::TPaimonTable>,
-        );
-        crate::thrift::descriptors::TDescriptorTable::new(
-            None::<Vec<crate::thrift::descriptors::TSlotDescriptor>>,
-            Vec::new(),
-            Some(vec![table]),
-            None::<bool>,
-        )
-    }
-
-    fn test_partitioned_desc_table_with_equality_delete_schema_and_no_partition_info(
-        table_id: i64,
-        table_location: &str,
-        metadata: &iceberg::spec::TableMetadata,
-    ) -> crate::thrift::descriptors::TDescriptorTable {
-        let iceberg_table = crate::thrift::descriptors::TIcebergTable::new(
-            Some(table_location.to_string()),
-            Some(vec![test_int_column("id")]),
-            Some(crate::thrift::descriptors::TIcebergSchema::new(Some(vec![
-                test_iceberg_schema_field("id", 42),
-            ]))),
-            None::<Vec<String>>,
-            None::<crate::thrift::descriptors::TCompressedPartitionMap>,
-            None::<std::collections::BTreeMap<i64, crate::thrift::descriptors::THdfsPartition>>,
-            Some(crate::thrift::descriptors::TIcebergSchema::new(Some(vec![
-                test_iceberg_schema_field("id", 42),
-            ]))),
-            None::<Vec<crate::thrift::descriptors::TIcebergPartitionInfo>>,
-            None::<crate::thrift::descriptors::TSortOrder>,
-            Some(serde_json::to_string(metadata).expect("serialize metadata")),
-            None::<i64>,
-        );
-        let table = crate::thrift::descriptors::TTableDescriptor::new(
-            table_id,
-            crate::thrift::types::TTableType::ICEBERG_TABLE,
-            1,
-            0,
-            "orders".to_string(),
-            "db".to_string(),
-            None::<crate::thrift::descriptors::TMySQLTable>,
-            None::<crate::thrift::descriptors::TOlapTable>,
-            None::<crate::thrift::descriptors::TSchemaTable>,
-            None::<crate::thrift::descriptors::TBrokerTable>,
-            None::<crate::thrift::descriptors::TEsTable>,
-            None::<crate::thrift::descriptors::TJDBCTable>,
-            None::<crate::thrift::descriptors::THdfsTable>,
-            Some(iceberg_table),
-            None::<crate::thrift::descriptors::THudiTable>,
-            None::<crate::thrift::descriptors::TDeltaLakeTable>,
-            None::<crate::thrift::descriptors::TFileTable>,
-            None::<crate::thrift::descriptors::TTableFunctionTable>,
-            None::<crate::thrift::descriptors::TPaimonTable>,
-        );
-        crate::thrift::descriptors::TDescriptorTable::new(
-            None::<Vec<crate::thrift::descriptors::TSlotDescriptor>>,
-            Vec::new(),
-            Some(vec![table]),
-            None::<bool>,
-        )
-    }
-
-    fn test_partitioned_desc_table_with_metadata(
-        table_id: i64,
-        table_location: &str,
-        metadata: &iceberg::spec::TableMetadata,
-    ) -> crate::thrift::descriptors::TDescriptorTable {
-        test_partitioned_desc_table_with_metadata_and_snapshot_id(
-            table_id,
-            table_location,
-            metadata,
-            None,
-        )
-    }
-
-    fn test_partitioned_desc_table_with_metadata_and_snapshot_id(
-        table_id: i64,
-        table_location: &str,
-        metadata: &iceberg::spec::TableMetadata,
-        current_snapshot_id: Option<i64>,
-    ) -> crate::thrift::descriptors::TDescriptorTable {
-        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::INT,
-        );
-        let partition_expr =
-            crate::sql::codegen::expr_compiler::build_slot_ref_texpr(3, 1, int_type);
-        let iceberg_table = crate::thrift::descriptors::TIcebergTable::new(
-            Some(table_location.to_string()),
-            Some(vec![test_int_column("id")]),
-            None::<crate::thrift::descriptors::TIcebergSchema>,
-            None::<Vec<String>>,
-            None::<crate::thrift::descriptors::TCompressedPartitionMap>,
-            None::<std::collections::BTreeMap<i64, crate::thrift::descriptors::THdfsPartition>>,
-            None::<crate::thrift::descriptors::TIcebergSchema>,
-            Some(vec![
-                crate::thrift::descriptors::TIcebergPartitionInfo::new(
-                    Some("id".to_string()),
-                    Some("id_part".to_string()),
-                    Some("identity".to_string()),
-                    Some(partition_expr),
-                ),
-            ]),
-            None::<crate::thrift::descriptors::TSortOrder>,
-            Some(serde_json::to_string(metadata).expect("serialize metadata")),
-            current_snapshot_id,
-        );
-        let table = crate::thrift::descriptors::TTableDescriptor::new(
-            table_id,
-            crate::thrift::types::TTableType::ICEBERG_TABLE,
-            1,
-            0,
-            "orders".to_string(),
-            "db".to_string(),
-            None::<crate::thrift::descriptors::TMySQLTable>,
-            None::<crate::thrift::descriptors::TOlapTable>,
-            None::<crate::thrift::descriptors::TSchemaTable>,
-            None::<crate::thrift::descriptors::TBrokerTable>,
-            None::<crate::thrift::descriptors::TEsTable>,
-            None::<crate::thrift::descriptors::TJDBCTable>,
-            None::<crate::thrift::descriptors::THdfsTable>,
-            Some(iceberg_table),
-            None::<crate::thrift::descriptors::THudiTable>,
-            None::<crate::thrift::descriptors::TDeltaLakeTable>,
-            None::<crate::thrift::descriptors::TFileTable>,
-            None::<crate::thrift::descriptors::TTableFunctionTable>,
-            None::<crate::thrift::descriptors::TPaimonTable>,
-        );
-        crate::thrift::descriptors::TDescriptorTable::new(
-            None::<Vec<crate::thrift::descriptors::TSlotDescriptor>>,
-            Vec::new(),
-            Some(vec![table]),
-            None::<bool>,
-        )
-    }
-
-    fn test_iceberg_table_sink(
-        table_id: i64,
-        table_location: &str,
-    ) -> crate::thrift::data_sinks::TIcebergTableSink {
-        crate::thrift::data_sinks::TIcebergTableSink::new(
-            Some(table_location.to_string()),
-            Some("parquet".to_string()),
-            Some(table_id),
-            Some(crate::thrift::types::TCompressionType::SNAPPY),
-            Some(false),
-            None::<crate::thrift::cloud_configuration::TCloudConfiguration>,
-            None::<i64>,
-            Some(1),
-            Some(format!("{table_location}/data")),
-            Some(7),
-            None::<crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor>,
-        )
-    }
-
-    fn test_position_delete_descriptor(
-        target_partition_spec_id: i32,
-        include_partition_source: bool,
-    ) -> crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor {
-        let mut descriptor =
-            crate::connector::iceberg::position_delete_descriptor::required_position_delete_descriptor_for_tests(
-                target_partition_spec_id,
-            );
-        let partitions = if include_partition_source {
-            vec![
-                crate::thrift::data_sinks::TIcebergPositionDeletePartitionSourceField::new(
-                    Some(2),
-                    Some("id".to_string()),
-                    Some("id_part".to_string()),
-                    Some("identity".to_string()),
-                    Some(42),
-                ),
-            ]
-        } else {
-            Vec::new()
-        };
-        descriptor.partition_source_fields = Some(partitions);
-        descriptor
-    }
-
-    fn test_delete_output_exprs(
-        include_partition_source: bool,
-    ) -> Vec<crate::thrift::exprs::TExpr> {
-        let varchar_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::VARCHAR,
-        );
-        let bigint_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::BIGINT,
-        );
-        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::INT,
-        );
-        let mut exprs = vec![
-            crate::sql::codegen::expr_compiler::build_slot_ref_texpr(1, 1, varchar_type),
-            crate::sql::codegen::expr_compiler::build_slot_ref_texpr(2, 1, bigint_type),
-        ];
-        if include_partition_source {
-            exprs.push(crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
-                3, 1, int_type,
-            ));
-        }
-        exprs
     }
 
     #[tokio::test]
@@ -3616,55 +2508,63 @@ mod tests {
             .prefix("novarocks-iceberg-equality-delete-sink-")
             .tempdir()
             .expect("temp dir");
-        let table_id = 102;
         let table_location = format!("file://{}", dir.path().display());
         let data_location = format!("{table_location}/custom-data");
-        let desc_tbl =
-            test_unpartitioned_desc_table_with_equality_delete_schema(table_id, &table_location);
-        let mut sink = test_iceberg_table_sink(table_id, &table_location);
-        sink.data_location = Some(data_location.clone());
-        sink.target_partition_spec_id = Some(0);
-        let layout = Layout {
-            order: Vec::new(),
-            index: HashMap::new(),
-        };
         let id_slot = SlotId::new(1);
         let category_slot = SlotId::new(2);
-        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::INT,
-        );
-        let varchar_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::VARCHAR,
-        );
-        let output_exprs = vec![
-            crate::sql::codegen::expr_compiler::build_slot_ref_texpr(1, 1, int_type),
-            crate::sql::codegen::expr_compiler::build_slot_ref_texpr(2, 1, varchar_type),
-        ];
-
-        let factory = IcebergTableSinkFactory::try_new(
-            sink,
-            IcebergSinkMode::EqualityDeletes,
-            &output_exprs,
-            &layout,
-            &desc_tbl,
-            None,
-            None,
-        )
-        .expect("equality-delete sink factory");
-        assert_eq!(
-            factory
-                .plan
-                .output_schema
-                .fields()
-                .iter()
-                .map(|field| field.name().as_str())
-                .collect::<Vec<_>>(),
-            vec!["id", "category"]
-        );
+        let mut arena = crate::exec::expr::ExprArena::default();
+        let id_expr = arena.push_typed(ExprNode::SlotId(id_slot), DataType::Int32);
+        let category_expr = arena.push_typed(ExprNode::SlotId(category_slot), DataType::Utf8);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "11".to_string(),
+            )])),
+            Field::new("category", DataType::Utf8, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "12".to_string(),
+            )])),
+        ]));
+        let plan = Arc::new(IcebergSinkPlan {
+            mode: IcebergSinkMode::EqualityDeletes,
+            table_location,
+            data_location: data_location.clone(),
+            target_partition_spec_id: 0,
+            target_table_metadata: None,
+            target_snapshot_id: None,
+            position_delete_data_file_partitions: HashMap::new(),
+            object_store_s3: None,
+            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            report_file_format: "parquet".to_string(),
+            compression: Compression::SNAPPY,
+            output_schema: Arc::clone(&schema),
+            target_schema: Arc::clone(&schema),
+            equality_delete_columns: vec![
+                EqualityDeleteColumn {
+                    name: "id".to_string(),
+                    field_id: 11,
+                    data_type: DataType::Int32,
+                    nullable: false,
+                },
+                EqualityDeleteColumn {
+                    name: "category".to_string(),
+                    field_id: 12,
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                },
+            ],
+            row_lineage_data: false,
+            output_exprs: vec![id_expr, category_expr],
+            partition_exprs: Vec::new(),
+            partition_source_column_names: Vec::new(),
+            partition_column_names: Vec::new(),
+            transform_exprs: Vec::new(),
+            position_delete_binding: None,
+        });
 
         let mut backend = IcebergTableSinkBackend {
-            arena: Arc::clone(&factory.arena),
-            plan: Arc::clone(&factory.plan),
+            arena: Arc::new(arena),
+            plan,
             driver_id: 17,
             file_seq: 0,
             runtime_state: None,
@@ -3719,10 +2619,11 @@ mod tests {
             .expect("iceberg equality-delete data file");
         assert_eq!(data_file.format.as_deref(), Some("parquet"));
         assert_eq!(data_file.record_count, Some(2));
-        assert_eq!(
-            data_file.file_content,
-            Some(crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES)
-        );
+        let expected_content =
+            crate::connector::iceberg::report_wire::expected_file_content_for_test(
+                IcebergFileContent::EqualityDeletes,
+            );
+        assert_eq!(data_file.file_content.as_ref(), Some(&expected_content));
         assert_eq!(data_file.equality_ids, Some(vec![11, 12]));
         assert_eq!(data_file.partition_path.as_deref(), Some(""));
         assert_eq!(data_file.partition_spec_id, Some(0));
@@ -3735,253 +2636,6 @@ mod tests {
             "unexpected equality-delete path: {:?}",
             data_file.path
         );
-    }
-
-    #[test]
-    fn equality_delete_factory_requires_projected_key_schema() {
-        let table_id = 103;
-        let table_location = "file:///warehouse/equality-delete-no-projected-schema";
-        let desc_tbl =
-            test_unpartitioned_desc_table_without_equality_delete_schema(table_id, table_location);
-        let mut sink = test_iceberg_table_sink(table_id, table_location);
-        sink.target_partition_spec_id = Some(0);
-        let layout = Layout {
-            order: Vec::new(),
-            index: HashMap::new(),
-        };
-        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::INT,
-        );
-        let varchar_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::VARCHAR,
-        );
-        let output_exprs = vec![
-            crate::sql::codegen::expr_compiler::build_slot_ref_texpr(1, 1, int_type.clone()),
-            crate::sql::codegen::expr_compiler::build_slot_ref_texpr(2, 1, varchar_type),
-            crate::sql::codegen::expr_compiler::build_slot_ref_texpr(3, 1, int_type),
-        ];
-
-        let err = match IcebergTableSinkFactory::try_new(
-            sink,
-            IcebergSinkMode::EqualityDeletes,
-            &output_exprs,
-            &layout,
-            &desc_tbl,
-            None,
-            None,
-        ) {
-            Ok(_) => panic!("equality-delete sink should require projected key schema"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.contains("iceberg_equal_delete_schema"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn equality_delete_factory_rejects_partitioned_metadata_spec_without_partition_info() {
-        let table_id = 104;
-        let table_location = "file:///warehouse/equality-delete-partitioned-metadata";
-        let target_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "42".to_string(),
-            )])),
-        ]));
-        let metadata =
-            test_identity_partition_metadata(table_location, table_location, target_schema, 7);
-        let desc_tbl =
-            test_partitioned_desc_table_with_equality_delete_schema_and_no_partition_info(
-                table_id,
-                table_location,
-                &metadata,
-            );
-        let sink = test_iceberg_table_sink(table_id, table_location);
-        let layout = Layout {
-            order: Vec::new(),
-            index: HashMap::new(),
-        };
-        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::INT,
-        );
-        let output_exprs = vec![crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
-            1, 1, int_type,
-        )];
-
-        let err = match IcebergTableSinkFactory::try_new(
-            sink,
-            IcebergSinkMode::EqualityDeletes,
-            &output_exprs,
-            &layout,
-            &desc_tbl,
-            None,
-            None,
-        ) {
-            Ok(_) => panic!("equality-delete sink should reject partitioned target spec"),
-            Err(err) => err,
-        };
-
-        assert!(err.contains("unpartitioned"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn position_delete_factory_requires_descriptor() {
-        let table_id = 101;
-        let table_location = "file:///warehouse/position-delete-no-descriptor";
-        let target_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "42".to_string(),
-            )])),
-        ]));
-        let metadata =
-            test_identity_partition_metadata(table_location, table_location, target_schema, 7);
-        let desc_tbl =
-            test_partitioned_desc_table_with_metadata(table_id, table_location, &metadata);
-        let sink = test_iceberg_table_sink(table_id, table_location);
-        let layout = Layout {
-            order: Vec::new(),
-            index: HashMap::new(),
-        };
-
-        let err = match IcebergTableSinkFactory::try_new(
-            sink,
-            IcebergSinkMode::PositionDeletes,
-            &test_delete_output_exprs(true),
-            &layout,
-            &desc_tbl,
-            None,
-            None,
-        ) {
-            Ok(_) => panic!("position-delete sink should require descriptor"),
-            Err(err) => err,
-        };
-
-        assert!(err.contains("UnsupportedPositionDeleteDescriptor"), "{err}");
-        assert!(err.contains("descriptor is missing"), "{err}");
-    }
-
-    #[test]
-    fn position_delete_factory_rejects_descriptor_order_mismatch() {
-        let table_id = 102;
-        let table_location = "file:///warehouse/position-delete-order";
-        let target_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "42".to_string(),
-            )])),
-        ]));
-        let metadata =
-            test_identity_partition_metadata(table_location, table_location, target_schema, 7);
-        let desc_tbl =
-            test_partitioned_desc_table_with_metadata(table_id, table_location, &metadata);
-        let mut sink = test_iceberg_table_sink(table_id, table_location);
-        let mut descriptor = test_position_delete_descriptor(7, true);
-        descriptor.file_path.as_mut().unwrap().output_expr_index = Some(1);
-        sink.position_delete_output_descriptor = Some(descriptor);
-        let layout = Layout {
-            order: Vec::new(),
-            index: HashMap::new(),
-        };
-
-        let err = match IcebergTableSinkFactory::try_new(
-            sink,
-            IcebergSinkMode::PositionDeletes,
-            &test_delete_output_exprs(true),
-            &layout,
-            &desc_tbl,
-            None,
-            None,
-        ) {
-            Ok(_) => panic!("position-delete sink should reject descriptor order mismatch"),
-            Err(err) => err,
-        };
-
-        assert!(err.contains("UnsupportedPositionDeleteDescriptor"), "{err}");
-        assert!(err.contains("file_path output_expr_index"), "{err}");
-    }
-
-    #[test]
-    fn deletion_vector_factory_requires_position_delete_input_shape() {
-        let table_id = 99;
-        let table_location = "file:///warehouse/dv-shape";
-        let target_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "42".to_string(),
-            )])),
-        ]));
-        let metadata =
-            test_identity_partition_metadata(table_location, table_location, target_schema, 7);
-        let desc_tbl =
-            test_partitioned_desc_table_with_metadata(table_id, table_location, &metadata);
-        let mut sink = test_iceberg_table_sink(table_id, table_location);
-        sink.position_delete_output_descriptor = Some(test_position_delete_descriptor(7, true));
-        let layout = Layout {
-            order: Vec::new(),
-            index: HashMap::new(),
-        };
-        let output_exprs = test_delete_output_exprs(false);
-
-        let err = match IcebergTableSinkFactory::try_new(
-            sink,
-            IcebergSinkMode::DeletionVectors,
-            &output_exprs,
-            &layout,
-            &desc_tbl,
-            None,
-            None,
-        ) {
-            Ok(_) => panic!("deletion-vector sink should require partition source output exprs"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.contains("output expr count mismatch"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn deletion_vector_factory_uses_position_delete_schema_and_metadata() {
-        let table_id = 100;
-        let table_location = "file:///warehouse/dv-metadata";
-        let target_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "42".to_string(),
-            )])),
-        ]));
-        let metadata =
-            test_identity_partition_metadata(table_location, table_location, target_schema, 7);
-        let desc_tbl =
-            test_partitioned_desc_table_with_metadata(table_id, table_location, &metadata);
-        let mut sink = test_iceberg_table_sink(table_id, table_location);
-        sink.position_delete_output_descriptor = Some(test_position_delete_descriptor(7, true));
-        let layout = Layout {
-            order: Vec::new(),
-            index: HashMap::new(),
-        };
-        let output_exprs = test_delete_output_exprs(true);
-
-        let factory = IcebergTableSinkFactory::try_new(
-            sink,
-            IcebergSinkMode::DeletionVectors,
-            &output_exprs,
-            &layout,
-            &desc_tbl,
-            None,
-            None,
-        )
-        .expect("deletion-vector sink factory");
-
-        assert_eq!(
-            factory.plan.output_schema,
-            position_delete_required_schema_for_tests()
-        );
-        assert!(factory.plan.target_table_metadata.is_some());
     }
 
     #[test]
@@ -4008,16 +2662,17 @@ mod tests {
 
     #[test]
     fn delete_like_sinks_wire_explicit_snapshot_selection_into_call_sites() {
-        let source = include_str!("sink.rs");
-        let partition_index = source
+        let lower_source = include_str!("../../lower/sink/iceberg.rs");
+        let partition_index = lower_source
             .split("fn build_position_delete_data_file_partition_index")
             .nth(1)
             .expect("partition index helper")
-            .split("fn delete_target_snapshot_id")
+            .split("fn insert_position_delete_data_file_partition")
             .next()
             .expect("partition index helper body");
         assert!(
-            partition_index.contains("delete_target_snapshot_id(metadata, target_snapshot_id)"),
+            partition_index
+                .contains("target_snapshot_id.or_else(|| metadata.current_snapshot_id())"),
             "partition index builder must select the descriptor target snapshot"
         );
         assert!(
@@ -4025,6 +2680,7 @@ mod tests {
             "partition index builder must not use metadata current snapshot directly"
         );
 
+        let source = include_str!("sink.rs");
         let dv_reader = source
             .split("fn read_existing_dv_positions")
             .nth(1)
@@ -4041,7 +2697,7 @@ mod tests {
             "DV reader must not use metadata current snapshot id directly"
         );
 
-        let partition_index_call_site = source
+        let partition_index_call_site = lower_source
             .split("let position_delete_data_file_partitions")
             .nth(1)
             .expect("partition index call site")
@@ -4052,50 +2708,6 @@ mod tests {
             partition_index_call_site.contains("IcebergSinkMode::DeletionVectors"),
             "DV sink factory must build referenced data file partition metadata"
         );
-    }
-
-    #[test]
-    fn iceberg_table_sink_factory_carries_descriptor_snapshot_id_into_plan() {
-        let table_id = 101;
-        let table_location = "file:///warehouse/sink-plan-snapshot";
-        let target_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "42".to_string(),
-            )])),
-        ]));
-        let metadata =
-            test_identity_partition_metadata(table_location, table_location, target_schema, 7);
-        let desc_tbl = test_partitioned_desc_table_with_metadata_and_snapshot_id(
-            table_id,
-            table_location,
-            &metadata,
-            Some(101),
-        );
-        let sink = test_iceberg_table_sink(table_id, table_location);
-        let layout = Layout {
-            order: Vec::new(),
-            index: HashMap::new(),
-        };
-        let int_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-            crate::thrift::types::TPrimitiveType::INT,
-        );
-        let output_exprs = vec![crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
-            3, 1, int_type,
-        )];
-
-        let factory = IcebergTableSinkFactory::try_new(
-            sink,
-            IcebergSinkMode::Data,
-            &output_exprs,
-            &layout,
-            &desc_tbl,
-            None,
-            None,
-        )
-        .expect("iceberg sink factory");
-
-        assert_eq!(factory.plan.target_snapshot_id, Some(101));
     }
 
     #[tokio::test]
@@ -4121,8 +2733,9 @@ mod tests {
             target_snapshot_id: None,
             position_delete_data_file_partitions: HashMap::new(),
             object_store_s3: None,
-            file_format: "parquet".to_string(),
-            compression: crate::thrift::types::TCompressionType::SNAPPY,
+            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            report_file_format: "parquet".to_string(),
+            compression: Compression::SNAPPY,
             output_schema: Arc::clone(&schema),
             target_schema: Arc::clone(&schema),
             equality_delete_columns: Vec::new(),
@@ -4132,6 +2745,7 @@ mod tests {
             partition_source_column_names: vec!["id".to_string()],
             partition_column_names: vec!["id_part".to_string()],
             transform_exprs: vec!["identity".to_string()],
+            position_delete_binding: None,
         };
 
         let ctx = plan.build_staged_write_context().expect("staged context");
@@ -4162,7 +2776,7 @@ mod tests {
             "id_part=7".to_string(),
             "0".to_string(),
             "parquet".to_string(),
-            crate::thrift::types::TIcebergFileContent::DATA,
+            crate::connector::iceberg::delete_file::IcebergFileContent::Data,
         )
         .expect("commit info");
         let data_file = commit_info.iceberg_data_file.expect("iceberg data file");
@@ -4238,8 +2852,9 @@ mod tests {
             target_snapshot_id: None,
             position_delete_data_file_partitions: HashMap::new(),
             object_store_s3: None,
-            file_format: "parquet".to_string(),
-            compression: crate::thrift::types::TCompressionType::SNAPPY,
+            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            report_file_format: "parquet".to_string(),
+            compression: Compression::SNAPPY,
             output_schema: Arc::clone(&arrow_schema),
             target_schema: arrow_schema,
             equality_delete_columns: Vec::new(),
@@ -4249,6 +2864,7 @@ mod tests {
             partition_source_column_names: Vec::new(),
             partition_column_names: Vec::new(),
             transform_exprs: Vec::new(),
+            position_delete_binding: None,
         };
 
         let staged_metadata = plan
@@ -4297,8 +2913,9 @@ mod tests {
             target_snapshot_id: None,
             position_delete_data_file_partitions: HashMap::new(),
             object_store_s3: None,
-            file_format: "parquet".to_string(),
-            compression: crate::thrift::types::TCompressionType::SNAPPY,
+            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            report_file_format: "parquet".to_string(),
+            compression: Compression::SNAPPY,
             output_schema: Arc::clone(&schema),
             target_schema: Arc::clone(&schema),
             equality_delete_columns: Vec::new(),
@@ -4308,6 +2925,7 @@ mod tests {
             partition_source_column_names: vec!["id".to_string()],
             partition_column_names: vec!["id_part".to_string()],
             transform_exprs: vec!["identity".to_string()],
+            position_delete_binding: None,
         });
         let mut backend = IcebergTableSinkBackend {
             arena: Arc::new(arena),
@@ -4361,10 +2979,11 @@ mod tests {
             "writer report must carry the target default partition spec id"
         );
         assert_eq!(data_file.record_count, Some(2));
-        assert_eq!(
-            data_file.file_content,
-            Some(crate::thrift::types::TIcebergFileContent::DATA)
-        );
+        let expected_content =
+            crate::connector::iceberg::report_wire::expected_file_content_for_test(
+                IcebergFileContent::Data,
+            );
+        assert_eq!(data_file.file_content.as_ref(), Some(&expected_content));
     }
 
     fn test_identity_partition_metadata(
@@ -4382,8 +3001,9 @@ mod tests {
             target_snapshot_id: None,
             position_delete_data_file_partitions: HashMap::new(),
             object_store_s3: None,
-            file_format: "parquet".to_string(),
-            compression: crate::thrift::types::TCompressionType::SNAPPY,
+            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            report_file_format: "parquet".to_string(),
+            compression: Compression::SNAPPY,
             output_schema: Arc::clone(&target_schema),
             target_schema,
             equality_delete_columns: Vec::new(),
@@ -4393,6 +3013,7 @@ mod tests {
             partition_source_column_names: vec!["id".to_string()],
             partition_column_names: vec!["id_part".to_string()],
             transform_exprs: vec!["identity".to_string()],
+            position_delete_binding: None,
         };
         let writer_schema =
             iceberg_schema_from_arrow_schema(&plan.target_schema).expect("target writer schema");
@@ -4509,8 +3130,9 @@ mod tests {
             target_snapshot_id: None,
             position_delete_data_file_partitions: referenced_partitions,
             object_store_s3: None,
-            file_format: "parquet".to_string(),
-            compression: crate::thrift::types::TCompressionType::SNAPPY,
+            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            report_file_format: "parquet".to_string(),
+            compression: Compression::SNAPPY,
             output_schema: position_delete_required_schema_for_tests(),
             target_schema,
             equality_delete_columns: Vec::new(),
@@ -4520,6 +3142,7 @@ mod tests {
             partition_source_column_names: vec!["id".to_string()],
             partition_column_names: vec!["id_part".to_string()],
             transform_exprs: vec!["identity".to_string()],
+            position_delete_binding: None,
         });
         let mut backend = IcebergTableSinkBackend {
             arena: Arc::new(arena),
@@ -4574,10 +3197,11 @@ mod tests {
             path.starts_with(&format!("{data_location}/id_part=7/delete-")),
             "position delete sink should keep manual delete file naming, got {path}"
         );
-        assert_eq!(
-            data_file.file_content,
-            Some(crate::thrift::types::TIcebergFileContent::POSITION_DELETES)
-        );
+        let expected_content =
+            crate::connector::iceberg::report_wire::expected_file_content_for_test(
+                IcebergFileContent::PositionDeletes,
+            );
+        assert_eq!(data_file.file_content.as_ref(), Some(&expected_content));
         assert_eq!(data_file.partition_spec_id, Some(7));
         assert!(
             data_file.partition_values_descriptor.is_some(),
@@ -4655,8 +3279,9 @@ mod tests {
             target_snapshot_id: None,
             position_delete_data_file_partitions: referenced_partitions,
             object_store_s3: None,
-            file_format: "parquet".to_string(),
-            compression: crate::thrift::types::TCompressionType::SNAPPY,
+            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            report_file_format: "parquet".to_string(),
+            compression: Compression::SNAPPY,
             output_schema: position_delete_required_schema_for_tests(),
             target_schema,
             equality_delete_columns: Vec::new(),
@@ -4666,6 +3291,7 @@ mod tests {
             partition_source_column_names: Vec::new(),
             partition_column_names: Vec::new(),
             transform_exprs: Vec::new(),
+            position_delete_binding: None,
         });
         let mut backend = IcebergTableSinkBackend {
             arena: Arc::new(arena),
@@ -4798,8 +3424,9 @@ mod tests {
             target_snapshot_id: None,
             position_delete_data_file_partitions: referenced_partitions,
             object_store_s3: None,
-            file_format: "parquet".to_string(),
-            compression: crate::thrift::types::TCompressionType::SNAPPY,
+            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            report_file_format: "parquet".to_string(),
+            compression: Compression::SNAPPY,
             output_schema: position_delete_required_schema_for_tests(),
             target_schema,
             equality_delete_columns: Vec::new(),
@@ -4809,6 +3436,7 @@ mod tests {
             partition_source_column_names: vec!["id".to_string()],
             partition_column_names: vec!["id_part".to_string()],
             transform_exprs: vec!["identity".to_string()],
+            position_delete_binding: None,
         });
         let files = vec![referenced_data_file; positions.len()];
         let ids = vec![7_i32; positions.len()];
@@ -4920,10 +3548,11 @@ mod tests {
             .as_ref()
             .expect("iceberg dv data file");
         assert_eq!(data_file.format.as_deref(), Some("puffin"));
-        assert_eq!(
-            data_file.file_content,
-            Some(crate::thrift::types::TIcebergFileContent::POSITION_DELETES)
-        );
+        let expected_content =
+            crate::connector::iceberg::report_wire::expected_file_content_for_test(
+                IcebergFileContent::PositionDeletes,
+            );
+        assert_eq!(data_file.file_content.as_ref(), Some(&expected_content));
         assert_eq!(data_file.referenced_data_file.as_deref(), Some(referenced));
         assert_eq!(data_file.cardinality, Some(2));
         assert_eq!(data_file.record_count, Some(2));
@@ -5149,9 +3778,9 @@ mod tests {
         let split_offsets = write_result.split_offsets.expect("split offsets");
         assert_eq!(split_offsets.len(), 1);
         let column_stats = write_result.column_stats.expect("column stats");
-        let value_counts = column_stats.value_counts.expect("value counts");
-        let lower_bounds = column_stats.lower_bounds.expect("lower bounds");
-        let upper_bounds = column_stats.upper_bounds.expect("upper bounds");
+        let value_counts = column_stats.value_counts;
+        let lower_bounds = column_stats.lower_bounds;
+        let upper_bounds = column_stats.upper_bounds;
 
         assert_eq!(value_counts.get(&1), Some(&2));
         assert_eq!(
@@ -5194,8 +3823,8 @@ mod tests {
             write_parquet_to_bytes(Arc::clone(&schema), &batch, props).expect("write parquet");
 
         let column_stats = write_result.column_stats.expect("column stats");
-        let value_counts = column_stats.value_counts.expect("value counts");
-        let null_value_counts = column_stats.null_value_counts.expect("null value counts");
+        let value_counts = column_stats.value_counts;
+        let null_value_counts = column_stats.null_value_counts;
 
         assert_eq!(value_counts.get(&1), Some(&1));
         assert_eq!(null_value_counts.get(&1), Some(&1));

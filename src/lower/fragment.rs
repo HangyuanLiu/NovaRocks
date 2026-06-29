@@ -147,19 +147,6 @@ fn collect_glm_metadata(
     Ok(())
 }
 
-fn iceberg_sink_mode_for_type(
-    t: data_sinks::TDataSinkType,
-) -> crate::connector::iceberg::sink::IcebergSinkMode {
-    use crate::connector::iceberg::sink::IcebergSinkMode;
-
-    match t {
-        data_sinks::TDataSinkType::ICEBERG_DELETE_SINK => IcebergSinkMode::PositionDeletes,
-        data_sinks::TDataSinkType::ICEBERG_DV_SINK => IcebergSinkMode::DeletionVectors,
-        data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK => IcebergSinkMode::EqualityDeletes,
-        _ => IcebergSinkMode::Data,
-    }
-}
-
 fn iceberg_sink_type_name(t: data_sinks::TDataSinkType) -> &'static str {
     match t {
         data_sinks::TDataSinkType::ICEBERG_DELETE_SINK => "ICEBERG_DELETE_SINK",
@@ -547,9 +534,9 @@ pub(crate) fn execute_fragment(
                 let desc_tbl = desc_tbl
                     .ok_or_else(|| format!("{sink_type_name} requires descriptor table"))?;
 
-                let sink_mode = iceberg_sink_mode_for_type(sink.type_);
-                let sink_factory = IcebergTableSinkFactory::try_new(
-                    iceberg_sink.clone(),
+                let sink_mode = crate::lower::sink::iceberg::iceberg_sink_mode_for_type(sink.type_);
+                let sink_input = crate::lower::sink::iceberg::lower_iceberg_sink_factory_input(
+                    iceberg_sink,
                     sink_mode,
                     output_exprs,
                     &lowered.layout,
@@ -557,11 +544,12 @@ pub(crate) fn execute_fragment(
                     last_query_id,
                     fe_addr,
                 )?;
+                let sink_factory = IcebergTableSinkFactory::try_new(sink_input)?;
                 let _exec_timer = profiler
                     .as_ref()
                     .map(|p| p.scoped_timer("PipelineExecuteTime"));
                 let root_sink_dop = (sink_mode
-                    == crate::connector::iceberg::sink::IcebergSinkMode::DeletionVectors)
+                    == crate::connector::iceberg::IcebergSinkMode::DeletionVectors)
                     .then_some(1);
                 execute_plan_with_pipeline_with_root_sink_dop(
                     exec_plan,
@@ -628,15 +616,19 @@ mod tests {
 
     #[test]
     fn iceberg_dv_sink_lowers_to_deletion_vectors_mode() {
-        let mode = super::iceberg_sink_mode_for_type(data_sinks::TDataSinkType::ICEBERG_DV_SINK);
+        let mode = crate::lower::sink::iceberg::iceberg_sink_mode_for_type(
+            data_sinks::TDataSinkType::ICEBERG_DV_SINK,
+        );
 
         assert_eq!(
             mode,
-            crate::connector::iceberg::sink::IcebergSinkMode::DeletionVectors
+            crate::connector::iceberg::IcebergSinkMode::DeletionVectors
         );
         assert_eq!(
-            super::iceberg_sink_mode_for_type(data_sinks::TDataSinkType::ICEBERG_DELETE_SINK),
-            crate::connector::iceberg::sink::IcebergSinkMode::PositionDeletes
+            crate::lower::sink::iceberg::iceberg_sink_mode_for_type(
+                data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
+            ),
+            crate::connector::iceberg::IcebergSinkMode::PositionDeletes
         );
     }
 
@@ -647,8 +639,8 @@ mod tests {
         assert_eq!(i32::from(sink_type), 19);
         assert_eq!(data_sinks::TDataSinkType::from(19), sink_type);
         assert_eq!(
-            super::iceberg_sink_mode_for_type(sink_type),
-            crate::connector::iceberg::sink::IcebergSinkMode::EqualityDeletes
+            crate::lower::sink::iceberg::iceberg_sink_mode_for_type(sink_type),
+            crate::connector::iceberg::IcebergSinkMode::EqualityDeletes
         );
     }
 }
