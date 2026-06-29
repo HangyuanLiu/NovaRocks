@@ -980,6 +980,7 @@ fn build_pipeline_for_node(
             let probe_keys = probe_keys.clone();
             let build_keys = build_keys.clone();
             let eq_null_safe = eq_null_safe.clone();
+            let has_equi_keys = !probe_keys.is_empty() && !build_keys.is_empty();
 
             if *distribution_mode == JoinDistributionMode::Broadcast {
                 if *join_type == JoinType::FullOuter {
@@ -1024,6 +1025,8 @@ fn build_pipeline_for_node(
                         Arc::clone(&ctx.arena),
                         *join_type,
                         residual_predicate.is_some(),
+                        probe_is_left,
+                        has_equi_keys,
                         build_keys.clone(),
                         eq_null_safe.clone(),
                         runtime_filters.clone(),
@@ -1118,6 +1121,8 @@ fn build_pipeline_for_node(
                     Arc::clone(&ctx.arena),
                     *join_type,
                     residual_predicate.is_some(),
+                    probe_is_left,
+                    has_equi_keys,
                     build_keys.clone(),
                     eq_null_safe.clone(),
                     runtime_filters.clone(),
