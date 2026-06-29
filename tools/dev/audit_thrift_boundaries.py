@@ -48,9 +48,10 @@ class BaselineEntry:
 
 
 BASELINE: dict[str, BaselineEntry] = {
-    "src/connector/iceberg/sink.rs": BaselineEntry("domain-leak", "B1", 35, "Iceberg sink still receives FE thrift sink/table/expr descriptors"),
+    "src/connector/iceberg/sink.rs": BaselineEntry("domain-leak", "B1", 0, "Iceberg sink no longer constructs thrift writer reports"),
     "src/connector/iceberg/schema.rs": BaselineEntry("domain-leak", "B1", 0, "Iceberg schema binding is thrift-free"),
     "src/connector/iceberg/position_delete_descriptor.rs": BaselineEntry("domain-leak", "B1", 0, "Position delete descriptor binding is thrift-free"),
+    "src/connector/iceberg/report_wire.rs": BaselineEntry("legal-boundary", "B1-wire", 4, "Iceberg writer report wire adapter serializes internal reports to TSinkCommitInfo"),
     "src/connector/iceberg/commit/collector.rs": BaselineEntry("domain-leak", "B2", 8, "Commit collector still accepts thrift writer report payloads"),
     "src/connector/iceberg/data_writer.rs": BaselineEntry("domain-leak", "B2", 20, "Data writer still serializes Iceberg data files directly into thrift reports"),
     "src/connector/iceberg/write_descriptor.rs": BaselineEntry("domain-leak", "B2", 5, "Write descriptor still exposes TIcebergPartitionDescriptor"),

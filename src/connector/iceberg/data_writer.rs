@@ -7,11 +7,10 @@ use crate::exec::row_position::{
 };
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
-use base64::Engine;
 use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, NestedField,
-    PartitionSpecRef, PrimitiveLiteral, PrimitiveType, SchemaRef, Struct, TableMetadata, Type,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, NestedField, PartitionSpecRef,
+    PrimitiveType, SchemaRef, TableMetadata, Type,
 };
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -22,6 +21,8 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 
+use super::delete_file::IcebergFileContent;
+use super::report::partition_path_from_struct;
 use super::theta_sketch::ThetaSketchHandle;
 use super::variant_write::{
     VariantShreddingConfig, apply_variant_shredding_to_arrow_schema,
@@ -400,7 +401,7 @@ pub(crate) fn to_sink_commit_info(
     partition_path: String,
     null_fingerprint: String,
     format: String,
-    content: crate::thrift::types::TIcebergFileContent,
+    content: IcebergFileContent,
 ) -> Result<
     (
         crate::thrift::types::TSinkCommitInfo,
@@ -414,7 +415,11 @@ pub(crate) fn to_sink_commit_info(
         partition_path,
         null_fingerprint,
         format,
-        content,
+        thrift_file_content(match content {
+            IcebergFileContent::Data => DataContentType::Data,
+            IcebergFileContent::PositionDeletes => DataContentType::PositionDeletes,
+            IcebergFileContent::EqualityDeletes => DataContentType::EqualityDeletes,
+        }),
         staged.partition_spec_id,
         staged.descriptor_partition_spec_id,
         staged.metadata.as_ref(),
@@ -533,65 +538,6 @@ fn written_file_column_stats(
         lower_bounds: (!lower_bounds.is_empty()).then_some(lower_bounds),
         upper_bounds: (!upper_bounds.is_empty()).then_some(upper_bounds),
     }))
-}
-
-pub(crate) fn partition_path_from_struct(
-    values: &Struct,
-    partition_spec: &PartitionSpecRef,
-) -> Result<(String, String), String> {
-    if values.fields().len() != partition_spec.fields().len() {
-        return Err(format!(
-            "partition value count {} does not match partition spec field count {}",
-            values.fields().len(),
-            partition_spec.fields().len()
-        ));
-    }
-    let mut path = String::new();
-    let mut null_fingerprint = String::with_capacity(values.fields().len());
-    for (value, field) in values.fields().iter().zip(partition_spec.fields().iter()) {
-        null_fingerprint.push(if value.is_none() { '1' } else { '0' });
-        path.push_str(&field.name);
-        path.push('=');
-        match value {
-            Some(value) => path.push_str(&partition_literal_to_path_value(value)?),
-            None => path.push_str("null"),
-        }
-        path.push('/');
-    }
-    Ok((path.trim_matches('/').to_string(), null_fingerprint))
-}
-
-fn partition_literal_to_path_value(value: &Literal) -> Result<String, String> {
-    let Literal::Primitive(value) = value else {
-        return Err("iceberg partition path only supports primitive literals".to_string());
-    };
-    Ok(match value {
-        PrimitiveLiteral::Boolean(value) => {
-            if *value {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }
-        }
-        PrimitiveLiteral::Int(value) => value.to_string(),
-        PrimitiveLiteral::Long(value) => value.to_string(),
-        PrimitiveLiteral::Float(value) => value.0.to_string(),
-        PrimitiveLiteral::Double(value) => value.0.to_string(),
-        PrimitiveLiteral::String(value) => url_encode_partition_value(value),
-        PrimitiveLiteral::Binary(value) => {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(value);
-            url_encode_partition_value(&encoded)
-        }
-        PrimitiveLiteral::Int128(value) => value.to_string(),
-        PrimitiveLiteral::UInt128(value) => value.to_string(),
-        PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => {
-            return Err("iceberg partition path cannot encode sentinel bounds".to_string());
-        }
-    })
-}
-
-fn url_encode_partition_value(input: &str) -> String {
-    url::form_urlencoded::byte_serialize(input.as_bytes()).collect()
 }
 
 /// Serialize an iceberg-rust `DataFile` into the thrift `TIcebergDataFile`
@@ -1317,8 +1263,8 @@ fn unique_file_suffix() -> String {
 mod tests {
     use iceberg::TableCreation;
     use iceberg::spec::{
-        DataContentType, FormatVersion, NestedField, PartitionSpec, Schema, Struct,
-        TableMetadataBuilder, Transform,
+        DataContentType, FormatVersion, Literal, NestedField, PartitionSpec, PrimitiveLiteral,
+        Schema, Struct, TableMetadataBuilder, Transform,
     };
 
     use super::*;
@@ -1986,7 +1932,7 @@ mod tests {
             String::new(),
             String::new(),
             "parquet".to_string(),
-            crate::thrift::types::TIcebergFileContent::DATA,
+            IcebergFileContent::Data,
         )
         .expect("commit info");
         let df = commit.iceberg_data_file.expect("iceberg data file");
@@ -2096,7 +2042,7 @@ mod tests {
             String::new(),
             String::new(),
             "parquet".to_string(),
-            crate::thrift::types::TIcebergFileContent::DATA,
+            IcebergFileContent::Data,
         )
         .map(|_| ())
         .expect_err("overflow should be rejected");
