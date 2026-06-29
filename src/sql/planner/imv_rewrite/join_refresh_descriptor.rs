@@ -108,6 +108,12 @@ impl Eq for JoinRefreshDescriptor {}
 
 impl JoinRefreshDescriptor {
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.left_base_fqn.trim().is_empty() {
+            return Err("join refresh descriptor requires left base FQN".to_string());
+        }
+        if self.right_base_fqn.trim().is_empty() {
+            return Err("join refresh descriptor requires right base FQN".to_string());
+        }
         if self
             .left_base_fqn
             .eq_ignore_ascii_case(&self.right_base_fqn)
@@ -508,6 +514,20 @@ mod tests {
         let mut desc = valid_descriptor();
         desc.right_base_fqn = "ICE.DB.LEFT_T".to_string();
         assert_invalid(desc, "requires distinct left and right bases");
+    }
+
+    #[test]
+    fn rejects_descriptor_without_left_base_fqn() {
+        let mut desc = valid_descriptor();
+        desc.left_base_fqn = "  ".to_string();
+        assert_invalid(desc, "requires left base");
+    }
+
+    #[test]
+    fn rejects_descriptor_without_right_base_fqn() {
+        let mut desc = valid_descriptor();
+        desc.right_base_fqn.clear();
+        assert_invalid(desc, "requires right base");
     }
 
     #[test]
