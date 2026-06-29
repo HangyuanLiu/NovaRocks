@@ -414,7 +414,7 @@ fn reconcile_chunk_field_to_field(expected: &Field, actual: &Field) -> Result<Ar
     if &data_type == expected.data_type() && nullable == expected.is_nullable() {
         Ok(Arc::new(expected.clone()))
     } else {
-        Ok(Arc::new(Field::new(expected.name(), data_type, nullable)))
+        Ok(Arc::new(rebuild_chunk_field(expected, data_type, nullable)))
     }
 }
 
@@ -428,8 +428,12 @@ fn reconcile_chunk_field_to_data_type(
     if &data_type == expected.data_type() && nullable == expected.is_nullable() {
         Ok(Arc::new(expected.clone()))
     } else {
-        Ok(Arc::new(Field::new(expected.name(), data_type, nullable)))
+        Ok(Arc::new(rebuild_chunk_field(expected, data_type, nullable)))
     }
+}
+
+fn rebuild_chunk_field(expected: &Field, data_type: DataType, nullable: bool) -> Field {
+    Field::new(expected.name(), data_type, nullable).with_metadata(expected.metadata().clone())
 }
 
 fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<DataType, String> {
@@ -677,7 +681,7 @@ mod tests {
     use crate::exec::chunk::Chunk;
     use crate::lower::type_lowering::scalar_type_desc;
     use crate::thrift::types::TPrimitiveType;
-    use crate::types::logical::{LogicalType, logical_type_of_field};
+    use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     #[test]
     fn strict_rejects_duplicate_slot_id() {
@@ -762,6 +766,55 @@ mod tests {
             assert_eq!(slot.data_type(), &expected_type);
             assert_eq!(logical_type_of_field(slot.field()), Some(expected_logical));
         }
+    }
+
+    #[test]
+    fn align_chunk_schema_preserves_logical_metadata_when_widening_nullable() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)])) as ArrayRef],
+        )
+        .expect("record batch");
+        let contract = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(9),
+                field_with_logical_type(
+                    Field::new("payload", DataType::Utf8, false),
+                    LogicalType::Json,
+                ),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+
+        let chunk = Chunk::try_new_with_chunk_schema(batch, contract).expect("chunk");
+        let slot = &chunk.chunk_schema().slots()[0];
+
+        assert!(slot.nullable());
+        assert_eq!(logical_type_of_field(slot.field()), Some(LogicalType::Json));
+    }
+
+    #[test]
+    fn reconcile_chunk_field_to_data_type_preserves_logical_metadata_when_widening_nullable() {
+        let expected = field_with_logical_type(
+            Field::new("payload", DataType::Binary, false),
+            LogicalType::Hll,
+        );
+
+        let reconciled =
+            super::reconcile_chunk_field_to_data_type(&expected, &DataType::Binary, true)
+                .expect("reconcile field");
+
+        assert!(reconciled.is_nullable());
+        assert_eq!(
+            logical_type_of_field(reconciled.as_ref()),
+            Some(LogicalType::Hll)
+        );
     }
 
     #[test]
