@@ -1636,6 +1636,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::ExprNode;
+    use crate::exec::operators::hashjoin::build_requirements::required_build_components;
     use crate::exec::operators::hashjoin::join_hash_map::build_store::BuildStore;
 
     const LEFT_K_SLOT_ID: SlotId = SlotId::new(1);
@@ -1690,6 +1691,7 @@ mod tests {
             crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind::DirectInt { .. }
         ));
         JoinBuildArtifact::new(
+            required_build_components(JoinType::Inner, false, true, true),
             Some(BuildStore::new(build)),
             Some(build_table),
             3,
@@ -1722,7 +1724,15 @@ mod tests {
             build_table.method_kind(),
             crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind::DirectIntSet { .. }
         ));
-        JoinBuildArtifact::new(None, Some(build_table), build_row_count, false, None, None)
+        JoinBuildArtifact::new(
+            required_build_components(JoinType::LeftSemi, false, true, true),
+            None,
+            Some(build_table),
+            build_row_count,
+            false,
+            None,
+            None,
+        )
     }
 
     #[test]
@@ -1958,6 +1968,7 @@ mod tests {
             .expect("add build rows");
         build_table.finalize().expect("finalize build table");
         let artifact = Arc::new(JoinBuildArtifact::new(
+            required_build_components(JoinType::RightSemi, true, true, true),
             Some(BuildStore::new(build_chunk.clone())),
             Some(build_table),
             1,
@@ -2019,6 +2030,7 @@ mod tests {
         let arena = Arc::new(arena);
 
         let artifact = Arc::new(JoinBuildArtifact::new(
+            required_build_components(JoinType::NullAwareLeftAnti, true, true, true),
             None,
             None,
             0,

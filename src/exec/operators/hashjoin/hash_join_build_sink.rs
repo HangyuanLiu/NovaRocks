@@ -32,6 +32,9 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef};
 
 use super::build_artifact::JoinBuildArtifact;
+use super::build_requirements::{
+    BuildComponentRequirements, LookupRequirement, RowPayloadRequirement, required_build_components,
+};
 use super::build_state::JoinBuildSinkState;
 use super::join_hash_map::build_store::BuildStoreBuilder;
 use super::join_hash_map::method::{
@@ -508,7 +511,13 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             .as_ref()
             .map(|t| t.method_kind().as_profile_str())
             .unwrap_or("None");
+        let provided = join_build_provided_components(
+            self.join_type,
+            self.has_residual_predicate,
+            !self.build_keys.is_empty(),
+        );
         let artifact = Arc::new(JoinBuildArtifact::new(
+            provided,
             build_store,
             table,
             self.build_row_count,
@@ -1294,6 +1303,24 @@ fn join_build_requires_row_storage(join_type: JoinType, has_residual_predicate: 
         == JoinHashMapBuildPurpose::RowMatches
 }
 
+fn join_build_provided_components(
+    join_type: JoinType,
+    has_residual_predicate: bool,
+    has_build_keys: bool,
+) -> BuildComponentRequirements {
+    let mut provided =
+        required_build_components(join_type, has_residual_predicate, true, has_build_keys);
+    if !has_build_keys {
+        provided.lookup = LookupRequirement::NotNeeded;
+    }
+    provided.row_payload = if join_build_requires_row_storage(join_type, has_residual_predicate) {
+        RowPayloadRequirement::Required
+    } else {
+        RowPayloadRequirement::NotNeeded
+    };
+    provided
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1306,6 +1333,9 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::{ExprNode, LiteralValue};
+    use crate::exec::operators::hashjoin::build_requirements::{
+        LookupRequirement, RowPayloadRequirement,
+    };
     use crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind;
     use crate::exec::pipeline::dependency::DependencyManager;
     use crate::runtime::profile::{OperatorProfiles, RuntimeProfile};
@@ -1717,5 +1747,29 @@ mod tests {
             join_hash_map_build_purpose(JoinType::RightSemi, false),
             JoinHashMapBuildPurpose::RowMatches
         );
+    }
+
+    #[test]
+    fn provided_components_for_no_equi_left_semi_without_residual_match_current_storage() {
+        let provided = join_build_provided_components(JoinType::LeftSemi, false, false);
+
+        assert_eq!(provided.lookup, LookupRequirement::NotNeeded);
+        assert_eq!(provided.row_payload, RowPayloadRequirement::NotNeeded);
+    }
+
+    #[test]
+    fn provided_components_for_keyed_left_semi_without_residual_are_membership_only() {
+        let provided = join_build_provided_components(JoinType::LeftSemi, false, true);
+
+        assert_eq!(provided.lookup, LookupRequirement::Membership);
+        assert_eq!(provided.row_payload, RowPayloadRequirement::NotNeeded);
+    }
+
+    #[test]
+    fn provided_components_for_keyed_residual_left_semi_include_row_matches_and_payload() {
+        let provided = join_build_provided_components(JoinType::LeftSemi, true, true);
+
+        assert_eq!(provided.lookup, LookupRequirement::RowMatches);
+        assert_eq!(provided.row_payload, RowPayloadRequirement::Required);
     }
 }
