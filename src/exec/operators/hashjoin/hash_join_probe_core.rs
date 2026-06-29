@@ -1653,7 +1653,7 @@ pub(crate) fn join_type_str(join_type: JoinType) -> &'static str {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Decimal128Array, Int32Array};
+    use arrow::array::{Array, ArrayRef, Decimal128Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
 
@@ -1680,6 +1680,16 @@ mod tests {
         let mut fields = left
             .fields()
             .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        fields.extend(right.fields().iter().map(|field| field.as_ref().clone()));
+        Arc::new(Schema::new(fields))
+    }
+
+    fn outer_join_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
+        let mut fields = left
+            .fields()
+            .iter()
             .map(|field| field.as_ref().clone().with_nullable(true))
             .collect::<Vec<_>>();
         fields.extend(
@@ -1703,6 +1713,25 @@ mod tests {
         let batch =
             RecordBatch::try_new(Arc::clone(&schema), vec![k_arr, v_arr]).expect("record batch");
         Chunk::new_with_chunk_schema(batch, chunk_schema_of(&schema, slot_ids))
+    }
+
+    fn int32_values(chunk: &Chunk, column: usize) -> Vec<Option<i32>> {
+        let array = chunk
+            .columns()
+            .get(column)
+            .expect("column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 column");
+        (0..chunk.len())
+            .map(|row| {
+                if array.is_null(row) {
+                    None
+                } else {
+                    Some(array.value(row))
+                }
+            })
+            .collect()
     }
 
     fn direct_build_artifact_from_build_chunk(build: Chunk) -> JoinBuildArtifact {
@@ -1995,7 +2024,7 @@ mod tests {
     fn full_outer_search_pairs_marks_build_and_probe_unmatched() {
         let left_schema = schema_kv("lk", "lv");
         let right_schema = schema_kv("rk", "rw");
-        let join_scope_schema = join_schema(&left_schema, &right_schema);
+        let join_scope_schema = outer_join_schema(&left_schema, &right_schema);
 
         let mut arena = ExprArena::default();
         let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
@@ -2048,8 +2077,25 @@ mod tests {
             .expect("finish")
             .expect("full outer final output");
         assert_eq!(finish_out.len(), 4);
+        assert_eq!(
+            int32_values(&finish_out, 0),
+            vec![Some(100), Some(102), None, None]
+        );
+        assert_eq!(
+            int32_values(&finish_out, 1),
+            vec![Some(1), Some(2), None, None]
+        );
+        assert_eq!(
+            int32_values(&finish_out, 2),
+            vec![Some(100), None, Some(101), Some(103)]
+        );
+        assert_eq!(
+            int32_values(&finish_out, 3),
+            vec![Some(10), None, Some(11), Some(13)]
+        );
         assert_eq!(core.lookup_hit_rows(), 1);
         assert_eq!(core.lookup_miss_rows(), 1);
+        assert_eq!(core.output_rows(), 4);
     }
 
     #[test]
