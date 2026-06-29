@@ -1392,7 +1392,8 @@ fn scan_supports_decode_hint(table: &TableDef, required_columns: &[String]) -> b
         ScanSource::IcebergMetadataTable { .. } => false,
         ScanSource::IcebergDeltaTable { .. }
         | ScanSource::IcebergVersionTable { .. }
-        | ScanSource::IcebergMvTargetState { .. } => false,
+        | ScanSource::IcebergMvTargetState { .. }
+        | ScanSource::IcebergMvTargetLocator { .. } => false,
     }
 }
 
@@ -1402,7 +1403,8 @@ fn scan_supports_min_max_stats(table: &TableDef, required_columns: &[String]) ->
         ScanSource::IcebergMetadataTable { .. } => return false,
         ScanSource::IcebergDeltaTable { .. }
         | ScanSource::IcebergVersionTable { .. }
-        | ScanSource::IcebergMvTargetState { .. } => return false,
+        | ScanSource::IcebergMvTargetState { .. }
+        | ScanSource::IcebergMvTargetLocator { .. } => return false,
     }
     required_columns.iter().all(|required| {
         table

@@ -821,6 +821,19 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
                         Some(projected_target_state_column_names(scan)),
                     )?
                 }
+                ScanSource::IcebergMvTargetLocator(scan) => {
+                    let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
+                        "Iceberg target-locator scan requires MV refresh context".to_string()
+                    })?;
+                    let source = refresh_ctx.target_locator_scan_source(scan)?;
+                    reject_target_state_equality_deletes(&source)?;
+                    build_iceberg_scan_ranges_from_source(
+                        connectors,
+                        planned,
+                        &source,
+                        Some(projected_target_locator_column_names(scan)),
+                    )?
+                }
                 ScanSource::StarRocks { .. } => unreachable!(
                     "StarRocks scan source is handled by the planned-connector branch above"
                 ),
@@ -941,6 +954,31 @@ pub(crate) fn projected_target_state_column_names(
             .any(|name| name.eq_ignore_ascii_case(&scope.branch_id_column_name))
     {
         names.push(scope.branch_id_column_name.clone());
+    }
+    for name in [
+        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+    ] {
+        if !names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(name))
+        {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+pub(crate) fn projected_target_locator_column_names(
+    scan: &crate::sql::catalog::IcebergMvTargetLocatorScan,
+) -> Vec<String> {
+    let mut names = vec![scan.apply_key_column.clone()];
+    if let Some(branch_id_column) = &scan.branch_id_column
+        && !names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(branch_id_column))
+    {
+        names.push(branch_id_column.clone());
     }
     for name in [
         crate::exec::row_position::ICEBERG_FILE_PATH_COL,

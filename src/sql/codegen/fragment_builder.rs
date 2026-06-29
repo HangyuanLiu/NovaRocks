@@ -160,12 +160,14 @@ fn validate_aggregate_state_merge_child_output(
                 && actual.data_type == expected.data_type
                 && actual.nullable == expected.nullable
         });
-    let trailing_matches = actual.len() == expected.len()
-        || (allow_locator_metadata
-            && aggregate_state_merge_locator_metadata_matches(&actual[expected.len()..]));
+    let trailing_matches = if allow_locator_metadata {
+        aggregate_state_merge_locator_metadata_matches(&actual[expected.len()..])
+    } else {
+        actual.len() == expected.len()
+    };
     if !prefix_matches || !trailing_matches {
         let expected_label = if allow_locator_metadata {
-            "physical aggregate columns with optional trailing _file/_pos"
+            "physical aggregate columns with trailing _file/_pos"
         } else {
             "physical aggregate columns"
         };
@@ -187,9 +189,6 @@ fn validate_aggregate_state_merge_child_output(
 }
 
 fn aggregate_state_merge_locator_metadata_matches(trailing: &[OutputColumn]) -> bool {
-    if trailing.is_empty() {
-        return true;
-    }
     if trailing.len() != 2 {
         return false;
     }
@@ -302,7 +301,8 @@ pub(in crate::sql::codegen) fn iceberg_table_info(
         | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. }
         | crate::sql::catalog::ScanSource::IcebergVersionTable { table, .. } => Some(table),
         crate::sql::catalog::ScanSource::StarRocks { .. }
-        | crate::sql::catalog::ScanSource::IcebergMvTargetState { .. } => None,
+        | crate::sql::catalog::ScanSource::IcebergMvTargetState { .. }
+        | crate::sql::catalog::ScanSource::IcebergMvTargetLocator { .. } => None,
     }
 }
 
@@ -384,7 +384,8 @@ pub(in crate::sql::codegen) fn iceberg_scan_table_handle_for_codegen(
             ..
         }
         | crate::sql::catalog::ScanSource::IcebergVersionTable { .. }
-        | crate::sql::catalog::ScanSource::IcebergMvTargetState(_) => {
+        | crate::sql::catalog::ScanSource::IcebergMvTargetState(_)
+        | crate::sql::catalog::ScanSource::IcebergMvTargetLocator(_) => {
             crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
                 &iceberg_table.catalog,
                 &iceberg_table.namespace,
@@ -1819,6 +1820,23 @@ mod tests {
         ]
     }
 
+    fn aggregate_sum_only_physical_columns_with_locator_metadata_for_test() -> Vec<OutputColumn> {
+        let mut columns = aggregate_sum_only_physical_columns_for_test();
+        columns.push(output_col_for_test(
+            15,
+            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            DataType::Utf8,
+            false,
+        ));
+        columns.push(output_col_for_test(
+            16,
+            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            DataType::Int64,
+            false,
+        ));
+        columns
+    }
+
     fn aggregate_sum_only_delta_state_columns_for_test() -> Vec<OutputColumn> {
         vec![
             output_col_for_test(21, "region", DataType::Utf8, true),
@@ -1949,7 +1967,7 @@ mod tests {
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
         let plan = aggregate_merge_plan_for_test(
-            values_plan_for_test(aggregate_physical_columns_for_test()),
+            values_plan_for_test(aggregate_physical_columns_with_locator_metadata_for_test()),
             values_plan_for_test(aggregate_delta_state_columns_for_test()),
             state_names,
         );
@@ -1994,6 +2012,40 @@ mod tests {
             delta_input.direct_exec.as_deref(),
             Some(DirectExecPlan::AggregateStatePhysicalize { .. })
         ));
+    }
+
+    #[test]
+    fn aggregate_state_merge_direct_codegen_rejects_old_input_without_locator_metadata() {
+        let shape = aggregate_merge_shape_for_test();
+        let layout = aggregate_merge_layout_for_test(&shape);
+        let state_names = layout
+            .state_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let plan = aggregate_merge_plan_for_test(
+            values_plan_for_test(aggregate_physical_columns_for_test()),
+            values_plan_for_test(aggregate_delta_state_columns_for_test()),
+            state_names,
+        );
+
+        let err = match PlanFragmentBuilder::build_aggregate_state_merge_direct_with_layout_via_ir(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::default(),
+            "db",
+            None,
+            layout,
+            None,
+        ) {
+            Ok(_) => panic!("aggregate merge unexpectedly accepted missing locator metadata"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("physical aggregate columns with trailing _file/_pos"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2077,7 +2129,7 @@ mod tests {
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
         let plan = aggregate_merge_plan_for_test(
-            values_plan_for_test(aggregate_physical_columns_for_test()),
+            values_plan_for_test(aggregate_physical_columns_with_locator_metadata_for_test()),
             values_plan_for_test(aggregate_delta_state_columns_for_test()),
             state_names,
         );
@@ -2123,7 +2175,7 @@ mod tests {
         let mut scalars = ScalarArena::new();
         let branch0 = branch_union_project_for_test(
             aggregate_merge_plan_for_test(
-                values_plan_for_test(aggregate_physical_columns_for_test()),
+                values_plan_for_test(aggregate_physical_columns_with_locator_metadata_for_test()),
                 values_plan_for_test(aggregate_delta_state_columns_for_test()),
                 state_names.clone(),
             ),
@@ -2133,7 +2185,7 @@ mod tests {
         );
         let branch1 = branch_union_project_for_test(
             aggregate_merge_plan_for_test(
-                values_plan_for_test(aggregate_physical_columns_for_test()),
+                values_plan_for_test(aggregate_physical_columns_with_locator_metadata_for_test()),
                 values_plan_for_test(aggregate_delta_state_columns_for_test()),
                 state_names,
             ),
@@ -2200,7 +2252,9 @@ mod tests {
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
         let plan = aggregate_sum_only_merge_plan_for_test(
-            values_plan_for_test(aggregate_sum_only_physical_columns_for_test()),
+            values_plan_for_test(
+                aggregate_sum_only_physical_columns_with_locator_metadata_for_test(),
+            ),
             values_plan_for_test(aggregate_sum_only_delta_state_columns_for_test()),
             state_names,
         );

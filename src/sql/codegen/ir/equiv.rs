@@ -636,7 +636,7 @@ mod tests {
         let state_names = aggregate_state_names_for_context(&ctx);
         let branch0 = branch_union_project_for_test(
             aggregate_merge_plan_for_test(
-                values_plan_for_columns(aggregate_physical_columns_for_test()),
+                values_plan_for_columns(aggregate_physical_columns_with_locator_metadata_for_test()),
                 values_plan_for_columns(aggregate_delta_state_columns_for_test()),
                 state_names.clone(),
             ),
@@ -652,7 +652,7 @@ mod tests {
             .clone();
         let branch1 = branch_union_project_for_test(
             aggregate_merge_plan_for_test(
-                values_plan_for_columns(aggregate_physical_columns_for_test()),
+                values_plan_for_columns(aggregate_physical_columns_with_locator_metadata_for_test()),
                 values_plan_for_columns(aggregate_delta_state_columns_for_test()),
                 state_names,
             ),
@@ -1460,7 +1460,7 @@ mod tests {
         ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
     ) -> PhysicalPlanNode {
         aggregate_merge_plan_for_test(
-            values_plan_for_columns(aggregate_physical_columns_for_test()),
+            values_plan_for_columns(aggregate_physical_columns_with_locator_metadata_for_test()),
             values_plan_for_columns(aggregate_delta_state_columns_for_test()),
             aggregate_state_names_for_context(ctx),
         )
@@ -1756,6 +1756,23 @@ mod tests {
             output_col(14, "__agg_state_c", DataType::Binary, false),
             output_col(15, "__agg_state_s", DataType::Binary, false),
         ]
+    }
+
+    fn aggregate_physical_columns_with_locator_metadata_for_test() -> Vec<OutputColumn> {
+        let mut columns = aggregate_physical_columns_for_test();
+        columns.push(output_col(
+            16,
+            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            DataType::Utf8,
+            false,
+        ));
+        columns.push(output_col(
+            17,
+            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            DataType::Int64,
+            false,
+        ));
+        columns
     }
 
     fn aggregate_delta_state_columns_for_test() -> Vec<OutputColumn> {

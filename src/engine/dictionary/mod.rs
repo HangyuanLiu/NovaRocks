@@ -328,11 +328,12 @@ impl DictionaryQueryProvider {
                 }))
             }
             // Metadata tables, IVM delta scans, IMV pinned-version placeholders,
-            // and IMV target-state scans never participate in dictionary rewriting.
+            // and IMV refresh target scans never participate in dictionary rewriting.
             ScanSource::IcebergMetadataTable { .. }
             | ScanSource::IcebergDeltaTable { .. }
             | ScanSource::IcebergVersionTable { .. }
-            | ScanSource::IcebergMvTargetState { .. } => Ok(None),
+            | ScanSource::IcebergMvTargetState { .. }
+            | ScanSource::IcebergMvTargetLocator { .. } => Ok(None),
         }
     }
 }

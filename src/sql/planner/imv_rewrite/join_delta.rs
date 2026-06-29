@@ -11,6 +11,7 @@ use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal}
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::marker::ImvVersionRef;
+use crate::sql::planner::imv_rewrite::target_locator::is_target_locator_join;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{
     LogicalImvDeltaNode, LogicalImvVersionNode, LogicalJoinNode, LogicalPlanNode,
@@ -370,10 +371,10 @@ fn plan_contains_unsupported_join(plan: &LogicalPlanNode) -> bool {
     }
     match &plan.kind {
         PlanNodeKind::Join(join) => {
-            if is_aggregate_change_stream_merge_join(plan) {
-                return false;
-            }
-            if !join_delta_kind_supported(join.join_type) {
+            if !is_aggregate_change_stream_merge_join(plan)
+                && !is_target_locator_join(plan)
+                && !join_delta_kind_supported(join.join_type)
+            {
                 return true;
             }
             plan.children.iter().any(plan_contains_unsupported_join)

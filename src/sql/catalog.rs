@@ -158,6 +158,20 @@ pub(crate) struct IcebergMvTargetStateScan {
     pub(crate) partition_constraint: IcebergMvTargetStatePartitionConstraint,
 }
 
+/// Metadata for an IMV target-locator scan source. It is a refresh-only
+/// placeholder that reads the MV target at the refresh-before snapshot and
+/// projects the physical apply-key columns plus Iceberg `_file` / `_pos`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IcebergMvTargetLocatorScan {
+    pub(crate) catalog: String,
+    pub(crate) database: String,
+    pub(crate) table: String,
+    pub(crate) target_table_uuid: String,
+    pub(crate) target_snapshot_id: Option<i64>,
+    pub(crate) apply_key_column: String,
+    pub(crate) branch_id_column: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BranchScope {
     pub(crate) branch_id_column_name: String,
@@ -215,6 +229,12 @@ impl IcebergMvTargetStateScan {
             row_filter,
             partition
         )
+    }
+}
+
+impl IcebergMvTargetLocatorScan {
+    pub(crate) fn fqn(&self) -> String {
+        format!("{}.{}.{}", self.catalog, self.database, self.table)
     }
 }
 
@@ -356,6 +376,11 @@ pub enum ScanSource {
     /// or runtime behavior in this task. Future tasks will implement the
     /// optimizer rewrite and execution path.
     IcebergMvTargetState(IcebergMvTargetStateScan),
+    /// IMV target locator placeholder. Produced by the IMV rewrite pipeline
+    /// after the change stream carries its logical apply key. Codegen resolves
+    /// it through `IcebergMvRefreshContext` into an explicit target snapshot
+    /// scan that emits physical apply key, `_file`, and `_pos`.
+    IcebergMvTargetLocator(IcebergMvTargetLocatorScan),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
