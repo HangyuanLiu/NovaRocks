@@ -167,6 +167,10 @@ impl FieldRenderSchema {
     fn map_value(&self) -> Option<&FieldRenderSchema> {
         self.children.get(1)
     }
+
+    pub(crate) fn renders_opaque_binary(&self) -> bool {
+        self.primitive.is_some_and(is_opaque_binary_primitive)
+    }
 }
 
 fn format_date32_for_mysql(days: i32) -> String {
@@ -202,10 +206,6 @@ fn effective_primitive_type(
             .and_then(|schema| schema.primitive)
             .unwrap_or(types::TPrimitiveType::INVALID_TYPE)
     }
-}
-
-fn renders_json_value(json_flag: bool, field_schema: Option<&FieldRenderSchema>) -> bool {
-    json_flag || field_schema.is_some_and(|schema| schema.json_value)
 }
 
 fn render_schema_for_field<'a>(
@@ -459,7 +459,6 @@ pub(crate) fn http_json_row_from_arrays_with_primitives(
     columns: &[ArrayRef],
     row: usize,
     primitive_types: Option<&[types::TPrimitiveType]>,
-    json_semantics: Option<&[bool]>,
     field_schemas: Option<&[FieldRenderSchema]>,
 ) -> Result<Vec<u8>, String> {
     let mut out = String::from("{\"data\":[");
@@ -475,18 +474,7 @@ pub(crate) fn http_json_row_from_arrays_with_primitives(
                 .unwrap_or(types::TPrimitiveType::INVALID_TYPE),
             field_schema,
         );
-        let json_semantic = json_semantics
-            .and_then(|flags| flags.get(idx))
-            .copied()
-            .unwrap_or(false);
-        append_http_json_value_with_schema(
-            &mut out,
-            col,
-            row,
-            primitive,
-            json_semantic,
-            field_schema,
-        )?;
+        append_http_json_value_with_schema(&mut out, col, row, primitive, field_schema)?;
     }
     out.push_str("]}\n");
     Ok(out.into_bytes())
@@ -504,7 +492,6 @@ fn append_http_json_value_with_schema(
     col: &ArrayRef,
     row: usize,
     primitive: types::TPrimitiveType,
-    json_semantic: bool,
     field_schema: Option<&FieldRenderSchema>,
 ) -> Result<(), String> {
     if col.is_null(row) {
@@ -513,7 +500,7 @@ fn append_http_json_value_with_schema(
     }
 
     let primitive = effective_primitive_type(primitive, field_schema);
-    let json_semantic = renders_json_value(json_semantic, field_schema);
+    let json_semantic = field_schema.is_some_and(|schema| schema.json_value);
 
     match col.data_type() {
         DataType::Null => out.push_str("null"),
@@ -735,7 +722,6 @@ fn append_http_json_value_with_schema(
                     values,
                     idx,
                     types::TPrimitiveType::INVALID_TYPE,
-                    false,
                     Some(item_schema.as_ref()),
                 )?;
             }
@@ -764,7 +750,6 @@ fn append_http_json_value_with_schema(
                     values,
                     idx,
                     types::TPrimitiveType::INVALID_TYPE,
-                    false,
                     Some(item_schema.as_ref()),
                 )?;
             }
@@ -806,7 +791,6 @@ fn append_http_json_value_with_schema(
                     values,
                     entry_idx,
                     types::TPrimitiveType::INVALID_TYPE,
-                    false,
                     Some(value_schema.as_ref()),
                 )?;
             }
@@ -834,7 +818,6 @@ fn append_http_json_value_with_schema(
                     arr.column(idx),
                     row,
                     types::TPrimitiveType::INVALID_TYPE,
-                    false,
                     Some(child_schema.as_ref()),
                 )?;
             }
@@ -1008,7 +991,6 @@ fn http_json_object_key_with_schema(
                 keys,
                 row,
                 types::TPrimitiveType::INVALID_TYPE,
-                false,
                 field_schema,
             )?;
             Ok(rendered.trim_matches('"').to_string())
@@ -1826,7 +1808,6 @@ mod tests {
             0,
             Some(&[types::TPrimitiveType::INT]),
             None,
-            None,
         )
         .expect("http json row");
         assert_eq!(String::from_utf8(row).unwrap(), "{\"data\":[1]}\n");
@@ -1839,7 +1820,6 @@ mod tests {
             &columns,
             0,
             Some(&[types::TPrimitiveType::JSON]),
-            None,
             None,
         )
         .expect("http json row");
@@ -1857,7 +1837,7 @@ mod tests {
             vec![Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)])) as ArrayRef],
             None,
         )) as ArrayRef];
-        let row = http_json_row_from_arrays_with_primitives(&columns, 0, None, None, None)
+        let row = http_json_row_from_arrays_with_primitives(&columns, 0, None, None)
             .expect("http json row");
         assert_eq!(
             String::from_utf8(row).unwrap(),

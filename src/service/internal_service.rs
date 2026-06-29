@@ -944,7 +944,6 @@ pub(crate) fn build_fetch_result_batch_for_chunk(
                     &columns,
                     row,
                     Some(&primitives),
-                    None,
                     Some(&field_schemas),
                 )?);
             }
@@ -957,7 +956,6 @@ pub(crate) fn build_fetch_result_batch_for_chunk(
                     columns,
                     row,
                     Some(&primitives),
-                    None,
                     Some(&field_schemas),
                 )?);
             }

@@ -16,6 +16,7 @@
 // under the License.
 use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::thrift::types;
+use crate::types::logical::{LogicalType, field_with_logical_type};
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use std::sync::Arc;
 
@@ -125,6 +126,16 @@ pub(crate) fn arrow_type_from_desc(desc: &types::TTypeDesc) -> Option<DataType> 
     let types = desc.types.as_ref()?;
     let mut cursor = 0usize;
     arrow_type_from_nodes(types, &mut cursor)
+}
+
+pub(crate) fn arrow_field_from_desc(
+    name: &str,
+    nullable: bool,
+    desc: &types::TTypeDesc,
+) -> Option<Field> {
+    let types = desc.types.as_ref()?;
+    let mut cursor = 0usize;
+    arrow_field_from_nodes_with_name(types, &mut cursor, name, nullable)
 }
 
 /// Convert TTypeNode array to Arrow DataType.
@@ -247,8 +258,26 @@ fn arrow_field_from_nodes_with_name(
     name: &str,
     nullable: bool,
 ) -> Option<Field> {
+    let node_start = *cursor;
     let data_type = arrow_type_from_nodes(types, cursor)?;
-    Some(Field::new(name, data_type, nullable))
+    let field = Field::new(name, data_type, nullable);
+    Some(match logical_type_from_node(types.get(node_start)?) {
+        Some(logical_type) => field_with_logical_type(field, logical_type),
+        None => field,
+    })
+}
+
+fn logical_type_from_node(node: &types::TTypeNode) -> Option<LogicalType> {
+    if node.type_ != types::TTypeNodeType::SCALAR {
+        return None;
+    }
+    match node.scalar_type.as_ref()?.type_ {
+        t if t == types::TPrimitiveType::JSON => Some(LogicalType::Json),
+        t if t == types::TPrimitiveType::HLL => Some(LogicalType::Hll),
+        t if t == types::TPrimitiveType::OBJECT => Some(LogicalType::Object),
+        t if t == types::TPrimitiveType::PERCENTILE => Some(LogicalType::Percentile),
+        _ => None,
+    }
 }
 
 // Keeping `decimal_params_from_desc` for potential future use when we need

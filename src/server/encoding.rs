@@ -231,6 +231,10 @@ pub(super) fn array_value_to_mysql_value(
         return timestamp_to_time_mysql_value(column, timestamp_unit(column.data_type())?, row_idx);
     }
 
+    if field_schema.is_some_and(FieldRenderSchema::renders_opaque_binary) {
+        return Ok(StandaloneMysqlValue::Null);
+    }
+
     let name_lower = declared.name.to_lowercase();
     if matches!(column.data_type(), DataType::Binary | DataType::LargeBinary)
         && (name_lower.starts_with("bitmap_agg(")
@@ -538,7 +542,7 @@ pub(super) fn invalid_data_error(err: String) -> io::Error {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{ListBuilder, StringBuilder, TimestampMicrosecondArray};
+    use arrow::array::{BinaryArray, ListBuilder, StringBuilder, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
@@ -629,5 +633,41 @@ mod tests {
                 br#"['{"2:3": null}']"#.to_vec()
             )]
         );
+    }
+
+    #[test]
+    fn build_mysql_row_uses_arrow_field_metadata_for_opaque_binary() {
+        let payload_field = field_with_logical_type(
+            Field::new("payload", DataType::Binary, true),
+            LogicalType::Hll,
+        );
+        let array = Arc::new(BinaryArray::from(vec![Some(b"opaque".as_slice())])) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![payload_field.clone()])),
+            vec![Arc::clone(&array)],
+        )
+        .expect("batch");
+        let chunk = Chunk::new_with_chunk_schema(
+            batch,
+            Arc::new(
+                ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                    SlotId::new(1),
+                    payload_field,
+                    None,
+                    None,
+                )])
+                .expect("chunk schema"),
+            ),
+        );
+        let columns = vec![QueryResultColumn {
+            name: "payload".to_string(),
+            data_type: array.data_type().clone(),
+            nullable: true,
+            logical_type: None,
+        }];
+
+        let row = build_mysql_row(&chunk, &columns, 0).expect("mysql row");
+
+        assert_eq!(row, vec![StandaloneMysqlValue::Null]);
     }
 }

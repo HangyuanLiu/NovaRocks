@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check};
-use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_desc};
+use crate::lower::type_lowering::{arrow_field_from_desc, primitive_type_from_desc};
 use crate::thrift::types;
 use crate::types::logical::{LogicalType, logical_type_of_field};
 use arrow::array::ArrayRef;
@@ -296,19 +296,15 @@ impl ChunkSlotSchema {
         type_desc: types::TTypeDesc,
         unique_id: Option<i32>,
     ) -> Result<Self, String> {
+        let name = name.into();
         let field_schema = ChunkFieldSchema::try_from_type_desc("", false, type_desc.clone())?;
-        let data_type = arrow_type_from_desc(&type_desc).ok_or_else(|| {
+        let field = arrow_field_from_desc(&name, nullable, &type_desc).ok_or_else(|| {
             format!(
                 "chunk slot {} has unsupported type desc for arrow conversion",
                 slot_id
             )
         })?;
-        Self::try_new_with_field(
-            slot_id,
-            Field::new(name, data_type, nullable),
-            Some(field_schema),
-            unique_id,
-        )
+        Self::try_new_with_field(slot_id, field, Some(field_schema), unique_id)
     }
 
     pub fn from_field(
@@ -681,6 +677,7 @@ mod tests {
     use crate::exec::chunk::Chunk;
     use crate::lower::type_lowering::scalar_type_desc;
     use crate::thrift::types::TPrimitiveType;
+    use crate::types::logical::{LogicalType, logical_type_of_field};
 
     #[test]
     fn strict_rejects_duplicate_slot_id() {
@@ -733,6 +730,38 @@ mod tests {
         assert_eq!(slot.primitive_type(), Some(TPrimitiveType::HLL));
         assert_eq!(slot.name(), "a");
         assert_eq!(slot.unique_id(), Some(77));
+    }
+
+    #[test]
+    fn try_from_type_desc_tags_logical_field_metadata() {
+        let cases = [
+            (TPrimitiveType::JSON, DataType::Utf8, LogicalType::Json),
+            (TPrimitiveType::HLL, DataType::Binary, LogicalType::Hll),
+            (
+                TPrimitiveType::OBJECT,
+                DataType::Binary,
+                LogicalType::Object,
+            ),
+            (
+                TPrimitiveType::PERCENTILE,
+                DataType::Binary,
+                LogicalType::Percentile,
+            ),
+        ];
+
+        for (primitive, expected_type, expected_logical) in cases {
+            let slot = ChunkSlotSchema::try_from_type_desc(
+                SlotId::new(9),
+                "payload",
+                true,
+                scalar_type_desc(primitive),
+                None,
+            )
+            .expect("slot from type desc");
+
+            assert_eq!(slot.data_type(), &expected_type);
+            assert_eq!(logical_type_of_field(slot.field()), Some(expected_logical));
+        }
     }
 
     #[test]
