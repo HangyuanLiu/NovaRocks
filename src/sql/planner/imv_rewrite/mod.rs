@@ -111,6 +111,7 @@ pub(crate) mod delta_pushdown;
 pub(crate) mod entrypoint;
 pub(crate) mod join_delta;
 pub(crate) mod join_delta_shape;
+pub(crate) mod join_refresh_builder;
 pub(crate) mod join_refresh_descriptor;
 pub(crate) mod marker;
 pub(crate) mod partition_derivation;
