@@ -64,6 +64,41 @@ where
     Ok(converted)
 }
 
+/// Mutable-context variant of [`bridge_apply_result`] for IMV rules that need
+/// to update [`RewriteContext`] extensions while still using
+/// `LogicalPlanNode` helpers.
+pub(crate) fn bridge_apply_result_mut<F>(
+    expr: crate::sql::optimizer::opt_expr::OptExpr,
+    ctx: &mut crate::sql::optimizer::rewrite::context::RewriteContext,
+    f: F,
+) -> Result<crate::sql::optimizer::rewrite::result::RewriteResult, String>
+where
+    F: FnOnce(
+        crate::sql::planner::plan::LogicalPlanNode,
+        &mut crate::sql::optimizer::rewrite::context::RewriteContext,
+    ) -> Result<PlanRewriteResult, String>,
+{
+    let plan = opt_expr_to_plan(expr, ctx);
+    let result = f(plan, ctx)?;
+    let arena = ctx.scalar_arena();
+    let converted = match result {
+        PlanRewriteResult::Changed(plan_out) => {
+            let opt_out = crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr(
+                &plan_out,
+                &mut arena.borrow_mut(),
+            );
+            crate::sql::optimizer::rewrite::result::RewriteResult::Changed(opt_out)
+        }
+        PlanRewriteResult::Unchanged => {
+            crate::sql::optimizer::rewrite::result::RewriteResult::Unchanged
+        }
+        PlanRewriteResult::Rejected(diag) => {
+            crate::sql::optimizer::rewrite::result::RewriteResult::Rejected(diag)
+        }
+    };
+    Ok(converted)
+}
+
 pub(crate) mod action_column;
 pub(crate) mod action_propagation;
 pub(crate) mod aggregate_rewrite;

@@ -94,7 +94,8 @@ mod tests {
     };
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource,
+        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, JoinContract,
+        JoinContractKind, JoinPredicateLineage, QualifiedFieldLineage,
     };
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
@@ -113,7 +114,11 @@ mod tests {
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::imv_rewrite::annotation::ImvPartitionAnnotation;
     use crate::sql::planner::imv_rewrite::change_stream::AggregateChangeStreamShape;
+    use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
+        JoinRefreshBranchSide, JoinRefreshMode, JoinRefreshOutputSource,
+    };
     use crate::sql::planner::imv_rewrite::marker::{ImvVersionRef, plan_contains_imv_marker};
+    use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,
@@ -564,6 +569,29 @@ mod tests {
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
         contract.target.hidden_apply_key.target_field_id = 999;
         contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
+        contract.bases = vec![
+            join_base_contract("ice.db.l", "uuid-l", "l"),
+            join_base_contract("ice.db.r", "uuid-r", "r"),
+        ];
+        contract.output.columns[0]
+            .expression
+            .referenced_base_field_ids
+            .clear();
+        contract.output.columns[0].expression.referenced_base_fields =
+            vec![qualified_field("ice.db.l", "l", 1)];
+        contract.output.columns[1]
+            .expression
+            .referenced_base_field_ids
+            .clear();
+        contract.output.columns[1].expression.referenced_base_fields =
+            vec![qualified_field("ice.db.r", "r", 2)];
+        contract.join = Some(JoinContract {
+            kind: JoinContractKind::InnerEquiJoin,
+            predicates: vec![JoinPredicateLineage {
+                left: qualified_field("ice.db.l", "l", 1),
+                right: qualified_field("ice.db.r", "r", 1),
+            }],
+        });
         contract.aggregate = Some(AggregateStateContract {
             state_layout_version: 1,
             row_id_column_name: "__row_id__".to_string(),
@@ -642,6 +670,39 @@ mod tests {
         )
     }
 
+    fn join_base_contract(table_fqn: &str, table_uuid: &str, alias: &str) -> BaseContract {
+        BaseContract {
+            table_fqn: table_fqn.to_string(),
+            table_uuid: table_uuid.to_string(),
+            alias_at_create: Some(alias.to_string()),
+            schema_id_at_create: 7,
+            schema_at_create: BaseSchemaSnapshot {
+                fields: vec![
+                    BaseFieldRecord {
+                        field_id: 1,
+                        name_at_create: "k".to_string(),
+                        type_signature: "long".to_string(),
+                        required: true,
+                    },
+                    BaseFieldRecord {
+                        field_id: 2,
+                        name_at_create: "v".to_string(),
+                        type_signature: "long".to_string(),
+                        required: false,
+                    },
+                ],
+            },
+        }
+    }
+
+    fn qualified_field(table_fqn: &str, qualifier: &str, field_id: i32) -> QualifiedFieldLineage {
+        QualifiedFieldLineage {
+            table_fqn: table_fqn.to_string(),
+            qualifier_at_create: qualifier.to_string(),
+            field_id,
+        }
+    }
+
     fn join_base_scan(table: &str, first_id: u32, current_snapshot_id: i64) -> LogicalPlanNode {
         let columns = vec![
             ColumnDef {
@@ -700,6 +761,7 @@ mod tests {
                         nullable: true,
                         is_internal: false,
                     },
+                    ImvRowIdColumn::output_column(ColumnId(first_id + 2)),
                 ],
                 predicates: Vec::new(),
                 required_columns: None,
@@ -725,6 +787,11 @@ mod tests {
                         expr: column_expr(first_id + 1, "v", true),
                         output_name: "v".to_string(),
                         output_column_id: ColumnId(first_id + 1),
+                    },
+                    ProjectItem {
+                        expr: column_expr(first_id + 2, ImvRowIdColumn::NAME, false),
+                        output_name: ImvRowIdColumn::NAME.to_string(),
+                        output_column_id: ColumnId(first_id + 2),
                     },
                 ],
                 output_qualifier: None,
@@ -1747,6 +1814,57 @@ mod tests {
             panic!("expected join delta UnionAll under signed aggregate");
         };
         assert_join_delta_union_shape(union_plan, signed_action_id);
+
+        let descriptor = outcome
+            .annotation
+            .change_stream
+            .join_refresh
+            .as_ref()
+            .expect("join delta rewrite must record join refresh descriptor");
+        assert_eq!(descriptor.mode, JoinRefreshMode::Coalesce);
+        assert_eq!(descriptor.mv_identity.catalog, "tgt");
+        assert_eq!(descriptor.mv_identity.database, "db");
+        assert_eq!(descriptor.mv_identity.name, "mv");
+        assert_eq!(descriptor.left_base_fqn, "ice.db.l");
+        assert_eq!(descriptor.right_base_fqn, "ice.db.r");
+        assert_eq!(descriptor.join_key_pairs.len(), 1);
+        assert_eq!(descriptor.join_key_pairs[0].left_column.name, "k");
+        assert_eq!(descriptor.join_key_pairs[0].right_column.name, "k");
+        assert_eq!(descriptor.branches.len(), 2);
+        assert!(descriptor.branches.iter().any(|branch| {
+            branch.side == JoinRefreshBranchSide::LeftDeltaRightSnapshot
+                && branch.action_column_id == descriptor.action_column.column_id
+        }));
+        assert!(descriptor.branches.iter().any(|branch| {
+            branch.side == JoinRefreshBranchSide::LeftSnapshotRightDelta
+                && branch.action_column_id == descriptor.action_column.column_id
+        }));
+        assert!(descriptor.output_mappings.iter().any(|mapping| {
+            matches!(
+                mapping.source,
+                JoinRefreshOutputSource::Action(column_id)
+                    if column_id == descriptor.action_column.column_id
+            )
+        }));
+        assert!(descriptor.output_mappings.iter().any(|mapping| {
+            matches!(
+                mapping.source,
+                JoinRefreshOutputSource::JoinApplyKey(column_id)
+                    if column_id == descriptor.join_apply_key_column.column_id
+            )
+        }));
+        for payload in &descriptor.payload_columns {
+            assert!(descriptor.output_mappings.iter().any(|mapping| {
+                matches!(
+                    mapping.source,
+                    JoinRefreshOutputSource::Payload(column_id)
+                        if column_id == payload.column_id
+                )
+            }));
+        }
+        descriptor
+            .validate()
+            .expect("recorded join refresh descriptor must validate");
     }
 
     #[test]
