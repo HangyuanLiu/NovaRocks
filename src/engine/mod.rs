@@ -3737,6 +3737,83 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     .execute()
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_logical_plan_with_options(
+    logical: crate::sql::planner::plan::LogicalPlanNode,
+    factory: crate::sql::column_id::ColumnRefFactory,
+    codegen_catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
+) -> Result<QueryResult, String> {
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        &logical,
+        &mut scalar_arena,
+    )?;
+    let providers = mv_rewrite_state
+        .map(query_stats::QueryStatsProviders::from_standalone_state)
+        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+    snapshot_effective_backend_count_into_session();
+    let physical = crate::sql::optimizer::optimize(
+        opt_expr,
+        scalar_arena,
+        &query_stats.snapshot,
+        factory,
+        None,
+        Vec::new(),
+    )?;
+
+    if let Some(reason) = direct_execution_reason(
+        terminal_sink.is_some(),
+        iceberg_catalogs.is_some(),
+        exchange_port,
+    ) {
+        return execute_query_direct_for_explicit_exception(
+            physical,
+            codegen_catalog,
+            connectors,
+            current_database,
+            query_opts,
+            terminal_sink,
+            iceberg_catalogs,
+            mv_refresh_ctx,
+            reason,
+        );
+    }
+
+    let build_result = if let Some(mv_refresh_ctx) = mv_refresh_ctx {
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
+            &physical,
+            codegen_catalog,
+            connectors,
+            current_database,
+            Some(mv_refresh_ctx),
+        )?
+    } else {
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
+            &physical,
+            codegen_catalog,
+            connectors,
+            current_database,
+        )?
+    };
+    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    crate::runtime::coordinator::ExecutionCoordinator::new(
+        build_result,
+        dispatcher,
+        scheduler,
+        query_opts,
+    )
+    .execute()
+}
+
 fn coordinated_execution_services() -> Result<
     (
         Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
