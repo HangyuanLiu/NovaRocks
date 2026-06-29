@@ -904,8 +904,11 @@ fn actual_suffix(
             if metrics.search_ns > 0 {
                 s.push_str(&format!(" search={}", fmt_time_ns(metrics.search_ns)));
             }
-            if metrics.output_ns > 0 {
-                s.push_str(&format!(" output={}", fmt_time_ns(metrics.output_ns)));
+            if metrics.out_build_ns > 0 {
+                s.push_str(&format!(" out_build={}", fmt_time_ns(metrics.out_build_ns)));
+            }
+            if metrics.out_probe_ns > 0 {
+                s.push_str(&format!(" out_probe={}", fmt_time_ns(metrics.out_probe_ns)));
             }
             s.push_str(&format!(" peak={}}}", fmt_bytes(metrics.peak_mem_bytes)));
             s
@@ -1935,7 +1938,8 @@ mod tests {
                 total_time_min_ns: 43_000_000_000,
                 build_ht_ns: 0,
                 search_ns: 20_000_000_000,
-                output_ns: 18_000_000_000,
+                out_build_ns: 6_000_000_000,
+                out_probe_ns: 12_000_000_000,
             },
         );
 
@@ -1944,7 +1948,7 @@ mod tests {
 
         assert!(
             text.contains(
-                "act={rows=13502430 time=44.8s (max=46.0s min=43.0s) search=20.0s output=18.0s peak=607.5MB}"
+                "act={rows=13502430 time=44.8s (max=46.0s min=43.0s) search=20.0s out_build=6.0s out_probe=12.0s peak=607.5MB}"
             ),
             "expected scan actuals to include phase timers and per-driver min/max in order:\n{text}"
         );

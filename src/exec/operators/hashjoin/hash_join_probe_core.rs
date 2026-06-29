@@ -41,6 +41,7 @@ use super::build_artifact::{BuildView, JoinBuildArtifact};
 use super::build_requirements;
 use super::build_requirements::{BuildComponentRequirements, required_build_components};
 use super::join_hash_map::finalize::{finalize_probe_rows, is_all_match_one, mark_build_matches};
+use super::join_hash_map::gather::GatherTimings;
 use super::join_hash_map::match_flags::BuildMatchFlags;
 use super::join_hash_map::method::JoinHashMap;
 use super::join_hash_map::search::{JoinSelection, SearchStats, append_cross_selection};
@@ -113,7 +114,8 @@ pub(crate) struct HashJoinProbeCore {
     residual_group_rows_total: u64,
     pending_output_batches: VecDeque<RecordBatch>,
     search_timer: Option<CounterRef>,
-    output_timer: Option<CounterRef>,
+    out_build_timer: Option<CounterRef>,
+    out_probe_timer: Option<CounterRef>,
 }
 
 impl HashJoinProbeCore {
@@ -162,13 +164,20 @@ impl HashJoinProbeCore {
             residual_group_rows_total: 0,
             pending_output_batches: VecDeque::new(),
             search_timer: None,
-            output_timer: None,
+            out_build_timer: None,
+            out_probe_timer: None,
         }
     }
 
-    pub(crate) fn set_phase_timers(&mut self, search_timer: CounterRef, output_timer: CounterRef) {
+    pub(crate) fn set_phase_timers(
+        &mut self,
+        search_timer: CounterRef,
+        out_build_timer: CounterRef,
+        out_probe_timer: CounterRef,
+    ) {
         self.search_timer = Some(search_timer);
-        self.output_timer = Some(output_timer);
+        self.out_build_timer = Some(out_build_timer);
+        self.out_probe_timer = Some(out_probe_timer);
     }
 
     #[inline]
@@ -179,13 +188,31 @@ impl HashJoinProbeCore {
     }
 
     #[inline]
+    fn add_timer_ns(timer: Option<&CounterRef>, value: i64) {
+        if let Some(timer) = timer {
+            timer.add(value);
+        }
+    }
+
+    #[inline]
     fn record_search_ns(&self, start: std::time::Instant) {
         Self::record_timer_ns(self.search_timer.as_ref(), start);
     }
 
     #[inline]
-    fn record_output_ns(&self, start: std::time::Instant) {
-        Self::record_timer_ns(self.output_timer.as_ref(), start);
+    fn record_out_build_ns(&self, start: std::time::Instant) {
+        Self::record_timer_ns(self.out_build_timer.as_ref(), start);
+    }
+
+    #[inline]
+    fn record_out_probe_ns(&self, start: std::time::Instant) {
+        Self::record_timer_ns(self.out_probe_timer.as_ref(), start);
+    }
+
+    #[inline]
+    fn record_out_timings(&self, timings: GatherTimings) {
+        Self::add_timer_ns(self.out_build_timer.as_ref(), timings.build_ns);
+        Self::add_timer_ns(self.out_probe_timer.as_ref(), timings.probe_ns);
     }
 
     fn build_view(&self) -> Result<&BuildView, String> {
@@ -380,7 +407,7 @@ impl HashJoinProbeCore {
         );
         let chunk = Chunk::try_new_with_columns(chunk_schema, columns)
             .map_err(|e| format!("extend_with_null_build_columns: {e}"))?;
-        self.record_output_ns(output_start);
+        self.record_out_build_ns(output_start);
         Ok(chunk)
     }
 
@@ -418,7 +445,7 @@ impl HashJoinProbeCore {
         );
         let chunk = Chunk::try_new_with_columns(chunk_schema, columns)
             .map_err(|e| format!("extend_with_null_probe_columns: {e}"))?;
-        self.record_output_ns(output_start);
+        self.record_out_probe_ns(output_start);
         Ok(chunk)
     }
 
@@ -518,26 +545,22 @@ impl HashJoinProbeCore {
             let end = (offset
                 + crate::exec::operators::hashjoin::join_hash_map::gather::MAX_JOIN_OUTPUT_ROWS_PER_BATCH)
                 .min(selection.len());
-            let output_start = std::time::Instant::now();
-            let candidate = if self.probe_is_left {
-                crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batch(
+            let gathered =
+                crate::exec::operators::hashjoin::join_hash_map::gather::gather_probe_build_batches(
                     probe,
                     build,
                     &selection.probe[offset..end],
                     &selection.build[offset..end],
                     &self.join_scope_schema,
-                )?
-            } else {
-                crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batch(
-                    build,
-                    probe,
-                    &selection.build[offset..end],
-                    &selection.probe[offset..end],
-                    &self.join_scope_schema,
-                )?
-            }
-            .ok_or_else(|| "join residual candidate batch missing".to_string())?;
-            self.record_output_ns(output_start);
+                    self.probe_is_left,
+                    false,
+                )?;
+            self.record_out_timings(gathered.timings);
+            let candidate = gathered
+                .batches
+                .into_iter()
+                .next()
+                .ok_or_else(|| "join residual candidate batch missing".to_string())?;
             let candidate_chunk = Chunk::try_new_with_chunk_schema(
                 candidate,
                 Arc::clone(&self.join_scope_chunk_schema),
@@ -740,7 +763,7 @@ impl HashJoinProbeCore {
                 &self.join_scope_schema,
             )?
         };
-        self.record_output_ns(output_start);
+        self.record_out_build_ns(output_start);
         Ok(out)
     }
 
@@ -802,7 +825,7 @@ impl HashJoinProbeCore {
         let mask = BooleanArray::from(mask);
         let output_start = std::time::Instant::now();
         let filtered = filter_record_batch(&build_chunk.batch, &mask).map_err(|e| e.to_string())?;
-        self.record_output_ns(output_start);
+        self.record_out_build_ns(output_start);
         if filtered.num_rows() == 0 {
             return Ok(None);
         }
@@ -872,9 +895,7 @@ impl HashJoinProbeCore {
                 return Ok(None);
             };
             for left in probe_chunks {
-                let output_start = std::time::Instant::now();
                 let batches = cross_join_batches(&left, right, &output_schema)?;
-                self.record_output_ns(output_start);
                 output_batches.extend(batches);
             }
         } else {
@@ -911,9 +932,8 @@ impl HashJoinProbeCore {
                 if selection.is_empty() {
                     continue;
                 }
-                let output_start = std::time::Instant::now();
                 let all_match_one = is_all_match_one(&selection, probe.len());
-                let batches =
+                let gathered =
                     crate::exec::operators::hashjoin::join_hash_map::gather::gather_probe_build_batches(
                         &probe,
                         build_chunk.as_ref(),
@@ -923,8 +943,8 @@ impl HashJoinProbeCore {
                         self.probe_is_left,
                         all_match_one,
                     )?;
-                self.record_output_ns(output_start);
-                output_batches.extend(batches);
+                self.record_out_timings(gathered.timings);
+                output_batches.extend(gathered.batches);
             }
         }
 
@@ -1012,7 +1032,7 @@ impl HashJoinProbeCore {
                         &output_schema,
                     )?
                 };
-                self.record_output_ns(output_start);
+                self.record_out_probe_ns(output_start);
                 if let Some(batch) = batch {
                     output_batches.push(batch);
                 }
@@ -1045,9 +1065,8 @@ impl HashJoinProbeCore {
                 mark_build_matches(flags, &selection)?;
             }
             if !selection.is_empty() {
-                let output_start = std::time::Instant::now();
                 let all_match_one = is_all_match_one(&selection, probe.len());
-                let batches =
+                let gathered =
                     crate::exec::operators::hashjoin::join_hash_map::gather::gather_probe_build_batches(
                         &probe,
                         build_chunk.as_ref(),
@@ -1057,8 +1076,8 @@ impl HashJoinProbeCore {
                         self.probe_is_left,
                         all_match_one,
                     )?;
-                self.record_output_ns(output_start);
-                output_batches.extend(batches);
+                self.record_out_timings(gathered.timings);
+                output_batches.extend(gathered.batches);
             }
 
             if output_unmatched_probe {
@@ -1079,7 +1098,7 @@ impl HashJoinProbeCore {
                             &output_schema,
                         )?
                     };
-                    self.record_output_ns(output_start);
+                    self.record_out_probe_ns(output_start);
                     if let Some(batch) = batch {
                         output_batches.push(batch);
                     }
@@ -1140,7 +1159,7 @@ impl HashJoinProbeCore {
                     let output_start = std::time::Instant::now();
                     let batch =
                         concat_compatible_batches(&output_schema, &batches, "anti join concat")?;
-                    self.record_output_ns(output_start);
+                    self.record_out_probe_ns(output_start);
                     batch
                 };
                 return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
@@ -1161,7 +1180,7 @@ impl HashJoinProbeCore {
                     let output_start = std::time::Instant::now();
                     let batch =
                         concat_compatible_batches(&output_schema, &batches, "anti join concat")?;
-                    self.record_output_ns(output_start);
+                    self.record_out_probe_ns(output_start);
                     batch
                 };
                 return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
@@ -1239,7 +1258,7 @@ impl HashJoinProbeCore {
                 let mask = BooleanArray::from(keep);
                 let filtered_batch = filter_record_batch(&probe.batch, &mask)
                     .map_err(|e| format!("semi/anti filter failed: {e}"))?;
-                self.record_output_ns(output_start);
+                self.record_out_probe_ns(output_start);
                 if filtered_batch.num_rows() > 0 {
                     output_batches.push(filtered_batch);
                 }
@@ -1259,7 +1278,7 @@ impl HashJoinProbeCore {
                     &output_batches,
                     "semi anti join concat",
                 )?;
-                self.record_output_ns(output_start);
+                self.record_out_probe_ns(output_start);
                 batch
             };
             return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
@@ -1303,7 +1322,7 @@ impl HashJoinProbeCore {
             let mask = BooleanArray::from(keep);
             let filtered_batch = filter_record_batch(&probe.batch, &mask)
                 .map_err(|e| format!("semi/anti membership filter failed: {e}"))?;
-            self.record_output_ns(output_start);
+            self.record_out_probe_ns(output_start);
             if filtered_batch.num_rows() > 0 {
                 output_batches.push(filtered_batch);
             }
@@ -1323,7 +1342,7 @@ impl HashJoinProbeCore {
                 &output_batches,
                 "semi anti membership join concat",
             )?;
-            self.record_output_ns(output_start);
+            self.record_out_probe_ns(output_start);
             batch
         };
         Ok(Some(self.extend_with_null_build_columns(probe_batch)?))
@@ -1353,7 +1372,7 @@ impl HashJoinProbeCore {
                     &batches,
                     "null aware anti join concat",
                 )?;
-                self.record_output_ns(output_start);
+                self.record_out_probe_ns(output_start);
                 batch
             };
             return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
@@ -1516,7 +1535,7 @@ impl HashJoinProbeCore {
             let mask = BooleanArray::from(keep);
             let filtered_batch = filter_record_batch(&probe.batch, &mask)
                 .map_err(|e| format!("null-aware anti filter failed: {e}"))?;
-            self.record_output_ns(output_start);
+            self.record_out_probe_ns(output_start);
             if filtered_batch.num_rows() > 0 {
                 output_batches.push(filtered_batch);
             }
@@ -1536,7 +1555,7 @@ impl HashJoinProbeCore {
                 &output_batches,
                 "null aware anti join output concat",
             )?;
-            self.record_output_ns(output_start);
+            self.record_out_probe_ns(output_start);
             batch
         };
         Ok(Some(self.extend_with_null_build_columns(probe_batch)?))

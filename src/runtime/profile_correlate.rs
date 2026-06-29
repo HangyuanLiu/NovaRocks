@@ -29,7 +29,8 @@ pub(crate) struct ActualMetrics {
     pub(crate) total_time_min_ns: i64,
     pub(crate) build_ht_ns: i64,
     pub(crate) search_ns: i64,
-    pub(crate) output_ns: i64,
+    pub(crate) out_build_ns: i64,
+    pub(crate) out_probe_ns: i64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -205,7 +206,8 @@ fn collect_rec(node: &Profiler, actuals: &mut HashMap<i32, ActualMetrics>) {
                     total_time_min_ns,
                     build_ht_ns: counter(&common, "BuildHashTableTime"),
                     search_ns: counter(&common, "SearchHashTableTime"),
-                    output_ns: counter(&common, "OutputColumnTime"),
+                    out_build_ns: counter(&common, "OutputBuildColumnTime"),
+                    out_probe_ns: counter(&common, "OutputProbeColumnTime"),
                 },
             );
         }
@@ -248,7 +250,8 @@ fn collect_thrift_rec(
                     total_time_min_ns,
                     build_ht_ns: thrift_counter(nodes, range.clone(), "BuildHashTableTime"),
                     search_ns: thrift_counter(nodes, range.clone(), "SearchHashTableTime"),
-                    output_ns: thrift_counter(nodes, range, "OutputColumnTime"),
+                    out_build_ns: thrift_counter(nodes, range.clone(), "OutputBuildColumnTime"),
+                    out_probe_ns: thrift_counter(nodes, range, "OutputProbeColumnTime"),
                 };
                 merge_actual_metrics(actuals, node_id, metrics);
                 break;
@@ -285,7 +288,8 @@ fn merge_actual_metrics(
     entry.total_time_max_ns = entry.total_time_max_ns.max(metrics.total_time_max_ns);
     entry.build_ht_ns = entry.build_ht_ns.max(metrics.build_ht_ns);
     entry.search_ns = entry.search_ns.max(metrics.search_ns);
-    entry.output_ns = entry.output_ns.max(metrics.output_ns);
+    entry.out_build_ns = entry.out_build_ns.max(metrics.out_build_ns);
+    entry.out_probe_ns = entry.out_probe_ns.max(metrics.out_probe_ns);
 }
 
 fn sanitize_operator_total_time(mut metrics: ActualMetrics) -> ActualMetrics {
@@ -443,7 +447,8 @@ mod tests {
             .child("CommonMetrics");
         common0.add_timer("BuildHashTableTime").set(2);
         common0.add_timer("SearchHashTableTime").set(4);
-        common0.add_timer("OutputColumnTime").set(6);
+        common0.add_timer("OutputBuildColumnTime").set(2);
+        common0.add_timer("OutputProbeColumnTime").set(4);
 
         let driver1 = pipeline.child("PipelineDriver (id=1)");
         add_operator_metrics(&driver1, "HASH JOIN (plan_node_id=9)", 20, 30, 32);
@@ -452,7 +457,8 @@ mod tests {
             .child("CommonMetrics");
         common1.add_timer("BuildHashTableTime").set(6);
         common1.add_timer("SearchHashTableTime").set(8);
-        common1.add_timer("OutputColumnTime").set(10);
+        common1.add_timer("OutputBuildColumnTime").set(6);
+        common1.add_timer("OutputProbeColumnTime").set(8);
 
         let actuals = collect_actuals_by_plan_node_id(&profiler);
 
@@ -466,7 +472,8 @@ mod tests {
                 total_time_min_ns: 10,
                 build_ht_ns: 4,
                 search_ns: 6,
-                output_ns: 8,
+                out_build_ns: 4,
+                out_probe_ns: 6,
             })
         );
     }
@@ -620,7 +627,8 @@ mod tests {
             .set(640);
         common.add_timer("BuildHashTableTime").set(0);
         common.add_timer("SearchHashTableTime").set(20_000);
-        common.add_timer("OutputColumnTime").set(15_000);
+        common.add_timer("OutputBuildColumnTime").set(6_000);
+        common.add_timer("OutputProbeColumnTime").set(9_000);
 
         let tree = profiler.to_thrift_tree();
         let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
@@ -630,7 +638,8 @@ mod tests {
         assert_eq!(m.total_time_max_ns, 46_000);
         assert_eq!(m.total_time_min_ns, 43_000);
         assert_eq!(m.search_ns, 20_000);
-        assert_eq!(m.output_ns, 15_000);
+        assert_eq!(m.out_build_ns, 6_000);
+        assert_eq!(m.out_probe_ns, 9_000);
         assert_eq!(m.build_ht_ns, 0);
     }
 
@@ -708,7 +717,8 @@ mod tests {
                 total_time_min_ns: 80,
                 build_ht_ns: 20,
                 search_ns: 30,
-                output_ns: 40,
+                out_build_ns: 35,
+                out_probe_ns: 40,
             },
         );
         merge_actual_metrics(
@@ -722,7 +732,8 @@ mod tests {
                 total_time_min_ns: 1,
                 build_ht_ns: 25,
                 search_ns: 10,
-                output_ns: 45,
+                out_build_ns: 45,
+                out_probe_ns: 15,
             },
         );
 
@@ -736,7 +747,8 @@ mod tests {
                 total_time_min_ns: 80,
                 build_ht_ns: 25,
                 search_ns: 30,
-                output_ns: 45,
+                out_build_ns: 45,
+                out_probe_ns: 40,
             })
         );
     }
