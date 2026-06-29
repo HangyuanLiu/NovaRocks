@@ -78,6 +78,39 @@ if [[ "$purge_requested" == true && "$stop_docker" == true ]]; then
   down_args+=("--volumes")
 fi
 
+purge_object_store_prefixes() {
+  if [[ "$purge_requested" != true || "$stop_docker" == true ]]; then
+    return 0
+  fi
+
+  case "$env_id" in
+    ""|*/*|"."|"..")
+      echo "refusing to purge object-store prefixes for invalid environment id: $env_id" >&2
+      return 1
+      ;;
+  esac
+
+  if [[ ! -f "$compose_env" ]]; then
+    echo "object-store purge skipped; environment is not initialized: $runtime_dir" >&2
+    return 0
+  fi
+
+  local target
+  for target in "minio/novarocks/$env_id/" "minio/warehouse/$env_id/"; do
+    echo "Purging object-store prefix: $target"
+    docker compose \
+      --env-file "$compose_env" \
+      -p "$compose_project" \
+      -f "$compose_file" \
+      run --rm --no-deps -T \
+      --entrypoint /bin/sh \
+      mc -c '/usr/bin/mc alias set minio http://minio:9000 "${MINIO_ROOT_USER:-admin}" "${MINIO_ROOT_PASSWORD:-admin123}" >/dev/null && /usr/bin/mc rm --recursive --force --quiet "$1"' \
+      _ "$target"
+  done
+}
+
+purge_object_store_prefixes
+
 if [[ "$stop_docker" == true ]]; then
   if [[ ! -f "$compose_env" ]]; then
     echo "environment is not initialized: $runtime_dir" >&2
