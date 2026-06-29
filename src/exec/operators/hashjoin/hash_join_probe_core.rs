@@ -1193,10 +1193,9 @@ impl HashJoinProbeCore {
             let mut output_batches = Vec::new();
             for probe in probe_chunks {
                 let search_start = std::time::Instant::now();
-                let (group_ids, mut selection) =
-                    table.lookup_selection(&self.arena, &self.probe_keys, &probe)?;
+                let (mut selection, stats) =
+                    table.search_pairs(&self.arena, &self.probe_keys, &probe)?;
                 self.record_search_ns(search_start);
-                let stats = SearchStats::from_group_ids(&group_ids);
                 self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(stats.lookup_hit_rows);
                 self.lookup_miss_rows =
                     self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
@@ -1222,25 +1221,15 @@ impl HashJoinProbeCore {
                     None
                 };
 
-                let mut matched = vec![false; probe.len()];
-                for probe_row in selection.probe.iter() {
-                    let slot = *probe_row as usize;
-                    if slot >= matched.len() {
-                        return Err(format!(
-                            "semi/anti probe row out of bounds: row={} rows={}",
-                            slot,
-                            matched.len()
-                        ));
-                    }
-                    matched[slot] = true;
-                }
+                let probe_finalize =
+                    finalize_probe_rows(probe.len(), &selection, is_semi, "semi/anti join")?;
                 if let Some(residual_matched_rows_before) = residual_matched_rows_before {
-                    let matched_probe_rows = matched.iter().filter(|matched| **matched).count();
-                    self.residual_matched_rows =
-                        residual_matched_rows_before.saturating_add(matched_probe_rows as u64);
+                    self.residual_matched_rows = residual_matched_rows_before
+                        .saturating_add(probe_finalize.selected.len() as u64);
                 }
 
-                let keep = matched
+                let keep = probe_finalize
+                    .matched
                     .into_iter()
                     .map(|matched| if is_semi { matched } else { !matched })
                     .collect::<Vec<bool>>();
@@ -1290,7 +1279,8 @@ impl HashJoinProbeCore {
         let mut output_batches = Vec::new();
         for probe in probe_chunks {
             let search_start = std::time::Instant::now();
-            let membership = table.lookup_membership(&self.arena, &self.probe_keys, &probe)?;
+            let (membership, stats) =
+                table.search_membership(&self.arena, &self.probe_keys, &probe)?;
             self.record_search_ns(search_start);
             if membership.len() != probe.len() {
                 return Err(format!(
@@ -1299,12 +1289,11 @@ impl HashJoinProbeCore {
                     probe.len()
                 ));
             }
-            let hits = membership.iter().filter(|matched| **matched).count() as u64;
-            let misses = membership.len() as u64 - hits;
-            self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(hits);
-            self.lookup_miss_rows = self.lookup_miss_rows.saturating_add(misses);
+            self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(stats.lookup_hit_rows);
+            self.lookup_miss_rows = self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
 
             let keep = membership
+                .into_vec()
                 .into_iter()
                 .map(|matched| if is_semi { matched } else { !matched })
                 .collect::<Vec<bool>>();
@@ -1565,10 +1554,9 @@ impl HashJoinProbeCore {
                 continue;
             }
             let search_start = std::time::Instant::now();
-            let (group_ids, mut selection) =
-                table.lookup_selection(&self.arena, &self.probe_keys, &probe)?;
+            let (mut selection, stats) =
+                table.search_pairs(&self.arena, &self.probe_keys, &probe)?;
             self.record_search_ns(search_start);
-            let stats = SearchStats::from_group_ids(&group_ids);
             self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(stats.lookup_hit_rows);
             self.lookup_miss_rows = self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
 
@@ -1592,12 +1580,7 @@ impl HashJoinProbeCore {
             let Some(flags) = self.build_matched.as_mut() else {
                 return Ok(());
             };
-            let mut unique_build_rows_marked = 0u64;
-            for build_row in selection.build {
-                if flags.mark(build_row)? {
-                    unique_build_rows_marked = unique_build_rows_marked.saturating_add(1);
-                }
-            }
+            let unique_build_rows_marked = mark_build_matches(flags, &selection)?;
             if let Some(residual_matched_rows_before) = residual_matched_rows_before {
                 self.residual_matched_rows =
                     residual_matched_rows_before.saturating_add(unique_build_rows_marked);
@@ -2212,6 +2195,65 @@ mod tests {
         assert_eq!(core.lookup_hit_rows(), 2);
         assert_eq!(core.lookup_miss_rows(), 1);
         assert_eq!(core.residual_group_rows_total(), 0);
+    }
+
+    #[test]
+    fn left_semi_with_residual_uses_pairs_before_probe_collapse() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let left_v = arena.push_typed(ExprNode::SlotId(LEFT_V_SLOT_ID), DataType::Int32);
+        let right_w = arena.push_typed(ExprNode::SlotId(RIGHT_W_SLOT_ID), DataType::Int32);
+        let residual = arena.push_typed(ExprNode::Lt(left_v, right_w), DataType::Boolean);
+        let arena = Arc::new(arena);
+
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[100, 100, 102],
+            &[0, 10, 30],
+        );
+        let artifact = Arc::new(direct_build_artifact_from_build_chunk(build_chunk));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::LeftSemi,
+            vec![probe_key],
+            Some(residual),
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        core.set_build_artifact(artifact, 3, false)
+            .expect("set build");
+
+        let probe_chunk = chunk_of_two(
+            Arc::clone(&left_schema),
+            &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID],
+            &[100, 101, 102],
+            &[5, 2, 40],
+        );
+
+        let out = core
+            .join_probe_chunks(vec![probe_chunk])
+            .expect("probe")
+            .expect("left semi output");
+        assert_eq!(out.len(), 1);
+        assert_eq!(core.lookup_hit_rows(), 2);
+        assert_eq!(core.lookup_miss_rows(), 1);
+        assert_eq!(core.residual_group_rows_total(), 3);
     }
 
     #[test]
