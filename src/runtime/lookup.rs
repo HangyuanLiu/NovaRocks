@@ -35,9 +35,7 @@ use crate::formats::{
     parquet::ParquetScanConfig,
 };
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
-use crate::lower::type_lowering::{
-    arrow_type_from_desc, primitive_type_from_desc, scalar_type_desc,
-};
+use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_desc};
 use crate::novarocks_connectors::{StarRocksScanConfig, StarRocksScanOp};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::thrift::descriptors;
@@ -512,11 +510,10 @@ pub(crate) fn execute_lake_lookup_request(
                 let meta = slot_meta
                     .get(&slot_id)
                     .ok_or_else(|| format!("missing slot meta for slot {}", slot_id))?;
-                Ok(ChunkSlotSchema::new(
+                Ok(ChunkSlotSchema::new_with_field(
                     slot_id,
-                    meta.name.clone(),
-                    true,
-                    Some(scalar_type_desc(meta.primitive)),
+                    arrow::datatypes::Field::new(meta.name.clone(), meta.arrow_type.clone(), true),
+                    None,
                     None,
                 ))
             })
