@@ -45,11 +45,9 @@ use crate::exec::runtime_filter::{
     RuntimeInFilter, RuntimeMembershipFilter, filter_chunk_by_in_filters_with_exprs,
     filter_chunk_by_membership_filters_with_exprs, filter_chunk_by_min_max_filters_with_exprs,
 };
-use crate::lower::type_lowering::scalar_type_desc;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
 use crate::thrift::metrics;
-use crate::thrift::types;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
 use arrow::compute::filter_record_batch;
 use roaring::RoaringTreemap;
@@ -958,11 +956,10 @@ impl ScanAsyncRunner {
                         .expect("file_path_array built when slot exists")
                         .clone(),
                 );
-                slot_schemas.push(ChunkSlotSchema::new(
+                slot_schemas.push(ChunkSlotSchema::new_with_field(
                     *slot_id,
-                    field.name().clone(),
-                    field.is_nullable(),
-                    Some(scalar_type_desc(types::TPrimitiveType::VARCHAR)),
+                    field.as_ref().clone(),
+                    None,
                     None,
                 ));
                 continue;
@@ -980,11 +977,10 @@ impl ScanAsyncRunner {
                         .expect("pos_array built when slot exists")
                         .clone(),
                 );
-                slot_schemas.push(ChunkSlotSchema::new(
+                slot_schemas.push(ChunkSlotSchema::new_with_field(
                     *slot_id,
-                    field.name().clone(),
-                    field.is_nullable(),
-                    Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+                    field.as_ref().clone(),
+                    None,
                     None,
                 ));
                 continue;
@@ -1002,11 +998,10 @@ impl ScanAsyncRunner {
                         .expect("row_id_array built when slot exists")
                         .clone(),
                 );
-                slot_schemas.push(ChunkSlotSchema::new(
+                slot_schemas.push(ChunkSlotSchema::new_with_field(
                     *slot_id,
-                    field.name().clone(),
-                    field.is_nullable(),
-                    Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+                    field.as_ref().clone(),
+                    None,
                     None,
                 ));
                 continue;
@@ -1022,11 +1017,10 @@ impl ScanAsyncRunner {
                         .expect("last_updated_seq_array built when slot exists")
                         .clone(),
                 );
-                slot_schemas.push(ChunkSlotSchema::new(
+                slot_schemas.push(ChunkSlotSchema::new_with_field(
                     *slot_id,
-                    field.name().clone(),
-                    field.is_nullable(),
-                    Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+                    field.as_ref().clone(),
+                    None,
                     None,
                 ));
                 continue;
@@ -1043,11 +1037,10 @@ impl ScanAsyncRunner {
                         .expect("change_op_array built when slot exists")
                         .clone(),
                 );
-                slot_schemas.push(ChunkSlotSchema::new(
+                slot_schemas.push(ChunkSlotSchema::new_with_field(
                     *slot_id,
-                    field.name().clone(),
-                    field.is_nullable(),
-                    Some(scalar_type_desc(types::TPrimitiveType::TINYINT)),
+                    field.as_ref().clone(),
+                    None,
                     None,
                 ));
                 continue;
@@ -1115,11 +1108,10 @@ impl ScanAsyncRunner {
             if *slot_id == state.spec.row_source_slot {
                 fields.push(state.spec.row_source_field.clone());
                 columns.push(row_source_array.clone());
-                slot_schemas.push(ChunkSlotSchema::new(
+                slot_schemas.push(ChunkSlotSchema::new_with_field(
                     *slot_id,
-                    state.spec.row_source_field.name().clone(),
-                    state.spec.row_source_field.is_nullable(),
-                    Some(scalar_type_desc(types::TPrimitiveType::INT)),
+                    state.spec.row_source_field.clone(),
+                    None,
                     None,
                 ));
                 continue;
@@ -1127,11 +1119,10 @@ impl ScanAsyncRunner {
             if *slot_id == state.spec.scan_range_slot {
                 fields.push(state.spec.scan_range_field.clone());
                 columns.push(scan_range_array.clone());
-                slot_schemas.push(ChunkSlotSchema::new(
+                slot_schemas.push(ChunkSlotSchema::new_with_field(
                     *slot_id,
-                    state.spec.scan_range_field.name().clone(),
-                    state.spec.scan_range_field.is_nullable(),
-                    Some(scalar_type_desc(types::TPrimitiveType::INT)),
+                    state.spec.scan_range_field.clone(),
+                    None,
                     None,
                 ));
                 continue;
@@ -1139,11 +1130,10 @@ impl ScanAsyncRunner {
             if *slot_id == state.spec.row_id_slot {
                 fields.push(state.spec.row_id_field.clone());
                 columns.push(row_id_array.clone());
-                slot_schemas.push(ChunkSlotSchema::new(
+                slot_schemas.push(ChunkSlotSchema::new_with_field(
                     *slot_id,
-                    state.spec.row_id_field.name().clone(),
-                    state.spec.row_id_field.is_nullable(),
-                    Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+                    state.spec.row_id_field.clone(),
+                    None,
                     None,
                 ));
                 continue;
@@ -1214,41 +1204,37 @@ impl ScanAsyncRunner {
 
         fields.push(spec.source_id_field.clone());
         columns.push(source_id_array);
-        slot_schemas_out.push(ChunkSlotSchema::new(
+        slot_schemas_out.push(ChunkSlotSchema::new_with_field(
             spec.source_id_slot,
-            spec.source_id_field.name().clone(),
-            spec.source_id_field.is_nullable(),
-            Some(scalar_type_desc(types::TPrimitiveType::INT)),
+            spec.source_id_field.clone(),
+            None,
             None,
         ));
 
         fields.push(spec.tablet_id_field.clone());
         columns.push(tablet_id_array);
-        slot_schemas_out.push(ChunkSlotSchema::new(
+        slot_schemas_out.push(ChunkSlotSchema::new_with_field(
             spec.tablet_id_slot,
-            spec.tablet_id_field.name().clone(),
-            spec.tablet_id_field.is_nullable(),
-            Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+            spec.tablet_id_field.clone(),
+            None,
             None,
         ));
 
         fields.push(spec.rss_id_field.clone());
         columns.push(rss_id_array);
-        slot_schemas_out.push(ChunkSlotSchema::new(
+        slot_schemas_out.push(ChunkSlotSchema::new_with_field(
             spec.rss_id_slot,
-            spec.rss_id_field.name().clone(),
-            spec.rss_id_field.is_nullable(),
-            Some(scalar_type_desc(types::TPrimitiveType::INT)),
+            spec.rss_id_field.clone(),
+            None,
             None,
         ));
 
         fields.push(spec.row_id_field.clone());
         columns.push(row_id_array);
-        slot_schemas_out.push(ChunkSlotSchema::new(
+        slot_schemas_out.push(ChunkSlotSchema::new_with_field(
             spec.row_id_slot,
-            spec.row_id_field.name().clone(),
-            spec.row_id_field.is_nullable(),
-            Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+            spec.row_id_field.clone(),
+            None,
             None,
         ));
 
