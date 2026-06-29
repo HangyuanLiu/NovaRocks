@@ -758,6 +758,15 @@ impl DirectIntJoinHashMap {
         probe: &Chunk,
     ) -> Result<(ProbeMask, SearchStats), String> {
         let probe_len = probe.len();
+        if probe_len == 0 {
+            return Ok((
+                ProbeMask::new(0, false),
+                SearchStats {
+                    lookup_hit_rows: 0,
+                    lookup_miss_rows: 0,
+                },
+            ));
+        }
         let probe_array = eval_single_probe_int_key(arena, probe_keys, probe, &self.data_type)?;
         let probe_view = IntArrayView::new(&probe_array)?;
         let mut mask = ProbeMask::new(probe_len, false);
@@ -970,6 +979,15 @@ impl DirectIntJoinHashSet {
         probe: &Chunk,
     ) -> Result<(ProbeMask, SearchStats), String> {
         let probe_len = probe.len();
+        if probe_len == 0 {
+            return Ok((
+                ProbeMask::new(0, false),
+                SearchStats {
+                    lookup_hit_rows: 0,
+                    lookup_miss_rows: 0,
+                },
+            ));
+        }
         let probe_array = eval_single_probe_int_key(arena, probe_keys, probe, &self.data_type)?;
         let probe_view = IntArrayView::new(&probe_array)?;
         let mut mask = ProbeMask::new(probe_len, false);
@@ -1503,7 +1521,7 @@ mod tests {
 
         let mut arena = ExprArena::default();
         let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
-        let probe = int32_chunk(vec![Some(10), Some(11), None, Some(12)]);
+        let probe = int32_chunk(vec![Some(9), Some(10), Some(11), None, Some(12), Some(13)]);
         let (mask, stats) = map
             .search_membership(&arena, &[probe_key], &probe)
             .expect("search membership");
@@ -1511,10 +1529,51 @@ mod tests {
             .lookup_membership(&arena, &[probe_key], &probe)
             .expect("membership");
 
-        assert_eq!(mask.as_slice(), &[true, false, false, true]);
+        assert_eq!(mask.as_slice(), &[false, true, false, false, true, false]);
         assert_eq!(stats.lookup_hit_rows, 2);
-        assert_eq!(stats.lookup_miss_rows, 2);
-        assert_eq!(membership, vec![true, false, false, true]);
+        assert_eq!(stats.lookup_miss_rows, 4);
+        assert_eq!(membership, vec![false, true, false, false, true, false]);
+    }
+
+    #[test]
+    fn search_membership_empty_probe_skips_direct_key_eval() {
+        let build = int32_chunk(vec![Some(10), Some(12)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let direct = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            std::slice::from_ref(&batch),
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("direct");
+        let direct_set = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions {
+                purpose: JoinHashMapBuildPurpose::PresenceOnly,
+                ..JoinHashMapBuildOptions::default()
+            },
+        )
+        .expect("direct set");
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(KEY_SLOT_ID), DataType::Int32);
+        let empty_probe = Chunk::default();
+
+        for map in [&direct, &direct_set] {
+            let (mask, stats) = map
+                .search_membership(&arena, &[probe_key], &empty_probe)
+                .expect("empty membership");
+            assert_eq!(mask.len(), 0);
+            assert!(mask.as_slice().is_empty());
+            assert_eq!(stats.lookup_hit_rows, 0);
+            assert_eq!(stats.lookup_miss_rows, 0);
+            assert_eq!(
+                map.lookup_membership(&arena, &[probe_key], &empty_probe)
+                    .expect("empty compat"),
+                Vec::<bool>::new()
+            );
+        }
     }
 
     #[test]
