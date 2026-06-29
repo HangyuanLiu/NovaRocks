@@ -11246,6 +11246,7 @@ fn run_imv_rewrite_for_refresh_explain(
 ) -> Result<crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome, String> {
     let (plan, factory) = plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
     let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
+    let next_column_id = factory_cell.borrow().peek_next_id();
     // Thread the active session's disable_optimizer_rules into IMV. When
     // refresh runs outside a user session (e.g. background scheduler),
     // the thread-local default is empty, so this is a safe no-op.
@@ -11259,7 +11260,7 @@ fn run_imv_rewrite_for_refresh_explain(
             disabled_rules,
             deadline: None,
             column_ref_factory: std::rc::Rc::clone(&factory_cell),
-            next_column_id: factory_cell.borrow().peek_next_id(),
+            next_column_id,
         },
     )
     .map_err(|e| format!("run_imv_rewrite: {e}"))?;
