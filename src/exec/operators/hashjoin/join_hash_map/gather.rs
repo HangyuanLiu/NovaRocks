@@ -24,8 +24,35 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::Chunk;
+use crate::runtime::profile::clamp_u128_to_i64;
 
 pub(crate) const MAX_JOIN_OUTPUT_ROWS_PER_BATCH: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GatherTimings {
+    pub(crate) build_ns: i64,
+    pub(crate) probe_ns: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct GatherBatches {
+    pub(crate) batches: Vec<RecordBatch>,
+    pub(crate) timings: GatherTimings,
+}
+
+impl GatherTimings {
+    fn add_build(&mut self, start: std::time::Instant) {
+        self.build_ns = self
+            .build_ns
+            .saturating_add(clamp_u128_to_i64(start.elapsed().as_nanos()));
+    }
+
+    fn add_probe(&mut self, start: std::time::Instant) {
+        self.probe_ns = self
+            .probe_ns
+            .saturating_add(clamp_u128_to_i64(start.elapsed().as_nanos()));
+    }
+}
 
 fn assert_columns_match_schema(
     output_schema: &SchemaRef,
@@ -133,6 +160,106 @@ pub(crate) fn gather_join_batches(
     Ok(batches)
 }
 
+pub(crate) fn gather_probe_build_batches(
+    probe: &Chunk,
+    build: &Chunk,
+    probe_indices: &[u32],
+    build_indices: &[u32],
+    output_schema: &SchemaRef,
+    probe_is_left: bool,
+    all_match_one: bool,
+) -> Result<GatherBatches, String> {
+    if probe_indices.len() != build_indices.len() {
+        return Err(format!(
+            "join index length mismatch: probe={} build={}",
+            probe_indices.len(),
+            build_indices.len()
+        ));
+    }
+    if probe_indices.is_empty() {
+        return Ok(GatherBatches {
+            batches: Vec::new(),
+            timings: GatherTimings::default(),
+        });
+    }
+
+    if all_match_one {
+        for (row, probe_row) in probe_indices.iter().enumerate() {
+            if *probe_row != row as u32 {
+                return Err(format!(
+                    "ALL_MATCH_ONE probe index mismatch: row={} probe_row={}",
+                    row, probe_row
+                ));
+            }
+        }
+    }
+
+    let mut batches = Vec::new();
+    let mut timings = GatherTimings::default();
+    let mut offset = 0usize;
+    while offset < probe_indices.len() {
+        let end = (offset + MAX_JOIN_OUTPUT_ROWS_PER_BATCH).min(probe_indices.len());
+        let row_count = end - offset;
+        let build_idx_array = UInt32Array::from(build_indices[offset..end].to_vec());
+        let build_idx_ref = Arc::new(build_idx_array) as ArrayRef;
+        let mut columns = Vec::with_capacity(probe.batch.num_columns() + build.batch.num_columns());
+        let take_probe_columns = |columns: &mut Vec<ArrayRef>,
+                                  timings: &mut GatherTimings|
+         -> Result<(), String> {
+            if all_match_one {
+                if probe.batch.num_columns() > 0 {
+                    let start = std::time::Instant::now();
+                    for col in probe.batch.columns() {
+                        columns.push(col.slice(offset, row_count));
+                    }
+                    timings.add_probe(start);
+                }
+            } else {
+                let probe_idx_array = UInt32Array::from(probe_indices[offset..end].to_vec());
+                let probe_idx_ref = Arc::new(probe_idx_array) as ArrayRef;
+                if probe.batch.num_columns() > 0 {
+                    let start = std::time::Instant::now();
+                    for col in probe.batch.columns() {
+                        columns.push(
+                            take(col.as_ref(), &probe_idx_ref, None).map_err(|e| e.to_string())?,
+                        );
+                    }
+                    timings.add_probe(start);
+                }
+            }
+            Ok(())
+        };
+        let take_build_columns = |columns: &mut Vec<ArrayRef>,
+                                  timings: &mut GatherTimings|
+         -> Result<(), String> {
+            if build.batch.num_columns() > 0 {
+                let start = std::time::Instant::now();
+                for col in build.batch.columns() {
+                    columns
+                        .push(take(col.as_ref(), &build_idx_ref, None).map_err(|e| e.to_string())?);
+                }
+                timings.add_build(start);
+            }
+            Ok(())
+        };
+
+        if probe_is_left {
+            take_probe_columns(&mut columns, &mut timings)?;
+            take_build_columns(&mut columns, &mut timings)?;
+        } else {
+            take_build_columns(&mut columns, &mut timings)?;
+            take_probe_columns(&mut columns, &mut timings)?;
+        }
+        batches.push(build_output_record_batch(
+            output_schema,
+            columns,
+            "join all-match-one output",
+        )?);
+        offset = end;
+    }
+    Ok(GatherBatches { batches, timings })
+}
+
 pub(crate) fn gather_left_with_null_right(
     left: &Chunk,
     left_indices: &[u32],
@@ -191,7 +318,7 @@ mod tests {
 
     use arrow::array::{Array, ArrayRef, Decimal128Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use arrow::record_batch::RecordBatch;
+    use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
@@ -229,11 +356,124 @@ mod tests {
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
+    fn empty_chunk(row_count: usize) -> Chunk {
+        let schema = Arc::new(Schema::empty());
+        let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+        let batch = RecordBatch::try_new_with_options(Arc::clone(&schema), Vec::new(), &options)
+            .expect("empty record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[])
+            .expect("empty chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
     fn join_schema(left_name: &str, right_name: &str) -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new(left_name, DataType::Int32, true),
             Field::new(right_name, DataType::Int32, true),
         ]))
+    }
+
+    fn int32_values(batch: &RecordBatch, column: usize) -> Vec<Option<i32>> {
+        let array = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 column");
+        (0..batch.num_rows())
+            .map(|row| {
+                if array.is_null(row) {
+                    None
+                } else {
+                    Some(array.value(row))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gather_probe_build_batches_directs_probe_when_all_match_one() {
+        let left = one_column_chunk("l", SlotId::new(1), vec![1, 2, 3]);
+        let right = one_column_chunk("r", SlotId::new(2), vec![10, 20, 30]);
+        let output_schema = join_schema("l", "r");
+        let probe_indices = vec![0, 1, 2];
+        let build_indices = vec![2, 0, 1];
+
+        let out = super::gather_probe_build_batches(
+            &left,
+            &right,
+            &probe_indices,
+            &build_indices,
+            &output_schema,
+            true,
+            true,
+        )
+        .expect("gather");
+
+        assert_eq!(out.batches.len(), 1);
+        assert_eq!(out.batches[0].num_rows(), 3);
+        assert_eq!(
+            int32_values(&out.batches[0], 0),
+            vec![Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(
+            int32_values(&out.batches[0], 1),
+            vec![Some(30), Some(10), Some(20)]
+        );
+    }
+
+    #[test]
+    fn gather_probe_build_batches_preserves_output_order_when_probe_is_right() {
+        let probe = one_column_chunk("r", SlotId::new(2), vec![10, 20, 30]);
+        let build = one_column_chunk("l", SlotId::new(1), vec![1, 2, 3]);
+        let output_schema = join_schema("l", "r");
+        let probe_indices = vec![0, 1, 2];
+        let build_indices = vec![2, 0, 1];
+
+        let out = super::gather_probe_build_batches(
+            &probe,
+            &build,
+            &probe_indices,
+            &build_indices,
+            &output_schema,
+            false,
+            true,
+        )
+        .expect("gather");
+
+        assert_eq!(out.batches.len(), 1);
+        assert_eq!(out.batches[0].num_rows(), 3);
+        assert_eq!(
+            int32_values(&out.batches[0], 0),
+            vec![Some(3), Some(1), Some(2)]
+        );
+        assert_eq!(
+            int32_values(&out.batches[0], 1),
+            vec![Some(10), Some(20), Some(30)]
+        );
+    }
+
+    #[test]
+    fn gather_probe_build_batches_does_not_charge_empty_build_side_when_all_match_one() {
+        let probe = one_column_chunk("l", SlotId::new(1), vec![1, 2, 3]);
+        let build = empty_chunk(3);
+        let output_schema = Arc::new(Schema::new(vec![Field::new("l", DataType::Int32, true)]));
+        let probe_indices = vec![0, 1, 2];
+        let build_indices = vec![0, 1, 2];
+
+        let out = super::gather_probe_build_batches(
+            &probe,
+            &build,
+            &probe_indices,
+            &build_indices,
+            &output_schema,
+            true,
+            true,
+        )
+        .expect("gather");
+
+        assert_eq!(out.batches.len(), 1);
+        assert_eq!(out.batches[0].num_rows(), 3);
+        assert_eq!(out.timings.build_ns, 0);
     }
 
     #[test]

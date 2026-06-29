@@ -312,8 +312,9 @@ impl PartitionedJoinProbeProcessorOperator {
                 .common
                 .add_info_string("DistributionMode", "PARTITIONED");
             let search = profile.common.add_timer("SearchHashTableTime");
-            let output = profile.common.add_timer("OutputColumnTime");
-            self.core.set_phase_timers(search, output);
+            let out_build = profile.common.add_timer("OutputBuildColumnTime");
+            let out_probe = profile.common.add_timer("OutputProbeColumnTime");
+            self.core.set_phase_timers(search, out_build, out_probe);
         }
     }
 }

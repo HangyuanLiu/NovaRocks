@@ -138,6 +138,24 @@ impl ProbeMask {
         Ok(())
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.keep.len()
+    }
+
+    pub(crate) fn count_true(&self) -> usize {
+        self.keep.iter().filter(|value| **value).count()
+    }
+
+    pub(crate) fn selected_rows(&self, value: bool) -> Vec<u32> {
+        self.keep
+            .iter()
+            .enumerate()
+            .filter_map(|(row, keep)| {
+                (*keep == value).then(|| u32::try_from(row).expect("join probe row id exceeds u32"))
+            })
+            .collect()
+    }
+
     pub(crate) fn as_slice(&self) -> &[bool] {
         &self.keep
     }
@@ -185,6 +203,18 @@ mod tests {
         mask.set(1, true).expect("set");
 
         assert_eq!(mask.as_slice(), &[false, true, false]);
+    }
+
+    #[test]
+    fn probe_mask_counts_and_selects_rows() {
+        let mut mask = ProbeMask::new(4, false);
+        mask.set(0, true).expect("set 0");
+        mask.set(3, true).expect("set 3");
+
+        assert_eq!(mask.len(), 4);
+        assert_eq!(mask.count_true(), 2);
+        assert_eq!(mask.selected_rows(true), vec![0, 3]);
+        assert_eq!(mask.selected_rows(false), vec![1, 2]);
     }
 
     #[test]

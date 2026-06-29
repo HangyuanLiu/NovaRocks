@@ -6721,7 +6721,8 @@ enable_path_style_access = true
         assert!(text.contains("act={rows="), "{text}");
         // W0': join node act trailer includes phase timing from probe/build sides.
         assert!(text.contains("search="), "{text}");
-        assert!(text.contains("output="), "{text}");
+        assert!(text.contains("out_build="), "{text}");
+        assert!(text.contains("out_probe="), "{text}");
         assert!(text.contains("build_ht="), "{text}");
         // W0'b: per-fragment active/blocked Profile line under each PLAN FRAGMENT header.
         assert!(text.contains("Profile: active="), "{text}");
