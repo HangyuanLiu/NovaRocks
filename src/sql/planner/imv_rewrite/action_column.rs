@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use arrow::datatypes::DataType;
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
-use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn};
+use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -21,6 +21,8 @@ use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal}
 use crate::sql::planner::imv_rewrite::action_propagation::{
     first_delta_base_fqn, is_supported_branch_union, is_supported_fan_in_delta_union,
 };
+use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 use crate::sql::planner::imv_rewrite::join_delta_shape::{
     is_supported_join_delta_branch, is_supported_join_delta_union,
 };
@@ -98,7 +100,11 @@ impl LogicalRewriteRule for ActionColumnValidationRule {
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
         let plan = opt_expr_to_plan(expr, ctx);
-        match validate(&plan) {
+        let change_stream = ctx
+            .extension::<ImvExtension>()
+            .map(|ext| ext.annotation.change_stream.clone())
+            .unwrap_or_default();
+        match validate_with_change_stream(&plan, &change_stream) {
             Ok(()) => Ok(RewriteResult::Unchanged),
             Err(message) => Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
                 "ActionColumnValidation",
@@ -109,6 +115,23 @@ impl LogicalRewriteRule for ActionColumnValidationRule {
 }
 
 fn validate(plan: &LogicalPlanNode) -> Result<(), String> {
+    validate_with_change_stream(plan, &ImvChangeStreamDescriptor::default())
+}
+
+fn validate_with_change_stream(
+    plan: &LogicalPlanNode,
+    change_stream: &ImvChangeStreamDescriptor,
+) -> Result<(), String> {
+    if change_stream.has_aggregate() {
+        if !has_visible_output(plan) {
+            return Err(
+                "root plan has no user-visible output; action column or other internal column may have leaked"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+
     validate_node(plan)?;
     // V4: root visible output must not be empty
     if !has_visible_output(plan) {
@@ -119,7 +142,6 @@ fn validate(plan: &LogicalPlanNode) -> Result<(), String> {
     }
     // V6: if a delta subtree exists, root output must carry the apply key.
     if !matches!(&plan.kind, PlanNodeKind::AggregateStateMerge(_))
-        && !is_aggregate_change_stream_plan(plan)
         && !(matches!(&plan.kind, PlanNodeKind::Union(_)) && is_supported_branch_union(plan))
         && subtree_has_delta(plan)
         && !output_has_apply_key(plan)
@@ -137,9 +159,6 @@ fn validate(plan: &LogicalPlanNode) -> Result<(), String> {
 // UnresolvedMarkerCheckRule precedes ActionColumnValidation in the
 // imv-validation stage and rejects any surviving marker.
 fn validate_node(plan: &LogicalPlanNode) -> Result<(), String> {
-    if is_aggregate_change_stream_plan(plan) {
-        return Ok(());
-    }
     match &plan.kind {
         PlanNodeKind::Scan(scan) => validate_scan(scan),
         PlanNodeKind::Filter(_) => validate_node(plan.unary_input()),
@@ -221,103 +240,6 @@ fn validate_node(plan: &LogicalPlanNode) -> Result<(), String> {
             ))
         }
         _ => Ok(()),
-    }
-}
-
-fn is_aggregate_change_stream_plan(plan: &LogicalPlanNode) -> bool {
-    match &plan.kind {
-        PlanNodeKind::Union(_) => {
-            has_change_stream_union_output(plan)
-                && contains_target_state_scan(plan)
-                && contains_signed_state_aggregate(plan)
-        }
-        PlanNodeKind::CTEAnchor(_) if plan.children.len() == 2 => {
-            has_change_stream_union_output(plan.child(1))
-                && contains_target_state_scan(plan.child(0))
-                && contains_signed_state_aggregate(plan.child(0))
-        }
-        PlanNodeKind::Project(_) => {
-            has_change_stream_project_output(plan) && is_branch_marker_change_stream(plan)
-        }
-        _ => false,
-    }
-}
-
-fn has_change_stream_union_output(plan: &LogicalPlanNode) -> bool {
-    matches!(
-        &plan.kind,
-        PlanNodeKind::Union(union)
-            if union
-                .output_columns
-                .iter()
-                .any(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
-    )
-}
-
-fn has_change_stream_project_output(plan: &LogicalPlanNode) -> bool {
-    matches!(
-        &plan.kind,
-        PlanNodeKind::Project(project)
-            if project
-                .items
-                .iter()
-                .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
-    )
-}
-
-fn is_branch_marker_change_stream(plan: &LogicalPlanNode) -> bool {
-    let PlanNodeKind::Project(_) = &plan.kind else {
-        return false;
-    };
-    let filter = plan.unary_input();
-    let PlanNodeKind::Filter(_) = &filter.kind else {
-        return false;
-    };
-    let expanded = filter.unary_input();
-    let PlanNodeKind::Join(join) = &expanded.kind else {
-        return false;
-    };
-    if join.join_type != JoinKind::Cross || expanded.children.len() != 2 {
-        return false;
-    }
-
-    let left = expanded.left();
-    let right = expanded.right();
-    let (core, marker) = if is_change_branch_values(left) {
-        (right, left)
-    } else if is_change_branch_values(right) {
-        (left, right)
-    } else {
-        return false;
-    };
-    let _ = marker;
-    contains_target_state_scan(core) && contains_signed_state_aggregate(core)
-}
-
-fn is_change_branch_values(plan: &LogicalPlanNode) -> bool {
-    matches!(
-        &plan.kind,
-        PlanNodeKind::Values(values)
-            if values
-                .columns
-                .iter()
-                .any(|column| column.name.eq_ignore_ascii_case("__imv_change_branch"))
-    )
-}
-
-fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
-    match &plan.kind {
-        PlanNodeKind::Scan(scan) => {
-            matches!(scan.table.source, ScanSource::IcebergMvTargetState(_))
-        }
-        _ => plan.children.iter().any(contains_target_state_scan),
-    }
-}
-
-fn contains_signed_state_aggregate(plan: &LogicalPlanNode) -> bool {
-    match &plan.kind {
-        PlanNodeKind::Aggregate(node) => is_signed_state_aggregate(node),
-        _ => plan.children.iter().any(contains_signed_state_aggregate),
     }
 }
 
@@ -543,6 +465,10 @@ mod tests {
     use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, ProjectItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::imv_rewrite::change_stream::{
+        AggregateChangeStreamDescriptor, AggregateChangeStreamShape, ImvChangeStreamDescriptor,
+        SignedStateAggregateProof, TargetStateProof,
+    };
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalJoinNode,
@@ -1292,11 +1218,10 @@ mod tests {
         scan
     }
 
-    #[test]
-    fn validation_rejects_missing_apply_key_above_delta() {
+    fn project_without_apply_key_above_delta() -> LogicalPlanNode {
         // Project carries k + __change_op + _row_id but NOT __nova_base_row_id.
         let scan = delta_scan_with_action_and_row_id();
-        let project = LogicalPlanNode::new(
+        LogicalPlanNode::new(
             PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![
                     ProjectItem {
@@ -1344,10 +1269,32 @@ mod tests {
             }),
             vec![scan_plan(scan)],
             None,
-        );
+        )
+    }
+
+    #[test]
+    fn validation_rejects_missing_apply_key_above_delta() {
+        let project = project_without_apply_key_above_delta();
         let err = validate(&project).expect_err("missing apply key must fail");
         assert!(err.contains("apply key"), "got: {err}");
         assert!(err.contains("ice.db.b"), "got: {err}");
+    }
+
+    #[test]
+    fn validation_uses_descriptor_for_aggregate_change_stream_bypass() {
+        let project = project_without_apply_key_above_delta();
+        let descriptor = ImvChangeStreamDescriptor {
+            aggregate: Some(AggregateChangeStreamDescriptor {
+                action_column_id: ColumnId(100),
+                action_column_name: ImvActionColumn::NAME.to_string(),
+                shape: AggregateChangeStreamShape::RelationalChangeStream,
+                target_state: TargetStateProof { present: false },
+                signed_state_aggregate: SignedStateAggregateProof { present: false },
+            }),
+        };
+
+        validate_with_change_stream(&project, &descriptor)
+            .expect("aggregate change-stream descriptor should own this semantic bypass");
     }
 
     #[test]

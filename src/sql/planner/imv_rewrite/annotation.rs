@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::engine::mv::partition::PartitionDerivationSpec;
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
+use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 
 /// IMV-pipeline-level plan annotations, populated by rewrite rules and
 /// returned to the refresh driver via `ImvRewriteOutcome.annotation`.
@@ -17,6 +18,9 @@ pub(crate) struct ImvPlanAnnotation {
     /// not run or did not match (non-aggregate shapes in P1, or the rule was
     /// disabled via `disable_optimizer_rules`).
     pub partition: Option<ImvPartitionAnnotation>,
+    /// Aggregate change-stream semantic descriptor produced by the IMV rewrite
+    /// pipeline and consumed by downstream validation/annotation rules.
+    pub change_stream: ImvChangeStreamDescriptor,
 }
 
 /// Plan-time partition derivation outcome (umbrella spec §4.2).
@@ -48,6 +52,12 @@ mod tests {
     fn default_annotation_has_no_partition_outcome() {
         let annotation = ImvPlanAnnotation::default();
         assert!(annotation.partition.is_none());
+    }
+
+    #[test]
+    fn default_annotation_has_empty_change_stream_descriptor() {
+        let annotation = ImvPlanAnnotation::default();
+        assert!(!annotation.change_stream.has_aggregate());
     }
 }
 

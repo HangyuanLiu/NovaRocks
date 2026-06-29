@@ -1,7 +1,6 @@
 use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem};
-use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -9,6 +8,8 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
+use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 use crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column;
 use crate::sql::planner::imv_rewrite::marker::ImvVersionRef;
 use crate::sql::planner::imv_rewrite::target_locator::is_target_locator_join;
@@ -360,76 +361,26 @@ pub(crate) struct UnsupportedJoinKindCheckRule;
 
 /// Returns true if `plan` contains any Join node whose kind is not supported
 /// for incremental delta rewrite (i.e., anything other than Inner/Cross).
-fn plan_contains_unsupported_join(plan: &LogicalPlanNode) -> bool {
-    if is_aggregate_change_stream_union(plan) {
+fn plan_contains_unsupported_join(
+    plan: &LogicalPlanNode,
+    change_stream: &ImvChangeStreamDescriptor,
+) -> bool {
+    if change_stream.covers_aggregate_validation_root(plan) {
         return false;
     }
     match &plan.kind {
         PlanNodeKind::Join(join) => {
-            if !is_aggregate_change_stream_merge_join(plan)
-                && !is_target_locator_join(plan)
-                && !join_delta_kind_supported(join.join_type)
-            {
+            if !is_target_locator_join(plan) && !join_delta_kind_supported(join.join_type) {
                 return true;
             }
-            plan.children.iter().any(plan_contains_unsupported_join)
-        }
-        _ => plan.children.iter().any(plan_contains_unsupported_join),
-    }
-}
-
-fn is_aggregate_change_stream_merge_join(plan: &LogicalPlanNode) -> bool {
-    matches!(&plan.kind, PlanNodeKind::Join(_))
-        && contains_target_state_scan(plan)
-        && contains_signed_state_aggregate(plan)
-}
-
-fn is_aggregate_change_stream_union(plan: &LogicalPlanNode) -> bool {
-    match &plan.kind {
-        PlanNodeKind::Union(_) => {
-            has_change_stream_union_output(plan)
-                && contains_target_state_scan(plan)
-                && contains_signed_state_aggregate(plan)
-        }
-        PlanNodeKind::CTEAnchor(_) if plan.children.len() == 2 => {
-            has_change_stream_union_output(plan.child(1))
-                && contains_target_state_scan(plan.child(0))
-                && contains_signed_state_aggregate(plan.child(0))
-        }
-        _ => false,
-    }
-}
-
-fn has_change_stream_union_output(plan: &LogicalPlanNode) -> bool {
-    matches!(
-        &plan.kind,
-        PlanNodeKind::Union(union)
-            if union
-                .output_columns
+            plan.children
                 .iter()
-                .any(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
-    )
-}
-
-fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
-    match &plan.kind {
-        PlanNodeKind::Scan(scan) => {
-            matches!(scan.table.source, ScanSource::IcebergMvTargetState(_))
+                .any(|child| plan_contains_unsupported_join(child, change_stream))
         }
-        _ => plan.children.iter().any(contains_target_state_scan),
-    }
-}
-
-fn contains_signed_state_aggregate(plan: &LogicalPlanNode) -> bool {
-    match &plan.kind {
-        PlanNodeKind::Aggregate(node) => {
-            !node.aggregates.is_empty()
-                && node
-                    .aggregates
-                    .iter()
-                    .any(|call| call.name.ends_with("_state_signed"))
-        }
-        _ => plan.children.iter().any(contains_signed_state_aggregate),
+        _ => plan
+            .children
+            .iter()
+            .any(|child| plan_contains_unsupported_join(child, change_stream)),
     }
 }
 
@@ -447,8 +398,12 @@ impl LogicalRewriteRule for UnsupportedJoinKindCheckRule {
     }
 
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let change_stream = ctx
+            .extension::<ImvExtension>()
+            .map(|ext| ext.annotation.change_stream.clone())
+            .unwrap_or_default();
         let plan = opt_expr_to_plan(expr.clone(), ctx);
-        plan_contains_unsupported_join(&plan)
+        plan_contains_unsupported_join(&plan, &change_stream)
     }
 
     fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -476,6 +431,10 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::planner::imv_rewrite::change_stream::{
+        AggregateChangeStreamDescriptor, AggregateChangeStreamShape, ImvChangeStreamDescriptor,
+        SignedStateAggregateProof, TargetStateProof,
+    };
     use crate::sql::planner::imv_rewrite::marker::ImvVersionRef;
     use crate::sql::planner::imv_rewrite::scan_binding::ImvVersionRole;
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
@@ -1066,6 +1025,43 @@ mod tests {
         assert!(
             matches!(result, RewriteResult::Rejected(_)),
             "UnsupportedJoinKindCheckRule must return Rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn validation_does_not_use_descriptor_as_global_join_bypass() {
+        let plan = LogicalPlanNode::new(
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                is_root: false,
+                action_column: Some(ColumnId(100)),
+                branch_scope: None,
+            }),
+            vec![join_over(JoinKind::LeftOuter)],
+            None,
+        );
+
+        let mut ctx = build_ctx();
+        let mut ext = ctx
+            .extension::<ImvExtension>()
+            .expect("test context should install ImvExtension")
+            .clone();
+        ext.annotation.change_stream = ImvChangeStreamDescriptor {
+            aggregate: Some(AggregateChangeStreamDescriptor {
+                action_column_id: ColumnId(100),
+                action_column_name: ImvActionColumn::NAME.to_string(),
+                shape: AggregateChangeStreamShape::RelationalChangeStream,
+                target_state: TargetStateProof { present: true },
+                signed_state_aggregate: SignedStateAggregateProof { present: true },
+            }),
+        };
+        ctx.set_extension::<ImvExtension>(ext);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+
+        let rule = super::UnsupportedJoinKindCheckRule;
+        assert!(
+            rule.matches(&expr, &ctx),
+            "aggregate change-stream descriptor must only suppress joins under the descriptor root"
         );
     }
 }
