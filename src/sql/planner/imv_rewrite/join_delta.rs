@@ -463,8 +463,6 @@ impl LogicalRewriteRule for UnsupportedJoinKindCheckRule {
 mod tests {
     use crate::sql::planner::plan::*;
     use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
 
     use arrow::datatypes::DataType;
 
@@ -776,7 +774,6 @@ mod tests {
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
-            next_column_id: Arc::new(AtomicU32::new(100)),
         });
         ctx
     }

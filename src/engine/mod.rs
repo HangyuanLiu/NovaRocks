@@ -3633,7 +3633,6 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     if let Some(mv_ctx) = mv_refresh_ctx {
         logical = crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical);
         let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
-        let next_column_id = factory_cell.borrow().peek_next_id();
         let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
             crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
                 plan: logical,
@@ -3644,7 +3643,6 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
                 mv_ctx: std::sync::Arc::clone(&mv_ctx.rewrite),
                 deadline: None,
                 column_ref_factory: std::rc::Rc::clone(&factory_cell),
-                next_column_id,
             },
         )
         .map_err(|e| format!("imv rewrite: {e}"))?;
@@ -3654,7 +3652,6 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         factory = std::rc::Rc::try_unwrap(factory_cell)
             .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
             .into_inner();
-        factory.reserve_until(outcome.next_column_id);
         logical = outcome.plan;
     } else if imv_rewrite_validator.is_some() {
         return Err("IMV rewrite validator requires MV refresh context".to_string());
