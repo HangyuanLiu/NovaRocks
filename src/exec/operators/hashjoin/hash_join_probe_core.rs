@@ -40,7 +40,7 @@ use super::build_artifact::{BuildView, JoinBuildArtifact};
 #[cfg(test)]
 use super::build_requirements;
 use super::build_requirements::{BuildComponentRequirements, required_build_components};
-use super::join_hash_map::finalize::{finalize_probe_rows, mark_build_matches};
+use super::join_hash_map::finalize::{finalize_probe_rows, is_all_match_one, mark_build_matches};
 use super::join_hash_map::match_flags::BuildMatchFlags;
 use super::join_hash_map::method::JoinHashMap;
 use super::join_hash_map::search::{JoinSelection, SearchStats, append_cross_selection};
@@ -912,13 +912,16 @@ impl HashJoinProbeCore {
                     continue;
                 }
                 let output_start = std::time::Instant::now();
+                let all_match_one = is_all_match_one(&selection, probe.len());
                 let batches =
-                    crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batches(
+                    crate::exec::operators::hashjoin::join_hash_map::gather::gather_probe_build_batches(
                         &probe,
-                        &build_chunk,
+                        build_chunk.as_ref(),
                         &selection.probe,
                         &selection.build,
                         &output_schema,
+                        self.probe_is_left,
+                        all_match_one,
                     )?;
                 self.record_output_ns(output_start);
                 output_batches.extend(batches);
@@ -1043,23 +1046,17 @@ impl HashJoinProbeCore {
             }
             if !selection.is_empty() {
                 let output_start = std::time::Instant::now();
-                let batches = if self.probe_is_left {
-                    crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batches(
+                let all_match_one = is_all_match_one(&selection, probe.len());
+                let batches =
+                    crate::exec::operators::hashjoin::join_hash_map::gather::gather_probe_build_batches(
                         &probe,
-                        build_chunk,
+                        build_chunk.as_ref(),
                         &selection.probe,
                         &selection.build,
                         &output_schema,
-                    )?
-                } else {
-                    crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batches(
-                        build_chunk,
-                        &probe,
-                        &selection.build,
-                        &selection.probe,
-                        &output_schema,
-                    )?
-                };
+                        self.probe_is_left,
+                        all_match_one,
+                    )?;
                 self.record_output_ns(output_start);
                 output_batches.extend(batches);
             }
@@ -1958,6 +1955,28 @@ mod tests {
             .expect("cross join probe")
             .expect("cross join output");
         assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn all_match_one_is_decided_after_residual_compaction() {
+        let selection = crate::exec::operators::hashjoin::join_hash_map::search::JoinSelection {
+            probe: vec![0, 0, 1],
+            build: vec![2, 0, 1],
+        };
+        assert!(
+            !crate::exec::operators::hashjoin::join_hash_map::finalize::is_all_match_one(
+                &selection, 2
+            )
+        );
+        let compacted = crate::exec::operators::hashjoin::join_hash_map::search::JoinSelection {
+            probe: vec![0, 1],
+            build: vec![2, 1],
+        };
+        assert!(
+            crate::exec::operators::hashjoin::join_hash_map::finalize::is_all_match_one(
+                &compacted, 2
+            )
+        );
     }
 
     #[test]

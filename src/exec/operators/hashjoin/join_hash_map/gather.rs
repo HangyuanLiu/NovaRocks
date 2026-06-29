@@ -133,6 +133,73 @@ pub(crate) fn gather_join_batches(
     Ok(batches)
 }
 
+pub(crate) fn gather_probe_build_batches(
+    probe: &Chunk,
+    build: &Chunk,
+    probe_indices: &[u32],
+    build_indices: &[u32],
+    output_schema: &SchemaRef,
+    probe_is_left: bool,
+    all_match_one: bool,
+) -> Result<Vec<RecordBatch>, String> {
+    if probe_indices.len() != build_indices.len() {
+        return Err(format!(
+            "join index length mismatch: probe={} build={}",
+            probe_indices.len(),
+            build_indices.len()
+        ));
+    }
+    if probe_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !all_match_one {
+        return if probe_is_left {
+            gather_join_batches(probe, build, probe_indices, build_indices, output_schema)
+        } else {
+            gather_join_batches(build, probe, build_indices, probe_indices, output_schema)
+        };
+    }
+    for (row, probe_row) in probe_indices.iter().enumerate() {
+        if *probe_row != row as u32 {
+            return Err(format!(
+                "ALL_MATCH_ONE probe index mismatch: row={} probe_row={}",
+                row, probe_row
+            ));
+        }
+    }
+
+    let mut batches = Vec::new();
+    let mut offset = 0usize;
+    while offset < probe_indices.len() {
+        let end = (offset + MAX_JOIN_OUTPUT_ROWS_PER_BATCH).min(probe_indices.len());
+        let build_idx_array = UInt32Array::from(build_indices[offset..end].to_vec());
+        let build_idx_ref = Arc::new(build_idx_array) as ArrayRef;
+        let mut columns = Vec::with_capacity(probe.batch.num_columns() + build.batch.num_columns());
+        if probe_is_left {
+            for col in probe.batch.columns() {
+                columns.push(col.slice(offset, end - offset));
+            }
+            for col in build.batch.columns() {
+                columns.push(take(col.as_ref(), &build_idx_ref, None).map_err(|e| e.to_string())?);
+            }
+        } else {
+            for col in build.batch.columns() {
+                columns.push(take(col.as_ref(), &build_idx_ref, None).map_err(|e| e.to_string())?);
+            }
+            for col in probe.batch.columns() {
+                columns.push(col.slice(offset, end - offset));
+            }
+        }
+        batches.push(build_output_record_batch(
+            output_schema,
+            columns,
+            "join all-match-one output",
+        )?);
+        offset = end;
+    }
+    Ok(batches)
+}
+
 pub(crate) fn gather_left_with_null_right(
     left: &Chunk,
     left_indices: &[u32],
@@ -234,6 +301,48 @@ mod tests {
             Field::new(left_name, DataType::Int32, true),
             Field::new(right_name, DataType::Int32, true),
         ]))
+    }
+
+    fn int32_values(batch: &RecordBatch, column: usize) -> Vec<Option<i32>> {
+        let array = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 column");
+        (0..batch.num_rows())
+            .map(|row| {
+                if array.is_null(row) {
+                    None
+                } else {
+                    Some(array.value(row))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gather_probe_build_batches_directs_probe_when_all_match_one() {
+        let left = one_column_chunk("l", SlotId::new(1), vec![1, 2, 3]);
+        let right = one_column_chunk("r", SlotId::new(2), vec![10, 20, 30]);
+        let output_schema = join_schema("l", "r");
+        let probe_indices = vec![0, 1, 2];
+        let build_indices = vec![2, 0, 1];
+
+        let out = super::gather_probe_build_batches(
+            &left,
+            &right,
+            &probe_indices,
+            &build_indices,
+            &output_schema,
+            true,
+            true,
+        )
+        .expect("gather");
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].num_rows(), 3);
+        assert_eq!(int32_values(&out[0], 0), vec![Some(1), Some(2), Some(3)]);
+        assert_eq!(int32_values(&out[0], 1), vec![Some(30), Some(10), Some(20)]);
     }
 
     #[test]
