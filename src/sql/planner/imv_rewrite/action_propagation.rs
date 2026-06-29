@@ -30,7 +30,7 @@ use crate::sql::planner::plan::{LogicalAggregateNode, LogicalPlanNode, PlanNodeK
 
 /// Returns true iff the plan's effective output schema contains the IMV
 /// action column. Used by `matches()` predicates and validation.
-pub(crate) fn output_has_action_column(plan: &LogicalPlanNode) -> bool {
+fn output_has_action_column(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
         PlanNodeKind::Scan(scan) => scan.columns.iter().any(ImvActionColumn::matches),
         PlanNodeKind::Filter(_) => output_has_action_column(plan.unary_input()),
@@ -59,7 +59,7 @@ pub(crate) fn output_has_action_column(plan: &LogicalPlanNode) -> bool {
 
 /// Returns the action column descriptor from the first descendant Scan/Project
 /// in the subtree that exposes one, or `None` if no descendant carries it.
-pub(crate) fn find_action_column(plan: &LogicalPlanNode) -> Option<OutputColumn> {
+fn first_propagated_action_column(plan: &LogicalPlanNode) -> Option<OutputColumn> {
     match &plan.kind {
         PlanNodeKind::Scan(scan) => scan
             .columns
@@ -67,23 +67,22 @@ pub(crate) fn find_action_column(plan: &LogicalPlanNode) -> Option<OutputColumn>
             .find(|c| ImvActionColumn::matches(c))
             .cloned(),
         PlanNodeKind::Filter(_) | PlanNodeKind::Project(_) => {
-            find_action_column(plan.unary_input())
+            first_propagated_action_column(plan.unary_input())
         }
         PlanNodeKind::Union(node) => node
             .output_columns
             .iter()
             .find(|c| ImvActionColumn::matches(c))
             .cloned(),
-        PlanNodeKind::AggregateStateMerge(_) => {
-            find_action_column(plan.child(0)).or_else(|| find_action_column(plan.child(1)))
-        }
+        PlanNodeKind::AggregateStateMerge(_) => first_propagated_action_column(plan.child(0))
+            .or_else(|| first_propagated_action_column(plan.child(1))),
         _ => None,
     }
 }
 
 /// Whether any descendant of the plan exposes an action column.
-pub(crate) fn subtree_has_action_column(plan: &LogicalPlanNode) -> bool {
-    if is_aggregate_change_stream_union(plan) {
+fn subtree_has_action_column(plan: &LogicalPlanNode) -> bool {
+    if is_change_stream_propagation_boundary(plan) {
         return false;
     }
     if matches!(&plan.kind, PlanNodeKind::Aggregate(node) if is_signed_state_aggregate(node)) {
@@ -160,16 +159,16 @@ fn is_hidden_retraction_count_call(call: &crate::sql::planner::plan::AggregateCa
         )
 }
 
-fn is_aggregate_change_stream_union(plan: &LogicalPlanNode) -> bool {
+fn is_change_stream_propagation_boundary(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
         PlanNodeKind::Union(_) => {
-            (has_change_stream_union_output(plan)
+            (union_outputs_action_column(plan)
                 && contains_target_state_scan(plan)
                 && contains_signed_state_aggregate(plan))
-                || is_aggregate_change_stream_cte_consumer_union(plan)
+                || is_cte_consumer_change_stream_boundary(plan)
         }
         PlanNodeKind::CTEAnchor(_) if plan.children.len() == 2 => {
-            has_change_stream_union_output(plan.child(1))
+            union_outputs_action_column(plan.child(1))
                 && contains_target_state_scan(plan.child(0))
                 && contains_signed_state_aggregate(plan.child(0))
         }
@@ -177,24 +176,24 @@ fn is_aggregate_change_stream_union(plan: &LogicalPlanNode) -> bool {
     }
 }
 
-fn is_aggregate_change_stream_cte_consumer_union(plan: &LogicalPlanNode) -> bool {
+fn is_cte_consumer_change_stream_boundary(plan: &LogicalPlanNode) -> bool {
     matches!(&plan.kind, PlanNodeKind::Union(_))
-        && has_change_stream_union_output(plan)
+        && union_outputs_action_column(plan)
         && !plan.children.is_empty()
-        && plan.children.iter().all(change_stream_branch_consumes_cte)
+        && plan.children.iter().all(branch_consumes_cte)
 }
 
-fn change_stream_branch_consumes_cte(plan: &LogicalPlanNode) -> bool {
+fn branch_consumes_cte(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
         PlanNodeKind::Project(_) | PlanNodeKind::Filter(_) => {
-            change_stream_branch_consumes_cte(plan.unary_input())
+            branch_consumes_cte(plan.unary_input())
         }
         PlanNodeKind::CTEConsume(_) => true,
         _ => false,
     }
 }
 
-fn has_change_stream_union_output(plan: &LogicalPlanNode) -> bool {
+fn union_outputs_action_column(plan: &LogicalPlanNode) -> bool {
     matches!(
         &plan.kind,
         PlanNodeKind::Union(union)
@@ -323,7 +322,7 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                     && !is_supported_join_delta_branch(&plan)
             }
             PlanNodeKind::Union(_) => {
-                if is_aggregate_change_stream_union(&plan) {
+                if is_change_stream_propagation_boundary(&plan) {
                     false
                 } else if branch_delta_union_needs_row_id_output(&plan) {
                     true
@@ -1848,8 +1847,8 @@ mod tests {
         // Filter itself must not match (schema-passthrough, no work).
         let filter_expr = logical_plan_to_opt_expr(&filter, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&filter_expr, &ctx));
-        // find_action_column traverses the Filter to the Scan.
-        assert!(find_action_column(&filter).is_some());
+        // first_propagated_action_column traverses the Filter to the Scan.
+        assert!(first_propagated_action_column(&filter).is_some());
         // Project over the Filter propagates the action column.
         let project = project_over(filter, ColumnId(1));
         let project_expr = logical_plan_to_opt_expr(&project, &mut arena_rc.borrow_mut());

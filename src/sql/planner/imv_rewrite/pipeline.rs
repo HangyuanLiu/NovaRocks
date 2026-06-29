@@ -2,7 +2,8 @@
 //!
 //! Stages run in order: logical normalize, delta marker, branch union, union
 //! delta, aggregate state, delta pushdown, scan binding, action propagation,
-//! apply key, target locator, partition derivation, marker cleanup, validation.
+//! apply key, target locator, change-stream descriptor, partition derivation,
+//! marker cleanup, validation.
 //! Each stage's name is part of the trace contract and is asserted in pipeline
 //! tests.
 
@@ -16,6 +17,9 @@ use crate::sql::planner::imv_rewrite::action_propagation::{
 use crate::sql::planner::imv_rewrite::aggregate_rewrite::RewriteAggregateStateRule;
 use crate::sql::planner::imv_rewrite::apply_key::InjectApplyKeyProjectRule;
 use crate::sql::planner::imv_rewrite::branch_union::RewriteBranchUnionRule;
+use crate::sql::planner::imv_rewrite::change_stream::{
+    BuildChangeStreamDescriptorRule, ValidateChangeStreamDescriptorRule,
+};
 use crate::sql::planner::imv_rewrite::delta_pushdown::PushDeltaThroughUnaryRule;
 use crate::sql::planner::imv_rewrite::join_delta::{
     RewriteJoinDeltaRule, UnsupportedJoinKindCheckRule,
@@ -92,6 +96,11 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             vec![Box::new(InjectTargetLocatorJoinRule::new()) as Box<dyn LogicalRewriteRule>],
         ),
         RewriteStage::new(
+            "imv-change-stream-descriptor",
+            RewritePhase::SemanticRewrite,
+            vec![Box::new(BuildChangeStreamDescriptorRule::new()) as Box<dyn LogicalRewriteRule>],
+        ),
+        RewriteStage::new(
             "imv-partition-derivation",
             RewritePhase::SemanticRewrite,
             vec![Box::new(DerivePartitionSpecRule) as Box<dyn LogicalRewriteRule>],
@@ -105,6 +114,7 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             "imv-validation",
             RewritePhase::Validation,
             vec![
+                Box::new(ValidateChangeStreamDescriptorRule::new()) as Box<dyn LogicalRewriteRule>,
                 Box::new(UnresolvedMarkerCheckRule) as Box<dyn LogicalRewriteRule>,
                 Box::new(ActionColumnValidationRule::new()),
                 Box::new(UnsupportedJoinKindCheckRule) as Box<dyn LogicalRewriteRule>,
@@ -148,6 +158,49 @@ mod tests {
             p.rule_names().iter().any(|n| *n == "DerivePartitionSpec"),
             "DerivePartitionSpec must be registered"
         );
+    }
+
+    #[test]
+    fn pipeline_runs_change_stream_descriptor_after_target_locator_before_partition_derivation() {
+        let p = build_imv_pipeline();
+        let names = p.stage_names();
+        let locator = names
+            .iter()
+            .position(|n| *n == "imv-target-locator")
+            .expect("imv-target-locator stage must exist");
+        let descriptor = names
+            .iter()
+            .position(|n| *n == "imv-change-stream-descriptor")
+            .expect("imv-change-stream-descriptor stage must exist");
+        let partition = names
+            .iter()
+            .position(|n| *n == "imv-partition-derivation")
+            .expect("imv-partition-derivation stage must exist");
+        assert!(
+            locator < descriptor && descriptor < partition,
+            "stage order: {names:?}"
+        );
+        assert!(
+            p.rule_names()
+                .iter()
+                .any(|n| *n == "BuildChangeStreamDescriptor"),
+            "BuildChangeStreamDescriptor must be registered"
+        );
+    }
+
+    #[test]
+    fn pipeline_validates_change_stream_descriptor_before_action_columns() {
+        let p = build_imv_pipeline();
+        let rules = p.rule_names();
+        let descriptor = rules
+            .iter()
+            .position(|n| *n == "ValidateChangeStreamDescriptor")
+            .expect("ValidateChangeStreamDescriptor must be registered");
+        let action = rules
+            .iter()
+            .position(|n| *n == "ActionColumnValidation")
+            .expect("ActionColumnValidation must be registered");
+        assert!(descriptor < action, "rule order: {rules:?}");
     }
 
     #[test]

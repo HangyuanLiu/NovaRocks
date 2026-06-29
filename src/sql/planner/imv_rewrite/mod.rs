@@ -70,6 +70,7 @@ pub(crate) mod aggregate_rewrite;
 pub(crate) mod annotation;
 pub(crate) mod apply_key;
 pub(crate) mod branch_union;
+pub(crate) mod change_stream;
 pub(crate) mod column_alloc;
 pub(crate) mod delta_pushdown;
 pub(crate) mod entrypoint;
