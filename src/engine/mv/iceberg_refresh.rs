@@ -10458,76 +10458,6 @@ fn repartition_iceberg_join_mv_overwrite(
             Some(repartition_restore),
         )
     })?;
-    let coalescer = crate::engine::mv::iceberg_join_coalesce::JoinDeltaCoalescer::new(
-        pin.uuid(left_ref)
-            .ok_or_else(|| format!("missing uuid for {}", left_ref.fqn()))
-            .map_err(|err| {
-                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                    state,
-                    target,
-                    target_entry,
-                    staging_branch,
-                    refresh_id,
-                    err,
-                    Some(repartition_restore),
-                )
-            })?
-            .to_string(),
-        pin.uuid(right_ref)
-            .ok_or_else(|| format!("missing uuid for {}", right_ref.fqn()))
-            .map_err(|err| {
-                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                    state,
-                    target,
-                    target_entry,
-                    staging_branch,
-                    refresh_id,
-                    err,
-                    Some(repartition_restore),
-                )
-            })?
-            .to_string(),
-        1_000_000,
-    );
-    let sink = crate::engine::mv::iceberg_join_coalesce::IcebergJoinCoalesceSinkFactory::new(
-        Arc::clone(&coalescer),
-    );
-    {
-        let connectors_snapshot = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock")
-            .clone();
-        let catalogs_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        if let Err(err) = crate::engine::execute_query_with_options(
-            &query,
-            &branch_catalog,
-            &connectors_snapshot,
-            current_database,
-            state.exchange_port,
-            None,
-            Some(Box::new(sink)),
-            Some(&*catalogs_guard),
-            None,
-        ) {
-            drop(catalogs_guard);
-            return Err(
-                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                    state,
-                    target,
-                    target_entry,
-                    staging_branch,
-                    refresh_id,
-                    err,
-                    Some(repartition_restore),
-                ),
-            );
-        }
-    }
-
     let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)
         .map_err(|err| {
             handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
@@ -10558,29 +10488,49 @@ fn repartition_iceberg_join_mv_overwrite(
         staging_branch,
         CommitOpKind::Overwrite,
     );
-    let flush_outcome = coalescer
-        .flush_to_iceberg_commit_collector(
-            crate::engine::mv::iceberg_join_coalesce::JoinCoalesceIcebergTarget {
-                state,
-                table: &target_table,
-                catalog_name: &target.catalog,
-                namespace: &target.namespace,
-                table_name: &target.table,
-            },
-            Arc::clone(&collector),
+    let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
+        target_table: target_table.clone(),
+        collector: Arc::clone(&collector),
+    };
+    let merge_sink =
+        crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
+    {
+        let connectors_snapshot = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
+        let catalogs_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        if let Err(err) = crate::engine::execute_query_with_options(
+            &query,
+            &branch_catalog,
+            &connectors_snapshot,
+            current_database,
+            state.exchange_port,
             None,
-        )
-        .map_err(|err| {
-            handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-                Some(repartition_restore),
-            )
-        })?;
+            Some(Box::new(merge_sink)),
+            Some(&*catalogs_guard),
+            None,
+        ) {
+            drop(catalogs_guard);
+            return Err(
+                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    Some(repartition_restore),
+                ),
+            );
+        }
+    }
+
+    let added_rows = collector.injected_data_record_count();
     let new_snapshot_id = match data_block_on(commit_iceberg_mv_with_populated_collector(
         &target_table,
         iceberg_catalog,
@@ -10625,7 +10575,7 @@ fn repartition_iceberg_join_mv_overwrite(
         state,
         refresh_id,
         new_snapshot_id,
-        flush_outcome.added_rows,
+        added_rows,
         table_uuids.clone(),
     )?;
     let published_snapshot_id = match publish_iceberg_mv_refresh(
@@ -10656,7 +10606,7 @@ fn repartition_iceberg_join_mv_overwrite(
     finalize_iceberg_mv_refresh_with_partition_contract(
         state,
         refresh_id,
-        flush_outcome.added_rows,
+        added_rows,
         snapshots,
         table_uuids,
         published_snapshot_id,

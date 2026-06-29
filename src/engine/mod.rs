@@ -3934,15 +3934,17 @@ fn lower_plan_build_result(
                     lower_plan_build_result(old_input, arena, query_opts, iceberg_catalogs)?;
                 let delta_input =
                     lower_plan_build_result(delta_input, arena, query_opts, iceberg_catalogs)?;
-                return Ok(
-                    crate::sql::codegen::nodes::build_aggregate_state_merge_exec_node(
-                        old_input,
-                        delta_input,
-                        layout,
-                        branch_id,
-                        pruning_limits,
+                return Ok(crate::exec::node::ExecNode {
+                    kind: crate::exec::node::ExecNodeKind::AggregateStateMerge(
+                        crate::exec::operators::aggregate_state_merge::AggregateStateMergePlan {
+                            old_input: Box::new(old_input),
+                            delta_input: Box::new(delta_input),
+                            layout,
+                            branch_id,
+                            pruning_limits,
+                        },
                     ),
-                );
+                });
             }
             crate::sql::codegen::DirectExecPlan::AggregateStatePhysicalize { input, layout } => {
                 let input = lower_plan_build_result(*input, arena, query_opts, iceberg_catalogs)?;
@@ -3996,7 +3998,6 @@ fn lower_plan_build_result(
         &layout_hints,
         None,
         None,
-        iceberg_catalogs,
     )?;
     Ok(lowered.node)
 }
