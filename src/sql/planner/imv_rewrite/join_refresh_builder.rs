@@ -23,6 +23,45 @@ pub(crate) fn build_join_apply_key_project(
     apply_key_column_id: u32,
     action_column_id: u32,
 ) -> Result<LogicalPlanNode, String> {
+    build_join_apply_key_project_with_action(
+        input,
+        desc,
+        left_uuid,
+        right_uuid,
+        apply_key_column_id,
+        action_column_id,
+        JoinApplyActionProjection::InputColumn,
+    )
+}
+
+pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
+    input: LogicalPlanNode,
+    desc: &JoinRefreshDescriptor,
+    left_uuid: &str,
+    right_uuid: &str,
+    apply_key_column_id: u32,
+    action_column_id: u32,
+) -> Result<LogicalPlanNode, String> {
+    build_join_apply_key_project_with_action(
+        input,
+        desc,
+        left_uuid,
+        right_uuid,
+        apply_key_column_id,
+        action_column_id,
+        JoinApplyActionProjection::ConstantInsert,
+    )
+}
+
+fn build_join_apply_key_project_with_action(
+    input: LogicalPlanNode,
+    desc: &JoinRefreshDescriptor,
+    left_uuid: &str,
+    right_uuid: &str,
+    apply_key_column_id: u32,
+    action_column_id: u32,
+    action_projection: JoinApplyActionProjection,
+) -> Result<LogicalPlanNode, String> {
     desc.validate()?;
     validate_apply_key_project_output_ids(desc, apply_key_column_id, action_column_id)?;
     let input_columns = crate::sql::planner::plan_output_columns(&input).map_err(|err| {
@@ -33,7 +72,14 @@ pub(crate) fn build_join_apply_key_project(
         .output_mappings
         .iter()
         .map(|mapping| {
-            project_item_for_mapping(mapping, desc, &input_columns, left_uuid, right_uuid)
+            project_item_for_mapping(
+                mapping,
+                desc,
+                &input_columns,
+                left_uuid,
+                right_uuid,
+                action_projection,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -45,6 +91,12 @@ pub(crate) fn build_join_apply_key_project(
         vec![input],
         None,
     ))
+}
+
+#[derive(Clone, Copy)]
+enum JoinApplyActionProjection {
+    InputColumn,
+    ConstantInsert,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -851,6 +903,7 @@ fn project_item_for_mapping(
     input_columns: &[OutputColumn],
     left_uuid: &str,
     right_uuid: &str,
+    action_projection: JoinApplyActionProjection,
 ) -> Result<ProjectItem, String> {
     let expr = match mapping.source {
         JoinRefreshOutputSource::Payload(column_id) => {
@@ -870,14 +923,29 @@ fn project_item_for_mapping(
                     "join refresh apply-key project references unknown action column {column_id}"
                 ));
             }
-            validate_input_column(input_columns, &desc.action_column)?;
-            TypedExpr {
-                kind: ExprKind::Cast {
-                    expr: Box::new(column_ref(&desc.action_column)),
-                    target: DataType::Int8,
+            match action_projection {
+                JoinApplyActionProjection::InputColumn => {
+                    validate_input_column(input_columns, &desc.action_column)?;
+                    TypedExpr {
+                        kind: ExprKind::Cast {
+                            expr: Box::new(column_ref(&desc.action_column)),
+                            target: DataType::Int8,
+                        },
+                        data_type: DataType::Int8,
+                        nullable: false,
+                    }
+                }
+                JoinApplyActionProjection::ConstantInsert => TypedExpr {
+                    kind: ExprKind::Cast {
+                        expr: Box::new(int_literal(
+                            i64::from(crate::exec::change_op::CHANGE_OP_INSERT),
+                            DataType::Int8,
+                        )),
+                        target: DataType::Int8,
+                    },
+                    data_type: DataType::Int8,
+                    nullable: false,
                 },
-                data_type: DataType::Int8,
-                nullable: false,
             }
         }
         JoinRefreshOutputSource::JoinApplyKey(column_id) => {
@@ -1084,6 +1152,46 @@ mod tests {
                 .expect_err("apply-key id mismatch should fail closed");
 
         assert!(err.contains("apply-key output id mismatch"), "err={err}");
+    }
+
+    #[test]
+    fn apply_key_project_can_use_constant_insert_action() {
+        let input = test_values_plan(vec![
+            out(1, "k", DataType::Int64, false, false),
+            out(
+                2,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+                true,
+            ),
+            out(
+                3,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+                true,
+            ),
+        ]);
+        let desc = test_descriptor(JoinRefreshMode::Full);
+
+        let plan = super::build_join_apply_key_project_with_constant_insert_action(
+            input,
+            &desc,
+            "left-uuid",
+            "right-uuid",
+            90,
+            91,
+        )
+        .expect("apply-key project with constant insert action");
+
+        let PlanNodeKind::Project(project) = &plan.kind else {
+            panic!("expected Project");
+        };
+        assert_eq!(project.items.len(), 3);
+        assert_payload_item(&project.items[0]);
+        assert_join_apply_key_item(&project.items[1]);
+        assert_constant_insert_action_item(&project.items[2]);
     }
 
     #[test]
@@ -1423,6 +1531,15 @@ mod tests {
             true,
         );
 
+        let branches = if mode == JoinRefreshMode::Full {
+            Vec::new()
+        } else {
+            vec![JoinRefreshBranchDescriptor {
+                side: JoinRefreshBranchSide::LeftDeltaRightSnapshot,
+                action_column_id: action.column_id,
+            }]
+        };
+
         JoinRefreshDescriptor {
             mode,
             mv_identity: JoinRefreshMvIdentity {
@@ -1467,10 +1584,7 @@ mod tests {
                     source: JoinRefreshOutputSource::Action(action.column_id),
                 },
             ],
-            branches: vec![JoinRefreshBranchDescriptor {
-                side: JoinRefreshBranchSide::LeftDeltaRightSnapshot,
-                action_column_id: action.column_id,
-            }],
+            branches,
             needs_target_locator: false,
         }
     }
@@ -1539,6 +1653,22 @@ mod tests {
             ColumnId(4),
             crate::exec::change_op::CHANGE_OP_COLUMN,
         );
+    }
+
+    fn assert_constant_insert_action_item(item: &ProjectItem) {
+        assert!(
+            item.output_name
+                .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+        );
+        assert_eq!(item.output_column_id, ColumnId(91));
+        let ExprKind::Cast { expr, target } = &item.expr.kind else {
+            panic!("expected action cast");
+        };
+        assert_eq!(target, &DataType::Int8);
+        let ExprKind::Literal(LiteralValue::Int(value)) = &expr.kind else {
+            panic!("expected action literal");
+        };
+        assert_eq!(*value, i64::from(crate::exec::change_op::CHANGE_OP_INSERT));
     }
 
     fn assert_string_literal(kind: &ExprKind, expected: &str) {

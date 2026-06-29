@@ -172,7 +172,9 @@ impl JoinRefreshDescriptor {
                     pair.right_column.data_type
                 ));
             }
-            if pair.left_column.nullable != pair.right_column.nullable {
+            if self.mode != JoinRefreshMode::Full
+                && pair.left_column.nullable != pair.right_column.nullable
+            {
                 return Err(format!(
                     "join refresh descriptor join key pair nullability mismatch: left {} nullable={}, right {} nullable={}",
                     pair.left_column.column_id,
@@ -305,6 +307,15 @@ impl JoinRefreshDescriptor {
     }
 
     fn validate_branches(&self) -> Result<(), String> {
+        if matches!(self.mode, JoinRefreshMode::Full) {
+            if !self.branches.is_empty() {
+                return Err(
+                    "full join refresh descriptor must not carry delta branches".to_string()
+                );
+            }
+            return Ok(());
+        }
+
         if self.branches.is_empty() {
             return Err("join refresh descriptor requires at least one branch".to_string());
         }
@@ -556,6 +567,37 @@ mod tests {
         let mut desc = valid_descriptor();
         desc.output_mappings.clear();
         assert_invalid(desc, "requires at least one output mapping");
+    }
+
+    #[test]
+    fn full_descriptor_allows_no_delta_branches() {
+        let mut desc = valid_descriptor();
+        desc.mode = JoinRefreshMode::Full;
+        desc.branches.clear();
+        desc.needs_target_locator = false;
+
+        desc.validate().expect("full refresh descriptor");
+    }
+
+    #[test]
+    fn full_descriptor_allows_nullable_join_key_mismatch() {
+        let mut desc = valid_descriptor();
+        desc.mode = JoinRefreshMode::Full;
+        desc.branches.clear();
+        desc.needs_target_locator = false;
+        desc.join_key_pairs[0].left_column.nullable = true;
+        desc.join_key_pairs[0].right_column.nullable = false;
+
+        desc.validate().expect("full refresh descriptor");
+    }
+
+    #[test]
+    fn full_descriptor_rejects_delta_branches() {
+        let mut desc = valid_descriptor();
+        desc.mode = JoinRefreshMode::Full;
+        desc.needs_target_locator = false;
+
+        assert_invalid(desc, "must not carry delta branches");
     }
 
     #[test]
