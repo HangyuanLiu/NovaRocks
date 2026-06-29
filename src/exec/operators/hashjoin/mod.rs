@@ -27,6 +27,7 @@
 mod broadcast_join_probe_processor;
 pub(crate) mod broadcast_join_shared;
 mod build_artifact;
+mod build_requirements;
 pub(crate) mod build_state;
 mod hash_join_build_sink;
 mod hash_join_probe_core;
