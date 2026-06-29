@@ -128,7 +128,9 @@ impl FsLocation {
                 .split_once('/')
                 .unwrap_or((without_prefix, ""));
             if !authority.is_empty() && authority != "localhost" {
-                return Err(format!("unsupported fs file authority: {original}"));
+                return Err(format!(
+                    "unsupported file URI host in local path: {original}"
+                ));
             }
             let path = if path.is_empty() {
                 ""
@@ -145,7 +147,11 @@ impl FsLocation {
 }
 
 fn split_uri_scheme(raw: &str) -> Option<(&str, &str)> {
-    let colon = raw.find(':')?;
+    if let Some(rest) = raw.strip_prefix("file:") {
+        return Some(("file", rest));
+    }
+
+    let colon = raw.find("://")?;
     let scheme = &raw[..colon];
     if scheme.is_empty() || !scheme.as_bytes()[0].is_ascii_alphabetic() {
         return None;
@@ -184,7 +190,9 @@ fn parse_authority_and_path(
     };
 
     if authority_required && authority.is_none() {
-        return Err(format!("fs location authority is empty: {original}"));
+        return Err(format!(
+            "{scheme_label} location missing authority: {original}"
+        ));
     }
     ensure_non_empty_path(original, scheme_label, &path)?;
 
@@ -220,6 +228,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_relative_paths_as_local() {
+        let loc = FsLocation::parse("relative/a.parquet").expect("parse relative path");
+        assert_eq!(loc.scheme(), FsScheme::Local);
+        assert_eq!(loc.uri_scheme(), None);
+        assert_eq!(loc.path(), "relative/a.parquet");
+        assert_eq!(loc.original(), "relative/a.parquet");
+
+        let colon = FsLocation::parse("relative:part/file").expect("parse colon relative path");
+        assert_eq!(colon.scheme(), FsScheme::Local);
+        assert_eq!(colon.uri_scheme(), None);
+        assert_eq!(colon.path(), "relative:part/file");
+        assert_eq!(colon.original(), "relative:part/file");
+    }
+
+    #[test]
     fn parses_file_uri_variants_as_local() {
         let loc = FsLocation::parse("file:///tmp/data/a.parquet").expect("parse file URI");
         assert_eq!(loc.scheme(), FsScheme::Local);
@@ -239,6 +262,16 @@ mod tests {
             let err = FsLocation::parse(raw).expect_err("file path is required");
             assert!(err.contains("file location missing path"), "{err}");
         }
+    }
+
+    #[test]
+    fn rejects_remote_file_uri_host() {
+        let err = FsLocation::parse("file://remote-host/tmp/a.parquet")
+            .expect_err("remote file host is unsupported");
+        assert!(
+            err.contains("unsupported file URI host in local path"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -262,6 +295,12 @@ mod tests {
     }
 
     #[test]
+    fn rejects_object_store_locations_without_authority() {
+        let err = FsLocation::parse("s3:///key").expect_err("s3 authority is required");
+        assert!(err.contains("s3 location missing authority"), "{err}");
+    }
+
+    #[test]
     fn parses_hdfs_location() {
         let loc = FsLocation::parse("hdfs://nn-1:9000/user/hive/a.parquet").expect("parse hdfs");
         assert_eq!(loc.scheme(), FsScheme::Hdfs);
@@ -274,6 +313,12 @@ mod tests {
     fn rejects_hdfs_location_without_path() {
         let err = FsLocation::parse("hdfs://nn-1:9000").expect_err("hdfs path is required");
         assert!(err.contains("hdfs location missing path"), "{err}");
+    }
+
+    #[test]
+    fn rejects_hdfs_location_without_authority() {
+        let err = FsLocation::parse("hdfs:///path").expect_err("hdfs authority is required");
+        assert!(err.contains("hdfs location missing authority"), "{err}");
     }
 
     #[test]
