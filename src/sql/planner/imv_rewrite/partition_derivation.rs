@@ -91,7 +91,9 @@ mod tests {
     use crate::sql::planner::imv_rewrite::annotation::ImvPlanAnnotation;
     use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
     use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
-        JoinRefreshBranchDescriptor, JoinRefreshBranchSide, JoinRefreshDescriptor, JoinRefreshMode,
+        JoinRefreshBranchDescriptor, JoinRefreshBranchSide, JoinRefreshDescriptor,
+        JoinRefreshJoinKeyPair, JoinRefreshMode, JoinRefreshMvIdentity, JoinRefreshOutputMapping,
+        JoinRefreshOutputSource,
     };
 
     #[test]
@@ -134,6 +136,11 @@ mod tests {
     fn valid_join_refresh_descriptor() -> JoinRefreshDescriptor {
         JoinRefreshDescriptor {
             mode: JoinRefreshMode::Coalesce,
+            mv_identity: JoinRefreshMvIdentity {
+                catalog: "ice".to_string(),
+                database: "db".to_string(),
+                name: "mv_join".to_string(),
+            },
             left_base_fqn: "ice.db.left_t".to_string(),
             right_base_fqn: "ice.db.right_t".to_string(),
             left_row_id_column: out(1, "_row_id", DataType::Int64, false, true),
@@ -153,6 +160,36 @@ mod tests {
                 true,
             ),
             payload_columns: vec![out(5, "k", DataType::Int64, false, false)],
+            join_key_pairs: vec![JoinRefreshJoinKeyPair {
+                left_column: out(6, "left_k", DataType::Int64, false, false),
+                right_column: out(7, "right_k", DataType::Int64, false, false),
+            }],
+            output_mappings: vec![
+                JoinRefreshOutputMapping {
+                    mv_output_column: out(8, "mv_k", DataType::Int64, false, false),
+                    source: JoinRefreshOutputSource::Payload(ColumnId(5)),
+                },
+                JoinRefreshOutputMapping {
+                    mv_output_column: out(
+                        9,
+                        crate::exec::change_op::CHANGE_OP_COLUMN,
+                        DataType::Int8,
+                        false,
+                        true,
+                    ),
+                    source: JoinRefreshOutputSource::Action(ColumnId(3)),
+                },
+                JoinRefreshOutputMapping {
+                    mv_output_column: out(
+                        10,
+                        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                        DataType::Utf8,
+                        false,
+                        true,
+                    ),
+                    source: JoinRefreshOutputSource::JoinApplyKey(ColumnId(4)),
+                },
+            ],
             branches: vec![
                 JoinRefreshBranchDescriptor {
                     side: JoinRefreshBranchSide::LeftDeltaRightSnapshot,

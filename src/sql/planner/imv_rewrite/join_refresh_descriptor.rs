@@ -23,9 +23,36 @@ pub(crate) struct JoinRefreshBranchDescriptor {
     pub action_column_id: ColumnId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JoinRefreshMvIdentity {
+    pub catalog: String,
+    pub database: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct JoinRefreshJoinKeyPair {
+    pub left_column: OutputColumn,
+    pub right_column: OutputColumn,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum JoinRefreshOutputSource {
+    Payload(ColumnId),
+    Action(ColumnId),
+    JoinApplyKey(ColumnId),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct JoinRefreshOutputMapping {
+    pub mv_output_column: OutputColumn,
+    pub source: JoinRefreshOutputSource,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct JoinRefreshDescriptor {
     pub mode: JoinRefreshMode,
+    pub mv_identity: JoinRefreshMvIdentity,
     pub left_base_fqn: String,
     pub right_base_fqn: String,
     pub left_row_id_column: OutputColumn,
@@ -33,13 +60,34 @@ pub(crate) struct JoinRefreshDescriptor {
     pub action_column: OutputColumn,
     pub join_apply_key_column: OutputColumn,
     pub payload_columns: Vec<OutputColumn>,
+    pub join_key_pairs: Vec<JoinRefreshJoinKeyPair>,
+    pub output_mappings: Vec<JoinRefreshOutputMapping>,
     pub branches: Vec<JoinRefreshBranchDescriptor>,
     pub needs_target_locator: bool,
 }
 
+impl PartialEq for JoinRefreshJoinKeyPair {
+    fn eq(&self, other: &Self) -> bool {
+        output_column_eq(&self.left_column, &other.left_column)
+            && output_column_eq(&self.right_column, &other.right_column)
+    }
+}
+
+impl Eq for JoinRefreshJoinKeyPair {}
+
+impl PartialEq for JoinRefreshOutputMapping {
+    fn eq(&self, other: &Self) -> bool {
+        output_column_eq(&self.mv_output_column, &other.mv_output_column)
+            && self.source == other.source
+    }
+}
+
+impl Eq for JoinRefreshOutputMapping {}
+
 impl PartialEq for JoinRefreshDescriptor {
     fn eq(&self, other: &Self) -> bool {
         self.mode == other.mode
+            && self.mv_identity == other.mv_identity
             && self.left_base_fqn == other.left_base_fqn
             && self.right_base_fqn == other.right_base_fqn
             && output_column_eq(&self.left_row_id_column, &other.left_row_id_column)
@@ -47,6 +95,8 @@ impl PartialEq for JoinRefreshDescriptor {
             && output_column_eq(&self.action_column, &other.action_column)
             && output_column_eq(&self.join_apply_key_column, &other.join_apply_key_column)
             && output_columns_eq(&self.payload_columns, &other.payload_columns)
+            && self.join_key_pairs == other.join_key_pairs
+            && self.output_mappings == other.output_mappings
             && self.branches == other.branches
             && self.needs_target_locator == other.needs_target_locator
     }
@@ -67,6 +117,11 @@ impl JoinRefreshDescriptor {
         if self.payload_columns.is_empty() {
             return Err("join refresh descriptor requires at least one payload column".to_string());
         }
+        self.validate_identity()?;
+        if self.join_key_pairs.is_empty() {
+            return Err("join refresh descriptor requires at least one join key pair".to_string());
+        }
+        self.validate_output_mappings()?;
         if !self
             .action_column
             .name
@@ -89,6 +144,57 @@ impl JoinRefreshDescriptor {
             return Err("coalescing join refresh requires target locator".to_string());
         }
         self.validate_branches()?;
+        Ok(())
+    }
+
+    fn validate_identity(&self) -> Result<(), String> {
+        if self.mv_identity.name.trim().is_empty() {
+            return Err("join refresh descriptor requires MV name".to_string());
+        }
+        if self.mv_identity.catalog.trim().is_empty() {
+            return Err("join refresh descriptor requires MV catalog".to_string());
+        }
+        if self.mv_identity.database.trim().is_empty() {
+            return Err("join refresh descriptor requires MV database".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_output_mappings(&self) -> Result<(), String> {
+        if self.output_mappings.is_empty() {
+            return Err("join refresh descriptor requires at least one output mapping".to_string());
+        }
+
+        for mapping in &self.output_mappings {
+            match mapping.source {
+                JoinRefreshOutputSource::Payload(column_id) => {
+                    if !self
+                        .payload_columns
+                        .iter()
+                        .any(|column| column.column_id == column_id)
+                    {
+                        return Err(format!(
+                            "join refresh descriptor output mapping references unknown payload column {column_id}"
+                        ));
+                    }
+                }
+                JoinRefreshOutputSource::Action(column_id) => {
+                    if column_id != self.action_column.column_id {
+                        return Err(format!(
+                            "join refresh descriptor output mapping references unknown action column {column_id}"
+                        ));
+                    }
+                }
+                JoinRefreshOutputSource::JoinApplyKey(column_id) => {
+                    if column_id != self.join_apply_key_column.column_id {
+                        return Err(format!(
+                            "join refresh descriptor output mapping references unknown join apply-key column {column_id}"
+                        ));
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -173,6 +279,11 @@ mod tests {
     fn valid_descriptor() -> JoinRefreshDescriptor {
         JoinRefreshDescriptor {
             mode: JoinRefreshMode::Coalesce,
+            mv_identity: JoinRefreshMvIdentity {
+                catalog: "ice".to_string(),
+                database: "db".to_string(),
+                name: "mv_join".to_string(),
+            },
             left_base_fqn: "ice.db.left_t".to_string(),
             right_base_fqn: "ice.db.right_t".to_string(),
             left_row_id_column: out(1, "_row_id", DataType::Int64, false, true),
@@ -192,6 +303,36 @@ mod tests {
                 true,
             ),
             payload_columns: vec![out(5, "k", DataType::Int64, false, false)],
+            join_key_pairs: vec![JoinRefreshJoinKeyPair {
+                left_column: out(6, "left_k", DataType::Int64, false, false),
+                right_column: out(7, "right_k", DataType::Int64, false, false),
+            }],
+            output_mappings: vec![
+                JoinRefreshOutputMapping {
+                    mv_output_column: out(8, "mv_k", DataType::Int64, false, false),
+                    source: JoinRefreshOutputSource::Payload(ColumnId(5)),
+                },
+                JoinRefreshOutputMapping {
+                    mv_output_column: out(
+                        9,
+                        crate::exec::change_op::CHANGE_OP_COLUMN,
+                        DataType::Int8,
+                        false,
+                        true,
+                    ),
+                    source: JoinRefreshOutputSource::Action(ColumnId(3)),
+                },
+                JoinRefreshOutputMapping {
+                    mv_output_column: out(
+                        10,
+                        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                        DataType::Utf8,
+                        false,
+                        true,
+                    ),
+                    source: JoinRefreshOutputSource::JoinApplyKey(ColumnId(4)),
+                },
+            ],
             branches: vec![
                 JoinRefreshBranchDescriptor {
                     side: JoinRefreshBranchSide::LeftDeltaRightSnapshot,
@@ -214,6 +355,14 @@ mod tests {
     }
 
     #[test]
+    fn valid_descriptor_carries_identity_join_keys_and_output_mappings() {
+        let desc = valid_descriptor();
+        assert_eq!(desc.mv_identity.name, "mv_join");
+        assert_eq!(desc.join_key_pairs.len(), 1);
+        assert_eq!(desc.output_mappings.len(), 3);
+    }
+
+    #[test]
     fn rejects_coalescing_descriptor_without_locator() {
         let mut desc = valid_descriptor();
         desc.needs_target_locator = false;
@@ -233,6 +382,48 @@ mod tests {
         let mut desc = valid_descriptor();
         desc.payload_columns.clear();
         assert_invalid(desc, "requires at least one payload column");
+    }
+
+    #[test]
+    fn rejects_descriptor_without_mv_name() {
+        let mut desc = valid_descriptor();
+        desc.mv_identity.name.clear();
+        assert_invalid(desc, "requires MV name");
+    }
+
+    #[test]
+    fn rejects_descriptor_without_join_key_pairs() {
+        let mut desc = valid_descriptor();
+        desc.join_key_pairs.clear();
+        assert_invalid(desc, "requires at least one join key pair");
+    }
+
+    #[test]
+    fn rejects_descriptor_without_output_mappings() {
+        let mut desc = valid_descriptor();
+        desc.output_mappings.clear();
+        assert_invalid(desc, "requires at least one output mapping");
+    }
+
+    #[test]
+    fn rejects_output_mapping_with_unknown_payload_column() {
+        let mut desc = valid_descriptor();
+        desc.output_mappings[0].source = JoinRefreshOutputSource::Payload(ColumnId(99));
+        assert_invalid(desc, "unknown payload column");
+    }
+
+    #[test]
+    fn rejects_output_mapping_with_unknown_action_column() {
+        let mut desc = valid_descriptor();
+        desc.output_mappings[1].source = JoinRefreshOutputSource::Action(ColumnId(99));
+        assert_invalid(desc, "unknown action column");
+    }
+
+    #[test]
+    fn rejects_output_mapping_with_unknown_join_apply_key_column() {
+        let mut desc = valid_descriptor();
+        desc.output_mappings[2].source = JoinRefreshOutputSource::JoinApplyKey(ColumnId(99));
+        assert_invalid(desc, "unknown join apply-key column");
     }
 
     #[test]
