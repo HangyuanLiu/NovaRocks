@@ -78,3 +78,108 @@ fn outcome_reason(outcome: &ImvPartitionAnnotation) -> &str {
         _ => "",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::*;
+    use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::{Operator, ValuesOp};
+    use crate::sql::planner::imv_rewrite::annotation::ImvPlanAnnotation;
+    use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
+    use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
+        JoinRefreshBranchDescriptor, JoinRefreshBranchSide, JoinRefreshDescriptor, JoinRefreshMode,
+    };
+
+    #[test]
+    fn partition_derivation_preserves_existing_join_refresh_descriptor() {
+        let descriptor = valid_join_refresh_descriptor();
+        let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        ctx.set_extension::<ImvExtension>(ImvExtension {
+            mv_ctx: dummy_rewrite_context(),
+            annotation: ImvPlanAnnotation {
+                partition: None,
+                change_stream: ImvChangeStreamDescriptor {
+                    join_refresh: Some(descriptor.clone()),
+                    ..Default::default()
+                },
+            },
+        });
+
+        DerivePartitionSpecRule
+            .apply(empty_values_expr(), &mut ctx)
+            .expect("partition derivation should run");
+
+        let annotation = &ctx
+            .extension::<ImvExtension>()
+            .expect("extension should remain installed")
+            .annotation;
+        assert!(annotation.partition.is_some());
+        assert_eq!(
+            annotation.change_stream.join_refresh.as_ref(),
+            Some(&descriptor)
+        );
+    }
+
+    fn empty_values_expr() -> OptExpr {
+        OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        }))
+    }
+
+    fn valid_join_refresh_descriptor() -> JoinRefreshDescriptor {
+        JoinRefreshDescriptor {
+            mode: JoinRefreshMode::Coalesce,
+            left_base_fqn: "ice.db.left_t".to_string(),
+            right_base_fqn: "ice.db.right_t".to_string(),
+            left_row_id_column: out(1, "_row_id", DataType::Int64, false, true),
+            right_row_id_column: out(2, "_row_id", DataType::Int64, false, true),
+            action_column: out(
+                3,
+                crate::exec::change_op::CHANGE_OP_COLUMN,
+                DataType::Int8,
+                false,
+                true,
+            ),
+            join_apply_key_column: out(
+                4,
+                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                DataType::Utf8,
+                false,
+                true,
+            ),
+            payload_columns: vec![out(5, "k", DataType::Int64, false, false)],
+            branches: vec![
+                JoinRefreshBranchDescriptor {
+                    side: JoinRefreshBranchSide::LeftDeltaRightSnapshot,
+                    action_column_id: ColumnId(3),
+                },
+                JoinRefreshBranchDescriptor {
+                    side: JoinRefreshBranchSide::LeftSnapshotRightDelta,
+                    action_column_id: ColumnId(3),
+                },
+            ],
+            needs_target_locator: true,
+        }
+    }
+
+    fn out(
+        id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        is_internal: bool,
+    ) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId(id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal,
+        }
+    }
+}

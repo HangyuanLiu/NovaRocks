@@ -88,6 +88,48 @@ impl JoinRefreshDescriptor {
         if matches!(self.mode, JoinRefreshMode::Coalesce) && !self.needs_target_locator {
             return Err("coalescing join refresh requires target locator".to_string());
         }
+        self.validate_branches()?;
+        Ok(())
+    }
+
+    fn validate_branches(&self) -> Result<(), String> {
+        if self.branches.is_empty() {
+            return Err("join refresh descriptor requires at least one branch".to_string());
+        }
+
+        for branch in &self.branches {
+            if branch.action_column_id != self.action_column.column_id {
+                return Err(format!(
+                    "join refresh descriptor branch action column id {} does not match action column id {}",
+                    branch.action_column_id, self.action_column.column_id
+                ));
+            }
+        }
+
+        if matches!(self.mode, JoinRefreshMode::Coalesce) {
+            let left_delta_count = self
+                .branches
+                .iter()
+                .filter(|branch| branch.side == JoinRefreshBranchSide::LeftDeltaRightSnapshot)
+                .count();
+            if left_delta_count != 1 {
+                return Err(format!(
+                    "coalescing join refresh requires exactly one LeftDeltaRightSnapshot branch, found {left_delta_count}"
+                ));
+            }
+
+            let right_delta_count = self
+                .branches
+                .iter()
+                .filter(|branch| branch.side == JoinRefreshBranchSide::LeftSnapshotRightDelta)
+                .count();
+            if right_delta_count != 1 {
+                return Err(format!(
+                    "coalescing join refresh requires exactly one LeftSnapshotRightDelta branch, found {right_delta_count}"
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -177,5 +219,76 @@ mod tests {
         desc.needs_target_locator = false;
         let err = desc.validate().expect_err("coalesce requires locator");
         assert!(err.contains("requires target locator"));
+    }
+
+    #[test]
+    fn rejects_descriptor_with_same_base_on_both_sides() {
+        let mut desc = valid_descriptor();
+        desc.right_base_fqn = "ICE.DB.LEFT_T".to_string();
+        assert_invalid(desc, "requires distinct left and right bases");
+    }
+
+    #[test]
+    fn rejects_descriptor_without_payload_columns() {
+        let mut desc = valid_descriptor();
+        desc.payload_columns.clear();
+        assert_invalid(desc, "requires at least one payload column");
+    }
+
+    #[test]
+    fn rejects_descriptor_with_invalid_action_column() {
+        let mut desc = valid_descriptor();
+        desc.action_column.data_type = DataType::Int64;
+        assert_invalid(desc, "invalid action column");
+    }
+
+    #[test]
+    fn rejects_descriptor_with_invalid_join_apply_key_column() {
+        let mut desc = valid_descriptor();
+        desc.join_apply_key_column.nullable = true;
+        assert_invalid(desc, "invalid join apply-key column");
+    }
+
+    #[test]
+    fn rejects_descriptor_without_branches() {
+        let mut desc = valid_descriptor();
+        desc.branches.clear();
+        assert_invalid(desc, "requires at least one branch");
+    }
+
+    #[test]
+    fn rejects_descriptor_with_branch_action_column_mismatch() {
+        let mut desc = valid_descriptor();
+        desc.branches[0].action_column_id = ColumnId(99);
+        assert_invalid(desc, "does not match action column id");
+    }
+
+    #[test]
+    fn rejects_coalescing_descriptor_missing_left_delta_branch() {
+        let mut desc = valid_descriptor();
+        desc.branches.remove(0);
+        assert_invalid(desc, "exactly one LeftDeltaRightSnapshot branch");
+    }
+
+    #[test]
+    fn rejects_coalescing_descriptor_missing_right_delta_branch() {
+        let mut desc = valid_descriptor();
+        desc.branches.pop();
+        assert_invalid(desc, "exactly one LeftSnapshotRightDelta branch");
+    }
+
+    #[test]
+    fn rejects_coalescing_descriptor_duplicate_delta_side() {
+        let mut desc = valid_descriptor();
+        desc.branches[1].side = JoinRefreshBranchSide::LeftDeltaRightSnapshot;
+        assert_invalid(desc, "exactly one LeftDeltaRightSnapshot branch");
+    }
+
+    fn assert_invalid(desc: JoinRefreshDescriptor, expected: &str) {
+        let err = desc.validate().expect_err("descriptor should be invalid");
+        assert!(
+            err.contains(expected),
+            "expected error to contain {expected:?}, got {err:?}"
+        );
     }
 }
