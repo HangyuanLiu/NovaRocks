@@ -16,6 +16,7 @@ use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor;
 use crate::sql::planner::imv_rewrite::opt_expr_to_plan;
 use crate::sql::planner::plan::{
     LogicalAggregateNode, LogicalPlanNode, LogicalProjectNode, LogicalScanNode, PlanNodeKind,
@@ -24,6 +25,7 @@ use crate::sql::planner::plan::{
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ImvChangeStreamDescriptor {
     pub(crate) aggregate: Option<AggregateChangeStreamDescriptor>,
+    pub(crate) join_refresh: Option<JoinRefreshDescriptor>,
 }
 
 impl ImvChangeStreamDescriptor {
@@ -152,7 +154,7 @@ impl LogicalRewriteRule for BuildChangeStreamDescriptorRule {
                 .ok_or("BuildChangeStreamDescriptor requires ImvExtension")?
                 .clone();
             let mut annotation = ext.annotation.clone();
-            annotation.change_stream = descriptor;
+            annotation.change_stream.aggregate = descriptor.aggregate;
             ctx.set_extension::<ImvExtension>(ImvExtension { annotation, ..ext });
         }
         Ok(RewriteResult::Unchanged)
@@ -211,11 +213,13 @@ pub(crate) fn build_change_stream_descriptor(plan: &LogicalPlanNode) -> ImvChang
     if let Some(aggregate) = build_union_change_stream_descriptor(plan) {
         return ImvChangeStreamDescriptor {
             aggregate: Some(aggregate),
+            ..Default::default()
         };
     }
     if let Some(aggregate) = build_relational_change_stream_descriptor(plan) {
         return ImvChangeStreamDescriptor {
             aggregate: Some(aggregate),
+            ..Default::default()
         };
     }
     ImvChangeStreamDescriptor::default()
@@ -697,6 +701,7 @@ mod tests {
                 target_state: TargetStateProof { present: true },
                 signed_state_aggregate: SignedStateAggregateProof { present: true },
             }),
+            ..Default::default()
         };
         let aggregate_merge_join = LogicalPlanNode::new(
             PlanNodeKind::Join(LogicalJoinNode {
@@ -809,6 +814,7 @@ mod tests {
                 target_state: TargetStateProof { present: true },
                 signed_state_aggregate: SignedStateAggregateProof { present: true },
             }),
+            ..Default::default()
         };
 
         let err = descriptor

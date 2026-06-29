@@ -18,8 +18,8 @@ pub(crate) struct ImvPlanAnnotation {
     /// not run or did not match (non-aggregate shapes in P1, or the rule was
     /// disabled via `disable_optimizer_rules`).
     pub partition: Option<ImvPartitionAnnotation>,
-    /// Aggregate change-stream semantic descriptor produced by the IMV rewrite
-    /// pipeline and consumed by downstream validation/annotation rules.
+    /// Change-stream semantic descriptor produced by the IMV rewrite pipeline
+    /// and consumed by downstream validation/annotation rules.
     pub change_stream: ImvChangeStreamDescriptor,
 }
 
@@ -52,6 +52,7 @@ mod tests {
     fn default_annotation_has_no_partition_outcome() {
         let annotation = ImvPlanAnnotation::default();
         assert!(annotation.partition.is_none());
+        assert!(annotation.change_stream.join_refresh.is_none());
     }
 
     #[test]

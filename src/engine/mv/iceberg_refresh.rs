@@ -11295,6 +11295,7 @@ mod aggregate_refresh_rewrite_validation_tests {
                 target_state: TargetStateProof { present: true },
                 signed_state_aggregate: SignedStateAggregateProof { present: true },
             }),
+            ..Default::default()
         }
     }
 
