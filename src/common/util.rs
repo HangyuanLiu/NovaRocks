@@ -1319,11 +1319,20 @@ pub(crate) fn format_mysql_container_value_with_schema(
                     field_schema.and_then(|schema| schema.struct_child(idx)),
                     field.as_ref(),
                 );
-                out.push_str(&format_mysql_container_value_with_schema(
-                    child,
-                    row,
-                    Some(child_schema.as_ref()),
-                )?);
+                let value = if child_schema.json_value {
+                    format_mysql_container_json_value_with_schema(
+                        child,
+                        row,
+                        Some(child_schema.as_ref()),
+                    )?
+                } else {
+                    format_mysql_container_value_with_schema(
+                        child,
+                        row,
+                        Some(child_schema.as_ref()),
+                    )?
+                };
+                out.push_str(&value);
             }
             out.push('}');
             Ok(out)
@@ -1843,5 +1852,24 @@ mod tests {
             String::from_utf8(row).unwrap(),
             "{\"data\":[{\"payload\":{\"a\":1}}]}\n"
         );
+    }
+
+    #[test]
+    fn mysql_text_row_uses_arrow_field_metadata_for_struct_json_children() {
+        let columns = vec![Arc::new(StructArray::new(
+            vec![Arc::new(field_with_logical_type(
+                Field::new("payload", DataType::Utf8, true),
+                LogicalType::Json,
+            ))]
+            .into(),
+            vec![Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)])) as ArrayRef],
+            None,
+        )) as ArrayRef];
+
+        let row =
+            mysql_text_row_from_arrays_with_primitives(&columns, 0, None, None).expect("mysql row");
+
+        assert_eq!(row[0] as usize, br#"{"payload":'{"a":1}'}"#.len());
+        assert_eq!(&row[1..], br#"{"payload":'{"a":1}'}"#);
     }
 }
