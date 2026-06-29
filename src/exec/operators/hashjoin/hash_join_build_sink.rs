@@ -32,7 +32,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef};
 
 use super::build_artifact::JoinBuildArtifact;
-use super::build_requirements::required_build_components;
+use super::build_requirements::{NullKeyRequirement, required_build_components};
 use super::build_state::JoinBuildSinkState;
 use super::join_hash_map::build_store::BuildStoreBuilder;
 use super::join_hash_map::method::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions};
@@ -129,6 +129,12 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             JoinDistributionMode::Broadcast => "BROADCAST",
             JoinDistributionMode::Partitioned => "PARTITIONED",
         };
+        let requirements = required_build_components(
+            self.join_type,
+            self.has_residual_predicate,
+            self.probe_is_left,
+            self.has_equi_keys,
+        );
         debug!(
             "HashJoinBuildSink create: node_id={} driver_id={} partition={} join_type={} residual_predicate={} dist={} build_keys={} null_safe_keys={} runtime_filters={}",
             self.node_id,
@@ -170,10 +176,9 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             finished: false,
             build_row_count: 0,
             build_has_null_key: false,
-            build_null_key_rows: if self.join_type == JoinType::NullAwareLeftAnti {
-                Some(Vec::new())
-            } else {
-                None
+            build_null_key_rows: match requirements.null_keys {
+                NullKeyRequirement::NullKeyRows => Some(Vec::new()),
+                NullKeyRequirement::NotNeeded | NullKeyRequirement::HasAnyNullKey => None,
             },
             logged_first_input: false,
             profile_initialized: false,
@@ -1343,6 +1348,16 @@ mod tests {
         Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
     }
 
+    fn nullable_int32_chunk(values: Vec<Option<i32>>) -> Chunk {
+        let array = Arc::new(Int32Array::from(values)) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).expect("record batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema");
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+    }
+
     fn direct_int_build_operator(state: Arc<TestBuildState>) -> HashJoinBuildSinkOperator {
         let mut arena = ExprArena::default();
         let build_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
@@ -1391,6 +1406,30 @@ mod tests {
         operator.join_type = JoinType::LeftSemi;
         operator.has_residual_predicate = false;
         operator
+    }
+
+    fn null_aware_build_operator(
+        state: Arc<TestBuildState>,
+        has_residual_predicate: bool,
+    ) -> Box<dyn Operator> {
+        let mut arena = ExprArena::default();
+        let build_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let sink_state: Arc<dyn JoinBuildSinkState> = state;
+        let factory = HashJoinBuildSinkFactory::new(
+            Arc::new(arena),
+            JoinType::NullAwareLeftAnti,
+            has_residual_predicate,
+            true,
+            true,
+            vec![build_key],
+            vec![false],
+            Vec::new(),
+            JoinDistributionMode::Broadcast,
+            sink_state,
+            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
+            None,
+        );
+        factory.create(1, 0)
     }
 
     fn no_key_inner_build_operator(state: Arc<TestBuildState>) -> HashJoinBuildSinkOperator {
@@ -1584,6 +1623,69 @@ mod tests {
         assert!(artifact.build_table.is_none());
         assert_eq!(artifact.build_row_count, 3);
         assert_eq!(artifact.build_store.as_ref().expect("build store").len(), 3);
+    }
+
+    #[test]
+    fn no_residual_null_aware_left_anti_tracks_has_null_key_without_null_key_rows() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = null_aware_build_operator(Arc::clone(&state), false);
+
+        let processor = operator.as_processor_mut().expect("processor");
+        processor
+            .push_chunk(
+                &RuntimeState::default(),
+                nullable_int32_chunk(vec![Some(1), None, Some(2)]),
+            )
+            .expect("push chunk");
+        processor
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        let artifact = state
+            .artifact
+            .lock()
+            .expect("artifact lock")
+            .clone()
+            .expect("artifact");
+        assert_eq!(
+            artifact.provided,
+            required_build_components(JoinType::NullAwareLeftAnti, false, true, true)
+        );
+        assert!(artifact.build_has_null_key);
+        assert!(artifact.build_null_key_rows.is_none());
+    }
+
+    #[test]
+    fn residual_null_aware_left_anti_tracks_null_key_rows() {
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = null_aware_build_operator(Arc::clone(&state), true);
+
+        let processor = operator.as_processor_mut().expect("processor");
+        processor
+            .push_chunk(
+                &RuntimeState::default(),
+                nullable_int32_chunk(vec![Some(1), None, Some(2)]),
+            )
+            .expect("push chunk");
+        processor
+            .set_finishing(&RuntimeState::default())
+            .expect("finish");
+
+        let artifact = state
+            .artifact
+            .lock()
+            .expect("artifact lock")
+            .clone()
+            .expect("artifact");
+        assert_eq!(
+            artifact.provided,
+            required_build_components(JoinType::NullAwareLeftAnti, true, true, true)
+        );
+        let null_key_rows = artifact
+            .build_null_key_rows
+            .as_ref()
+            .expect("null-key rows");
+        assert_eq!(null_key_rows.as_slice(), &[1]);
     }
 
     #[test]
