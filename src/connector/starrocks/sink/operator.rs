@@ -2954,7 +2954,9 @@ mod tests {
     fn default_expr_node() -> exprs::TExprNode {
         exprs::TExprNode {
             node_type: exprs::TExprNodeType::INT_LITERAL,
-            type_: crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::INT),
+            type_: crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+                types::TPrimitiveType::INT,
+            ),
             opcode: None,
             num_children: 0,
             agg_expr: None,
@@ -3001,7 +3003,7 @@ mod tests {
     fn slot_ref_node(slot_id: i32, ty: types::TPrimitiveType) -> exprs::TExprNode {
         exprs::TExprNode {
             node_type: exprs::TExprNodeType::SLOT_REF,
-            type_: crate::lower::type_lowering::scalar_type_desc(ty),
+            type_: crate::types::arrow_thrift::thrift_type_desc_from_primitive(ty),
             slot_ref: Some(exprs::TSlotRef {
                 slot_id,
                 tuple_id: 0,
@@ -3013,7 +3015,9 @@ mod tests {
     fn int_literal_node(value: i64) -> exprs::TExprNode {
         exprs::TExprNode {
             node_type: exprs::TExprNodeType::INT_LITERAL,
-            type_: crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT),
+            type_: crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+                types::TPrimitiveType::BIGINT,
+            ),
             int_literal: Some(exprs::TIntLiteral { value }),
             ..default_expr_node()
         }
@@ -3022,7 +3026,9 @@ mod tests {
     fn string_literal_node(value: &str) -> exprs::TExprNode {
         exprs::TExprNode {
             node_type: exprs::TExprNodeType::STRING_LITERAL,
-            type_: crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::VARCHAR),
+            type_: crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+                types::TPrimitiveType::VARCHAR,
+            ),
             string_literal: Some(exprs::TStringLiteral {
                 value: value.to_string(),
             }),
@@ -3040,7 +3046,7 @@ mod tests {
             nodes: vec![
                 exprs::TExprNode {
                     node_type: exprs::TExprNodeType::BINARY_PRED,
-                    type_: crate::lower::type_lowering::scalar_type_desc(
+                    type_: crate::types::arrow_thrift::thrift_type_desc_from_primitive(
                         types::TPrimitiveType::BOOLEAN,
                     ),
                     opcode: Some(opcode),

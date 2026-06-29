@@ -31,7 +31,6 @@ use crate::common::types::format_uuid;
 use crate::exec::chunk::type_compatibility::retag_column;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::novarocks_logging::debug;
 use crate::runtime::mem_tracker::MemTracker;
 
@@ -1156,15 +1155,13 @@ fn materialize_chunk_for_wire_meta(
         let mut out_column = batch.column(idx).clone();
         let mut out_field = field.as_ref().clone();
 
-        if let Some(type_desc) = expected_slot.type_desc()
-            && let Some(expected_arrow_type) = arrow_type_from_desc(type_desc)
-            && field.data_type() != &expected_arrow_type
-        {
+        let expected_arrow_type = expected_slot.data_type();
+        if field.data_type() != expected_arrow_type {
             // Receiver is the type authority: materialize the decoded column
             // to the registered descriptor type (metadata-only retag).
             out_column = crate::exec::chunk::type_compatibility::retag_column(
                 batch.column(idx),
-                &expected_arrow_type,
+                expected_arrow_type,
             )
             .map_err(|m| {
                 format!(
@@ -1174,7 +1171,7 @@ fn materialize_chunk_for_wire_meta(
             })?;
             out_field = arrow::datatypes::Field::new(
                 field.name(),
-                expected_arrow_type,
+                expected_arrow_type.clone(),
                 field.is_nullable(),
             )
             .with_metadata(field.metadata().clone());
@@ -1737,8 +1734,6 @@ mod tests {
     #[test]
     fn decode_chunks_for_sender_rejects_numeric_for_opaque_descriptor() {
         use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-        use crate::lower::type_lowering::scalar_type_desc;
-        use crate::thrift::types::TPrimitiveType;
 
         let key = ExchangeKey {
             finst_id_hi: 501,
@@ -1764,11 +1759,10 @@ mod tests {
         let wire_chunk = Chunk::new_with_chunk_schema(wire_batch, wire_chunk_schema);
 
         let expected_schema = Arc::new(
-            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                 SlotId::new(41),
-                "__opaque_state",
-                true,
-                Some(scalar_type_desc(TPrimitiveType::VARBINARY)),
+                Field::new("__opaque_state", DataType::Binary, true),
+                None,
                 Some(41),
             )])
             .expect("expected chunk schema"),

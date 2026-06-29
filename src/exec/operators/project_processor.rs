@@ -46,6 +46,7 @@ fn projected_field_from_existing(
     data_type: &arrow::datatypes::DataType,
 ) -> Field {
     Field::new(existing.name(), data_type.clone(), existing.is_nullable())
+        .with_metadata(existing.metadata().clone())
 }
 
 fn field_from_slot_schema(slot_schema: &ChunkSlotSchema, data_type: &DataType) -> Field {
@@ -54,6 +55,12 @@ fn field_from_slot_schema(slot_schema: &ChunkSlotSchema, data_type: &DataType) -
         data_type.clone(),
         slot_schema.nullable(),
     )
+    .with_metadata(slot_schema.field().metadata().clone())
+}
+
+fn with_nullable_preserving_metadata(field: &Field, nullable: bool) -> Field {
+    Field::new(field.name(), field.data_type().clone(), nullable)
+        .with_metadata(field.metadata().clone())
 }
 
 fn projected_slot_schema_from_existing(
@@ -109,7 +116,7 @@ fn slots_adjusted_for_actual_nullability(
         .zip(columns.iter())
         .map(|(schema, array)| {
             if !schema.nullable() && array.null_count() > 0 {
-                let nullable_field = Field::new(schema.name(), schema.data_type().clone(), true);
+                let nullable_field = with_nullable_preserving_metadata(schema.field(), true);
                 schema
                     .with_field(nullable_field)
                     .unwrap_or_else(|_| schema.clone())
@@ -325,7 +332,7 @@ impl ProjectProcessorOperator {
                     .map(|schema| {
                         let f = field_from_slot_schema(schema, data_type);
                         if array_has_nulls && !f.is_nullable() {
-                            Field::new(f.name(), f.data_type().clone(), true)
+                            with_nullable_preserving_metadata(&f, true)
                         } else {
                             f
                         }
@@ -356,7 +363,7 @@ impl ProjectProcessorOperator {
             let field = if let Some(slot_schema) = declared_slot_schema.as_ref() {
                 let f = field_from_slot_schema(slot_schema, data_type);
                 if array_has_nulls && !f.is_nullable() {
-                    Field::new(f.name(), f.data_type().clone(), true)
+                    with_nullable_preserving_metadata(&f, true)
                 } else {
                     f
                 }
@@ -453,11 +460,12 @@ impl ProjectProcessorOperator {
             let base = declared_output_slot_schema
                 .as_ref()
                 .map(|schema| {
-                    Field::new(
-                        schema.name(),
-                        schema.data_type().clone(),
-                        schema.nullable() || runtime_nullable,
-                    )
+                    let field = field_from_slot_schema(schema, schema.data_type());
+                    if runtime_nullable && !field.is_nullable() {
+                        with_nullable_preserving_metadata(&field, true)
+                    } else {
+                        field
+                    }
                 })
                 .or_else(|| {
                     working_chunk
@@ -560,8 +568,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::lower::type_lowering::scalar_type_desc;
-    use crate::thrift::types::TPrimitiveType;
+    use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> Arc<ChunkSchema> {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
@@ -583,18 +590,16 @@ mod tests {
             output_indices: None,
             output_chunk_schema: Arc::new(
                 ChunkSchema::try_new(vec![
-                    ChunkSlotSchema::new(
+                    ChunkSlotSchema::new_with_field(
                         SlotId::new(17),
-                        "s17",
-                        true,
-                        Some(scalar_type_desc(TPrimitiveType::INT)),
+                        Field::new("s17", DataType::Int32, true),
+                        None,
                         None,
                     ),
-                    ChunkSlotSchema::new(
+                    ChunkSlotSchema::new_with_field(
                         SlotId::new(19),
-                        "s19",
-                        true,
-                        Some(scalar_type_desc(TPrimitiveType::INT)),
+                        Field::new("s19", DataType::Int32, true),
+                        None,
                         None,
                     ),
                 ])
@@ -653,9 +658,12 @@ mod tests {
         let mut arena = ExprArena::default();
         let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Binary);
         let output_slot = SlotId::new(2);
-        let output_desc = scalar_type_desc(TPrimitiveType::HLL);
-        let output_slot_schema =
-            ChunkSlotSchema::new(output_slot, "out", false, Some(output_desc.clone()), None);
+        let output_slot_schema = ChunkSlotSchema::new_with_field(
+            output_slot,
+            field_with_logical_type(Field::new("out", DataType::Binary, false), LogicalType::Hll),
+            None,
+            None,
+        );
         let output_chunk_schema =
             Arc::new(ChunkSchema::try_new(vec![output_slot_schema.clone()]).expect("schema"));
         let mut op = ProjectProcessorOperator {
@@ -692,8 +700,9 @@ mod tests {
             .chunk_schema()
             .slot(output_slot)
             .expect("output slot schema");
-        assert_eq!(slot.type_desc(), Some(&output_desc));
-        assert_eq!(slot.primitive_type(), Some(TPrimitiveType::HLL));
+        assert_eq!(slot.data_type(), &DataType::Binary);
+        assert_eq!(slot.field_schema().logical_type(), Some(LogicalType::Hll));
+        assert_eq!(logical_type_of_field(slot.field()), Some(LogicalType::Hll));
         assert_eq!(output.batch.schema().field(0).name(), "out");
         assert!(!output.batch.schema().field(0).is_nullable());
     }
@@ -704,11 +713,10 @@ mod tests {
         let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
         let output_slot = SlotId::new(2);
         let output_chunk_schema = Arc::new(
-            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                 output_slot,
-                "out",
-                false,
-                Some(scalar_type_desc(TPrimitiveType::INT)),
+                Field::new("out", DataType::Int32, false),
+                None,
                 None,
             )])
             .expect("schema"),

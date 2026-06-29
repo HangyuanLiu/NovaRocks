@@ -322,6 +322,8 @@ pub(crate) fn lower_project_node(
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::DataType;
+
     use super::project_output_chunk_schema;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSlotSchema;
@@ -385,11 +387,6 @@ mod tests {
         assert_eq!(slots[1].slot_id().as_u32(), 61);
         assert_eq!(slots[2].slot_id().as_u32(), 128);
         assert_eq!(slots[2].name(), "_expr_128");
-        assert_eq!(
-            slots[2]
-                .type_desc()
-                .and_then(crate::lower::type_lowering::primitive_type_from_desc),
-            Some(TPrimitiveType::BOOLEAN)
-        );
+        assert_eq!(slots[2].data_type(), &DataType::Boolean);
     }
 }

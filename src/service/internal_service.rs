@@ -21,7 +21,7 @@ use arrow::array::ArrayRef;
 use base64::Engine;
 use thrift::OrderedFloat;
 
-use crate::exec::chunk::{Chunk, ChunkFieldSchema};
+use crate::exec::chunk::Chunk;
 use crate::novarocks_logging::{error, info, warn};
 
 use crate::common::app_config;
@@ -34,7 +34,8 @@ use crate::common::thrift::{
 use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
 use crate::common::util::{
-    http_json_row_from_arrays_with_primitives, mysql_text_row_from_arrays_with_primitives,
+    FieldRenderSchema, http_json_row_from_arrays_with_primitives,
+    mysql_text_row_from_arrays_with_primitives,
 };
 use crate::lower::fragment::execute_fragment;
 use crate::lower::thrift::cache_iceberg_table_locations;
@@ -50,6 +51,7 @@ use crate::runtime::query_context::{
 use crate::runtime::result_buffer;
 use crate::service::fe_report;
 use crate::thrift::{data, data_sinks, descriptors, exprs, internal_service, planner, types};
+use crate::types::arrow_thrift::arrow_field_to_primitive;
 
 const STATISTIC_DATA_VERSION_V1: i32 = 1;
 const STATISTIC_HISTOGRAM_VERSION: i32 = 2;
@@ -411,45 +413,31 @@ fn primitives_for_chunk_fields(chunk: &Chunk) -> Vec<types::TPrimitiveType> {
         .slots()
         .iter()
         .map(|slot| {
-            slot.primitive_type()
-                .unwrap_or(types::TPrimitiveType::INVALID_TYPE)
+            arrow_field_to_primitive(slot.field()).unwrap_or(types::TPrimitiveType::INVALID_TYPE)
         })
         .collect()
 }
 
 fn field_schemas_for_output_exprs(
     output_exprs: &[exprs::TExpr],
-) -> Result<Vec<ChunkFieldSchema>, String> {
+) -> Result<Vec<FieldRenderSchema>, String> {
     let mut out = Vec::with_capacity(output_exprs.len());
     for (col_idx, e) in output_exprs.iter().enumerate() {
         let root = e
             .nodes
             .first()
             .ok_or_else(|| format!("output_exprs[{}] is empty", col_idx))?;
-        out.push(ChunkFieldSchema::try_from_type_desc(
-            format!("col_{col_idx}"),
-            true,
-            root.type_.clone(),
-        )?);
+        out.push(FieldRenderSchema::try_from_type_desc(&root.type_)?);
     }
     Ok(out)
 }
 
-fn field_schemas_for_chunk_fields(chunk: &Chunk) -> Vec<ChunkFieldSchema> {
+fn field_schemas_for_chunk_fields(chunk: &Chunk) -> Vec<FieldRenderSchema> {
     chunk
         .chunk_schema()
         .slots()
         .iter()
-        .map(|slot| slot.field_schema().clone())
-        .collect()
-}
-
-fn json_semantics_for_chunk_fields(chunk: &Chunk) -> Vec<bool> {
-    chunk
-        .chunk_schema()
-        .slots()
-        .iter()
-        .map(|slot| slot.primitive_type() == Some(types::TPrimitiveType::JSON))
+        .map(|slot| FieldRenderSchema::from_field(slot.field()))
         .collect()
 }
 
@@ -956,21 +944,18 @@ pub(crate) fn build_fetch_result_batch_for_chunk(
                     &columns,
                     row,
                     Some(&primitives),
-                    None,
                     Some(&field_schemas),
                 )?);
             }
         } else {
             let columns = chunk.columns();
             let primitives = primitives_for_chunk_fields(chunk);
-            let json_semantics = json_semantics_for_chunk_fields(chunk);
             let field_schemas = field_schemas_for_chunk_fields(chunk);
             for row in 0..chunk.len() {
                 batch.rows.push(http_json_row_from_arrays_with_primitives(
                     columns,
                     row,
                     Some(&primitives),
-                    Some(&json_semantics),
                     Some(&field_schemas),
                 )?);
             }
@@ -1681,9 +1666,18 @@ pub(crate) fn mark_query_failed_from_report(query_id: QueryId, finst_id: UniqueI
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
-    use super::{mark_query_failed_from_report, validate_internal_addresses};
+    use arrow::array::{ArrayRef, BinaryArray, StringArray};
+    use arrow::datatypes::{DataType, Field};
+
+    use super::{
+        build_fetch_result_batch_for_chunk, mark_query_failed_from_report,
+        validate_internal_addresses,
+    };
+    use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
+    use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
     use crate::runtime::{
         exchange::{ExchangeKey, set_expected_senders, snapshot_receiver_state},
         query_context::{QueryId, query_context_manager},
@@ -1693,9 +1687,61 @@ mod tests {
         data_sinks, descriptors, exprs, internal_service, partitions, plan_nodes, planner,
         runtime_filter, types,
     };
+    use crate::types::logical::{LogicalType, field_with_logical_type};
 
     fn unique_id(hi: i64, lo: i64) -> types::TUniqueId {
         types::TUniqueId::new(hi, lo)
+    }
+
+    fn chunk_with_stale_field_schema(field: Field, column: ArrayRef) -> Result<Chunk, String> {
+        let chunk_schema = Arc::new(ChunkSchema::try_new(vec![
+            ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                field,
+                Some(ChunkFieldSchema::try_new(None)?),
+                None,
+            ),
+        ])?);
+        Chunk::try_new_with_columns(chunk_schema, vec![column])
+    }
+
+    #[test]
+    fn fetch_fallback_http_json_uses_arrow_field_metadata_for_json() {
+        let field = field_with_logical_type(
+            Field::new("payload", DataType::Utf8, true),
+            LogicalType::Json,
+        );
+        let chunk = chunk_with_stale_field_schema(
+            field,
+            Arc::new(StringArray::from(vec![r#"{"a":1}"#])) as ArrayRef,
+        )
+        .expect("chunk");
+
+        let batch = build_fetch_result_batch_for_chunk(
+            &chunk,
+            None,
+            Some(data_sinks::TResultSinkType::HTTP_PROTOCAL),
+            Some(data_sinks::TResultSinkFormatType::JSON),
+        )
+        .expect("fetch batch");
+
+        assert_eq!(batch.rows, vec![b"{\"data\":[{\"a\":1}]}\n".to_vec()]);
+    }
+
+    #[test]
+    fn fetch_fallback_mysql_uses_arrow_field_metadata_for_opaque_binary() {
+        let field =
+            field_with_logical_type(Field::new("hll", DataType::Binary, true), LogicalType::Hll);
+        let chunk = chunk_with_stale_field_schema(
+            field,
+            Arc::new(BinaryArray::from(vec![Some(b"opaque".as_slice())])) as ArrayRef,
+        )
+        .expect("chunk");
+
+        let batch =
+            build_fetch_result_batch_for_chunk(&chunk, None, None, None).expect("fetch batch");
+
+        assert_eq!(batch.rows, vec![vec![0xFB]]);
     }
 
     #[test]

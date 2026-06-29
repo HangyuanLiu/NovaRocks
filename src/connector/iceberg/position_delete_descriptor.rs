@@ -42,7 +42,7 @@ fn descriptor_error(message: impl Into<String>) -> crate::common::engine_error::
 }
 
 fn primitive_type(type_desc: &types::TTypeDesc) -> Option<types::TPrimitiveType> {
-    crate::lower::type_lowering::primitive_type_from_desc(type_desc)
+    crate::types::arrow_thrift::thrift_desc_to_primitive(type_desc)
 }
 
 fn validate_output_field(
@@ -169,7 +169,7 @@ pub(crate) fn required_position_delete_descriptor_for_tests(
         Some(data_sinks::TIcebergPositionDeleteOutputField::new(
             Some(0),
             Some(ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string()),
-            Some(crate::lower::type_lowering::scalar_type_desc(
+            Some(crate::types::arrow_thrift::thrift_type_desc_from_primitive(
                 types::TPrimitiveType::VARCHAR,
             )),
             Some(ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID),
@@ -177,7 +177,7 @@ pub(crate) fn required_position_delete_descriptor_for_tests(
         Some(data_sinks::TIcebergPositionDeleteOutputField::new(
             Some(1),
             Some(ICEBERG_POSITION_DELETE_POS_COLUMN.to_string()),
-            Some(crate::lower::type_lowering::scalar_type_desc(
+            Some(crate::types::arrow_thrift::thrift_type_desc_from_primitive(
                 types::TPrimitiveType::BIGINT,
             )),
             Some(ICEBERG_POSITION_DELETE_POS_FIELD_ID),
@@ -321,7 +321,7 @@ pub(crate) fn bind_position_delete_descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lower::type_lowering::scalar_type_desc;
+    use crate::types::arrow_thrift::thrift_type_desc_from_primitive;
 
     fn field(
         index: i32,
@@ -332,7 +332,7 @@ mod tests {
         crate::thrift::data_sinks::TIcebergPositionDeleteOutputField::new(
             Some(index),
             Some(name.to_string()),
-            Some(scalar_type_desc(primitive)),
+            Some(thrift_type_desc_from_primitive(primitive)),
             Some(field_id),
         )
     }
@@ -393,7 +393,7 @@ mod tests {
             };
         crate::thrift::exprs::TExpr::new(vec![crate::thrift::exprs::TExprNode {
             node_type,
-            type_: scalar_type_desc(primitive),
+            type_: thrift_type_desc_from_primitive(primitive),
             opcode: None,
             num_children: 0,
             agg_expr: None,

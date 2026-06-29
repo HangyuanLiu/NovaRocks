@@ -24,8 +24,8 @@ use crate::exec::row_position::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
 };
-use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::thrift::descriptors;
+use crate::types::arrow_thrift::thrift_desc_to_arrow_type;
 
 const VIRTUAL_COUNT_COLUMN: &str = "___count___";
 pub const ICEBERG_INITIAL_DEFAULT_META_KEY: &str = "novarocks.iceberg.initial_default";
@@ -62,7 +62,7 @@ pub fn build_full_output_schema(iceberg: &descriptors::TIcebergTable) -> Result<
             let dtype = col
                 .type_desc
                 .as_ref()
-                .and_then(arrow_type_from_desc)
+                .and_then(thrift_desc_to_arrow_type)
                 .ok_or_else(|| format!("iceberg column {} missing type_desc", col.column_name))?;
             let nullable = col.is_allow_null.unwrap_or(true);
             let field = Field::new(col.column_name.clone(), dtype, nullable);
@@ -77,7 +77,7 @@ pub fn build_full_output_schema(iceberg: &descriptors::TIcebergTable) -> Result<
         let dtype = col
             .type_desc
             .as_ref()
-            .and_then(arrow_type_from_desc)
+            .and_then(thrift_desc_to_arrow_type)
             .ok_or_else(|| format!("iceberg column {} missing type_desc", col.column_name))?;
         let nullable = col.is_allow_null.unwrap_or(true);
         fields.push(Field::new(col.column_name.clone(), dtype, nullable));

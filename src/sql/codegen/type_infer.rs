@@ -2,19 +2,20 @@ use arrow::datatypes::{DataType, Field};
 
 use crate::lower::thrift::type_lowering::scalar_type_desc;
 use crate::thrift::types;
-
-/// Metadata key on a `Field` that overrides the inferred StarRocks primitive.
-/// Mirrors `crate::sql::analyzer::helpers::NR_LOGICAL_TYPE_KEY` (kept duplicated
-/// to avoid pulling the analyzer module into codegen). Today only "json" is
-/// emitted; the analyzer attaches it when a CAST target is `json` nested
-/// inside `map<…>`/`array<…>`/`struct<…>` so the JSON-ness survives the
-/// JSON-to-`Utf8` collapse in `sql_type_to_arrow`.
-const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
+use crate::types::arrow_thrift::{arrow_type_to_primitive, field_logical_primitive};
 
 /// Convert Arrow DataType to Thrift TTypeDesc.
 pub(crate) fn arrow_type_to_type_desc(data_type: &DataType) -> Result<types::TTypeDesc, String> {
     let mut nodes = Vec::new();
     append_arrow_type_nodes(data_type, None, &mut nodes)?;
+    Ok(types::TTypeDesc::new(nodes))
+}
+
+/// Convert an Arrow Field to Thrift TTypeDesc at a protocol/codegen boundary.
+#[allow(dead_code)] // Staged M2 boundary helper; callers migrate in later slices.
+pub(crate) fn arrow_field_to_type_desc(field: &Field) -> Result<types::TTypeDesc, String> {
+    let mut nodes = Vec::new();
+    append_arrow_type_nodes(field.data_type(), Some(field), &mut nodes)?;
     Ok(types::TTypeDesc::new(nodes))
 }
 
@@ -25,7 +26,7 @@ fn append_arrow_type_nodes(
 ) -> Result<(), String> {
     // If the enclosing `Field` carries a logical-type tag, override the
     // inferred primitive so the child reports e.g. JSON instead of VARCHAR.
-    if let Some(primitive) = logical_type_override(parent_field) {
+    if let Some(primitive) = parent_field.and_then(field_logical_primitive) {
         nodes.extend(scalar_type_desc(primitive).types.unwrap_or_default());
         return Ok(());
     }
@@ -147,49 +148,122 @@ fn append_arrow_type_nodes(
     }
 }
 
-fn logical_type_override(field: Option<&Field>) -> Option<types::TPrimitiveType> {
-    let logical = field?.metadata().get(NR_LOGICAL_TYPE_KEY)?;
-    match logical.as_str() {
-        "json" => Some(types::TPrimitiveType::JSON),
-        _ => None,
-    }
-}
-
-pub(crate) fn arrow_type_to_primitive(
-    data_type: &DataType,
-) -> Result<types::TPrimitiveType, String> {
-    match data_type {
-        DataType::Boolean => Ok(types::TPrimitiveType::BOOLEAN),
-        DataType::Int8 => Ok(types::TPrimitiveType::TINYINT),
-        DataType::Int16 => Ok(types::TPrimitiveType::SMALLINT),
-        DataType::Int32 => Ok(types::TPrimitiveType::INT),
-        DataType::Int64 => Ok(types::TPrimitiveType::BIGINT),
-        DataType::Float32 => Ok(types::TPrimitiveType::FLOAT),
-        DataType::Float64 => Ok(types::TPrimitiveType::DOUBLE),
-        DataType::Utf8 | DataType::LargeUtf8 => Ok(types::TPrimitiveType::VARCHAR),
-        DataType::Binary => Ok(types::TPrimitiveType::VARBINARY),
-        // NovaRocks reserves arrow `LargeBinary` for the v3 variant payload
-        // (see src/lower/type_lowering.rs:170). Plain BINARY uses `Binary`.
-        DataType::LargeBinary => Ok(types::TPrimitiveType::VARIANT),
-        DataType::Date32 => Ok(types::TPrimitiveType::DATE),
-        DataType::Timestamp(_, _) => Ok(types::TPrimitiveType::DATETIME),
-        DataType::Decimal128(_, _) => Ok(types::TPrimitiveType::DECIMAL128),
-        DataType::Decimal256(_, _) => Ok(types::TPrimitiveType::DECIMAL256),
-        DataType::FixedSizeBinary(16) => Ok(types::TPrimitiveType::LARGEINT),
-        DataType::Time64(_) => Ok(types::TPrimitiveType::TIME),
-        DataType::Null => Ok(types::TPrimitiveType::NULL_TYPE),
-        other => Err(format!(
-            "ThriftPlanBuilder does not support data type {:?}",
-            other
-        )),
-    }
-}
-
 pub(crate) use crate::types::{arithmetic_result_type_with_op, wider_type};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::arrow_thrift::arrow_field_to_primitive;
+    use crate::types::logical::LogicalType;
+
+    fn primitive_from_desc(desc: &types::TTypeDesc) -> Option<types::TPrimitiveType> {
+        crate::lower::type_lowering::primitive_type_from_desc(desc)
+    }
+
+    fn logical_field(name: &str, data_type: DataType, logical_type: LogicalType) -> Field {
+        crate::types::logical::field_with_logical_type(
+            Field::new(name, data_type, true),
+            logical_type,
+        )
+    }
+
+    #[test]
+    fn arrow_field_to_type_desc_honors_top_level_json_metadata() {
+        let field = logical_field("payload", DataType::Utf8, LogicalType::Json);
+
+        let desc = arrow_field_to_type_desc(&field).unwrap();
+
+        assert_eq!(
+            primitive_from_desc(&desc),
+            Some(types::TPrimitiveType::JSON)
+        );
+        assert_eq!(
+            arrow_field_to_primitive(&field),
+            Some(types::TPrimitiveType::JSON)
+        );
+    }
+
+    #[test]
+    fn arrow_field_to_primitive_honors_object_family_metadata() {
+        let cases = [
+            (
+                logical_field("hll", DataType::Binary, LogicalType::Hll),
+                types::TPrimitiveType::HLL,
+            ),
+            (
+                logical_field("bitmap", DataType::Binary, LogicalType::Bitmap),
+                types::TPrimitiveType::OBJECT,
+            ),
+            (
+                logical_field("object", DataType::LargeBinary, LogicalType::Object),
+                types::TPrimitiveType::OBJECT,
+            ),
+            (
+                logical_field("percentile", DataType::Binary, LogicalType::Percentile),
+                types::TPrimitiveType::PERCENTILE,
+            ),
+        ];
+
+        for (field, expected) in cases {
+            let desc = arrow_field_to_type_desc(&field).unwrap();
+
+            assert_eq!(primitive_from_desc(&desc), Some(expected));
+            assert_eq!(arrow_field_to_primitive(&field), Some(expected));
+        }
+    }
+
+    #[test]
+    fn arrow_field_to_primitive_falls_back_to_arrow_type_without_metadata() {
+        let field = Field::new("plain", DataType::Utf8, true);
+
+        assert_eq!(
+            arrow_field_to_primitive(&field),
+            Some(types::TPrimitiveType::VARCHAR)
+        );
+    }
+
+    #[test]
+    fn nested_json_metadata_survives_type_desc_conversion() {
+        use std::sync::Arc;
+
+        let array_json = DataType::List(Arc::new(logical_field(
+            "item",
+            DataType::Utf8,
+            LogicalType::Json,
+        )));
+        let array_desc = arrow_type_to_type_desc(&array_json).unwrap();
+        let array_nodes = array_desc.types.as_ref().unwrap();
+        assert_eq!(array_nodes[0].type_, types::TTypeNodeType::ARRAY);
+        assert_eq!(
+            array_nodes[1]
+                .scalar_type
+                .as_ref()
+                .map(|scalar| scalar.type_),
+            Some(types::TPrimitiveType::JSON)
+        );
+
+        let map_json = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Utf8, false)),
+                        Arc::new(logical_field("value", DataType::Utf8, LogicalType::Json)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let map_desc = arrow_type_to_type_desc(&map_json).unwrap();
+        let map_nodes = map_desc.types.as_ref().unwrap();
+        assert_eq!(map_nodes[0].type_, types::TTypeNodeType::MAP);
+        assert_eq!(
+            map_nodes[2].scalar_type.as_ref().map(|scalar| scalar.type_),
+            Some(types::TPrimitiveType::JSON)
+        );
+    }
 
     #[test]
     fn timestamp_unit_roundtrips_through_thrift_desc() {

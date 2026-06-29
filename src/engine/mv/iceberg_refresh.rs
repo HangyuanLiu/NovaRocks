@@ -2699,7 +2699,10 @@ fn validate_repartition_support(caps: &RefreshCapabilities) -> Result<Repartitio
             Ok(RepartitionSupport::AggregateSingleBase)
         }
         (BaseSnapshotPolicy::JoinPairPartialInitialSkip, false, RefreshIdentity::JoinRowKey) => {
-            Ok(RepartitionSupport::JoinProjectionFilter)
+            Err(format!(
+                "UnsupportedRepartitionShape: ALTER MATERIALIZED VIEW ... REPARTITION does not support identity={:?}, snapshot_policy={:?}, aggregate_state={}; join projection/filter repartition requires a merge-sink rebuild path that is not wired",
+                caps.identity, caps.snapshot_policy, caps.has_agg_state
+            ))
         }
         (BaseSnapshotPolicy::JoinPairPartialInitialSkip, true, RefreshIdentity::GroupRowId) => {
             Ok(RepartitionSupport::JoinAggregate)
@@ -10334,286 +10337,19 @@ fn build_join_projection_repartition_context(
 
 #[allow(clippy::too_many_arguments)]
 fn repartition_iceberg_join_mv_overwrite(
-    state: &Arc<StandaloneState>,
-    ctx: &IcebergMvRefreshContext,
-    staging_branch: &str,
-    refresh_id: i64,
-    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
-    left_ref: &IcebergTableRef,
-    right_ref: &IcebergTableRef,
-    partition_contract: &crate::meta::repository::mv_contract::MvPartitionContract,
-    repartition_restore: RepartitionDefaultSpecRestore,
+    _state: &Arc<StandaloneState>,
+    _ctx: &IcebergMvRefreshContext,
+    _staging_branch: &str,
+    _refresh_id: i64,
+    _aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
+    _left_ref: &IcebergTableRef,
+    _right_ref: &IcebergTableRef,
+    _partition_contract: &crate::meta::repository::mv_contract::MvPartitionContract,
+    _repartition_restore: RepartitionDefaultSpecRestore,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.rewrite.target;
-    let target_entry = &*ctx.target_entry;
-    let iceberg_catalog = &ctx.iceberg_catalog;
-    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
-    let current_database = ctx.rewrite.current_database.as_str();
-    let mv_definition = &*ctx.rewrite.mv_definition;
-    let pin = &*ctx.rewrite.pin;
-    if let Err(err) = ensure_iceberg_mv_staging_branch(
-        iceberg_catalog,
-        target,
-        staging_branch,
-        expected_main_snapshot_id,
-    ) {
-        return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
-            state,
-            refresh_id,
-            target_entry,
-            target,
-            repartition_restore.new_default_spec_id,
-            repartition_restore.old_default_spec_id,
-            err,
-        )
-        .into());
-    }
-    let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
-        Ok(table) => table,
-        Err(err) => {
-            return Err(
-                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                    state,
-                    target,
-                    target_entry,
-                    staging_branch,
-                    refresh_id,
-                    err,
-                    Some(repartition_restore),
-                ),
-            );
-        }
-    };
-    let left_snapshot = pin
-        .get(left_ref)
-        .ok_or_else(|| format!("missing refresh pin for {}", left_ref.fqn()))
-        .map_err(|err| {
-            handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-                Some(repartition_restore),
-            )
-        })?;
-    let right_snapshot = pin
-        .get(right_ref)
-        .ok_or_else(|| format!("missing refresh pin for {}", right_ref.fqn()))
-        .map_err(|err| {
-            handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-                Some(repartition_restore),
-            )
-        })?;
-    let mut query = parse_mv_select_query(&mv_definition.select_sql).map_err(|err| {
-        handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-            state,
-            target,
-            target_entry,
-            staging_branch,
-            refresh_id,
-            err,
-            Some(repartition_restore),
-        )
-    })?;
-    rewrite_join_full_refresh_query(
-        &mut query,
-        left_ref,
-        left_snapshot,
-        right_ref,
-        right_snapshot,
-        &aliases.left_alias,
-        &aliases.right_alias,
-    )
-    .map_err(|err| {
-        handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-            state,
-            target,
-            target_entry,
-            staging_branch,
-            refresh_id,
-            err,
-            Some(repartition_restore),
-        )
-    })?;
-    let branch_catalog = build_join_snapshot_catalog(
-        state,
-        &[(left_ref, left_snapshot), (right_ref, right_snapshot)],
-    )
-    .map_err(|err| {
-        handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-            state,
-            target,
-            target_entry,
-            staging_branch,
-            refresh_id,
-            err,
-            Some(repartition_restore),
-        )
-    })?;
-    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)
-        .map_err(|err| {
-            handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-                Some(repartition_restore),
-            )
-        })?
-        .to_summary_properties();
-    let ident = iceberg_mv_table_ident(target).map_err(|err| {
-        handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-            state,
-            target,
-            target_entry,
-            staging_branch,
-            refresh_id,
-            err,
-            Some(repartition_restore),
-        )
-    })?;
-    let collector = new_iceberg_mv_commit_collector(
-        &target_table,
-        &ident,
-        staging_branch,
-        CommitOpKind::Overwrite,
-    );
-    let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
-        target_table: target_table.clone(),
-        collector: Arc::clone(&collector),
-    };
-    let merge_sink =
-        crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
-    {
-        let connectors_snapshot = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock")
-            .clone();
-        let catalogs_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        if let Err(err) = crate::engine::execute_query_with_options(
-            &query,
-            &branch_catalog,
-            &connectors_snapshot,
-            current_database,
-            state.exchange_port,
-            None,
-            Some(Box::new(merge_sink)),
-            Some(&*catalogs_guard),
-            None,
-        ) {
-            drop(catalogs_guard);
-            return Err(
-                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                    state,
-                    target,
-                    target_entry,
-                    staging_branch,
-                    refresh_id,
-                    err,
-                    Some(repartition_restore),
-                ),
-            );
-        }
-    }
-
-    let added_rows = collector.injected_data_record_count();
-    let new_snapshot_id = match data_block_on(commit_iceberg_mv_with_populated_collector(
-        &target_table,
-        iceberg_catalog,
-        target_entry,
-        &ident,
-        Arc::clone(&collector),
-        staging_branch,
-        marker,
-    )) {
-        Ok(Ok(outcome)) => outcome.new_snapshot_id,
-        Ok(Err(err)) => {
-            return Err(
-                handle_iceberg_mv_commit_service_error_with_repartition_restore(
-                    state,
-                    target,
-                    target_entry,
-                    staging_branch,
-                    refresh_id,
-                    err,
-                    Some(repartition_restore),
-                ),
-            );
-        }
-        Err(err) => {
-            return Err(
-                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                    state,
-                    target,
-                    target_entry,
-                    staging_branch,
-                    refresh_id,
-                    err,
-                    Some(repartition_restore),
-                ),
-            );
-        }
-    };
-
-    let snapshots = pin.to_snapshot_map();
-    let table_uuids = pin.to_table_uuid_map();
-    record_iceberg_mv_staging_commit(
-        state,
-        refresh_id,
-        new_snapshot_id,
-        added_rows,
-        table_uuids.clone(),
-    )?;
-    let published_snapshot_id = match publish_iceberg_mv_refresh(
-        state,
-        target,
-        target_entry,
-        staging_branch,
-        expected_main_snapshot_id,
-        new_snapshot_id,
-        refresh_id,
-        mv_definition.mv_id,
-    ) {
-        Ok(snapshot_id) => snapshot_id,
-        Err(err) => {
-            return Err(handle_iceberg_mv_publish_error_with_repartition_restore(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-                Some(repartition_restore),
-            ));
-        }
-    };
-    record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
-    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
-    finalize_iceberg_mv_refresh_with_partition_contract(
-        state,
-        refresh_id,
-        added_rows,
-        snapshots,
-        table_uuids,
-        published_snapshot_id,
-        partition_contract,
-        IcebergMvPartitionStateFinalize::Clear,
-    )?;
-    Ok(StatementResult::Ok)
+    Err(IcebergMvRefreshExecutionError::pre_commit(
+        "UnsupportedRepartitionShape: ALTER MATERIALIZED VIEW ... REPARTITION for join projection/filter Iceberg MVs is disabled until the merge-sink rebuild path is wired",
+    ))
 }
 
 fn first_refresh_iceberg_join_mv(
@@ -13997,7 +13733,7 @@ mod tests {
     }
 
     #[test]
-    fn repartition_support_accepts_join_and_multi_base_shapes() {
+    fn repartition_support_rejects_join_projection_until_rebuild_path_is_wired() {
         let join = RefreshCapabilities {
             snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
             has_agg_state: false,
@@ -14006,11 +13742,15 @@ mod tests {
             apply_key_value_type: ApplyKeyValueType::Utf8,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
-        assert_eq!(
-            validate_repartition_support(&join).expect("join support"),
-            RepartitionSupport::JoinProjectionFilter
-        );
+        let err = validate_repartition_support(&join)
+            .expect_err("join projection repartition should fail fast until rebuild is wired");
+        assert!(err.contains("UnsupportedRepartitionShape"), "err={err}");
+        assert!(err.contains("JoinPairPartialInitialSkip"), "err={err}");
+        assert!(err.contains("merge-sink rebuild path"), "err={err}");
+    }
 
+    #[test]
+    fn repartition_support_accepts_multi_base_shapes() {
         let join_aggregate = RefreshCapabilities {
             snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
             has_agg_state: true,
@@ -14062,7 +13802,6 @@ mod tests {
         for support in [
             RepartitionSupport::ProjectionFilterSingleBase,
             RepartitionSupport::AggregateSingleBase,
-            RepartitionSupport::JoinProjectionFilter,
             RepartitionSupport::JoinAggregate,
             RepartitionSupport::FanInAggregate,
             RepartitionSupport::UnionProjectionFilter,
