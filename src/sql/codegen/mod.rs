@@ -36,11 +36,30 @@ pub(crate) type FragmentId = u32;
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
+pub(crate) enum DirectExecPlan {
+    AggregateStateMerge {
+        old_input: Box<PlanBuildResult>,
+        delta_input: Box<PlanBuildResult>,
+        layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+        branch_id: Option<i32>,
+        pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits,
+    },
+    AggregateStatePhysicalize {
+        input: Box<PlanBuildResult>,
+        layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    },
+    UnionAll {
+        inputs: Vec<PlanBuildResult>,
+    },
+}
+
+#[derive(Clone)]
 pub(crate) struct PlanBuildResult {
     pub plan: plan_nodes::TPlan,
     pub desc_tbl: thrift_descriptors::TDescriptorTable,
     pub exec_params: internal_service::TPlanFragmentExecParams,
     pub output_columns: Vec<OutputColumn>,
+    pub direct_exec: Option<Box<DirectExecPlan>>,
     #[allow(dead_code)]
     // Carried by single-fragment conversions so EXPLAIN/codegen consumers do
     // not lose boundary schema reports when a multi-fragment build collapses.
@@ -135,6 +154,7 @@ pub(crate) struct FragmentBuildResult {
     pub output_sink: data_sinks::TDataSink,
     pub output_exprs: Option<Vec<crate::thrift::exprs::TExpr>>,
     pub output_columns: Vec<OutputColumn>,
+    pub direct_exec: Option<Box<DirectExecPlan>>,
     pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
     /// CTE ID if this is a multicast fragment.
     pub cte_id: Option<CteId>,

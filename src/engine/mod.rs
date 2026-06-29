@@ -2776,6 +2776,7 @@ fn single_fragment_plan(
         desc_tbl: fragment.desc_tbl,
         exec_params: fragment.exec_params,
         output_columns: fragment.output_columns,
+        direct_exec: fragment.direct_exec,
         boundary_schemas: fragment.boundary_schemas,
         query_global_dicts: fragment.query_global_dicts,
         query_global_dict_exprs: fragment.query_global_dict_exprs,
@@ -3647,7 +3648,6 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         if let Some(validator) = imv_rewrite_validator {
             validator(&outcome)?;
         }
-        factory.reserve_until(outcome.next_column_id);
         logical = outcome.plan;
     } else if imv_rewrite_validator.is_some() {
         return Err("IMV rewrite validator requires MV refresh context".to_string());
@@ -3919,6 +3919,60 @@ fn lower_plan_build_result(
     use crate::lower::thrift::layout::{build_tuple_slot_order, reorder_tuple_slots};
     use crate::lower::thrift::lower_plan;
 
+    if let Some(direct) = result.direct_exec {
+        match *direct {
+            crate::sql::codegen::DirectExecPlan::AggregateStateMerge {
+                old_input,
+                delta_input,
+                layout,
+                branch_id,
+                pruning_limits,
+            } => {
+                let old_input = *old_input;
+                let delta_input = *delta_input;
+                let old_input =
+                    lower_plan_build_result(old_input, arena, query_opts, iceberg_catalogs)?;
+                let delta_input =
+                    lower_plan_build_result(delta_input, arena, query_opts, iceberg_catalogs)?;
+                return Ok(crate::exec::node::ExecNode {
+                    kind: crate::exec::node::ExecNodeKind::AggregateStateMerge(
+                        crate::exec::operators::aggregate_state_merge::AggregateStateMergePlan {
+                            old_input: Box::new(old_input),
+                            delta_input: Box::new(delta_input),
+                            layout,
+                            branch_id,
+                            pruning_limits,
+                        },
+                    ),
+                });
+            }
+            crate::sql::codegen::DirectExecPlan::AggregateStatePhysicalize { input, layout } => {
+                let input = lower_plan_build_result(*input, arena, query_opts, iceberg_catalogs)?;
+                return Ok(crate::exec::node::ExecNode {
+                    kind: crate::exec::node::ExecNodeKind::AggregateStatePhysicalize(
+                        crate::exec::operators::aggregate_state_merge::AggregateStatePhysicalizePlan {
+                            input: Box::new(input),
+                            layout,
+                        },
+                    ),
+                });
+            }
+            crate::sql::codegen::DirectExecPlan::UnionAll { inputs } => {
+                let inputs = inputs
+                    .into_iter()
+                    .map(|input| {
+                        lower_plan_build_result(input, arena, query_opts, iceberg_catalogs)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(crate::exec::node::ExecNode {
+                    kind: crate::exec::node::ExecNodeKind::UnionAll(
+                        crate::exec::node::union_all::UnionAllNode { inputs, node_id: 0 },
+                    ),
+                });
+            }
+        }
+    }
+
     let desc_tbl = result.desc_tbl;
     let plan = result.plan;
     let exec_params = result.exec_params;
@@ -3958,7 +4012,7 @@ fn execute_plan(
     use crate::exec::expr::ExprArena;
     use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
-    use crate::exec::pipeline::executor::execute_plan_with_pipeline_with_root_sink_dop;
+    use crate::exec::pipeline::executor::execute_plan_with_pipeline;
     use crate::runtime::runtime_state::RuntimeState;
 
     let output_columns = result.output_columns.clone();
@@ -3972,7 +4026,6 @@ fn execute_plan(
     // custom sink is in use, output chunks are intercepted by the sink so
     // the returned `QueryResult` only carries the column metadata.
     let handle = ResultSinkHandle::new();
-    let has_custom_terminal_sink = terminal_sink.is_some();
     let sink: Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory> =
         match terminal_sink {
             Some(custom_sink) => custom_sink,
@@ -3986,7 +4039,7 @@ fn execute_plan(
         .and_then(|opts| opts.pipeline_dop)
         .unwrap_or(0);
     let pipeline_dop = crate::runtime::exec_env::calc_pipeline_dop(session_dop) as usize;
-    execute_plan_with_pipeline_with_root_sink_dop(
+    execute_plan_with_pipeline(
         exec_plan,
         false,
         std::time::Duration::from_millis(10),
@@ -4000,7 +4053,6 @@ fn execute_plan(
         None,
         None,
         None,
-        has_custom_terminal_sink.then_some(1),
     )?;
 
     Ok(QueryResult {

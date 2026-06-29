@@ -279,6 +279,43 @@ mod tests {
             .collect()
     }
 
+    fn locator_join_left_input(plan: &LogicalPlanNode) -> &LogicalPlanNode {
+        let PlanNodeKind::Project(_) = &plan.kind else {
+            panic!("expected root Project over target locator join, got {plan:?}");
+        };
+        let join_plan = plan.unary_input();
+        let PlanNodeKind::Join(join) = &join_plan.kind else {
+            panic!("expected target locator Join under root Project, got {join_plan:?}");
+        };
+        assert_eq!(join.join_type, JoinKind::LeftOuter);
+        let PlanNodeKind::Scan(scan) = &join_plan.right().kind else {
+            panic!("expected target locator scan on join right side");
+        };
+        assert!(
+            matches!(scan.table.source, ScanSource::IcebergMvTargetLocator(_)),
+            "join right side must be target locator scan"
+        );
+        join_plan.left()
+    }
+
+    fn find_delta_scan(plan: &LogicalPlanNode) -> Option<&LogicalScanNode> {
+        match &plan.kind {
+            PlanNodeKind::Scan(scan)
+                if matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. }) =>
+            {
+                Some(scan)
+            }
+            _ => plan.children.iter().find_map(find_delta_scan),
+        }
+    }
+
+    fn find_union_plan(plan: &LogicalPlanNode) -> Option<&LogicalPlanNode> {
+        match &plan.kind {
+            PlanNodeKind::Union(_) => Some(plan),
+            _ => plan.children.iter().find_map(find_union_plan),
+        }
+    }
+
     fn aggregate_mv_ctx_customized(
         mutate: impl FnOnce(&mut crate::meta::repository::mv_contract::MvSchemaContract),
     ) -> Arc<IcebergMvRewriteContext> {
@@ -953,7 +990,7 @@ mod tests {
         })
         .expect("unknown disabled rule must not break the pipeline");
 
-        assert_eq!(outcome.trace.stage_names().len(), 12);
+        assert_eq!(outcome.trace.stage_names().len(), 13);
     }
 
     // ── Task-5 helpers ──────────────────────────────────────────────────────
@@ -1105,6 +1142,7 @@ mod tests {
                 "imv-scan-binding",
                 "imv-action-propagation",
                 "imv-apply-key",
+                "imv-target-locator",
                 "imv-partition-derivation",
                 "imv-marker-cleanup",
                 "imv-validation",
@@ -1289,19 +1327,112 @@ mod tests {
             project.items.iter().any(|item| item.output_name == "k"),
             "user column k must remain"
         );
-        // The child scan is delta-bound and carries the internal action column.
-        let PlanNodeKind::Scan(scan) = &outcome.plan.unary_input().kind else {
-            panic!("expected Scan under Project");
-        };
-        assert!(
-            matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. }),
-            "child scan must be delta-bound"
-        );
+        // The user plan is on the left side of the injected target locator join.
+        let scan = find_delta_scan(locator_join_left_input(&outcome.plan))
+            .expect("expected delta-bound scan under target locator join left side");
         assert!(
             scan.columns
                 .iter()
                 .any(|c| c.is_internal && c.name.eq_ignore_ascii_case("__change_op")),
             "child scan must carry the internal action column"
+        );
+    }
+
+    #[test]
+    fn imv_pipeline_projection_filter_outputs_target_locator_metadata() {
+        let scan = iceberg_scan_plan();
+        let project = LogicalPlanNode::new(
+            PlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: column_ref(1, "k", DataType::Int64, false),
+                    output_name: "k".to_string(),
+                    output_column_id: ColumnId(1),
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
+
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: project,
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect("projection/filter rewrite must carry target locator metadata");
+
+        let PlanNodeKind::Project(project) = &outcome.plan.kind else {
+            panic!("expected root Project, got {:?}", outcome.plan);
+        };
+        let output_names = project_output_names(project);
+        assert!(
+            output_names
+                .iter()
+                .any(|name| name
+                    .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)),
+            "root output must include target _file locator metadata; items: {output_names:?}"
+        );
+        assert!(
+            output_names
+                .iter()
+                .any(|name| name
+                    .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)),
+            "root output must include target _pos locator metadata; items: {output_names:?}"
+        );
+    }
+
+    #[test]
+    fn imv_pipeline_rejects_preexisting_locator_metadata_name_collision() {
+        let scan = iceberg_scan_plan();
+        let project = LogicalPlanNode::new(
+            PlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: column_ref(1, "k", DataType::Int64, false),
+                        output_name: "k".to_string(),
+                        output_column_id: ColumnId(1),
+                    },
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::String(
+                                "not-target-file".to_string(),
+                            )),
+                            data_type: DataType::Utf8,
+                            nullable: false,
+                        },
+                        output_name: crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+                        output_column_id: ColumnId(2),
+                    },
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Int(7)),
+                            data_type: DataType::Int64,
+                            nullable: false,
+                        },
+                        output_name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+                        output_column_id: ColumnId(3),
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
+
+        let err = run_imv_rewrite(ImvRewriteInput {
+            plan: project,
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect_err("preexisting _file/_pos names must not bypass target locator injection");
+
+        assert!(
+            err.contains("reserved target locator metadata column"),
+            "{err}"
         );
     }
 
@@ -1346,9 +1477,13 @@ mod tests {
             "root output must include apply key; items: {:?}",
             project_output_names(project)
         );
-        let union_plan = outcome.plan.unary_input();
+        let union_plan = find_union_plan(locator_join_left_input(&outcome.plan))
+            .expect("expected union under target locator join left side");
         let PlanNodeKind::Union(union) = &union_plan.kind else {
-            panic!("expected root Project over Union, got {:?}", union_plan);
+            panic!(
+                "expected Union under target locator join left side, got {:?}",
+                union_plan
+            );
         };
         assert!(
             union.output_columns.iter().any(|column| column

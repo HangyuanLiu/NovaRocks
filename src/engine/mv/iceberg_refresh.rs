@@ -46,7 +46,7 @@ use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID, ICEBERG_MV_PROP_APPLY_KEY_SOURCE,
     ICEBERG_MV_PROP_HIDDEN_COLUMNS, apply_key_table_column, branch_id_table_column,
     ensure_base_row_lineage_contract, find_apply_key_field_id_by_column,
-    iceberg_mv_physical_select_sql, join_apply_key_table_column, load_target_apply_locator_inputs,
+    iceberg_mv_physical_select_sql, join_apply_key_table_column,
 };
 use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, MvBaseRef, MvStorageEngine,
@@ -10458,76 +10458,6 @@ fn repartition_iceberg_join_mv_overwrite(
             Some(repartition_restore),
         )
     })?;
-    let coalescer = crate::engine::mv::iceberg_join_coalesce::JoinDeltaCoalescer::new(
-        pin.uuid(left_ref)
-            .ok_or_else(|| format!("missing uuid for {}", left_ref.fqn()))
-            .map_err(|err| {
-                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                    state,
-                    target,
-                    target_entry,
-                    staging_branch,
-                    refresh_id,
-                    err,
-                    Some(repartition_restore),
-                )
-            })?
-            .to_string(),
-        pin.uuid(right_ref)
-            .ok_or_else(|| format!("missing uuid for {}", right_ref.fqn()))
-            .map_err(|err| {
-                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                    state,
-                    target,
-                    target_entry,
-                    staging_branch,
-                    refresh_id,
-                    err,
-                    Some(repartition_restore),
-                )
-            })?
-            .to_string(),
-        1_000_000,
-    );
-    let sink = crate::engine::mv::iceberg_join_coalesce::IcebergJoinCoalesceSinkFactory::new(
-        Arc::clone(&coalescer),
-    );
-    {
-        let connectors_snapshot = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock")
-            .clone();
-        let catalogs_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        if let Err(err) = crate::engine::execute_query_with_options(
-            &query,
-            &branch_catalog,
-            &connectors_snapshot,
-            current_database,
-            state.exchange_port,
-            None,
-            Some(Box::new(sink)),
-            Some(&*catalogs_guard),
-            None,
-        ) {
-            drop(catalogs_guard);
-            return Err(
-                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                    state,
-                    target,
-                    target_entry,
-                    staging_branch,
-                    refresh_id,
-                    err,
-                    Some(repartition_restore),
-                ),
-            );
-        }
-    }
-
     let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)
         .map_err(|err| {
             handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
@@ -10558,29 +10488,49 @@ fn repartition_iceberg_join_mv_overwrite(
         staging_branch,
         CommitOpKind::Overwrite,
     );
-    let flush_outcome = coalescer
-        .flush_to_iceberg_commit_collector(
-            crate::engine::mv::iceberg_join_coalesce::JoinCoalesceIcebergTarget {
-                state,
-                table: &target_table,
-                catalog_name: &target.catalog,
-                namespace: &target.namespace,
-                table_name: &target.table,
-            },
-            Arc::clone(&collector),
+    let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
+        target_table: target_table.clone(),
+        collector: Arc::clone(&collector),
+    };
+    let merge_sink =
+        crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
+    {
+        let connectors_snapshot = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
+        let catalogs_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        if let Err(err) = crate::engine::execute_query_with_options(
+            &query,
+            &branch_catalog,
+            &connectors_snapshot,
+            current_database,
+            state.exchange_port,
             None,
-        )
-        .map_err(|err| {
-            handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-                Some(repartition_restore),
-            )
-        })?;
+            Some(Box::new(merge_sink)),
+            Some(&*catalogs_guard),
+            None,
+        ) {
+            drop(catalogs_guard);
+            return Err(
+                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    Some(repartition_restore),
+                ),
+            );
+        }
+    }
+
+    let added_rows = collector.injected_data_record_count();
     let new_snapshot_id = match data_block_on(commit_iceberg_mv_with_populated_collector(
         &target_table,
         iceberg_catalog,
@@ -10625,7 +10575,7 @@ fn repartition_iceberg_join_mv_overwrite(
         state,
         refresh_id,
         new_snapshot_id,
-        flush_outcome.added_rows,
+        added_rows,
         table_uuids.clone(),
     )?;
     let published_snapshot_id = match publish_iceberg_mv_refresh(
@@ -10656,7 +10606,7 @@ fn repartition_iceberg_join_mv_overwrite(
     finalize_iceberg_mv_refresh_with_partition_contract(
         state,
         refresh_id,
-        flush_outcome.added_rows,
+        added_rows,
         snapshots,
         table_uuids,
         published_snapshot_id,
@@ -10814,12 +10764,6 @@ fn first_refresh_iceberg_join_mv(
     let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
         target_table: target_table.clone(),
         collector: Arc::clone(&collector),
-        locator_state: None,
-        apply_key_column: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
-        apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
-        partition_filter: ctx.affected_partitions_to_target_partition_filter(),
-        pruning_limits: ctx.pruning_limits,
-        partition_derivation: merge_sink_partition_derivation(&ctx.rewrite.schema_contract),
     };
     let merge_sink =
         crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
@@ -12456,12 +12400,6 @@ fn execute_append_only_join_delta_branches(
         let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
             target_table: target_table.clone(),
             collector: Arc::clone(&collector),
-            locator_state: None,
-            apply_key_column: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
-            apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
-            partition_filter: ctx.affected_partitions_to_target_partition_filter(),
-            pruning_limits: ctx.pruning_limits,
-            partition_derivation: merge_sink_partition_derivation(&ctx.rewrite.schema_contract),
         };
         let merge_sink =
             crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
@@ -12695,12 +12633,17 @@ fn execute_join_delta_branches(
         })?;
         branch_queries.push(branch_query);
     }
+    let target_locator_relation =
+        crate::engine::mv::iceberg_join_branch::join_delta_target_locator_relation(
+            &target.namespace,
+        );
     let query =
-        crate::engine::mv::iceberg_join_branch::rewrite_join_delta_coalesce_query_with_branch_queries(
+        crate::engine::mv::iceberg_join_branch::rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
             &base_query,
             branch_queries,
             &left_uuid,
             &right_uuid,
+            &target_locator_relation,
         )
         .map_err(|err| {
             handle_iceberg_mv_commit_error(
@@ -12712,7 +12655,14 @@ fn execute_join_delta_branches(
                 err,
             )
         })?;
-    let branch_catalog = build_join_delta_coalesce_catalog(state, &branches).map_err(|err| {
+    let branch_catalog = build_join_delta_coalesce_catalog(
+        state,
+        &branches,
+        target,
+        &target_table,
+        expected_main_snapshot_id,
+    )
+    .map_err(|err| {
         handle_iceberg_mv_commit_error(
             state,
             target,
@@ -12751,43 +12701,9 @@ fn execute_join_delta_branches(
         &staging_branch,
         CommitOpKind::RowDeltaDv,
     );
-    let (existing_deletes_by_file, referenced_data_file_partitions) =
-        load_target_apply_locator_inputs(target_entry, &target_table).map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            )
-        })?;
     let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
         target_table: target_table.clone(),
         collector: Arc::clone(&collector),
-        locator_state: Some(crate::engine::mv::iceberg_merge_sink::TargetLocatorState {
-            existing_deletes_by_file,
-            referenced_data_file_partitions,
-        }),
-        apply_key_column: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
-        apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
-        partition_filter: affected_partitions.to_target_partition_filter(),
-        pruning_limits: state.mv_refresh_pruning_limits,
-        partition_derivation: merge_sink_partition_derivation(
-            mv_definition.schema_contract.as_ref().ok_or_else(|| {
-                handle_iceberg_mv_commit_error(
-                    state,
-                    target,
-                    target_entry,
-                    &staging_branch,
-                    refresh_id,
-                    format!(
-                        "iceberg join MV {}.{}.{} missing schema contract for merge sink",
-                        target.catalog, target.namespace, target.table
-                    ),
-                )
-            })?,
-        ),
     };
     let merge_sink =
         crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
@@ -12974,6 +12890,9 @@ fn build_join_branch_catalog(
 fn build_join_delta_coalesce_catalog(
     state: &Arc<StandaloneState>,
     branches: &[crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan],
+    target: &IcebergMvTarget,
+    target_table: &iceberg::table::Table,
+    target_snapshot_id: Option<i64>,
 ) -> Result<crate::engine::catalog::InMemoryCatalog, String> {
     let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
     let mut registered_delta_tables = BTreeSet::new();
@@ -12996,7 +12915,78 @@ fn build_join_delta_coalesce_catalog(
             &mut registered_snapshot_tables,
         )?;
     }
+    register_join_delta_target_locator(
+        &mut catalog,
+        state,
+        target,
+        target_table,
+        target_snapshot_id,
+    )?;
     Ok(catalog)
+}
+
+fn register_join_delta_target_locator(
+    catalog: &mut crate::engine::catalog::InMemoryCatalog,
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_table: &iceberg::table::Table,
+    target_snapshot_id: Option<i64>,
+) -> Result<(), String> {
+    catalog.create_database(&target.namespace)?;
+    let table_def =
+        build_join_delta_target_locator_table_def(state, target, target_table, target_snapshot_id)?;
+    catalog
+        .register(&target.namespace, table_def)
+        .map_err(|e| format!("register join coalesce target locator table: {e}"))
+}
+
+fn build_join_delta_target_locator_table_def(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_table: &iceberg::table::Table,
+    target_snapshot_id: Option<i64>,
+) -> Result<crate::sql::catalog::TableDef, String> {
+    let base = IcebergTableRef {
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+    };
+    let mut table_def = match target_snapshot_id {
+        Some(snapshot_id) => build_iceberg_table_def_for_snapshot_scan(state, &base, snapshot_id)?,
+        None => build_empty_join_delta_target_locator_table_def(state, target)?,
+    };
+    table_def.name =
+        crate::engine::mv::iceberg_join_branch::JOIN_DELTA_TARGET_LOCATOR_TABLE.to_string();
+    crate::engine::mv::iceberg_target_apply::expose_physical_apply_key_for_locator_registration(
+        table_def,
+        target_table,
+        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+    )
+}
+
+fn build_empty_join_delta_target_locator_table_def(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+) -> Result<crate::sql::catalog::TableDef, String> {
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        registry.get(&target.catalog)?
+    };
+    let loaded =
+        crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)?;
+    let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_for_delta_scan(
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        loaded,
+    )?;
+    table_def
+        .iceberg_row_lineage_metadata_columns
+        .retain(|column| column.name != crate::exec::change_op::CHANGE_OP_COLUMN);
+    Ok(table_def)
 }
 
 fn register_join_delta_coalesce_side(
@@ -13103,9 +13093,9 @@ fn normalize_join_branch_snapshot_tables(
 /// in a one-shot `InMemoryCatalog` via `build_iceberg_table_def_for_delta_scan`,
 /// and execute the resulting `Query` through `execute_query_with_options`
 /// with a custom `IcebergMergeSinkFactory`. The sink fans inserts to a
-/// streaming data-file writer and routes DELETE rows through the A9 target
-/// locator, accumulating into a shared `IcebergCommitCollector`. After the
-/// pipeline completes, the refresh driver hands the populated collector to
+/// streaming data-file writer and routes DELETE rows carrying `_file` / `_pos`
+/// into a shared `IcebergCommitCollector`. After the pipeline completes, the
+/// refresh driver hands the populated collector to
 /// `commit_iceberg_mv_with_populated_collector` for the staging-branch commit,
 /// then publishes and finalizes.
 ///
@@ -13167,22 +13157,6 @@ fn rewrite_refresh_table_uuid_map(
         .iter()
         .map(|change| (change.base_ref.fqn(), change.current_table_uuid.to_string()))
         .collect()
-}
-
-fn merge_sink_partition_derivation(
-    contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-) -> Option<crate::engine::mv::iceberg_merge_sink::BoundTargetPartitionDerivation> {
-    let spec = crate::engine::mv::partition::resolve_partition_derivation_spec(contract)
-        .ok()
-        .flatten()?;
-    let bound_fields =
-        crate::engine::mv::partition::bind_spec_to_target_visible_columns(&spec, contract).ok()?;
-    Some(
-        crate::engine::mv::iceberg_merge_sink::BoundTargetPartitionDerivation {
-            target_spec_id: spec.target_spec_id,
-            bound_fields,
-        },
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13494,39 +13468,18 @@ fn incremental_refresh_iceberg_mv_with_changes(
     // any catalog qualifier before binding.
     crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
 
-    // 6. Pre-load the A9 target locator inputs when the base change batch
+    // 6. Use the RowDelta/DV commit path whenever the base change batch
     // carries DELETE-side rows or the IMV rewrite can emit change-stream
-    // DELETE rows while applying existing target groups.
-    let needs_locator_state =
+    // DELETE rows while applying existing target groups. Row location itself
+    // must be carried by the plan as `_file` / `_pos`.
+    let can_emit_delete_rows =
         has_delete_changes || apply_key.preload_locator_for_change_stream_deletes;
-    let locator_state = if needs_locator_state {
-        let inputs = match load_target_apply_locator_inputs(target_entry, &target_table) {
-            Ok(v) => v,
-            Err(err) => {
-                return Err(handle_iceberg_mv_commit_error(
-                    state,
-                    target,
-                    target_entry,
-                    &staging_branch,
-                    refresh_id,
-                    err,
-                ));
-            }
-        };
-        let (existing_deletes_by_file, referenced_data_file_partitions) = inputs;
-        Some(crate::engine::mv::iceberg_merge_sink::TargetLocatorState {
-            existing_deletes_by_file,
-            referenced_data_file_partitions,
-        })
-    } else {
-        None
-    };
 
     // 7. Build the shared commit collector + merge sink factory. The sink
     // injects WrittenFile / PositionDeleteGroup descriptors into the
     // collector during pipeline execution; the commit driver below
     // consumes the populated collector.
-    let op_kind = if needs_locator_state {
+    let op_kind = if can_emit_delete_rows {
         CommitOpKind::RowDeltaDv
     } else {
         CommitOpKind::FastAppend
@@ -13536,15 +13489,6 @@ fn incremental_refresh_iceberg_mv_with_changes(
     let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
         target_table: target_table.clone(),
         collector: Arc::clone(&collector),
-        locator_state,
-        apply_key_column: apply_key.column_name.to_string(),
-        apply_key_value_type: apply_key.value_type,
-        // Prune the delete-side locator to the same affected-partition
-        // allow-list the planner derived for the target-state read side.
-        // `Known` => AllowList; join/union/unpartitioned/NotDerived => None.
-        partition_filter: ctx.affected_partitions_to_target_partition_filter(),
-        pruning_limits: ctx.pruning_limits,
-        partition_derivation: merge_sink_partition_derivation(&ctx.rewrite.schema_contract),
     };
     let merge_sink =
         crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
@@ -14229,6 +14173,105 @@ mod tests {
         assert_eq!(status.fqn, "ice.sales.orders");
         assert_eq!(status.previous_snapshot_id, Some(10));
         assert_eq!(status.current_snapshot_id_before_pin, Some(11));
+    }
+
+    #[test]
+    fn join_delta_coalesce_catalog_registers_target_locator_at_supplied_snapshot() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "sales");
+        create_base_table(&env.state, "ice", "sales", "left_orders");
+        create_base_table(&env.state, "ice", "sales", "right_orders");
+        insert_into_iceberg_table(&env.state, "ice", "sales", "left_orders", &[(1, "left")]);
+        insert_into_iceberg_table(&env.state, "ice", "sales", "right_orders", &[(1, "right")]);
+        let right_snapshot_id = load_iceberg_table(&env.state, "ice", "sales", "right_orders")
+            .metadata()
+            .current_snapshot()
+            .expect("right snapshot")
+            .snapshot_id();
+        create_join_mv_target_locator_table(&env.state, "ice", "sales", "mv_join");
+        insert_into_join_mv_target_locator_table(
+            &env.state,
+            "ice",
+            "sales",
+            "mv_join",
+            &[(1, "sku-1", "join-key-1")],
+        );
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "sales".to_string(),
+            table: "mv_join".to_string(),
+        };
+        let target_table = load_iceberg_table(&env.state, "ice", "sales", "mv_join");
+        let target_snapshot_id = target_table
+            .metadata()
+            .current_snapshot()
+            .expect("target snapshot")
+            .snapshot_id();
+        let branches = vec![
+            crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan {
+                left_base: iceberg_ref("ice", "sales", "left_orders"),
+                right_base: iceberg_ref("ice", "sales", "right_orders"),
+                left: crate::engine::mv::iceberg_join_branch::BranchSide::Delta(
+                    crate::engine::mv::iceberg_join_branch::SnapshotWindow { from: 10, to: 11 },
+                ),
+                right: crate::engine::mv::iceberg_join_branch::BranchSide::Snapshot(
+                    right_snapshot_id,
+                ),
+            },
+        ];
+
+        let catalog = build_join_delta_coalesce_catalog(
+            &env.state,
+            &branches,
+            &target,
+            &target_table,
+            Some(target_snapshot_id),
+        )
+        .expect("join coalesce catalog");
+        let locator = catalog
+            .get("sales", "__nr_join_delta_target_locator")
+            .expect("target locator table");
+
+        assert!(
+            locator
+                .columns
+                .iter()
+                .any(|column| column.name == ICEBERG_MV_JOIN_APPLY_KEY_COLUMN),
+            "locator columns={:?}",
+            locator.columns
+        );
+        assert!(
+            locator
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|column| column.name == "_file"),
+            "locator metadata columns={:?}",
+            locator.iceberg_row_lineage_metadata_columns
+        );
+        assert!(
+            locator
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|column| column.name == "_pos"),
+            "locator metadata columns={:?}",
+            locator.iceberg_row_lineage_metadata_columns
+        );
+        let crate::sql::catalog::ScanSource::IcebergDataFiles {
+            table,
+            files,
+            binding,
+            ..
+        } = &locator.source
+        else {
+            panic!("expected iceberg data-file locator source");
+        };
+        assert_eq!(table.catalog, "ice");
+        assert_eq!(table.namespace, "sales");
+        assert_eq!(table.table, "mv_join");
+        assert_eq!(
+            *binding,
+            crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles
+        );
+        assert_eq!(files.len(), 1, "locator must use supplied snapshot files");
     }
 
     #[test]
@@ -15835,6 +15878,98 @@ mod tests {
             ],
         )
         .expect("create join customers iceberg table");
+    }
+
+    fn create_join_mv_target_locator_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let columns = vec![
+            crate::sql::TableColumnDef {
+                name: "id".to_string(),
+                data_type: crate::sql::SqlType::Int,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            },
+            crate::sql::TableColumnDef {
+                name: "label".to_string(),
+                data_type: crate::sql::SqlType::String,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            },
+            crate::sql::TableColumnDef {
+                name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                data_type: crate::sql::SqlType::String,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            },
+        ];
+        crate::connector::iceberg::catalog::registry::create_table(
+            &entry,
+            namespace,
+            table,
+            &columns,
+            None,
+            &[],
+            &[
+                ("format-version".to_string(), "3".to_string()),
+                ("write.row-lineage".to_string(), "true".to_string()),
+                (
+                    ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
+                    ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                ),
+            ],
+        )
+        .expect("create join MV target locator table");
+    }
+
+    fn insert_into_join_mv_target_locator_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        rows: &[(i32, &str, &str)],
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let rows = rows
+            .iter()
+            .map(|(id, label, join_key)| {
+                vec![
+                    crate::sql::Literal::Int(i64::from(*id)),
+                    crate::sql::Literal::String((*label).to_string()),
+                    crate::sql::Literal::String((*join_key).to_string()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
+            .expect("insert join MV target locator rows");
+    }
+
+    fn load_iceberg_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> iceberg::table::Table {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
+            .expect("load iceberg table")
+            .table
     }
 
     fn create_identity_partitioned_base_table(

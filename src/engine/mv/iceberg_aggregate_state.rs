@@ -229,9 +229,9 @@ fn validate_physical_aggregate_schema(
     batch: &RecordBatch,
     context: &str,
 ) -> Result<(), String> {
-    if batch.num_columns() != layout.physical_columns.len() {
+    if batch.num_columns() < layout.physical_columns.len() {
         return Err(format!(
-            "{context}: physical aggregate schema column count mismatch: got {} expected {}",
+            "{context}: physical aggregate schema column count mismatch: got {} expected at least {}",
             batch.num_columns(),
             layout.physical_columns.len()
         ));
@@ -518,6 +518,52 @@ mod tests {
         .expect("physical batch")
     }
 
+    fn count_physical_batch_with_positions(
+        rows: &[(&str, &str, i64, i64, &str, i64)],
+    ) -> RecordBatch {
+        let mut state_builder = LargeBinaryBuilder::new();
+        for row in rows {
+            state_builder.append_value(encode_count_state(row.3));
+        }
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("__row_id__", DataType::Utf8, false),
+                Field::new("region", DataType::Utf8, true),
+                Field::new("c", DataType::Int64, false),
+                Field::new("__agg_state_c", DataType::LargeBinary, false),
+                Field::new(
+                    crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                    DataType::Utf8,
+                    false,
+                ),
+                Field::new(
+                    crate::exec::row_position::ICEBERG_ROW_POS_COL,
+                    DataType::Int64,
+                    false,
+                ),
+            ])),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(state_builder.finish()) as ArrayRef,
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.4).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.5).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .expect("physical batch with positions")
+    }
+
     fn count_physical_batch_with_raw_state(rows: &[(&str, &str, i64, &[u8])]) -> RecordBatch {
         let mut state_builder = LargeBinaryBuilder::new();
         for row in rows {
@@ -657,6 +703,93 @@ mod tests {
         assert_eq!(
             insert_ops.value(0),
             crate::exec::change_op::CHANGE_OP_INSERT
+        );
+    }
+
+    #[test]
+    fn change_stream_delete_rows_preserve_old_file_pos_metadata() {
+        let layout = test_count_layout();
+        let r1 = encoded_utf8_group_row_id("r1");
+        let old = vec![chunk(count_physical_batch_with_positions(&[(
+            r1.as_str(),
+            "r1",
+            2,
+            2,
+            "s3://bucket/table/data-1.parquet",
+            42,
+        )]))];
+        let delta = vec![chunk(count_physical_batch(&[(r1.as_str(), "r1", 1, 1)]))];
+
+        let chunks = merge_aggregate_state_chunks_for_change_stream(&old, &delta, &layout)
+            .expect("change stream");
+
+        assert_eq!(chunks.len(), 2);
+        let delete_batch = &chunks[0].batch;
+        let delete_fields = delete_batch.schema().fields().clone();
+        assert_eq!(delete_fields.len(), 7);
+        assert_field(
+            delete_fields[0].as_ref(),
+            "__row_id__",
+            &DataType::Utf8,
+            false,
+        );
+        assert_field(delete_fields[1].as_ref(), "region", &DataType::Utf8, true);
+        assert_field(delete_fields[2].as_ref(), "c", &DataType::Int64, false);
+        assert_field(
+            delete_fields[3].as_ref(),
+            "__agg_state_c",
+            &DataType::LargeBinary,
+            false,
+        );
+        assert_field(
+            delete_fields[4].as_ref(),
+            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            &DataType::Utf8,
+            false,
+        );
+        assert_field(
+            delete_fields[5].as_ref(),
+            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            &DataType::Int64,
+            false,
+        );
+        assert_field(
+            delete_fields[6].as_ref(),
+            "__change_op",
+            &DataType::Int8,
+            false,
+        );
+        let file_values = delete_batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("file path column");
+        let pos_values = delete_batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("position column");
+        assert_eq!(file_values.value(0), "s3://bucket/table/data-1.parquet");
+        assert_eq!(pos_values.value(0), 42);
+        let delete_ops = delete_batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .expect("delete op");
+        assert_eq!(
+            delete_ops.value(0),
+            crate::exec::change_op::CHANGE_OP_DELETE
+        );
+
+        let insert_batch = &chunks[1].batch;
+        assert_eq!(
+            insert_batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["__row_id__", "region", "c", "__agg_state_c", "__change_op"]
         );
     }
 

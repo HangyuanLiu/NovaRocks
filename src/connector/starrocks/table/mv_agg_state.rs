@@ -1005,9 +1005,9 @@ fn load_aggregate_physical_rows_from_batch_owned(
     allow_negative_counts: bool,
 ) -> Result<Vec<AggregatePhysicalRow>, String> {
     let expected_columns = 1 + layout.visible_columns.len() + layout.state_columns.len();
-    if batch.num_columns() != expected_columns {
+    if batch.num_columns() < expected_columns {
         return Err(format!(
-            "aggregate MV physical column count mismatch: batch_columns={} expected={expected_columns}",
+            "aggregate MV physical column count mismatch: batch_columns={} expected_at_least={expected_columns}",
             batch.num_columns()
         ));
     }

@@ -200,7 +200,9 @@ fn table_info_from_source(source: &ScanSource) -> Option<&IcebergTableInfo> {
         | ScanSource::IcebergMetadataTable { table, .. }
         | ScanSource::IcebergDeltaTable { table, .. }
         | ScanSource::IcebergVersionTable { table, .. } => Some(table),
-        ScanSource::StarRocks { .. } | ScanSource::IcebergMvTargetState { .. } => None,
+        ScanSource::StarRocks { .. }
+        | ScanSource::IcebergMvTargetState { .. }
+        | ScanSource::IcebergMvTargetLocator(_) => None,
     }
 }
 
