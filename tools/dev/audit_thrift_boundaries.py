@@ -18,6 +18,7 @@ SCAN_ROOTS = (
 
 THRIFT_PATTERN = re.compile(
     r"\b("
+    r"use\s+crate\s+as|"
     r"crate::thrift|"
     r"crate::types::arrow_thrift|"
     r"TTypeDesc|TPrimitiveType|TExpr|TExprNode|TDescriptorTable|"
@@ -138,9 +139,9 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/engine/mod.rs": BaselineEntry("domain-leak", "B7", 16, "Standalone engine still contains thrift compatibility paths outside dedicated adapters"),
     "src/exec/spill/mod.rs": BaselineEntry("domain-leak", "B7", 2, "Spill path still carries thrift-derived compression/type metadata"),
     "src/exec/node/join.rs": BaselineEntry("domain-leak", "B7", 2, "Execution join node still carries thrift-derived metadata"),
-    "src/exec/node/aggregate.rs": BaselineEntry("domain-leak", "B7", 0, "Execution aggregate node uses internal runtime filter metadata"),
+    "src/exec/node/aggregate.rs": BaselineEntry("domain-leak", "B7", 2, "Execution aggregate node still carries thrift-derived metadata"),
     "src/exec/expr/cast.rs": BaselineEntry("domain-leak", "B7", 0, "Execution cast path still uses thrift primitive conversion helpers"),
-    "src/exec/operators/aggregate/mod.rs": BaselineEntry("domain-leak", "B7", 0, "Aggregate operator uses internal runtime filter metadata"),
+    "src/exec/operators/aggregate/mod.rs": BaselineEntry("domain-leak", "B7", 1, "Aggregate operator still carries thrift-derived metadata"),
     "src/engine/statement.rs": BaselineEntry("domain-leak", "B7", 1, "Standalone statement path still contains thrift compatibility code outside dedicated adapters"),
 }
 

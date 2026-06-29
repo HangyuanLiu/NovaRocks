@@ -37,7 +37,9 @@ use crate::fs::scan_context::FileScanRange;
 use crate::runtime::lookup::GlobalLateMaterializationContext;
 use crate::runtime::mem_tracker::{self, MemTracker};
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
-use crate::runtime::runtime_filter_worker::RuntimeFilterWorker;
+use crate::runtime::runtime_filter_worker::{
+    RuntimeFilterProberTarget, RuntimeFilterWorker, RuntimeFilterWorkerParams,
+};
 use crate::thrift::descriptors;
 use crate::thrift::internal_service;
 use crate::thrift::runtime_filter;
@@ -73,6 +75,7 @@ pub(crate) struct QueryContext {
     pub(crate) exchange_senders: HashMap<i32, usize>,
     pub(crate) runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
     pub(crate) runtime_filter_params: Option<runtime_filter::TRuntimeFilterParams>,
+    pub(crate) runtime_filter_worker_params: Option<RuntimeFilterWorkerParams>,
     pub(crate) runtime_filter_worker: Option<Arc<RuntimeFilterWorker>>,
     pub(crate) pending_runtime_filters: Vec<PendingRuntimeFilter>,
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
@@ -115,6 +118,7 @@ impl QueryContext {
             exchange_senders: HashMap::new(),
             runtime_filter_hub: None,
             runtime_filter_params: None,
+            runtime_filter_worker_params: None,
             runtime_filter_worker: None,
             pending_runtime_filters: Vec::new(),
             row_pos_descs: HashMap::new(),
@@ -195,12 +199,18 @@ impl QueryContext {
         params: runtime_filter::TRuntimeFilterParams,
     ) {
         if self.runtime_filter_params.is_none() {
+            self.runtime_filter_worker_params =
+                Some(runtime_filter_worker_params_from_thrift(&params));
             self.runtime_filter_params = Some(params);
         }
     }
 
     pub(crate) fn runtime_filter_params(&self) -> Option<runtime_filter::TRuntimeFilterParams> {
         self.runtime_filter_params.clone()
+    }
+
+    pub(crate) fn runtime_filter_worker_params(&self) -> Option<RuntimeFilterWorkerParams> {
+        self.runtime_filter_worker_params.clone()
     }
 
     pub(crate) fn set_runtime_filter_worker(&mut self, worker: Arc<RuntimeFilterWorker>) {
@@ -738,7 +748,7 @@ impl QueryContextManager {
         if let Some(worker) = ctx.runtime_filter_worker() {
             return Some(worker);
         }
-        let params = ctx.runtime_filter_params()?;
+        let params = ctx.runtime_filter_worker_params()?;
         let hub = if let Some(hub) = ctx.runtime_filter_hub() {
             hub
         } else {
@@ -983,6 +993,42 @@ impl QueryContextManager {
             guard.active.insert(query_id, ctx);
         }
     }
+}
+
+fn runtime_filter_worker_params_from_thrift(
+    params: &runtime_filter::TRuntimeFilterParams,
+) -> RuntimeFilterWorkerParams {
+    let mut id_to_prober_targets = HashMap::new();
+    if let Some(id_to_prober_params) = params.id_to_prober_params.as_ref() {
+        for (filter_id, probers) in id_to_prober_params {
+            let targets = probers
+                .iter()
+                .filter_map(|prober| {
+                    let addr = prober.fragment_instance_address.as_ref()?;
+                    Some(RuntimeFilterProberTarget::new(
+                        addr.hostname.clone(),
+                        addr.port,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            id_to_prober_targets.insert(*filter_id, targets);
+        }
+    }
+    let runtime_filter_builder_number = params
+        .runtime_filter_builder_number
+        .as_ref()
+        .map(|builder_numbers| {
+            builder_numbers
+                .iter()
+                .map(|(filter_id, count)| (*filter_id, *count))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    RuntimeFilterWorkerParams::new(
+        id_to_prober_targets,
+        runtime_filter_builder_number,
+        params.runtime_filter_max_size,
+    )
 }
 
 static QUERY_CONTEXT_MANAGER: OnceLock<Arc<QueryContextManager>> = OnceLock::new();

@@ -36,7 +36,6 @@ use super::build_requirements::{NullKeyRequirement, required_build_components};
 use super::build_state::JoinBuildSinkState;
 use super::join_hash_map::build_store::BuildStoreBuilder;
 use super::join_hash_map::method::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions};
-use crate as nr;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::{JoinDistributionMode, JoinRuntimeFilterSpec, JoinType};
@@ -58,7 +57,6 @@ use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::exchange_sender;
-use nr::thrift::metrics;
 use std::collections::{HashMap, HashSet};
 
 /// Factory for hash-join build sinks that construct build-side hash structures.
@@ -640,16 +638,12 @@ impl HashJoinBuildSinkOperator {
                 self.log_in_filters("publish", &in_filters);
                 self.log_membership_filters("publish", &membership_filters);
                 if let Some(profile) = self.profiles.as_ref() {
-                    profile.common.counter_set(
-                        "RuntimeFilterNum",
-                        metrics::TUnit::UNIT,
-                        membership_filters.len() as i64,
-                    );
-                    profile.common.counter_set(
-                        "RuntimeInFilterNum",
-                        metrics::TUnit::UNIT,
-                        in_filters.len() as i64,
-                    );
+                    profile
+                        .common
+                        .counter_set_unit("RuntimeFilterNum", membership_filters.len() as i64);
+                    profile
+                        .common
+                        .counter_set_unit("RuntimeInFilterNum", in_filters.len() as i64);
                 }
                 let local_filters = self.build_local_filters(&in_filters);
                 let membership_for_publish = membership_filters.clone();
@@ -668,16 +662,12 @@ impl HashJoinBuildSinkOperator {
             self.log_in_filters("publish", &in_filters);
             self.log_membership_filters("publish", &membership_filters);
             if let Some(profile) = self.profiles.as_ref() {
-                profile.common.counter_set(
-                    "RuntimeFilterNum",
-                    metrics::TUnit::UNIT,
-                    membership_filters.len() as i64,
-                );
-                profile.common.counter_set(
-                    "RuntimeInFilterNum",
-                    metrics::TUnit::UNIT,
-                    in_filters.len() as i64,
-                );
+                profile
+                    .common
+                    .counter_set_unit("RuntimeFilterNum", membership_filters.len() as i64);
+                profile
+                    .common
+                    .counter_set_unit("RuntimeInFilterNum", in_filters.len() as i64);
             }
             let local_filters = self.build_local_filters(&in_filters);
             let membership_for_publish = membership_filters.clone();
@@ -867,11 +857,9 @@ impl HashJoinBuildSinkOperator {
         if encoded_bytes > 0
             && let Some(profile) = self.profiles.as_ref()
         {
-            profile.common.counter_add(
-                "PartialRuntimeMembershipFilterBytes",
-                metrics::TUnit::BYTES,
-                encoded_bytes,
-            );
+            profile
+                .common
+                .counter_add_bytes("PartialRuntimeMembershipFilterBytes", encoded_bytes);
         }
         Ok(())
     }
@@ -959,16 +947,13 @@ impl HashJoinBuildSinkOperator {
             return;
         };
         if counters.in_filters > 0 {
-            profile.common.counter_add(
-                "RuntimeInFilterDropped",
-                metrics::TUnit::UNIT,
-                counters.in_filters as i64,
-            );
+            profile
+                .common
+                .counter_add_unit("RuntimeInFilterDropped", counters.in_filters as i64);
         }
         if counters.membership_filters > 0 {
-            profile.common.counter_add(
+            profile.common.counter_add_unit(
                 "RuntimeMembershipFilterDropped",
-                metrics::TUnit::UNIT,
                 counters.membership_filters as i64,
             );
         }
@@ -1235,21 +1220,15 @@ impl HashJoinBuildSinkOperator {
             profile.common.add_info_string("DistributionMode", mode);
             profile.common.add_timer("RuntimeFilterBuildTime");
             profile.common.add_timer("BuildHashTableTime");
+            profile.common.add_unit_counter("RuntimeFilterNum");
+            profile.common.add_unit_counter("RuntimeInFilterNum");
+            profile.common.add_unit_counter("RuntimeInFilterDropped");
             profile
                 .common
-                .add_counter("RuntimeFilterNum", metrics::TUnit::UNIT);
+                .add_unit_counter("RuntimeMembershipFilterDropped");
             profile
                 .common
-                .add_counter("RuntimeInFilterNum", metrics::TUnit::UNIT);
-            profile
-                .common
-                .add_counter("RuntimeInFilterDropped", metrics::TUnit::UNIT);
-            profile
-                .common
-                .add_counter("RuntimeMembershipFilterDropped", metrics::TUnit::UNIT);
-            profile
-                .common
-                .add_counter("PartialRuntimeMembershipFilterBytes", metrics::TUnit::BYTES);
+                .add_bytes_counter("PartialRuntimeMembershipFilterBytes");
         }
     }
 }
