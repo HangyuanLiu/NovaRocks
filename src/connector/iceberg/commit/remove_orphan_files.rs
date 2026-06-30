@@ -285,7 +285,7 @@ async fn list_files_opendal(
     location: &str,
     cfg: &ObjectStoreConfig,
 ) -> Result<Vec<ScannedFile>, String> {
-    use crate::connector::iceberg::catalog::add_files::parse_s3_path;
+    use crate::connector::iceberg::fs_io::parse_object_store_path_parse_only;
     use crate::fs::object_store::build_object_store_operator;
 
     let scheme = if location.starts_with("oss://") {
@@ -294,7 +294,7 @@ async fn list_files_opendal(
         "s3"
     };
 
-    let (bucket, location_key) = parse_s3_path(location)
+    let (bucket, location_key) = parse_object_store_path_parse_only(location)
         .map_err(|e| format!("parse table location for opendal scan: {e}"))?;
 
     // Build an operator rooted at the bucket level so keys we pass match

@@ -333,6 +333,33 @@ pub(crate) fn build_file_io_for_location(
     .build()
 }
 
+pub(crate) fn build_storage_factory_for_location(
+    location: &str,
+    object_store_config: Option<&ObjectStoreConfig>,
+) -> Arc<dyn StorageFactory> {
+    // StorageFactory construction is lazy for the same reason FileIO is: keep
+    // credentials here and resolve concrete operators per IO call.
+    let _ = location;
+    Arc::new(IcebergFsStorageFactory::new(object_store_config.cloned()))
+}
+
+pub(crate) fn object_store_config_from_catalog_properties(
+    props: &[(String, String)],
+) -> std::result::Result<Option<ObjectStoreConfig>, String> {
+    use std::collections::BTreeMap;
+
+    let props_map: BTreeMap<String, String> = props
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let credentials =
+        crate::fs::object_store_credentials::ObjectStoreCredentials::optional_from_aws_s3_properties(
+            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
+            &props_map,
+        )?;
+    Ok(credentials.map(|credentials| credentials.to_object_store_config()))
+}
+
 pub(crate) fn resolve_access_for_location(
     location: &str,
     object_store_config: Option<&ObjectStoreConfig>,
@@ -350,6 +377,44 @@ where
 {
     let handle = FsAccessResolver::new().resolve_locations(locations, object_store_config)?;
     Ok(IcebergFsAccess::new(handle))
+}
+
+pub(crate) fn format_resolved_location(
+    handle: &FsAccessHandle,
+    operator_relative_path: &str,
+) -> std::result::Result<String, String> {
+    let path = operator_relative_path.trim_start_matches('/');
+    let location = handle
+        .paths()
+        .first()
+        .map(|path| path.location())
+        .ok_or_else(|| "fs access handle has no resolved paths".to_string())?;
+
+    match location.scheme() {
+        FsScheme::Local => {
+            let root = handle
+                .root()
+                .ok_or_else(|| "local fs access handle missing root".to_string())?;
+            let full_path = Path::new(root).join(path);
+            Ok(format!("file://{}", full_path.display()))
+        }
+        FsScheme::ObjectStore => {
+            let scheme = location.uri_scheme().unwrap_or("s3");
+            let bucket = handle
+                .authority()
+                .or_else(|| location.authority())
+                .ok_or_else(|| "object-store fs access handle missing bucket".to_string())?;
+            Ok(format!("{scheme}://{bucket}/{path}"))
+        }
+        FsScheme::Hdfs => {
+            let scheme = location.uri_scheme().unwrap_or("hdfs");
+            let authority = handle
+                .authority()
+                .or_else(|| location.authority())
+                .ok_or_else(|| "hdfs fs access handle missing authority".to_string())?;
+            Ok(format!("{scheme}://{authority}/{path}"))
+        }
+    }
 }
 
 pub(crate) fn reader_factory_for_table_location(
@@ -380,6 +445,22 @@ pub(crate) fn normalize_hdfs_path_parse_only(path: &str) -> std::result::Result<
         return Err(format!("expected hdfs location: {path}"));
     }
     crate::fs::hdfs::parse_hdfs_path(location.original()).map(|parsed| parsed.rel_path)
+}
+
+pub(crate) fn parse_object_store_path_parse_only(
+    path: &str,
+) -> std::result::Result<(String, String), String> {
+    let location = FsAccessResolver::new()
+        .parse_location(path)
+        .map_err(|e| format!("parse object-store location {path}: {e}"))?;
+    if !location.scheme().is_object_store() {
+        return Err(format!("expected object-store location: {path}"));
+    }
+    let bucket = location
+        .authority()
+        .ok_or_else(|| format!("object-store location missing bucket: {path}"))?
+        .to_string();
+    Ok((bucket, location.path().trim_start_matches('/').to_string()))
 }
 
 pub(crate) fn read_exact_range(
@@ -415,9 +496,26 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        build_file_io_for_location, read_exact_range, resolve_access_for_location,
+        build_file_io_for_location, format_resolved_location,
+        object_store_config_from_catalog_properties, read_exact_range, resolve_access_for_location,
         resolve_access_for_locations,
     };
+
+    fn test_object_store_config() -> crate::fs::object_store::ObjectStoreConfig {
+        crate::fs::object_store::ObjectStoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            session_token: None,
+            enable_path_style_access: Some(true),
+            region: Some("us-east-1".to_string()),
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        }
+    }
 
     #[tokio::test]
     async fn file_io_round_trips_local_file_location() {
@@ -555,6 +653,48 @@ mod tests {
     }
 
     #[test]
+    fn catalog_properties_build_optional_object_store_config() {
+        let props = vec![
+            (
+                "aws.s3.endpoint_url".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "true".to_string(),
+            ),
+            ("aws.s3.sessionToken".to_string(), "token".to_string()),
+            ("aws.s3.max_retries".to_string(), "9".to_string()),
+        ];
+
+        let cfg = object_store_config_from_catalog_properties(&props)
+            .expect("parse catalog properties")
+            .expect("object-store config");
+
+        assert_eq!(cfg.endpoint, "http://localhost:9000");
+        assert_eq!(cfg.access_key_id, "ak");
+        assert_eq!(cfg.access_key_secret, "sk");
+        assert_eq!(cfg.session_token.as_deref(), Some("token"));
+        assert_eq!(cfg.enable_path_style_access, Some(true));
+        assert_eq!(cfg.retry_max_times, Some(9));
+    }
+
+    #[test]
+    fn catalog_properties_without_complete_credentials_return_none() {
+        let props = vec![(
+            "aws.s3.endpoint_url".to_string(),
+            "http://localhost:9000".to_string(),
+        )];
+
+        let cfg = object_store_config_from_catalog_properties(&props)
+            .expect("incomplete credentials are optional");
+
+        assert!(cfg.is_none());
+    }
+
+    #[test]
     fn read_exact_range_uses_resolved_operator_relative_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file_path = dir.path().join("data.bin");
@@ -564,6 +704,30 @@ mod tests {
         let bytes = read_exact_range(&location, 2..6, None).expect("range read");
 
         assert_eq!(bytes, "2345");
+    }
+
+    #[test]
+    fn format_resolved_location_preserves_object_store_uri_scheme() {
+        let cfg = test_object_store_config();
+
+        for (location, expected) in [
+            (
+                "s3a://bucket/warehouse/table",
+                "s3a://bucket/warehouse/table/data/a.parquet",
+            ),
+            (
+                "oss://bucket/warehouse/table",
+                "oss://bucket/warehouse/table/data/a.parquet",
+            ),
+        ] {
+            let access =
+                resolve_access_for_location(location, Some(&cfg)).expect("resolve object store");
+            let formatted =
+                format_resolved_location(access.handle(), "warehouse/table/data/a.parquet")
+                    .expect("format location");
+
+            assert_eq!(formatted, expected);
+        }
     }
 
     #[test]

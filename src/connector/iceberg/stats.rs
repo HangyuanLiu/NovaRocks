@@ -316,31 +316,25 @@ fn build_stats_file_io(
     let scheme = location.split("://").next().unwrap_or("");
     let is_s3 = matches!(scheme, "s3" | "s3a" | "oss");
     if !is_s3 {
-        return Ok(iceberg::io::FileIO::new_with_fs());
+        return Ok(crate::connector::iceberg::fs_io::build_file_io_for_location(location, None));
     }
 
-    let credentials =
-        crate::fs::object_store_credentials::ObjectStoreCredentials::from_aws_s3_properties(
-            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
-            cloud_properties,
-        )?;
-
-    let factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory {
-        endpoint: credentials.endpoint,
-        access_key_id: credentials.access_key_id,
-        access_key_secret: credentials.access_key_secret,
-        session_token: credentials.session_token,
-        region: credentials
-            .region
-            .unwrap_or_else(|| "us-east-1".to_string()),
-        enable_path_style: credentials.enable_path_style_access.unwrap_or(false),
-        retry_max_times: credentials.retry_max_times,
-        retry_min_delay_ms: credentials.retry_min_delay_ms,
-        retry_max_delay_ms: credentials.retry_max_delay_ms,
-        timeout_ms: credentials.timeout_ms,
-        io_timeout_ms: credentials.io_timeout_ms,
-    };
-    Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build())
+    let props = cloud_properties
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    let object_store_config =
+        crate::connector::iceberg::fs_io::object_store_config_from_catalog_properties(&props)?
+            .ok_or_else(|| {
+                "object-store stats FileIO requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
+                    .to_string()
+            })?;
+    Ok(
+        crate::connector::iceberg::fs_io::build_file_io_for_location(
+            location,
+            Some(&object_store_config),
+        ),
+    )
 }
 
 #[cfg(test)]

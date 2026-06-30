@@ -1477,21 +1477,13 @@ mod tests {
         assert_eq!(s3.timeout_ms, Some(1234));
         assert_eq!(s3.io_timeout_ms, Some(5678));
 
-        let factory = s3.to_s3_storage_factory();
-        assert_eq!(factory.session_token.as_deref(), Some("token"));
-        assert_eq!(factory.retry_max_times, Some(7));
-        assert_eq!(factory.retry_min_delay_ms, Some(11));
-        assert_eq!(factory.retry_max_delay_ms, Some(99));
-        assert_eq!(factory.timeout_ms, Some(1234));
-        assert_eq!(factory.io_timeout_ms, Some(5678));
-
-        let legacy = s3.to_object_store_config();
-        assert_eq!(legacy.session_token.as_deref(), Some("token"));
-        assert_eq!(legacy.retry_max_times, Some(7));
-        assert_eq!(legacy.retry_min_delay_ms, Some(11));
-        assert_eq!(legacy.retry_max_delay_ms, Some(99));
-        assert_eq!(legacy.timeout_ms, Some(1234));
-        assert_eq!(legacy.io_timeout_ms, Some(5678));
+        let object_store_config = s3.to_object_store_config();
+        assert_eq!(object_store_config.session_token.as_deref(), Some("token"));
+        assert_eq!(object_store_config.retry_max_times, Some(7));
+        assert_eq!(object_store_config.retry_min_delay_ms, Some(11));
+        assert_eq!(object_store_config.retry_max_delay_ms, Some(99));
+        assert_eq!(object_store_config.timeout_ms, Some(1234));
+        assert_eq!(object_store_config.io_timeout_ms, Some(5678));
     }
 
     #[test]

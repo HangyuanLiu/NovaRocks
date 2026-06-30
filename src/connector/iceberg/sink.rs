@@ -1449,16 +1449,24 @@ pub(crate) fn build_staged_file_io(
     data_location: &str,
     s3_config: Option<&IcebergSinkObjectStoreConfig>,
 ) -> Result<iceberg::io::FileIO, String> {
-    if data_location.starts_with("s3://") || data_location.starts_with("oss://") {
+    if data_location.starts_with("s3://")
+        || data_location.starts_with("s3a://")
+        || data_location.starts_with("oss://")
+    {
         let s3 = s3_config.ok_or_else(|| {
             format!(
                 "iceberg sink missing S3 config for staged writer data_location={data_location}"
             )
         })?;
-        let factory = s3.to_s3_storage_factory();
-        return Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build());
+        let object_store_config = s3.to_object_store_config();
+        return Ok(
+            crate::connector::iceberg::fs_io::build_file_io_for_location(
+                data_location,
+                Some(&object_store_config),
+            ),
+        );
     }
-    Ok(iceberg::io::FileIO::new_with_fs())
+    Ok(crate::connector::iceberg::fs_io::build_file_io_for_location(data_location, None))
 }
 
 pub(crate) fn parse_object_store_bucket_and_root(path: &str) -> Option<(String, String)> {

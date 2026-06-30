@@ -1,9 +1,9 @@
 //! ADD FILES implementation for Iceberg tables.
 //!
-//! Registers existing parquet files from S3/OSS into an Iceberg table's
-//! metadata without data movement.
+//! Registers existing parquet files from resolver-backed filesystem locations
+//! into an Iceberg table's metadata without data movement.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -12,8 +12,9 @@ use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_hadoop_catalog, load_table,
 };
+use crate::connector::iceberg::fs_io;
 use crate::engine::catalog::normalize_identifier;
-use crate::fs::object_store::{ObjectStoreConfig, build_object_store_operator};
+use crate::fs::object_store::ObjectStoreConfig;
 
 /// Execute ADD FILES: register parquet files from an S3 directory into an Iceberg table.
 pub(crate) fn add_files(
@@ -23,9 +24,10 @@ pub(crate) fn add_files(
     s3_directory: &str,
 ) -> Result<usize, String> {
     let loaded = load_table(entry, namespace, table_name)?;
-    let s3_config = build_s3_config_from_properties(&entry.properties)?;
+    let object_store_config = fs_io::object_store_config_from_catalog_properties(&entry.properties)
+        .map_err(|e| format!("parse Iceberg ADD FILES object-store catalog properties: {e}"))?;
 
-    let files = list_parquet_files(&s3_config, s3_directory)?;
+    let files = list_parquet_files(s3_directory, object_store_config.as_ref())?;
     tracing::info!(
         "ADD FILES: found {} parquet files in {s3_directory}",
         files.len()
@@ -35,16 +37,14 @@ pub(crate) fn add_files(
     }
     if files.is_empty() {
         return Err(format!(
-            "ADD FILES: no parquet files found in {s3_directory} (bucket={}, prefix from parse)",
-            parse_s3_path(s3_directory)
-                .map(|(b, _)| b)
-                .unwrap_or_default()
+            "ADD FILES: no parquet files found under {s3_directory}"
         ));
     }
 
     let mut data_files = Vec::with_capacity(files.len());
     for (file_path, file_size) in &files {
-        let record_count = read_parquet_record_count(&s3_config, file_path, *file_size)?;
+        let record_count =
+            read_parquet_record_count(file_path, *file_size, object_store_config.as_ref())?;
         let data_file = DataFileBuilder::default()
             .content(DataContentType::Data)
             .file_path(file_path.clone())
@@ -97,100 +97,55 @@ pub(crate) fn add_files(
     Ok(count)
 }
 
-// ---------------------------------------------------------------------------
-// S3 config helpers
-// ---------------------------------------------------------------------------
-
-fn build_s3_config_from_properties(
-    properties: &[(String, String)],
-) -> Result<ObjectStoreConfig, String> {
-    let props_map: BTreeMap<String, String> = properties
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    let credentials =
-        crate::fs::object_store_credentials::ObjectStoreCredentials::from_aws_s3_properties(
-            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
-            &props_map,
-        )?;
-    let mut cfg = credentials.to_object_store_config();
-    crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
-    Ok(cfg)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::build_s3_config_from_properties;
+    use std::sync::Arc;
+
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+
+    use super::{list_parquet_files, read_parquet_record_count};
 
     #[test]
-    fn build_s3_config_accepts_shared_aliases_and_retry_values() {
-        let props = vec![
-            (
-                "aws.s3.endpoint_url".to_string(),
-                "http://localhost:9000".to_string(),
-            ),
-            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
-            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
-            (
-                "aws.s3.enable_path_style_access".to_string(),
-                "1".to_string(),
-            ),
-            ("aws.s3.max_retries".to_string(), "7".to_string()),
-            ("aws.s3.retry_min_delay_ms".to_string(), "11".to_string()),
-            ("aws.s3.retry_max_delay_ms".to_string(), "99".to_string()),
-            ("aws.s3.request_timeout_ms".to_string(), "1234".to_string()),
-            ("aws.s3.io_timeout_ms".to_string(), "5678".to_string()),
-        ];
+    fn list_parquet_files_uses_resolver_and_formats_file_locations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.parquet"), b"data").expect("write parquet placeholder");
+        std::fs::write(dir.path().join("_hidden.parquet"), b"hidden").expect("write hidden");
+        std::fs::write(dir.path().join("notes.txt"), b"notes").expect("write notes");
+        let directory = format!("file://{}", dir.path().display());
 
-        let cfg = build_s3_config_from_properties(&props).expect("build S3 config");
+        let files = list_parquet_files(&directory, None).expect("list parquet files");
 
-        assert_eq!(cfg.endpoint, "http://localhost:9000");
-        assert_eq!(cfg.access_key_id, "ak");
-        assert_eq!(cfg.access_key_secret, "sk");
-        assert_eq!(cfg.session_token, None);
-        assert_eq!(cfg.enable_path_style_access, Some(true));
-        assert_eq!(cfg.region, None);
-        assert_eq!(cfg.retry_max_times, Some(7));
-        assert_eq!(cfg.retry_min_delay_ms, Some(11));
-        assert_eq!(cfg.retry_max_delay_ms, Some(99));
-        assert_eq!(cfg.timeout_ms, Some(1234));
-        assert_eq!(cfg.io_timeout_ms, Some(5678));
+        assert_eq!(
+            files,
+            vec![(format!("file://{}/a.parquet", dir.path().display()), 4)]
+        );
     }
 
     #[test]
-    fn build_s3_config_leaves_retry_and_timeout_to_runtime_defaults_when_omitted() {
-        let props = vec![
-            (
-                "aws.s3.endpoint_url".to_string(),
-                "http://localhost:9000".to_string(),
-            ),
-            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
-            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
-        ];
+    fn read_parquet_record_count_reads_local_file_footer_through_resolver() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("rows.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50]))],
+        )
+        .expect("record batch");
+        let file = std::fs::File::create(&file_path).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close parquet writer");
+        let file_size = std::fs::metadata(&file_path).expect("metadata").len();
+        let file_uri = format!("file://{}", file_path.display());
 
-        let cfg = build_s3_config_from_properties(&props).expect("build S3 config");
+        let row_count =
+            read_parquet_record_count(&file_uri, file_size, None).expect("read record count");
 
-        assert_eq!(cfg.retry_max_times, None);
-        assert_eq!(cfg.retry_min_delay_ms, None);
-        assert_eq!(cfg.retry_max_delay_ms, None);
-        assert_eq!(cfg.timeout_ms, None);
-        assert_eq!(cfg.io_timeout_ms, None);
+        assert_eq!(row_count, 5);
     }
-}
-
-pub(crate) fn parse_s3_path(path: &str) -> Result<(String, String), String> {
-    let stripped = path
-        .strip_prefix("s3://")
-        .or_else(|| path.strip_prefix("s3a://"))
-        .or_else(|| path.strip_prefix("oss://"))
-        .ok_or_else(|| format!("unsupported path scheme: {path}"))?;
-    let slash = stripped
-        .find('/')
-        .ok_or_else(|| format!("path has no key: {path}"))?;
-    Ok((
-        stripped[..slash].to_string(),
-        stripped[slash + 1..].to_string(),
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -198,22 +153,18 @@ pub(crate) fn parse_s3_path(path: &str) -> Result<(String, String), String> {
 // ---------------------------------------------------------------------------
 
 fn list_parquet_files(
-    base_config: &ObjectStoreConfig,
     directory: &str,
+    object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<Vec<(String, u64)>, String> {
-    let (bucket, prefix) = parse_s3_path(directory)?;
-    let scheme = if directory.starts_with("oss://") {
-        "oss"
-    } else {
-        "s3"
-    };
-    let op = build_object_store_operator(&bucket, base_config)
-        .map_err(|e| format!("build S3 operator: {e}"))?;
+    let access = fs_io::resolve_access_for_location(directory, object_store_config)
+        .map_err(|e| format!("resolve ADD FILES directory {directory}: {e}"))?;
+    let op = access.operator();
 
-    let prefix = if prefix.ends_with('/') {
-        prefix
+    let relative_directory = access.single_relative_path()?;
+    let prefix = if relative_directory.ends_with('/') {
+        relative_directory.to_string()
     } else {
-        format!("{prefix}/")
+        format!("{relative_directory}/")
     };
 
     block_on_iceberg(async {
@@ -230,7 +181,7 @@ fn list_parquet_files(
                     .stat(entry.path())
                     .await
                     .map_err(|e| format!("stat {}: {e}", entry.path()))?;
-                let full_path = format!("{scheme}://{bucket}/{}", entry.path());
+                let full_path = fs_io::format_resolved_location(access.handle(), entry.path())?;
                 result.push((full_path, meta.content_length()));
             }
         }
@@ -240,17 +191,18 @@ fn list_parquet_files(
 }
 
 fn read_parquet_record_count(
-    base_config: &ObjectStoreConfig,
-    s3_path: &str,
+    path: &str,
     file_size: u64,
+    object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<u64, String> {
-    let (bucket, key) = parse_s3_path(s3_path)?;
-    let op = build_object_store_operator(&bucket, base_config)
-        .map_err(|e| format!("build operator: {e}"))?;
+    let access = fs_io::resolve_access_for_location(path, object_store_config)
+        .map_err(|e| format!("resolve parquet file {path}: {e}"))?;
+    let key = access.single_relative_path()?.to_string();
+    let op = access.operator();
 
     block_on_iceberg(async {
         if file_size < 12 {
-            return Err(format!("parquet file too small: {s3_path}"));
+            return Err(format!("parquet file too small: {path}"));
         }
         // Parquet footer: last 8 bytes = [footer_len(4 LE), magic "PAR1"(4)]
         let tail = op
@@ -260,7 +212,7 @@ fn read_parquet_record_count(
             .map_err(|e| format!("read footer tail: {e}"))?
             .to_bytes();
         if tail.len() < 8 || &tail[4..8] != b"PAR1" {
-            return Err(format!("invalid parquet footer: {s3_path}"));
+            return Err(format!("invalid parquet footer: {path}"));
         }
         let footer_len = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as u64;
 
