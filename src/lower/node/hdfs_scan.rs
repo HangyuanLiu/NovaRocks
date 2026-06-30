@@ -264,37 +264,27 @@ fn file_cache_flags_from_query_options(
 }
 
 /// Extract an `ObjectStoreConfig` from the cloud properties map attached to
-/// `THdfsScanNode.cloud_configuration`.  Returns `None` when any required field is absent
-/// so the caller falls back to the shard registry (used by native lake tablets).
+/// `THdfsScanNode.cloud_configuration`. Returns `Ok(None)` when any required
+/// field is absent so the caller falls back to the shard registry (used by
+/// native lake tablets).
 fn resolve_cloud_object_store_config<S>(
     cloud_props: Option<&std::collections::BTreeMap<S, S>>,
     ranges: &[FileScanRange],
-) -> Option<crate::fs::object_store::ObjectStoreConfig>
+) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String>
 where
     S: std::borrow::Borrow<str> + Ord,
 {
-    let props = cloud_props?;
-    let retry_settings =
-        crate::fs::object_store::ObjectStoreRetrySettings::from_aws_s3_props(cloud_props);
-    let get = |key: &str| {
-        props
-            .get(key)
-            .map(|v| v.borrow().trim())
-            .filter(|v| !v.is_empty())
+    let Some(props) = cloud_props else {
+        return Ok(None);
     };
-
-    let endpoint = get("aws.s3.endpoint")
-        .or_else(|| get("aws.s3.endpoint_url"))?
-        .to_string();
-    let access_key_id = get("aws.s3.accessKeyId")
-        .or_else(|| get("aws.s3.access_key"))?
-        .to_string();
-    let access_key_secret = get("aws.s3.accessKeySecret")
-        .or_else(|| get("aws.s3.secret_key"))?
-        .to_string();
-    let region = get("aws.s3.region").map(|v| v.to_string());
-    let enable_path_style_access =
-        get("aws.s3.enable_path_style_access").and_then(parse_true_false);
+    let credentials =
+        crate::fs::object_store_credentials::ObjectStoreCredentials::optional_from_aws_s3_properties(
+            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
+            props,
+        )?;
+    let Some(credentials) = credentials else {
+        return Ok(None);
+    };
 
     // Derive bucket from the first OSS range path so that normalize_oss_path can
     // validate bucket consistency and strip the correct prefix.
@@ -314,23 +304,9 @@ where
         })
         .unwrap_or_default();
 
-    let mut cfg = crate::fs::object_store::ObjectStoreConfig {
-        endpoint,
-        bucket,
-        root: String::new(),
-        access_key_id,
-        access_key_secret,
-        session_token: None,
-        enable_path_style_access,
-        region,
-        retry_max_times: retry_settings.retry_max_times,
-        retry_min_delay_ms: retry_settings.retry_min_delay_ms,
-        retry_max_delay_ms: retry_settings.retry_max_delay_ms,
-        timeout_ms: retry_settings.timeout_ms,
-        io_timeout_ms: retry_settings.io_timeout_ms,
-    };
+    let mut cfg = credentials.to_object_store_config(&bucket, "");
     crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
-    Some(cfg)
+    Ok(Some(cfg))
 }
 
 pub(crate) fn extract_change_op_from_extended_columns(
@@ -1767,7 +1743,7 @@ pub(crate) fn lower_hdfs_scan_node(
         .cloud_configuration
         .as_ref()
         .and_then(|c| c.cloud_properties.as_ref());
-    let object_store_config = resolve_cloud_object_store_config(cloud_props, &ranges);
+    let object_store_config = resolve_cloud_object_store_config(cloud_props, &ranges)?;
     let iceberg_table_locations = snapshot_iceberg_table_locations();
     let row_position_ranges = row_position_spec.as_ref().map(|_| ranges.clone());
     let cfg = HdfsScanConfig {
@@ -1871,6 +1847,22 @@ mod tests {
         validate_included_positions_full_file_range, variant_path_ensure_source_read_columns,
     };
 
+    fn test_range(path: &str) -> FileScanRange {
+        FileScanRange {
+            path: path.to_string(),
+            file_len: 0,
+            offset: 0,
+            length: 0,
+            scan_range_id: 0,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+        }
+    }
+
     #[test]
     fn file_cache_flags_default_to_disabled_when_query_options_missing() {
         let (meta, page) = file_cache_flags_from_query_options(None);
@@ -1888,6 +1880,54 @@ mod tests {
         let (meta, page) = file_cache_flags_from_query_options(Some(&query_opts));
         assert!(meta);
         assert!(page);
+    }
+
+    #[test]
+    fn cloud_object_store_config_uses_shared_credentials_aliases() {
+        let cloud_props = BTreeMap::from([
+            (
+                "aws.s3.endpoint_url".to_string(),
+                " http://localhost:9000 ".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), " ak ".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), " sk ".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "yes".to_string(),
+            ),
+        ]);
+        let ranges = vec![test_range("s3://bucket-a/table/data.parquet")];
+
+        let cfg = resolve_cloud_object_store_config(Some(&cloud_props), &ranges)
+            .expect("parse cloud config")
+            .expect("credentials present");
+
+        assert_eq!(cfg.endpoint, "http://localhost:9000");
+        assert_eq!(cfg.bucket, "bucket-a");
+        assert_eq!(cfg.access_key_id, "ak");
+        assert_eq!(cfg.access_key_secret, "sk");
+        assert_eq!(cfg.enable_path_style_access, Some(true));
+    }
+
+    #[test]
+    fn cloud_object_store_config_errors_on_invalid_bool() {
+        let cloud_props = BTreeMap::from([
+            (
+                "aws.s3.endpoint".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.access_key".to_string(), "ak".to_string()),
+            ("aws.s3.secret_key".to_string(), "sk".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "maybe".to_string(),
+            ),
+        ]);
+        let ranges = vec![test_range("s3://bucket-a/table/data.parquet")];
+
+        let err = resolve_cloud_object_store_config(Some(&cloud_props), &ranges)
+            .expect_err("invalid bool should fail");
+        assert!(err.contains("invalid boolean value: maybe"), "{err}");
     }
 
     #[test]
@@ -1919,6 +1959,7 @@ mod tests {
         }];
 
         let config = resolve_cloud_object_store_config(Some(&cloud_props), &ranges)
+            .expect("parse cloud config")
             .expect("object store config");
 
         assert_eq!(config.bucket, "novarocks");
