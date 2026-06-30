@@ -1,4 +1,4 @@
-//! PhysicalPlan tree extracted from the Memo after optimization.
+//! Optimizer physical operator tree extracted from the Memo after optimization.
 
 use std::sync::Arc;
 
@@ -21,7 +21,7 @@ pub(crate) struct PlanExecutionProps {
     pub child_output_properties: Vec<PhysicalPropertySet>,
     pub join_distribution: Option<JoinExecutionDistribution>,
     /// Shared scalar arena that owns all `ScalarId` handles referenced by this
-    /// physical plan. Attached after extraction so codegen can materialize the
+    /// optimizer physical tree. Attached after extraction so codegen can materialize the
     /// scalar handles at its TypedExpr boundary.
     pub scalar_arena: Option<Arc<ScalarArena>>,
 }
@@ -37,11 +37,11 @@ impl Default for PlanExecutionProps {
     }
 }
 
-/// A node in the physical plan tree produced by `extract_best`.
+/// A node in the optimizer physical operator tree produced by `extract_best`.
 #[derive(Clone, Debug)]
-pub(crate) struct PhysicalPlanNode {
+pub(crate) struct OptimizerPhysicalNode {
     pub op: Operator,
-    pub children: Vec<PhysicalPlanNode>,
+    pub children: Vec<OptimizerPhysicalNode>,
     pub stats: Statistics,
     pub output_columns: Vec<OutputColumn>,
     pub execution_props: PlanExecutionProps,
@@ -51,7 +51,7 @@ pub(crate) struct PhysicalPlanNode {
     pub probe_runtime_filters: Vec<crate::sql::optimizer::runtime_filter_pass::RuntimeFilterProbe>,
 }
 
-pub(crate) fn attach_scalar_arena(root: &mut PhysicalPlanNode, arena: Arc<ScalarArena>) {
+pub(crate) fn attach_scalar_arena(root: &mut OptimizerPhysicalNode, arena: Arc<ScalarArena>) {
     root.execution_props.scalar_arena = Some(Arc::clone(&arena));
     for child in &mut root.children {
         attach_scalar_arena(child, Arc::clone(&arena));
@@ -67,7 +67,7 @@ mod rf_field_tests {
     #[test]
     fn physical_node_carries_rf_annotations() {
         let mut scalars = ScalarArena::new();
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: make_test_op(),
             children: vec![],
             stats: Statistics {
@@ -76,7 +76,7 @@ mod rf_field_tests {
                 ..Default::default()
             },
             output_columns: vec![],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
@@ -91,7 +91,7 @@ mod rf_field_tests {
 
     #[test]
     fn physical_node_carries_execution_properties() {
-        let node = PhysicalPlanNode {
+        let node = OptimizerPhysicalNode {
             op: make_test_op(),
             children: vec![],
             stats: Statistics {

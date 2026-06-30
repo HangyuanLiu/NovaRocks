@@ -1,5 +1,5 @@
-//! PlanFragmentBuilder — converts a PhysicalPlanNode tree into Thrift TPlan
-//! per fragment.
+//! PlanFragmentBuilder — migration path that converts an OptimizerPhysicalNode
+//! tree into Thrift TPlan fragments through DistributedPlan.
 //!
 //! Fragment boundaries are created at `PhysicalDistribution` nodes.
 //! `PhysicalCTEProduce` / `PhysicalCTEConsume` create multicast fragments
@@ -31,7 +31,7 @@ use crate::sql::codegen::{
 };
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::operator::ProjectOp;
-use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
 use crate::sql::optimizer::scalar::ScalarArena;
 
 use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
@@ -130,13 +130,13 @@ fn branch_union_project_branch_id(op: &ProjectOp, scalars: &ScalarArena) -> Opti
 }
 
 fn physical_scalar_arena<'a>(
-    plan: &'a PhysicalPlanNode,
+    plan: &'a OptimizerPhysicalNode,
     context: &str,
 ) -> Result<&'a ScalarArena, String> {
     plan.execution_props
         .scalar_arena
         .as_deref()
-        .ok_or_else(|| format!("{context}: missing scalar arena on physical plan"))
+        .ok_or_else(|| format!("{context}: missing scalar arena on optimizer physical tree"))
 }
 
 fn branch_id_literal_expr(expr: &TypedExpr) -> Option<i32> {
@@ -419,7 +419,7 @@ impl PlanFragmentBuilder {
     // -------------------------------------------------------------------
 
     pub(crate) fn build_via_distributed_plan(
-        plan: &PhysicalPlanNode,
+        plan: &OptimizerPhysicalNode,
         catalog: &dyn CatalogProvider,
         connectors: &crate::connector::ConnectorRegistry,
         _current_database: &str,
@@ -434,7 +434,7 @@ impl PlanFragmentBuilder {
     }
 
     pub(crate) fn build_via_distributed_plan_with_mv_refresh_ctx<'a>(
-        plan: &PhysicalPlanNode,
+        plan: &OptimizerPhysicalNode,
         catalog: &'a dyn CatalogProvider,
         connectors: &'a crate::connector::ConnectorRegistry,
         _current_database: &str,
@@ -478,7 +478,7 @@ impl PlanFragmentBuilder {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_via_distributed_plan_with_iceberg_sink<'a>(
-        plan: &PhysicalPlanNode,
+        plan: &OptimizerPhysicalNode,
         catalog: &'a dyn CatalogProvider,
         connectors: &'a crate::connector::ConnectorRegistry,
         current_database: &str,
@@ -496,7 +496,7 @@ impl PlanFragmentBuilder {
     }
 
     fn build_aggregate_state_merge_direct_via_ir<'a>(
-        plan: &PhysicalPlanNode,
+        plan: &OptimizerPhysicalNode,
         catalog: &'a dyn CatalogProvider,
         connectors: &'a crate::connector::ConnectorRegistry,
         current_database: &str,
@@ -529,7 +529,7 @@ impl PlanFragmentBuilder {
 
     #[allow(clippy::too_many_arguments)]
     fn build_aggregate_state_merge_direct_with_layout_via_ir<'a>(
-        plan: &PhysicalPlanNode,
+        plan: &OptimizerPhysicalNode,
         catalog: &'a dyn CatalogProvider,
         connectors: &'a crate::connector::ConnectorRegistry,
         current_database: &str,
@@ -649,7 +649,7 @@ impl PlanFragmentBuilder {
 
     #[allow(clippy::too_many_arguments)]
     fn try_build_branch_union_aggregate_direct_via_ir<'a>(
-        plan: &PhysicalPlanNode,
+        plan: &OptimizerPhysicalNode,
         catalog: &'a dyn CatalogProvider,
         connectors: &'a crate::connector::ConnectorRegistry,
         current_database: &str,
@@ -1025,8 +1025,8 @@ mod tests {
         ScanDictionaryColumn, ScanOp, ScanVariantColumn, SortOp, TopNOp, TopNPhase, UnionOp,
         ValuesOp, WindowOp,
     };
-    use crate::sql::optimizer::physical_plan::{
-        JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
+    use crate::sql::optimizer::physical_tree::{
+        JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
@@ -1262,7 +1262,7 @@ mod tests {
         }
     }
 
-    fn values_plan_for_test(columns: Vec<OutputColumn>) -> PhysicalPlanNode {
+    fn values_plan_for_test(columns: Vec<OutputColumn>) -> OptimizerPhysicalNode {
         physical_node_for_test(
             Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
@@ -1275,10 +1275,10 @@ mod tests {
 
     fn physical_node_for_test(
         op: Operator,
-        children: Vec<PhysicalPlanNode>,
+        children: Vec<OptimizerPhysicalNode>,
         output_columns: Vec<OutputColumn>,
-    ) -> PhysicalPlanNode {
-        attach_test_scalar_arena(PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
+        attach_test_scalar_arena(OptimizerPhysicalNode {
             op,
             children,
             stats: stats_for_test(),
@@ -1289,7 +1289,7 @@ mod tests {
         })
     }
 
-    fn attach_test_scalar_arena(mut plan: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn attach_test_scalar_arena(mut plan: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let scalars = plan
             .children
             .iter()
@@ -1300,7 +1300,7 @@ mod tests {
     }
 
     fn two_value_join_for_sort_test() -> (
-        PhysicalPlanNode,
+        OptimizerPhysicalNode,
         Vec<OutputColumn>,
         crate::sql::optimizer::scalar::SortKey,
         ScalarArena,
@@ -1362,10 +1362,10 @@ mod tests {
     }
 
     fn project_passthrough_plan_for_test(
-        child: PhysicalPlanNode,
+        child: OptimizerPhysicalNode,
         source_column: &OutputColumn,
         output_column_id: ColumnId,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
         let output_column = OutputColumn {
             column_id: output_column_id,
@@ -1384,7 +1384,7 @@ mod tests {
             output_name: source_column.name.clone(),
             output_column_id,
         }];
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
@@ -1392,7 +1392,7 @@ mod tests {
             children: vec![child],
             stats: stats_for_test(),
             output_columns: vec![output_column],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -1407,7 +1407,7 @@ mod tests {
         let action_id = ColumnId::new_for_test(14);
         let stale_id = ColumnId::new_for_test(13);
         let parent_id = ColumnId::new_for_test(20);
-        let values = PhysicalPlanNode {
+        let values = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
                 columns: vec![source.clone()],
@@ -1431,7 +1431,7 @@ mod tests {
             nullable: false,
             is_internal: true,
         };
-        let child_project = PhysicalPlanNode {
+        let child_project = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: intern_project_items(&mut scalars, &[child_item]),
                 output_qualifier: None,
@@ -1455,7 +1455,7 @@ mod tests {
             nullable: false,
             is_internal: true,
         };
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: intern_project_items(&mut scalars, &[parent_item]),
                 output_qualifier: None,
@@ -1542,10 +1542,10 @@ mod tests {
     }
 
     fn aggregate_merge_plan_for_test(
-        old_child: PhysicalPlanNode,
-        delta_child: PhysicalPlanNode,
+        old_child: OptimizerPhysicalNode,
+        delta_child: OptimizerPhysicalNode,
         aggregate_state_names: Vec<String>,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let output_columns = vec![
             output_col_for_test(1, "region", DataType::Utf8, true),
             output_col_for_test(2, "c", DataType::Int64, false),
@@ -1565,10 +1565,10 @@ mod tests {
     }
 
     fn aggregate_sum_only_merge_plan_for_test(
-        old_child: PhysicalPlanNode,
-        delta_child: PhysicalPlanNode,
+        old_child: OptimizerPhysicalNode,
+        delta_child: OptimizerPhysicalNode,
         aggregate_state_names: Vec<String>,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let output_columns = vec![
             output_col_for_test(1, "region", DataType::Utf8, true),
             output_col_for_test(2, "s", DataType::Int64, true),
@@ -1923,11 +1923,11 @@ mod tests {
     }
 
     fn branch_union_project_for_test(
-        merge: PhysicalPlanNode,
+        merge: OptimizerPhysicalNode,
         branch_id: i32,
         output_id_base: u32,
         scalars: &mut ScalarArena,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let mut items = merge
             .output_columns
             .iter()
@@ -1964,7 +1964,7 @@ mod tests {
                 is_internal: false,
             })
             .collect::<Vec<_>>();
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: intern_project_items(scalars, &items),
                 output_qualifier: None,
@@ -1972,7 +1972,7 @@ mod tests {
             children: vec![merge],
             stats: stats_for_test(),
             output_columns,
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -2271,7 +2271,7 @@ mod tests {
             &mut scalars,
         );
         let output_columns = branch0.output_columns.clone();
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalUnion(UnionOp {
                 all: true,
                 output_columns: output_columns.clone(),
@@ -2746,7 +2746,7 @@ mod tests {
         registry
     }
 
-    fn iceberg_scan_files(plan: &PhysicalPlanNode) -> Vec<IcebergDataFileInfo> {
+    fn iceberg_scan_files(plan: &OptimizerPhysicalNode) -> Vec<IcebergDataFileInfo> {
         let Operator::PhysicalScan(scan) = &plan.op else {
             panic!("expected scan plan");
         };
@@ -2817,7 +2817,7 @@ mod tests {
         }
     }
 
-    fn with_id_predicate(mut plan: PhysicalPlanNode, value: i64) -> PhysicalPlanNode {
+    fn with_id_predicate(mut plan: OptimizerPhysicalNode, value: i64) -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
         let Operator::PhysicalScan(scan) = &mut plan.op else {
             panic!("expected scan plan");
@@ -3092,7 +3092,7 @@ mod tests {
                 binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
-        let plan = attach_test_scalar_arena(PhysicalPlanNode {
+        let plan = attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table,
@@ -3108,7 +3108,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });
@@ -3198,8 +3198,8 @@ mod tests {
         );
     }
 
-    fn scan_plan(path: PathBuf) -> PhysicalPlanNode {
-        attach_test_scalar_arena(PhysicalPlanNode {
+    fn scan_plan(path: PathBuf) -> OptimizerPhysicalNode {
+        attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -3245,14 +3245,14 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         })
     }
 
-    fn starrocks_scan_plan() -> PhysicalPlanNode {
-        attach_test_scalar_arena(PhysicalPlanNode {
+    fn starrocks_scan_plan() -> OptimizerPhysicalNode {
+        attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -3282,14 +3282,14 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         })
     }
 
-    fn iceberg_scan_plan() -> PhysicalPlanNode {
-        attach_test_scalar_arena(PhysicalPlanNode {
+    fn iceberg_scan_plan() -> OptimizerPhysicalNode {
+        attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -3321,15 +3321,15 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         })
     }
 
-    fn iceberg_scan_plan_with_file_stats() -> PhysicalPlanNode {
+    fn iceberg_scan_plan_with_file_stats() -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -3364,7 +3364,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -3372,9 +3372,9 @@ mod tests {
         plan
     }
 
-    fn iceberg_scan_plan_with_partition_values() -> PhysicalPlanNode {
+    fn iceberg_scan_plan_with_partition_values() -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -3409,7 +3409,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -3417,10 +3417,10 @@ mod tests {
         plan
     }
 
-    fn iceberg_scan_plan_with_large_file(size: i64) -> PhysicalPlanNode {
+    fn iceberg_scan_plan_with_large_file(size: i64) -> OptimizerPhysicalNode {
         let mut file = iceberg_i32_file("s3://bucket/large.parquet", 1, 100);
         file.size = size;
-        attach_test_scalar_arena(PhysicalPlanNode {
+        attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -3452,18 +3452,18 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         })
     }
 
-    fn iceberg_scan_plan_with_many_delete_files(delete_count: usize) -> PhysicalPlanNode {
+    fn iceberg_scan_plan_with_many_delete_files(delete_count: usize) -> OptimizerPhysicalNode {
         let mut file = iceberg_i32_file("s3://bucket/delete-heavy.parquet", 1, 100);
         file.delete_files = (0..delete_count)
             .map(|idx| iceberg_delete_file(&format!("s3://bucket/delete-{idx}.parquet"), 1))
             .collect();
-        attach_test_scalar_arena(PhysicalPlanNode {
+        attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -3495,7 +3495,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         })
@@ -3652,7 +3652,7 @@ mod tests {
         );
     }
 
-    fn mixed_starrocks_iceberg_join_plan() -> PhysicalPlanNode {
+    fn mixed_starrocks_iceberg_join_plan() -> OptimizerPhysicalNode {
         let id_col = crate::sql::column_id::ColumnId::new_for_test(1);
         let mut scalars = ScalarArena::new();
         let left_expr = TypedExpr {
@@ -3673,7 +3673,7 @@ mod tests {
             data_type: DataType::Int32,
             nullable: false,
         };
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
@@ -3687,7 +3687,7 @@ mod tests {
             children: vec![iceberg_scan_plan(), starrocks_scan_plan()],
             stats: stats(),
             output_columns: output_columns(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -3699,7 +3699,7 @@ mod tests {
     fn build_splits_gather_distribution_into_stream_edge() {
         let file = NamedTempFile::new().expect("temp parquet path");
         let mut scalars = ScalarArena::new();
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalSort(SortOp {
                 items: intern_sort_items(
                     &mut scalars,
@@ -3713,21 +3713,21 @@ mod tests {
                 partition_limit: None,
                 topn_type: None,
             }),
-            children: vec![PhysicalPlanNode {
+            children: vec![OptimizerPhysicalNode {
                 op: Operator::PhysicalDistribution(PhysicalDistributionOp {
                     spec: DistributionSpec::Gather,
                 }),
                 children: vec![scan_plan(file.path().to_path_buf())],
                 stats: stats(),
                 output_columns: output_columns(),
-                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(
                 ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             output_columns: output_columns(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -4241,12 +4241,12 @@ mod tests {
         ];
         let window_exprs = intern_window_exprs(&mut scalars, &[win_rows, win_range]);
         let sort_items = intern_sort_items(&mut scalars, &order_by);
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalWindow(WindowOp {
                 window_exprs,
                 output_columns: window_output_columns,
             }),
-            children: vec![PhysicalPlanNode {
+            children: vec![OptimizerPhysicalNode {
                 op: Operator::PhysicalSort(SortOp {
                     items: sort_items,
                     analytic_partition_exprs: Vec::new(),
@@ -4256,14 +4256,14 @@ mod tests {
                 children: vec![scan_plan(file.path().to_path_buf())],
                 stats: stats(),
                 output_columns: output_columns(),
-                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(
                 ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             output_columns: output_columns(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -4352,7 +4352,7 @@ mod tests {
         // (root-level Gather is elided).
         let file = NamedTempFile::new().expect("temp parquet path");
         let mut scalars = ScalarArena::new();
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalSort(SortOp {
                 items: intern_sort_items(
                     &mut scalars,
@@ -4366,11 +4366,11 @@ mod tests {
                 partition_limit: None,
                 topn_type: None,
             }),
-            children: vec![PhysicalPlanNode {
+            children: vec![OptimizerPhysicalNode {
                 op: Operator::PhysicalDistribution(PhysicalDistributionOp {
                     spec: DistributionSpec::Gather,
                 }),
-                children: vec![PhysicalPlanNode {
+                children: vec![OptimizerPhysicalNode {
                     op: Operator::PhysicalDistribution(PhysicalDistributionOp {
                         spec: DistributionSpec::Gather,
                     }),
@@ -4378,20 +4378,20 @@ mod tests {
                     stats: stats(),
                     output_columns: output_columns(),
                     execution_props:
-                        crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+                        crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
                     build_runtime_filters: Vec::new(),
                     probe_runtime_filters: Vec::new(),
                 }],
                 stats: stats(),
                 output_columns: output_columns(),
-                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(
                 ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             output_columns: output_columns(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -4536,7 +4536,7 @@ mod tests {
     #[test]
     fn p2_generate_series_registers_output_column_by_id_without_name_fallback() {
         let source_column = output_col_for_test(9201, "x", DataType::Int64, false);
-        let generate_series = PhysicalPlanNode {
+        let generate_series = OptimizerPhysicalNode {
             op: Operator::PhysicalGenerateSeries(GenerateSeriesOp {
                 start: 1,
                 end: 3,
@@ -4552,7 +4552,7 @@ mod tests {
                 ..Default::default()
             },
             output_columns: vec![source_column.clone()],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -4639,7 +4639,7 @@ mod tests {
 
     #[test]
     fn build_generate_series_emits_table_function_without_scan_source() {
-        let plan = attach_test_scalar_arena(PhysicalPlanNode {
+        let plan = attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalGenerateSeries(GenerateSeriesOp {
                 start: 1,
                 end: 3_000_000,
@@ -4661,7 +4661,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });
@@ -5358,7 +5358,7 @@ mod tests {
         // Build a StarRocks scan that exposes one dict column ("id" string
         // column gets a sibling "id_dict" INT slot via dict_columns).
         let layout = starrocks_layout();
-        let scan = attach_test_scalar_arena(PhysicalPlanNode {
+        let scan = attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -5404,12 +5404,12 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });
 
-        let decode_plan = attach_test_scalar_arena(PhysicalPlanNode {
+        let decode_plan = attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalDecode(DecodeOp {
                 mappings: vec![DecodeMapping {
                     source_column_id: id_col,
@@ -5434,7 +5434,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });
@@ -5513,7 +5513,7 @@ mod tests {
     #[test]
     fn scan_dict_column_emits_query_global_dict() {
         let layout = starrocks_layout();
-        let plan = attach_test_scalar_arena(PhysicalPlanNode {
+        let plan = attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -5569,7 +5569,7 @@ mod tests {
                 output_col_for_test(8101, "id", DataType::Utf8, false),
                 output_col_for_test(8102, "name", DataType::Utf8, false),
             ],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });
@@ -5735,7 +5735,7 @@ mod tests {
         // the BE layout swap is a no-op rather than collapsing two
         // distinct slots onto one storage slot id.
         let layout = starrocks_layout();
-        let plan = attach_test_scalar_arena(PhysicalPlanNode {
+        let plan = attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -5779,7 +5779,7 @@ mod tests {
                 DataType::Int32,
                 false,
             )],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });
@@ -5882,7 +5882,7 @@ mod tests {
             serialized_metadata: None,
             serialized_metadata_rows: None,
         };
-        let plan = attach_test_scalar_arena(PhysicalPlanNode {
+        let plan = attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -5918,7 +5918,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: vec![output_col_for_test(8401, "id", DataType::Utf8, false)],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });
@@ -5952,7 +5952,7 @@ mod tests {
 
     #[test]
     fn iceberg_scan_slots_carry_schema_field_ids() {
-        let plan = attach_test_scalar_arena(PhysicalPlanNode {
+        let plan = attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -5991,7 +5991,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: vec![output_col_for_test(8402, "id", DataType::Int32, false)],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });
@@ -6205,7 +6205,7 @@ mod tests {
             nullable: true,
             is_internal: true,
         };
-        let plan = attach_test_scalar_arena(PhysicalPlanNode {
+        let plan = attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
                 database: "default".to_string(),
                 table: TableDef {
@@ -6271,7 +6271,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: vec![synthetic_column.clone()],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });
@@ -6471,7 +6471,7 @@ mod tests {
 
     #[test]
     fn assert_one_row_emits_assert_num_rows_node() {
-        let child = attach_test_scalar_arena(PhysicalPlanNode {
+        let child = attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalGenerateSeries(GenerateSeriesOp {
                 start: 1,
                 end: 3,
@@ -6489,19 +6489,19 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });
         let output_columns = child.output_columns.clone();
-        let plan = attach_test_scalar_arena(PhysicalPlanNode {
+        let plan = attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalAssertOneRow(crate::sql::optimizer::operator::AssertOneRowOp {
                 subquery_text: "select 1".to_string(),
             }),
             children: vec![child],
             stats: Statistics::default(),
             output_columns,
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });

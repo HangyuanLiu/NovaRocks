@@ -40,7 +40,7 @@ use crate::sql::codegen::{
 use crate::sql::optimizer::operator::{
     AggMode, AssertOneRowOp, DecodeOp, GenerateSeriesOp, RepeatOp, ScanDictionaryColumn, TopNPhase,
 };
-use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
+use crate::sql::optimizer::physical_tree::JoinExecutionDistribution;
 use crate::sql::optimizer::property::OrderingSpec;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::optimizer_bridge::property::{
@@ -4863,8 +4863,8 @@ mod tests {
     use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{JoinDistribution, Operator, ProjectOp, ScanOp};
-    use crate::sql::optimizer::physical_plan::{
-        PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
+    use crate::sql::optimizer::physical_tree::{
+        OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
@@ -5699,7 +5699,7 @@ mod tests {
         }
     }
 
-    fn project_over_metadata_scan_plan() -> PhysicalPlanNode {
+    fn project_over_metadata_scan_plan() -> OptimizerPhysicalNode {
         let k = output_col(1, "k", DataType::Int64, false);
         let scan = physical_node(
             Operator::PhysicalScan(ScanOp {
@@ -5744,14 +5744,14 @@ mod tests {
 
     fn physical_node(
         op: Operator,
-        children: Vec<PhysicalPlanNode>,
+        children: Vec<OptimizerPhysicalNode>,
         output_columns: Vec<OutputColumn>,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let scalars = children
             .iter()
             .find_map(|child| child.execution_props.scalar_arena.as_deref().cloned())
             .unwrap_or_else(ScalarArena::new);
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op,
             children,
             stats: Statistics::default(),

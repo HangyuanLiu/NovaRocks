@@ -2,7 +2,7 @@ use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::JoinDistribution;
-use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
+use crate::sql::optimizer::physical_tree::JoinExecutionDistribution;
 use crate::thrift::exprs;
 use crate::thrift::plan_nodes;
 

@@ -1,7 +1,8 @@
-//! Bridge 2: PhysicalPlanNode/PhysicalOperator to DistributedPlanNode.
+//! Bridge 2 migration path: OptimizerPhysicalNode/PhysicalOperator to DistributedPlanNode.
 //!
 //! This bridge materializes optimizer scalars into typed plan nodes and splits
-//! the tree into distributed fragments.
+//! the tree into distributed fragments. PIR-3/PIR-4 will replace this input
+//! with planner-owned physical plan nodes.
 
 use std::collections::HashMap;
 
@@ -20,7 +21,7 @@ use crate::sql::optimizer::operator::{
     TopNPhase, UnionOp,
 };
 use crate::sql::optimizer::options::{OptimizerOptions, current_session_optimizer_settings};
-use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
 use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::Statistics;
@@ -57,7 +58,7 @@ struct DistributedPlanBuilder<'a> {
     cte_fragments: HashMap<CteId, usize>,
 }
 
-fn stats_for_physical_node(node: &PhysicalPlanNode) -> PlanNodeStats {
+fn stats_for_physical_node(node: &OptimizerPhysicalNode) -> PlanNodeStats {
     let child_stats: Vec<&Statistics> = node.children.iter().map(|child| &child.stats).collect();
     let child_outputs: Vec<&PhysicalPropertySet> = node
         .execution_props
@@ -68,10 +69,10 @@ fn stats_for_physical_node(node: &PhysicalPlanNode) -> PlanNodeStats {
     let opts = OptimizerOptions::from_session(&settings);
     let options = opts.cost_options;
     let alt_kind = match node.execution_props.join_distribution {
-        Some(crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Broadcast) => {
+        Some(crate::sql::optimizer::physical_tree::JoinExecutionDistribution::Broadcast) => {
             PropertyAlternativeKind::BroadcastJoin
         }
-        Some(crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Partitioned) => {
+        Some(crate::sql::optimizer::physical_tree::JoinExecutionDistribution::Partitioned) => {
             PropertyAlternativeKind::ShuffleJoin
         }
         _ => PropertyAlternativeKind::Default,
@@ -117,7 +118,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             .ok_or_else(|| "build_distributed_plan has no active fragment id".to_string())
     }
 
-    fn visit(&mut self, node: &PhysicalPlanNode) -> Result<DistributedPlanNode, String> {
+    fn visit(&mut self, node: &OptimizerPhysicalNode) -> Result<DistributedPlanNode, String> {
         let fragment_id = self.current_fragment_id()?;
         match &node.op {
             Operator::PhysicalScan(op) => {
@@ -656,7 +657,7 @@ impl<'a> DistributedPlanBuilder<'a> {
     fn visit_distribution(
         &mut self,
         op: &PhysicalDistributionOp,
-        node: &PhysicalPlanNode,
+        node: &OptimizerPhysicalNode,
     ) -> Result<DistributedPlanNode, String> {
         if node.children.len() != 1 {
             return Err(format!(
@@ -697,8 +698,8 @@ impl<'a> DistributedPlanBuilder<'a> {
     fn visit_gather_distribution_over_limit(
         &mut self,
         op: &LimitOp,
-        limit_node: &PhysicalPlanNode,
-        distribution_node: &PhysicalPlanNode,
+        limit_node: &OptimizerPhysicalNode,
+        distribution_node: &OptimizerPhysicalNode,
     ) -> Result<DistributedPlanNode, String> {
         let child_plan = expect_single_child(limit_node, "PhysicalLimit below Gather")?;
         let output_partition = data_partition_for_distribution_spec(
@@ -735,7 +736,7 @@ impl<'a> DistributedPlanBuilder<'a> {
     fn visit_limit_offset_exchange(
         &mut self,
         op: &LimitOp,
-        node: &PhysicalPlanNode,
+        node: &OptimizerPhysicalNode,
     ) -> Result<DistributedPlanNode, String> {
         let child_plan = expect_single_child(node, "PhysicalLimit")?;
         let output_partition = data_partition_for_distribution_spec(
@@ -772,7 +773,7 @@ impl<'a> DistributedPlanBuilder<'a> {
     fn visit_physical_top_n_final_split(
         &mut self,
         op: &TopNOp,
-        node: &PhysicalPlanNode,
+        node: &OptimizerPhysicalNode,
     ) -> Result<DistributedPlanNode, String> {
         let child_plan = expect_single_child(node, "PhysicalTopN")?;
         let output_partition = data_partition_for_distribution_spec(
@@ -812,8 +813,8 @@ impl<'a> DistributedPlanBuilder<'a> {
     #[allow(clippy::too_many_arguments)]
     fn emit_fragment_exchange(
         &mut self,
-        node: &PhysicalPlanNode,
-        child_plan: &PhysicalPlanNode,
+        node: &OptimizerPhysicalNode,
+        child_plan: &OptimizerPhysicalNode,
         output_partition: DataPartition,
         stream_kind: FragmentStreamKind,
         flavor_for_validation: ExchangeFlavor,
@@ -875,7 +876,7 @@ impl<'a> DistributedPlanBuilder<'a> {
     fn visit_cte_anchor(
         &mut self,
         _op: &CTEAnchorOp,
-        node: &PhysicalPlanNode,
+        node: &OptimizerPhysicalNode,
     ) -> Result<DistributedPlanNode, String> {
         let (produce, consume) = expect_binary_children(node, "PhysicalCTEAnchor")?;
         let Operator::PhysicalCTEProduce(produce_op) = &produce.op else {
@@ -888,7 +889,7 @@ impl<'a> DistributedPlanBuilder<'a> {
     fn visit_cte_produce(
         &mut self,
         op: &CTEProduceOp,
-        node: &PhysicalPlanNode,
+        node: &OptimizerPhysicalNode,
     ) -> Result<(), String> {
         let child_plan = expect_single_child(node, "PhysicalCTEProduce")?;
         let cte_fragment_id = self.alloc_fragment_id();
@@ -916,7 +917,7 @@ impl<'a> DistributedPlanBuilder<'a> {
     fn visit_cte_consume(
         &mut self,
         op: &CTEConsumeOp,
-        node: &PhysicalPlanNode,
+        node: &OptimizerPhysicalNode,
     ) -> Result<DistributedPlanNode, String> {
         if !node.children.is_empty() {
             return Err(format!(
@@ -970,7 +971,7 @@ impl<'a> DistributedPlanBuilder<'a> {
 
     fn visit_set_op(
         &mut self,
-        node: &PhysicalPlanNode,
+        node: &OptimizerPhysicalNode,
         kind: SetOpKind,
         explicit_output_columns: &[crate::sql::analysis::OutputColumn],
         child_output_columns: &[Vec<crate::sql::analysis::OutputColumn>],
@@ -1017,14 +1018,14 @@ impl<'a> DistributedPlanBuilder<'a> {
     fn visit_union_distinct(
         &mut self,
         op: &UnionOp,
-        node: &PhysicalPlanNode,
+        node: &OptimizerPhysicalNode,
     ) -> Result<DistributedPlanNode, String> {
         let output_columns = if node.output_columns.is_empty() {
             op.output_columns.clone()
         } else {
             node.output_columns.clone()
         };
-        let union_all_node = PhysicalPlanNode {
+        let union_all_node = OptimizerPhysicalNode {
             op: Operator::PhysicalUnion(UnionOp {
                 all: true,
                 output_columns: op.output_columns.clone(),
@@ -1037,7 +1038,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             build_runtime_filters: node.build_runtime_filters.clone(),
             probe_runtime_filters: node.probe_runtime_filters.clone(),
         };
-        let gathered_union = PhysicalPlanNode {
+        let gathered_union = OptimizerPhysicalNode {
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
                 spec: DistributionSpec::Gather,
             }),
@@ -1069,7 +1070,7 @@ impl<'a> DistributedPlanBuilder<'a> {
         &mut self,
         child: DistributedPlanNode,
         output_columns: &[crate::sql::analysis::OutputColumn],
-        node: &PhysicalPlanNode,
+        node: &OptimizerPhysicalNode,
     ) -> Result<DistributedPlanNode, String> {
         if output_columns.is_empty() {
             return Err("UNION DISTINCT requires at least one output column".to_string());
@@ -1159,9 +1160,9 @@ fn distributed_node_ordering(node: &DistributedPlanNode) -> OrderingSpec {
 }
 
 fn expect_binary_children<'a>(
-    node: &'a PhysicalPlanNode,
+    node: &'a OptimizerPhysicalNode,
     operator_name: &str,
-) -> Result<(&'a PhysicalPlanNode, &'a PhysicalPlanNode), String> {
+) -> Result<(&'a OptimizerPhysicalNode, &'a OptimizerPhysicalNode), String> {
     if node.children.len() != 2 {
         return Err(format!(
             "build_distributed_plan M0: {operator_name} expected 2 children, got {}",
@@ -1172,9 +1173,9 @@ fn expect_binary_children<'a>(
 }
 
 fn expect_single_child<'a>(
-    node: &'a PhysicalPlanNode,
+    node: &'a OptimizerPhysicalNode,
     operator_name: &str,
-) -> Result<&'a PhysicalPlanNode, String> {
+) -> Result<&'a OptimizerPhysicalNode, String> {
     if node.children.len() != 1 {
         return Err(format!(
             "build_distributed_plan slice 1: {operator_name} expected 1 child, got {}",
@@ -1184,7 +1185,7 @@ fn expect_single_child<'a>(
     Ok(&node.children[0])
 }
 
-fn limit_child_can_apply_offset_locally(child: &PhysicalPlanNode) -> bool {
+fn limit_child_can_apply_offset_locally(child: &OptimizerPhysicalNode) -> bool {
     matches!(
         &child.op,
         Operator::PhysicalSort(_) | Operator::PhysicalTopN(_)
@@ -1276,7 +1277,9 @@ fn stream_kind_for_distribution(spec: &DistributionSpec) -> FragmentStreamKind {
     }
 }
 
-pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<DistributedPlan, String> {
+pub(crate) fn build_distributed_plan(
+    plan: &OptimizerPhysicalNode,
+) -> Result<DistributedPlan, String> {
     let plan = match &plan.op {
         Operator::PhysicalDistribution(op) if matches!(op.spec, DistributionSpec::Gather) => plan
             .children
@@ -1291,7 +1294,7 @@ pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<Distribu
         .as_ref()
         .cloned()
         .ok_or_else(|| {
-            "PhysicalPlanNode missing scalar arena for distributed plan build".to_string()
+            "OptimizerPhysicalNode missing scalar arena for distributed plan build".to_string()
         })?;
 
     let mut builder = DistributedPlanBuilder {
@@ -1366,8 +1369,8 @@ mod tests {
         AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, FilterOp, LimitOp, Operator,
         PhysicalDistributionOp, ProjectOp, ScanOp, SortOp, TopNOp, TopNPhase, UnionOp, WindowOp,
     };
-    use crate::sql::optimizer::physical_plan::{
-        PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
+    use crate::sql::optimizer::physical_tree::{
+        OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::ScalarArena;
@@ -1617,7 +1620,7 @@ mod tests {
         assert!(matches!(root.children[0].kind, PlanNodeKind::Window(_)));
     }
 
-    fn scan_then_project_plan() -> PhysicalPlanNode {
+    fn scan_then_project_plan() -> OptimizerPhysicalNode {
         project_plan(scan_plan())
     }
 
@@ -1653,15 +1656,15 @@ mod tests {
             .find_map(|child| find_exchange_node(child, matches_flavor))
     }
 
-    fn filter_then_project_plan() -> PhysicalPlanNode {
+    fn filter_then_project_plan() -> OptimizerPhysicalNode {
         project_plan(filter_plan(scan_plan()))
     }
 
-    fn filter_over_project_plan() -> PhysicalPlanNode {
+    fn filter_over_project_plan() -> OptimizerPhysicalNode {
         filter_plan(project_plan(scan_plan()))
     }
 
-    fn sort_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn sort_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = child.output_columns.clone();
         let mut plan = physical_node(
@@ -1686,11 +1689,11 @@ mod tests {
     }
 
     fn limit_plan(
-        child: PhysicalPlanNode,
+        child: OptimizerPhysicalNode,
         limit: Option<i64>,
         offset: Option<i64>,
         row_count: f64,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let output_columns = child.output_columns.clone();
         physical_node_with_row_count(
             Operator::PhysicalLimit(LimitOp { limit, offset }),
@@ -1700,7 +1703,7 @@ mod tests {
         )
     }
 
-    fn topn_split_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn topn_split_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = child.output_columns.clone();
         let mut plan = physical_node(
@@ -1725,7 +1728,10 @@ mod tests {
         plan
     }
 
-    fn distribution_plan(child: PhysicalPlanNode, spec: DistributionSpec) -> PhysicalPlanNode {
+    fn distribution_plan(
+        child: OptimizerPhysicalNode,
+        spec: DistributionSpec,
+    ) -> OptimizerPhysicalNode {
         let output_columns = child.output_columns.clone();
         physical_node(
             Operator::PhysicalDistribution(PhysicalDistributionOp { spec }),
@@ -1734,7 +1740,7 @@ mod tests {
         )
     }
 
-    fn union_distinct_plan(children: Vec<PhysicalPlanNode>) -> PhysicalPlanNode {
+    fn union_distinct_plan(children: Vec<OptimizerPhysicalNode>) -> OptimizerPhysicalNode {
         let output_columns = children[0].output_columns.clone();
         let child_output_columns = children
             .iter()
@@ -1752,9 +1758,9 @@ mod tests {
     }
 
     fn cte_anchor_plan(
-        produce_child: PhysicalPlanNode,
-        consume: PhysicalPlanNode,
-    ) -> PhysicalPlanNode {
+        produce_child: OptimizerPhysicalNode,
+        consume: OptimizerPhysicalNode,
+    ) -> OptimizerPhysicalNode {
         let output_columns = consume.output_columns.clone();
         physical_node(
             Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id: 1 }),
@@ -1763,7 +1769,7 @@ mod tests {
         )
     }
 
-    fn cte_produce_plan(cte_id: CteId, child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn cte_produce_plan(cte_id: CteId, child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let output_columns = child.output_columns.clone();
         physical_node(
             Operator::PhysicalCTEProduce(CTEProduceOp {
@@ -1775,7 +1781,7 @@ mod tests {
         )
     }
 
-    fn cte_consume_plan(cte_id: CteId) -> PhysicalPlanNode {
+    fn cte_consume_plan(cte_id: CteId) -> OptimizerPhysicalNode {
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
         let output_columns = vec![k, v];
@@ -1790,7 +1796,7 @@ mod tests {
         )
     }
 
-    fn assert_one_row_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn assert_one_row_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let output_columns = child.output_columns.clone();
         physical_node(
             Operator::PhysicalAssertOneRow(AssertOneRowOp {
@@ -1801,7 +1807,7 @@ mod tests {
         )
     }
 
-    fn multi_group_window_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn multi_group_window_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
@@ -1853,11 +1859,11 @@ mod tests {
         plan
     }
 
-    fn scan_plan() -> PhysicalPlanNode {
+    fn scan_plan() -> OptimizerPhysicalNode {
         scan_plan_with_row_count(3.0)
     }
 
-    fn scan_plan_with_row_count(row_count: f64) -> PhysicalPlanNode {
+    fn scan_plan_with_row_count(row_count: f64) -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
@@ -1889,11 +1895,14 @@ mod tests {
         plan
     }
 
-    fn filter_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn filter_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         filter_plan_with_row_count(child, 3.0)
     }
 
-    fn filter_plan_with_row_count(child: PhysicalPlanNode, row_count: f64) -> PhysicalPlanNode {
+    fn filter_plan_with_row_count(
+        child: OptimizerPhysicalNode,
+        row_count: f64,
+    ) -> OptimizerPhysicalNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = child.output_columns.clone();
         let mut plan = physical_node_with_row_count(
@@ -1922,7 +1931,7 @@ mod tests {
         plan
     }
 
-    fn project_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn project_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = vec![output_col(1, "k", DataType::Int64, false)];
         let items = vec![ProjectItem {
@@ -1944,20 +1953,20 @@ mod tests {
 
     fn physical_node(
         op: Operator,
-        children: Vec<PhysicalPlanNode>,
+        children: Vec<OptimizerPhysicalNode>,
         output_columns: Vec<OutputColumn>,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         physical_node_with_row_count(op, children, output_columns, 3.0)
     }
 
     fn physical_node_with_row_count(
         op: Operator,
-        children: Vec<PhysicalPlanNode>,
+        children: Vec<OptimizerPhysicalNode>,
         output_columns: Vec<OutputColumn>,
         row_count: f64,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let scalars = scalars_from_children(&children);
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op,
             children,
             stats: stats(row_count),
@@ -1970,7 +1979,7 @@ mod tests {
         plan
     }
 
-    fn scalars_from_children(children: &[PhysicalPlanNode]) -> ScalarArena {
+    fn scalars_from_children(children: &[OptimizerPhysicalNode]) -> ScalarArena {
         children
             .iter()
             .find_map(|child| child.execution_props.scalar_arena.as_deref().cloned())

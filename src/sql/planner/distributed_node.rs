@@ -7,7 +7,7 @@ use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, CostEstimat
 pub(crate) use crate::sql::planner::plan::PlanNodeKind;
 
 /// Self-contained copy of the estimated stats this node carries, so EXPLAIN /
-/// ANALYZE never reach back into `PhysicalPlanNode`.
+/// ANALYZE never reaches back into `OptimizerPhysicalNode`.
 #[derive(Clone, Debug)]
 pub(crate) struct PlanNodeStats {
     pub output_row_count: f64,
@@ -58,7 +58,7 @@ pub(crate) struct DistributedPlanNode {
     /// -1 == no limit.
     pub limit: i64,
     pub execution_join_distribution:
-        Option<crate::sql::optimizer::physical_plan::JoinExecutionDistribution>,
+        Option<crate::sql::optimizer::physical_tree::JoinExecutionDistribution>,
     pub build_runtime_filters: Vec<crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc>,
     pub probe_runtime_filters: Vec<crate::sql::optimizer::runtime_filter_pass::RuntimeFilterProbe>,
     pub children: Vec<DistributedPlanNode>,

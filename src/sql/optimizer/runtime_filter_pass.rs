@@ -1,6 +1,6 @@
 //! OQ-5 Stage 1: physical-tree runtime-filter planning pass.
 //!
-//! Annotates eligible hash-join `PhysicalPlanNode`s with build-side filter
+//! Annotates eligible hash-join `OptimizerPhysicalNode`s with build-side filter
 //! descriptors and pushes a matching probe descriptor down to the deepest
 //! descendant that can bind the probe column. EXPLAIN renders the annotations;
 //! codegen lowers them to thrift `TRuntimeFilterDescription`.
@@ -9,7 +9,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::common::JoinKind;
 use crate::sql::optimizer::operator::{JoinDistribution, Operator, PhysicalHashJoinEqCondition};
 use crate::sql::optimizer::options::OptimizerOptions;
-use crate::sql::optimizer::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode};
+use crate::sql::optimizer::physical_tree::{JoinExecutionDistribution, OptimizerPhysicalNode};
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use std::collections::HashSet;
 
@@ -70,7 +70,7 @@ impl RuntimeFilterProbe {
 /// Returns immediately if the rule is disabled via
 /// `SET disable_optimizer_rules = 'RuntimeFilterPushDown'`.
 pub(crate) fn annotate(
-    root: &mut PhysicalPlanNode,
+    root: &mut OptimizerPhysicalNode,
     scalars: &ScalarArena,
     options: &OptimizerOptions,
 ) {
@@ -212,12 +212,12 @@ fn column_id_vec(scalars: &ScalarArena, expr: ScalarId) -> Vec<ColumnId> {
     ids
 }
 
-fn child_column_set(node: &PhysicalPlanNode) -> HashSet<ColumnId> {
+fn child_column_set(node: &OptimizerPhysicalNode) -> HashSet<ColumnId> {
     node.output_columns.iter().map(|c| c.column_id).collect()
 }
 
 fn expr_bound_child(
-    node: &PhysicalPlanNode,
+    node: &OptimizerPhysicalNode,
     scalars: &ScalarArena,
     expr: ScalarId,
 ) -> Option<usize> {
@@ -247,7 +247,7 @@ struct OrientedRfKey {
 }
 
 fn orient_rf_key(
-    node: &PhysicalPlanNode,
+    node: &OptimizerPhysicalNode,
     scalars: &ScalarArena,
     sides: JoinRfSides,
     expr_order: usize,
@@ -281,7 +281,7 @@ fn rf_key_types_match(scalars: &ScalarArena, eq: &PhysicalHashJoinEqCondition) -
 ///
 /// An empty needed set (e.g. a literal probe expression) cannot be bound — the
 /// probe is always non-trivial for real join keys, but we guard for correctness.
-fn could_bound(node: &PhysicalPlanNode, scalars: &ScalarArena, probe_expr: ScalarId) -> bool {
+fn could_bound(node: &OptimizerPhysicalNode, scalars: &ScalarArena, probe_expr: ScalarId) -> bool {
     let mut needed = HashSet::new();
     column_ids(scalars, probe_expr, &mut needed);
     if needed.is_empty() {
@@ -293,14 +293,14 @@ fn could_bound(node: &PhysicalPlanNode, scalars: &ScalarArena, probe_expr: Scala
 
 /// Returns true for non-crossable exchange boundaries (Gather / Any distribution).
 /// These remain hard fragment boundaries that probe runtime filters cannot cross.
-fn is_exchange(node: &PhysicalPlanNode) -> bool {
+fn is_exchange(node: &OptimizerPhysicalNode) -> bool {
     matches!(node.op, Operator::PhysicalDistribution(_))
 }
 
 /// A `PhysicalDistribution` whose spec is a shuffle/hash partition is the kind
 /// of boundary a probe runtime filter may cross when the build RF is complete.
 /// Gather / Any are never crossable.
-fn distribution_is_crossable(node: &PhysicalPlanNode) -> bool {
+fn distribution_is_crossable(node: &OptimizerPhysicalNode) -> bool {
     use crate::sql::optimizer::property::DistributionSpec;
     matches!(
         &node.op,
@@ -327,7 +327,7 @@ fn join_is_outer_or_anti_boundary(kind: JoinKind) -> bool {
     )
 }
 
-fn is_probe_semantic_boundary(node: &PhysicalPlanNode) -> bool {
+fn is_probe_semantic_boundary(node: &OptimizerPhysicalNode) -> bool {
     matches!(
         &node.op,
         Operator::PhysicalHashJoin(join) if join_is_outer_or_anti_boundary(join.join_type)
@@ -349,7 +349,7 @@ fn is_probe_semantic_boundary(node: &PhysicalPlanNode) -> bool {
 /// 6. If no child accepted it, place the probe on `node` itself (the deepest
 ///    reachable binder).
 fn push_probe_down(
-    node: &mut PhysicalPlanNode,
+    node: &mut OptimizerPhysicalNode,
     scalars: &ScalarArena,
     probe: &RuntimeFilterProbe,
     policy: ProbePushPolicy,
@@ -412,7 +412,7 @@ fn probe_gate_passes(
 }
 
 fn join_distribution_for_runtime_filter(
-    node: &PhysicalPlanNode,
+    node: &OptimizerPhysicalNode,
     fallback: &JoinDistribution,
 ) -> JoinDistribution {
     match node.execution_props.join_distribution {
@@ -425,7 +425,7 @@ fn join_distribution_for_runtime_filter(
 
 /// Recursive tree walk: post-order so that nested joins get distinct filter ids.
 fn annotate_node(
-    node: &mut PhysicalPlanNode,
+    node: &mut OptimizerPhysicalNode,
     scalars: &ScalarArena,
     next_filter_id: &mut i32,
     options: &OptimizerOptions,
@@ -560,7 +560,7 @@ pub(crate) mod test_support {
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ValuesOp,
     };
-    use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, attach_scalar_arena};
+    use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, attach_scalar_arena};
     use crate::sql::optimizer::scalar::ScalarArena;
 
     use crate::sql::optimizer::statistics::Statistics;
@@ -608,13 +608,16 @@ pub(crate) mod test_support {
         }
     }
 
-    fn with_scalars(mut plan: PhysicalPlanNode, scalars: ScalarArena) -> PhysicalPlanNode {
+    fn with_scalars(
+        mut plan: OptimizerPhysicalNode,
+        scalars: ScalarArena,
+    ) -> OptimizerPhysicalNode {
         attach_scalar_arena(&mut plan, Arc::new(scalars));
         plan
     }
 
-    fn leaf(rows: f64, oc: OutputColumn) -> PhysicalPlanNode {
-        PhysicalPlanNode {
+    fn leaf(rows: f64, oc: OutputColumn) -> OptimizerPhysicalNode {
+        OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
@@ -626,13 +629,13 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![oc],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         }
     }
 
-    pub(crate) fn inner_join_two_scans() -> PhysicalPlanNode {
+    pub(crate) fn inner_join_two_scans() -> OptimizerPhysicalNode {
         inner_join_two_scans_with_key_types(
             arrow::datatypes::DataType::Int32,
             arrow::datatypes::DataType::Int32,
@@ -642,13 +645,13 @@ pub(crate) mod test_support {
     pub(crate) fn inner_join_two_scans_with_key_types(
         left_type: arrow::datatypes::DataType,
         right_type: arrow::datatypes::DataType,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
         let (loc, lexpr) = col_with_type(1, "lc", left_type);
         let (roc, rexpr) = col_with_type(2, "rc", right_type);
         let left = leaf(1_000_000.0, loc.clone());
         let right = leaf(10.0, roc.clone());
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![eq(&mut scalars, &lexpr, &rexpr)],
@@ -662,20 +665,20 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         with_scalars(plan, scalars)
     }
 
-    pub(crate) fn hash_join_two_scans(join_type: JoinKind) -> PhysicalPlanNode {
+    pub(crate) fn hash_join_two_scans(join_type: JoinKind) -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
         let (loc, lexpr) = col(1, "lc");
         let (roc, rexpr) = col(2, "rc");
         let left = leaf(1_000_000.0, loc.clone());
         let right = leaf(10.0, roc.clone());
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type,
                 eq_conditions: vec![eq(&mut scalars, &lexpr, &rexpr)],
@@ -689,20 +692,20 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         with_scalars(plan, scalars)
     }
 
-    pub(crate) fn cross_hash_join_without_eq_conditions() -> PhysicalPlanNode {
+    pub(crate) fn cross_hash_join_without_eq_conditions() -> OptimizerPhysicalNode {
         let scalars = ScalarArena::new();
         let (loc, _) = col(1, "lc");
         let (roc, _) = col(2, "rc");
         let left = leaf(1_000_000.0, loc.clone());
         let right = leaf(10.0, roc.clone());
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Cross,
                 eq_conditions: vec![],
@@ -716,20 +719,20 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         with_scalars(plan, scalars)
     }
 
-    pub(crate) fn inner_join_with_swapped_eq_labels() -> PhysicalPlanNode {
+    pub(crate) fn inner_join_with_swapped_eq_labels() -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
         let (loc, lexpr) = col(1, "lc");
         let (roc, rexpr) = col(2, "rc");
         let left = leaf(1_000_000.0, loc.clone());
         let right = leaf(10.0, roc.clone());
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![eq(&mut scalars, &rexpr, &lexpr)],
@@ -743,20 +746,20 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         with_scalars(plan, scalars)
     }
 
-    pub(crate) fn shuffle_join(build_rows: f64, probe_rows: f64) -> PhysicalPlanNode {
+    pub(crate) fn shuffle_join(build_rows: f64, probe_rows: f64) -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
         let (loc, lexpr) = col(1, "lc");
         let (roc, rexpr) = col(2, "rc");
         let probe = leaf(probe_rows, loc.clone());
         let build = leaf(build_rows, roc.clone());
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![eq(&mut scalars, &lexpr, &rexpr)],
@@ -770,7 +773,7 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
@@ -781,7 +784,10 @@ pub(crate) mod test_support {
     /// column plus a WIDE payload column. Full-row build size blows past
     /// rf_build_max_bytes (64MB) while the key-only size stays well under it —
     /// exercises the build-key-width gate (M0).
-    pub(crate) fn wide_build_shuffle_join(build_rows: f64, probe_rows: f64) -> PhysicalPlanNode {
+    pub(crate) fn wide_build_shuffle_join(
+        build_rows: f64,
+        probe_rows: f64,
+    ) -> OptimizerPhysicalNode {
         use crate::sql::optimizer::statistics::ColumnStatistic;
 
         let mut scalars = ScalarArena::new();
@@ -809,7 +815,7 @@ pub(crate) mod test_support {
         .into_iter()
         .collect();
 
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![eq(&mut scalars, &probe_expr, &build_key_expr)],
@@ -823,7 +829,7 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![probe_oc, build_key_oc, payload_oc],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
@@ -833,7 +839,7 @@ pub(crate) mod test_support {
     /// Shuffle join where the probe child is a `PhysicalDistribution(HashPartitioned)`
     /// over a leaf scan. Tests that probe RFs cross the shuffle exchange to reach the
     /// underlying scan rather than stopping at the exchange boundary.
-    pub(crate) fn shuffle_join_with_probe_exchange() -> PhysicalPlanNode {
+    pub(crate) fn shuffle_join_with_probe_exchange() -> OptimizerPhysicalNode {
         use crate::sql::optimizer::operator::PhysicalDistributionOp;
         use crate::sql::optimizer::property::{DistributionSpec, HashSource};
         let mut scalars = ScalarArena::new();
@@ -841,7 +847,7 @@ pub(crate) mod test_support {
         let (roc, rexpr) = col(2, "rc"); // build column
         // probe side: PhysicalDistribution(HashPartitioned on col 1) over a leaf scan.
         let scan = leaf(1_000_000.0, loc.clone());
-        let exch = PhysicalPlanNode {
+        let exch = OptimizerPhysicalNode {
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
                 spec: DistributionSpec::HashPartitioned {
                     cols: vec![loc.column_id],
@@ -856,14 +862,14 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc.clone()], // exchange preserves column 1
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         // build side SMALL so the build gate and probe gate both pass
         // (build_size = 100 * 8 = 800 bytes, well below BUILD_MIN 128KB).
         let build = leaf(100.0, roc.clone());
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![eq(&mut scalars, &lexpr, &rexpr)],
@@ -878,21 +884,21 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         with_scalars(plan, scalars)
     }
 
-    pub(crate) fn broadcast_join_with_probe_exchange() -> PhysicalPlanNode {
+    pub(crate) fn broadcast_join_with_probe_exchange() -> OptimizerPhysicalNode {
         use crate::sql::optimizer::operator::PhysicalDistributionOp;
         use crate::sql::optimizer::property::{DistributionSpec, HashSource};
         let mut scalars = ScalarArena::new();
         let (loc, lexpr) = col(1, "lc"); // probe column
         let (roc, rexpr) = col(2, "rc"); // build column
         let scan = leaf(1_000_000.0, loc.clone());
-        let exch = PhysicalPlanNode {
+        let exch = OptimizerPhysicalNode {
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
                 spec: DistributionSpec::HashPartitioned {
                     cols: vec![loc.column_id],
@@ -907,12 +913,12 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc.clone()],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         let build = leaf(100.0, roc.clone());
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![eq(&mut scalars, &lexpr, &rexpr)],
@@ -927,21 +933,21 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         with_scalars(plan, scalars)
     }
 
-    pub(crate) fn inner_join_over_left_outer_probe_child() -> PhysicalPlanNode {
+    pub(crate) fn inner_join_over_left_outer_probe_child() -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
         let (preserved_oc, preserved_expr) = col(1, "preserved");
         let (outer_build_oc, outer_build_expr) = col(2, "outer_build");
         let (top_build_oc, top_build_expr) = col(3, "top_build");
         let preserved = leaf(1_000_000.0, preserved_oc.clone());
         let outer_build = leaf(10.0, outer_build_oc.clone());
-        let left_outer = PhysicalPlanNode {
+        let left_outer = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::LeftOuter,
                 eq_conditions: vec![eq(&mut scalars, &preserved_expr, &outer_build_expr)],
@@ -955,12 +961,12 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![preserved_oc.clone(), outer_build_oc],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         let top_build = leaf(10.0, top_build_oc.clone());
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![eq(&mut scalars, &preserved_expr, &top_build_expr)],
@@ -974,21 +980,21 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![preserved_oc, top_build_oc],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         with_scalars(plan, scalars)
     }
 
-    pub(crate) fn join_with_project_over_probe_scan() -> PhysicalPlanNode {
+    pub(crate) fn join_with_project_over_probe_scan() -> OptimizerPhysicalNode {
         use crate::sql::optimizer::operator::ProjectOp;
         let mut scalars = ScalarArena::new();
         let (loc, lexpr) = col(1, "lc"); // probe column
         let (roc, rexpr) = col(2, "rc"); // build column
         // probe side: PhysicalProject(node) over a leaf scan; both expose column 1.
         let scan = leaf(1_000_000.0, loc.clone());
-        let project = PhysicalPlanNode {
+        let project = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: vec![],
                 output_qualifier: None,
@@ -1000,12 +1006,12 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc.clone()], // project passes column 1 through
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         let build = leaf(10.0, roc.clone());
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![eq(&mut scalars, &lexpr, &rexpr)],
@@ -1019,7 +1025,7 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
@@ -1032,7 +1038,7 @@ mod tests {
     use super::*;
     use crate::sql::optimizer::options::OptimizerOptions;
 
-    fn annotate_test(plan: &mut PhysicalPlanNode, options: &OptimizerOptions) {
+    fn annotate_test(plan: &mut OptimizerPhysicalNode, options: &OptimizerOptions) {
         let scalars = plan
             .execution_props
             .scalar_arena
@@ -1224,7 +1230,7 @@ mod tests {
     fn runtime_filter_uses_execution_distribution_metadata() {
         let mut join = super::test_support::inner_join_two_scans();
         join.execution_props.join_distribution =
-            Some(crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Partitioned);
+            Some(crate::sql::optimizer::physical_tree::JoinExecutionDistribution::Partitioned);
         let Operator::PhysicalHashJoin(op) = &mut join.op else {
             panic!("expected hash join");
         };
@@ -1244,11 +1250,11 @@ mod tests {
     fn runtime_filter_uses_local_execution_distribution_metadata() {
         for (metadata, expected) in [
             (
-                crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Broadcast,
+                crate::sql::optimizer::physical_tree::JoinExecutionDistribution::Broadcast,
                 JoinDistribution::Broadcast,
             ),
             (
-                crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Colocate,
+                crate::sql::optimizer::physical_tree::JoinExecutionDistribution::Colocate,
                 JoinDistribution::Colocate,
             ),
         ] {
@@ -1354,7 +1360,7 @@ mod tests {
         assert_eq!(probe_runtime_filter_count(&join), 0);
     }
 
-    fn probe_runtime_filter_count(node: &PhysicalPlanNode) -> usize {
+    fn probe_runtime_filter_count(node: &OptimizerPhysicalNode) -> usize {
         node.probe_runtime_filters.len()
             + node
                 .children

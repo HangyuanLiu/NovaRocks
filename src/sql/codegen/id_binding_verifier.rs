@@ -11,23 +11,23 @@ use crate::sql::optimizer::operator::{
     PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp,
     TableFunctionOp, WindowOp,
 };
-use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
 use crate::sql::optimizer::property::DistributionSpec;
 use crate::sql::optimizer::scalar::ScalarArena;
 
-pub(crate) fn verify_id_binding(plan: &PhysicalPlanNode) -> Result<(), String> {
+pub(crate) fn verify_id_binding(plan: &OptimizerPhysicalNode) -> Result<(), String> {
     let scalars = plan
         .execution_props
         .scalar_arena
         .as_deref()
         .ok_or_else(|| {
-            "PhysicalPlanNode missing scalar arena for codegen id verification".to_string()
+            "OptimizerPhysicalNode missing scalar arena for codegen id verification".to_string()
         })?;
     verify_node(plan, scalars).map(|_| ())
 }
 
 fn verify_node(
-    node: &PhysicalPlanNode,
+    node: &OptimizerPhysicalNode,
     scalars: &ScalarArena,
 ) -> Result<HashSet<ColumnId>, String> {
     let child_outputs = node
@@ -518,12 +518,15 @@ fn output_ids(ids: impl IntoIterator<Item = ColumnId>) -> HashSet<ColumnId> {
         .collect()
 }
 
-fn declared_node_output_ids(node: &PhysicalPlanNode) -> Result<HashSet<ColumnId>, String> {
+fn declared_node_output_ids(node: &OptimizerPhysicalNode) -> Result<HashSet<ColumnId>, String> {
     let mut out = HashSet::new();
     for column in &node.output_columns {
         verify_output_id(
             column.column_id,
-            &format!("PhysicalPlanNode output `{}` on {:?}", column.name, node.op),
+            &format!(
+                "OptimizerPhysicalNode output `{}` on {:?}",
+                column.name, node.op
+            ),
         )?;
         out.insert(column.column_id);
     }
@@ -595,7 +598,7 @@ mod tests {
     use crate::sql::optimizer::operator::{
         AggMode, PhysicalHashAggregateOp, ProjectOp, RepeatOp, ValuesOp,
     };
-    use crate::sql::optimizer::physical_plan::{PlanExecutionProps, attach_scalar_arena};
+    use crate::sql::optimizer::physical_tree::{PlanExecutionProps, attach_scalar_arena};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::optimizer_bridge::scalar::{
@@ -625,8 +628,8 @@ mod tests {
         }
     }
 
-    fn values_node(columns: Vec<OutputColumn>) -> PhysicalPlanNode {
-        PhysicalPlanNode {
+    fn values_node(columns: Vec<OutputColumn>) -> OptimizerPhysicalNode {
+        OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: columns.clone(),
@@ -641,10 +644,10 @@ mod tests {
     }
 
     fn project_over(
-        child: PhysicalPlanNode,
+        child: OptimizerPhysicalNode,
         expr: TypedExpr,
         output_id: ColumnId,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let mut scalars = child
             .execution_props
             .scalar_arena
@@ -656,7 +659,7 @@ mod tests {
             output_name: "p".to_string(),
             output_column_id: output_id,
         }];
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
@@ -673,10 +676,10 @@ mod tests {
     }
 
     fn hash_aggregate_over(
-        child: PhysicalPlanNode,
+        child: OptimizerPhysicalNode,
         aggregate_output_id: ColumnId,
         declared_visible_id: ColumnId,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let mut scalars = child
             .execution_props
             .scalar_arena
@@ -691,7 +694,7 @@ mod tests {
             order_by: vec![],
             output_column_id: aggregate_output_id,
         }];
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: vec![],
@@ -710,9 +713,12 @@ mod tests {
         plan
     }
 
-    fn repeat_over(child: PhysicalPlanNode, grouping_output_id: ColumnId) -> PhysicalPlanNode {
+    fn repeat_over(
+        child: OptimizerPhysicalNode,
+        grouping_output_id: ColumnId,
+    ) -> OptimizerPhysicalNode {
         let rollup_id = ColumnId::new_for_test(1);
-        PhysicalPlanNode {
+        OptimizerPhysicalNode {
             op: Operator::PhysicalRepeat(RepeatOp {
                 repeat_column_ref_list: vec![vec!["a".to_string()], vec![]],
                 repeat_column_ref_ids: vec![vec![rollup_id], vec![]],
@@ -808,7 +814,7 @@ mod tests {
             values_node(vec![int_col(input_id, "a")]),
             grouping_output_id,
         );
-        let distribution = PhysicalPlanNode {
+        let distribution = OptimizerPhysicalNode {
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
                 spec: DistributionSpec::Gather,
             }),
@@ -820,7 +826,7 @@ mod tests {
             probe_runtime_filters: vec![],
         };
         let mut scalars = ScalarArena::new();
-        let mut aggregate = PhysicalPlanNode {
+        let mut aggregate = OptimizerPhysicalNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: intern_exprs(
