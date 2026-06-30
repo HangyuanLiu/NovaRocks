@@ -11009,17 +11009,43 @@ pub(crate) fn normalize_imv_rewrite_root_project(
             required_output_columns,
         );
     }
-    aggregate.output_columns = project
+    let aggregate_output_ids = aggregate
+        .output_columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect::<HashSet<_>>();
+    let Some(output_columns) = project
         .items
         .iter()
-        .map(|item| crate::sql::analysis::OutputColumn {
-            column_id: item.output_column_id,
-            name: item.output_name.clone(),
-            data_type: item.expr.data_type.clone(),
-            nullable: item.expr.nullable,
-            is_internal: false,
+        .map(|item| {
+            let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind else {
+                return None;
+            };
+            if !aggregate_output_ids.contains(column_id) {
+                return None;
+            }
+            Some(crate::sql::analysis::OutputColumn {
+                column_id: *column_id,
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+                is_internal: false,
+            })
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()
+    else {
+        let input = LogicalPlanNode::new(
+            PlanNodeKind::Aggregate(aggregate),
+            aggregate_children,
+            aggregate_required_output_columns,
+        );
+        return LogicalPlanNode::new(
+            PlanNodeKind::Project(project),
+            vec![input],
+            required_output_columns,
+        );
+    };
+    aggregate.output_columns = output_columns;
     LogicalPlanNode::new(
         LogicalPlanKind::Aggregate(aggregate),
         aggregate_children,
@@ -15168,6 +15194,9 @@ mod tests {
     use super::*;
     use crate::engine::mv::apply_key::ApplyKeyValueType;
     use crate::engine::mv::refresh_property::PartitionPruningPolicy;
+    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr;
+    use crate::sql::planner::plan::*;
     use arrow::array::{BinaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
@@ -15198,6 +15227,96 @@ mod tests {
             b.branch_kind
                 == crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind::ReuseData
         }));
+    }
+
+    #[test]
+    fn normalize_imv_rewrite_root_project_preserves_aggregate_output_identity() {
+        let group_output = OutputColumn {
+            column_id: ColumnId::new_for_test(1),
+            name: "region".to_string(),
+            data_type: DataType::Utf8,
+            nullable: false,
+            is_internal: false,
+        };
+        let aggregate_output = OutputColumn {
+            column_id: ColumnId::new_for_test(11),
+            name: "sum(amount)".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        };
+        let child = LogicalPlanNode::new(
+            PlanNodeKind::Values(LogicalValuesNode {
+                rows: Vec::new(),
+                columns: vec![group_output.clone()],
+            }),
+            vec![],
+            None,
+        );
+        let aggregate = LogicalPlanNode::new(
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![column_ref_expr(&group_output)],
+                aggregates: vec![AggregateCall {
+                    name: "sum".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: Vec::new(),
+                    output_column_id: aggregate_output.column_id,
+                }],
+                output_columns: vec![group_output.clone(), aggregate_output.clone()],
+                already_pushed: false,
+            }),
+            vec![child],
+            None,
+        );
+        let root = LogicalPlanNode::new(
+            PlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: column_ref_expr(&group_output),
+                        output_name: "region".to_string(),
+                        output_column_id: ColumnId::new_for_test(21),
+                    },
+                    ProjectItem {
+                        expr: column_ref_expr(&aggregate_output),
+                        output_name: "s".to_string(),
+                        output_column_id: ColumnId::new_for_test(22),
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![aggregate],
+            None,
+        );
+
+        let normalized = normalize_imv_rewrite_root_project(root);
+        let PlanNodeKind::Aggregate(aggregate) = &normalized.kind else {
+            panic!(
+                "expected normalized root Aggregate, got {:?}",
+                normalized.kind
+            );
+        };
+
+        assert_eq!(
+            aggregate
+                .output_columns
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (group_output.column_id, "region"),
+                (aggregate_output.column_id, "s")
+            ]
+        );
+        assert_eq!(
+            aggregate.aggregates[0].output_column_id,
+            aggregate_output.column_id
+        );
+
+        let mut arena = ScalarArena::new();
+        try_logical_plan_to_opt_expr(&normalized, &mut arena)
+            .expect("normalized aggregate must satisfy optimizer bridge contract");
     }
 
     #[test]
