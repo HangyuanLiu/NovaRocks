@@ -25,6 +25,7 @@ pub(crate) mod mv_refresh_strategy;
 pub(crate) mod mv_shape;
 pub(crate) mod refresh_pin;
 pub(crate) mod scan_planner;
+pub(crate) mod schema_adapter;
 pub(crate) mod state_codec;
 pub(crate) mod txn;
 

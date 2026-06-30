@@ -34,7 +34,7 @@ use crate::connector::iceberg::{
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
-    ParquetReadCachePolicy, VariantPathPruningPredicate, VariantPathSpec,
+    ParquetReadCachePolicy, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
 };
 use crate::lower::expr::parse_min_max_conjuncts_with_column_resolver;
 use crate::lower::layout::{
@@ -556,6 +556,14 @@ struct HdfsSlotInfo {
     field_id: Option<i32>,
 }
 
+fn parquet_slot_kind_from_primitive(primitive: types::TPrimitiveType) -> ParquetSlotKind {
+    if primitive == types::TPrimitiveType::VARIANT {
+        ParquetSlotKind::Variant
+    } else {
+        ParquetSlotKind::Regular
+    }
+}
+
 fn build_hdfs_slot_info_map(
     slot_descs: &[descriptors::TSlotDescriptor],
     tuple_id: types::TTupleId,
@@ -594,7 +602,7 @@ fn build_hdfs_slot_info_map(
 struct HdfsScanReadColumns {
     columns: Vec<String>,
     slot_ids: Vec<SlotId>,
-    slot_types: Vec<types::TPrimitiveType>,
+    slot_kinds: Vec<ParquetSlotKind>,
     fields: Vec<Field>,
     iceberg_projected_columns: Vec<IcebergArrowColumn>,
 }
@@ -603,7 +611,8 @@ impl HdfsScanReadColumns {
     fn push_physical(&mut self, read_slot_id: SlotId, info: &HdfsSlotInfo) {
         self.columns.push(info.name.clone());
         self.slot_ids.push(read_slot_id);
-        self.slot_types.push(info.primitive);
+        self.slot_kinds
+            .push(parquet_slot_kind_from_primitive(info.primitive));
         self.fields.push(Field::new(
             info.name.clone(),
             info.arrow_type.clone(),
@@ -1731,7 +1740,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 .columns
                 .push(crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string());
             read_columns.slot_ids.push(hidden_slot_id);
-            read_columns.slot_types.push(types::TPrimitiveType::BIGINT);
+            read_columns.slot_kinds.push(ParquetSlotKind::Regular);
             read_columns.fields.push(iceberg_reserved_field(
                 crate::exec::row_position::ICEBERG_ROW_ID_COL,
                 true,
@@ -1751,7 +1760,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 .columns
                 .push(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string());
             read_columns.slot_ids.push(hidden_slot_id);
-            read_columns.slot_types.push(types::TPrimitiveType::BIGINT);
+            read_columns.slot_kinds.push(ParquetSlotKind::Regular);
             read_columns.fields.push(iceberg_reserved_field(
                 crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
                 true,
@@ -1813,7 +1822,7 @@ pub(crate) fn lower_hdfs_scan_node(
     let parquet_cfg = ParquetScanConfig {
         columns: read_columns.columns,
         chunk_schema: parquet_chunk_schema,
-        slot_types: read_columns.slot_types,
+        slot_kinds: read_columns.slot_kinds,
         case_sensitive,
         enable_page_index,
         min_max_predicates,

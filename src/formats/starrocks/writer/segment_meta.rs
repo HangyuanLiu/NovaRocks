@@ -25,7 +25,6 @@ use crate::service::grpc_client::proto::starrocks::{
     ColumnPb, KeysType, PScalarType, PTypeDesc, PTypeNode, SegmentMetadataPb, TabletSchemaPb,
     TuplePb, VariantPb, VariantTypePb,
 };
-use crate::thrift::types::TPrimitiveType;
 
 const TYPE_NODE_SCALAR: i32 = 0;
 const DATE32_UNIX_EPOCH_DAY_OFFSET: i32 = 719_163; // 1970-01-01 in proleptic Gregorian days
@@ -43,7 +42,61 @@ enum SortKeyValueType {
     Datetime,
     LargeInt,
     Varchar,
-    Decimal { primitive: i32, scale: i8 },
+    Decimal {
+        wire_type: StarRocksSegmentWireType,
+        scale: i8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StarRocksSegmentWireType {
+    Boolean,
+    TinyInt,
+    SmallInt,
+    Int,
+    BigInt,
+    Float,
+    Double,
+    Date,
+    Datetime,
+    Binary,
+    Decimal,
+    Char,
+    LargeInt,
+    Varchar,
+    DecimalV2,
+    Decimal32,
+    Decimal64,
+    Decimal128,
+    VarBinary,
+    Decimal256,
+}
+
+impl StarRocksSegmentWireType {
+    fn primitive_code(self) -> i32 {
+        match self {
+            Self::Boolean => 2,
+            Self::TinyInt => 3,
+            Self::SmallInt => 4,
+            Self::Int => 5,
+            Self::BigInt => 6,
+            Self::Float => 7,
+            Self::Double => 8,
+            Self::Date => 9,
+            Self::Datetime => 10,
+            Self::Binary => 11,
+            Self::Decimal => 12,
+            Self::Char => 13,
+            Self::LargeInt => 14,
+            Self::Varchar => 15,
+            Self::DecimalV2 => 17,
+            Self::Decimal32 => 21,
+            Self::Decimal64 => 22,
+            Self::Decimal128 => 23,
+            Self::VarBinary => 26,
+            Self::Decimal256 => 27,
+        }
+    }
 }
 
 pub fn sort_batch_for_native_write(
@@ -359,8 +412,8 @@ fn build_variant_for_value(
             format_date32_sort_key_value(typed.value(row_idx))?
         }
         SortKeyValueType::Datetime => extract_datetime_sort_key_value(array, row_idx, col_idx)?,
-        SortKeyValueType::Decimal { primitive, scale } => {
-            if primitive == TPrimitiveType::DECIMAL256.0 {
+        SortKeyValueType::Decimal { wire_type, scale } => {
+            if wire_type == StarRocksSegmentWireType::Decimal256 {
                 let typed = array
                     .as_any()
                     .downcast_ref::<Decimal256Array>()
@@ -408,12 +461,16 @@ fn parse_sort_key_value_type(col: &ColumnPb) -> Result<SortKeyValueType, String>
         "DATE" | "DATE_V2" => Ok(SortKeyValueType::Date),
         "DATETIME" | "DATETIME_V2" | "TIMESTAMP" => Ok(SortKeyValueType::Datetime),
         "CHAR" | "VARCHAR" | "STRING" | "BINARY" | "VARBINARY" => Ok(SortKeyValueType::Varchar),
-        "DECIMAL32" => parse_decimal_sort_key_value_type(col, TPrimitiveType::DECIMAL32.0),
-        "DECIMAL64" => parse_decimal_sort_key_value_type(col, TPrimitiveType::DECIMAL64.0),
-        "DECIMAL128" => parse_decimal_sort_key_value_type(col, TPrimitiveType::DECIMAL128.0),
-        "DECIMAL256" => parse_decimal_sort_key_value_type(col, TPrimitiveType::DECIMAL256.0),
-        "DECIMAL" => parse_decimal_sort_key_value_type(col, TPrimitiveType::DECIMAL.0),
-        "DECIMALV2" => parse_decimal_sort_key_value_type(col, TPrimitiveType::DECIMALV2.0),
+        "DECIMAL32" => parse_decimal_sort_key_value_type(col, StarRocksSegmentWireType::Decimal32),
+        "DECIMAL64" => parse_decimal_sort_key_value_type(col, StarRocksSegmentWireType::Decimal64),
+        "DECIMAL128" => {
+            parse_decimal_sort_key_value_type(col, StarRocksSegmentWireType::Decimal128)
+        }
+        "DECIMAL256" => {
+            parse_decimal_sort_key_value_type(col, StarRocksSegmentWireType::Decimal256)
+        }
+        "DECIMAL" => parse_decimal_sort_key_value_type(col, StarRocksSegmentWireType::Decimal),
+        "DECIMALV2" => parse_decimal_sort_key_value_type(col, StarRocksSegmentWireType::DecimalV2),
         other => Err(format!(
             "unsupported sort-key schema type for segment metadata writer: {}",
             other
@@ -426,26 +483,26 @@ fn build_scalar_type_desc(
     value_type: SortKeyValueType,
 ) -> Result<PTypeDesc, String> {
     let primitive = match value_type {
-        SortKeyValueType::Boolean => TPrimitiveType::BOOLEAN.0,
-        SortKeyValueType::TinyInt => TPrimitiveType::TINYINT.0,
-        SortKeyValueType::SmallInt => TPrimitiveType::SMALLINT.0,
-        SortKeyValueType::Int => TPrimitiveType::INT.0,
-        SortKeyValueType::BigInt => TPrimitiveType::BIGINT.0,
-        SortKeyValueType::LargeInt => TPrimitiveType::LARGEINT.0,
-        SortKeyValueType::Float => TPrimitiveType::FLOAT.0,
-        SortKeyValueType::Double => TPrimitiveType::DOUBLE.0,
-        SortKeyValueType::Date => TPrimitiveType::DATE.0,
-        SortKeyValueType::Datetime => TPrimitiveType::DATETIME.0,
-        SortKeyValueType::Decimal { primitive, .. } => primitive,
+        SortKeyValueType::Boolean => StarRocksSegmentWireType::Boolean.primitive_code(),
+        SortKeyValueType::TinyInt => StarRocksSegmentWireType::TinyInt.primitive_code(),
+        SortKeyValueType::SmallInt => StarRocksSegmentWireType::SmallInt.primitive_code(),
+        SortKeyValueType::Int => StarRocksSegmentWireType::Int.primitive_code(),
+        SortKeyValueType::BigInt => StarRocksSegmentWireType::BigInt.primitive_code(),
+        SortKeyValueType::LargeInt => StarRocksSegmentWireType::LargeInt.primitive_code(),
+        SortKeyValueType::Float => StarRocksSegmentWireType::Float.primitive_code(),
+        SortKeyValueType::Double => StarRocksSegmentWireType::Double.primitive_code(),
+        SortKeyValueType::Date => StarRocksSegmentWireType::Date.primitive_code(),
+        SortKeyValueType::Datetime => StarRocksSegmentWireType::Datetime.primitive_code(),
+        SortKeyValueType::Decimal { wire_type, .. } => wire_type.primitive_code(),
         SortKeyValueType::Varchar => {
             let type_name = col.r#type.trim().to_ascii_uppercase();
             let base_type = type_name.split('(').next().unwrap_or(type_name.as_str());
             match base_type {
-                "CHAR" => TPrimitiveType::CHAR.0,
-                "STRING" => TPrimitiveType::VARCHAR.0,
-                "VARCHAR" => TPrimitiveType::VARCHAR.0,
-                "BINARY" => TPrimitiveType::BINARY.0,
-                "VARBINARY" => TPrimitiveType::VARBINARY.0,
+                "CHAR" => StarRocksSegmentWireType::Char.primitive_code(),
+                "STRING" => StarRocksSegmentWireType::Varchar.primitive_code(),
+                "VARCHAR" => StarRocksSegmentWireType::Varchar.primitive_code(),
+                "BINARY" => StarRocksSegmentWireType::Binary.primitive_code(),
+                "VARBINARY" => StarRocksSegmentWireType::VarBinary.primitive_code(),
                 other => {
                     return Err(format!(
                         "unsupported textual schema type for segment metadata writer: {}",
@@ -471,7 +528,7 @@ fn build_scalar_type_desc(
 
 fn parse_decimal_sort_key_value_type(
     col: &ColumnPb,
-    primitive: i32,
+    wire_type: StarRocksSegmentWireType,
 ) -> Result<SortKeyValueType, String> {
     let raw_scale = col
         .frac
@@ -488,7 +545,7 @@ fn parse_decimal_sort_key_value_type(
             col.r#type, scale
         ));
     }
-    Ok(SortKeyValueType::Decimal { primitive, scale })
+    Ok(SortKeyValueType::Decimal { wire_type, scale })
 }
 
 fn extract_integral_sort_key_value(
@@ -772,12 +829,98 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use arrow_buffer::i256;
 
-    use super::{align_batch_columns_to_schema, build_single_segment_metadata};
+    use super::{
+        StarRocksSegmentWireType, align_batch_columns_to_schema, build_single_segment_metadata,
+    };
     use crate::common::largeint;
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, KeysType, TabletSchemaPb, VariantTypePb,
     };
     use crate::thrift::types::TPrimitiveType;
+
+    #[test]
+    fn segment_wire_type_codes_match_starrocks_thrift_primitives() {
+        assert_eq!(
+            StarRocksSegmentWireType::Boolean.primitive_code(),
+            TPrimitiveType::BOOLEAN.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::TinyInt.primitive_code(),
+            TPrimitiveType::TINYINT.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::SmallInt.primitive_code(),
+            TPrimitiveType::SMALLINT.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Int.primitive_code(),
+            TPrimitiveType::INT.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::BigInt.primitive_code(),
+            TPrimitiveType::BIGINT.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Float.primitive_code(),
+            TPrimitiveType::FLOAT.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Double.primitive_code(),
+            TPrimitiveType::DOUBLE.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Date.primitive_code(),
+            TPrimitiveType::DATE.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Datetime.primitive_code(),
+            TPrimitiveType::DATETIME.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Binary.primitive_code(),
+            TPrimitiveType::BINARY.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Decimal.primitive_code(),
+            TPrimitiveType::DECIMAL.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Char.primitive_code(),
+            TPrimitiveType::CHAR.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::LargeInt.primitive_code(),
+            TPrimitiveType::LARGEINT.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Varchar.primitive_code(),
+            TPrimitiveType::VARCHAR.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::DecimalV2.primitive_code(),
+            TPrimitiveType::DECIMALV2.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Decimal32.primitive_code(),
+            TPrimitiveType::DECIMAL32.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Decimal64.primitive_code(),
+            TPrimitiveType::DECIMAL64.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Decimal128.primitive_code(),
+            TPrimitiveType::DECIMAL128.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::VarBinary.primitive_code(),
+            TPrimitiveType::VARBINARY.0
+        );
+        assert_eq!(
+            StarRocksSegmentWireType::Decimal256.primitive_code(),
+            TPrimitiveType::DECIMAL256.0
+        );
+    }
 
     fn one_bigint_tablet_schema() -> TabletSchemaPb {
         TabletSchemaPb {

@@ -639,7 +639,7 @@ mod tests {
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::node::scan::{ScanMorsel, ScanOp};
     use crate::formats::parquet::{
-        ParquetReadCachePolicy, ParquetScanConfig, VariantPathPruningPredicate,
+        ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind, VariantPathPruningPredicate,
     };
     use crate::fs::scan_context::FileScanRange;
     use crate::thrift::descriptors;
@@ -815,10 +815,10 @@ mod tests {
         ParquetScanConfig {
             columns: vec!["id".to_string(), "payload".to_string()],
             chunk_schema,
-            slot_types: vec![
-                types::TPrimitiveType::INT,
-                types::TPrimitiveType::BIGINT,
-                types::TPrimitiveType::VARIANT,
+            slot_kinds: vec![
+                ParquetSlotKind::Regular,
+                ParquetSlotKind::Regular,
+                ParquetSlotKind::Variant,
             ],
             case_sensitive: true,
             enable_page_index: true,

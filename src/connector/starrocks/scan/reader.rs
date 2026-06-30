@@ -1,7 +1,7 @@
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::fe_v2_meta::fetch_table_schema_for_lake_scan;
-use crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift;
+use crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_pb_from_thrift;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::formats::starrocks::cache as native_cache;
 use crate::formats::starrocks::data::build_native_record_batch;

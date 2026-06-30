@@ -35,6 +35,7 @@ pub(crate) mod pk_applier;
 #[allow(dead_code)]
 pub(crate) mod replay_policy;
 pub(crate) mod schema;
+pub(crate) mod schema_adapter;
 pub(crate) mod schema_change;
 #[allow(dead_code)]
 pub(crate) mod transactions;
@@ -44,7 +45,7 @@ pub(crate) mod txn_log;
 
 pub(crate) use context::TabletWriteContext;
 pub(crate) use create_tablet::create_lake_tablet_from_req;
-pub(crate) use schema::build_sink_tablet_schema;
+pub(crate) use schema_adapter::build_sink_tablet_schema;
 pub(crate) use schema_change::{execute_alter_tablet_task, execute_update_tablet_meta_info_task};
 pub(crate) use txn_log::append_lake_txn_log_with_chunk_rowset;
 #[cfg(test)]
