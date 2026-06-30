@@ -103,8 +103,13 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
                 join_type,
                 condition,
             } = join;
-            let mut output_columns = join_output_columns(join_type, &left, &right)?;
-            output_columns.push(ImvActionColumn::output_column(action_column));
+            let mut output_columns = join_delta_payload_output_columns(join_type, &left, &right)?;
+            if !output_columns
+                .iter()
+                .any(|column| column.column_id == action_column)
+            {
+                output_columns.push(ImvActionColumn::output_column(action_column));
+            }
 
             let left_delta_branch = normalize_branch_output(
                 LogicalPlanNode::new(
@@ -1055,6 +1060,24 @@ fn join_output_columns(
     Ok(out)
 }
 
+fn join_delta_payload_output_columns(
+    join_type: JoinKind,
+    left: &LogicalPlanNode,
+    right: &LogicalPlanNode,
+) -> Result<Vec<OutputColumn>, String> {
+    if !join_delta_kind_supported(join_type) {
+        return Err(format!(
+            "Iceberg IMV join delta rewrite cannot derive output columns for unsupported join kind {:?}",
+            join_type
+        ));
+    }
+    Ok(plan_output_columns(left)?
+        .into_iter()
+        .chain(plan_output_columns(right)?)
+        .filter(|column| !ImvActionColumn::matches(column))
+        .collect())
+}
+
 pub(crate) fn mark_delta_scan(
     plan: LogicalPlanNode,
     action_column: ColumnId,
@@ -1785,18 +1808,21 @@ mod tests {
         let PlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected normalized branch Project");
         };
+        let mut expected_output_ids = plan_output_columns(plan.unary_input())
+            .expect("branch output columns")
+            .into_iter()
+            .map(|column| column.column_id)
+            .collect::<Vec<_>>();
+        if !expected_output_ids.contains(&action_column) {
+            expected_output_ids.push(action_column);
+        }
         assert_eq!(
             project
                 .items
                 .iter()
                 .map(|item| item.output_column_id)
                 .collect::<Vec<_>>(),
-            plan_output_columns(plan.unary_input())
-                .expect("branch output columns")
-                .into_iter()
-                .map(|column| column.column_id)
-                .chain(std::iter::once(action_column))
-                .collect::<Vec<_>>()
+            expected_output_ids
         );
         assert!(
             project
@@ -2180,10 +2206,10 @@ mod tests {
         );
 
         let mut ctx = build_ctx();
-        let mut ext = ctx
-            .extension::<ImvExtension>()
-            .expect("test context should install ImvExtension")
-            .clone();
+        let mut ext = ImvExtension {
+            mv_ctx: dummy_rewrite_context(),
+            annotation: ImvPlanAnnotation::default(),
+        };
         ext.annotation.change_stream = ImvChangeStreamDescriptor {
             aggregate: Some(AggregateChangeStreamDescriptor {
                 action_column_id: ColumnId(100),

@@ -91,17 +91,18 @@ struct JoinRfSides {
 /// probe child to be early-filtered by keys from the true build child.
 fn rf_sides_for_join(kind: JoinKind) -> Option<JoinRfSides> {
     match kind {
-        JoinKind::Inner
-        | JoinKind::LeftSemi
-        | JoinKind::RightOuter
-        | JoinKind::RightSemi
-        | JoinKind::RightAnti => Some(JoinRfSides {
+        JoinKind::Inner | JoinKind::RightOuter => Some(JoinRfSides {
             probe_child: 0,
             build_child: 1,
         }),
         JoinKind::LeftOuter
         | JoinKind::FullOuter
+        // Semi/anti RFs are semantically possible, but the current execution
+        // path can apply incomplete membership filters under pipelined builds.
+        | JoinKind::LeftSemi
+        | JoinKind::RightSemi
         | JoinKind::LeftAnti
+        | JoinKind::RightAnti
         | JoinKind::NullAwareLeftAnti
         | JoinKind::Cross => None,
     }
@@ -1269,13 +1270,7 @@ mod tests {
     fn rf_join_eligibility_matches_probe_output_semantics() {
         use crate::sql::analysis::JoinKind;
 
-        for kind in [
-            JoinKind::Inner,
-            JoinKind::LeftSemi,
-            JoinKind::RightOuter,
-            JoinKind::RightSemi,
-            JoinKind::RightAnti,
-        ] {
+        for kind in [JoinKind::Inner, JoinKind::RightOuter] {
             let mut join = super::test_support::hash_join_two_scans(kind);
             annotate_test(&mut join, &OptimizerOptions::default_settings());
             assert_eq!(
@@ -1288,7 +1283,10 @@ mod tests {
         for kind in [
             JoinKind::LeftOuter,
             JoinKind::FullOuter,
+            JoinKind::LeftSemi,
+            JoinKind::RightSemi,
             JoinKind::LeftAnti,
+            JoinKind::RightAnti,
             JoinKind::NullAwareLeftAnti,
         ] {
             let mut join = super::test_support::hash_join_two_scans(kind);
@@ -1308,6 +1306,10 @@ mod tests {
         assert!(
             rf_sides_for_join(JoinKind::Cross).is_none(),
             "Cross should not be marked RF-producing"
+        );
+        assert!(
+            rf_sides_for_join(JoinKind::LeftSemi).is_none(),
+            "Semi joins should not be marked RF-producing until execution RF completeness is fixed"
         );
     }
 

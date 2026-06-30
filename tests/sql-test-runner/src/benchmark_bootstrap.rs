@@ -493,6 +493,28 @@ mod tests {
     }
 
     #[test]
+    fn spark_bootstrap_bounds_local_loader_resources() {
+        let script = include_str!("../../../sql-tests/bootstrap/bootstrap_benchmark_data.sh");
+
+        assert!(
+            script.contains("NOVAROCKS_BENCHMARK_SPARK_MASTER:-local[2]"),
+            "benchmark Spark loader must avoid unbounded local[*] task fanout"
+        );
+        assert!(
+            script.contains("NOVAROCKS_BENCHMARK_SPARK_MEMORY:-2g"),
+            "benchmark Spark loader must raise the local JVM heap above Spark's 1g default"
+        );
+        assert!(
+            script.contains("--conf 'spark.executor.memory=$spark_memory'"),
+            "benchmark Spark loader must pass the heap setting to Spark executor resources"
+        );
+        assert!(
+            script.contains("NOVAROCKS_BENCHMARK_SPARK_SHUFFLE_PARTITIONS:-8"),
+            "benchmark Spark loader must cap default shuffle writer parallelism"
+        );
+    }
+
+    #[test]
     fn bootstrap_readiness_requires_v3_manifest_and_statistics_files() {
         let script = include_str!("../../../sql-tests/bootstrap/bootstrap_benchmark_data.sh");
 

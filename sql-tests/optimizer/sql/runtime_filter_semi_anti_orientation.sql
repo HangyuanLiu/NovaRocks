@@ -1,7 +1,7 @@
 -- @tags=optimizer,oq10,runtime_filter
 -- Test Objective:
--- Runtime filters keep the LEFT SEMI join build/probe orientation even when
--- the ON predicate is written in reverse order. LEFT ANTI remains RF-free.
+-- LEFT SEMI and LEFT ANTI stay RF-free until semi/anti runtime filters are
+-- made completion-safe. The reversed ON predicate still preserves join shape.
 DROP TABLE IF EXISTS ${case_db}.rf_side_l;
 DROP TABLE IF EXISTS ${case_db}.rf_side_r;
 CREATE TABLE ${case_db}.rf_side_l (k INT, v INT);
@@ -14,16 +14,15 @@ ANALYZE TABLE ${case_db}.rf_side_l;
 ANALYZE TABLE ${case_db}.rf_side_r;
 
 -- @explain_contains=HASH JOIN (BROADCAST, LEFT SEMI
--- @explain_contains=build runtime filters:
--- @explain_contains=build_expr = (r.k)
--- @explain_contains=probe runtime filters:
--- @explain_contains=probe_expr = (l.k)
+-- @explain_not_contains=build runtime filters:
+-- @explain_not_contains=probe runtime filters:
 SELECT count(*)
 FROM ${case_db}.rf_side_l l
 LEFT SEMI JOIN ${case_db}.rf_side_r r ON r.k = l.k;
 
 -- @explain_contains=HASH JOIN (BROADCAST, LEFT ANTI
 -- @explain_not_contains=build runtime filters:
+-- @explain_not_contains=probe runtime filters:
 SELECT count(*)
 FROM ${case_db}.rf_side_l l
 LEFT ANTI JOIN ${case_db}.rf_side_r r ON r.k = l.k;

@@ -31,12 +31,7 @@ pub(crate) fn rewrite(
         return;
     }
     let max_existing = max_existing_column_id(root);
-    debug_assert!(
-        max_existing < factory.peek_next_id(),
-        "ColumnRefFactory is behind physical plan columns: max_existing={}, next_id={}",
-        max_existing,
-        factory.peek_next_id()
-    );
+    factory.reserve_until(max_existing.saturating_add(1));
     rewrite_node(root, scalars, factory);
 }
 
@@ -1723,8 +1718,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ColumnRefFactory is behind physical plan columns")]
-    fn rewrite_panics_in_debug_when_factory_is_behind_plan_columns() {
+    fn rewrite_reserves_factory_when_behind_plan_columns() {
         let mut arena = ScalarArena::new();
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 1);
@@ -1748,11 +1742,16 @@ mod tests {
             &mut factory,
             &crate::sql::optimizer::options::OptimizerOptions::default_settings(),
         );
+
+        assert_eq!(
+            factory.peek_next_id(),
+            11,
+            "CSE should reserve ids above existing physical plan columns"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "ColumnRefFactory is behind physical plan columns")]
-    fn rewrite_panics_when_factory_is_behind_repeat_grouping_output_ids() {
+    fn rewrite_reserves_factory_for_repeat_grouping_output_ids() {
         let mut arena = ScalarArena::new();
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();
         let values = values_node(vec![output_column(1, "a"), output_column(2, "b")]);
@@ -1775,16 +1774,17 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        while factory.peek_next_id() < 3 {
-            let raw = factory.peek_next_id();
-            factory.create(None, format!("__visible_seed_{raw}"), DataType::Null, true);
-        }
-
         super::rewrite(
             &mut node,
             &mut arena,
             &mut factory,
             &crate::sql::optimizer::options::OptimizerOptions::default_settings(),
+        );
+
+        assert_eq!(
+            factory.peek_next_id(),
+            51,
+            "CSE should reserve ids above repeat-owned grouping function columns"
         );
     }
 

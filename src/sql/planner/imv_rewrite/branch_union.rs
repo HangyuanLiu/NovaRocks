@@ -217,7 +217,7 @@ fn branch_union_aggregate_change_stream_output_columns(
 ) -> Result<Vec<OutputColumn>, String> {
     let (_shape, layout) = ext.mv_ctx.aggregate_shape_and_layout_for_execution()?;
     let mut columns =
-        Vec::with_capacity(1 + layout.visible_columns.len() + layout.state_columns.len() + 2);
+        Vec::with_capacity(1 + layout.visible_columns.len() + layout.state_columns.len() + 4);
     columns.push(allocate_imv_output_column(
         ctx,
         &layout.row_id_column.column.name,
@@ -256,6 +256,20 @@ fn branch_union_aggregate_change_stream_output_columns(
         ICEBERG_MV_BRANCH_ID_COLUMN,
         DataType::Int32,
         false,
+        true,
+    )?);
+    columns.push(allocate_imv_output_column(
+        ctx,
+        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        DataType::Utf8,
+        true,
+        true,
+    )?);
+    columns.push(allocate_imv_output_column(
+        ctx,
+        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        DataType::Int64,
+        true,
         true,
     )?);
     columns.push(allocate_imv_output_column(
@@ -511,6 +525,13 @@ mod tests {
                 .any(|c| c.name.eq_ignore_ascii_case("__branch_id__")),
             "union output must expose __branch_id__"
         );
+        assert_locator_columns_precede_action(
+            &union
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+        );
         for branch in &out.children {
             assert_aggregate_change_stream_branch(branch);
         }
@@ -548,6 +569,7 @@ mod tests {
                 .any(|name| name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
             "change-stream branch output must expose __change_op"
         );
+        assert_locator_columns_precede_action(&output_names);
         assert!(
             contains_join_kind(branch, JoinKind::LeftOuter),
             "relational change-stream branch must merge delta and old target state once"
@@ -593,6 +615,34 @@ mod tests {
             PlanNodeKind::CTEAnchor(_) => aggregate_change_stream_output_names(branch.child(1)),
             other => panic!("expected aggregate change-stream branch, got {other:?}"),
         }
+    }
+
+    fn assert_locator_columns_precede_action(output_names: &[&str]) {
+        let branch_idx = output_names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN))
+            .expect("branch-union aggregate output must include branch id");
+        let file_idx = output_names
+            .iter()
+            .position(|name| {
+                name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
+            })
+            .expect("branch-union aggregate output must include file locator");
+        let pos_idx = output_names
+            .iter()
+            .position(|name| {
+                name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
+            })
+            .expect("branch-union aggregate output must include row-position locator");
+        let action_idx = output_names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+            .expect("branch-union aggregate output must include action column");
+        assert_eq!(
+            [branch_idx + 1, branch_idx + 2, branch_idx + 3],
+            [file_idx, pos_idx, action_idx],
+            "branch-union aggregate output must keep branch id, locator metadata, and action column contiguous: {output_names:?}"
+        );
     }
 
     fn contains_join_kind(plan: &LogicalPlanNode, join_type: JoinKind) -> bool {
@@ -1330,6 +1380,13 @@ mod tests {
                 .iter()
                 .any(|c| c.name.eq_ignore_ascii_case("__branch_id__")),
             "union output must expose __branch_id__"
+        );
+        assert_locator_columns_precede_action(
+            &union
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
         );
         for branch in &out.children {
             assert_aggregate_change_stream_branch(branch);

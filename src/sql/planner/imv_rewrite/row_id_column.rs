@@ -9,7 +9,7 @@
 use arrow::datatypes::DataType;
 
 use crate::sql::analysis::OutputColumn;
-use crate::sql::catalog::ScanSource;
+use crate::sql::catalog::{ColumnDef, ScanSource};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -36,6 +36,22 @@ impl ImvRowIdColumn {
 
     pub(crate) fn matches(column: &OutputColumn) -> bool {
         column.is_internal && column.name.eq_ignore_ascii_case(Self::NAME)
+    }
+
+    pub(crate) fn ensure_metadata_column(columns: &mut Vec<ColumnDef>) {
+        if columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(Self::NAME))
+        {
+            return;
+        }
+        columns.push(ColumnDef {
+            name: Self::NAME.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        });
     }
 }
 
@@ -90,6 +106,9 @@ impl LogicalRewriteRule for InjectRowIdRule {
             scan.columns
                 .retain(|column| !column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME));
             scan.columns.push(ImvRowIdColumn::output_column(column_id));
+            ImvRowIdColumn::ensure_metadata_column(
+                &mut scan.table.iceberg_row_lineage_metadata_columns,
+            );
             Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
                 PlanNodeKind::Scan(scan),
                 children,
@@ -228,6 +247,12 @@ mod tests {
             panic!("expected Changed(Scan)");
         };
         assert!(scan.columns.iter().any(ImvRowIdColumn::matches));
+        assert!(
+            scan.table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
+        );
     }
 
     #[test]
@@ -251,6 +276,12 @@ mod tests {
             panic!("expected Changed(Scan)");
         };
         assert!(scan.columns.iter().any(ImvRowIdColumn::matches));
+        assert!(
+            scan.table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
+        );
     }
 
     #[test]

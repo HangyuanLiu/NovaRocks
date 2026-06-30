@@ -15,7 +15,7 @@ use crate::engine::mv::refresh_context::MvRefreshPruningLimits;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
-use crate::thrift::plan_nodes::TFileFormatType;
+use crate::thrift::{internal_service::TQueryOptions, plan_nodes::TFileFormatType};
 
 use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, normalize_identifier};
 use crate::connector::{
@@ -793,7 +793,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+        query_opts: Option<TQueryOptions>,
     ) -> Result<StatementResult, String> {
         // Install the per-statement dictionary provider so optimizer
         // calls reached through nested engine entry points (insert,
@@ -815,7 +815,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+        query_opts: Option<TQueryOptions>,
     ) -> Result<StatementResult, String> {
         use crate::sql::parser::dialect::{
             StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
@@ -1946,7 +1946,7 @@ impl StandaloneSession {
         insert: &sqlparser::ast::Insert,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
+        query_opts: Option<&TQueryOptions>,
     ) -> Result<StatementResult, String> {
         self.execute_insert_via_custom_parser(insert, current_catalog, current_database, query_opts)
     }
@@ -1958,7 +1958,7 @@ impl StandaloneSession {
         insert: &sqlparser::ast::Insert,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
+        query_opts: Option<&TQueryOptions>,
     ) -> Result<StatementResult, String> {
         let insert_stmt = convert_sqlparser_insert_to_custom(insert)?;
         execute_insert_statement(
@@ -2789,7 +2789,7 @@ fn execute_query_direct_for_explicit_exception(
     codegen_catalog: &dyn crate::sql::catalog::CatalogProvider,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
-    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3095,7 +3095,7 @@ fn explain_analyze_query(
     codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
-    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<TQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     use crate::sql::codegen::ir::explain_distributed_plan_analyze;
@@ -3310,7 +3310,7 @@ pub(crate) fn execute_query(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<TQueryOptions>,
 ) -> Result<QueryResult, String> {
     execute_query_with_catalog_provider(
         query,
@@ -3329,7 +3329,7 @@ pub(crate) fn execute_query_with_catalog_mgr(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<TQueryOptions>,
 ) -> Result<QueryResult, String> {
     let catalog_snapshot = state
         .catalog
@@ -3428,7 +3428,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink_spec: crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec,
-    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<TQueryOptions>,
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
@@ -3522,7 +3522,7 @@ pub(crate) fn execute_query_with_catalog_provider(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<TQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     execute_query_with_options_and_imv_validator_with_catalog_provider(
@@ -3538,6 +3538,7 @@ pub(crate) fn execute_query_with_catalog_provider(
         None,
         None,
         mv_rewrite_state,
+        false,
     )
 }
 
@@ -3550,9 +3551,10 @@ pub(crate) fn execute_query_with_catalog_provider(
 /// `terminal_sink = None` falls back to the default `ResultSinkFactory`.
 /// `iceberg_catalogs = None` matches the legacy behaviour for non-IVM
 /// callers.
-/// `mv_refresh_ctx = Some(ctx)` runs the IMV rewrite pipeline on the
-/// logical plan before optimization. Callers that do not need IMV rewriting
-/// pass `None` (dormant until Task 9 flips the PF refresh caller).
+/// `execute_query_with_options(..., mv_refresh_ctx = Some(ctx))` runs the
+/// IMV rewrite pipeline before optimization and also passes the refresh
+/// context into codegen. Pre-expanded MV refresh SQL that only needs the
+/// codegen context must use `execute_preexpanded_mv_refresh_query_with_options`.
 pub(crate) type ImvRewriteValidator<'a> = dyn Fn(&crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome) -> Result<(), String>
     + 'a;
 
@@ -3562,7 +3564,7 @@ pub(crate) fn execute_query_with_options(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3589,7 +3591,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3609,6 +3611,36 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
         mv_refresh_ctx,
         imv_rewrite_validator,
         mv_rewrite_state,
+        mv_refresh_ctx.is_some(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
+    query: &sqlparser::ast::Query,
+    catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<QueryResult, String> {
+    execute_query_with_options_and_imv_validator_with_catalog_provider(
+        query,
+        catalog,
+        catalog,
+        connectors,
+        current_database,
+        exchange_port,
+        query_opts,
+        terminal_sink,
+        iceberg_catalogs,
+        mv_refresh_ctx,
+        None,
+        None,
+        false,
     )
 }
 
@@ -3620,17 +3652,20 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    run_imv_rewrite: bool,
 ) -> Result<QueryResult, String> {
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let mut logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    if let Some(mv_ctx) = mv_refresh_ctx {
+    if run_imv_rewrite {
+        let mv_ctx =
+            mv_refresh_ctx.ok_or_else(|| "IMV rewrite requires MV refresh context".to_string())?;
         logical = crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical);
         let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
         let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
@@ -3847,7 +3882,9 @@ fn coordinated_execution_services() -> Result<
 
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
 ///
-/// - `AllInOne` and `Fe`: use `RemoteDispatcher` bound to live registry backends.
+/// - `Fe`: prefer explicit `[cluster].backends`; when the active config is
+///   truly `role=fe`, fall back to live registry backends.
+/// - `AllInOne`: use `RemoteDispatcher` bound to live registry backends.
 /// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
 pub(crate) fn dispatcher_for_role(
     role: crate::common::app_config::ClusterRole,
@@ -3855,6 +3892,18 @@ pub(crate) fn dispatcher_for_role(
     use crate::common::app_config::ClusterRole;
     match role {
         ClusterRole::Fe => {
+            let (configured, may_use_live_registry) =
+                configured_fe_dispatch_entries_and_live_fallback()?;
+            if let Some(entries) = configured {
+                return Ok(Arc::new(
+                    crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+                ));
+            }
+            if !may_use_live_registry {
+                return Err(with_fe_error_context(
+                    "no configured backend available".to_string(),
+                ));
+            }
             let entries = backend_ops::live_backend_dispatch_entries()
                 .map_err(|e| with_fe_error_context(e))?;
             Ok(Arc::new(
@@ -3869,6 +3918,34 @@ pub(crate) fn dispatcher_for_role(
         }
         ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
     }
+}
+
+type FeDispatchSelection = (Option<Vec<(usize, std::net::SocketAddr)>>, bool);
+
+fn configured_fe_dispatch_entries_and_live_fallback() -> Result<FeDispatchSelection, String> {
+    let cfg = novarocks_config::config()
+        .map_err(|e| with_fe_error_context(format!("cannot read config: {e}")))?;
+    if cfg.cluster.backends.is_empty() {
+        return Ok((
+            None,
+            cfg.cluster.role == crate::common::app_config::ClusterRole::Fe,
+        ));
+    }
+    let entries = cfg
+        .cluster
+        .backends
+        .iter()
+        .enumerate()
+        .map(|(idx, backend)| {
+            backend
+                .parse::<std::net::SocketAddr>()
+                .map(|endpoint| (idx, endpoint))
+                .map_err(|e| {
+                    with_fe_error_context(format!("invalid backend addr '{backend}': {e}"))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((Some(entries), true))
 }
 
 fn with_fe_error_context(err: String) -> String {
@@ -3993,7 +4070,7 @@ fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
 fn lower_plan_build_result(
     result: PlanBuildResult,
     arena: &mut crate::exec::expr::ExprArena,
-    query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<&TQueryOptions>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
 ) -> Result<crate::exec::node::ExecNode, String> {
     use crate::lower::thrift::layout::{build_tuple_slot_order, reorder_tuple_slots};
@@ -4084,7 +4161,7 @@ fn lower_plan_build_result(
 
 fn execute_plan(
     result: PlanBuildResult,
-    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     profiler: Option<crate::runtime::profile::Profiler>,
@@ -6309,6 +6386,46 @@ enable_path_style_access = true
         .expect_err("validator errors must abort refresh query execution");
 
         assert_eq!(err, "sentinel IMV validator error");
+    }
+
+    #[test]
+    fn preexpanded_mv_refresh_query_skips_imv_rewrite() {
+        let query = parse_query_for_engine_test("select 1");
+        let catalog = super::InMemoryCatalog::default();
+        let connectors = crate::connector::ConnectorRegistry::default();
+        let mv_ctx = dummy_mv_refresh_context_for_validator_test();
+
+        let rewrite_err = super::execute_query_with_options(
+            &query,
+            &catalog,
+            &connectors,
+            "default",
+            0,
+            None,
+            None,
+            None,
+            Some(&mv_ctx),
+        )
+        .expect_err("regular MV refresh entrypoint should run IMV rewrite");
+        assert!(
+            rewrite_err
+                .starts_with("imv rewrite: IVM rewrite failed to resolve incremental markers:"),
+            "unexpected rewrite error: {rewrite_err}"
+        );
+
+        let result = super::execute_preexpanded_mv_refresh_query_with_options(
+            &query,
+            &catalog,
+            &connectors,
+            "default",
+            0,
+            None,
+            None,
+            None,
+            Some(&mv_ctx),
+        )
+        .expect("pre-expanded MV refresh query should skip IMV rewrite");
+        assert_eq!(result.row_count(), 1);
     }
 
     #[test]

@@ -6138,7 +6138,7 @@ mod tests {
         let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
         let planner = std::sync::Arc::new(CurrentSnapshotAssertingIcebergPlanner {
             counts: counts.clone(),
-            files: vec![iceberg_i32_file("s3://bucket/current.parquet", 1, 1)],
+            files: vec![iceberg_i32_file("s3://bucket/current.parquet", 1, 10)],
         });
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);

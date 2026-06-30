@@ -159,7 +159,9 @@ fn validate_with_change_stream(
         );
     }
     // V6: if a delta subtree exists, root output must carry the apply key.
-    if contains_join_delta_union(plan) {
+    if contains_join_delta_union(plan)
+        && !matches!(&plan.kind, PlanNodeKind::AggregateStateMerge(_))
+    {
         if !output_has_join_apply_key(plan) {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
             return Err(format!(
