@@ -17,7 +17,7 @@
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
-use crate::thrift::types::TPrimitiveType;
+use crate::exec::runtime_filter::RuntimeFilterType;
 use arrow::datatypes::DataType;
 
 #[derive(Clone, Debug)]
@@ -69,8 +69,8 @@ pub struct AggFunction {
 pub struct TopNRuntimeFilterSpec {
     pub filter_id: i32,
     pub expr_order: usize,
-    /// The primitive type of the build expression (from FE).
-    pub build_type: TPrimitiveType,
+    /// The internal runtime filter type of the build expression.
+    pub(crate) build_type: RuntimeFilterType,
     /// The column name on the probe (scan) side that this filter targets.
     pub probe_column_name: String,
     /// TopN limit — filter is only published when group count >= limit.

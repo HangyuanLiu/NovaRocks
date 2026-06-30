@@ -34,6 +34,7 @@ use arrow::array::ArrayRef;
 use crate::common::ids::SlotId;
 use crate::novarocks_logging::warn;
 
+use super::RuntimeFilterType;
 use super::bloom::RuntimeBloomFilter;
 use super::in_filter::RuntimeInFilter;
 use super::maybe_build_runtime_bitset_filter;
@@ -45,7 +46,7 @@ use super::min_max::RuntimeMinMaxFilter;
 pub(crate) struct RuntimeMembershipFilterBuildParam {
     filter_id: i32,
     slot_id: SlotId,
-    ltype: crate::thrift::types::TPrimitiveType,
+    ltype: RuntimeFilterType,
     join_mode: i8,
     arrays: Vec<ArrayRef>,
 }
@@ -54,7 +55,7 @@ impl RuntimeMembershipFilterBuildParam {
     pub(crate) fn new(
         filter_id: i32,
         slot_id: SlotId,
-        ltype: crate::thrift::types::TPrimitiveType,
+        ltype: RuntimeFilterType,
         join_mode: i8,
     ) -> Self {
         Self {
@@ -78,7 +79,7 @@ impl RuntimeMembershipFilterBuildParam {
         self.slot_id
     }
 
-    pub(crate) fn ltype(&self) -> crate::thrift::types::TPrimitiveType {
+    pub(crate) fn ltype(&self) -> RuntimeFilterType {
         self.ltype
     }
 

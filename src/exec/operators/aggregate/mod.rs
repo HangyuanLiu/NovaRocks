@@ -372,11 +372,9 @@ impl AggregateProcessorOperator {
 
         let num_rows = chunk.len();
         if let Some(profile) = self.profiles.as_ref() {
-            profile.common.counter_add(
-                "InputRowCount",
-                crate::thrift::metrics::TUnit::UNIT,
-                num_rows as i64,
-            );
+            profile
+                .common
+                .counter_add_unit("InputRowCount", num_rows as i64);
         }
         if self.group_by.is_empty() {
             self.ensure_scalar_group().map_err(|e| e.to_string())?;

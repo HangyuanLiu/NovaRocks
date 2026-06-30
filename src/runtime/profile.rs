@@ -211,6 +211,14 @@ impl RuntimeProfile {
         )
     }
 
+    pub fn add_unit_counter(&self, name: impl Into<String>) -> CounterRef {
+        self.add_counter(name, metrics::TUnit::UNIT)
+    }
+
+    pub fn add_bytes_counter(&self, name: impl Into<String>) -> CounterRef {
+        self.add_counter(name, metrics::TUnit::BYTES)
+    }
+
     pub fn add_child_counter(
         &self,
         name: impl Into<String>,
@@ -267,6 +275,14 @@ impl RuntimeProfile {
         c.add(delta);
     }
 
+    pub fn counter_add_unit(&self, name: &str, delta: i64) {
+        self.counter_add(name, metrics::TUnit::UNIT, delta);
+    }
+
+    pub fn counter_add_bytes(&self, name: &str, delta: i64) {
+        self.counter_add(name, metrics::TUnit::BYTES, delta);
+    }
+
     pub fn counter_add_with_parent(
         &self,
         name: &str,
@@ -281,6 +297,14 @@ impl RuntimeProfile {
     pub fn counter_set(&self, name: &str, unit: metrics::TUnit, value: i64) {
         let c = self.add_counter(name.to_string(), unit);
         c.set(value);
+    }
+
+    pub fn counter_set_unit(&self, name: &str, value: i64) {
+        self.counter_set(name, metrics::TUnit::UNIT, value);
+    }
+
+    pub fn counter_set_bytes(&self, name: &str, value: i64) {
+        self.counter_set(name, metrics::TUnit::BYTES, value);
     }
 
     pub(crate) fn counter_value(&self, name: &str) -> Option<i64> {

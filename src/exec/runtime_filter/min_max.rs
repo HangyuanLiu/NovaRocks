@@ -39,9 +39,9 @@ use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::common::largeint;
 use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
-use crate::thrift::types::TPrimitiveType;
 
 use super::codec::{read_i8, read_i16_le, read_i32_le, read_i64_le, read_u8, read_u64_le};
+use super::{RuntimeDecimalWidth, RuntimeFilterType};
 
 #[derive(Clone, Debug)]
 /// Typed bound values used by runtime min-max filters.
@@ -87,7 +87,7 @@ impl MinMaxValue {
 #[derive(Clone, Debug)]
 /// Runtime range filter that prunes rows using typed lower/upper bounds.
 pub(crate) struct RuntimeMinMaxFilter {
-    ltype: TPrimitiveType,
+    ltype: RuntimeFilterType,
     has_min_max: bool,
     min: MinMaxValue,
     max: MinMaxValue,
@@ -95,7 +95,7 @@ pub(crate) struct RuntimeMinMaxFilter {
 
 impl RuntimeMinMaxFilter {
     pub(crate) fn new(
-        ltype: TPrimitiveType,
+        ltype: RuntimeFilterType,
         has_min_max: bool,
         min: MinMaxValue,
         max: MinMaxValue,
@@ -129,37 +129,39 @@ impl RuntimeMinMaxFilter {
         if !self.has_min_max {
             return Ok(None);
         }
-        let to_value = |ltype: TPrimitiveType,
+        let to_value = |ltype: RuntimeFilterType,
                         value: &MinMaxValue|
          -> Result<MinMaxPredicateValue, String> {
             match (ltype, value) {
-                (TPrimitiveType::BOOLEAN, MinMaxValue::Bool(v)) => {
+                (RuntimeFilterType::Boolean, MinMaxValue::Bool(v)) => {
                     Ok(MinMaxPredicateValue::Boolean(*v))
                 }
-                (TPrimitiveType::TINYINT, MinMaxValue::Int8(v)) => {
+                (RuntimeFilterType::Int8, MinMaxValue::Int8(v)) => {
                     Ok(MinMaxPredicateValue::Int32(i32::from(*v)))
                 }
-                (TPrimitiveType::SMALLINT, MinMaxValue::Int16(v)) => {
+                (RuntimeFilterType::Int16, MinMaxValue::Int16(v)) => {
                     Ok(MinMaxPredicateValue::Int32(i32::from(*v)))
                 }
-                (TPrimitiveType::INT, MinMaxValue::Int32(v)) => Ok(MinMaxPredicateValue::Int32(*v)),
-                (TPrimitiveType::BIGINT, MinMaxValue::Int64(v)) => {
+                (RuntimeFilterType::Int32, MinMaxValue::Int32(v)) => {
+                    Ok(MinMaxPredicateValue::Int32(*v))
+                }
+                (RuntimeFilterType::Int64, MinMaxValue::Int64(v)) => {
                     Ok(MinMaxPredicateValue::Int64(*v))
                 }
-                (TPrimitiveType::LARGEINT, MinMaxValue::LargeInt(v)) => {
+                (RuntimeFilterType::LargeInt, MinMaxValue::LargeInt(v)) => {
                     Ok(MinMaxPredicateValue::LargeInt(*v))
                 }
-                (TPrimitiveType::FLOAT, MinMaxValue::Float32(v)) => {
+                (RuntimeFilterType::Float32, MinMaxValue::Float32(v)) => {
                     Ok(MinMaxPredicateValue::Float(*v))
                 }
-                (TPrimitiveType::DOUBLE, MinMaxValue::Float64(v)) => {
+                (RuntimeFilterType::Float64, MinMaxValue::Float64(v)) => {
                     Ok(MinMaxPredicateValue::Double(*v))
                 }
-                (TPrimitiveType::DATE, MinMaxValue::Date32(v)) => {
+                (RuntimeFilterType::Date32, MinMaxValue::Date32(v)) => {
                     Ok(MinMaxPredicateValue::Date32(*v))
                 }
-                (TPrimitiveType::DATETIME, MinMaxValue::Timestamp(v))
-                | (TPrimitiveType::TIME, MinMaxValue::Timestamp(v)) => {
+                (RuntimeFilterType::TimestampMicros, MinMaxValue::Timestamp(v))
+                | (RuntimeFilterType::TimeMicros, MinMaxValue::Timestamp(v)) => {
                     Ok(MinMaxPredicateValue::DateTimeMicros(*v))
                 }
                 (t, MinMaxValue::Utf8(v)) if is_utf8_type(&t) => {
@@ -177,17 +179,20 @@ impl RuntimeMinMaxFilter {
         Ok(Some((min, max)))
     }
 
-    pub(crate) fn full_range(ltype: TPrimitiveType) -> Result<Self, String> {
+    pub(crate) fn full_range(ltype: RuntimeFilterType) -> Result<Self, String> {
         let (min, max) = full_range_values(&ltype)?;
         Ok(Self::new(ltype, true, min, max))
     }
 
-    pub(crate) fn empty_range(ltype: TPrimitiveType) -> Result<Self, String> {
+    pub(crate) fn empty_range(ltype: RuntimeFilterType) -> Result<Self, String> {
         let (min, max) = empty_range_values(&ltype)?;
         Ok(Self::new(ltype, true, min, max))
     }
 
-    pub(crate) fn from_arrays(ltype: TPrimitiveType, arrays: &[ArrayRef]) -> Result<Self, String> {
+    pub(crate) fn from_arrays(
+        ltype: RuntimeFilterType,
+        arrays: &[ArrayRef],
+    ) -> Result<Self, String> {
         if arrays.is_empty() {
             return Self::empty_range(ltype);
         }
@@ -195,7 +200,7 @@ impl RuntimeMinMaxFilter {
         let mut max: Option<MinMaxValue> = None;
         for array in arrays {
             match ltype {
-                t if t == TPrimitiveType::BOOLEAN => {
+                t if t == RuntimeFilterType::Boolean => {
                     let arr = as_array::<BooleanArray>(array, "Boolean")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -205,7 +210,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == TPrimitiveType::TINYINT => {
+                t if t == RuntimeFilterType::Int8 => {
                     let arr = as_array::<Int8Array>(array, "Int8")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -215,7 +220,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == TPrimitiveType::SMALLINT => {
+                t if t == RuntimeFilterType::Int16 => {
                     let arr = as_array::<Int16Array>(array, "Int16")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -225,7 +230,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == TPrimitiveType::INT => {
+                t if t == RuntimeFilterType::Int32 => {
                     let arr = as_array::<Int32Array>(array, "Int32")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -235,7 +240,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == TPrimitiveType::BIGINT => {
+                t if t == RuntimeFilterType::Int64 => {
                     let arr = as_array::<Int64Array>(array, "Int64")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -245,7 +250,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == TPrimitiveType::LARGEINT => {
+                t if t == RuntimeFilterType::LargeInt => {
                     let arr = as_array::<FixedSizeBinaryArray>(array, "FixedSizeBinary(16)")?;
                     if arr.value_length() != largeint::LARGEINT_BYTE_WIDTH {
                         return Err(
@@ -261,7 +266,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == TPrimitiveType::FLOAT => {
+                t if t == RuntimeFilterType::Float32 => {
                     let arr = as_array::<Float32Array>(array, "Float32")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -275,7 +280,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == TPrimitiveType::DOUBLE => {
+                t if t == RuntimeFilterType::Float64 => {
                     let arr = as_array::<Float64Array>(array, "Float64")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -289,7 +294,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == TPrimitiveType::DATE => {
+                t if t == RuntimeFilterType::Date32 => {
                     let arr = as_array::<Date32Array>(array, "Date32")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -299,7 +304,9 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == TPrimitiveType::DATETIME || t == TPrimitiveType::TIME => {
+                t if t == RuntimeFilterType::TimestampMicros
+                    || t == RuntimeFilterType::TimeMicros =>
+                {
                     let (values, unit) = timestamp_values(array)?;
                     for (value, is_null) in values {
                         if is_null {
@@ -344,7 +351,7 @@ impl RuntimeMinMaxFilter {
     /// Convenience wrapper that builds a `RuntimeMinMaxFilter` from a single array.
     ///
     /// Used by the AGG operator to construct a TopN filter from a group-by key column.
-    pub(crate) fn from_array(ltype: TPrimitiveType, array: &ArrayRef) -> Result<Self, String> {
+    pub(crate) fn from_array(ltype: RuntimeFilterType, array: &ArrayRef) -> Result<Self, String> {
         Self::from_arrays(ltype, std::slice::from_ref(array))
     }
 
@@ -354,7 +361,7 @@ impl RuntimeMinMaxFilter {
     /// For DESC only the lower bound is active. Mirrors StarRocks
     /// `agg_runtime_filter_builder.cpp` (ASC tightens `_max`, DESC tightens `_min`).
     pub(crate) fn from_array_one_sided(
-        ltype: TPrimitiveType,
+        ltype: RuntimeFilterType,
         array: &ArrayRef,
         is_asc: bool,
     ) -> Result<Self, String> {
@@ -440,7 +447,7 @@ impl RuntimeMinMaxFilter {
             return Err("runtime min/max selection size mismatch".to_string());
         }
         match self.ltype {
-            t if t == TPrimitiveType::BOOLEAN => {
+            t if t == RuntimeFilterType::Boolean => {
                 let (min, max) = self.bool_range()?;
                 let arr = as_array::<BooleanArray>(array, "Boolean")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -459,7 +466,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == TPrimitiveType::TINYINT => {
+            t if t == RuntimeFilterType::Int8 => {
                 let (min, max) = self.i8_range()?;
                 let arr = as_array::<Int8Array>(array, "Int8")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -478,7 +485,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == TPrimitiveType::SMALLINT => {
+            t if t == RuntimeFilterType::Int16 => {
                 let (min, max) = self.i16_range()?;
                 let arr = as_array::<Int16Array>(array, "Int16")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -497,7 +504,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == TPrimitiveType::INT => {
+            t if t == RuntimeFilterType::Int32 => {
                 let (min, max) = self.i32_range()?;
                 let arr = as_array::<Int32Array>(array, "Int32")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -516,7 +523,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == TPrimitiveType::BIGINT => {
+            t if t == RuntimeFilterType::Int64 => {
                 let (min, max) = self.i64_range()?;
                 let arr = as_array::<Int64Array>(array, "Int64")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -535,7 +542,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == TPrimitiveType::LARGEINT => {
+            t if t == RuntimeFilterType::LargeInt => {
                 let (min, max) = self.i128_range()?;
                 let arr = as_array::<FixedSizeBinaryArray>(array, "FixedSizeBinary(16)")?;
                 if arr.value_length() != largeint::LARGEINT_BYTE_WIDTH {
@@ -557,7 +564,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == TPrimitiveType::FLOAT => {
+            t if t == RuntimeFilterType::Float32 => {
                 let (min, max) = self.f32_range()?;
                 let arr = as_array::<Float32Array>(array, "Float32")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -576,7 +583,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == TPrimitiveType::DOUBLE => {
+            t if t == RuntimeFilterType::Float64 => {
                 let (min, max) = self.f64_range()?;
                 let arr = as_array::<Float64Array>(array, "Float64")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -595,7 +602,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == TPrimitiveType::DATE => {
+            t if t == RuntimeFilterType::Date32 => {
                 let (min, max) = self.date32_range()?;
                 let arr = as_array::<Date32Array>(array, "Date32")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -614,7 +621,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == TPrimitiveType::DATETIME || t == TPrimitiveType::TIME => {
+            t if t == RuntimeFilterType::TimestampMicros || t == RuntimeFilterType::TimeMicros => {
                 let (min, max) = self.timestamp_range()?;
                 let (values, unit) = timestamp_values(array)?;
                 for (idx, (value, is_null)) in values.iter().enumerate() {
@@ -691,7 +698,7 @@ impl RuntimeMinMaxFilter {
     }
 
     pub(crate) fn decode(
-        ltype: TPrimitiveType,
+        ltype: RuntimeFilterType,
         data: &[u8],
         offset: &mut usize,
     ) -> Result<Self, String> {
@@ -817,29 +824,35 @@ fn update_min_max(
     Ok(())
 }
 
-fn full_range_values(ltype: &TPrimitiveType) -> Result<(MinMaxValue, MinMaxValue), String> {
+fn full_range_values(ltype: &RuntimeFilterType) -> Result<(MinMaxValue, MinMaxValue), String> {
     match *ltype {
-        TPrimitiveType::BOOLEAN => Ok((MinMaxValue::Bool(false), MinMaxValue::Bool(true))),
-        TPrimitiveType::TINYINT => Ok((MinMaxValue::Int8(i8::MIN), MinMaxValue::Int8(i8::MAX))),
-        TPrimitiveType::SMALLINT => {
+        RuntimeFilterType::Boolean => Ok((MinMaxValue::Bool(false), MinMaxValue::Bool(true))),
+        RuntimeFilterType::Int8 => Ok((MinMaxValue::Int8(i8::MIN), MinMaxValue::Int8(i8::MAX))),
+        RuntimeFilterType::Int16 => {
             Ok((MinMaxValue::Int16(i16::MIN), MinMaxValue::Int16(i16::MAX)))
         }
-        TPrimitiveType::INT => Ok((MinMaxValue::Int32(i32::MIN), MinMaxValue::Int32(i32::MAX))),
-        TPrimitiveType::BIGINT => Ok((MinMaxValue::Int64(i64::MIN), MinMaxValue::Int64(i64::MAX))),
-        TPrimitiveType::LARGEINT => Ok((
+        RuntimeFilterType::Int32 => {
+            Ok((MinMaxValue::Int32(i32::MIN), MinMaxValue::Int32(i32::MAX)))
+        }
+        RuntimeFilterType::Int64 => {
+            Ok((MinMaxValue::Int64(i64::MIN), MinMaxValue::Int64(i64::MAX)))
+        }
+        RuntimeFilterType::LargeInt => Ok((
             MinMaxValue::LargeInt(i128::MIN),
             MinMaxValue::LargeInt(i128::MAX),
         )),
-        TPrimitiveType::FLOAT => Ok((
+        RuntimeFilterType::Float32 => Ok((
             MinMaxValue::Float32(f32::MIN),
             MinMaxValue::Float32(f32::MAX),
         )),
-        TPrimitiveType::DOUBLE => Ok((
+        RuntimeFilterType::Float64 => Ok((
             MinMaxValue::Float64(f64::MIN),
             MinMaxValue::Float64(f64::MAX),
         )),
-        TPrimitiveType::DATE => Ok((MinMaxValue::Date32(i32::MIN), MinMaxValue::Date32(i32::MAX))),
-        TPrimitiveType::DATETIME | TPrimitiveType::TIME => Ok((
+        RuntimeFilterType::Date32 => {
+            Ok((MinMaxValue::Date32(i32::MIN), MinMaxValue::Date32(i32::MAX)))
+        }
+        RuntimeFilterType::TimestampMicros | RuntimeFilterType::TimeMicros => Ok((
             MinMaxValue::Timestamp(i64::MIN),
             MinMaxValue::Timestamp(i64::MAX),
         )),
@@ -847,15 +860,24 @@ fn full_range_values(ltype: &TPrimitiveType) -> Result<(MinMaxValue, MinMaxValue
             MinMaxValue::Utf8(String::new()),
             MinMaxValue::Utf8(String::from("\u{10FFFF}")),
         )),
-        TPrimitiveType::DECIMAL32 => Ok((
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal32,
+            ..
+        } => Ok((
             MinMaxValue::Decimal128(i32::MIN as i128),
             MinMaxValue::Decimal128(i32::MAX as i128),
         )),
-        TPrimitiveType::DECIMAL64 => Ok((
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal64,
+            ..
+        } => Ok((
             MinMaxValue::Decimal128(i64::MIN as i128),
             MinMaxValue::Decimal128(i64::MAX as i128),
         )),
-        TPrimitiveType::DECIMAL128 | TPrimitiveType::DECIMAL | TPrimitiveType::DECIMALV2 => Ok((
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal128,
+            ..
+        } => Ok((
             MinMaxValue::Decimal128(i128::MIN),
             MinMaxValue::Decimal128(i128::MAX),
         )),
@@ -863,29 +885,35 @@ fn full_range_values(ltype: &TPrimitiveType) -> Result<(MinMaxValue, MinMaxValue
     }
 }
 
-fn empty_range_values(ltype: &TPrimitiveType) -> Result<(MinMaxValue, MinMaxValue), String> {
+fn empty_range_values(ltype: &RuntimeFilterType) -> Result<(MinMaxValue, MinMaxValue), String> {
     match *ltype {
-        TPrimitiveType::BOOLEAN => Ok((MinMaxValue::Bool(true), MinMaxValue::Bool(false))),
-        TPrimitiveType::TINYINT => Ok((MinMaxValue::Int8(i8::MAX), MinMaxValue::Int8(i8::MIN))),
-        TPrimitiveType::SMALLINT => {
+        RuntimeFilterType::Boolean => Ok((MinMaxValue::Bool(true), MinMaxValue::Bool(false))),
+        RuntimeFilterType::Int8 => Ok((MinMaxValue::Int8(i8::MAX), MinMaxValue::Int8(i8::MIN))),
+        RuntimeFilterType::Int16 => {
             Ok((MinMaxValue::Int16(i16::MAX), MinMaxValue::Int16(i16::MIN)))
         }
-        TPrimitiveType::INT => Ok((MinMaxValue::Int32(i32::MAX), MinMaxValue::Int32(i32::MIN))),
-        TPrimitiveType::BIGINT => Ok((MinMaxValue::Int64(i64::MAX), MinMaxValue::Int64(i64::MIN))),
-        TPrimitiveType::LARGEINT => Ok((
+        RuntimeFilterType::Int32 => {
+            Ok((MinMaxValue::Int32(i32::MAX), MinMaxValue::Int32(i32::MIN)))
+        }
+        RuntimeFilterType::Int64 => {
+            Ok((MinMaxValue::Int64(i64::MAX), MinMaxValue::Int64(i64::MIN)))
+        }
+        RuntimeFilterType::LargeInt => Ok((
             MinMaxValue::LargeInt(i128::MAX),
             MinMaxValue::LargeInt(i128::MIN),
         )),
-        TPrimitiveType::FLOAT => Ok((
+        RuntimeFilterType::Float32 => Ok((
             MinMaxValue::Float32(f32::MAX),
             MinMaxValue::Float32(f32::MIN),
         )),
-        TPrimitiveType::DOUBLE => Ok((
+        RuntimeFilterType::Float64 => Ok((
             MinMaxValue::Float64(f64::MAX),
             MinMaxValue::Float64(f64::MIN),
         )),
-        TPrimitiveType::DATE => Ok((MinMaxValue::Date32(i32::MAX), MinMaxValue::Date32(i32::MIN))),
-        TPrimitiveType::DATETIME | TPrimitiveType::TIME => Ok((
+        RuntimeFilterType::Date32 => {
+            Ok((MinMaxValue::Date32(i32::MAX), MinMaxValue::Date32(i32::MIN)))
+        }
+        RuntimeFilterType::TimestampMicros | RuntimeFilterType::TimeMicros => Ok((
             MinMaxValue::Timestamp(i64::MAX),
             MinMaxValue::Timestamp(i64::MIN),
         )),
@@ -893,15 +921,24 @@ fn empty_range_values(ltype: &TPrimitiveType) -> Result<(MinMaxValue, MinMaxValu
             MinMaxValue::Utf8(String::from("\u{10FFFF}")),
             MinMaxValue::Utf8(String::new()),
         )),
-        TPrimitiveType::DECIMAL32 => Ok((
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal32,
+            ..
+        } => Ok((
             MinMaxValue::Decimal128(i32::MAX as i128),
             MinMaxValue::Decimal128(i32::MIN as i128),
         )),
-        TPrimitiveType::DECIMAL64 => Ok((
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal64,
+            ..
+        } => Ok((
             MinMaxValue::Decimal128(i64::MAX as i128),
             MinMaxValue::Decimal128(i64::MIN as i128),
         )),
-        TPrimitiveType::DECIMAL128 | TPrimitiveType::DECIMAL | TPrimitiveType::DECIMALV2 => Ok((
+        RuntimeFilterType::Decimal {
+            width: RuntimeDecimalWidth::Decimal128,
+            ..
+        } => Ok((
             MinMaxValue::Decimal128(i128::MAX),
             MinMaxValue::Decimal128(i128::MIN),
         )),
@@ -910,27 +947,27 @@ fn empty_range_values(ltype: &TPrimitiveType) -> Result<(MinMaxValue, MinMaxValu
 }
 
 fn decode_value(
-    ltype: &TPrimitiveType,
+    ltype: &RuntimeFilterType,
     data: &[u8],
     offset: &mut usize,
 ) -> Result<MinMaxValue, String> {
     match *ltype {
-        TPrimitiveType::BOOLEAN => Ok(MinMaxValue::Bool(read_u8(data, offset)? != 0)),
-        TPrimitiveType::TINYINT => Ok(MinMaxValue::Int8(read_i8(data, offset)?)),
-        TPrimitiveType::SMALLINT => Ok(MinMaxValue::Int16(read_i16_le(data, offset)?)),
-        TPrimitiveType::INT => Ok(MinMaxValue::Int32(read_i32_le(data, offset)?)),
-        TPrimitiveType::BIGINT => Ok(MinMaxValue::Int64(read_i64_le(data, offset)?)),
-        TPrimitiveType::LARGEINT => Ok(MinMaxValue::LargeInt(read_i128_le(data, offset)?)),
-        TPrimitiveType::FLOAT => {
+        RuntimeFilterType::Boolean => Ok(MinMaxValue::Bool(read_u8(data, offset)? != 0)),
+        RuntimeFilterType::Int8 => Ok(MinMaxValue::Int8(read_i8(data, offset)?)),
+        RuntimeFilterType::Int16 => Ok(MinMaxValue::Int16(read_i16_le(data, offset)?)),
+        RuntimeFilterType::Int32 => Ok(MinMaxValue::Int32(read_i32_le(data, offset)?)),
+        RuntimeFilterType::Int64 => Ok(MinMaxValue::Int64(read_i64_le(data, offset)?)),
+        RuntimeFilterType::LargeInt => Ok(MinMaxValue::LargeInt(read_i128_le(data, offset)?)),
+        RuntimeFilterType::Float32 => {
             let bits = read_i32_le(data, offset)? as u32;
             Ok(MinMaxValue::Float32(f32::from_bits(bits)))
         }
-        TPrimitiveType::DOUBLE => {
+        RuntimeFilterType::Float64 => {
             let bits = read_i64_le(data, offset)? as u64;
             Ok(MinMaxValue::Float64(f64::from_bits(bits)))
         }
-        TPrimitiveType::DATE => Ok(MinMaxValue::Date32(read_i32_le(data, offset)?)),
-        TPrimitiveType::DATETIME | TPrimitiveType::TIME => {
+        RuntimeFilterType::Date32 => Ok(MinMaxValue::Date32(read_i32_le(data, offset)?)),
+        RuntimeFilterType::TimestampMicros | RuntimeFilterType::TimeMicros => {
             Ok(MinMaxValue::Timestamp(read_i64_le(data, offset)?))
         }
         t if is_utf8_type(&t) => {
@@ -946,11 +983,18 @@ fn decode_value(
         }
         t if is_decimal_type(&t) => {
             let value = match *ltype {
-                TPrimitiveType::DECIMAL32 => read_i32_le(data, offset)? as i128,
-                TPrimitiveType::DECIMAL64 => read_i64_le(data, offset)? as i128,
-                TPrimitiveType::DECIMAL128
-                | TPrimitiveType::DECIMAL
-                | TPrimitiveType::DECIMALV2 => read_i128_le(data, offset)?,
+                RuntimeFilterType::Decimal {
+                    width: RuntimeDecimalWidth::Decimal32,
+                    ..
+                } => read_i32_le(data, offset)? as i128,
+                RuntimeFilterType::Decimal {
+                    width: RuntimeDecimalWidth::Decimal64,
+                    ..
+                } => read_i64_le(data, offset)? as i128,
+                RuntimeFilterType::Decimal {
+                    width: RuntimeDecimalWidth::Decimal128,
+                    ..
+                } => read_i128_le(data, offset)?,
                 _ => {
                     return Err(format!(
                         "unsupported runtime min/max decimal type: {:?}",
@@ -965,40 +1009,40 @@ fn decode_value(
 }
 
 fn encode_value(
-    ltype: &TPrimitiveType,
+    ltype: &RuntimeFilterType,
     value: &MinMaxValue,
     buf: &mut Vec<u8>,
 ) -> Result<(), String> {
     match (ltype, value) {
-        (t, MinMaxValue::Bool(v)) if *t == TPrimitiveType::BOOLEAN => {
+        (t, MinMaxValue::Bool(v)) if *t == RuntimeFilterType::Boolean => {
             buf.push(if *v { 1 } else { 0 });
         }
-        (t, MinMaxValue::Int8(v)) if *t == TPrimitiveType::TINYINT => {
+        (t, MinMaxValue::Int8(v)) if *t == RuntimeFilterType::Int8 => {
             buf.push(*v as u8);
         }
-        (t, MinMaxValue::Int16(v)) if *t == TPrimitiveType::SMALLINT => {
+        (t, MinMaxValue::Int16(v)) if *t == RuntimeFilterType::Int16 => {
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        (t, MinMaxValue::Int32(v)) if *t == TPrimitiveType::INT => {
+        (t, MinMaxValue::Int32(v)) if *t == RuntimeFilterType::Int32 => {
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        (t, MinMaxValue::Int64(v)) if *t == TPrimitiveType::BIGINT => {
+        (t, MinMaxValue::Int64(v)) if *t == RuntimeFilterType::Int64 => {
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        (t, MinMaxValue::LargeInt(v)) if *t == TPrimitiveType::LARGEINT => {
+        (t, MinMaxValue::LargeInt(v)) if *t == RuntimeFilterType::LargeInt => {
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        (t, MinMaxValue::Float32(v)) if *t == TPrimitiveType::FLOAT => {
+        (t, MinMaxValue::Float32(v)) if *t == RuntimeFilterType::Float32 => {
             buf.extend_from_slice(&v.to_bits().to_le_bytes());
         }
-        (t, MinMaxValue::Float64(v)) if *t == TPrimitiveType::DOUBLE => {
+        (t, MinMaxValue::Float64(v)) if *t == RuntimeFilterType::Float64 => {
             buf.extend_from_slice(&v.to_bits().to_le_bytes());
         }
-        (t, MinMaxValue::Date32(v)) if *t == TPrimitiveType::DATE => {
+        (t, MinMaxValue::Date32(v)) if *t == RuntimeFilterType::Date32 => {
             buf.extend_from_slice(&v.to_le_bytes());
         }
         (t, MinMaxValue::Timestamp(v))
-            if *t == TPrimitiveType::DATETIME || *t == TPrimitiveType::TIME =>
+            if *t == RuntimeFilterType::TimestampMicros || *t == RuntimeFilterType::TimeMicros =>
         {
             buf.extend_from_slice(&v.to_le_bytes());
         }
@@ -1008,17 +1052,26 @@ fn encode_value(
             buf.extend_from_slice(bytes);
         }
         (t, MinMaxValue::Decimal128(v)) if is_decimal_type(t) => match *t {
-            TPrimitiveType::DECIMAL32 => {
+            RuntimeFilterType::Decimal {
+                width: RuntimeDecimalWidth::Decimal32,
+                ..
+            } => {
                 let value = i32::try_from(*v)
                     .map_err(|_| "runtime min/max decimal32 overflow".to_string())?;
                 buf.extend_from_slice(&value.to_le_bytes());
             }
-            TPrimitiveType::DECIMAL64 => {
+            RuntimeFilterType::Decimal {
+                width: RuntimeDecimalWidth::Decimal64,
+                ..
+            } => {
                 let value = i64::try_from(*v)
                     .map_err(|_| "runtime min/max decimal64 overflow".to_string())?;
                 buf.extend_from_slice(&value.to_le_bytes());
             }
-            TPrimitiveType::DECIMAL128 | TPrimitiveType::DECIMAL | TPrimitiveType::DECIMALV2 => {
+            RuntimeFilterType::Decimal {
+                width: RuntimeDecimalWidth::Decimal128,
+                ..
+            } => {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
             _ => return Err(format!("unsupported runtime min/max decimal type: {:?}", t)),
@@ -1091,28 +1144,12 @@ fn to_microseconds(value: i64, unit: TimeUnit) -> i64 {
     }
 }
 
-fn is_utf8_type(ltype: &TPrimitiveType) -> bool {
-    matches!(
-        *ltype,
-        TPrimitiveType::CHAR
-            | TPrimitiveType::VARCHAR
-            | TPrimitiveType::JSON
-            | TPrimitiveType::HLL
-            | TPrimitiveType::OBJECT
-            | TPrimitiveType::PERCENTILE
-            | TPrimitiveType::FUNCTION
-    )
+fn is_utf8_type(ltype: &RuntimeFilterType) -> bool {
+    matches!(*ltype, RuntimeFilterType::Utf8)
 }
 
-fn is_decimal_type(ltype: &TPrimitiveType) -> bool {
-    matches!(
-        *ltype,
-        TPrimitiveType::DECIMAL
-            | TPrimitiveType::DECIMALV2
-            | TPrimitiveType::DECIMAL32
-            | TPrimitiveType::DECIMAL64
-            | TPrimitiveType::DECIMAL128
-    )
+fn is_decimal_type(ltype: &RuntimeFilterType) -> bool {
+    matches!(*ltype, RuntimeFilterType::Decimal { .. })
 }
 
 #[cfg(test)]
@@ -1124,7 +1161,7 @@ mod tests {
     use super::{MinMaxValue, RuntimeMinMaxFilter};
     use crate::common::largeint;
     use crate::common::min_max_predicate::MinMaxPredicateValue;
-    use crate::thrift::types::TPrimitiveType;
+    use crate::exec::runtime_filter::RuntimeFilterType;
 
     #[test]
     fn test_largeint_min_max_from_arrays() {
@@ -1136,7 +1173,8 @@ mod tests {
             Some(i128::MIN + 2),
         ])
         .unwrap();
-        let filter = RuntimeMinMaxFilter::from_arrays(TPrimitiveType::LARGEINT, &[array]).unwrap();
+        let filter =
+            RuntimeMinMaxFilter::from_arrays(RuntimeFilterType::LargeInt, &[array]).unwrap();
         match (filter.min(), filter.max()) {
             (MinMaxValue::LargeInt(min), MinMaxValue::LargeInt(max)) => {
                 assert_eq!(*min, i128::MIN + 2);
@@ -1149,7 +1187,7 @@ mod tests {
     #[test]
     fn test_largeint_min_max_encode_decode() {
         let filter = RuntimeMinMaxFilter::new(
-            TPrimitiveType::LARGEINT,
+            RuntimeFilterType::LargeInt,
             true,
             MinMaxValue::LargeInt(i128::MIN + 123),
             MinMaxValue::LargeInt(i128::MAX - 456),
@@ -1158,7 +1196,8 @@ mod tests {
         filter.encode_into(&mut encoded).unwrap();
         let mut offset = 0usize;
         let decoded =
-            RuntimeMinMaxFilter::decode(TPrimitiveType::LARGEINT, &encoded, &mut offset).unwrap();
+            RuntimeMinMaxFilter::decode(RuntimeFilterType::LargeInt, &encoded, &mut offset)
+                .unwrap();
         assert_eq!(offset, encoded.len());
         match decoded.min_max_predicate_values().unwrap() {
             Some((MinMaxPredicateValue::LargeInt(min), MinMaxPredicateValue::LargeInt(max))) => {
@@ -1172,7 +1211,7 @@ mod tests {
     #[test]
     fn test_largeint_apply_to_array() {
         let filter = RuntimeMinMaxFilter::new(
-            TPrimitiveType::LARGEINT,
+            RuntimeFilterType::LargeInt,
             true,
             MinMaxValue::LargeInt(0),
             MinMaxValue::LargeInt(10),
@@ -1189,7 +1228,7 @@ mod tests {
     #[test]
     fn test_largeint_apply_to_array_with_null_allowed() {
         let filter = RuntimeMinMaxFilter::new(
-            TPrimitiveType::LARGEINT,
+            RuntimeFilterType::LargeInt,
             true,
             MinMaxValue::LargeInt(0),
             MinMaxValue::LargeInt(10),
@@ -1205,7 +1244,7 @@ mod tests {
     #[test]
     fn test_largeint_apply_to_array_type_mismatch() {
         let filter = RuntimeMinMaxFilter::new(
-            TPrimitiveType::LARGEINT,
+            RuntimeFilterType::LargeInt,
             true,
             MinMaxValue::LargeInt(0),
             MinMaxValue::LargeInt(10),
@@ -1225,8 +1264,8 @@ mod tests {
     fn topn_min_max_asc_is_one_sided_upper_bound() {
         // top groups seen so far = {5,6,7,8,9} (does NOT yet include small keys 0..4)
         let groups: arrow::array::ArrayRef = Arc::new(Int32Array::from(vec![5, 6, 7, 8, 9]));
-        let f =
-            RuntimeMinMaxFilter::from_array_one_sided(TPrimitiveType::INT, &groups, true).unwrap();
+        let f = RuntimeMinMaxFilter::from_array_one_sided(RuntimeFilterType::Int32, &groups, true)
+            .unwrap();
         let scan: arrow::array::ArrayRef =
             Arc::new(Int32Array::from((0..=12).collect::<Vec<i32>>()));
         let mut keep = vec![true; 13];
@@ -1243,8 +1282,8 @@ mod tests {
     #[test]
     fn topn_min_max_desc_is_one_sided_lower_bound() {
         let groups: arrow::array::ArrayRef = Arc::new(Int32Array::from(vec![5, 6, 7, 8, 9]));
-        let f =
-            RuntimeMinMaxFilter::from_array_one_sided(TPrimitiveType::INT, &groups, false).unwrap();
+        let f = RuntimeMinMaxFilter::from_array_one_sided(RuntimeFilterType::Int32, &groups, false)
+            .unwrap();
         let scan: arrow::array::ArrayRef =
             Arc::new(Int32Array::from((0..=12).collect::<Vec<i32>>()));
         let mut keep = vec![true; 13];

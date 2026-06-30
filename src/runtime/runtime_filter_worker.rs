@@ -31,13 +31,74 @@ use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::service::exchange_sender;
 use crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams;
-use crate::thrift::runtime_filter;
 
 pub(crate) struct RuntimeFilterWorker {
     query_id: QueryId,
-    params: runtime_filter::TRuntimeFilterParams,
+    params: RuntimeFilterWorkerParams,
     hub: Arc<RuntimeFilterHub>,
     merge_states: Mutex<HashMap<i32, MergeState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RuntimeFilterWorkerParams {
+    id_to_prober_targets: HashMap<i32, Vec<RuntimeFilterProberTarget>>,
+    runtime_filter_builder_number: HashMap<i32, i32>,
+    runtime_filter_max_size: Option<i64>,
+}
+
+impl RuntimeFilterWorkerParams {
+    pub(crate) fn new(
+        id_to_prober_targets: HashMap<i32, Vec<RuntimeFilterProberTarget>>,
+        runtime_filter_builder_number: HashMap<i32, i32>,
+        runtime_filter_max_size: Option<i64>,
+    ) -> Self {
+        Self {
+            id_to_prober_targets,
+            runtime_filter_builder_number,
+            runtime_filter_max_size,
+        }
+    }
+
+    fn runtime_filter_max_size(&self) -> Option<i64> {
+        self.runtime_filter_max_size.filter(|v| *v > 0)
+    }
+
+    fn expected_builders(&self, filter_id: i32) -> usize {
+        self.runtime_filter_builder_number
+            .get(&filter_id)
+            .copied()
+            .unwrap_or(1)
+            .max(1) as usize
+    }
+
+    fn prober_targets(&self, filter_id: i32) -> Option<&[RuntimeFilterProberTarget]> {
+        self.id_to_prober_targets
+            .get(&filter_id)
+            .map(|targets| targets.as_slice())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterProberTarget {
+    hostname: String,
+    port: i32,
+}
+
+impl RuntimeFilterProberTarget {
+    pub(crate) fn new(hostname: impl Into<String>, port: i32) -> Self {
+        Self {
+            hostname: hostname.into(),
+            port,
+        }
+    }
+
+    fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    fn port(&self) -> i32 {
+        self.port
+    }
 }
 
 struct MergeState {
@@ -59,7 +120,7 @@ impl MergeState {
 impl RuntimeFilterWorker {
     pub(crate) fn new(
         query_id: QueryId,
-        params: runtime_filter::TRuntimeFilterParams,
+        params: RuntimeFilterWorkerParams,
         hub: Arc<RuntimeFilterHub>,
     ) -> Self {
         Self {
@@ -148,7 +209,7 @@ impl RuntimeFilterWorker {
         };
 
         if let Some(parts) = ready {
-            let max_size = self.params.runtime_filter_max_size.filter(|v| *v > 0);
+            let max_size = self.params.runtime_filter_max_size();
             let data = merge_and_encode_filters(parts, max_size)?;
             debug!(
                 "runtime filter merged final: filter_id={} bytes={}",
@@ -161,19 +222,11 @@ impl RuntimeFilterWorker {
     }
 
     fn expected_builders(&self, filter_id: i32) -> usize {
-        self.params
-            .runtime_filter_builder_number
-            .as_ref()
-            .and_then(|m| m.get(&filter_id).copied())
-            .unwrap_or(1)
-            .max(1) as usize
+        self.params.expected_builders(filter_id)
     }
 
     fn broadcast_final_filter(&self, filter_id: i32, data: Vec<u8>) {
-        let Some(id_to_probers) = self.params.id_to_prober_params.as_ref() else {
-            return;
-        };
-        let Some(probers) = id_to_probers.get(&filter_id) else {
+        let Some(probers) = self.params.prober_targets(filter_id) else {
             return;
         };
         debug!(
@@ -185,13 +238,10 @@ impl RuntimeFilterWorker {
 
         let mut seen_hosts = HashSet::new();
         for prober in probers {
-            let Some(addr) = prober.fragment_instance_address.as_ref() else {
-                continue;
-            };
-            if addr.hostname.is_empty() {
+            if prober.hostname().is_empty() {
                 continue;
             }
-            if !seen_hosts.insert(addr.hostname.clone()) {
+            if !seen_hosts.insert(prober.hostname().to_string()) {
                 continue;
             }
             let req = PTransmitRuntimeFilterParams {
@@ -204,11 +254,14 @@ impl RuntimeFilterWorker {
                 data: Some(data.clone()),
                 ..Default::default()
             };
-            let dest_port = addr.port as u16;
-            if let Err(e) = exchange_sender::send_runtime_filter(&addr.hostname, dest_port, req) {
+            let dest_port = prober.port() as u16;
+            if let Err(e) = exchange_sender::send_runtime_filter(prober.hostname(), dest_port, req)
+            {
                 warn!(
                     "send runtime filter failed: dest={} filter_id={} err={}",
-                    addr.hostname, filter_id, e
+                    prober.hostname(),
+                    filter_id,
+                    e
                 );
             }
         }

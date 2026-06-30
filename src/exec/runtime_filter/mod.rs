@@ -14,22 +14,17 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Runtime-filter module exports and shared conversions.
+//! Runtime-filter module exports.
 //!
 //! Responsibilities:
 //! - Re-exports runtime-filter implementations and codec helpers used across exec runtime.
-//! - Provides shared type conversion helpers required by filter serialization.
 //!
 //! Key exported interfaces:
-//! - Functions: `data_type_to_tprimitive`.
+//! - Internal type model: `RuntimeFilterType`, `RuntimeDecimalWidth`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
-
-use arrow::datatypes::DataType;
-
-use crate::common::largeint;
 
 mod apply;
 mod bitset;
@@ -41,6 +36,7 @@ mod membership;
 mod merger;
 pub(crate) mod min_max;
 mod proto_type;
+mod types;
 
 pub(crate) use apply::{
     filter_chunk_by_in_filters_with_exprs, filter_chunk_by_membership_filters_with_exprs,
@@ -64,79 +60,9 @@ pub(crate) use merger::{
 };
 pub(crate) use min_max::RuntimeMinMaxFilter;
 pub(crate) use proto_type::{arrow_type_from_proto_type_desc, arrow_type_to_proto_type_desc};
+// Staged export for the B3 internal type model; follow-up tasks add production consumers.
+#[allow(unused_imports)]
+pub(crate) use types::{RuntimeDecimalWidth, RuntimeFilterType};
 
 pub(in crate::exec::runtime_filter) use bloom::SimdBlockFilter;
 pub(in crate::exec::runtime_filter) use in_filter::RuntimeInFilterValues;
-
-/// Map Arrow data type to StarRocks thrift primitive type for runtime filter serialization.
-pub(crate) fn data_type_to_tprimitive(
-    data_type: &DataType,
-) -> Result<crate::thrift::types::TPrimitiveType, String> {
-    use crate::thrift::types;
-    let t = match data_type {
-        DataType::Boolean => types::TPrimitiveType::BOOLEAN,
-        DataType::Int8 => types::TPrimitiveType::TINYINT,
-        DataType::Int16 => types::TPrimitiveType::SMALLINT,
-        DataType::Int32 => types::TPrimitiveType::INT,
-        DataType::Int64 => types::TPrimitiveType::BIGINT,
-        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-            types::TPrimitiveType::LARGEINT
-        }
-        DataType::Float32 => types::TPrimitiveType::FLOAT,
-        DataType::Float64 => types::TPrimitiveType::DOUBLE,
-        DataType::Date32 => types::TPrimitiveType::DATE,
-        DataType::Timestamp(_, _) => types::TPrimitiveType::DATETIME,
-        DataType::Utf8 => types::TPrimitiveType::VARCHAR,
-        DataType::Decimal128(precision, _) if *precision <= 9 => types::TPrimitiveType::DECIMAL32,
-        DataType::Decimal128(precision, _) if *precision <= 18 => types::TPrimitiveType::DECIMAL64,
-        DataType::Decimal128(_, _) => types::TPrimitiveType::DECIMAL128,
-        _ => {
-            return Err(format!(
-                "unsupported runtime filter data type: {:?}",
-                data_type
-            ));
-        }
-    };
-    Ok(t)
-}
-
-#[cfg(test)]
-mod tests {
-    use arrow::datatypes::{DataType, TimeUnit};
-
-    use crate::thrift::types::TPrimitiveType;
-
-    use super::data_type_to_tprimitive;
-
-    #[test]
-    fn runtime_filter_decimal_widths_map_to_starrocks_primitives() {
-        assert_eq!(
-            data_type_to_tprimitive(&DataType::Decimal128(9, 0)).unwrap(),
-            TPrimitiveType::DECIMAL32
-        );
-        assert_eq!(
-            data_type_to_tprimitive(&DataType::Decimal128(18, 2)).unwrap(),
-            TPrimitiveType::DECIMAL64
-        );
-        assert_eq!(
-            data_type_to_tprimitive(&DataType::Decimal128(19, 0)).unwrap(),
-            TPrimitiveType::DECIMAL128
-        );
-    }
-
-    #[test]
-    fn runtime_filter_non_bitset_candidates_keep_their_primitives() {
-        assert_eq!(
-            data_type_to_tprimitive(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
-            TPrimitiveType::DATETIME
-        );
-        assert_eq!(
-            data_type_to_tprimitive(&DataType::Utf8).unwrap(),
-            TPrimitiveType::VARCHAR
-        );
-        assert_eq!(
-            data_type_to_tprimitive(&DataType::Float64).unwrap(),
-            TPrimitiveType::DOUBLE
-        );
-    }
-}
