@@ -395,6 +395,13 @@ fn remap_plan_node_payload_references(
             remap_runtime_filter_description(filter, node_id_map)?;
         }
     }
+    if let Some(waiting_set) = node.local_rf_waiting_set.as_mut() {
+        let mut remapped = std::collections::BTreeSet::new();
+        for build_node_id in std::mem::take(waiting_set) {
+            remapped.insert(remap_node_id(build_node_id, node_id_map)?);
+        }
+        *waiting_set = remapped;
+    }
     if let Some(hdfs_scan) = node.hdfs_scan_node.as_mut()
         && let Some(scan_node_id) = hdfs_scan.scan_node_id
     {
@@ -934,7 +941,6 @@ mod tests {
         node.node_type = crate::thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE;
         node.num_children = 0;
         node.row_tuples = vec![row_tuple];
-        node.local_rf_waiting_set = Some(std::collections::BTreeSet::from([99]));
         node
     }
 
@@ -1105,6 +1111,8 @@ mod tests {
             change_event_expand_plan_node(20),
             exchange_plan_node(10, 1),
         ]);
+        build_result.fragment_results[0].plan.nodes[1].local_rf_waiting_set =
+            Some(std::collections::BTreeSet::from([20]));
 
         inject_dml_pre_expand_keyed_assert(&mut build_result, Some(&keyed_assert_for_test()))
             .expect("inject assert");
@@ -1132,7 +1140,7 @@ mod tests {
                 .local_rf_waiting_set
                 .as_ref()
                 .map(|set| set.iter().copied().collect::<Vec<_>>()),
-            Some(vec![99])
+            Some(vec![nodes[0].node_id])
         );
         assert!(
             build_result.fragment_results[0]
@@ -1172,6 +1180,25 @@ mod tests {
 
         assert!(
             err.contains("exactly one ChangeEventExpand"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn pre_expand_keyed_assert_rejects_unknown_local_rf_waiting_node_id() {
+        let mut build_result = keyed_assert_build_result(vec![
+            change_event_expand_plan_node(20),
+            exchange_plan_node(10, 1),
+        ]);
+        build_result.fragment_results[0].plan.nodes[1].local_rf_waiting_set =
+            Some(std::collections::BTreeSet::from([999]));
+
+        let err =
+            inject_dml_pre_expand_keyed_assert(&mut build_result, Some(&keyed_assert_for_test()))
+                .expect_err("unknown local runtime-filter dependency node id must fail");
+
+        assert!(
+            err.contains("cannot remap unknown TPlan node id 999"),
             "unexpected error: {err}"
         );
     }
