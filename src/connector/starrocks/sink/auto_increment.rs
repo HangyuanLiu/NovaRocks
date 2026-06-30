@@ -18,15 +18,10 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::thrift::frontend_service::TFrontendServiceSyncClient;
-use crate::thrift::{frontend_service, status_code, types};
-
-#[derive(Clone, Copy, Debug)]
-struct AutoIncrementInterval {
-    next: i64,
-    end: i64,
-}
+use crate::connector::starrocks::sink::frontend_wire::{
+    AutoIncrementInterval, allocate_auto_increment_interval,
+};
+use crate::connector::starrocks::sink::plan::FrontendAddress;
 
 static AUTO_INCREMENT_INTERVALS: OnceLock<Mutex<HashMap<i64, AutoIncrementInterval>>> =
     OnceLock::new();
@@ -35,78 +30,8 @@ fn interval_cache() -> &'static Mutex<HashMap<i64, AutoIncrementInterval>> {
     AUTO_INCREMENT_INTERVALS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn with_frontend_client<T, F>(fe_addr: &types::TNetworkAddress, f: F) -> Result<T, String>
-where
-    F: Clone + FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
-{
-    FrontendRpcManager::shared()
-        .call(FrontendRpcKind::Control, fe_addr, move |client| {
-            f.clone()(client).map_err(FrontendRpcError::from_message_guess)
-        })
-        .map_err(|err| err.to_string())
-}
-
-fn request_new_interval(
-    fe_addr: &types::TNetworkAddress,
-    table_id: i64,
-    rows: usize,
-) -> Result<AutoIncrementInterval, String> {
-    if table_id <= 0 {
-        return Err(format!(
-            "invalid table_id for auto increment allocation: {table_id}"
-        ));
-    }
-    if rows == 0 {
-        return Err("auto increment allocation rows cannot be zero".to_string());
-    }
-    let rows_i64 = i64::try_from(rows)
-        .map_err(|_| format!("auto increment allocation rows overflow: {rows}"))?;
-    let request = frontend_service::TAllocateAutoIncrementIdParam {
-        table_id: Some(table_id),
-        rows: Some(rows_i64),
-    };
-    let response = with_frontend_client(fe_addr, |client| {
-        client
-            .alloc_auto_increment_id(request)
-            .map_err(|e| format!("alloc_auto_increment_id RPC failed: {e}"))
-    })?;
-    let status = response
-        .status
-        .as_ref()
-        .ok_or_else(|| "alloc_auto_increment_id response missing status".to_string())?;
-    if status.status_code != status_code::TStatusCode::OK {
-        let detail = status
-            .error_msgs
-            .as_ref()
-            .map(|v| v.join("; "))
-            .unwrap_or_default();
-        return Err(format!(
-            "alloc_auto_increment_id failed: status={:?}, error={}",
-            status.status_code, detail
-        ));
-    }
-    let start = response
-        .auto_increment_id
-        .ok_or_else(|| "alloc_auto_increment_id response missing auto_increment_id".to_string())?;
-    let allocated_rows = response
-        .allocated_rows
-        .ok_or_else(|| "alloc_auto_increment_id response missing allocated_rows".to_string())?;
-    if allocated_rows <= 0 {
-        return Err(format!(
-            "alloc_auto_increment_id returned invalid allocated_rows={allocated_rows}"
-        ));
-    }
-    let end = start.checked_add(allocated_rows).ok_or_else(|| {
-        format!(
-            "auto increment interval overflow: start={} allocated_rows={}",
-            start, allocated_rows
-        )
-    })?;
-    Ok(AutoIncrementInterval { next: start, end })
-}
-
 pub(crate) fn allocate_auto_increment_ids(
-    fe_addr: &types::TNetworkAddress,
+    fe_addr: &FrontendAddress,
     table_id: i64,
     rows: usize,
 ) -> Result<Vec<i64>, String> {
@@ -149,7 +74,7 @@ pub(crate) fn allocate_auto_increment_ids(
         }
 
         let request_rows = remaining.max(1024);
-        let interval = request_new_interval(fe_addr, table_id, request_rows)?;
+        let interval = allocate_auto_increment_interval(fe_addr, table_id, request_rows)?;
         guard.insert(table_id, interval);
     }
 

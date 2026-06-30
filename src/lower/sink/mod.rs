@@ -16,3 +16,4 @@
 // under the License.
 
 pub(crate) mod iceberg;
+pub(crate) mod starrocks;

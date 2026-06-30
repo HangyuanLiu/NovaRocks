@@ -15,13 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod auto_increment;
-mod factory;
-pub(crate) mod frontend_wire;
-pub(crate) mod operator;
-pub(crate) mod partition_key;
-pub(crate) mod plan;
-pub(crate) mod report_wire;
-pub(crate) mod routing;
+use crate::thrift::types;
 
-pub use factory::OlapTableSinkFactory;
+pub(crate) type TabletCommitInfo = types::TTabletCommitInfo;
+pub(crate) type TabletFailInfo = types::TTabletFailInfo;
+
+pub(crate) fn tablet_commit_info(tablet_id: i64, backend_id: i64) -> TabletCommitInfo {
+    types::TTabletCommitInfo::new(
+        tablet_id,
+        backend_id,
+        Option::<Vec<String>>::None,
+        Option::<Vec<String>>::None,
+        Option::<Vec<i64>>::None,
+    )
+}
+
+pub(crate) fn tablet_fail_info(tablet_id: i64, backend_id: i64) -> TabletFailInfo {
+    types::TTabletFailInfo::new(Some(tablet_id), Some(backend_id))
+}
