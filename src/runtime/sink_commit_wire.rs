@@ -247,8 +247,8 @@ mod tests {
     };
     use iceberg::TableCreation;
     use iceberg::spec::{
-        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, Struct, TableMetadata,
-        TableMetadataBuilder, Type,
+        FormatVersion, Literal, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType,
+        Schema, Struct, TableMetadata, TableMetadataBuilder, Transform, Type,
     };
     use std::sync::Arc;
 
@@ -274,6 +274,68 @@ mod tests {
             .build()
             .expect("table metadata")
             .metadata
+    }
+
+    fn test_string_partition_metadata(spec_id: i32) -> TableMetadata {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "region",
+                    Type::Primitive(PrimitiveType::String),
+                ))])
+                .build()
+                .expect("schema"),
+        );
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(spec_id)
+            .add_partition_field("region", "region", Transform::Identity)
+            .expect("partition field")
+            .build()
+            .expect("partition spec");
+        let creation = TableCreation::builder()
+            .name("t".to_string())
+            .location("file:///warehouse/db/t".to_string())
+            .schema(schema.as_ref().clone())
+            .partition_spec(spec)
+            .format_version(FormatVersion::V2)
+            .build();
+        TableMetadataBuilder::from_table_creation(creation)
+            .expect("table metadata builder")
+            .build()
+            .expect("table metadata")
+            .metadata
+    }
+
+    fn partitioned_writer_report(metadata: &TableMetadata, region: &str) -> IcebergWriterReport {
+        IcebergWriterReport {
+            file: IcebergWrittenFileReport {
+                path: "file:///warehouse/t/data-1.parquet".to_string(),
+                format: "parquet".to_string(),
+                content: IcebergFileContent::Data,
+                record_count: 2,
+                file_size_in_bytes: 128,
+                partition: IcebergPartitionReport {
+                    partition_path: format!("region={region}"),
+                    null_fingerprint: "0".to_string(),
+                    partition_spec_id: metadata.default_partition_spec_id(),
+                    partition_values: Struct::from_iter([Some(Literal::Primitive(
+                        PrimitiveLiteral::String(region.to_string()),
+                    ))]),
+                },
+                split_offsets: None,
+                column_stats: None,
+                referenced_data_file: None,
+                first_row_id: None,
+                equality_ids: None,
+                key_metadata: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            },
+            is_overwrite: None,
+            is_rewrite: None,
+        }
     }
 
     #[test]
@@ -343,6 +405,91 @@ mod tests {
                 .expect("values")
                 .len(),
             0
+        );
+    }
+
+    #[test]
+    fn sink_commit_info_to_writer_report_uses_descriptor_not_partition_path() {
+        let metadata = test_string_partition_metadata(7);
+        let expected_values = Struct::from_iter([Some(Literal::Primitive(
+            PrimitiveLiteral::String("west".to_string()),
+        ))]);
+        let mut info = writer_report_to_sink_commit_info(
+            partitioned_writer_report(&metadata, "west"),
+            &metadata,
+        )
+        .expect("wire encode");
+        info.iceberg_data_file
+            .as_mut()
+            .expect("iceberg data file")
+            .partition_path = Some("region=east".to_string());
+
+        let report = sink_commit_info_to_writer_report(info, &metadata).expect("wire decode");
+
+        assert_eq!(report.file.partition.partition_values, expected_values);
+        assert_eq!(report.file.partition.partition_path, "region=east");
+    }
+
+    #[test]
+    fn sink_commit_info_to_writer_report_rejects_missing_data_file() {
+        let metadata = test_unpartitioned_metadata();
+        let err = sink_commit_info_to_writer_report(
+            types::TSinkCommitInfo {
+                iceberg_data_file: None,
+                ..Default::default()
+            },
+            &metadata,
+        )
+        .expect_err("missing data file should fail");
+
+        assert!(
+            err.contains("sink_commit_info missing iceberg_data_file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn sink_commit_info_to_writer_report_rejects_missing_partition_descriptor() {
+        let metadata = test_string_partition_metadata(7);
+        let mut info = writer_report_to_sink_commit_info(
+            partitioned_writer_report(&metadata, "west"),
+            &metadata,
+        )
+        .expect("wire encode");
+        info.iceberg_data_file
+            .as_mut()
+            .expect("iceberg data file")
+            .partition_values_descriptor = None;
+
+        let err = sink_commit_info_to_writer_report(info, &metadata)
+            .expect_err("missing descriptor should fail");
+
+        assert!(
+            err.starts_with("[IcebergWriteDescriptorMismatch] "),
+            "got: {err}"
+        );
+        assert!(err.contains("missing partition descriptor"), "got: {err}");
+    }
+
+    #[test]
+    fn sink_commit_info_to_writer_report_rejects_missing_partition_spec_id() {
+        let metadata = test_string_partition_metadata(7);
+        let mut info = writer_report_to_sink_commit_info(
+            partitioned_writer_report(&metadata, "west"),
+            &metadata,
+        )
+        .expect("wire encode");
+        info.iceberg_data_file
+            .as_mut()
+            .expect("iceberg data file")
+            .partition_spec_id = None;
+
+        let err = sink_commit_info_to_writer_report(info, &metadata)
+            .expect_err("missing partition spec id should fail");
+
+        assert_eq!(
+            err,
+            "[IcebergWriteDescriptorMismatch] TIcebergDataFile missing partition_spec_id"
         );
     }
 

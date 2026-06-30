@@ -22,7 +22,6 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 
 use super::delete_file::IcebergFileContent;
-use super::report::partition_path_from_struct;
 use super::theta_sketch::ThetaSketchHandle;
 use super::variant_write::{
     VariantShreddingConfig, apply_variant_shredding_to_arrow_schema,
@@ -487,66 +486,6 @@ pub(crate) fn to_sink_commit_info(
     Ok((commit_info, sketch_set))
 }
 
-pub(crate) fn written_file_to_sink_commit_info(
-    file: &super::commit::WrittenFile,
-    metadata: &TableMetadata,
-) -> Result<crate::thrift::types::TSinkCommitInfo, String> {
-    let partition_spec = metadata
-        .partition_spec_by_id(file.partition_spec_id)
-        .ok_or_else(|| {
-            format!(
-                "iceberg written file `{}` references unknown partition spec id {}",
-                file.path, file.partition_spec_id
-            )
-        })?;
-    let (partition_path, null_fingerprint) =
-        partition_path_from_struct(&file.partition_values, partition_spec)?;
-    let partition_descriptor =
-        encode_partition_descriptor(&file.partition_values, file.partition_spec_id, metadata)
-            .map_err(|e| {
-                crate::common::engine_error::EngineError::from(e).to_bracketed_user_message()
-            })?;
-    let partition_values_descriptor =
-        crate::runtime::sink_commit_wire::partition_descriptor_to_thrift(partition_descriptor);
-    let data_file = crate::thrift::types::TIcebergDataFile {
-        path: Some(file.path.clone()),
-        format: Some(file.format.to_string()),
-        record_count: Some(u64_to_i64(file.record_count, "record_count")?),
-        file_size_in_bytes: Some(u64_to_i64(file.file_size_in_bytes, "file_size_in_bytes")?),
-        partition_path: Some(partition_path),
-        split_offsets: (!file.split_offsets.is_empty()).then_some(file.split_offsets.clone()),
-        column_stats: written_file_column_stats(file)?,
-        partition_null_fingerprint: Some(null_fingerprint),
-        file_content: Some(thrift_file_content(file.content)),
-        referenced_data_file: file.referenced_data_file.clone(),
-        first_row_id: file.first_row_id,
-        equality_ids: file.equality_ids.clone(),
-        key_metadata: file.key_metadata.clone(),
-        partition_values_descriptor: Some(partition_values_descriptor),
-        partition_spec_id: Some(file.partition_spec_id),
-        content_offset: file.content_offset,
-        content_size_in_bytes: file.content_size_in_bytes,
-        cardinality: file
-            .cardinality
-            .map(|value| u64_to_i64(value, "cardinality"))
-            .transpose()?,
-    };
-    Ok(crate::thrift::types::TSinkCommitInfo {
-        iceberg_data_file: Some(data_file),
-        hive_file_info: None,
-        is_overwrite: None,
-        staging_dir: None,
-        is_rewrite: None,
-    })
-}
-
-pub(crate) fn written_file_to_sink_commit_info_for_metadata(
-    file: &super::commit::WrittenFile,
-    metadata: &TableMetadata,
-) -> Result<crate::thrift::types::TSinkCommitInfo, String> {
-    written_file_to_sink_commit_info(file, metadata)
-}
-
 fn thrift_file_content(content: DataContentType) -> crate::thrift::types::TIcebergFileContent {
     match content {
         DataContentType::Data => crate::thrift::types::TIcebergFileContent::DATA,
@@ -557,36 +496,6 @@ fn thrift_file_content(content: DataContentType) -> crate::thrift::types::TIcebe
             crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES
         }
     }
-}
-
-fn written_file_column_stats(
-    file: &super::commit::WrittenFile,
-) -> Result<Option<crate::thrift::types::TIcebergColumnStats>, String> {
-    let column_sizes = u64_stats_to_i64(&file.column_sizes, "column_sizes")?;
-    let value_counts = u64_stats_to_i64(&file.value_counts, "value_counts")?;
-    let null_value_counts = u64_stats_to_i64(&file.null_value_counts, "null_value_counts")?;
-    let nan_value_counts = u64_stats_to_i64(&file.nan_value_counts, "nan_value_counts")?;
-    let lower_bounds = datum_bounds_to_bytes(&file.lower_bounds, "lower_bounds")?;
-    let upper_bounds = datum_bounds_to_bytes(&file.upper_bounds, "upper_bounds")?;
-
-    if column_sizes.is_empty()
-        && value_counts.is_empty()
-        && null_value_counts.is_empty()
-        && nan_value_counts.is_empty()
-        && lower_bounds.is_empty()
-        && upper_bounds.is_empty()
-    {
-        return Ok(None);
-    }
-
-    Ok(Some(crate::thrift::types::TIcebergColumnStats {
-        column_sizes: (!column_sizes.is_empty()).then_some(column_sizes),
-        value_counts: (!value_counts.is_empty()).then_some(value_counts),
-        null_value_counts: (!null_value_counts.is_empty()).then_some(null_value_counts),
-        nan_value_counts: (!nan_value_counts.is_empty()).then_some(nan_value_counts),
-        lower_bounds: (!lower_bounds.is_empty()).then_some(lower_bounds),
-        upper_bounds: (!upper_bounds.is_empty()).then_some(upper_bounds),
-    }))
 }
 
 /// Serialize an iceberg-rust `DataFile` into the thrift `TIcebergDataFile`
@@ -1406,6 +1315,15 @@ mod tests {
             .metadata
     }
 
+    fn encode_written_file_report(
+        file: &super::super::commit::WrittenFile,
+        metadata: &TableMetadata,
+    ) -> Result<crate::thrift::types::TSinkCommitInfo, String> {
+        let report =
+            crate::connector::iceberg::report::writer_report_from_written_file(file, metadata)?;
+        crate::runtime::sink_commit_wire::writer_report_to_sink_commit_info(report, metadata)
+    }
+
     #[test]
     fn data_file_to_iceberg_thrift_carries_partition_descriptor() {
         use iceberg::spec::{DataFileBuilder, DataFileFormat};
@@ -1513,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn written_file_to_sink_commit_info_carries_partition_descriptor() {
+    fn writer_report_to_sink_commit_info_carries_partition_descriptor() {
         use iceberg::spec::DataFileFormat;
 
         let metadata = test_string_partition_metadata(7);
@@ -1544,7 +1462,7 @@ mod tests {
             cardinality: None,
         };
 
-        let info = written_file_to_sink_commit_info(&file, &metadata).expect("commit info");
+        let info = encode_written_file_report(&file, &metadata).expect("commit info");
         let desc = info
             .iceberg_data_file
             .expect("data file")
@@ -1555,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn written_file_to_sink_commit_info_descriptor_failure_uses_engine_code() {
+    fn writer_report_to_sink_commit_info_descriptor_failure_uses_engine_code() {
         use iceberg::spec::DataFileFormat;
 
         let metadata = test_string_partition_metadata(7);
@@ -1586,7 +1504,7 @@ mod tests {
             cardinality: None,
         };
 
-        let err = written_file_to_sink_commit_info(&file, &metadata)
+        let err = encode_written_file_report(&file, &metadata)
             .expect_err("descriptor encode should fail");
 
         assert!(
@@ -1604,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn written_file_to_sink_commit_info_preserves_position_delete_metadata() {
+    fn writer_report_to_sink_commit_info_preserves_position_delete_metadata() {
         use iceberg::spec::{DataFileFormat, PrimitiveLiteral};
 
         let metadata = test_unpartitioned_metadata();
@@ -1632,7 +1550,7 @@ mod tests {
             cardinality: None,
         };
 
-        let info = written_file_to_sink_commit_info(&file, &metadata).expect("sink commit info");
+        let info = encode_written_file_report(&file, &metadata).expect("sink commit info");
         let df = info.iceberg_data_file.expect("iceberg data file");
         assert_eq!(df.path.as_deref(), Some("file:///t/delete-1.parquet"));
         assert_eq!(
@@ -1655,7 +1573,7 @@ mod tests {
         partitioned.partition_values = Struct::from_iter([Some(
             iceberg::spec::Literal::Primitive(PrimitiveLiteral::String("us west".to_string())),
         )]);
-        let df = written_file_to_sink_commit_info(&partitioned, &metadata)
+        let df = encode_written_file_report(&partitioned, &metadata)
             .expect("partitioned sink commit info")
             .iceberg_data_file
             .expect("iceberg data file");
@@ -1663,7 +1581,7 @@ mod tests {
     }
 
     #[test]
-    fn written_file_to_sink_commit_info_preserves_nan_value_counts() {
+    fn writer_report_to_sink_commit_info_preserves_nan_value_counts() {
         use iceberg::spec::DataFileFormat;
 
         let metadata = test_unpartitioned_metadata();
@@ -1691,7 +1609,7 @@ mod tests {
             cardinality: None,
         };
 
-        let info = written_file_to_sink_commit_info(&file, &metadata).expect("sink commit info");
+        let info = encode_written_file_report(&file, &metadata).expect("sink commit info");
         let column_stats = info
             .iceberg_data_file
             .expect("iceberg data file")
@@ -1708,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn written_file_to_sink_commit_info_preserves_puffin_dv_descriptor() {
+    fn writer_report_to_sink_commit_info_preserves_puffin_dv_descriptor() {
         use iceberg::spec::DataFileFormat;
 
         let metadata = test_unpartitioned_metadata();
@@ -1736,7 +1654,7 @@ mod tests {
             cardinality: Some(3),
         };
 
-        let info = written_file_to_sink_commit_info(&file, &metadata).expect("sink commit info");
+        let info = encode_written_file_report(&file, &metadata).expect("sink commit info");
         let df = info.iceberg_data_file.expect("iceberg data file");
 
         assert_eq!(df.format.as_deref(), Some("puffin"));
@@ -1750,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn written_file_to_sink_commit_info_rejects_cardinality_overflow() {
+    fn writer_report_to_sink_commit_info_rejects_cardinality_overflow() {
         use iceberg::spec::DataFileFormat;
 
         let metadata = test_unpartitioned_metadata();
@@ -1778,7 +1696,7 @@ mod tests {
             cardinality: Some(i64::MAX as u64 + 1),
         };
 
-        let err = written_file_to_sink_commit_info(&file, &metadata)
+        let err = encode_written_file_report(&file, &metadata)
             .expect_err("cardinality overflow should fail");
 
         assert!(err.contains("cardinality"), "got: {err}");
