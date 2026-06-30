@@ -21,11 +21,11 @@ use std::sync::{Mutex, OnceLock};
 ///
 /// This type intentionally does NOT carry any per-tablet/per-path state
 /// (e.g. tablet root, partition prefix). A tablet's location lives in
-/// [`StarletShardInfo::full_path`]; the OpenDAL operator is built with an
-/// `normalize_oss_path` resolves the bucket-relative key from the full_path
-/// being accessed. Mixing path state into this struct (as earlier revisions
-/// did via `path_prefix`) causes `full_path` and operator path state to drift
-/// apart and resolve to the wrong object.
+/// [`StarletShardInfo::full_path`]; the object-store resolver returns the
+/// bucket-relative key from the full_path being accessed. Mixing path state
+/// into this struct (as earlier revisions did via `path_prefix`) causes
+/// `full_path` and operator path state to drift apart and resolve to the wrong
+/// object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct S3StoreConfig {
     pub(crate) endpoint: String,
@@ -243,8 +243,7 @@ pub(crate) fn find_s3_config_for_path(path: &str) -> Option<S3StoreConfig> {
 }
 
 /// Look up the OSS credentials for a native lake tablet path from the shard registry and
-/// return credentials ready for use with
-/// [`resolve_oss_operator_and_path_with_config`].
+/// return credentials ready for use with the object-store path resolver.
 ///
 /// This is the entry point for the native lake write/read paths.  Iceberg external tables
 /// must not call this — they receive credentials from `THdfsScanNode.cloud_configuration`.
@@ -519,12 +518,11 @@ mod tests {
         // longer carries path state, so any tablet path is normalized to a
         // bucket-relative key without depending on cached root state.
         let s3 = sample_s3_config();
-        let key = crate::fs::object_store::normalize_oss_path(
+        let (_op, key) = crate::fs::path::resolve_object_store_operator_and_path(
             "s3://bucket/brand/new/root/tablet-42/data/seg_0.parquet",
-            &s3.bucket,
-            "",
+            &s3.to_object_store_config(),
         )
-        .expect("normalize bucket-relative key");
+        .expect("resolve bucket-relative key");
         assert_eq!(key, "brand/new/root/tablet-42/data/seg_0.parquet");
     }
 
@@ -554,12 +552,11 @@ mod tests {
         assert_eq!(info.full_path, new_path);
         let preserved = info.s3.expect("cluster S3 profile should be preserved");
         assert_eq!(preserved, sample_s3_config());
-        let key = crate::fs::object_store::normalize_oss_path(
+        let (_op, key) = crate::fs::path::resolve_object_store_operator_and_path(
             &format!("{new_path}/meta/0001.meta"),
-            &preserved.bucket,
-            "",
+            &preserved.to_object_store_config(),
         )
-        .expect("normalize key");
+        .expect("resolve key");
         assert_eq!(key, "totally/different/place/tablet-9001/meta/0001.meta");
     }
 

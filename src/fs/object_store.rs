@@ -663,10 +663,7 @@ pub fn resolve_oss_operator_and_path_with_config(
     full_path: &str,
     cfg: &ObjectStoreConfig,
 ) -> Result<(Operator, String), String> {
-    let bucket = object_store_bucket_from_path(full_path)?;
-    let op = build_object_store_operator(&bucket, cfg).map_err(|e| e.to_string())?;
-    let rel = normalize_oss_path(full_path, &bucket, "")?;
-    Ok((op, rel))
+    crate::fs::path::resolve_object_store_operator_and_path(full_path, cfg)
 }
 
 pub(crate) fn object_store_bucket_from_path(full_path: &str) -> Result<String, String> {
@@ -687,6 +684,8 @@ pub(crate) fn object_store_bucket_from_path(full_path: &str) -> Result<String, S
 }
 
 pub fn normalize_oss_path(full: &str, bucket: &str, _root: &str) -> Result<String, String> {
+    // `_root` is a deprecated compatibility parameter. Operators are rooted at
+    // the bucket, so this helper no longer strips a table root prefix.
     // Expected full path formats:
     // - oss://<bucket>/<key>
     // - s3://<bucket>/<key> / s3a://<bucket>/<key>

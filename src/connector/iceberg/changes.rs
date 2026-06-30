@@ -2103,7 +2103,7 @@ pub(crate) fn normalize_delete_projection_path(
             Ok(path.strip_prefix("file://").unwrap_or(path).to_string())
         }
         crate::fs::path::ScanPathScheme::Oss => {
-            let _cfg = object_store_config.ok_or_else(|| {
+            let cfg = object_store_config.ok_or_else(|| {
                 ChangeError::InternalInconsistency(format!(
                     "missing object store config for delete reverse projection path {path}"
                 ))
@@ -2120,11 +2120,13 @@ pub(crate) fn normalize_delete_projection_path(
                     "bucket mismatch for object-store delete reverse projection path {path}: path bucket={bucket} expected bucket={expected}"
                 )));
             }
-            crate::fs::oss::normalize_oss_path(path, &bucket, "").map_err(|e| {
-                ChangeError::InternalInconsistency(format!(
-                    "normalize object-store delete reverse projection path {path}: {e}"
-                ))
-            })
+            let (_op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, cfg)
+                .map_err(|e| {
+                    ChangeError::InternalInconsistency(format!(
+                        "normalize object-store delete reverse projection path {path}: {e}"
+                    ))
+                })?;
+            Ok(rel)
         }
         crate::fs::path::ScanPathScheme::Hdfs => {
             let paths = vec![path.to_string()];

@@ -95,7 +95,7 @@ pub fn write_parquet_file(path: &str, batch: &RecordBatch) -> Result<u64, String
         }
         ScanPathScheme::Oss => {
             let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
-            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path_with_config(path, &cfg)?;
+            let (op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, &cfg)?;
             let mut bytes = Vec::new();
             {
                 let cursor = Cursor::new(&mut bytes);
@@ -137,7 +137,7 @@ pub fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>, String> {
         }
         ScanPathScheme::Oss => {
             let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
-            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path_with_config(path, &cfg)?;
+            let (op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, &cfg)?;
             let read_result = crate::fs::oss::oss_block_on(op.read(&rel))?;
             let bytes = read_result.map_err(|e| format!("read parquet object failed: {}", e))?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.to_bytes())

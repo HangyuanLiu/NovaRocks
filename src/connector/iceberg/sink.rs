@@ -1506,9 +1506,8 @@ fn write_parquet_file(
             )
         })?;
         let object_store_cfg = s3.to_object_store_config();
-        let op = crate::fs::oss::build_object_store_operator(&s3.bucket, &object_store_cfg)
-            .map_err(|e| e.to_string())?;
-        let rel = crate::fs::oss::normalize_oss_path(path, &s3.bucket, "")?;
+        let (op, rel) =
+            crate::fs::path::resolve_object_store_operator_and_path(path, &object_store_cfg)?;
         data_block_on(op.write(&rel, data))
             .map_err(|e| format!("run object-store write on data runtime failed: {e}"))?
             .map_err(|e| format!("opendal write failed: {e}"))?;
