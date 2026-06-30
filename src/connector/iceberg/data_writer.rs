@@ -456,11 +456,13 @@ pub(crate) fn written_file_to_sink_commit_info(
         })?;
     let (partition_path, null_fingerprint) =
         partition_path_from_struct(&file.partition_values, partition_spec)?;
-    let partition_values_descriptor =
+    let partition_descriptor =
         encode_partition_descriptor(&file.partition_values, file.partition_spec_id, metadata)
             .map_err(|e| {
                 crate::common::engine_error::EngineError::from(e).to_bracketed_user_message()
             })?;
+    let partition_values_descriptor =
+        crate::runtime::sink_commit_wire::partition_descriptor_to_thrift(partition_descriptor);
     let data_file = crate::thrift::types::TIcebergDataFile {
         path: Some(file.path.clone()),
         format: Some(file.format.to_string()),
@@ -583,10 +585,12 @@ fn data_file_to_iceberg_thrift_with_descriptor_spec(
     metadata: &TableMetadata,
 ) -> Result<crate::thrift::types::TIcebergDataFile, String> {
     let partition_values_descriptor =
-        encode_partition_descriptor(df.partition(), descriptor_partition_spec_id, metadata)
-            .map_err(|e| {
-                crate::common::engine_error::EngineError::from(e).to_bracketed_user_message()
-            })?;
+        crate::runtime::sink_commit_wire::partition_descriptor_to_thrift(
+            encode_partition_descriptor(df.partition(), descriptor_partition_spec_id, metadata)
+                .map_err(|e| {
+                    crate::common::engine_error::EngineError::from(e).to_bracketed_user_message()
+                })?,
+        );
     Ok(crate::thrift::types::TIcebergDataFile {
         path: Some(df.file_path().to_string()),
         format: Some(format),

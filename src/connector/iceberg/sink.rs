@@ -2789,7 +2789,9 @@ mod tests {
             .expect("target metadata");
         assert_eq!(target_metadata.default_partition_spec_id(), 7);
         let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
-            data_file.partition_values_descriptor.clone(),
+            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(
+                data_file.partition_values_descriptor.clone(),
+            ),
             data_file
                 .partition_spec_id
                 .expect("writer report partition spec id"),
@@ -3210,7 +3212,9 @@ mod tests {
         );
         assert_eq!(target_metadata.default_partition_spec_id(), 7);
         let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
-            data_file.partition_values_descriptor.clone(),
+            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(
+                data_file.partition_values_descriptor.clone(),
+            ),
             data_file
                 .partition_spec_id
                 .expect("writer report partition spec id"),
@@ -3362,7 +3366,7 @@ mod tests {
         assert_eq!(reports[1].1, old_spec_id);
         for (_, spec_id, descriptor) in reports {
             crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
-                descriptor,
+                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(descriptor),
                 spec_id,
                 &target_metadata,
             )
@@ -3568,7 +3572,9 @@ mod tests {
         );
         assert_eq!(data_file.partition_path.as_deref(), Some("id_part=7"));
         let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
-            data_file.partition_values_descriptor.clone(),
+            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(
+                data_file.partition_values_descriptor.clone(),
+            ),
             data_file
                 .partition_spec_id
                 .expect("writer report partition spec id"),

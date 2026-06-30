@@ -415,9 +415,13 @@ impl IcebergCommitCollector {
             )
             .to_bracketed_user_message()
         })?;
+        let partition_descriptor =
+            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(
+                df.partition_values_descriptor,
+            );
         let partition_values =
             crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
-                df.partition_values_descriptor,
+                partition_descriptor,
                 partition_spec_id,
                 metadata,
             )
@@ -1015,10 +1019,12 @@ mod parity_tests {
     fn convert_uses_partition_descriptor_not_partition_path() {
         let (collector, metadata, spec_id) = string_partition_collector();
         let values = Struct::from_iter([Some(Literal::string("west"))]);
-        let descriptor = crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-            &values, spec_id, &metadata,
-        )
-        .expect("descriptor");
+        let descriptor = crate::runtime::sink_commit_wire::partition_descriptor_to_thrift(
+            crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
+                &values, spec_id, &metadata,
+            )
+            .expect("descriptor"),
+        );
         let thrift = crate::thrift::types::TIcebergDataFile {
             path: Some("file:///warehouse/t/data/a.parquet".to_string()),
             format: Some("PARQUET".to_string()),
@@ -1087,10 +1093,12 @@ mod parity_tests {
     fn convert_rejects_missing_partition_spec_id() {
         let (collector, metadata, spec_id) = string_partition_collector();
         let values = Struct::from_iter([Some(Literal::string("west"))]);
-        let descriptor = crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-            &values, spec_id, &metadata,
-        )
-        .expect("descriptor");
+        let descriptor = crate::runtime::sink_commit_wire::partition_descriptor_to_thrift(
+            crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
+                &values, spec_id, &metadata,
+            )
+            .expect("descriptor"),
+        );
         let thrift = crate::thrift::types::TIcebergDataFile {
             path: Some("file:///warehouse/t/data/a.parquet".to_string()),
             format: Some("PARQUET".to_string()),
@@ -1127,10 +1135,12 @@ mod parity_tests {
     fn convert_rejects_missing_collector_metadata() {
         let (collector_with_metadata, metadata, spec_id) = string_partition_collector();
         let values = Struct::from_iter([Some(Literal::string("west"))]);
-        let descriptor = crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-            &values, spec_id, &metadata,
-        )
-        .expect("descriptor");
+        let descriptor = crate::runtime::sink_commit_wire::partition_descriptor_to_thrift(
+            crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
+                &values, spec_id, &metadata,
+            )
+            .expect("descriptor"),
+        );
         let thrift = crate::thrift::types::TIcebergDataFile {
             path: Some("file:///warehouse/t/data/a.parquet".to_string()),
             format: Some("PARQUET".to_string()),
@@ -1518,12 +1528,14 @@ mod parity_tests {
         let metadata = unpartitioned_metadata(int_variant_schema());
         let partition_spec_id = metadata.default_partition_spec_id();
         let partition_values_descriptor =
-            crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-                &Struct::empty(),
-                partition_spec_id,
-                &metadata,
-            )
-            .expect("descriptor");
+            crate::runtime::sink_commit_wire::partition_descriptor_to_thrift(
+                crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
+                    &Struct::empty(),
+                    partition_spec_id,
+                    &metadata,
+                )
+                .expect("descriptor"),
+            );
         let thrift = crate::thrift::types::TIcebergDataFile {
             path: Some("file:///t/data-variant.parquet".to_string()),
             format: Some("PARQUET".to_string()),
@@ -1625,12 +1637,14 @@ mod tests {
             referenced_data_file: Some("s3://b/data/f.parquet".to_string()),
             partition_spec_id: Some(0),
             partition_values_descriptor: Some(
-                crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-                    &iceberg::spec::Struct::empty(),
-                    0,
-                    collector.metadata.as_ref().expect("metadata"),
-                )
-                .expect("descriptor"),
+                crate::runtime::sink_commit_wire::partition_descriptor_to_thrift(
+                    crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
+                        &iceberg::spec::Struct::empty(),
+                        0,
+                        collector.metadata.as_ref().expect("metadata"),
+                    )
+                    .expect("descriptor"),
+                ),
             ),
             content_offset: Some(4),
             content_size_in_bytes: Some(12),
@@ -1660,12 +1674,14 @@ mod tests {
             referenced_data_file: Some("s3://b/data/f.parquet".to_string()),
             partition_spec_id: Some(0),
             partition_values_descriptor: Some(
-                crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-                    &iceberg::spec::Struct::empty(),
-                    0,
-                    collector.metadata.as_ref().expect("metadata"),
-                )
-                .expect("descriptor"),
+                crate::runtime::sink_commit_wire::partition_descriptor_to_thrift(
+                    crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
+                        &iceberg::spec::Struct::empty(),
+                        0,
+                        collector.metadata.as_ref().expect("metadata"),
+                    )
+                    .expect("descriptor"),
+                ),
             ),
             content_offset: Some(4),
             content_size_in_bytes: Some(12),
@@ -1720,12 +1736,14 @@ mod tests {
             file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
             partition_spec_id: Some(0),
             partition_values_descriptor: Some(
-                crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-                    &iceberg::spec::Struct::empty(),
-                    0,
-                    collector.metadata.as_ref().expect("metadata"),
-                )
-                .expect("descriptor"),
+                crate::runtime::sink_commit_wire::partition_descriptor_to_thrift(
+                    crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
+                        &iceberg::spec::Struct::empty(),
+                        0,
+                        collector.metadata.as_ref().expect("metadata"),
+                    )
+                    .expect("descriptor"),
+                ),
             ),
             ..Default::default()
         };
@@ -1746,12 +1764,14 @@ mod tests {
             file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
             partition_spec_id: Some(0),
             partition_values_descriptor: Some(
-                crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-                    &iceberg::spec::Struct::empty(),
-                    0,
-                    collector.metadata.as_ref().expect("metadata"),
-                )
-                .expect("descriptor"),
+                crate::runtime::sink_commit_wire::partition_descriptor_to_thrift(
+                    crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
+                        &iceberg::spec::Struct::empty(),
+                        0,
+                        collector.metadata.as_ref().expect("metadata"),
+                    )
+                    .expect("descriptor"),
+                ),
             ),
             ..Default::default()
         };

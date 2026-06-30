@@ -38,12 +38,15 @@ fn writer_report_to_sink_commit_info(
     report: IcebergWriterReport,
     metadata: &iceberg::spec::TableMetadata,
 ) -> Result<types::TSinkCommitInfo, String> {
-    let partition_values_descriptor = encode_partition_descriptor(
-        &report.file.partition.partition_values,
-        report.file.partition.partition_spec_id,
-        metadata,
-    )
-    .map_err(|e| EngineError::from(e).to_bracketed_user_message())?;
+    let partition_values_descriptor =
+        crate::runtime::sink_commit_wire::partition_descriptor_to_thrift(
+            encode_partition_descriptor(
+                &report.file.partition.partition_values,
+                report.file.partition.partition_spec_id,
+                metadata,
+            )
+            .map_err(|e| EngineError::from(e).to_bracketed_user_message())?,
+        );
     Ok(types::TSinkCommitInfo {
         iceberg_data_file: Some(types::TIcebergDataFile {
             path: Some(report.file.path),
