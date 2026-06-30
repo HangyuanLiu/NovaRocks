@@ -28,9 +28,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
-use crate::exec::chunk::type_compatibility::{
-    CompatibilityPolicy, check, nested_path_label, retag_column,
-};
+use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label, retag_column};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::debug;
@@ -950,7 +948,7 @@ fn check_exchange_data_type(
     actual: &arrow::datatypes::DataType,
     root_label: &str,
 ) -> Result<(), String> {
-    check(expected, actual, CompatibilityPolicy::ExactArrow).map_err(|m| {
+    check_exact(expected, actual).map_err(|m| {
         format!(
             "exchange schema type mismatch at {}: expected {:?}, got {:?} ({:?})",
             nested_path_label(root_label, &m.nested_path),

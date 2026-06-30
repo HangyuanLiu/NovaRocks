@@ -16,7 +16,7 @@
 // under the License.
 use arrow::datatypes::DataType;
 
-use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check};
+use crate::exec::chunk::type_compatibility::check_exact;
 use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
 use super::functions;
@@ -58,13 +58,7 @@ fn apply_type_signature(
         output_type,
         sig.intermediate_type.as_ref(),
     )?;
-    if check(
-        &out.output_type,
-        output_type,
-        CompatibilityPolicy::ExactArrow,
-    )
-    .is_err()
-    {
+    if check_exact(&out.output_type, output_type).is_err() {
         return Err(format!(
             "aggregate output type signature mismatch for {}: expected {:?}, got {:?}",
             func.name, out.output_type, output_type
@@ -74,13 +68,7 @@ fn apply_type_signature(
 
     let _ = input_is_intermediate;
     if let Some(intermediate_type) = sig.intermediate_type.as_ref() {
-        if check(
-            &out.intermediate_type,
-            intermediate_type,
-            CompatibilityPolicy::ExactArrow,
-        )
-        .is_err()
-        {
+        if check_exact(&out.intermediate_type, intermediate_type).is_err() {
             return Err(format!(
                 "aggregate intermediate type signature mismatch for {}: expected {:?}, got {:?}",
                 func.name, out.intermediate_type, intermediate_type

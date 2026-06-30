@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check, nested_path_label};
+use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label};
 use crate::lower::type_lowering::arrow_field_from_desc;
 use crate::thrift::types;
 use crate::types::logical::{LogicalType, logical_type_of_field};
@@ -341,7 +341,7 @@ fn check_chunk_data_type(
     actual: &DataType,
     root_label: &str,
 ) -> Result<(), String> {
-    check(expected, actual, CompatibilityPolicy::ExactArrow).map_err(|m| {
+    check_exact(expected, actual).map_err(|m| {
         format!(
             "chunk schema type mismatch at {}: expected {:?}, got {:?} ({:?})",
             nested_path_label(root_label, &m.nested_path),

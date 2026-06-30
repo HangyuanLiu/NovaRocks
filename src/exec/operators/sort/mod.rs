@@ -22,7 +22,7 @@
 //! - Keep sorting algorithms isolated from operator state transitions.
 
 use crate::exec::chunk::Chunk;
-use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check, retag_column};
+use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use arrow::array::{
     Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int8Array, ListArray, MapArray,
     StructArray, UInt64Array,
@@ -100,12 +100,7 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
             let actual = schema.field(idx);
             let actual = sort_field_from_array(actual, chunk.batch.column(idx));
             if expected.name() != actual.name()
-                || check(
-                    expected.data_type(),
-                    actual.data_type(),
-                    CompatibilityPolicy::ExactArrow,
-                )
-                .is_err()
+                || check_exact(expected.data_type(), actual.data_type()).is_err()
             {
                 return Err(format!(
                     "sort schema field mismatch at index {}: expected=({}, {:?}) actual=({}, {:?})",
@@ -136,11 +131,7 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
 }
 
 fn normalize_sort_array_for_field(array: &ArrayRef, field: &Field) -> Result<ArrayRef, String> {
-    if let Err(mismatch) = check(
-        field.data_type(),
-        array.data_type(),
-        CompatibilityPolicy::ExactArrow,
-    ) {
+    if let Err(mismatch) = check_exact(field.data_type(), array.data_type()) {
         return Err(format!(
             "sort payload type mismatch for field {}: array={:?} field={:?} ({:?})",
             field.name(),
