@@ -30,6 +30,9 @@ use crate::connector::iceberg::operation_lifecycle::{
 };
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
+use crate::engine::iceberg_change_stream_write::{
+    ChangeStreamWriterCommitPlan, route_change_stream_writer_reports,
+};
 use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergOperationFactUpdate, IcebergOperationKind,
     IcebergOperationState, IcebergOperationTarget,
@@ -148,7 +151,33 @@ impl IcebergWriteCommitExecutor {
             }
         }
         self.collector.inject_written_files(writer_files);
+        self.run_commit_after_collector_injection()
+    }
 
+    pub(crate) fn commit_change_stream_write_input(
+        &self,
+        write_commit: &WriteCommitInput,
+        plan: &ChangeStreamWriterCommitPlan,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        let routed = route_change_stream_writer_reports(
+            &self.collector,
+            self.table.metadata(),
+            write_commit,
+            plan,
+        )
+        .map_err(|err| {
+            let (message, converted_files) = err.into_parts();
+            CommitServiceError::known_uncommitted(
+                message,
+                self.cleanup_converted_writer_files(&converted_files),
+            )
+        })?;
+        self.collector.inject_written_files(routed.reuse_or_dv);
+        self.collector.inject_appended_files(routed.fresh);
+        self.run_commit_after_collector_injection()
+    }
+
+    fn run_commit_after_collector_injection(&self) -> Result<CommitOutcome, CommitServiceError> {
         let file_io = self.table.file_io().clone();
         let input = RunInput {
             collector: Arc::clone(&self.collector),
