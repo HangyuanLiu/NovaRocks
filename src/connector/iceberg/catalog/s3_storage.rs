@@ -4,7 +4,7 @@
 //! OpenDAL S3 operator, allowing Iceberg metadata and data files to be stored
 //! on S3-compatible object storage (MinIO, AWS S3, Aliyun OSS).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -295,26 +295,25 @@ pub(crate) struct S3StorageFactory {
 impl S3StorageFactory {
     /// Build from catalog properties (aws.s3.access_key, aws.s3.secret_key, etc.).
     pub fn from_catalog_properties(props: &[(String, String)]) -> Option<Self> {
-        let map: HashMap<&str, &str> = props
+        let props_map: BTreeMap<String, String> = props
             .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-
-        let endpoint = map.get("aws.s3.endpoint").copied()?;
-        let ak = map.get("aws.s3.access_key").copied()?;
-        let sk = map.get("aws.s3.secret_key").copied()?;
-        let region = map.get("aws.s3.region").copied().unwrap_or("us-east-1");
-        let path_style = map
-            .get("aws.s3.enable_path_style_access")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let credentials =
+            crate::fs::object_store_credentials::ObjectStoreCredentials::from_aws_s3_properties(
+                crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
+                &props_map,
+            )
+            .ok()?;
 
         Some(Self {
-            endpoint: endpoint.to_string(),
-            access_key_id: ak.to_string(),
-            access_key_secret: sk.to_string(),
-            region: region.to_string(),
-            enable_path_style: path_style,
+            endpoint: credentials.endpoint,
+            access_key_id: credentials.access_key_id,
+            access_key_secret: credentials.access_key_secret,
+            region: credentials
+                .region
+                .unwrap_or_else(|| "us-east-1".to_string()),
+            enable_path_style: credentials.enable_path_style_access.unwrap_or(false),
         })
     }
 }
@@ -329,5 +328,34 @@ impl StorageFactory for S3StorageFactory {
             &self.region,
             self.enable_path_style,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::S3StorageFactory;
+
+    #[test]
+    fn s3_storage_factory_uses_shared_credentials_aliases() {
+        let props = vec![
+            (
+                "aws.s3.endpoint_url".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "1".to_string(),
+            ),
+        ];
+
+        let factory = S3StorageFactory::from_catalog_properties(&props).expect("parse factory");
+
+        assert_eq!(factory.endpoint, "http://localhost:9000");
+        assert_eq!(factory.access_key_id, "ak");
+        assert_eq!(factory.access_key_secret, "sk");
+        assert_eq!(factory.region, "us-east-1");
+        assert!(factory.enable_path_style);
     }
 }

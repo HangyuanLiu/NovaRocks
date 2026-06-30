@@ -319,37 +319,27 @@ fn build_stats_file_io(
         return Ok(iceberg::io::FileIO::new_with_fs());
     }
 
-    let endpoint = cloud_properties
-        .get("aws.s3.endpoint")
-        .ok_or_else(|| "missing aws.s3.endpoint".to_string())?;
-    let access_key = cloud_properties
-        .get("aws.s3.access_key")
-        .ok_or_else(|| "missing aws.s3.access_key".to_string())?;
-    let secret_key = cloud_properties
-        .get("aws.s3.secret_key")
-        .ok_or_else(|| "missing aws.s3.secret_key".to_string())?;
-    let region = cloud_properties
-        .get("aws.s3.region")
-        .cloned()
-        .unwrap_or_else(|| "us-east-1".to_string());
-    let path_style = cloud_properties
-        .get("aws.s3.enable_path_style_access")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let credentials =
+        crate::fs::object_store_credentials::ObjectStoreCredentials::from_aws_s3_properties(
+            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
+            cloud_properties,
+        )?;
 
     let factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory {
-        endpoint: endpoint.clone(),
-        access_key_id: access_key.clone(),
-        access_key_secret: secret_key.clone(),
-        region,
-        enable_path_style: path_style,
+        endpoint: credentials.endpoint,
+        access_key_id: credentials.access_key_id,
+        access_key_secret: credentials.access_key_secret,
+        region: credentials
+            .region
+            .unwrap_or_else(|| "us-east-1".to_string()),
+        enable_path_style: credentials.enable_path_style_access.unwrap_or(false),
     };
     Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, RwLock};
 
     use crate::connector::iceberg::catalog::registry::{
@@ -368,6 +358,44 @@ mod tests {
         BaseTableStatistics, StatValue, StatsMissingReason, StatsSource,
     };
     use crate::sql::{Literal, SqlType, TableColumnDef};
+
+    fn s3_cloud_properties(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn build_stats_file_io_uses_shared_s3_credentials_aliases() {
+        let props = s3_cloud_properties(&[
+            ("aws.s3.endpoint_url", "http://localhost:9000"),
+            ("aws.s3.accessKeyId", "ak"),
+            ("aws.s3.accessKeySecret", "sk"),
+            ("aws.s3.enable_path_style_access", "1"),
+        ]);
+
+        let _file_io =
+            super::build_stats_file_io("s3://bucket/warehouse/table", &props).expect("FileIO");
+    }
+
+    #[test]
+    fn build_stats_file_io_keeps_local_fallback_without_credentials() {
+        let props = BTreeMap::new();
+
+        let _file_io = super::build_stats_file_io("file:///tmp/warehouse/table", &props)
+            .expect("local FileIO");
+    }
+
+    #[test]
+    fn build_stats_file_io_rejects_object_store_without_credentials() {
+        let props = s3_cloud_properties(&[("aws.s3.endpoint_url", "http://localhost:9000")]);
+
+        let err = super::build_stats_file_io("s3://bucket/warehouse/table", &props)
+            .expect_err("missing S3 credentials should be explicit");
+
+        assert!(err.contains("aws.s3.access_key"), "{err}");
+    }
 
     #[test]
     fn iceberg_provider_rejects_non_iceberg_source_without_registry_lookup() {

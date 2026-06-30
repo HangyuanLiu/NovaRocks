@@ -173,15 +173,10 @@ impl IcebergCatalogEntry {
     pub(crate) fn cloud_properties_map(&self) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         for (key, value) in &self.properties {
-            match key.as_str() {
-                "aws.s3.endpoint"
-                | "aws.s3.access_key"
-                | "aws.s3.secret_key"
-                | "aws.s3.enable_path_style_access"
-                | "aws.s3.region" => {
-                    map.insert(key.clone(), value.clone());
-                }
-                _ => {}
+            if crate::fs::object_store_credentials::AWS_S3_CREDENTIAL_PROPERTY_KEYS
+                .contains(&key.as_str())
+            {
+                map.insert(key.clone(), value.clone());
             }
         }
         map
@@ -1509,7 +1504,7 @@ pub(crate) fn build_catalog_entry(
 ) -> Result<IcebergCatalogEntry, String> {
     let mut props = HashMap::new();
     for (key, value) in properties {
-        props.insert(key.to_ascii_lowercase(), value.clone());
+        props.insert(normalize_catalog_property_key(key), value.clone());
     }
     if let Some(kind) = props.get("type")
         && !kind.eq_ignore_ascii_case("iceberg")
@@ -1553,29 +1548,14 @@ pub(crate) fn build_catalog_entry(
         || raw_warehouse.starts_with("oss://");
 
     let (warehouse_uri, warehouse_path, s3_config) = if is_s3 {
-        let s3_factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(properties)
-            .ok_or_else(|| {
-            "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
-                .to_string()
-        })?;
         let (bucket, _root_prefix) =
             crate::connector::iceberg::catalog::add_files::parse_s3_path(&raw_warehouse)
                 .map_err(|e| format!("parse warehouse URI: {e}"))?;
-        let cfg = crate::fs::object_store::ObjectStoreConfig {
-            endpoint: s3_factory.endpoint.clone(),
-            bucket,
-            root: String::new(),
-            access_key_id: s3_factory.access_key_id.clone(),
-            access_key_secret: s3_factory.access_key_secret.clone(),
-            session_token: None,
-            enable_path_style_access: Some(s3_factory.enable_path_style),
-            region: Some(s3_factory.region.clone()),
-            retry_max_times: Some(3),
-            retry_min_delay_ms: Some(100),
-            retry_max_delay_ms: Some(2000),
-            timeout_ms: Some(30000),
-            io_timeout_ms: Some(30000),
-        };
+        let credentials = object_store_credentials_from_props(&props).map_err(|_| {
+            "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
+                .to_string()
+        })?;
+        let cfg = object_store_config_from_credentials(credentials, &bucket);
         // S3 warehouse: keep URI as-is, use a temp local path for metadata cache
         let cache_dir = std::env::temp_dir()
             .join("novarocks_iceberg_cache")
@@ -1615,6 +1595,15 @@ pub(crate) fn build_catalog_entry(
     Ok(entry)
 }
 
+fn normalize_catalog_property_key(key: &str) -> String {
+    crate::fs::object_store_credentials::AWS_S3_CREDENTIAL_PROPERTY_KEYS
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(key))
+        .copied()
+        .map(str::to_string)
+        .unwrap_or_else(|| key.to_ascii_lowercase())
+}
+
 /// Build an object-store config from catalog S3 properties, deriving the
 /// bucket from an `s3://` / `s3a://` / `oss://` warehouse URI. Shared by the
 /// REST and Hive entry builders (both point at object-store warehouses and
@@ -1623,12 +1612,7 @@ fn object_store_config_from_props(
     props: &HashMap<String, String>,
     warehouse: &str,
 ) -> Option<crate::fs::object_store::ObjectStoreConfig> {
-    let raw_props: Vec<(String, String)> =
-        props.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    let s3_factory =
-        crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(
-            &raw_props,
-        )?;
+    let credentials = object_store_credentials_from_props(props).ok()?;
     let bucket = warehouse
         .strip_prefix("s3://")
         .or_else(|| warehouse.strip_prefix("s3a://"))
@@ -1636,21 +1620,32 @@ fn object_store_config_from_props(
         .and_then(|rest| rest.split('/').next())
         .unwrap_or_default()
         .to_string();
-    Some(crate::fs::object_store::ObjectStoreConfig {
-        endpoint: s3_factory.endpoint.clone(),
-        bucket,
-        root: String::new(),
-        access_key_id: s3_factory.access_key_id.clone(),
-        access_key_secret: s3_factory.access_key_secret.clone(),
-        session_token: None,
-        enable_path_style_access: Some(s3_factory.enable_path_style),
-        region: Some(s3_factory.region.clone()),
-        retry_max_times: Some(3),
-        retry_min_delay_ms: Some(100),
-        retry_max_delay_ms: Some(2000),
-        timeout_ms: Some(30000),
-        io_timeout_ms: Some(30000),
-    })
+    Some(object_store_config_from_credentials(credentials, &bucket))
+}
+
+fn object_store_credentials_from_props(
+    props: &HashMap<String, String>,
+) -> Result<crate::fs::object_store_credentials::ObjectStoreCredentials, String> {
+    let props_map: BTreeMap<String, String> = props
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    crate::fs::object_store_credentials::ObjectStoreCredentials::from_aws_s3_properties(
+        crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
+        &props_map,
+    )
+}
+
+fn object_store_config_from_credentials(
+    credentials: crate::fs::object_store_credentials::ObjectStoreCredentials,
+    bucket: &str,
+) -> crate::fs::object_store::ObjectStoreConfig {
+    let mut cfg = credentials.to_object_store_config(bucket, "");
+    if cfg.region.is_none() {
+        cfg.region = Some("us-east-1".to_string());
+    }
+    crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
+    cfg
 }
 
 /// Build an [`IcebergCatalogEntry`] for `iceberg.catalog.type = rest`. The
@@ -3741,6 +3736,133 @@ mod rest_catalog_tests {
         .expect("rest entry with warehouse");
         assert_eq!(entry.kind, IcebergCatalogKind::Rest);
         assert_eq!(entry.warehouse_uri, "s3://demo/wh");
+    }
+
+    #[test]
+    fn build_catalog_entry_s3_warehouse_uses_shared_credentials_aliases() {
+        let entry = build_catalog_entry(
+            "ice_s3",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    "s3://bucket-a/warehouse".to_string(),
+                ),
+                (
+                    "aws.s3.endpoint_url".to_string(),
+                    "http://localhost:9000".to_string(),
+                ),
+                ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+                ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+                (
+                    "aws.s3.enable_path_style_access".to_string(),
+                    "1".to_string(),
+                ),
+                ("aws.s3.max_retries".to_string(), "8".to_string()),
+                ("aws.s3.retry_min_delay_ms".to_string(), "12".to_string()),
+                ("aws.s3.retry_max_delay_ms".to_string(), "34".to_string()),
+                ("aws.s3.request_timeout_ms".to_string(), "5678".to_string()),
+                ("aws.s3.io_timeout_ms".to_string(), "8765".to_string()),
+            ],
+        )
+        .expect("S3 entry");
+
+        let cfg = entry.object_store_config().expect("object-store config");
+        assert_eq!(cfg.endpoint, "http://localhost:9000");
+        assert_eq!(cfg.bucket, "bucket-a");
+        assert_eq!(cfg.root, "");
+        assert_eq!(cfg.access_key_id, "ak");
+        assert_eq!(cfg.access_key_secret, "sk");
+        assert_eq!(cfg.enable_path_style_access, Some(true));
+        assert_eq!(cfg.retry_max_times, Some(8));
+        assert_eq!(cfg.retry_min_delay_ms, Some(12));
+        assert_eq!(cfg.retry_max_delay_ms, Some(34));
+        assert_eq!(cfg.timeout_ms, Some(5678));
+        assert_eq!(cfg.io_timeout_ms, Some(8765));
+    }
+
+    #[test]
+    fn rest_entry_object_store_config_uses_shared_credentials_aliases() {
+        let entry = build_catalog_entry(
+            "ice_rest",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), "http://localhost:8181".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    "s3://bucket-b/rest".to_string(),
+                ),
+                (
+                    "aws.s3.endpoint_url".to_string(),
+                    "http://localhost:9000".to_string(),
+                ),
+                ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+                ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+                (
+                    "aws.s3.enable_path_style_access".to_string(),
+                    "yes".to_string(),
+                ),
+                ("aws.s3.retry_max_times".to_string(), "4".to_string()),
+            ],
+        )
+        .expect("REST S3 entry");
+
+        let cfg = entry.object_store_config().expect("object-store config");
+        assert_eq!(cfg.endpoint, "http://localhost:9000");
+        assert_eq!(cfg.bucket, "bucket-b");
+        assert_eq!(cfg.access_key_id, "ak");
+        assert_eq!(cfg.access_key_secret, "sk");
+        assert_eq!(cfg.enable_path_style_access, Some(true));
+        assert_eq!(cfg.retry_max_times, Some(4));
+    }
+
+    #[test]
+    fn cloud_properties_map_filters_shared_s3_property_keys() {
+        let entry = build_catalog_entry(
+            "ice_rest",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), "http://localhost:8181".to_string()),
+                (
+                    "aws.s3.endpoint_url".to_string(),
+                    "http://localhost:9000".to_string(),
+                ),
+                ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+                ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+                ("aws.s3.sessionToken".to_string(), "token".to_string()),
+                ("aws.s3.max_retries".to_string(), "5".to_string()),
+                ("unrelated".to_string(), "ignore".to_string()),
+            ],
+        )
+        .expect("REST entry");
+
+        let cloud_props = entry.cloud_properties_map();
+
+        assert_eq!(
+            cloud_props.get("aws.s3.endpoint_url").map(String::as_str),
+            Some("http://localhost:9000")
+        );
+        assert_eq!(
+            cloud_props.get("aws.s3.accessKeyId").map(String::as_str),
+            Some("ak")
+        );
+        assert_eq!(
+            cloud_props
+                .get("aws.s3.accessKeySecret")
+                .map(String::as_str),
+            Some("sk")
+        );
+        assert_eq!(
+            cloud_props.get("aws.s3.sessionToken").map(String::as_str),
+            Some("token")
+        );
+        assert_eq!(
+            cloud_props.get("aws.s3.max_retries").map(String::as_str),
+            Some("5")
+        );
+        assert!(!cloud_props.contains_key("unrelated"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Registers existing parquet files from S3/OSS into an Iceberg table's
 //! metadata without data movement.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -104,39 +104,60 @@ pub(crate) fn add_files(
 fn build_s3_config_from_properties(
     properties: &[(String, String)],
 ) -> Result<ObjectStoreConfig, String> {
-    let mut map = std::collections::HashMap::new();
-    for (k, v) in properties {
-        map.insert(k.as_str(), v.as_str());
-    }
-    let endpoint = map
-        .get("aws.s3.endpoint")
-        .ok_or("ADD FILES requires aws.s3.endpoint")?;
-    let ak = map
-        .get("aws.s3.access_key")
-        .ok_or("ADD FILES requires aws.s3.access_key")?;
-    let sk = map
-        .get("aws.s3.secret_key")
-        .ok_or("ADD FILES requires aws.s3.secret_key")?;
-    let path_style = map
-        .get("aws.s3.enable_path_style_access")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let props_map: BTreeMap<String, String> = properties
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let credentials =
+        crate::fs::object_store_credentials::ObjectStoreCredentials::from_aws_s3_properties(
+            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
+            &props_map,
+        )?;
+    let mut cfg = credentials.to_object_store_config("", "");
+    crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
+    Ok(cfg)
+}
 
-    Ok(ObjectStoreConfig {
-        endpoint: endpoint.to_string(),
-        bucket: String::new(),
-        root: String::new(),
-        access_key_id: ak.to_string(),
-        access_key_secret: sk.to_string(),
-        session_token: None,
-        enable_path_style_access: Some(path_style),
-        region: map.get("aws.s3.region").map(|s| s.to_string()),
-        retry_max_times: Some(3),
-        retry_min_delay_ms: Some(100),
-        retry_max_delay_ms: Some(2000),
-        timeout_ms: Some(60000),
-        io_timeout_ms: Some(60000),
-    })
+#[cfg(test)]
+mod tests {
+    use super::build_s3_config_from_properties;
+
+    #[test]
+    fn build_s3_config_accepts_shared_aliases_and_retry_values() {
+        let props = vec![
+            (
+                "aws.s3.endpoint_url".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "1".to_string(),
+            ),
+            ("aws.s3.max_retries".to_string(), "7".to_string()),
+            ("aws.s3.retry_min_delay_ms".to_string(), "11".to_string()),
+            ("aws.s3.retry_max_delay_ms".to_string(), "99".to_string()),
+            ("aws.s3.request_timeout_ms".to_string(), "1234".to_string()),
+            ("aws.s3.io_timeout_ms".to_string(), "5678".to_string()),
+        ];
+
+        let cfg = build_s3_config_from_properties(&props).expect("build S3 config");
+
+        assert_eq!(cfg.endpoint, "http://localhost:9000");
+        assert_eq!(cfg.bucket, "");
+        assert_eq!(cfg.root, "");
+        assert_eq!(cfg.access_key_id, "ak");
+        assert_eq!(cfg.access_key_secret, "sk");
+        assert_eq!(cfg.session_token, None);
+        assert_eq!(cfg.enable_path_style_access, Some(true));
+        assert_eq!(cfg.region, None);
+        assert_eq!(cfg.retry_max_times, Some(7));
+        assert_eq!(cfg.retry_min_delay_ms, Some(11));
+        assert_eq!(cfg.retry_max_delay_ms, Some(99));
+        assert_eq!(cfg.timeout_ms, Some(1234));
+        assert_eq!(cfg.io_timeout_ms, Some(5678));
+    }
 }
 
 pub(crate) fn parse_s3_path(path: &str) -> Result<(String, String), String> {
