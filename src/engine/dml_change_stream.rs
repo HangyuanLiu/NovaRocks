@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
@@ -161,35 +162,49 @@ pub(crate) fn inject_dml_pre_expand_keyed_assert(
         return Ok(());
     };
 
-    let mut injected = false;
-    let mut next_node_id = next_plan_node_id(build_result);
-    for fragment in &mut build_result.fragment_results {
-        let Some(expand_idx) = fragment.plan.nodes.iter().position(|node| {
-            node.node_type == crate::thrift::plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE
-        }) else {
-            continue;
-        };
-        if injected {
-            return Err(
-                "DML change-stream keyed assert found multiple ChangeEventExpand nodes".to_string(),
-            );
-        }
-        inject_keyed_assert_before_expand_node(fragment, expand_idx, keyed_assert, next_node_id)?;
-        next_node_id += 1;
-        injected = true;
+    let expand_nodes = change_event_expand_positions(build_result);
+    if expand_nodes.len() != 1 {
+        return Err(format!(
+            "DML change-stream keyed assert requires exactly one ChangeEventExpand node, found {}",
+            expand_nodes.len()
+        ));
     }
-
-    if !injected {
-        return Err("DML change-stream keyed assert found no ChangeEventExpand node".to_string());
-    }
+    let (fragment_idx, expand_idx) = expand_nodes[0];
+    inject_keyed_assert_before_expand_node(
+        &mut build_result.fragment_results[fragment_idx],
+        expand_idx,
+        keyed_assert,
+    )?;
+    renumber_plan_node_ids_preserving_preorder(build_result)?;
     Ok(())
+}
+
+fn change_event_expand_positions(
+    build_result: &crate::sql::codegen::MultiFragmentBuildResult,
+) -> Vec<(usize, usize)> {
+    build_result
+        .fragment_results
+        .iter()
+        .enumerate()
+        .flat_map(|(fragment_idx, fragment)| {
+            fragment
+                .plan
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(move |(node_idx, node)| {
+                    (node.node_type
+                        == crate::thrift::plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE)
+                        .then_some((fragment_idx, node_idx))
+                })
+        })
+        .collect()
 }
 
 fn inject_keyed_assert_before_expand_node(
     fragment: &mut crate::sql::codegen::FragmentBuildResult,
     expand_idx: usize,
     keyed_assert: &DmlPreExpandKeyedAssert,
-    node_id: i32,
 ) -> Result<(), String> {
     let expand = fragment
         .plan
@@ -214,7 +229,7 @@ fn inject_keyed_assert_before_expand_node(
         &keyed_assert.key_column_name,
     )?;
     let mut assert_node = crate::sql::codegen::nodes::default_plan_node();
-    assert_node.node_id = node_id;
+    assert_node.node_id = -1;
     assert_node.node_type = crate::thrift::plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE;
     assert_node.num_children = 1;
     assert_node.limit = -1;
@@ -262,14 +277,190 @@ fn find_slot_id_in_row_tuples(
     })
 }
 
-fn next_plan_node_id(build_result: &crate::sql::codegen::MultiFragmentBuildResult) -> i32 {
-    build_result
-        .fragment_results
-        .iter()
-        .flat_map(|fragment| fragment.plan.nodes.iter().map(|node| node.node_id))
-        .max()
-        .unwrap_or(0)
-        + 1
+fn renumber_plan_node_ids_preserving_preorder(
+    build_result: &mut crate::sql::codegen::MultiFragmentBuildResult,
+) -> Result<(), String> {
+    let mut next_node_id = 1;
+    let mut node_id_map = HashMap::new();
+    for fragment in &mut build_result.fragment_results {
+        if fragment.plan.nodes.is_empty() {
+            continue;
+        }
+        let consumed = assign_preorder_invariant_node_ids(
+            &mut fragment.plan.nodes,
+            0,
+            &mut next_node_id,
+            &mut node_id_map,
+        )?;
+        if consumed != fragment.plan.nodes.len() {
+            return Err(format!(
+                "DML change-stream keyed assert cannot renumber fragment {}: plan contains {} nodes but first pre-order tree consumed {}",
+                fragment.fragment_id,
+                fragment.plan.nodes.len(),
+                consumed
+            ));
+        }
+    }
+    remap_plan_node_references(build_result, &node_id_map)?;
+    Ok(())
+}
+
+fn assign_preorder_invariant_node_ids(
+    nodes: &mut [crate::thrift::plan_nodes::TPlanNode],
+    root_idx: usize,
+    next_node_id: &mut i32,
+    node_id_map: &mut HashMap<i32, i32>,
+) -> Result<usize, String> {
+    if root_idx >= nodes.len() {
+        return Err(format!(
+            "DML change-stream keyed assert cannot renumber missing TPlan subtree root at index {root_idx}"
+        ));
+    }
+    let old_root_id = nodes[root_idx].node_id;
+    let child_count = nodes[root_idx].num_children;
+    if child_count < 0 {
+        return Err(format!(
+            "DML change-stream keyed assert cannot renumber node {old_root_id}: negative child count {child_count}"
+        ));
+    }
+    let mut next_idx = root_idx + 1;
+    for child_ordinal in 0..child_count {
+        if next_idx >= nodes.len() {
+            return Err(format!(
+                "DML change-stream keyed assert cannot renumber node {old_root_id}: missing child {child_ordinal}"
+            ));
+        }
+        next_idx = assign_preorder_invariant_node_ids(nodes, next_idx, next_node_id, node_id_map)?;
+    }
+    let new_root_id = *next_node_id;
+    *next_node_id += 1;
+    if node_id_map.insert(old_root_id, new_root_id).is_some() {
+        return Err(format!(
+            "DML change-stream keyed assert cannot renumber duplicate TPlan node id {old_root_id}"
+        ));
+    }
+    nodes[root_idx].node_id = new_root_id;
+    Ok(next_idx)
+}
+
+fn remap_plan_node_references(
+    build_result: &mut crate::sql::codegen::MultiFragmentBuildResult,
+    node_id_map: &HashMap<i32, i32>,
+) -> Result<(), String> {
+    for fragment in &mut build_result.fragment_results {
+        for node in &mut fragment.plan.nodes {
+            remap_plan_node_payload_references(node, node_id_map)?;
+        }
+        remap_btree_map_keys(&mut fragment.exec_params.per_node_scan_ranges, node_id_map)?;
+        remap_btree_map_keys(&mut fragment.exec_params.per_exch_num_senders, node_id_map)?;
+        if let Some(ranges) = fragment
+            .exec_params
+            .node_to_per_driver_seq_scan_ranges
+            .as_mut()
+        {
+            remap_btree_map_keys(ranges, node_id_map)?;
+        }
+        for (_, exchange_node_id) in &mut fragment.cte_exchange_nodes {
+            *exchange_node_id = remap_node_id(*exchange_node_id, node_id_map)?;
+        }
+        for boundary in &mut fragment.boundary_schemas {
+            remap_boundary_schema_node_id(boundary, node_id_map)?;
+        }
+    }
+    for edge in &mut build_result.edges {
+        edge.target_exchange_node_id = remap_node_id(edge.target_exchange_node_id, node_id_map)?;
+    }
+    for boundary in &mut build_result.boundary_schemas {
+        remap_boundary_schema_node_id(boundary, node_id_map)?;
+    }
+    if let Some(rf_plan) = build_result.rf_plan.as_mut() {
+        for desc in rf_plan.all_filters.values_mut() {
+            remap_runtime_filter_description(desc, node_id_map)?;
+        }
+        for probes in rf_plan.probe_side_filters.values_mut() {
+            for (_, probe_node_id) in probes {
+                *probe_node_id = remap_node_id(*probe_node_id, node_id_map)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remap_plan_node_payload_references(
+    node: &mut crate::thrift::plan_nodes::TPlanNode,
+    node_id_map: &HashMap<i32, i32>,
+) -> Result<(), String> {
+    if let Some(filters) = node.probe_runtime_filters.as_mut() {
+        for filter in filters {
+            remap_runtime_filter_description(filter, node_id_map)?;
+        }
+    }
+    if let Some(hdfs_scan) = node.hdfs_scan_node.as_mut()
+        && let Some(scan_node_id) = hdfs_scan.scan_node_id
+    {
+        hdfs_scan.scan_node_id = Some(i64::from(remap_node_id(
+            i32::try_from(scan_node_id).map_err(|_| {
+                format!(
+                    "DML change-stream keyed assert cannot remap HDFS scan_node_id {scan_node_id}: out of i32 range"
+                )
+            })?,
+            node_id_map,
+        )?));
+    }
+    if let Some(fetch) = node.fetch_node.as_mut()
+        && let Some(target_node_id) = fetch.target_node_id
+    {
+        fetch.target_node_id = Some(remap_node_id(target_node_id, node_id_map)?);
+    }
+    Ok(())
+}
+
+fn remap_runtime_filter_description(
+    desc: &mut crate::thrift::runtime_filter::TRuntimeFilterDescription,
+    node_id_map: &HashMap<i32, i32>,
+) -> Result<(), String> {
+    if let Some(build_node_id) = desc.build_plan_node_id {
+        desc.build_plan_node_id = Some(remap_node_id(build_node_id, node_id_map)?);
+    }
+    if let Some(target_exprs) = desc.plan_node_id_to_target_expr.as_mut() {
+        remap_btree_map_keys(target_exprs, node_id_map)?;
+    }
+    if let Some(partition_exprs) = desc.plan_node_id_to_partition_by_exprs.as_mut() {
+        remap_btree_map_keys(partition_exprs, node_id_map)?;
+    }
+    Ok(())
+}
+
+fn remap_boundary_schema_node_id(
+    boundary: &mut crate::sql::codegen::boundary_schema::BoundarySchemaReport,
+    node_id_map: &HashMap<i32, i32>,
+) -> Result<(), String> {
+    if boundary.node_id >= 0 {
+        boundary.node_id = remap_node_id(boundary.node_id, node_id_map)?;
+    }
+    Ok(())
+}
+
+fn remap_btree_map_keys<V>(
+    map: &mut BTreeMap<i32, V>,
+    node_id_map: &HashMap<i32, i32>,
+) -> Result<(), String> {
+    let old = std::mem::take(map);
+    for (old_key, value) in old {
+        let new_key = remap_node_id(old_key, node_id_map)?;
+        if map.insert(new_key, value).is_some() {
+            return Err(format!(
+                "DML change-stream keyed assert remapped multiple node-id references to {new_key}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remap_node_id(node_id: i32, node_id_map: &HashMap<i32, i32>) -> Result<i32, String> {
+    node_id_map.get(&node_id).copied().ok_or_else(|| {
+        format!("DML change-stream keyed assert cannot remap unknown TPlan node id {node_id}")
+    })
 }
 
 fn build_dml_change_stream_dag_from_sink_specs(
@@ -374,18 +565,10 @@ pub(crate) fn execute_dml_change_stream_write(
     mut plan: DmlChangeStreamWritePlan,
     query_opts: Option<&TQueryOptions>,
 ) -> Result<DmlChangeStreamWriteExecution, String> {
-    let planned = crate::engine::build_physical_plan_as_iceberg_change_stream_write(
-        state,
-        Some(&target.catalog),
-        &target.namespace,
-        &plan.producer,
-        &mut plan.dag,
-        None,
-    )?;
     let crate::engine::PlannedIcebergChangeStreamWrite {
         build_result,
         commit_plan,
-    } = planned;
+    } = plan_dml_change_stream_write(state, target, &mut plan)?;
     #[cfg(test)]
     if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&plan.dag) {
         return dml_change_stream_write_execution(result, commit_plan);
@@ -395,6 +578,30 @@ pub(crate) fn execute_dml_change_stream_write(
         query_opts.cloned(),
     )?;
     dml_change_stream_write_execution(result, commit_plan)
+}
+
+pub(crate) fn plan_dml_change_stream_write(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    plan: &mut DmlChangeStreamWritePlan,
+) -> Result<crate::engine::PlannedIcebergChangeStreamWrite, String> {
+    let planned = crate::engine::build_physical_plan_as_iceberg_change_stream_write(
+        state,
+        Some(&target.catalog),
+        &target.namespace,
+        &plan.producer,
+        &mut plan.dag,
+        None,
+    )?;
+    let crate::engine::PlannedIcebergChangeStreamWrite {
+        mut build_result,
+        commit_plan,
+    } = planned;
+    inject_dml_pre_expand_keyed_assert(&mut build_result, plan.pre_expand_keyed_assert.as_ref())?;
+    Ok(crate::engine::PlannedIcebergChangeStreamWrite {
+        build_result,
+        commit_plan,
+    })
 }
 
 fn dml_change_stream_write_execution(
@@ -697,58 +904,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn execution_return_type_carries_commit_plan() {
-        let execution = DmlChangeStreamWriteExecution {
-            result: CoordinatedQueryResult {
-                query_result: crate::runtime::query_result::QueryResult::empty(),
-                write_commit: Some(crate::runtime::write_coordinator::WriteCommitInput {
-                    write_id: crate::thrift::types::TUniqueId::new(1, 2),
-                    writers: Vec::new(),
-                }),
-                write_abort: None,
-                fragment_profiles: Vec::new(),
-            },
-            commit_plan:
-                crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::new(
-                    BTreeMap::new(),
-                ),
-        };
-
-        assert!(execution.result.write_commit.is_some());
-        assert!(execution.commit_plan.is_empty());
+    fn keyed_assert_for_test() -> DmlPreExpandKeyedAssert {
+        DmlPreExpandKeyedAssert {
+            key_column_name: "__nr_row_id".to_string(),
+            key_label: "_row_id".to_string(),
+            message_prefix: "MOR UPDATE matched target row".to_string(),
+        }
     }
 
-    #[test]
-    fn pre_expand_keyed_assert_inserts_assert_num_rows_before_expand() {
-        let fragment = crate::sql::codegen::FragmentBuildResult {
+    fn change_event_expand_plan_node(node_id: i32) -> crate::thrift::plan_nodes::TPlanNode {
+        let mut node = crate::sql::codegen::nodes::default_plan_node();
+        node.node_id = node_id;
+        node.node_type = crate::thrift::plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE;
+        node.num_children = 1;
+        node.row_tuples = vec![2];
+        node.change_event_expand_node = Some(crate::thrift::plan_nodes::TChangeEventExpandNode {
+            events: Vec::new(),
+            output_slot_ids: Vec::new(),
+            change_op_slot_id: 4,
+            data_route_slot_id: Some(5),
+        });
+        node.nullable_tuples = vec![false];
+        node
+    }
+
+    fn exchange_plan_node(node_id: i32, row_tuple: i32) -> crate::thrift::plan_nodes::TPlanNode {
+        let mut node = crate::sql::codegen::nodes::default_plan_node();
+        node.node_id = node_id;
+        node.node_type = crate::thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE;
+        node.num_children = 0;
+        node.row_tuples = vec![row_tuple];
+        node.local_rf_waiting_set = Some(std::collections::BTreeSet::from([99]));
+        node
+    }
+
+    fn keyed_assert_fragment(
+        nodes: Vec<crate::thrift::plan_nodes::TPlanNode>,
+    ) -> crate::sql::codegen::FragmentBuildResult {
+        crate::sql::codegen::FragmentBuildResult {
             fragment_id: 0,
-            plan: crate::thrift::plan_nodes::TPlan::new(vec![
-                {
-                    let mut node = crate::sql::codegen::nodes::default_plan_node();
-                    node.node_id = 10;
-                    node.node_type =
-                        crate::thrift::plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE;
-                    node.num_children = 1;
-                    node.row_tuples = vec![2];
-                    node.change_event_expand_node =
-                        Some(crate::thrift::plan_nodes::TChangeEventExpandNode {
-                            events: Vec::new(),
-                            output_slot_ids: Vec::new(),
-                            change_op_slot_id: 4,
-                            data_route_slot_id: Some(5),
-                        });
-                    node
-                },
-                {
-                    let mut node = crate::sql::codegen::nodes::default_plan_node();
-                    node.node_id = 11;
-                    node.node_type = crate::thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE;
-                    node.num_children = 0;
-                    node.row_tuples = vec![1];
-                    node
-                },
-            ]),
+            plan: crate::thrift::plan_nodes::TPlan::new(nodes),
             desc_tbl: crate::thrift::descriptors::TDescriptorTable::new(
                 Some(vec![crate::thrift::descriptors::TSlotDescriptor::new(
                     Some(7),
@@ -824,27 +1019,98 @@ mod tests {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
             query_global_dicts: None,
-            query_global_dict_exprs: None,
-        };
-        let mut build_result = crate::sql::codegen::MultiFragmentBuildResult {
-            fragment_results: vec![fragment],
+            query_global_dict_exprs: Some(std::collections::BTreeMap::from([(
+                99,
+                crate::thrift::exprs::TExpr::new(Vec::new()),
+            )])),
+        }
+    }
+
+    fn keyed_assert_build_result(
+        nodes: Vec<crate::thrift::plan_nodes::TPlanNode>,
+    ) -> crate::sql::codegen::MultiFragmentBuildResult {
+        crate::sql::codegen::MultiFragmentBuildResult {
+            fragment_results: vec![keyed_assert_fragment(nodes)],
             root_fragment_id: 0,
             edges: Vec::new(),
             boundary_schemas: Vec::new(),
             rf_plan: None,
+        }
+    }
+
+    fn assert_plan_node_ids_follow_preorder_for_test(plan: &crate::thrift::plan_nodes::TPlan) {
+        fn assert_subtree(
+            nodes: &[crate::thrift::plan_nodes::TPlanNode],
+            root_idx: usize,
+        ) -> usize {
+            let root = &nodes[root_idx];
+            let mut next_idx = root_idx + 1;
+            let mut previous_child_root_id = None;
+            for child_ordinal in 0..root.num_children {
+                let child = nodes.get(next_idx).unwrap_or_else(|| {
+                    panic!("missing child {child_ordinal} for node {}", root.node_id)
+                });
+                assert!(
+                    root.node_id > child.node_id,
+                    "parent node id {} must be greater than child root id {}",
+                    root.node_id,
+                    child.node_id
+                );
+                if let Some(previous_child_root_id) = previous_child_root_id {
+                    assert!(
+                        previous_child_root_id < child.node_id,
+                        "sibling child root ids must increase: {} before {}",
+                        previous_child_root_id,
+                        child.node_id
+                    );
+                }
+                previous_child_root_id = Some(child.node_id);
+                next_idx = assert_subtree(nodes, next_idx);
+            }
+            next_idx
+        }
+
+        assert_eq!(
+            assert_subtree(&plan.nodes, 0),
+            plan.nodes.len(),
+            "TPlan must contain exactly one pre-order tree"
+        );
+    }
+
+    #[test]
+    fn execution_return_type_carries_commit_plan() {
+        let execution = DmlChangeStreamWriteExecution {
+            result: CoordinatedQueryResult {
+                query_result: crate::runtime::query_result::QueryResult::empty(),
+                write_commit: Some(crate::runtime::write_coordinator::WriteCommitInput {
+                    write_id: crate::thrift::types::TUniqueId::new(1, 2),
+                    writers: Vec::new(),
+                }),
+                write_abort: None,
+                fragment_profiles: Vec::new(),
+            },
+            commit_plan:
+                crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::new(
+                    BTreeMap::new(),
+                ),
         };
 
-        inject_dml_pre_expand_keyed_assert(
-            &mut build_result,
-            Some(&DmlPreExpandKeyedAssert {
-                key_column_name: "__nr_row_id".to_string(),
-                key_label: "_row_id".to_string(),
-                message_prefix: "MOR UPDATE matched target row".to_string(),
-            }),
-        )
-        .expect("inject assert");
+        assert!(execution.result.write_commit.is_some());
+        assert!(execution.commit_plan.is_empty());
+    }
+
+    #[test]
+    fn pre_expand_keyed_assert_inserts_assert_num_rows_before_expand() {
+        let mut build_result = keyed_assert_build_result(vec![
+            change_event_expand_plan_node(20),
+            exchange_plan_node(10, 1),
+        ]);
+
+        inject_dml_pre_expand_keyed_assert(&mut build_result, Some(&keyed_assert_for_test()))
+            .expect("inject assert");
 
         let nodes = &build_result.fragment_results[0].plan.nodes;
+        assert_plan_node_ids_follow_preorder_for_test(&build_result.fragment_results[0].plan);
         assert_eq!(
             nodes[0].node_type,
             crate::thrift::plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE
@@ -861,10 +1127,69 @@ mod tests {
             .assert_num_rows_node
             .as_ref()
             .expect("assert payload");
+        assert_eq!(
+            nodes[2]
+                .local_rf_waiting_set
+                .as_ref()
+                .map(|set| set.iter().copied().collect::<Vec<_>>()),
+            Some(vec![99])
+        );
+        assert!(
+            build_result.fragment_results[0]
+                .query_global_dict_exprs
+                .as_ref()
+                .expect("dict exprs")
+                .contains_key(&99)
+        );
+        assert_eq!(assert_payload.desired_num_rows, Some(1));
+        assert_eq!(
+            assert_payload.assertion,
+            Some(crate::thrift::plan_nodes::TAssertion::LE)
+        );
         assert_eq!(assert_payload.group_key_slots.as_deref(), Some(&[7][..]));
         assert_eq!(
             assert_payload.group_key_labels.as_deref(),
             Some(&["_row_id".to_string()][..])
+        );
+        assert_eq!(
+            assert_payload.keyed_message_prefix.as_deref(),
+            Some("MOR UPDATE matched target row")
+        );
+    }
+
+    #[test]
+    fn pre_expand_keyed_assert_rejects_multiple_expands_in_one_fragment() {
+        let mut build_result = keyed_assert_build_result(vec![
+            change_event_expand_plan_node(40),
+            exchange_plan_node(30, 1),
+            change_event_expand_plan_node(20),
+            exchange_plan_node(10, 1),
+        ]);
+
+        let err =
+            inject_dml_pre_expand_keyed_assert(&mut build_result, Some(&keyed_assert_for_test()))
+                .expect_err("multiple ChangeEventExpand nodes must fail");
+
+        assert!(
+            err.contains("exactly one ChangeEventExpand"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_dml_change_stream_write_applies_keyed_assert_before_observer() {
+        let _test_guard = crate::engine::acquire_standalone_test_guard();
+        let _observer = crate::engine::install_change_stream_write_test_observer(true);
+        let state = Arc::new(StandaloneState::default());
+        let mut plan = execution_test_plan();
+        plan.pre_expand_keyed_assert = Some(keyed_assert_for_test());
+
+        let err = execute_dml_change_stream_write(&state, &target_for_execution_test(), plan, None)
+            .expect_err("assert-bearing plan must be processed before the observer short-circuit");
+
+        assert!(
+            err.contains("requires exactly one ChangeEventExpand node, found 0"),
+            "unexpected error: {err}"
         );
     }
 

@@ -1089,22 +1089,15 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
             .expect("MOR UPDATE change-stream plan lock poisoned")
             .take()
             .ok_or_else(|| "MOR UPDATE change-stream plan was already consumed".to_string())?;
-        let planned = crate::engine::build_physical_plan_as_iceberg_change_stream_write(
+        let planned = crate::engine::dml_change_stream::plan_dml_change_stream_write(
             &self.state,
-            Some(&self.target.catalog),
-            &self.target.namespace,
-            &plan.producer,
-            &mut plan.dag,
-            None,
+            &self.target,
+            &mut plan,
         )?;
         let crate::engine::PlannedIcebergChangeStreamWrite {
-            mut build_result,
+            build_result,
             commit_plan,
         } = planned;
-        crate::engine::dml_change_stream::inject_dml_pre_expand_keyed_assert(
-            &mut build_result,
-            plan.pre_expand_keyed_assert.as_ref(),
-        )?;
         *self
             .commit_plan
             .lock()
@@ -3240,6 +3233,16 @@ mod tests {
         }
     }
 
+    fn non_null_col(name: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        }
+    }
+
     fn iceberg_target() -> crate::engine::backend_resolver::TargetBackend {
         crate::engine::backend_resolver::TargetBackend {
             backend_name: "iceberg",
@@ -3247,6 +3250,94 @@ mod tests {
             namespace: "db1".to_string(),
             table: "t".to_string(),
         }
+    }
+
+    fn optimizer_output_column(
+        name: &str,
+        column_id: u32,
+        data_type: DataType,
+        nullable: bool,
+        is_internal: bool,
+    ) -> crate::sql::analysis::OutputColumn {
+        crate::sql::analysis::OutputColumn {
+            column_id: crate::sql::column_id::ColumnId::new_for_test(column_id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal,
+        }
+    }
+
+    fn update_mor_expand_child_plan_for_test() -> crate::sql::optimizer::OptimizerPhysicalNode {
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
+        use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+        use crate::sql::optimizer::statistics::Statistics;
+
+        let output_columns = vec![
+            optimizer_output_column("__nr_file", 1, DataType::Utf8, false, true),
+            optimizer_output_column("__nr_pos", 2, DataType::Int64, false, true),
+            optimizer_output_column("__nr_row_id", 3, DataType::Int64, false, true),
+            optimizer_output_column("id", 4, DataType::Int64, false, false),
+            optimizer_output_column("qty", 5, DataType::Int64, true, false),
+            optimizer_output_column("__nr_new_qty", 6, DataType::Int64, true, true),
+        ];
+        let mut node = OptimizerPhysicalNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: Vec::new(),
+                columns: output_columns.clone(),
+            }),
+            children: Vec::new(),
+            stats: Statistics {
+                output_row_count: 3.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns,
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        crate::sql::optimizer::physical_tree::attach_scalar_arena(
+            &mut node,
+            Arc::new(crate::sql::optimizer::scalar::ScalarArena::new()),
+        );
+        node
+    }
+
+    fn output_column_by_name_for_test<'a>(
+        columns: &'a [crate::sql::analysis::OutputColumn],
+        name: &str,
+    ) -> &'a crate::sql::analysis::OutputColumn {
+        columns
+            .iter()
+            .find(|column| column.name == name)
+            .unwrap_or_else(|| panic!("missing output column {name}"))
+    }
+
+    fn assignment_expr_for_output(
+        event: &crate::sql::optimizer::operator::ChangeEventSpec,
+        output_column_id: crate::sql::column_id::ColumnId,
+    ) -> crate::sql::optimizer::scalar::ScalarId {
+        event
+            .assignments
+            .iter()
+            .find(|assignment| assignment.output_column_id == output_column_id)
+            .unwrap_or_else(|| panic!("missing assignment for output {output_column_id:?}"))
+            .expr
+            .expect("assignment expression")
+    }
+
+    fn assert_assignment_is_column_ref(
+        arena: &crate::sql::optimizer::scalar::ScalarArena,
+        expr: crate::sql::optimizer::scalar::ScalarId,
+        expected: u32,
+    ) {
+        assert_eq!(
+            arena.node(expr),
+            &crate::sql::optimizer::scalar::ScalarNode::ColumnRef(
+                crate::sql::column_id::ColumnId::new_for_test(expected)
+            )
+        );
     }
 
     #[test]
@@ -3287,6 +3378,112 @@ mod tests {
         assert_eq!(columns[0].data_type, DataType::Int64);
         assert_eq!(columns[1].data_type, DataType::LargeBinary);
         assert_eq!(columns[2].data_type, DataType::Binary);
+    }
+
+    #[test]
+    fn update_mor_change_event_expand_plan_has_expected_shape() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::Operator;
+        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+        use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
+
+        let target_columns = vec![non_null_col("id"), col("qty")];
+        let plan = build_update_mor_change_event_expand_plan(
+            update_mor_expand_child_plan_for_test(),
+            &target_columns,
+            77,
+        )
+        .expect("MOR UPDATE expand plan");
+        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
+            panic!("expected PhysicalChangeEventExpand");
+        };
+        assert_eq!(plan.children.len(), 1);
+        let Operator::PhysicalDistribution(distribution) = &plan.children[0].op else {
+            panic!("expected pre-expand PhysicalDistribution");
+        };
+        assert_eq!(
+            distribution.spec,
+            DistributionSpec::HashPartitioned {
+                cols: vec![crate::sql::column_id::ColumnId::new_for_test(3)],
+                source: HashSource::ShuffleAgg,
+            }
+        );
+
+        assert_eq!(expand.events.len(), 2);
+        assert_eq!(
+            expand.events[0].branch_kind,
+            ChangeStreamBranchKind::DeleteDv
+        );
+        assert_eq!(
+            expand.events[1].branch_kind,
+            ChangeStreamBranchKind::ReuseData
+        );
+
+        let file = output_column_by_name_for_test(&expand.output_columns, "_file");
+        let pos = output_column_by_name_for_test(&expand.output_columns, "_pos");
+        let id = output_column_by_name_for_test(&expand.output_columns, "id");
+        let qty = output_column_by_name_for_test(&expand.output_columns, "qty");
+        let row_id = output_column_by_name_for_test(&expand.output_columns, "_row_id");
+        let seq =
+            output_column_by_name_for_test(&expand.output_columns, "_last_updated_sequence_number");
+        let change_op = output_column_by_name_for_test(&expand.output_columns, "__change_op");
+        let route = output_column_by_name_for_test(&expand.output_columns, "__change_data_route");
+        assert!(file.is_internal);
+        assert!(pos.is_internal);
+        assert!(!id.is_internal);
+        assert!(!qty.is_internal);
+        assert!(row_id.is_internal);
+        assert!(seq.is_internal);
+        assert!(change_op.is_internal);
+        assert!(route.is_internal);
+        assert_eq!(expand.change_op_column_id, change_op.column_id);
+        assert_eq!(expand.data_route_column_id, Some(route.column_id));
+        assert_eq!(plan.output_columns.len(), expand.output_columns.len());
+        assert!(
+            plan.output_columns
+                .iter()
+                .zip(&expand.output_columns)
+                .all(|(left, right)| left.column_id == right.column_id
+                    && left.name == right.name
+                    && left.is_internal == right.is_internal)
+        );
+
+        let arena = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("scalar arena");
+        let delete = &expand.events[0];
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(delete, file.column_id),
+            1,
+        );
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(delete, pos.column_id),
+            2,
+        );
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(delete, id.column_id), 4);
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(delete, qty.column_id),
+            5,
+        );
+
+        let reuse = &expand.events[1];
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(reuse, id.column_id), 4);
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(reuse, qty.column_id), 6);
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(reuse, row_id.column_id),
+            3,
+        );
+        let seq_expr = assignment_expr_for_output(reuse, seq.column_id);
+        assert_eq!(
+            arena.node(seq_expr),
+            &ScalarNode::Literal(HashableLiteral(crate::sql::analysis::LiteralValue::Int(77)))
+        );
     }
 
     #[test]
@@ -3371,12 +3568,12 @@ mod tests {
             .next()
             .expect("MorUpdateChangeStreamExecutor run_coordinated_write");
         assert!(
-            mor_executor.contains("build_physical_plan_as_iceberg_change_stream_write"),
-            "MOR UPDATE must build a W10 change-stream write DAG"
+            mor_executor.contains("plan_dml_change_stream_write"),
+            "MOR UPDATE must build the W10 change-stream write DAG through the shared DML path"
         );
         assert!(
-            mor_executor.contains("inject_dml_pre_expand_keyed_assert"),
-            "MOR UPDATE must insert keyed AssertNumRows before ChangeEventExpand"
+            !mor_executor.contains("build_physical_plan_as_iceberg_change_stream_write"),
+            "MOR UPDATE must not bypass the shared DML change-stream planning path"
         );
         let commit = production_source
             .split("impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor")
