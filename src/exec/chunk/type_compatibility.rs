@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The single recursive type compatibility check for the execution layer.
+//! Exact runtime descriptor type checks for the execution layer.
 //!
 //! This is the keystone of the distributed-execution target architecture
 //! (pillar P1, see `docs/design/specs/2026-06-12-distributed-execution-target-architecture.md`).
-//! It is the one place that answers "is column type `actual` compatible with the
+//! It is the one place that answers "does column type `actual` exactly match the
 //! authoritative descriptor type `expected`?". It replaces the five hand-rolled
 //! copies of that predicate that drifted apart:
 //!   - `exec::chunk::schema::is_compatible_chunk_field_type` / `reconcile_chunk_data_type`
@@ -28,8 +28,7 @@
 //!   - `exec::expr::agg::functions::array_agg::reconcile_data_type`
 //!
 //! Deliberate decisions encoded here (resolved divergences across those copies):
-//!   - decimal is scale-strict; `SameScaleWiden` permits a precision difference
-//!     only within the same physical width (never Decimal128 <-> Decimal256).
+//!   - decimal is precision-and-scale strict.
 //!   - `Map` `ordered` flags must match.
 //!   - `List` and `LargeList` are never compatible with each other.
 //!   - structs are checked by POSITION, ignoring field names (Arrow field names are
@@ -40,29 +39,10 @@
 //!
 //! Type only: this check says nothing about nullability. Field-level
 //! nullability reconciliation (and the root-boundary `required -> null`
-//! fail-fast) is a separate concern layered on top when call sites are rewired.
-#![allow(dead_code)] // Staged foundation: wired into exchange/sort/aggregate by the
-// descriptor-authoritative migration (P3/P5). Unused until then.
+//! fail-fast) is a separate concern layered on top at descriptor boundaries.
 
 use arrow::array::{Array, ArrayData, ArrayRef, make_array};
-use arrow::datatypes::{DataType, Field};
-
-/// The compatibility policy parameter for [`check`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompatibilityPolicy {
-    /// Arrow-structural identity: same discriminant and same scalar parameters
-    /// (decimal precision AND scale, timestamp unit/tz), recursing children by
-    /// position while ignoring field names. Used where the descriptor type must
-    /// be reproduced exactly (post-materialization, final output boundary).
-    ExactArrow,
-    /// Internal-transport tolerance: a decimal may differ in precision at the
-    /// same scale within the same physical width (never Decimal128 <-> Decimal256),
-    /// a timestamp may differ in unit/tz, and Utf8 <-> Binary are interchangeable.
-    /// Children recurse by position; `List` != `LargeList`; `Map` `ordered` must
-    /// match. Used for the metadata-only retag the exchange receiver applies to
-    /// materialize a decoded column to its registered descriptor.
-    SameScaleWiden,
-}
+use arrow::datatypes::DataType;
 
 /// One step on the path from a top-level type to a nested mismatch, for
 /// diagnostics that can name `col.field[2].list.item` precisely.
@@ -80,7 +60,7 @@ pub(crate) enum NestedStep {
 /// type-mismatch arm of the engine error enum).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TypeMismatchKind {
-    /// Non-compatible scalars (e.g. Int32 vs Int64; Utf8 vs Binary under `ExactArrow`).
+    /// Non-compatible scalars (e.g. Int32 vs Int64; Utf8 vs Binary).
     ScalarMismatch,
     /// Decimal scales differ (never permitted under any policy).
     DecimalScaleMismatch,
@@ -94,35 +74,28 @@ pub(crate) enum TypeMismatchKind {
     StructArityMismatch,
 }
 
-/// A structured type mismatch produced by [`check`].
+/// A structured type mismatch produced by [`check_exact`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TypeMismatch {
     pub nested_path: Vec<NestedStep>,
     pub expected: DataType,
     pub actual: DataType,
-    pub policy: CompatibilityPolicy,
     pub kind: TypeMismatchKind,
 }
 
-/// The one recursive compatibility check. Returns `Ok(())` when `actual` is
-/// compatible with the authoritative `expected` under `policy` (and therefore retaggable to
-/// `expected`), or a structured [`TypeMismatch`] otherwise.
-pub(crate) fn check(
-    expected: &DataType,
-    actual: &DataType,
-    policy: CompatibilityPolicy,
-) -> Result<(), TypeMismatch> {
+/// The one recursive descriptor check. Returns `Ok(())` when `actual` exactly
+/// matches the authoritative `expected`, or a structured [`TypeMismatch`]
+/// otherwise.
+pub(crate) fn check_exact(expected: &DataType, actual: &DataType) -> Result<(), TypeMismatch> {
     let mut path = Vec::new();
-    check_inner(expected, actual, policy, &mut path)
+    check_exact_inner(expected, actual, &mut path)
 }
 
-fn check_inner(
+fn check_exact_inner(
     expected: &DataType,
     actual: &DataType,
-    policy: CompatibilityPolicy,
     path: &mut Vec<NestedStep>,
 ) -> Result<(), TypeMismatch> {
-    use CompatibilityPolicy::{ExactArrow, SameScaleWiden};
     use DataType::*;
     use TypeMismatchKind::*;
 
@@ -134,7 +107,6 @@ fn check_inner(
         nested_path: path.to_vec(),
         expected: expected.clone(),
         actual: actual.clone(),
-        policy,
         kind,
     };
 
@@ -142,30 +114,27 @@ fn check_inner(
         (Decimal128(ep, es), Decimal128(ap, as_)) | (Decimal256(ep, es), Decimal256(ap, as_)) => {
             if es != as_ {
                 Err(mismatch(DecimalScaleMismatch, path))
+            } else if ep == ap {
+                Ok(())
             } else {
-                match policy {
-                    SameScaleWiden => Ok(()),
-                    ExactArrow if ep == ap => Ok(()),
-                    ExactArrow => Err(mismatch(ScalarMismatch, path)),
-                }
+                Err(mismatch(ScalarMismatch, path))
             }
         }
         (Decimal128(..), Decimal256(..)) | (Decimal256(..), Decimal128(..)) => {
             Err(mismatch(DecimalWidthCross, path))
         }
-        (Timestamp(_, _), Timestamp(_, _)) | (Utf8, Binary) | (Binary, Utf8) => match policy {
-            SameScaleWiden => Ok(()),
-            ExactArrow => Err(mismatch(ScalarMismatch, path)),
-        },
+        (Timestamp(_, _), Timestamp(_, _)) | (Utf8, Binary) | (Binary, Utf8) => {
+            Err(mismatch(ScalarMismatch, path))
+        }
         (List(ef), List(af)) => {
             path.push(NestedStep::ListItem);
-            let r = check_inner(ef.data_type(), af.data_type(), policy, path);
+            let r = check_exact_inner(ef.data_type(), af.data_type(), path);
             path.pop();
             r
         }
         (LargeList(ef), LargeList(af)) => {
             path.push(NestedStep::LargeListItem);
-            let r = check_inner(ef.data_type(), af.data_type(), policy, path);
+            let r = check_exact_inner(ef.data_type(), af.data_type(), path);
             path.pop();
             r
         }
@@ -179,11 +148,11 @@ fn check_inner(
             let (ek, ev) = map_key_value(ef).ok_or_else(|| mismatch(ScalarMismatch, path))?;
             let (ak, av) = map_key_value(af).ok_or_else(|| mismatch(ScalarMismatch, path))?;
             path.push(NestedStep::MapKey);
-            let rk = check_inner(ek, ak, policy, path);
+            let rk = check_exact_inner(ek, ak, path);
             path.pop();
             rk?;
             path.push(NestedStep::MapValue);
-            let rv = check_inner(ev, av, policy, path);
+            let rv = check_exact_inner(ev, av, path);
             path.pop();
             rv
         }
@@ -193,7 +162,7 @@ fn check_inner(
             }
             for (idx, (e, a)) in ef.iter().zip(af.iter()).enumerate() {
                 path.push(NestedStep::StructField(idx));
-                let r = check_inner(e.data_type(), a.data_type(), policy, path);
+                let r = check_exact_inner(e.data_type(), a.data_type(), path);
                 path.pop();
                 r?;
             }
@@ -204,15 +173,16 @@ fn check_inner(
 }
 
 /// Retag `array` so its type equals `target`, changing only metadata — never a
-/// single value. This is the surviving "normalize" primitive the exchange
-/// receiver uses to materialize a decoded column to its registered descriptor
-/// (pillar P3). The legitimate cases are: identity; a decimal precision change
-/// at the SAME scale within the same physical width (an `i128`/`i256` buffer is
+/// single value. This is an explicit metadata-only rebuild primitive, not a
+/// compatibility policy. Descriptor-bound runtime callers must run
+/// [`check_exact`] before using it.
+///
+/// The legitimate retag cases are: identity; a decimal precision change at the
+/// SAME scale within the same physical width (an `i128`/`i256` buffer is
 /// reinterpreted, values untouched); `Utf8` <-> `Binary` (identical physical
 /// layout); and recursion into `List` / `LargeList` / `Struct` / `Map` children.
 /// Any difference that is not a pure relabel (e.g. a timestamp unit change, or
-/// `Decimal128` <-> `Decimal256`) returns `Err`; under pillar P2 the sender and
-/// receiver descriptors agree by construction so those do not arise.
+/// `Decimal128` <-> `Decimal256`) returns `Err`.
 pub(crate) fn retag_column(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, TypeMismatch> {
     let data = retag_data(array.to_data(), target, &mut Vec::new())?;
     Ok(make_array(data))
@@ -313,19 +283,8 @@ fn retag_mismatch(
         nested_path: path.to_vec(),
         expected: expected.clone(),
         actual: actual.clone(),
-        policy: CompatibilityPolicy::SameScaleWiden,
         kind,
     }
-}
-
-/// The one Field-level nullability merge rule across exchange / sort / chunk
-/// boundaries: a merged field is nullable if EITHER side is (OR). This is the
-/// single source of truth replacing the scattered `expected || actual` sites.
-///
-/// Descriptor nullability is the contract; runtime nullability may widen it
-/// when a producer observes NULL values. Type selection stays descriptor-led.
-pub(crate) fn merge_fields_nullability(expected: &Field, actual: &Field) -> bool {
-    expected.is_nullable() || actual.is_nullable()
 }
 
 pub(crate) fn nested_path_label(root: &str, path: &[NestedStep]) -> String {
@@ -359,9 +318,8 @@ fn map_key_value(entries: &arrow::datatypes::FieldRef) -> Option<(&DataType, &Da
 
 #[cfg(test)]
 mod tests {
-    use super::CompatibilityPolicy::{ExactArrow, SameScaleWiden};
     use super::TypeMismatchKind::*;
-    use super::{NestedStep, check, merge_fields_nullability, nested_path_label, retag_column};
+    use super::{NestedStep, check_exact, nested_path_label, retag_column};
     use arrow::array::{
         Array, ArrayRef, BinaryArray, Decimal128Array, Int32Array, Int64Array, ListArray,
         StringArray, StructArray,
@@ -403,63 +361,54 @@ mod tests {
     }
 
     #[test]
-    fn identical_scalars_pass_under_any_policy() {
-        assert!(check(&DataType::Int64, &DataType::Int64, ExactArrow).is_ok());
-        assert!(check(&DataType::Int64, &DataType::Int64, SameScaleWiden).is_ok());
+    fn identical_scalars_pass_exact_check() {
+        assert!(check_exact(&DataType::Int64, &DataType::Int64).is_ok());
     }
 
     #[test]
     fn distinct_scalars_are_a_scalar_mismatch() {
-        let err = check(&DataType::Int32, &DataType::Int64, SameScaleWiden).unwrap_err();
+        let err = check_exact(&DataType::Int32, &DataType::Int64).unwrap_err();
         assert_eq!(err.kind, ScalarMismatch);
         assert!(err.nested_path.is_empty());
     }
 
     #[test]
-    fn same_scale_decimal_widens_precision_both_directions() {
-        assert!(check(&d128(20, 2), &d128(38, 2), SameScaleWiden).is_ok());
-        assert!(check(&d128(38, 2), &d128(20, 2), SameScaleWiden).is_ok());
-    }
-
-    #[test]
-    fn exact_arrow_rejects_decimal_precision_difference() {
-        let err = check(&d128(20, 2), &d128(38, 2), ExactArrow).unwrap_err();
+    fn exact_check_rejects_decimal_precision_difference() {
+        let err = check_exact(&d128(20, 2), &d128(38, 2)).unwrap_err();
         assert_eq!(err.kind, ScalarMismatch);
     }
 
     #[test]
-    fn decimal_scale_difference_is_never_compatible() {
-        let err = check(&d128(20, 2), &d128(20, 3), SameScaleWiden).unwrap_err();
-        assert_eq!(err.kind, DecimalScaleMismatch);
-        let err = check(&d128(20, 2), &d128(20, 3), ExactArrow).unwrap_err();
+    fn decimal_scale_difference_is_not_exact() {
+        let err = check_exact(&d128(20, 2), &d128(20, 3)).unwrap_err();
         assert_eq!(err.kind, DecimalScaleMismatch);
     }
 
     #[test]
-    fn decimal128_and_decimal256_are_never_compatible() {
-        let err = check(&d128(20, 2), &d256(20, 2), SameScaleWiden).unwrap_err();
+    fn decimal128_and_decimal256_are_not_exact() {
+        let err = check_exact(&d128(20, 2), &d256(20, 2)).unwrap_err();
         assert_eq!(err.kind, DecimalWidthCross);
-        let err = check(&d256(20, 2), &d128(20, 2), SameScaleWiden).unwrap_err();
+        let err = check_exact(&d256(20, 2), &d128(20, 2)).unwrap_err();
         assert_eq!(err.kind, DecimalWidthCross);
     }
 
     #[test]
-    fn timestamp_unit_tolerated_only_under_widen() {
+    fn timestamp_unit_difference_is_not_exact() {
         let us = DataType::Timestamp(TimeUnit::Microsecond, None);
         let ns = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
-        assert!(check(&us, &ns, SameScaleWiden).is_ok());
-        assert_eq!(
-            check(&us, &ns, ExactArrow).unwrap_err().kind,
-            ScalarMismatch
-        );
+        assert_eq!(check_exact(&us, &ns).unwrap_err().kind, ScalarMismatch);
     }
 
     #[test]
-    fn utf8_binary_interchangeable_only_under_widen() {
-        assert!(check(&DataType::Utf8, &DataType::Binary, SameScaleWiden).is_ok());
-        assert!(check(&DataType::Binary, &DataType::Utf8, SameScaleWiden).is_ok());
+    fn utf8_binary_difference_is_not_exact() {
         assert_eq!(
-            check(&DataType::Utf8, &DataType::Binary, ExactArrow)
+            check_exact(&DataType::Utf8, &DataType::Binary)
+                .unwrap_err()
+                .kind,
+            ScalarMismatch
+        );
+        assert_eq!(
+            check_exact(&DataType::Binary, &DataType::Utf8)
                 .unwrap_err()
                 .kind,
             ScalarMismatch
@@ -468,30 +417,23 @@ mod tests {
 
     #[test]
     fn list_recurses_into_item_with_path() {
-        assert!(check(&list(d128(20, 2)), &list(d128(38, 2)), SameScaleWiden).is_ok());
-        let err = check(&list(d128(20, 2)), &list(d128(20, 3)), SameScaleWiden).unwrap_err();
+        let err = check_exact(&list(d128(20, 2)), &list(d128(20, 3))).unwrap_err();
         assert_eq!(err.kind, DecimalScaleMismatch);
         assert_eq!(err.nested_path, vec![NestedStep::ListItem]);
     }
 
     #[test]
     fn list_and_large_list_are_never_compatible() {
-        let err = check(
-            &list(DataType::Int64),
-            &large_list(DataType::Int64),
-            SameScaleWiden,
-        )
-        .unwrap_err();
+        let err = check_exact(&list(DataType::Int64), &large_list(DataType::Int64)).unwrap_err();
         assert_eq!(err.kind, ListKindMismatch);
     }
 
     #[test]
     fn list_struct_collapse_is_dropped() {
         // The historical List<->Struct[len==1] tolerance is deliberately removed.
-        let err = check(
+        let err = check_exact(
             &list(DataType::Int32),
             &strukt(vec![("f", DataType::Int32)]),
-            SameScaleWiden,
         )
         .unwrap_err();
         assert_eq!(err.kind, ListKindMismatch);
@@ -499,30 +441,23 @@ mod tests {
 
     #[test]
     fn struct_is_checked_by_position_ignoring_names() {
-        // Same positions/types, different field names -> Ok even under ExactArrow.
         let a = strukt(vec![("a", DataType::Int64), ("b", d128(20, 2))]);
-        let b = strukt(vec![("x", DataType::Int64), ("y", d128(38, 2))]);
-        assert!(check(&a, &b, SameScaleWiden).is_ok());
-        let a2 = strukt(vec![("a", DataType::Int64)]);
-        let b2 = strukt(vec![("z", DataType::Int64)]);
-        assert!(check(&a2, &b2, ExactArrow).is_ok());
+        let b = strukt(vec![("x", DataType::Int64), ("y", d128(20, 2))]);
+        assert!(check_exact(&a, &b).is_ok());
     }
 
     #[test]
     fn struct_arity_mismatch_is_reported() {
         let a = strukt(vec![("a", DataType::Int64), ("b", DataType::Int64)]);
         let b = strukt(vec![("a", DataType::Int64)]);
-        assert_eq!(
-            check(&a, &b, SameScaleWiden).unwrap_err().kind,
-            StructArityMismatch
-        );
+        assert_eq!(check_exact(&a, &b).unwrap_err().kind, StructArityMismatch);
     }
 
     #[test]
     fn struct_child_mismatch_carries_field_path() {
         let a = strukt(vec![("a", DataType::Int64), ("b", d128(20, 2))]);
         let b = strukt(vec![("a", DataType::Int64), ("b", d128(20, 3))]);
-        let err = check(&a, &b, SameScaleWiden).unwrap_err();
+        let err = check_exact(&a, &b).unwrap_err();
         assert_eq!(err.kind, DecimalScaleMismatch);
         assert_eq!(err.nested_path, vec![NestedStep::StructField(1)]);
     }
@@ -532,7 +467,7 @@ mod tests {
         let expected = strukt(vec![("items", list(DataType::Int32))]);
         let actual = strukt(vec![("items", list(DataType::Int64))]);
 
-        let err = check(&expected, &actual, ExactArrow).unwrap_err();
+        let err = check_exact(&expected, &actual).unwrap_err();
 
         assert_eq!(
             err.nested_path,
@@ -553,9 +488,7 @@ mod tests {
         let ordered = map(DataType::Utf8, DataType::Int64, true);
         let unordered = map(DataType::Utf8, DataType::Int64, false);
         assert_eq!(
-            check(&ordered, &unordered, SameScaleWiden)
-                .unwrap_err()
-                .kind,
+            check_exact(&ordered, &unordered).unwrap_err().kind,
             MapOrderingMismatch
         );
     }
@@ -564,15 +497,17 @@ mod tests {
     fn map_recurses_into_key_and_value() {
         let a = map(DataType::Utf8, d128(20, 2), false);
         let b = map(DataType::Utf8, d128(38, 2), false);
-        assert!(check(&a, &b, SameScaleWiden).is_ok());
+        let err = check_exact(&a, &b).unwrap_err();
+        assert_eq!(err.kind, ScalarMismatch);
+        assert_eq!(err.nested_path, vec![NestedStep::MapValue]);
 
         let bad_value = map(DataType::Utf8, d128(20, 3), false);
-        let err = check(&a, &bad_value, SameScaleWiden).unwrap_err();
+        let err = check_exact(&a, &bad_value).unwrap_err();
         assert_eq!(err.kind, DecimalScaleMismatch);
         assert_eq!(err.nested_path, vec![NestedStep::MapValue]);
 
         let bad_key = map(DataType::Int64, d128(20, 2), false);
-        let err = check(&a, &bad_key, SameScaleWiden).unwrap_err();
+        let err = check_exact(&a, &bad_key).unwrap_err();
         assert_eq!(err.kind, ScalarMismatch);
         assert_eq!(err.nested_path, vec![NestedStep::MapKey]);
     }
@@ -583,17 +518,7 @@ mod tests {
         // but the item types match.
         let non_null_item = DataType::List(Arc::new(Field::new("item", DataType::Int64, false)));
         let null_item = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
-        assert!(check(&non_null_item, &null_item, ExactArrow).is_ok());
-    }
-
-    #[test]
-    fn merge_fields_nullability_is_or_rule() {
-        let req = Field::new("f", DataType::Int64, false);
-        let nul = Field::new("f", DataType::Int64, true);
-        assert!(!merge_fields_nullability(&req, &req));
-        assert!(merge_fields_nullability(&req, &nul));
-        assert!(merge_fields_nullability(&nul, &req));
-        assert!(merge_fields_nullability(&nul, &nul));
+        assert!(check_exact(&non_null_item, &null_item).is_ok());
     }
 
     fn decimal128(values: Vec<i128>, p: u8, s: i8) -> ArrayRef {
@@ -616,7 +541,7 @@ mod tests {
         let arr = decimal128(vec![123, -45], 18, 2);
         let out = retag_column(&arr, &DataType::Decimal128(38, 2)).expect("retag");
         assert_eq!(out.data_type(), &DataType::Decimal128(38, 2));
-        assert!(check(&DataType::Decimal128(38, 2), out.data_type(), ExactArrow).is_ok());
+        assert!(check_exact(&DataType::Decimal128(38, 2), out.data_type()).is_ok());
         let d = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
         assert_eq!(d.value(0), 123);
         assert_eq!(d.value(1), -45);

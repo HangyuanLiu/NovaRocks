@@ -22,7 +22,7 @@
 //! - Keep sorting algorithms isolated from operator state transitions.
 
 use crate::exec::chunk::Chunk;
-use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check, retag_column};
+use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use arrow::array::{
     Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int8Array, ListArray, MapArray,
     StructArray, UInt64Array,
@@ -60,10 +60,6 @@ pub(crate) fn concat_sort_chunks(chunks: &[Chunk]) -> Result<RecordBatch, String
 }
 
 fn sort_field_from_array(field: &Field, array: &ArrayRef) -> Field {
-    // No decimal-precision widening: sort uses the array's own (operator-assigned)
-    // type. Planning (pillar P2) makes cross-fragment decimal types canonical, so
-    // the merged concat schema is the first chunk's actual type and the remaining
-    // chunks are same-scale retagged to it by `normalize_sort_array_for_field`.
     Field::new(
         field.name(),
         array.data_type().clone(),
@@ -104,12 +100,7 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
             let actual = schema.field(idx);
             let actual = sort_field_from_array(actual, chunk.batch.column(idx));
             if expected.name() != actual.name()
-                || check(
-                    expected.data_type(),
-                    actual.data_type(),
-                    CompatibilityPolicy::SameScaleWiden,
-                )
-                .is_err()
+                || check_exact(expected.data_type(), actual.data_type()).is_err()
             {
                 return Err(format!(
                     "sort schema field mismatch at index {}: expected=({}, {:?}) actual=({}, {:?})",
@@ -140,9 +131,15 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
 }
 
 fn normalize_sort_array_for_field(array: &ArrayRef, field: &Field) -> Result<ArrayRef, String> {
-    // Metadata-only retag of the column to the merged concat schema's type, via
-    // the shared compatibility primitive (same-scale decimal / utf8<->binary /
-    // recursive). Replaces the sort-local decimal retag helpers.
+    if let Err(mismatch) = check_exact(field.data_type(), array.data_type()) {
+        return Err(format!(
+            "sort payload type mismatch for field {}: array={:?} field={:?} ({:?})",
+            field.name(),
+            array.data_type(),
+            field.data_type(),
+            mismatch.kind
+        ));
+    }
     retag_column(array, field.data_type()).map_err(|m| {
         format!(
             "sort payload retag failed for field {}: array={:?} field={:?} ({:?})",
@@ -318,6 +315,77 @@ pub(crate) fn append_stable_row_index_sort_column(
             nulls_first: true,
         }),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::ChunkSchema;
+    use arrow::array::StringArray;
+
+    fn decimal_chunk(precision: u8, scale: i8, value: i128) -> Chunk {
+        let data_type = DataType::Decimal128(precision, scale);
+        let array = Decimal128Array::from(vec![Some(value)])
+            .with_precision_and_scale(precision, scale)
+            .expect("decimal array");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "price",
+            data_type.clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array) as ArrayRef])
+            .expect("record batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema");
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+    }
+
+    #[test]
+    fn merged_sort_schema_rejects_decimal_precision_drift() {
+        let left = decimal_chunk(10, 2, 1234);
+        let right = decimal_chunk(38, 2, 5678);
+
+        let err = merged_sort_schema_for_chunks(&[left, right])
+            .expect_err("sort concat must reject decimal precision drift");
+
+        assert!(err.contains("sort schema field mismatch"), "err={err}");
+        assert!(err.contains("Decimal128(10, 2)"), "err={err}");
+        assert!(err.contains("Decimal128(38, 2)"), "err={err}");
+    }
+
+    #[test]
+    fn normalize_sort_batch_rejects_utf8_binary_type_drift() {
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![Arc::new(StringArray::from(vec![Some("abc")])) as ArrayRef],
+        )
+        .expect("record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            source_schema.as_ref(),
+            &[SlotId::new(7)],
+        )
+        .expect("chunk schema");
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            true,
+        )]));
+
+        let err = normalize_sort_batch_for_schema(&chunk, &target_schema, 0)
+            .expect_err("sort normalize must reject Utf8/Binary descriptor drift");
+
+        assert!(err.contains("sort payload type mismatch"), "err={err}");
+        assert!(err.contains("Utf8"), "err={err}");
+        assert!(err.contains("Binary"), "err={err}");
+    }
 }
 
 pub(crate) use chunks_sorter_full_sort::ChunksSorterFullSort;

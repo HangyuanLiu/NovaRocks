@@ -28,7 +28,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
-use crate::exec::chunk::type_compatibility::retag_column;
+use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label, retag_column};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::debug;
@@ -931,15 +931,29 @@ fn normalize_exchange_array_for_field(
     array: &ArrayRef,
     field: &arrow::datatypes::Field,
 ) -> Result<ArrayRef, String> {
-    // Metadata-only retag of the column to the wire contract schema's type, via
-    // the shared compatibility primitive (same-scale decimal / utf8<->binary /
-    // recursive). Replaces the exchange-local decimal retag helpers.
+    check_exchange_data_type(field.data_type(), array.data_type(), field.name())?;
     retag_column(array, field.data_type()).map_err(|m| {
         format!(
             "exchange array retag failed for field {}: array={:?} field={:?} ({:?})",
             field.name(),
             array.data_type(),
             field.data_type(),
+            m.kind
+        )
+    })
+}
+
+fn check_exchange_data_type(
+    expected: &arrow::datatypes::DataType,
+    actual: &arrow::datatypes::DataType,
+    root_label: &str,
+) -> Result<(), String> {
+    check_exact(expected, actual).map_err(|m| {
+        format!(
+            "exchange schema type mismatch at {}: expected {:?}, got {:?} ({:?})",
+            nested_path_label(root_label, &m.nested_path),
+            expected,
+            actual,
             m.kind
         )
     })
@@ -1080,13 +1094,9 @@ fn chunk_from_exchange_batch(
     Chunk::try_new_with_chunk_schema(batch, chunk_schema)
 }
 
-/// Descriptor-authoritative decode (pillar P3): the RECEIVER is the type
-/// authority. Each decoded column is materialized (metadata-only retag) to the
-/// Arrow type derived from the receiver's registered descriptor, so downstream
-/// operators never see the sender's wire type. Returns the materialized batch
-/// alongside the chunk schema. When nothing needs retagging (the common case
-/// once planning makes types deterministic), the original batch is returned
-/// unchanged so a zero-column batch keeps its row count.
+/// Descriptor-authoritative decode: the receiver's registered chunk schema is
+/// the exact Arrow type contract. Decoded columns may be rebuilt to the
+/// receiver's field metadata and slot namespace, but type drift fails here.
 fn materialize_chunk_for_wire_meta(
     expected_chunk_schema: Option<&ChunkSchemaRef>,
     batch: &RecordBatch,
@@ -1157,8 +1167,8 @@ fn materialize_chunk_for_wire_meta(
 
         let expected_arrow_type = expected_slot.data_type();
         if field.data_type() != expected_arrow_type {
-            // Receiver is the type authority: materialize the decoded column
-            // to the registered descriptor type (metadata-only retag).
+            let root = format!("slot {}", expected_slot.slot_id());
+            check_exchange_data_type(expected_arrow_type, field.data_type(), &root)?;
             out_column = crate::exec::chunk::type_compatibility::retag_column(
                 batch.column(idx),
                 expected_arrow_type,
@@ -1507,11 +1517,9 @@ mod tests {
     fn encode_chunks_preserves_decimal128_values_exceeding_declared_precision() {
         // Descriptor-authoritative exchange (pillar P3): the sender writes its
         // OWN type verbatim — it no longer widens decimal precision to 38. The
-        // i128 payload is preserved regardless of the precision tag, so an
-        // over-precision value survives the round trip. With no registered
-        // receiver descriptor (`decode_chunks`), the decoded type is the wire
-        // type (the sender's Decimal128(20, 2)); a registered descriptor would
-        // materialize it to that descriptor's precision instead.
+        // i128 payload is preserved regardless of the precision tag. With no
+        // registered receiver descriptor (`decode_chunks`), the decoded type is
+        // the sender's wire type; a registered descriptor must match exactly.
         let value = 100_000_000_000_000_000_000_i128;
         let chunk = decimal128_chunk_with_over_precision_value(value);
 
@@ -1531,10 +1539,126 @@ mod tests {
     }
 
     #[test]
-    fn decode_root_result_chunks_retags_decimal_to_expected_descriptor_type() {
+    fn decode_root_result_chunks_rejects_decimal_precision_drift() {
         let value = 100_000_000_000_000_000_000_i128;
         let chunk = decimal128_chunk_with_over_precision_value(value);
         let payload = encode_chunks(&[chunk], true).expect("encode");
+        let expected_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::try_from_type_desc(
+                    SlotId::new(55),
+                    "price",
+                    true,
+                    decimal_type_desc(types::TPrimitiveType::DECIMAL128, 38, 2),
+                    None,
+                )
+                .expect("expected decimal slot"),
+            ])
+            .expect("expected chunk schema"),
+        );
+
+        let err = decode_root_result_chunks(&payload, Some(&expected_schema))
+            .expect_err("root result decode must reject decimal precision drift");
+
+        assert!(err.contains("exchange schema type mismatch"), "err={err}");
+        assert!(err.contains("slot 55"), "err={err}");
+        assert!(err.contains("Decimal128(38, 2)"), "err={err}");
+        assert!(err.contains("Decimal128(20, 2)"), "err={err}");
+    }
+
+    #[test]
+    fn decode_chunks_for_sender_rejects_decimal_precision_drift() {
+        let key = ExchangeKey {
+            finst_id_hi: 601,
+            finst_id_lo: 602,
+            node_id: 33,
+        };
+        let expected_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::try_from_type_desc(
+                    SlotId::new(55),
+                    "price",
+                    true,
+                    decimal_type_desc(types::TPrimitiveType::DECIMAL128, 38, 2),
+                    None,
+                )
+                .expect("expected decimal slot"),
+            ])
+            .expect("expected chunk schema"),
+        );
+        register_expected_chunk_schema(key, 1, expected_schema).expect("register expected schema");
+
+        let chunk = decimal128_chunk_with_over_precision_value(1234_i128);
+        let payload = encode_chunks(&[chunk], true).expect("encode drifted decimal chunk");
+
+        let err = decode_chunks_for_sender(key, 3, 1, &payload)
+            .expect_err("exchange decode must reject decimal precision drift");
+
+        assert!(err.contains("exchange schema type mismatch"), "err={err}");
+        assert!(err.contains("slot 55"), "err={err}");
+        assert!(err.contains("Decimal128(38, 2)"), "err={err}");
+        assert!(err.contains("Decimal128(20, 2)"), "err={err}");
+        cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn decode_root_result_chunks_rejects_utf8_binary_type_drift() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some("abc")])) as ArrayRef],
+        )
+        .expect("record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(56)],
+        )
+        .expect("chunk schema");
+        let payload = encode_chunks(&[Chunk::new_with_chunk_schema(batch, chunk_schema)], true)
+            .expect("encode");
+        let expected_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(56),
+                Field::new("payload", DataType::Binary, true),
+                None,
+                None,
+            )])
+            .expect("expected chunk schema"),
+        );
+
+        let err = decode_root_result_chunks(&payload, Some(&expected_schema))
+            .expect_err("root result decode must reject Utf8/Binary drift");
+
+        assert!(err.contains("exchange schema type mismatch"), "err={err}");
+        assert!(err.contains("slot 56"), "err={err}");
+        assert!(err.contains("Binary"), "err={err}");
+        assert!(err.contains("Utf8"), "err={err}");
+    }
+
+    #[test]
+    fn decode_root_result_chunks_preserves_exact_decimal_descriptor_type() {
+        let value = 1234_i128;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "price",
+            DataType::Decimal128(38, 2),
+            true,
+        )]));
+        let array = Decimal128Array::from(vec![Some(value)])
+            .with_precision_and_scale(38, 2)
+            .expect("decimal array");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(array) as ArrayRef]).expect("record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(55)],
+        )
+        .expect("chunk schema");
+        let payload = encode_chunks(&[Chunk::new_with_chunk_schema(batch, chunk_schema)], true)
+            .expect("encode");
         let expected_schema = Arc::new(
             ChunkSchema::try_new(vec![
                 ChunkSlotSchema::try_from_type_desc(
@@ -1553,14 +1677,10 @@ mod tests {
             decode_root_result_chunks(&payload, Some(&expected_schema)).expect("decode root");
 
         assert_eq!(decoded.len(), 1);
-        let array = decoded[0]
-            .batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .expect("decimal128 array");
-        assert_eq!(array.data_type(), &DataType::Decimal128(38, 2));
-        assert_eq!(array.value(0), value);
+        assert_eq!(
+            decoded[0].batch.schema().field(0).data_type(),
+            &DataType::Decimal128(38, 2)
+        );
         assert_eq!(
             decoded[0].chunk_schema().slots()[0].slot_id(),
             SlotId::new(55)
@@ -1772,10 +1892,7 @@ mod tests {
         let payload = encode_chunks(&[wire_chunk], true).expect("encode drifted chunk");
         let err = decode_chunks_for_sender(key, 3, 1, &payload)
             .expect_err("numeric payload must not pass as an opaque aggregate state");
-        assert!(
-            err.contains("exchange decoded arrow type mismatch"),
-            "err={err}"
-        );
+        assert!(err.contains("exchange schema type mismatch"), "err={err}");
 
         cancel_exchange_key(key);
     }

@@ -660,10 +660,9 @@ fn align_fetch_chunk_to_output_columns(
     let mut arrays = Vec::with_capacity(output_columns.len());
     for (idx, output) in output_columns.iter().enumerate() {
         let array = chunk.batch.column(idx).clone();
-        if let Err(mismatch) = crate::exec::chunk::type_compatibility::check(
+        if let Err(mismatch) = crate::exec::chunk::type_compatibility::check_exact(
             &output.data_type,
             array.data_type(),
-            crate::exec::chunk::type_compatibility::CompatibilityPolicy::SameScaleWiden,
         ) {
             return Err(format!(
                 "typed root result column {idx} type mismatch: output={:?} chunk={:?} ({:?})",
@@ -1573,64 +1572,66 @@ mod tests {
     }
 
     #[test]
-    fn typed_root_alignment_preserves_decimal_and_largeint_types() {
+    fn typed_root_alignment_rejects_decimal_precision_drift() {
         let decimal = Decimal128Array::from(vec![Some(100_000_000_000_000_000_000_i128), None])
             .with_precision_and_scale(38, 2)
             .expect("decimal array");
-        let largeint = crate::common::largeint::array_from_i128(&[Some(128), Some(-5)])
-            .expect("largeint array");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("wire_price", DataType::Decimal128(38, 2), true),
-            Field::new(
-                "wire_big",
-                DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
-                true,
-            ),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(decimal) as ArrayRef, largeint],
-        )
-        .expect("typed batch");
-        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            schema.as_ref(),
-            &[SlotId::new(11), SlotId::new(12)],
-        )
-        .expect("chunk schema");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "wire_price",
+            DataType::Decimal128(38, 2),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(decimal) as ArrayRef])
+            .expect("typed batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(11)])
+                .expect("chunk schema");
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
 
-        let columns = vec![
-            crate::sql::codegen::OutputColumn {
-                name: "price".to_string(),
-                data_type: DataType::Decimal128(20, 2),
-                nullable: true,
-            },
-            crate::sql::codegen::OutputColumn {
-                name: "big_value".to_string(),
-                data_type: DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
-                nullable: true,
-            },
-        ];
+        let columns = vec![crate::sql::codegen::OutputColumn {
+            name: "price".to_string(),
+            data_type: DataType::Decimal128(20, 2),
+            nullable: true,
+        }];
+
+        let err = align_fetch_chunks_to_output_columns(vec![chunk], &columns)
+            .expect_err("typed root must reject decimal precision drift");
+
+        assert!(
+            err.contains("typed root result column 0 type mismatch"),
+            "{err}"
+        );
+        assert!(err.contains("Decimal128(20, 2)"), "{err}");
+        assert!(err.contains("Decimal128(38, 2)"), "{err}");
+    }
+
+    #[test]
+    fn typed_root_alignment_preserves_largeint_type() {
+        let largeint = crate::common::largeint::array_from_i128(&[Some(128), Some(-5)])
+            .expect("largeint array");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "wire_big",
+            DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![largeint]).expect("typed batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(12)])
+                .expect("chunk schema");
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+
+        let columns = vec![crate::sql::codegen::OutputColumn {
+            name: "big_value".to_string(),
+            data_type: DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
+            nullable: true,
+        }];
 
         let chunks =
             align_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("align chunks");
         let batch = &chunks[0].batch;
-        assert_eq!(batch.schema().field(0).name(), "price");
-        assert_eq!(
-            batch.schema().field(0).data_type(),
-            &DataType::Decimal128(38, 2)
-        );
-        let decimal_values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .expect("decimal array");
-        assert_eq!(decimal_values.value(0), 100_000_000_000_000_000_000_i128);
-        assert!(decimal_values.is_null(1));
-
-        assert_eq!(batch.schema().field(1).name(), "big_value");
+        assert_eq!(batch.schema().field(0).name(), "big_value");
         let largeint_values = batch
-            .column(1)
+            .column(0)
             .as_any()
             .downcast_ref::<FixedSizeBinaryArray>()
             .expect("largeint array");
