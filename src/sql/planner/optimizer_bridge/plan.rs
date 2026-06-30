@@ -129,15 +129,15 @@ fn logical_plan_to_opt_expr_unchecked(
         LogicalPlanKind::Aggregate(node) => {
             let child = logical_plan_to_opt_expr_unchecked(plan.unary_input(), scalars);
             let group_by = intern_exprs(scalars, &node.group_by);
-            for (scalar_id, output) in group_by.iter().zip(node.output_columns.iter()) {
-                scalars.remember_column_display_from_scalar(output.column_id, *scalar_id);
-            }
             let aggregates = intern_aggregate_calls(scalars, &node.aggregates);
             let output_layout = aggregate_output_layout_from_plan(
                 node.group_by.len(),
                 &aggregates,
                 &node.output_columns,
             );
+            for (scalar_id, output) in group_by.iter().zip(output_layout.group_key_columns.iter()) {
+                scalars.remember_column_display_from_scalar(output.column_id, *scalar_id);
+            }
             let op = Operator::LogicalAggregate(LogicalAggregateOp::single(
                 group_by,
                 aggregates,
