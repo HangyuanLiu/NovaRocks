@@ -1982,52 +1982,36 @@ fn read_full_data_file_with_base_row_id_and_visibility(
 }
 
 /// Build a filesystem factory that can read planned delta-scan data/delete
-/// files for a table location. We use the same `OpendalRangeReaderFactory`
-/// shape as the HDFS scan path (`build_fs_operator` for local FS,
-/// S3/cloud-credentialled operator when the catalog has cloud properties).
+/// files for a table location through the Iceberg fs adapter.
 pub(crate) fn build_factory_for_table_location(
     location: &str,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<crate::fs::opendal::OpendalRangeReaderFactory, String> {
-    let scheme = crate::fs::path::classify_scan_paths(std::iter::once(location))
-        .map_err(|e| format!("classify iceberg delete reverse projection path: {e}"))?;
-    let operator = match scheme {
-        crate::fs::path::ScanPathScheme::Local => crate::fs::opendal::build_fs_operator("/")
-            .map_err(|e| format!("build local fs operator for delete reverse projection: {e}"))?,
-        crate::fs::path::ScanPathScheme::Oss => {
-            let cfg = object_store_config.ok_or_else(|| {
-                format!(
-                    "missing object store config for delete reverse projection: table_location={location}"
-                )
-            })?;
-            let bucket = crate::fs::oss::object_store_bucket_from_path(location)?;
-            crate::fs::oss::build_object_store_operator(&bucket, cfg).map_err(|e| {
-                format!("build object-store operator for delete reverse projection: {e}")
-            })?
-        }
-        crate::fs::path::ScanPathScheme::Hdfs => {
-            let paths = vec![location.to_string()];
-            let resolved = crate::fs::hdfs::resolve_hdfs_scan_paths(&paths)
-                .map_err(|e| format!("resolve hdfs path for delete reverse projection: {e}"))?;
-            crate::fs::hdfs::build_hdfs_operator(&resolved.name_node, resolved.user.as_deref())
-                .map_err(|e| format!("build hdfs operator for delete reverse projection: {e}"))?
-        }
-    };
-    crate::fs::opendal::OpendalRangeReaderFactory::from_operator(operator)
-        .map_err(|e| format!("build opendal range reader factory: {e}"))
+    crate::connector::iceberg::fs_io::reader_factory_for_table_location(
+        location,
+        object_store_config,
+    )
+    .map_err(|e| format!("build iceberg table reader factory for {location}: {e}"))
 }
 
 pub(crate) fn expected_object_store_bucket_from_location(
     location: &str,
 ) -> Result<Option<String>, String> {
-    match crate::fs::path::classify_scan_paths(std::iter::once(location))
-        .map_err(|e| format!("classify iceberg object-store table location {location}: {e}"))?
-    {
-        crate::fs::path::ScanPathScheme::Oss => {
-            crate::fs::oss::object_store_bucket_from_path(location).map(Some)
-        }
-        crate::fs::path::ScanPathScheme::Local | crate::fs::path::ScanPathScheme::Hdfs => Ok(None),
+    let location = crate::fs::access::FsAccessResolver::new()
+        .parse_location(location)
+        .map_err(|e| format!("parse iceberg table location {location}: {e}"))?;
+    if location.scheme() == crate::fs::access::FsScheme::ObjectStore {
+        return location
+            .authority()
+            .map(|bucket| Some(bucket.to_string()))
+            .ok_or_else(|| {
+                format!(
+                    "object-store iceberg table location missing bucket: {}",
+                    location.original()
+                )
+            });
     }
+    Ok(None)
 }
 
 pub(crate) fn expected_object_store_bucket_for_table(
@@ -2052,24 +2036,28 @@ pub(crate) fn normalize_delete_projection_path(
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
 ) -> Result<String, ChangeError> {
-    let scheme = crate::fs::path::classify_scan_paths(std::iter::once(path)).map_err(|e| {
-        ChangeError::InternalInconsistency(format!(
-            "classify iceberg delete reverse projection path {path}: {e}"
-        ))
-    })?;
-    match scheme {
-        crate::fs::path::ScanPathScheme::Local => {
-            Ok(path.strip_prefix("file://").unwrap_or(path).to_string())
-        }
-        crate::fs::path::ScanPathScheme::Oss => {
-            let cfg = object_store_config.ok_or_else(|| {
+    let parsed = crate::fs::access::FsAccessResolver::new()
+        .parse_location(path)
+        .map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "parse iceberg delete reverse projection path {path}: {e}"
+            ))
+        })?;
+    match parsed.scheme() {
+        crate::fs::access::FsScheme::Local => Ok(parsed.path().to_string()),
+        crate::fs::access::FsScheme::ObjectStore => {
+            let access = crate::connector::iceberg::fs_io::resolve_access_for_location(
+                path,
+                object_store_config,
+            )
+            .map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
-                    "missing object store config for delete reverse projection path {path}"
+                    "normalize object-store delete reverse projection path {path}: {e}"
                 ))
             })?;
-            let bucket = crate::fs::oss::object_store_bucket_from_path(path).map_err(|e| {
+            let bucket = access.handle().authority().ok_or_else(|| {
                 ChangeError::InternalInconsistency(format!(
-                    "parse object-store delete reverse projection path {path}: {e}"
+                    "object-store delete reverse projection path {path} missing bucket"
                 ))
             })?;
             if let Some(expected) = expected_object_store_bucket
@@ -2079,24 +2067,19 @@ pub(crate) fn normalize_delete_projection_path(
                     "bucket mismatch for object-store delete reverse projection path {path}: path bucket={bucket} expected bucket={expected}"
                 )));
             }
-            let (_op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, cfg)
+            access
+                .single_relative_path()
+                .map(str::to_string)
                 .map_err(|e| {
                     ChangeError::InternalInconsistency(format!(
                         "normalize object-store delete reverse projection path {path}: {e}"
                     ))
-                })?;
-            Ok(rel)
+                })
         }
-        crate::fs::path::ScanPathScheme::Hdfs => {
-            let paths = vec![path.to_string()];
-            let resolved = crate::fs::hdfs::resolve_hdfs_scan_paths(&paths).map_err(|e| {
+        crate::fs::access::FsScheme::Hdfs => {
+            crate::connector::iceberg::fs_io::normalize_hdfs_path_parse_only(path).map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
                     "normalize hdfs delete reverse projection path {path}: {e}"
-                ))
-            })?;
-            resolved.paths.into_iter().next().ok_or_else(|| {
-                ChangeError::InternalInconsistency(format!(
-                    "normalize hdfs delete reverse projection path {path}: empty result"
                 ))
             })
         }
@@ -2511,10 +2494,11 @@ mod tests {
 
     use super::{
         ChangeError, DeletedDataFileRef, EqualityDeleteRef, IcebergChangeBatch,
-        IcebergChangePolicySignal, LineageAction, classify_snapshot,
-        delta_source_files_from_change_batch_with_equality_targets,
-        normalize_delete_projection_path, policy_signal_from_change_error,
-        scan_deleted_data_file_rows_with_factory, validate_replace_snapshot,
+        IcebergChangePolicySignal, LineageAction, build_factory_for_table_location,
+        classify_snapshot, delta_source_files_from_change_batch_with_equality_targets,
+        expected_object_store_bucket_from_location, normalize_delete_projection_path,
+        policy_signal_from_change_error, scan_deleted_data_file_rows_with_factory,
+        validate_replace_snapshot,
     };
 
     use crate::connector::iceberg::catalog::registry::{
@@ -2906,6 +2890,66 @@ mod tests {
     }
 
     #[test]
+    fn build_factory_for_local_table_location_uses_resolver() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("data.parquet");
+        let location = format!("file://{}", file_path.display());
+
+        let _factory =
+            build_factory_for_table_location(&location, None).expect("local reader factory");
+    }
+
+    #[test]
+    fn build_factory_for_object_store_location_requires_credentials() {
+        let err = build_factory_for_table_location("s3://lake/warehouse/db/orders", None)
+            .expect_err("object-store location requires credentials");
+
+        assert!(
+            err.contains("object-store location requires object store config"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn expected_object_store_bucket_from_location_ignores_hdfs_authority() {
+        let bucket =
+            expected_object_store_bucket_from_location("hdfs://nn-1:9000/warehouse/db/orders")
+                .expect("parse hdfs location");
+
+        assert_eq!(bucket, None);
+    }
+
+    #[test]
+    fn normalize_delete_projection_path_keeps_full_local_file_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("nested").join("data.parquet");
+        let location = format!("file://{}", file_path.display());
+
+        let normalized =
+            normalize_delete_projection_path(&location, None, None).expect("normalize local path");
+
+        assert_eq!(normalized, file_path.display().to_string());
+    }
+
+    #[test]
+    fn local_table_factory_reads_normalized_full_local_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table_location = format!("file://{}", dir.path().join("table").display());
+        let data_path = dir.path().join("table").join("data").join("part-0.bin");
+        std::fs::create_dir_all(data_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&data_path, b"abcdef").expect("write data");
+        let data_location = format!("file://{}", data_path.display());
+
+        let factory =
+            build_factory_for_table_location(&table_location, None).expect("local factory");
+        let normalized =
+            normalize_delete_projection_path(&data_location, None, None).expect("normalize");
+        let reader = factory.open(&normalized).expect("open normalized path");
+
+        assert_eq!(reader.read_remote_range(1, 4).expect("read range"), "bcd");
+    }
+
+    #[test]
     fn normalize_delete_projection_path_uses_object_store_config_for_s3_uri() {
         let cfg = test_object_store_config();
         let path = normalize_delete_projection_path(
@@ -2917,6 +2961,18 @@ mod tests {
         // Object-store operators are bucket-root scoped in FS-3, so the key
         // passed to OpenDAL must remain relative to the bucket, not to a table
         // warehouse prefix.
+        assert_eq!(path, "warehouse/db/orders/data.parquet");
+    }
+
+    #[test]
+    fn normalize_delete_projection_path_keeps_hdfs_relative_path() {
+        let path = normalize_delete_projection_path(
+            "hdfs://nn-1:9000/warehouse/db/orders/data.parquet",
+            None,
+            None,
+        )
+        .expect("normalize hdfs path");
+
         assert_eq!(path, "warehouse/db/orders/data.parquet");
     }
 
@@ -2940,7 +2996,10 @@ mod tests {
             Some("lake"),
         )
         .expect_err("must reject");
-        assert!(format!("{err}").contains("missing object store config"));
+        assert!(
+            format!("{err}").contains("object-store location requires object store config"),
+            "{err}"
+        );
     }
 
     #[test]

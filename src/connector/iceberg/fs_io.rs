@@ -12,7 +12,7 @@ use iceberg::{Error, ErrorKind, Result};
 use opendal::Operator;
 use serde::{Deserialize, Serialize};
 
-use crate::fs::access::{FsAccessHandle, FsAccessResolver};
+use crate::fs::access::{FsAccessHandle, FsAccessResolver, FsScheme};
 use crate::fs::object_store::ObjectStoreConfig;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 
@@ -350,6 +350,36 @@ where
 {
     let handle = FsAccessResolver::new().resolve_locations(locations, object_store_config)?;
     Ok(IcebergFsAccess::new(handle))
+}
+
+pub(crate) fn reader_factory_for_table_location(
+    location: &str,
+    object_store_config: Option<&ObjectStoreConfig>,
+) -> std::result::Result<OpendalRangeReaderFactory, String> {
+    let resolver = FsAccessResolver::new();
+    let parsed = resolver
+        .parse_location(location)
+        .map_err(|e| format!("parse table fs location {location}: {e}"))?;
+    if parsed.scheme() == FsScheme::Local {
+        let operator = crate::fs::opendal::build_fs_operator("/")
+            .map_err(|e| format!("build local table reader factory operator: {e}"))?;
+        return OpendalRangeReaderFactory::from_operator(operator)
+            .map_err(|e| format!("build local table reader factory: {e}"));
+    }
+
+    resolver
+        .resolve_location(parsed.original(), object_store_config)
+        .and_then(|handle| handle.reader_factory())
+}
+
+pub(crate) fn normalize_hdfs_path_parse_only(path: &str) -> std::result::Result<String, String> {
+    let location = FsAccessResolver::new()
+        .parse_location(path)
+        .map_err(|e| format!("parse hdfs location {path}: {e}"))?;
+    if location.scheme() != FsScheme::Hdfs {
+        return Err(format!("expected hdfs location: {path}"));
+    }
+    crate::fs::hdfs::parse_hdfs_path(location.original()).map(|parsed| parsed.rel_path)
 }
 
 pub(crate) fn read_exact_range(
