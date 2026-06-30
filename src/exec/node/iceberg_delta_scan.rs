@@ -55,6 +55,7 @@ pub(crate) struct DeltaScanDeleteSidePayload {
 #[derive(Clone, Debug)]
 pub struct IcebergDeltaScanNode {
     pub base_table_ident: BaseTableIdent,
+    pub table_location: String,
     pub from_snapshot_id: i64,
     pub to_snapshot_id: i64,
     pub output_chunk_schema: ChunkSchemaRef,

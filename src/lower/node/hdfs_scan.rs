@@ -270,7 +270,7 @@ fn file_cache_flags_from_query_options(
 /// native lake tablets).
 fn resolve_cloud_object_store_config<S>(
     cloud_props: Option<&std::collections::BTreeMap<S, S>>,
-    ranges: &[FileScanRange],
+    _ranges: &[FileScanRange],
 ) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String>
 where
     S: std::borrow::Borrow<str> + Ord,
@@ -287,25 +287,7 @@ where
         return Ok(None);
     };
 
-    // Derive bucket from the first OSS range path so that normalize_oss_path can
-    // validate bucket consistency and strip the correct prefix.
-    let bucket = ranges
-        .iter()
-        .find_map(|r| {
-            let p = r.path.trim();
-            for scheme in ["oss://", "s3://", "s3a://"] {
-                if let Some(rest) = p.strip_prefix(scheme) {
-                    let b = rest.split('/').next()?.trim();
-                    if !b.is_empty() {
-                        return Some(b.to_string());
-                    }
-                }
-            }
-            None
-        })
-        .unwrap_or_default();
-
-    let mut cfg = credentials.to_object_store_config(&bucket, "");
+    let mut cfg = credentials.to_object_store_config();
     crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
     Ok(Some(cfg))
 }
@@ -1904,7 +1886,6 @@ mod tests {
             .expect("credentials present");
 
         assert_eq!(cfg.endpoint, "http://localhost:9000");
-        assert_eq!(cfg.bucket, "bucket-a");
         assert_eq!(cfg.access_key_id, "ak");
         assert_eq!(cfg.access_key_secret, "sk");
         assert_eq!(cfg.enable_path_style_access, Some(true));
@@ -1963,7 +1944,12 @@ mod tests {
             .expect("parse cloud config")
             .expect("object store config");
 
-        assert_eq!(config.bucket, "novarocks");
+        assert_eq!(config.access_key_id, "ak");
+        assert_eq!(
+            crate::fs::object_store::object_store_bucket_from_path(&ranges[0].path)
+                .expect("bucket from range"),
+            "novarocks"
+        );
     }
 
     fn int_expr(value: i64) -> exprs::TExpr {

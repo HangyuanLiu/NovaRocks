@@ -111,8 +111,6 @@ impl S3Storage {
 
         let cfg = ObjectStoreConfig {
             endpoint: self.endpoint.clone(),
-            bucket: bucket.to_string(),
-            root: String::new(),
             access_key_id: self.access_key_id.clone(),
             access_key_secret: self.access_key_secret.clone(),
             session_token: self.session_token.clone(),
@@ -124,7 +122,7 @@ impl S3Storage {
             timeout_ms: self.timeout_ms,
             io_timeout_ms: self.io_timeout_ms,
         };
-        let op = crate::fs::object_store::build_oss_operator(&cfg)
+        let op = crate::fs::object_store::build_object_store_operator(bucket, &cfg)
             .map_err(|e| Error::new(ErrorKind::Unexpected, format!("build S3 operator: {e}")))?;
         cache.insert(bucket.to_string(), op.clone());
         Ok(op)

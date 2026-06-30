@@ -488,11 +488,9 @@ mod tests {
     }
 
     #[test]
-    fn object_store_config_keeps_bucket_root_for_fs1_compatibility() {
+    fn object_store_config_is_credentials_only_for_fs3() {
         let cfg = crate::fs::object_store::ObjectStoreConfig {
             endpoint: "http://localhost:9000".to_string(),
-            bucket: "bucket-a".to_string(),
-            root: "warehouse/root".to_string(),
             access_key_id: "ak".to_string(),
             access_key_secret: "sk".to_string(),
             session_token: None,
@@ -505,8 +503,8 @@ mod tests {
             io_timeout_ms: None,
         };
 
-        assert_eq!(cfg.bucket, "bucket-a");
-        assert_eq!(cfg.root, "warehouse/root");
+        assert_eq!(cfg.endpoint, "http://localhost:9000");
+        assert_eq!(cfg.access_key_id, "ak");
     }
 
     #[test]

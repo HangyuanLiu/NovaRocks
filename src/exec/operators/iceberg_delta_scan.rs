@@ -464,6 +464,12 @@ fn open_scanner_for_role(
     }
 }
 
+fn expected_object_store_bucket(node: &IcebergDeltaScanNode) -> Result<Option<String>, String> {
+    crate::connector::iceberg::changes::expected_object_store_bucket_from_location(
+        &node.table_location,
+    )
+}
+
 struct DataFileScanner {
     batches: std::vec::IntoIter<RecordBatch>,
     /// File path used to populate the `_file` lineage column on every row.
@@ -547,11 +553,13 @@ fn open_data_file_scanner(
     node: &IcebergDeltaScanNode,
     file: &DeltaSourceFile,
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
+    let expected_bucket = expected_object_store_bucket(node)?;
     let batches = crate::connector::iceberg::changes::scan_one_added_data_file_with_factory(
         &file.path,
         file.size,
         node.iceberg_runtime.object_store_factory.as_ref(),
         node.object_store_config.as_ref(),
+        expected_bucket.as_deref(),
     )?;
     // Iceberg v3 row-lineage data files always carry `first_row_id` on the
     // manifest entry; the IVM-A1 contract is to fail loudly if either lineage
@@ -723,6 +731,7 @@ fn open_position_delete_scanner(
         )
     })?;
     let lineage = position_delete_lineage_lookup(delete_side);
+    let expected_bucket = expected_object_store_bucket(node)?;
     let rows = crate::connector::iceberg::changes::scan_position_delete_rows_for_targets(
         &delete_refs,
         &lineage,
@@ -731,6 +740,7 @@ fn open_position_delete_scanner(
         node.iceberg_runtime.object_store_factory.as_ref(),
         &node.iceberg_runtime.file_io,
         node.object_store_config.as_ref(),
+        expected_bucket.as_deref(),
     )?;
     Ok(Box::new(PositionDeleteScanner {
         batches: rows.into_iter(),
@@ -777,12 +787,14 @@ fn open_equality_delete_scanner(
         partition_key: file.partition_key.clone(),
         partition_values: Vec::new(),
     };
+    let expected_bucket = expected_object_store_bucket(node)?;
     let rows =
         crate::connector::iceberg::changes::scan_equality_delete_rows_for_targets_with_v3_lineage(
             &delete,
             targets,
             node.iceberg_runtime.object_store_factory.as_ref(),
             node.object_store_config.as_ref(),
+            expected_bucket.as_deref(),
         )?;
     Ok(Box::new(EqualityDeleteScanner {
         batches: rows.into_iter(),
@@ -870,6 +882,7 @@ fn open_deleted_data_file_scanner(
         &deleted_file,
         node.iceberg_runtime.object_store_factory.as_ref(),
         node.object_store_config.as_ref(),
+        expected_object_store_bucket(node)?.as_deref(),
         &delete_side.previous_delete_visibility,
     )?;
     Ok(Box::new(DeletedDataFileScanner {

@@ -286,7 +286,7 @@ async fn list_files_opendal(
     cfg: &ObjectStoreConfig,
 ) -> Result<Vec<ScannedFile>, String> {
     use crate::connector::iceberg::catalog::add_files::parse_s3_path;
-    use crate::fs::object_store::build_oss_operator;
+    use crate::fs::object_store::build_object_store_operator;
 
     let scheme = if location.starts_with("oss://") {
         "oss"
@@ -297,12 +297,10 @@ async fn list_files_opendal(
     let (bucket, location_key) = parse_s3_path(location)
         .map_err(|e| format!("parse table location for opendal scan: {e}"))?;
 
-    // Build an operator rooted at the bucket level (empty root) so keys we pass
-    // match exactly the key portion of the full URIs we reconstruct.
-    let mut op_cfg = cfg.clone();
-    op_cfg.bucket = bucket.clone();
-    op_cfg.root = String::new();
-    let op = build_oss_operator(&op_cfg).map_err(|e| format!("build opendal operator: {e}"))?;
+    // Build an operator rooted at the bucket level so keys we pass match
+    // exactly the key portion of the full URIs we reconstruct.
+    let op = build_object_store_operator(&bucket, cfg)
+        .map_err(|e| format!("build opendal operator: {e}"))?;
 
     let location_key = location_key.trim_matches('/');
 

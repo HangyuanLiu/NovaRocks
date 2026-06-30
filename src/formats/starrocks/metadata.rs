@@ -1183,11 +1183,11 @@ fn build_operator(
 
 fn build_s3_operator(
     bucket: &str,
-    root_path: &str,
+    _root_path: &str,
     object_store_profile: &ObjectStoreProfile,
 ) -> Result<Operator, String> {
-    let cfg = object_store_profile.to_object_store_config(bucket, root_path);
-    crate::fs::object_store::build_oss_operator(&cfg)
+    let cfg = object_store_profile.to_object_store_config();
+    crate::fs::object_store::build_object_store_operator(bucket, &cfg)
         .map_err(|e| format!("init object store metadata operator failed: {e}"))
 }
 

@@ -53,10 +53,10 @@ fn build_local_operator(root: &str) -> Result<Operator, String> {
 
 fn build_s3_operator(
     bucket: &str,
-    root: &str,
+    _root: &str,
     object_store_profile: &ObjectStoreProfile,
 ) -> Result<Operator, String> {
-    let cfg = object_store_profile.to_object_store_config(bucket, root);
-    crate::fs::object_store::build_oss_operator(&cfg)
+    let cfg = object_store_profile.to_object_store_config();
+    crate::fs::object_store::build_object_store_operator(bucket, &cfg)
         .map_err(|e| format!("init object store native data operator failed: {e}"))
 }

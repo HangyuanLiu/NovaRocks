@@ -852,6 +852,8 @@ impl IcebergTableSinkBackend {
             &table,
             object_store_cfg.as_ref(),
         )?;
+        let expected_object_store_bucket =
+            crate::connector::iceberg::changes::expected_object_store_bucket_for_table(&table)?;
         let owned_files: HashSet<&str> = owned_files.into_iter().collect();
         let existing = crate::connector::iceberg::scan_deletes::previously_deleted_positions_at_snapshot(
             &table,
@@ -860,6 +862,7 @@ impl IcebergTableSinkBackend {
             &|path| crate::connector::iceberg::changes::normalize_delete_projection_path(
                 path,
                 object_store_cfg.as_ref(),
+                expected_object_store_bucket.as_deref(),
             ),
             |path| owned_files.contains(path),
         )
@@ -1503,13 +1506,9 @@ fn write_parquet_file(
             )
         })?;
         let object_store_cfg = s3.to_object_store_config();
-        let op =
-            crate::fs::oss::build_oss_operator(&object_store_cfg).map_err(|e| e.to_string())?;
-        let rel = crate::fs::oss::normalize_oss_path(
-            path,
-            &object_store_cfg.bucket,
-            &object_store_cfg.root,
-        )?;
+        let op = crate::fs::oss::build_object_store_operator(&s3.bucket, &object_store_cfg)
+            .map_err(|e| e.to_string())?;
+        let rel = crate::fs::oss::normalize_oss_path(path, &s3.bucket, "")?;
         data_block_on(op.write(&rel, data))
             .map_err(|e| format!("run object-store write on data runtime failed: {e}"))?
             .map_err(|e| format!("opendal write failed: {e}"))?;

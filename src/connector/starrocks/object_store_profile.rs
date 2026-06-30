@@ -93,11 +93,9 @@ impl ObjectStoreProfile {
         Ok(Self::from_credentials(credentials))
     }
 
-    pub(crate) fn to_object_store_config(&self, bucket: &str, root: &str) -> ObjectStoreConfig {
+    pub(crate) fn to_object_store_config(&self) -> ObjectStoreConfig {
         let mut cfg = ObjectStoreConfig {
             endpoint: self.endpoint.clone(),
-            bucket: bucket.to_string(),
-            root: root.trim_matches('/').to_string(),
             access_key_id: self.access_key_id.clone(),
             access_key_secret: self.access_key_secret.clone(),
             session_token: self.session_token.clone(),

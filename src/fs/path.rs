@@ -109,10 +109,15 @@ pub fn resolve_opendal_paths(
         }
         ScanPathScheme::Oss => {
             let cfg = object_store_cfg.ok_or_else(|| "missing object store config".to_string())?;
-            let op = crate::fs::oss::build_oss_operator(cfg).map_err(|e| e.to_string())?;
+            let bucket = paths
+                .first()
+                .ok_or_else(|| "missing object store path".to_string())
+                .and_then(|path| crate::fs::oss::object_store_bucket_from_path(path))?;
+            let op = crate::fs::oss::build_object_store_operator(&bucket, cfg)
+                .map_err(|e| e.to_string())?;
             let mut normalized = Vec::with_capacity(paths.len());
             for path in paths {
-                let p = crate::fs::oss::normalize_oss_path(path, &cfg.bucket, &cfg.root)?;
+                let p = crate::fs::oss::normalize_oss_path(path, &bucket, "")?;
                 normalized.push(p);
             }
             Ok((

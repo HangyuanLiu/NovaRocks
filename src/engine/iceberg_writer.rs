@@ -1283,9 +1283,11 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
 ) -> Result<AbortCleanupOperator, String> {
     if let Some(s3_config) = entry.object_store_config() {
-        let fs = crate::fs::object_store::build_oss_operator(s3_config)
+        let (bucket, _) =
+            crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
+                .map_err(|e| format!("parse warehouse URI for iceberg abort cleanup: {e}"))?;
+        let fs = crate::fs::object_store::build_object_store_operator(&bucket, s3_config)
             .map_err(|e| format!("build S3 operator for iceberg abort cleanup: {e}"))?;
-        let bucket = s3_config.bucket.clone();
         let mapper: CleanupPathMapper = Arc::new(move |path| {
             crate::connector::iceberg::catalog::add_files::parse_s3_path(path)
                 .ok()
