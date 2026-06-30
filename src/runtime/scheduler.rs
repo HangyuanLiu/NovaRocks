@@ -78,6 +78,8 @@ pub(crate) struct FragmentInstancePlacement {
     pub(crate) finst_id: TUniqueId,
     /// Backend id from the scheduler's live backend snapshot.
     pub(crate) backend_idx: usize,
+    /// Internal brpc endpoint for this fragment instance.
+    pub(crate) brpc_server: TNetworkAddress,
     /// Scan ranges for this instance, keyed by plan node id.
     pub(crate) scan_ranges: BTreeMap<i32, Vec<TScanRangeParams>>,
     /// Destinations this instance should push its output to.
@@ -161,8 +163,6 @@ impl FragmentScheduler {
         query_id: TUniqueId,
         live: &[LiveBackend],
     ) -> Result<SchedulingPlan, String> {
-        reject_unsupported_router_edges(edges)?;
-
         let n = live.len();
         if n == 0 {
             return Err("no live backend available".into());
@@ -188,9 +188,7 @@ impl FragmentScheduler {
             let stream_kind = match e.edge_kind {
                 FragmentEdgeKind::Stream => e.stream_kind,
                 FragmentEdgeKind::CteMulticast { .. } => FragmentStreamKind::Broadcast,
-                FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
-                    unreachable!("router edges are rejected before ordinary fragment scheduling")
-                }
+                FragmentEdgeKind::IcebergChangeStreamRouter { .. } => e.stream_kind,
             };
             incoming.entry(e.target_fragment_id).or_default().push((
                 e.source_fragment_id,
@@ -256,33 +254,42 @@ impl FragmentScheduler {
                 .ok_or_else(|| format!("fragment {fid} missing from fragment list"))?;
 
             let mut instances: Vec<FragmentInstancePlacement> = (0..count)
-                .map(|instance_index| {
-                    let backend_idx = if count == 1 {
-                        root_backend_idx
-                    } else {
-                        live[instance_index].0
-                    };
-                    // finst_id encoding: hi = query_id.hi, lo = (fragment_id << 16) | instance_index.
-                    // Unique within a query as long as instance_index < 65536 (always true:
-                    // instance_count <= backends.len(), far below 65536).
-                    debug_assert!(
-                        instance_index < (1 << 16),
-                        "instance_index {instance_index} overflows finst_id encoding"
-                    );
-                    let finst_id =
-                        TUniqueId::new(query_id.hi, ((fid as i64) << 16) | (instance_index as i64));
-                    FragmentInstancePlacement {
-                        fragment_id: fid,
-                        instance_index,
-                        finst_id,
-                        backend_idx,
-                        scan_ranges: BTreeMap::new(),
-                        destinations: Vec::new(),
-                        runtime_filter_prober_params: BTreeMap::new(),
-                        per_exch_num_senders: BTreeMap::new(),
-                    }
-                })
-                .collect();
+                .map(
+                    |instance_index| -> Result<FragmentInstancePlacement, String> {
+                        let backend_idx = if count == 1 {
+                            root_backend_idx
+                        } else {
+                            live[instance_index].0
+                        };
+                        let addr = live_backend_addr(live, backend_idx)?;
+                        // finst_id encoding: hi = query_id.hi, lo = (fragment_id << 16) | instance_index.
+                        // Unique within a query as long as instance_index < 65536 (always true:
+                        // instance_count <= backends.len(), far below 65536).
+                        debug_assert!(
+                            instance_index < (1 << 16),
+                            "instance_index {instance_index} overflows finst_id encoding"
+                        );
+                        let finst_id = TUniqueId::new(
+                            query_id.hi,
+                            ((fid as i64) << 16) | (instance_index as i64),
+                        );
+                        Ok(FragmentInstancePlacement {
+                            fragment_id: fid,
+                            instance_index,
+                            finst_id,
+                            backend_idx,
+                            brpc_server: TNetworkAddress::new(
+                                addr.ip().to_string(),
+                                addr.port() as i32,
+                            ),
+                            scan_ranges: BTreeMap::new(),
+                            destinations: Vec::new(),
+                            runtime_filter_prober_params: BTreeMap::new(),
+                            per_exch_num_senders: BTreeMap::new(),
+                        })
+                    },
+                )
+                .collect::<Result<Vec<_>, _>>()?;
 
             // Step 7 (Scheme C): partition scan ranges round-robin.
             for (&node_id, all_ranges) in &fr.exec_params.per_node_scan_ranges {
@@ -332,8 +339,6 @@ impl FragmentScheduler {
         edges: &[FragmentEdge],
         live: &[LiveBackend],
     ) -> Result<(), String> {
-        reject_unsupported_router_edges(edges)?;
-
         for e in edges {
             // Snapshot target placements to avoid borrow conflict.
             let target_placements: Vec<(TUniqueId, usize)> = plan
@@ -471,18 +476,6 @@ impl FragmentScheduler {
     fn full_live_snapshot(&self) -> Vec<LiveBackend> {
         self.live_backends.clone()
     }
-}
-
-fn reject_unsupported_router_edges(edges: &[FragmentEdge]) -> Result<(), String> {
-    if edges.iter().any(|edge| {
-        matches!(
-            edge.edge_kind,
-            FragmentEdgeKind::IcebergChangeStreamRouter { .. }
-        )
-    }) {
-        return Err("Iceberg change-stream router edges are not wired yet".to_string());
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -805,14 +798,14 @@ mod tests {
         }
     }
 
-    fn fake_router_edge(src: FragmentId, tgt: FragmentId, exch_node_id: i32) -> FragmentEdge {
-        let mut edge = fake_stream_edge(
-            src,
-            tgt,
-            partitions::TPartitionType::UNPARTITIONED,
-            exch_node_id,
-            FragmentStreamKind::Gather,
-        );
+    fn fake_router_edge(
+        src: FragmentId,
+        tgt: FragmentId,
+        ptype: partitions::TPartitionType,
+        exch_node_id: i32,
+        stream_kind: FragmentStreamKind,
+    ) -> FragmentEdge {
+        let mut edge = fake_stream_edge(src, tgt, ptype, exch_node_id, stream_kind);
         edge.edge_kind = FragmentEdgeKind::IcebergChangeStreamRouter {
             router_group_id: 42,
             branch_id: 1,
@@ -917,16 +910,51 @@ mod tests {
     }
 
     #[test]
-    fn change_stream_router_edges_are_not_scheduled_as_stream_edges() {
-        let scheduler = FragmentScheduler::new(two_backends());
-        let fragments = vec![fake_fragment(0, Some(1), 3), fake_fragment(1, None, 0)];
-        let edges = vec![fake_router_edge(0, 1, 10)];
+    fn change_stream_router_partitioned_edge_is_scheduled_like_stream_edge() {
+        let scheduler = FragmentScheduler::new(three_backends());
+        let fragments = vec![
+            fake_fragment(0, Some(1), 3),
+            fake_fragment(1, None, 0),
+            fake_fragment(2, None, 0),
+        ];
+        let edges = vec![
+            fake_router_edge(
+                0,
+                1,
+                partitions::TPartitionType::HASH_PARTITIONED,
+                10,
+                FragmentStreamKind::Partitioned,
+            ),
+            fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),
+        ];
 
-        let err = scheduler
+        let mut plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 1))
-            .expect_err("router edges are graph-model-only in Task 2");
+            .expect("router branch edge should schedule");
+        assert_eq!(plan.by_fragment[&0].len(), 3, "scan source has 3 senders");
+        assert_eq!(
+            plan.by_fragment[&1].len(),
+            3,
+            "partitioned router target inherits upstream sender count"
+        );
 
-        assert!(err.contains("Iceberg change-stream router edges are not wired yet"));
+        scheduler.fill_destinations(&mut plan, &edges);
+        scheduler.fill_per_exch_num_senders(&mut plan, &edges);
+
+        for inst in &plan.by_fragment[&0] {
+            assert_eq!(
+                inst.destinations.len(),
+                3,
+                "router branch source sees every target writer instance"
+            );
+        }
+        for inst in &plan.by_fragment[&1] {
+            assert_eq!(
+                inst.per_exch_num_senders.get(&10).copied(),
+                Some(3),
+                "router branch target sees same sender count as a stream edge"
+            );
+        }
     }
 
     #[test]
