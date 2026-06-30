@@ -544,7 +544,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
-                    output_column_id: ColumnId::UNSET,
+                    output_column_id: ColumnId(3),
                 }],
                 output_columns: vec![
                     OutputColumn {
@@ -948,7 +948,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
-                    output_column_id: ColumnId::UNSET,
+                    output_column_id: ColumnId(12),
                 }],
                 output_columns: vec![
                     OutputColumn {

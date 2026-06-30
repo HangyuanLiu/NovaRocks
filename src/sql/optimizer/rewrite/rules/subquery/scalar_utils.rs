@@ -258,12 +258,7 @@ pub(super) fn is_count_aggregate_result(
         Operator::LogicalAggregate(aggregate) => aggregate
             .aggregates
             .iter()
-            .zip(
-                aggregate
-                    .output_columns
-                    .iter()
-                    .skip(aggregate.group_by.len()),
-            )
+            .zip(aggregate.output_layout.aggregate_columns.iter())
             .any(|(call, output)| {
                 output.column_id == column_id && call.name.eq_ignore_ascii_case("count")
             }),
@@ -562,6 +557,50 @@ pub(super) fn any_value_spec(arg: ScalarId, output_column_id: ColumnId) -> Scala
         args: vec![arg],
         distinct: false,
         order_by: vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::optimizer::operator::{AggregateOutputLayout, LogicalAggregateOp};
+
+    fn output_column(column_id: ColumnId, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id,
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    #[test]
+    fn is_count_aggregate_result_uses_layout_when_group_key_is_hidden() {
+        let mut arena = ScalarArena::new();
+        let group_id = ColumnId::new_for_test(1);
+        let count_id = ColumnId::new_for_test(2);
+        let group = arena.intern(ScalarNode::ColumnRef(group_id), DataType::Int64, false);
+        let aggregate = OptExpr::new(
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![group],
+                vec![ScalarAggregateSpec {
+                    output_column_id: count_id,
+                    name: "count".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    order_by: vec![],
+                }],
+                AggregateOutputLayout::new(
+                    vec![output_column(group_id, "k")],
+                    vec![output_column(count_id, "count(1)")],
+                ),
+                vec![output_column(count_id, "count(1)")],
+            )),
+            vec![],
+        );
+
+        assert!(is_count_aggregate_result(&aggregate, &arena, count_id));
     }
 }
 

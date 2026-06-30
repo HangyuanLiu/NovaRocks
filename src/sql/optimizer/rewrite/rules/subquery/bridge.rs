@@ -11,8 +11,8 @@ use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::optimizer_bridge::scalar::materialize;
 use crate::sql::planner::optimizer_bridge::scalar::{
-    aggregate_output_layout_from_legacy_outputs, materialize_aggregate_call, materialize_exprs,
-    materialize_project_items, materialize_sort_keys, materialize_window_exprs,
+    materialize_aggregate_call, materialize_exprs, materialize_project_items,
+    materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::planner::plan::{
     LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalApplyNode,
@@ -60,21 +60,15 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
 
         Operator::LogicalAggregate(op) => {
             let group_by = materialize_exprs(arena, &op.group_by);
-            let group_by_len = op.group_by.len();
-            let output_layout = aggregate_output_layout_from_legacy_outputs(
-                group_by_len,
-                op.aggregates.len(),
-                &op.output_columns,
-            );
             let aggregates = op
                 .aggregates
                 .iter()
-                .map(|a| materialize_aggregate_call(arena, a, &output_layout))
+                .map(|a| materialize_aggregate_call(arena, a, &op.output_layout))
                 .collect();
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by,
                 aggregates,
-                output_columns: op.output_columns.clone(),
+                output_columns: op.output_layout.full_output_columns(),
                 already_pushed: false,
             })
         }
@@ -239,4 +233,88 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
     let mut plan = LogicalPlanNode::new(kind, children, None);
     plan.required_output_columns = expr.required_output_columns.clone();
     plan
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::{
+        AggregateOutputLayout, LogicalAggregateOp, ScalarAggregateSpec, ValuesOp,
+    };
+    use crate::sql::optimizer::scalar::ScalarNode;
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use arrow::datatypes::DataType;
+
+    fn output_column(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    #[test]
+    fn aggregate_hidden_group_layout_round_trips_through_subquery_bridge() {
+        let mut arena = ScalarArena::new();
+        let group_output = output_column(1, "k");
+        let value_output = output_column(2, "v");
+        let sum_output = output_column(3, "sum_v");
+        let group = arena.intern(
+            ScalarNode::ColumnRef(group_output.column_id),
+            DataType::Int64,
+            false,
+        );
+        let value = arena.intern(
+            ScalarNode::ColumnRef(value_output.column_id),
+            DataType::Int64,
+            false,
+        );
+        let aggregate = OptExpr::new(
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![group],
+                vec![ScalarAggregateSpec {
+                    output_column_id: sum_output.column_id,
+                    name: "sum".to_string(),
+                    args: vec![value],
+                    distinct: false,
+                    order_by: vec![],
+                }],
+                AggregateOutputLayout::new(vec![group_output.clone()], vec![sum_output.clone()]),
+                vec![sum_output.clone()],
+            )),
+            vec![OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![group_output.clone(), value_output],
+            }))],
+        );
+
+        let plan = opt_expr_to_plan(&aggregate, &arena);
+        let mut round_trip_arena = ScalarArena::new();
+        let round_tripped = logical_plan_to_opt_expr(&plan, &mut round_trip_arena);
+        let Operator::LogicalAggregate(round_tripped_agg) = round_tripped.op else {
+            panic!("expected LogicalAggregate after round trip");
+        };
+        assert_eq!(
+            round_tripped_agg
+                .output_layout
+                .group_key_columns
+                .iter()
+                .map(|output| output.column_id)
+                .collect::<Vec<_>>(),
+            vec![group_output.column_id]
+        );
+        assert_eq!(
+            round_tripped_agg
+                .output_layout
+                .aggregate_columns
+                .iter()
+                .map(|output| output.column_id)
+                .collect::<Vec<_>>(),
+            vec![sum_output.column_id]
+        );
+    }
 }

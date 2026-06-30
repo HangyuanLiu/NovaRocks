@@ -145,6 +145,7 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
 
     let mut new_aggregate = peeled.aggregate;
     new_aggregate.group_by = inner_key_exprs;
+    new_aggregate.output_layout.group_key_columns = new_group_key_output_columns.clone();
     new_aggregate.output_columns = new_output_columns;
     let new_agg = OptExpr::new(
         Operator::LogicalAggregate(new_aggregate),

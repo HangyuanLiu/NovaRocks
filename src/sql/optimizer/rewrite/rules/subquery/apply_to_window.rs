@@ -336,7 +336,7 @@ fn check_preconditions_opt(
     if !WHITELIST.contains(&inner_agg.name.as_str()) {
         return None;
     }
-    let inner_agg_output = agg.output_columns.get(agg.group_by.len())?.clone();
+    let inner_agg_output = agg.output_layout.aggregate_columns.first()?.clone();
 
     // (1) No LIMIT and only whitelisted operators in either subtree.
     if !operator_whitelist_ok(apply_left, false) {
@@ -1423,6 +1423,32 @@ mod tests {
     }
 
     #[test]
+    fn precond_reads_inner_aggregate_output_from_layout_when_group_key_is_hidden() {
+        let plan = winmagic_filter_apply();
+        let mut arena = ScalarArena::new();
+        let opt = logical_plan_to_opt_expr(&plan, &mut arena);
+        let Operator::LogicalFilter(filter) = &opt.op else {
+            panic!("expected Filter");
+        };
+        let apply_expr = opt.unary_input();
+        let Operator::LogicalApply(apply) = &apply_expr.op else {
+            panic!("expected Apply");
+        };
+        let left = apply_expr.left().clone();
+        let mut right = apply_expr.right().clone();
+        let Operator::LogicalAggregate(agg) = &mut right.op else {
+            panic!("expected right Aggregate");
+        };
+        agg.output_columns = agg.output_layout.aggregate_columns.clone();
+
+        let matched =
+            super::check_preconditions_opt(filter.predicate, apply, &left, &right, &arena)
+                .expect("hidden group-key layout aggregate should satisfy preconditions");
+
+        assert_eq!(matched.inner_agg_output.column_id, AVG_RESULT);
+    }
+
+    #[test]
     fn precond_rejects_non_whitelist_agg() {
         let plan = winmagic_filter_apply();
         let (pred, a_orig, left, right) = extract_filter_apply(&plan);
@@ -1469,6 +1495,14 @@ mod tests {
         let (pred, a_orig, left, right) = extract_filter_apply(&plan);
         let a = a_orig.clone();
         let orig_agg = right.as_aggregate().unwrap();
+        let mut output_columns = orig_agg.output_columns.clone();
+        let mut second_output = output_columns
+            .last()
+            .expect("aggregate output column")
+            .clone();
+        second_output.column_id = ColumnId(99);
+        second_output.name = "min".to_string();
+        output_columns.push(second_output);
         let two_agg = LogicalAggregateNode {
             aggregates: vec![
                 orig_agg.aggregates[0].clone(),
@@ -1478,6 +1512,7 @@ mod tests {
                     ..orig_agg.aggregates[0].clone()
                 },
             ],
+            output_columns,
             ..orig_agg.clone()
         };
         let bad_right = with_kind_like(right, LogicalPlanKind::Aggregate(two_agg));

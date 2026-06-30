@@ -209,27 +209,31 @@ impl SpjgDescriptor {
                     .map(|c| substitute_aggregate(arena, c, &defs))
                     .collect::<Option<Vec<_>>>()
                     .ok_or_else(|| "unsupported aggregate order_by in MV rewrite".to_string())?;
-                // Aggregate output convention: [group keys..., agg results...]
-                if a.output_columns.len() != a.group_by.len() + a.aggregates.len() {
+                if a.output_layout.group_key_columns.len() != a.group_by.len()
+                    || a.output_layout.aggregate_columns.len() != a.aggregates.len()
+                {
                     return Err(format!(
-                        "aggregate output layout {} != group_by {} + aggs {}",
-                        a.output_columns.len(),
+                        "aggregate output layout mismatch: group_keys {} != group_by {}, aggregate_columns {} != aggs {}",
+                        a.output_layout.group_key_columns.len(),
                         a.group_by.len(),
+                        a.output_layout.aggregate_columns.len(),
                         a.aggregates.len()
                     ));
                 }
                 // Binding map at the aggregate's outputs.
                 let mut agg_outputs: Vec<SpjgOutput> = Vec::new();
-                for (i, oc) in a.output_columns.iter().enumerate() {
-                    let expr = if i < a.group_by.len() {
-                        SpjgOutputExpr::Dimension(group_by[i])
-                    } else {
-                        SpjgOutputExpr::Aggregate(aggregates[i - a.group_by.len()].clone())
-                    };
+                for (idx, oc) in a.output_layout.group_key_columns.iter().enumerate() {
                     agg_outputs.push(SpjgOutput {
                         name: oc.name.clone(),
                         column_id: oc.column_id,
-                        expr,
+                        expr: SpjgOutputExpr::Dimension(group_by[idx]),
+                    });
+                }
+                for (idx, oc) in a.output_layout.aggregate_columns.iter().enumerate() {
+                    agg_outputs.push(SpjgOutput {
+                        name: oc.name.clone(),
+                        column_id: oc.column_id,
+                        expr: SpjgOutputExpr::Aggregate(aggregates[idx].clone()),
                     });
                 }
                 let outputs = apply_top_project(arena, top_project, agg_outputs)?;
@@ -348,20 +352,24 @@ impl SpjgDescriptor {
                     .iter()
                     .map(|c| substitute_aggregate(&mut memo.scalars, c, &defs))
                     .collect::<Option<Vec<_>>>()?;
-                if a.output_columns.len() != a.group_by.len() + a.aggregates.len() {
+                if a.output_layout.group_key_columns.len() != a.group_by.len()
+                    || a.output_layout.aggregate_columns.len() != a.aggregates.len()
+                {
                     return None;
                 }
                 let mut agg_outputs: Vec<SpjgOutput> = Vec::new();
-                for (i, oc) in a.output_columns.iter().enumerate() {
-                    let out_expr = if i < a.group_by.len() {
-                        SpjgOutputExpr::Dimension(group_by[i])
-                    } else {
-                        SpjgOutputExpr::Aggregate(aggregates[i - a.group_by.len()].clone())
-                    };
+                for (idx, oc) in a.output_layout.group_key_columns.iter().enumerate() {
                     agg_outputs.push(SpjgOutput {
                         name: oc.name.clone(),
                         column_id: oc.column_id,
-                        expr: out_expr,
+                        expr: SpjgOutputExpr::Dimension(group_by[idx]),
+                    });
+                }
+                for (idx, oc) in a.output_layout.aggregate_columns.iter().enumerate() {
+                    agg_outputs.push(SpjgOutput {
+                        name: oc.name.clone(),
+                        column_id: oc.column_id,
+                        expr: SpjgOutputExpr::Aggregate(aggregates[idx].clone()),
                     });
                 }
                 (

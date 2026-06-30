@@ -480,6 +480,65 @@ mod tests {
     }
 
     #[test]
+    fn split_aggregate_preserves_layout_when_visible_group_key_is_pruned() {
+        let mut memo = Memo::new();
+        let group_output_id = ColumnId::new_for_test(101);
+        let sum_output_id = ColumnId::new_for_test(201);
+        let group = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")])[0];
+        let arg = intern_exprs(&mut memo.scalars, &[col_ref(2, "v")])[0];
+        let agg = LogicalAggregateOp::single(
+            vec![group],
+            vec![ScalarAggregateSpec {
+                output_column_id: sum_output_id,
+                name: "sum".to_string(),
+                args: vec![arg],
+                distinct: false,
+                order_by: vec![],
+            }],
+            AggregateOutputLayout::new(
+                vec![OutputColumn {
+                    column_id: group_output_id,
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+                vec![OutputColumn {
+                    column_id: sum_output_id,
+                    name: "sum(v)".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                }],
+            ),
+            vec![OutputColumn {
+                column_id: sum_output_id,
+                name: "sum(v)".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+        );
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(agg),
+            children: vec![values_group(&mut memo)],
+        };
+
+        let out = SplitAggregateRule.apply(&expr, &mut memo);
+
+        let Operator::LogicalAggregate(global) = &out[0].op else {
+            panic!("expected global aggregate");
+        };
+        assert_eq!(global.output_columns.len(), 1);
+        assert_eq!(global.output_columns[0].column_id, sum_output_id);
+        assert_eq!(
+            global.output_layout.group_key_columns[0].column_id,
+            group_output_id
+        );
+    }
+
+    #[test]
     fn repeated_apply_reuses_existing_local_group() {
         let mut memo = Memo::new();
         let expr = single_grouped_expr(&mut memo);

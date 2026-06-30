@@ -1860,7 +1860,7 @@ mod tests {
     fn aggregate_over(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
-                group_by: vec![col_expr(1, "l_k")],
+                group_by: vec![col_expr(1, "l_k"), col_expr(10, "r_k")],
                 aggregates: Vec::new(),
                 output_columns: vec![output_column(1, "l_k"), output_column(10, "r_k")],
                 already_pushed: false,

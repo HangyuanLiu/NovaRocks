@@ -157,21 +157,6 @@ fn aggregate_output_column<'a>(
     output_column
 }
 
-pub(crate) fn aggregate_output_layout_from_legacy_outputs(
-    group_by_len: usize,
-    aggregate_len: usize,
-    output_columns: &[OutputColumn],
-) -> AggregateOutputLayout {
-    assert!(
-        output_columns.len() >= group_by_len + aggregate_len,
-        "aggregate output layout must be [group_by..., aggregates...]"
-    );
-    AggregateOutputLayout::new(
-        output_columns[..group_by_len].to_vec(),
-        output_columns[group_by_len..group_by_len + aggregate_len].to_vec(),
-    )
-}
-
 pub(crate) fn materialize_aggregate_call(
     arena: &ScalarArena,
     call: &ScalarAggregateSpec,

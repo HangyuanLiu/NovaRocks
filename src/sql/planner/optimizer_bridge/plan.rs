@@ -46,10 +46,23 @@ fn aggregate_output_layout_from_plan(
     output_columns: &[OutputColumn],
 ) -> AggregateOutputLayout {
     assert!(
-        output_columns.len() >= group_by_len + aggregates.len(),
-        "planner Aggregate output_columns must contain group keys and aggregate outputs"
+        output_columns.len() >= aggregates.len(),
+        "planner Aggregate output_columns must contain aggregate outputs"
     );
-    let group_key_columns = output_columns[..group_by_len].to_vec();
+    let aggregate_output_ids: Vec<_> = aggregates
+        .iter()
+        .map(|aggregate| aggregate.output_column_id)
+        .collect();
+    let group_key_columns: Vec<_> = output_columns
+        .iter()
+        .filter(|column| !aggregate_output_ids.contains(&column.column_id))
+        .take(group_by_len)
+        .cloned()
+        .collect();
+    assert!(
+        group_key_columns.len() == group_by_len,
+        "planner Aggregate output_columns must contain group key outputs"
+    );
     let aggregate_columns = aggregates
         .iter()
         .map(|aggregate| {

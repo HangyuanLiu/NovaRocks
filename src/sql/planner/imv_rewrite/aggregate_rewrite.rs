@@ -2506,7 +2506,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
-                    output_column_id: ColumnId::UNSET,
+                    output_column_id: ColumnId::new_for_test(3),
                 }],
                 output_columns: vec![
                     OutputColumn {
@@ -2541,7 +2541,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
-                    output_column_id: ColumnId::UNSET,
+                    output_column_id: ColumnId::new_for_test(3),
                 }],
                 output_columns: vec![
                     OutputColumn {
@@ -2577,7 +2577,7 @@ mod tests {
             distinct: false,
             result_type: DataType::Int64,
             order_by: Vec::new(),
-            output_column_id: ColumnId::UNSET,
+            output_column_id: ColumnId::new_for_test(4),
         });
         node.output_columns.push(OutputColumn {
             column_id: ColumnId::new_for_test(4),
@@ -2836,6 +2836,9 @@ mod tests {
             unreachable!()
         };
         aggregate.group_by.clear();
+        aggregate
+            .output_columns
+            .retain(|column| column.column_id == ColumnId::new_for_test(3));
         let arena_rc = ctx.scalar_arena();
         let expr = logical_plan_to_opt_expr(&delta(aggregate_plan), &mut arena_rc.borrow_mut());
         let err = rule
