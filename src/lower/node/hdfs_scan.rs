@@ -238,17 +238,6 @@ fn scan_ranges_have_position_delete_files(ranges: &[FileScanRange]) -> bool {
     })
 }
 
-fn parse_true_false(value: &str) -> Option<bool> {
-    let trimmed = value.trim();
-    if trimmed.eq_ignore_ascii_case("true") || trimmed == "1" {
-        return Some(true);
-    }
-    if trimmed.eq_ignore_ascii_case("false") || trimmed == "0" {
-        return Some(false);
-    }
-    None
-}
-
 fn file_cache_flags_from_query_options(
     query_opts: Option<&internal_service::TQueryOptions>,
 ) -> (bool, bool) {
