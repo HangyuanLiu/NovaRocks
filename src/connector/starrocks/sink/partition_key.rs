@@ -26,15 +26,13 @@ use arrow::array::{
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
-use chrono::{Datelike, NaiveDate, NaiveDateTime};
 
 use crate::common::ids::SlotId;
+use crate::connector::starrocks::sink::plan::{
+    SinkPartitionDescriptor, SinkSchemaDescriptor, SinkSlotDescriptor,
+};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::Layout;
-use crate::thrift::{data_sinks, descriptors, exprs};
-use crate::types::arrow_thrift::thrift_desc_to_arrow_type;
 
 #[derive(Clone)]
 pub(crate) enum PartitionKeySource {
@@ -83,8 +81,6 @@ pub(crate) enum PartitionKeyValue {
     Binary(Vec<u8>),
 }
 
-const UNIX_EPOCH_DAY_OFFSET: i32 = 719_163;
-
 pub(crate) fn partition_key_source_len(source: &PartitionKeySource) -> usize {
     match source {
         PartitionKeySource::None => 0,
@@ -94,17 +90,16 @@ pub(crate) fn partition_key_source_len(source: &PartitionKeySource) -> usize {
 }
 
 pub(crate) fn build_slot_name_map(
-    slot_descs: &[descriptors::TSlotDescriptor],
+    slot_descs: &[SinkSlotDescriptor],
 ) -> Result<HashMap<String, SlotId>, String> {
     let mut slot_by_name = HashMap::new();
     for (idx, slot) in slot_descs.iter().enumerate() {
-        let Some(id) = slot.id else {
+        let Some(slot_id) = slot.id else {
             return Err(format!(
                 "OLAP_TABLE_SINK schema.slot_descs[{}] missing id while resolving slot names",
                 idx
             ));
         };
-        let slot_id = SlotId::try_from(id)?;
         if let Some(col_name) = slot
             .col_name
             .as_deref()
@@ -126,7 +121,7 @@ pub(crate) fn build_slot_name_map(
 }
 
 pub(crate) fn resolve_slot_ids_by_names(
-    slot_descs: &[descriptors::TSlotDescriptor],
+    slot_descs: &[SinkSlotDescriptor],
     names: &[String],
     label: &str,
     slot_name_overrides: Option<&HashMap<String, SlotId>>,
@@ -149,37 +144,22 @@ pub(crate) fn resolve_slot_ids_by_names(
 }
 
 pub(crate) fn build_partition_key_source(
-    sink: &data_sinks::TOlapTableSink,
-    session_time_zone: Option<&str>,
+    partition: &SinkPartitionDescriptor,
+    schema: &SinkSchemaDescriptor,
     slot_name_overrides: Option<&HashMap<String, SlotId>>,
-    slot_id_overrides: Option<&HashMap<SlotId, SlotId>>,
 ) -> Result<PartitionKeySource, String> {
-    if let Some(exprs) = sink.partition.partition_exprs.as_ref()
-        && !exprs.is_empty()
-    {
-        let plan = lower_partition_expr_plan(exprs, session_time_zone, slot_id_overrides)?;
-        return Ok(PartitionKeySource::Expr(Arc::new(plan)));
+    if let Some(exprs) = partition.partition_exprs.as_ref() {
+        return Ok(PartitionKeySource::Expr(Arc::clone(exprs)));
     }
 
-    let partition_columns = sink
-        .partition
-        .partition_columns
-        .as_ref()
-        .map(|v| {
-            v.iter()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_ascii_lowercase())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let partition_columns = &partition.partition_columns;
     if partition_columns.is_empty() {
         return Ok(PartitionKeySource::None);
     }
 
     let slot_ids = resolve_slot_ids_by_names(
-        &sink.schema.slot_descs,
-        &partition_columns,
+        &schema.slot_descs,
+        partition_columns,
         "partition column",
         slot_name_overrides,
     )?;
@@ -192,92 +172,6 @@ pub(crate) fn build_partition_key_source(
         })
         .collect::<Vec<_>>();
     Ok(PartitionKeySource::SlotRefs(slot_refs))
-}
-
-fn lower_partition_expr_plan(
-    exprs: &[exprs::TExpr],
-    session_time_zone: Option<&str>,
-    slot_id_overrides: Option<&HashMap<SlotId, SlotId>>,
-) -> Result<PartitionExprPlan, String> {
-    let mut arena = ExprArena::default();
-    arena.set_session_time_zone(session_time_zone.map(|s| s.to_string()));
-    let mut expr_ids = Vec::with_capacity(exprs.len());
-    let empty_layout = Layout {
-        order: Vec::new(),
-        index: HashMap::new(),
-    };
-    for expr in exprs {
-        let mut rewritten_expr = expr.clone();
-        if let Some(overrides) = slot_id_overrides {
-            remap_partition_expr_slot_ids(&mut rewritten_expr, overrides)?;
-        }
-        let expr_id = lower_t_expr(&rewritten_expr, &mut arena, &empty_layout, None, None)?;
-        expr_ids.push(expr_id);
-    }
-    Ok(PartitionExprPlan { arena, expr_ids })
-}
-
-fn remap_partition_expr_slot_ids(
-    expr: &mut exprs::TExpr,
-    slot_id_overrides: &HashMap<SlotId, SlotId>,
-) -> Result<(), String> {
-    if slot_id_overrides.is_empty() {
-        return Ok(());
-    }
-    for (idx, node) in expr.nodes.iter_mut().enumerate() {
-        if node.node_type != exprs::TExprNodeType::SLOT_REF {
-            continue;
-        }
-        let Some(slot_ref) = node.slot_ref.as_mut() else {
-            continue;
-        };
-        let source_slot_id = SlotId::try_from(slot_ref.slot_id).map_err(|e| {
-            format!(
-                "invalid partition expr slot id {} at node {}: {}",
-                slot_ref.slot_id, idx, e
-            )
-        })?;
-        let Some(target_slot_id) = slot_id_overrides.get(&source_slot_id).copied() else {
-            continue;
-        };
-        let target_slot_i32 = i32::try_from(target_slot_id.as_u32()).map_err(|_| {
-            format!(
-                "partition expr remapped slot id {} exceeds i32 range",
-                target_slot_id
-            )
-        })?;
-        slot_ref.slot_id = target_slot_i32;
-    }
-    Ok(())
-}
-
-pub(crate) fn parse_partition_boundary_key(
-    key_nodes: Option<&[exprs::TExprNode]>,
-    legacy_node: Option<&exprs::TExprNode>,
-) -> Result<Option<Vec<PartitionKeyValue>>, String> {
-    if let Some(nodes) = key_nodes {
-        if nodes.is_empty() {
-            return Ok(None);
-        }
-        return parse_partition_key_nodes(nodes).map(Some);
-    }
-    if let Some(node) = legacy_node {
-        return parse_partition_key_nodes(std::slice::from_ref(node)).map(Some);
-    }
-    Ok(None)
-}
-
-pub(crate) fn parse_partition_in_keys(
-    in_keys: Option<&[Vec<exprs::TExprNode>]>,
-) -> Result<Vec<Vec<PartitionKeyValue>>, String> {
-    let Some(in_keys) = in_keys else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::with_capacity(in_keys.len());
-    for key in in_keys {
-        out.push(parse_partition_key_nodes(key)?);
-    }
-    Ok(out)
 }
 
 pub(crate) fn validate_partition_key_length(
@@ -329,209 +223,6 @@ pub(crate) fn validate_partition_key_length(
         }
     }
     Ok(())
-}
-
-fn parse_partition_key_nodes(nodes: &[exprs::TExprNode]) -> Result<Vec<PartitionKeyValue>, String> {
-    let mut out = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        out.push(parse_partition_key_node(node)?);
-    }
-    Ok(out)
-}
-
-fn parse_partition_key_node(node: &exprs::TExprNode) -> Result<PartitionKeyValue, String> {
-    match node.node_type {
-        t if t == exprs::TExprNodeType::NULL_LITERAL => Ok(PartitionKeyValue::Null),
-        t if t == exprs::TExprNodeType::BOOL_LITERAL => {
-            let value = node
-                .bool_literal
-                .as_ref()
-                .ok_or_else(|| "BOOL_LITERAL missing bool_literal payload".to_string())?
-                .value;
-            Ok(PartitionKeyValue::Bool(value))
-        }
-        t if t == exprs::TExprNodeType::INT_LITERAL => {
-            let value = node
-                .int_literal
-                .as_ref()
-                .ok_or_else(|| "INT_LITERAL missing int_literal payload".to_string())?
-                .value as i128;
-            Ok(PartitionKeyValue::Int(value))
-        }
-        t if t == exprs::TExprNodeType::LARGE_INT_LITERAL => {
-            let value = node
-                .large_int_literal
-                .as_ref()
-                .ok_or_else(|| "LARGE_INT_LITERAL missing payload".to_string())?
-                .value
-                .trim()
-                .parse::<i128>()
-                .map_err(|_| "LARGE_INT_LITERAL parse failed".to_string())?;
-            Ok(PartitionKeyValue::Int(value))
-        }
-        t if t == exprs::TExprNodeType::DECIMAL_LITERAL => {
-            let text = node
-                .decimal_literal
-                .as_ref()
-                .ok_or_else(|| "DECIMAL_LITERAL missing decimal_literal payload".to_string())?
-                .value
-                .clone();
-            let DataType::Decimal128(precision, scale) = thrift_desc_to_arrow_type(&node.type_)
-                .ok_or_else(|| {
-                    "DECIMAL_LITERAL missing or unsupported type descriptor".to_string()
-                })?
-            else {
-                return Err("DECIMAL_LITERAL type descriptor is not decimal".to_string());
-            };
-            let value = parse_decimal_literal_value(&text, precision, scale)?;
-            Ok(PartitionKeyValue::Decimal { value, scale })
-        }
-        t if t == exprs::TExprNodeType::STRING_LITERAL
-            || t == exprs::TExprNodeType::DATE_LITERAL =>
-        {
-            let value = if t == exprs::TExprNodeType::STRING_LITERAL {
-                node.string_literal
-                    .as_ref()
-                    .ok_or_else(|| "STRING_LITERAL missing string_literal payload".to_string())?
-                    .value
-                    .clone()
-            } else {
-                node.date_literal
-                    .as_ref()
-                    .ok_or_else(|| "DATE_LITERAL missing date_literal payload".to_string())?
-                    .value
-                    .clone()
-            };
-            match thrift_desc_to_arrow_type(&node.type_) {
-                Some(DataType::Date32) => {
-                    Ok(PartitionKeyValue::Date32(parse_date_literal_days(&value)?))
-                }
-                Some(DataType::Timestamp(_, _)) | Some(DataType::Time64(_)) => Ok(
-                    PartitionKeyValue::TimestampMicros(parse_datetime_literal_micros(&value)?),
-                ),
-                Some(DataType::Binary) => Ok(PartitionKeyValue::Binary(value.into_bytes())),
-                _ => Ok(PartitionKeyValue::Utf8(value)),
-            }
-        }
-        t if t == exprs::TExprNodeType::BINARY_LITERAL => {
-            let value = node
-                .binary_literal
-                .as_ref()
-                .ok_or_else(|| "BINARY_LITERAL missing payload".to_string())?
-                .value
-                .clone();
-            Ok(PartitionKeyValue::Binary(value))
-        }
-        t if t == exprs::TExprNodeType::FLOAT_LITERAL => {
-            let _ = node
-                .float_literal
-                .as_ref()
-                .ok_or_else(|| "FLOAT_LITERAL missing float_literal payload".to_string())?;
-            Err("unsupported partition key literal node type: FLOAT_LITERAL".to_string())
-        }
-        other => Err(format!(
-            "unsupported partition key literal node type: {:?}",
-            other
-        )),
-    }
-}
-
-fn parse_date_literal_days(value: &str) -> Result<i32, String> {
-    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        return Ok(date.num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET);
-    }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
-        return Ok(dt.date().num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET);
-    }
-    Err(format!("invalid DATE literal '{value}'"))
-}
-
-fn parse_datetime_literal_micros(value: &str) -> Result<i64, String> {
-    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") {
-        return Ok(dt.and_utc().timestamp_micros());
-    }
-    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        let dt = date
-            .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| format!("invalid DATETIME literal '{value}'"))?;
-        return Ok(dt.and_utc().timestamp_micros());
-    }
-    Err(format!("invalid DATETIME literal '{value}'"))
-}
-
-fn parse_decimal_literal_value(value: &str, precision: u8, scale: i8) -> Result<i128, String> {
-    if scale < 0 {
-        return Err(format!("invalid decimal scale: {scale}"));
-    }
-    let mut s = value.trim();
-    if s.is_empty() {
-        return Err("empty DECIMAL literal".to_string());
-    }
-
-    let mut sign: i128 = 1;
-    if let Some(rest) = s.strip_prefix('-') {
-        sign = -1;
-        s = rest;
-    } else if let Some(rest) = s.strip_prefix('+') {
-        s = rest;
-    }
-    if s.is_empty() {
-        return Err("empty DECIMAL literal".to_string());
-    }
-
-    let mut iter = s.split('.');
-    let int_part_raw = iter.next().unwrap_or("");
-    let frac_part = iter.next().unwrap_or("");
-    if iter.next().is_some() {
-        return Err(format!("invalid DECIMAL literal '{value}'"));
-    }
-    if int_part_raw.is_empty() && frac_part.is_empty() {
-        return Err(format!("invalid DECIMAL literal '{value}'"));
-    }
-
-    let int_part = if int_part_raw.is_empty() {
-        "0"
-    } else {
-        int_part_raw
-    };
-    if !int_part.chars().all(|c| c.is_ascii_digit())
-        || !frac_part.chars().all(|c| c.is_ascii_digit())
-    {
-        return Err(format!("invalid DECIMAL literal '{value}'"));
-    }
-
-    let scale_usize = scale as usize;
-    if frac_part.len() > scale_usize {
-        return Err(format!(
-            "DECIMAL literal '{}' exceeds scale {}",
-            value, scale_usize
-        ));
-    }
-
-    let mut digits = String::with_capacity(int_part.len() + scale_usize);
-    digits.push_str(int_part);
-    digits.push_str(frac_part);
-    for _ in 0..(scale_usize - frac_part.len()) {
-        digits.push('0');
-    }
-
-    let digits_trim = digits.trim_start_matches('0');
-    let digits_final = if digits_trim.is_empty() {
-        "0"
-    } else {
-        digits_trim
-    };
-    if digits_final.len() > precision as usize {
-        return Err(format!(
-            "DECIMAL literal '{}' exceeds precision {}",
-            value, precision
-        ));
-    }
-
-    let unsigned = digits_final
-        .parse::<i128>()
-        .map_err(|_| format!("failed to parse DECIMAL literal '{value}'"))?;
-    Ok(unsigned.saturating_mul(sign))
 }
 
 pub(crate) fn build_partition_key_arrays(

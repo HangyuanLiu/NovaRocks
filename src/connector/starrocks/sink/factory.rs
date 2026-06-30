@@ -23,60 +23,345 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use arrow::array::{
-    Array, BooleanArray, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow::datatypes::DataType;
-use chrono::NaiveDate;
-
-use crate::common::config;
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::fe_v2_meta::{
     LakeTableIdentity, LakeTabletPartitionRef, resolve_tablet_paths_for_olap_sink,
 };
+use crate::connector::starrocks::lake::TabletWriteContext;
 use crate::connector::starrocks::lake::context::{
-    AutoIncrementWritePolicy, PartialUpdateWriteMode, PartialUpdateWritePolicy, get_tablet_runtime,
+    AutoIncrementWritePolicy, PartialUpdateWritePolicy, get_tablet_runtime,
 };
-use crate::connector::starrocks::lake::{TabletWriteContext, build_sink_tablet_schema};
+use crate::connector::starrocks::sink::frontend_wire::create_automatic_partitions;
 use crate::connector::starrocks::sink::operator::{
     OlapSinkFinalizeSharedState, OlapTableSinkOperator,
 };
 use crate::connector::starrocks::sink::partition_key::{
     PartitionKeySource, build_partition_key_source, build_slot_name_map, resolve_slot_ids_by_names,
 };
+use crate::connector::starrocks::sink::plan::{
+    FrontendAddress, SinkIndexDescriptor, SinkOutputProjectionPlan, SinkPredicatePlan,
+    SinkSchemaDescriptor, SinkSlotDescriptor, StarRocksSinkDescriptor, StarRocksSinkFactoryInput,
+};
+use crate::connector::starrocks::sink::report_wire::TabletCommitInfo;
 use crate::connector::starrocks::sink::routing::{RowRoutingPlan, build_sink_routing_for_index_id};
-use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::node::{ExecNodeKind, ExecPlan};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
-use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::Layout;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::info;
 use crate::runtime::starlet_shard_registry;
-use crate::service::disk_report;
-use crate::service::frontend_rpc::{
-    FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
-};
 use crate::service::grpc_client::proto::starrocks::{KeysType, PUniqueId, TabletSchemaPb};
-use crate::thrift::frontend_service::{self, TFrontendServiceSyncClient};
-use crate::thrift::status_code;
-use crate::thrift::{data_sinks, descriptors, exprs, types};
 
 const LOAD_OP_COLUMN: &str = "__op";
 pub(crate) const STARROCKS_DEFAULT_PARTITION_VALUE: &str = "__STARROCKS_DEFAULT_PARTITION__";
-const CREATE_PARTITION_TRANSPORT_RETRIES: usize = 4;
 
 #[derive(Clone)]
 pub struct OlapTableSinkFactory {
     name: String,
     plan: Arc<OlapTableSinkPlan>,
     finalize_shared: Arc<OlapSinkFinalizeSharedState>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::{
+        SinkWriteIndexSelection, build_auto_partition_plan,
+        resolve_effective_tablet_schema_for_index, resolve_write_slot_bindings,
+    };
+    use crate::common::ids::SlotId;
+    use crate::connector::starrocks::lake::TabletWriteContext;
+    use crate::connector::starrocks::lake::context::{
+        PartialUpdateWriteMode, lock_runtime_test_state, register_tablet_runtime,
+    };
+    use crate::connector::starrocks::sink::plan::{
+        FrontendAddress, SinkIndexDescriptor, SinkLocationDescriptor, SinkNodeInfo,
+        SinkNodesDescriptor, SinkPartitionDescriptor, SinkPartitionEntry, SinkPartitionIndex,
+        SinkSchemaDescriptor, SinkSlotDescriptor, SinkTabletLocation, StarRocksSinkDescriptor,
+    };
+    use crate::service::grpc_client::proto::starrocks::{
+        ColumnPb, KeysType, PUniqueId, TabletSchemaPb,
+    };
+
+    fn slot(id: u32, name: &str) -> SinkSlotDescriptor {
+        SinkSlotDescriptor {
+            id: Some(SlotId::new(id)),
+            col_name: Some(name.to_string()),
+            col_physical_name: None,
+        }
+    }
+
+    fn column(name: &str, unique_id: i32, is_key: bool) -> ColumnPb {
+        ColumnPb {
+            unique_id,
+            name: Some(name.to_string()),
+            r#type: "BIGINT".to_string(),
+            is_key: Some(is_key),
+            is_nullable: Some(!is_key),
+            ..Default::default()
+        }
+    }
+
+    fn mv_tablet_schema() -> TabletSchemaPb {
+        TabletSchemaPb {
+            id: Some(10),
+            keys_type: Some(KeysType::AggKeys as i32),
+            column: vec![
+                column("ds", 1, true),
+                column("tag", 2, true),
+                column("mv_sum_v1", 3, false),
+                column("mv_bitmap_union_user_id", 4, false),
+            ],
+            sort_key_idxes: vec![0, 1],
+            sort_key_unique_ids: vec![1, 2],
+            ..Default::default()
+        }
+    }
+
+    fn pk_tablet_schema() -> TabletSchemaPb {
+        TabletSchemaPb {
+            id: Some(10),
+            keys_type: Some(KeysType::PrimaryKeys as i32),
+            column: vec![column("k1", 1, true), column("v", 2, false)],
+            sort_key_idxes: vec![0],
+            sort_key_unique_ids: vec![1],
+            ..Default::default()
+        }
+    }
+
+    fn descriptor(
+        keys_type: KeysType,
+        slot_descs: Vec<SinkSlotDescriptor>,
+        index_columns: Vec<&str>,
+        tablet_schema: TabletSchemaPb,
+    ) -> StarRocksSinkDescriptor {
+        StarRocksSinkDescriptor {
+            db_id: 1,
+            table_id: 2,
+            db_name: Some("db".to_string()),
+            table_name: Some("tbl".to_string()),
+            txn_id: 10,
+            load_id: PUniqueId { hi: 1, lo: 2 },
+            keys_type,
+            is_lake_table: true,
+            dynamic_overwrite: false,
+            partial_update_mode: PartialUpdateWriteMode::Unknown,
+            merge_condition: None,
+            null_expr_in_auto_increment: false,
+            miss_auto_increment_column: false,
+            schema: SinkSchemaDescriptor {
+                slot_descs,
+                indexes: vec![SinkIndexDescriptor {
+                    index_id: 10,
+                    schema_id: 10,
+                    column_names: index_columns
+                        .into_iter()
+                        .map(|name| name.to_ascii_lowercase())
+                        .collect(),
+                    tablet_schema,
+                    column_to_expr_value: HashMap::new(),
+                    is_shadow: false,
+                    where_clause: None,
+                }],
+            },
+            partition: SinkPartitionDescriptor {
+                enable_automatic_partition: false,
+                partition_columns: Vec::new(),
+                distributed_columns: Vec::new(),
+                partition_exprs: None,
+                partitions: vec![SinkPartitionEntry {
+                    partition_id: 20,
+                    is_shadow: false,
+                    indexes: vec![SinkPartitionIndex {
+                        index_id: 10,
+                        tablet_ids: vec![100],
+                    }],
+                    start_key: None,
+                    end_key: None,
+                    in_keys: Vec::new(),
+                }],
+            },
+            location: SinkLocationDescriptor {
+                tablets: vec![SinkTabletLocation {
+                    tablet_id: 100,
+                    node_ids: vec![1],
+                }],
+            },
+            nodes: SinkNodesDescriptor {
+                nodes: vec![SinkNodeInfo { id: 1, option: 0 }],
+            },
+            frontend: Some(FrontendAddress {
+                hostname: "127.0.0.1".to_string(),
+                port: 9030,
+            }),
+        }
+    }
+
+    #[test]
+    fn write_slot_bindings_use_projected_output_ordinals_for_rollup_agg_columns() {
+        let descriptor = descriptor(
+            KeysType::AggKeys,
+            vec![
+                slot(1, "ds"),
+                slot(2, "tag"),
+                slot(3, "sum_v1"),
+                slot(4, "user_id"),
+            ],
+            vec!["ds", "tag", "mv_sum_v1", "mv_bitmap_union_user_id"],
+            mv_tablet_schema(),
+        );
+        let projected = vec![
+            SlotId::new(1),
+            SlotId::new(2),
+            SlotId::new(3),
+            SlotId::new(4),
+        ];
+
+        let (bindings, op_slot_id) = resolve_write_slot_bindings(
+            &descriptor,
+            10,
+            &HashMap::new(),
+            &[],
+            Some(projected.as_slice()),
+            &mv_tablet_schema(),
+        )
+        .expect("bindings");
+
+        assert_eq!(
+            bindings,
+            vec![
+                Some(SlotId::new(1)),
+                Some(SlotId::new(2)),
+                Some(SlotId::new(3)),
+                Some(SlotId::new(4))
+            ]
+        );
+        assert_eq!(op_slot_id, None);
+    }
+
+    #[test]
+    fn write_slot_bindings_use_output_expr_ordinals_when_aliases_do_not_match_physical_mv_names() {
+        let descriptor = descriptor(
+            KeysType::AggKeys,
+            vec![
+                slot(1, "ds"),
+                slot(2, "tag"),
+                slot(3, "sum_v1"),
+                slot(4, "user_id"),
+            ],
+            vec!["ds", "tag", "mv_sum_v1", "mv_bitmap_union_user_id"],
+            mv_tablet_schema(),
+        );
+        let output_slot_ids = vec![
+            Some(SlotId::new(1)),
+            Some(SlotId::new(2)),
+            Some(SlotId::new(3)),
+            Some(SlotId::new(4)),
+        ];
+
+        let (bindings, op_slot_id) = resolve_write_slot_bindings(
+            &descriptor,
+            10,
+            &HashMap::new(),
+            output_slot_ids.as_slice(),
+            None,
+            &mv_tablet_schema(),
+        )
+        .expect("bindings");
+
+        assert_eq!(
+            bindings,
+            vec![
+                Some(SlotId::new(1)),
+                Some(SlotId::new(2)),
+                Some(SlotId::new(3)),
+                Some(SlotId::new(4))
+            ]
+        );
+        assert_eq!(op_slot_id, None);
+    }
+
+    #[test]
+    fn write_slot_bindings_skip_hidden_op_for_primary_key_delete_plan() {
+        let descriptor = descriptor(
+            KeysType::PrimaryKeys,
+            vec![slot(1, "k1"), slot(6, super::LOAD_OP_COLUMN)],
+            vec!["k1", "v"],
+            pk_tablet_schema(),
+        );
+        let mut output_map = HashMap::new();
+        output_map.insert("k1".to_string(), SlotId::new(1));
+        output_map.insert(super::LOAD_OP_COLUMN.to_string(), SlotId::new(6));
+        let output_slot_ids = vec![Some(SlotId::new(1)), Some(SlotId::new(6))];
+
+        let (bindings, op_slot_id) = resolve_write_slot_bindings(
+            &descriptor,
+            10,
+            &output_map,
+            output_slot_ids.as_slice(),
+            None,
+            &pk_tablet_schema(),
+        )
+        .expect("bindings");
+
+        assert_eq!(bindings, vec![Some(SlotId::new(1)), None]);
+        assert_eq!(op_slot_id, Some(SlotId::new(6)));
+    }
+
+    #[test]
+    fn automatic_partition_plan_does_not_require_shadow_partitions() {
+        let mut descriptor = descriptor(
+            KeysType::DupKeys,
+            vec![slot(1, "ds"), slot(2, "v")],
+            vec!["ds", "v"],
+            TabletSchemaPb::default(),
+        );
+        descriptor.partition.enable_automatic_partition = true;
+        descriptor.partition.partition_columns = vec!["ds".to_string()];
+        descriptor.partition.distributed_columns = vec!["ds".to_string()];
+        descriptor.partition.partitions.clear();
+
+        let plan = build_auto_partition_plan(
+            &descriptor,
+            &[SinkWriteIndexSelection {
+                index_id: 10,
+                schema_id: 10,
+                where_clause: None,
+            }],
+            10,
+            &HashMap::new(),
+        )
+        .expect("auto partition plan")
+        .expect("enabled");
+
+        assert_eq!(plan.partition_slot_ids, vec![SlotId::new(1)]);
+        assert_eq!(plan.fe_addr.hostname, "127.0.0.1");
+    }
+
+    #[test]
+    fn write_index_prefers_registered_runtime_schema_for_rollup_tablets() {
+        let _guard = lock_runtime_test_state();
+        let mut runtime_schema = mv_tablet_schema();
+        runtime_schema.keys_type = Some(KeysType::DupKeys as i32);
+        let ctx = TabletWriteContext {
+            db_id: 1,
+            table_id: 2,
+            tablet_id: 100,
+            tablet_root_path: "/tmp/novarocks-test-tablet-100".to_string(),
+            tablet_schema: runtime_schema.clone(),
+            s3_config: None,
+            partial_update: Default::default(),
+        };
+        register_tablet_runtime(&ctx).expect("register runtime");
+
+        let resolved =
+            resolve_effective_tablet_schema_for_index(2, 10, 10, &[100], &mv_tablet_schema());
+
+        assert_eq!(resolved.keys_type, Some(KeysType::DupKeys as i32));
+    }
 }
 
 #[derive(Clone)]
@@ -89,7 +374,7 @@ pub(crate) struct OlapTableSinkPlan {
     pub(crate) txn_id: i64,
     pub(crate) load_id: PUniqueId,
     pub(crate) write_format: StarRocksWriteFormat,
-    pub(crate) tablet_commit_infos: Vec<types::TTabletCommitInfo>,
+    pub(crate) tablet_commit_infos: Vec<TabletCommitInfo>,
     pub(crate) write_targets: HashMap<i64, TabletWriteTarget>,
     pub(crate) row_routing: RowRoutingPlan,
     pub(crate) schema_slot_bindings: Vec<Option<SlotId>>,
@@ -114,22 +399,14 @@ pub(crate) struct SinkIndexWritePlan {
     pub(crate) write_targets: HashMap<i64, TabletWriteTarget>,
     pub(crate) schema_slot_bindings: Vec<Option<SlotId>>,
     pub(crate) op_slot_id: Option<SlotId>,
-    pub(crate) where_clause: Option<exprs::TExpr>,
+    pub(crate) where_clause: Option<SinkPredicatePlan>,
 }
 
 #[derive(Clone)]
 struct SinkWriteIndexSelection {
     index_id: i64,
     schema_id: i64,
-    where_clause: Option<exprs::TExpr>,
-}
-
-#[derive(Clone)]
-pub(crate) struct SinkOutputProjectionPlan {
-    pub(crate) arena: Arc<ExprArena>,
-    pub(crate) expr_ids: Vec<ExprId>,
-    pub(crate) output_slot_ids: Vec<SlotId>,
-    pub(crate) output_field_names: Vec<String>,
+    where_clause: Option<SinkPredicatePlan>,
 }
 
 #[derive(Clone)]
@@ -145,67 +422,50 @@ pub(crate) struct AutomaticPartitionPlan {
     pub(crate) table_id: i64,
     pub(crate) txn_id: i64,
     pub(crate) dynamic_overwrite: bool,
-    pub(crate) fe_addr: types::TNetworkAddress,
+    pub(crate) fe_addr: FrontendAddress,
     pub(crate) partition_key_source: PartitionKeySource,
     pub(crate) partition_column_names: Vec<String>,
     pub(crate) partition_slot_ids: Vec<SlotId>,
 }
 
 impl OlapTableSinkFactory {
-    pub(crate) fn try_new(
-        sink: data_sinks::TOlapTableSink,
-        output_exprs: Option<&[exprs::TExpr]>,
-        exec_plan: Option<&ExecPlan>,
-        layout: Option<&Layout>,
-        last_query_id: Option<&str>,
-        session_time_zone: Option<&str>,
-        fe_addr: Option<&types::TNetworkAddress>,
-    ) -> Result<Self, String> {
-        let mut sink = sink;
-        if sink.is_lake_table != Some(true) {
+    pub(crate) fn try_new(input: StarRocksSinkFactoryInput) -> Result<Self, String> {
+        let StarRocksSinkFactoryInput {
+            name,
+            mut descriptor,
+            output_projection,
+            output_expr_slot_name_map,
+            output_expr_slot_ids,
+            literal_partition_values,
+        } = input;
+        if !descriptor.is_lake_table {
             return Err(
                 "OLAP_TABLE_SINK only supports shared-data lake table in novarocks phase-1 write path"
                     .to_string(),
             );
         }
-        let keys_type = map_sink_keys_type(sink.keys_type)?;
-        let write_indexes = resolve_sink_write_index_selections(&sink)?;
+        let write_indexes = resolve_sink_write_index_selections(&descriptor)?;
         let primary_write_index = write_indexes.first().ok_or_else(|| {
             "OLAP_TABLE_SINK cannot resolve any write index from sink schema/partition metadata"
                 .to_string()
         })?;
         let schema_id = primary_write_index.schema_id;
         maybe_create_automatic_partitions_for_literal_insert(
-            &mut sink,
+            &mut descriptor,
             schema_id,
-            output_exprs,
-            exec_plan,
-            fe_addr,
+            literal_partition_values,
         )?;
-        let output_projection = build_output_projection_plan(
-            &sink,
-            output_exprs,
-            layout,
-            session_time_zone,
-            last_query_id,
-            fe_addr,
-        )?;
-        // StarRocks routes and writes against the post-output_expr tuple slots.
-        // Once we materialize output_exprs into sink schema slot ids, downstream slot resolution
-        // must also use sink schema ids instead of original child slot refs.
-        let routing_exprs = if output_projection.is_some() {
-            None
+        let routing_output_expr_slot_name_map = if output_projection.is_some() {
+            HashMap::new()
         } else {
-            output_exprs
+            output_expr_slot_name_map.clone()
         };
-        let table_identity = build_lake_table_identity_with_schema_id(&sink, schema_id)?;
+        let table_identity = build_lake_table_identity_with_schema_id(&descriptor, schema_id)?;
         let auto_partition = build_auto_partition_plan(
-            &sink,
+            &descriptor,
             &write_indexes,
             schema_id,
-            routing_exprs,
-            session_time_zone,
-            fe_addr,
+            &routing_output_expr_slot_name_map,
         )?;
         let write_format = load_lake_data_write_format()?;
 
@@ -216,11 +476,10 @@ impl OlapTableSinkFactory {
         let mut commit_info_keys = HashSet::<(i64, i64)>::new();
         for index in &write_indexes {
             let routing = build_sink_routing_for_index_id(
-                &sink,
+                &descriptor,
                 index.index_id,
                 index.schema_id,
-                routing_exprs,
-                session_time_zone,
+                &routing_output_expr_slot_name_map,
             )?;
             if routing.commit_infos.is_empty() {
                 return Err(format!(
@@ -228,10 +487,10 @@ impl OlapTableSinkFactory {
                     index.index_id, index.schema_id
                 ));
             }
-            if sink.keys_type == Some(types::TKeysType::PRIMARY_KEYS) {
+            if descriptor.keys_type == KeysType::PrimaryKeys {
                 info!(
                     target: "novarocks::sink",
-                    table_id = sink.table_id,
+                    table_id = descriptor.table_id,
                     schema_id = index.schema_id,
                     index_id = index.index_id,
                     distributed_slot_ids = ?routing.row_routing.distributed_slot_ids,
@@ -256,24 +515,18 @@ impl OlapTableSinkFactory {
         if all_refs.is_empty() {
             return Err("OLAP_TABLE_SINK resolved empty tablet refs for write targets".to_string());
         }
-        let path_map =
-            resolve_tablet_paths_for_olap_sink(None, fe_addr, &table_identity, &all_refs)?;
+        let path_map = resolve_tablet_paths_for_olap_sink(None, None, &table_identity, &all_refs)?;
         let shard_infos =
             starlet_shard_registry::select_infos(&all_tablets.into_iter().collect::<Vec<_>>());
 
-        let partial_mode = PartialUpdateWriteMode::from_thrift(sink.partial_update_mode);
-        let merge_condition = sink
-            .merge_condition
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(ToString::to_string);
+        let partial_mode = descriptor.partial_update_mode.clone();
+        let merge_condition = descriptor.merge_condition.clone();
         let mut index_write_plans = Vec::with_capacity(index_routings.len());
         for (index, routing) in index_routings {
-            let sink_tablet_schema =
-                build_sink_tablet_schema(&sink.schema, index.schema_id, keys_type)?;
+            let index_descriptor = resolve_index_descriptor(&descriptor.schema, index.schema_id)?;
+            let sink_tablet_schema = index_descriptor.tablet_schema.clone();
             let tablet_schema = resolve_effective_tablet_schema_for_index(
-                sink.table_id,
+                descriptor.table_id,
                 index.index_id,
                 index.schema_id,
                 &routing.row_routing.tablet_ids,
@@ -283,16 +536,15 @@ impl OlapTableSinkFactory {
                 .as_ref()
                 .map(|plan| plan.output_slot_ids.as_slice());
             let (schema_slot_bindings, op_slot_id) = resolve_write_slot_bindings(
-                &sink,
+                &descriptor,
                 index.schema_id,
-                routing_exprs,
+                &output_expr_slot_name_map,
+                &output_expr_slot_ids,
                 projected_output_slot_ids,
                 &tablet_schema,
             )?;
-            let column_to_expr_value =
-                resolve_column_to_expr_value_for_write(&sink, index.schema_id)?;
-            let auto_increment =
-                resolve_auto_increment_write_policy(&sink, &tablet_schema, fe_addr)?;
+            let column_to_expr_value = index_descriptor.column_to_expr_value.clone();
+            let auto_increment = resolve_auto_increment_write_policy(&descriptor, &tablet_schema)?;
 
             let mut write_targets = HashMap::with_capacity(routing.row_routing.tablet_ids.len());
             for tablet_id in &routing.row_routing.tablet_ids {
@@ -346,8 +598,8 @@ impl OlapTableSinkFactory {
                             }
                         };
                         TabletWriteContext {
-                            db_id: sink.db_id,
-                            table_id: sink.table_id,
+                            db_id: descriptor.db_id,
+                            table_id: descriptor.table_id,
                             tablet_id: *tablet_id,
                             tablet_root_path: tablet_root_path.clone(),
                             tablet_schema: tablet_schema.clone(),
@@ -384,16 +636,13 @@ impl OlapTableSinkFactory {
         })?;
 
         let plan = OlapTableSinkPlan {
-            db_id: sink.db_id,
-            table_id: sink.table_id,
+            db_id: descriptor.db_id,
+            table_id: descriptor.table_id,
             table_identity,
-            db_name: sink.db_name.clone(),
-            table_name: sink.table_name.clone(),
-            txn_id: sink.txn_id,
-            load_id: PUniqueId {
-                hi: sink.load_id.hi,
-                lo: sink.load_id.lo,
-            },
+            db_name: descriptor.db_name.clone(),
+            table_name: descriptor.table_name.clone(),
+            txn_id: descriptor.txn_id,
+            load_id: descriptor.load_id,
             write_format,
             tablet_commit_infos,
             write_targets: primary_plan.write_targets.clone(),
@@ -414,12 +663,12 @@ impl OlapTableSinkFactory {
                 });
                 auto_idx.and_then(|idx| primary_plan.schema_slot_bindings.get(idx).and_then(|s| *s))
             },
-            null_expr_in_auto_increment: sink.null_expr_in_auto_increment.unwrap_or(false),
-            miss_auto_increment_column: sink.miss_auto_increment_column.unwrap_or(false),
+            null_expr_in_auto_increment: descriptor.null_expr_in_auto_increment,
+            miss_auto_increment_column: descriptor.miss_auto_increment_column,
         };
 
         Ok(Self {
-            name: "OLAP_TABLE_SINK".to_string(),
+            name,
             plan: Arc::new(plan),
             finalize_shared: Arc::new(OlapSinkFinalizeSharedState::default()),
         })
@@ -427,125 +676,89 @@ impl OlapTableSinkFactory {
 }
 
 fn maybe_create_automatic_partitions_for_literal_insert(
-    sink: &mut data_sinks::TOlapTableSink,
+    descriptor: &mut StarRocksSinkDescriptor,
     schema_id: i64,
-    output_exprs: Option<&[exprs::TExpr]>,
-    exec_plan: Option<&ExecPlan>,
-    fe_addr: Option<&types::TNetworkAddress>,
+    literal_partition_values: Option<Vec<String>>,
 ) -> Result<(), String> {
-    if !sink.partition.enable_automatic_partition.unwrap_or(false) {
+    if !descriptor.partition.enable_automatic_partition {
         return Ok(());
     }
-    if sink
-        .partition
-        .partition_exprs
-        .as_ref()
-        .is_some_and(|exprs| !exprs.is_empty())
-    {
+    if descriptor.partition.partition_exprs.is_some() {
         // For expression partitions, runtime automatic partition discovery should use
         // evaluated partition expr outputs from incoming chunks.
         return Ok(());
     }
 
-    let partition_columns = resolve_partition_columns_for_write(&sink.partition);
-    if partition_columns.is_empty() {
+    if descriptor.partition.partition_columns.is_empty() {
         return Ok(());
     }
 
-    let Some(output_exprs) = output_exprs else {
+    let Some(partition_values) = literal_partition_values else {
         return Ok(());
     };
-    let index_columns = resolve_index_column_names_for_write(sink, schema_id)?;
-    if index_columns.is_empty() {
-        return Ok(());
-    }
-
-    let mut partition_values = Vec::with_capacity(partition_columns.len());
-    for partition_col in &partition_columns {
-        let Some(column_idx) = index_columns.iter().position(|name| name == partition_col) else {
-            return Ok(());
-        };
-        let Some(expr) = output_exprs.get(column_idx) else {
-            return Ok(());
-        };
-        let Some(value) = extract_partition_literal_value(expr)
-            .or_else(|| extract_partition_value_from_exec_plan(expr, exec_plan))
-        else {
-            info!(
-                target: "novarocks::starrocks::sink",
-                table_id = sink.table_id,
-                txn_id = sink.txn_id,
-                partition_column = partition_col,
-                column_idx,
-                "OLAP_TABLE_SINK skip createPartition: cannot resolve partition value"
-            );
-            return Ok(());
-        };
-        partition_values.push(value);
-    }
-
-    let fe_addr = resolve_frontend_addr(fe_addr).ok_or_else(|| {
+    let fe_addr = descriptor.frontend.as_ref().ok_or_else(|| {
         "OLAP_TABLE_SINK automatic partition cannot resolve FE address".to_string()
     })?;
     info!(
         target: "novarocks::starrocks::sink",
-        table_id = sink.table_id,
-        txn_id = sink.txn_id,
+        table_id = descriptor.table_id,
+        txn_id = descriptor.txn_id,
+        schema_id,
         partition_values = ?partition_values,
         "OLAP_TABLE_SINK attempting FE createPartition for automatic partition"
     );
     let response = create_automatic_partitions(
         &fe_addr,
-        sink.db_id,
-        sink.table_id,
-        sink.txn_id,
-        sink.dynamic_overwrite.unwrap_or(false),
+        descriptor.db_id,
+        descriptor.table_id,
+        descriptor.txn_id,
+        descriptor.dynamic_overwrite,
         vec![partition_values],
     )
     .map_err(|e| format!("OLAP_TABLE_SINK precreate automatic partition failed: {e}"))?;
     info!(
         target: "novarocks::starrocks::sink",
-        table_id = sink.table_id,
-        txn_id = sink.txn_id,
-        partitions = response.partitions.as_ref().map(|v| v.len()).unwrap_or(0),
-        tablets = response.tablets.as_ref().map(|v| v.len()).unwrap_or(0),
-        nodes = response.nodes.as_ref().map(|v| v.len()).unwrap_or(0),
+        table_id = descriptor.table_id,
+        txn_id = descriptor.txn_id,
+        partitions = response.partitions.len(),
+        tablets = response.tablets.len(),
+        nodes = response.nodes.len(),
         "OLAP_TABLE_SINK FE createPartition succeeded"
     );
 
-    let mut partition_ids = sink
+    let mut partition_ids = descriptor
         .partition
         .partitions
         .iter()
-        .map(|part| part.id)
+        .map(|part| part.partition_id)
         .collect::<HashSet<_>>();
-    for part in response.partitions.unwrap_or_default() {
-        if partition_ids.insert(part.id) {
-            sink.partition.partitions.push(part);
+    for part in response.partitions {
+        if partition_ids.insert(part.partition_id) {
+            descriptor.partition.partitions.push(part);
         }
     }
 
-    let mut tablet_ids = sink
+    let mut tablet_ids = descriptor
         .location
         .tablets
         .iter()
         .map(|tablet| tablet.tablet_id)
         .collect::<HashSet<_>>();
-    for tablet in response.tablets.unwrap_or_default() {
+    for tablet in response.tablets {
         if tablet_ids.insert(tablet.tablet_id) {
-            sink.location.tablets.push(tablet);
+            descriptor.location.tablets.push(tablet);
         }
     }
 
-    let mut node_ids = sink
-        .nodes_info
+    let mut node_ids = descriptor
+        .nodes
         .nodes
         .iter()
         .map(|node| node.id)
         .collect::<HashSet<_>>();
-    for node in response.nodes.unwrap_or_default() {
+    for node in response.nodes {
         if node_ids.insert(node.id) {
-            sink.nodes_info.nodes.push(node);
+            descriptor.nodes.nodes.push(node);
         }
     }
 
@@ -553,51 +766,37 @@ fn maybe_create_automatic_partitions_for_literal_insert(
 }
 
 fn build_auto_partition_plan(
-    sink: &data_sinks::TOlapTableSink,
+    descriptor: &StarRocksSinkDescriptor,
     write_indexes: &[SinkWriteIndexSelection],
     schema_id: i64,
-    output_exprs: Option<&[exprs::TExpr]>,
-    session_time_zone: Option<&str>,
-    fe_addr: Option<&types::TNetworkAddress>,
+    output_expr_slot_name_map: &HashMap<String, SlotId>,
 ) -> Result<Option<AutomaticPartitionPlan>, String> {
-    if !sink.partition.enable_automatic_partition.unwrap_or(false) {
+    if !descriptor.partition.enable_automatic_partition {
         return Ok(None);
     }
     // StarRocks BE keeps automatic partition routing enabled for the whole load,
     // even when FE only opens a subset of partitions in the initial sink metadata.
-    // Existing partitions may therefore be "missing" from TOlapTablePartitionParam
+    // Existing partitions may therefore be missing from initial sink partition metadata
     // and need to be recovered through createPartition reuse semantics at runtime.
     // Gating this path on shadow partitions breaks insert-select/reuse flows once
     // FE stops sending shadow metadata after the first load.
 
-    let partition_column_names = resolve_partition_columns_for_write(&sink.partition);
+    let partition_column_names = descriptor.partition.partition_columns.clone();
     if partition_column_names.is_empty() {
         return Ok(None);
     }
-    let output_expr_slot_map =
-        build_output_expr_slot_name_map_for_write(sink, schema_id, output_exprs)?;
-    let slot_name_overrides = if output_expr_slot_map.is_empty() {
+    let slot_name_overrides = if output_expr_slot_name_map.is_empty() {
         None
     } else {
-        Some(&output_expr_slot_map)
-    };
-    let output_expr_slot_id_overrides = build_output_expr_slot_id_overrides_for_write(
-        &sink.schema.slot_descs,
-        slot_name_overrides,
-    )?;
-    let slot_id_overrides = if output_expr_slot_id_overrides.is_empty() {
-        None
-    } else {
-        Some(&output_expr_slot_id_overrides)
+        Some(output_expr_slot_name_map)
     };
     let partition_key_source = build_partition_key_source(
-        sink,
-        session_time_zone,
+        &descriptor.partition,
+        &descriptor.schema,
         slot_name_overrides,
-        slot_id_overrides,
     )?;
     let partition_slot_ids = resolve_slot_ids_by_names(
-        &sink.schema.slot_descs,
+        &descriptor.schema.slot_descs,
         &partition_column_names,
         "automatic partition column",
         slot_name_overrides,
@@ -614,18 +813,18 @@ fn build_auto_partition_plan(
             "OLAP_TABLE_SINK automatic partition cannot resolve routing index for schema_id={schema_id}"
         ));
     }
-    let fe_addr = resolve_frontend_addr(fe_addr).ok_or_else(|| {
+    let fe_addr = descriptor.frontend.clone().ok_or_else(|| {
         format!(
             "OLAP_TABLE_SINK automatic partition cannot resolve FE address: table_id={} txn_id={}",
-            sink.table_id, sink.txn_id
+            descriptor.table_id, descriptor.txn_id
         )
     })?;
 
     Ok(Some(AutomaticPartitionPlan {
-        db_id: sink.db_id,
-        table_id: sink.table_id,
-        txn_id: sink.txn_id,
-        dynamic_overwrite: sink.dynamic_overwrite.unwrap_or(false),
+        db_id: descriptor.db_id,
+        table_id: descriptor.table_id,
+        txn_id: descriptor.txn_id,
+        dynamic_overwrite: descriptor.dynamic_overwrite,
         fe_addr,
         partition_key_source,
         partition_column_names,
@@ -633,299 +832,40 @@ fn build_auto_partition_plan(
     }))
 }
 
-fn resolve_partition_columns_for_write(
-    partition: &descriptors::TOlapTablePartitionParam,
-) -> Vec<String> {
-    let mut cols = partition
-        .partition_columns
-        .as_ref()
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-                .map(|value| value.to_ascii_lowercase())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if cols.is_empty()
-        && let Some(col) = partition
-            .partition_column
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    {
-        cols.push(col.to_ascii_lowercase());
-    }
-    cols
-}
-
-fn extract_partition_literal_value(expr: &exprs::TExpr) -> Option<String> {
-    for node in &expr.nodes {
-        let ty = node.node_type;
-        if ty == exprs::TExprNodeType::STRING_LITERAL {
-            return node.string_literal.as_ref().map(|v| v.value.clone());
-        }
-        if ty == exprs::TExprNodeType::DATE_LITERAL {
-            return node.date_literal.as_ref().map(|v| v.value.clone());
-        }
-        if ty == exprs::TExprNodeType::INT_LITERAL {
-            return node.int_literal.as_ref().map(|v| v.value.to_string());
-        }
-        if ty == exprs::TExprNodeType::LARGE_INT_LITERAL {
-            return node.large_int_literal.as_ref().map(|v| v.value.clone());
-        }
-        if ty == exprs::TExprNodeType::BOOL_LITERAL {
-            return node.bool_literal.as_ref().map(|v| {
-                if v.value {
-                    "TRUE".to_string()
-                } else {
-                    "FALSE".to_string()
-                }
-            });
-        }
-    }
-    None
-}
-
-fn extract_partition_value_from_exec_plan(
-    expr: &exprs::TExpr,
-    exec_plan: Option<&ExecPlan>,
-) -> Option<String> {
-    let exec_plan = exec_plan?;
-    let root = expr.nodes.first()?;
-    if root.node_type != exprs::TExprNodeType::SLOT_REF {
-        return None;
-    }
-    let slot_ref = root.slot_ref.as_ref()?;
-    let output_slot_id = SlotId::try_from(slot_ref.slot_id).ok()?;
-
-    let project = match &exec_plan.root.kind {
-        ExecNodeKind::Project(project) => project,
-        _ => return None,
-    };
-    let values = match &project.input.kind {
-        ExecNodeKind::Values(values) => values,
-        _ => return None,
-    };
-    if values.chunk.is_empty() {
-        return None;
-    }
-
-    let output_pos = project
-        .output_chunk_schema
-        .slot_ids()
-        .iter()
-        .position(|slot| *slot == output_slot_id)?;
-    let expr_idx = project
-        .output_indices
-        .as_ref()
-        .and_then(|indices| indices.get(output_pos).copied())
-        .unwrap_or(output_pos);
-    let expr_id = *project.exprs.get(expr_idx)?;
-    let array = exec_plan.arena.eval(expr_id, &values.chunk).ok()?;
-    if array.is_null(0) {
-        return None;
-    }
-    scalar_partition_value_to_string(array.as_ref(), 0)
-}
-
-fn scalar_partition_value_to_string(array: &dyn Array, row: usize) -> Option<String> {
-    match array.data_type() {
-        DataType::Utf8 => array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .map(|v| v.value(row).to_string()),
-        DataType::LargeUtf8 => array
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .map(|v| v.value(row).to_string()),
-        DataType::Int8 => array
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .map(|v| v.value(row).to_string()),
-        DataType::Int16 => array
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .map(|v| v.value(row).to_string()),
-        DataType::Int32 => array
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .map(|v| v.value(row).to_string()),
-        DataType::Int64 => array
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .map(|v| v.value(row).to_string()),
-        DataType::UInt8 => array
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .map(|v| v.value(row).to_string()),
-        DataType::UInt16 => array
-            .as_any()
-            .downcast_ref::<UInt16Array>()
-            .map(|v| v.value(row).to_string()),
-        DataType::UInt32 => array
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .map(|v| v.value(row).to_string()),
-        DataType::UInt64 => array
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .map(|v| v.value(row).to_string()),
-        DataType::Boolean => array.as_any().downcast_ref::<BooleanArray>().map(|v| {
-            if v.value(row) {
-                "TRUE".to_string()
-            } else {
-                "FALSE".to_string()
-            }
-        }),
-        DataType::Date32 => {
-            let days_since_epoch = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .map(|v| v.value(row))?;
-            let days_from_ce = 719_163_i32.checked_add(days_since_epoch)?;
-            let date = NaiveDate::from_num_days_from_ce_opt(days_from_ce)?;
-            Some(date.format("%Y-%m-%d").to_string())
-        }
-        _ => None,
-    }
-}
-
-fn resolve_frontend_addr(
-    fe_addr: Option<&types::TNetworkAddress>,
-) -> Option<types::TNetworkAddress> {
-    fe_addr.cloned().or_else(disk_report::latest_fe_addr)
-}
-
-fn with_frontend_client<T, F>(
-    fe_addr: &types::TNetworkAddress,
-    options: FrontendRpcCallOptions,
-    f: F,
-) -> Result<T, String>
-where
-    F: Clone + FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
-{
-    FrontendRpcManager::shared()
-        .call_with_options(FrontendRpcKind::Control, fe_addr, options, move |client| {
-            f.clone()(client).map_err(FrontendRpcError::from_message_guess)
-        })
-        .map_err(|err| err.to_string())
-}
-
-pub(crate) fn create_automatic_partitions(
-    fe_addr: &types::TNetworkAddress,
-    db_id: i64,
-    table_id: i64,
-    txn_id: i64,
-    is_temp: bool,
-    partition_values: Vec<Vec<String>>,
-) -> Result<frontend_service::TCreatePartitionResult, String> {
-    if db_id <= 0 {
-        return Err(format!(
-            "invalid db_id for automatic partition create: {db_id}"
-        ));
-    }
-    if table_id <= 0 {
-        return Err(format!(
-            "invalid table_id for automatic partition create: {table_id}"
-        ));
-    }
-    if txn_id <= 0 {
-        return Err(format!(
-            "invalid txn_id for automatic partition create: {txn_id}"
-        ));
-    }
-    if partition_values.is_empty() {
-        return Err("automatic partition values cannot be empty".to_string());
-    }
-
-    let request = frontend_service::TCreatePartitionRequest::new(
-        Some(txn_id),
-        Some(db_id),
-        Some(table_id),
-        Some(partition_values),
-        Some(is_temp),
-        None::<i32>,
-    );
-    let retry_interval = Duration::from_millis(config::fe_rpc_retry_interval_ms().clamp(1, 5_000));
-    let deadline = Instant::now() + Duration::from_millis(config::fe_rpc_timeout_ms().max(1));
-    let mut service_unavailable_attempts = 0usize;
-    loop {
-        let response = with_frontend_client(
-            fe_addr,
-            FrontendRpcCallOptions {
-                transport_retries: CREATE_PARTITION_TRANSPORT_RETRIES,
-            },
-            |client| {
-                client
-                    .create_partition(request.clone())
-                    .map_err(|e| format!("createPartition RPC failed: {e}"))
-            },
-        )?;
-        let status = response
-            .status
-            .as_ref()
-            .ok_or_else(|| "createPartition response missing status".to_string())?;
-        if status.status_code == status_code::TStatusCode::OK {
-            return Ok(response);
-        }
-        if status.status_code == status_code::TStatusCode::SERVICE_UNAVAILABLE
-            && Instant::now() < deadline
-        {
-            service_unavailable_attempts += 1;
-            if service_unavailable_attempts > 1 {
-                std::thread::sleep(retry_interval);
-            }
-            continue;
-        }
-        let detail = status
-            .error_msgs
-            .as_ref()
-            .map(|v| v.join("; "))
-            .unwrap_or_default();
-        return Err(format!(
-            "createPartition failed: status={:?}, error={detail}",
-            status.status_code
-        ));
-    }
-}
-
 fn resolve_write_slot_bindings(
-    sink: &data_sinks::TOlapTableSink,
+    descriptor: &StarRocksSinkDescriptor,
     schema_id: i64,
-    output_exprs: Option<&[exprs::TExpr]>,
+    output_expr_slot_map: &HashMap<String, SlotId>,
+    output_expr_slot_ids: &[Option<SlotId>],
     projected_output_slot_ids: Option<&[SlotId]>,
     tablet_schema: &TabletSchemaPb,
 ) -> Result<(Vec<Option<SlotId>>, Option<SlotId>), String> {
-    let has_hidden_op_slot = sink.keys_type == Some(types::TKeysType::PRIMARY_KEYS)
-        && sink.schema.slot_descs.iter().any(|slot| {
+    let has_hidden_op_slot = descriptor.keys_type == KeysType::PrimaryKeys
+        && descriptor.schema.slot_descs.iter().any(|slot| {
             slot.col_name
                 .as_deref()
                 .map(str::trim)
                 .is_some_and(|name| name.eq_ignore_ascii_case(LOAD_OP_COLUMN))
         });
-    let slot_by_name = build_slot_name_map(&sink.schema.slot_descs)?;
-    let output_expr_slot_map =
-        build_output_expr_slot_name_map_for_write(sink, schema_id, output_exprs)?;
     let output_expr_slot_by_ordinal = filter_hidden_op_slot_ids_by_ordinal(
-        &sink.schema.slot_descs,
-        resolve_output_expr_slot_ids_for_write(output_exprs)?,
+        &descriptor.schema.slot_descs,
+        output_expr_slot_ids.to_vec(),
         has_hidden_op_slot,
     );
+    let slot_by_name = build_slot_name_map(&descriptor.schema.slot_descs)?;
     let projected_output_slot_by_ordinal = filter_hidden_op_slot_ids_by_ordinal(
-        &sink.schema.slot_descs,
+        &descriptor.schema.slot_descs,
         projected_output_slot_ids
             .map(|slot_ids| slot_ids.iter().copied().map(Some).collect::<Vec<_>>())
             .unwrap_or_default(),
         has_hidden_op_slot,
     );
     let schema_slot_by_ordinal = filter_hidden_op_slot_ids_by_ordinal(
-        &sink.schema.slot_descs,
-        resolve_schema_slot_ids_by_ordinal(&sink.schema.slot_descs)?,
+        &descriptor.schema.slot_descs,
+        resolve_schema_slot_ids_by_ordinal(&descriptor.schema.slot_descs),
         has_hidden_op_slot,
     );
-    let index_column_names = resolve_index_column_names_for_write(sink, schema_id)?;
+    let index_column_names = resolve_index_column_names_for_write(&descriptor.schema, schema_id)?;
     let allow_output_ordinal_fallback =
         output_expr_slot_by_ordinal.len() == tablet_schema.column.len();
     let allow_projected_ordinal_fallback =
@@ -984,35 +924,24 @@ fn resolve_write_slot_bindings(
         .copied()
         .or_else(|| slot_by_name.get(LOAD_OP_COLUMN).copied());
     if op_slot_id.is_none() {
-        let slot_desc_summary = sink
+        let slot_desc_summary = descriptor
             .schema
             .slot_descs
             .iter()
             .map(|slot| {
                 format!(
-                    "id={:?},col_name={:?},col_physical_name={:?},col_unique_id={:?}",
-                    slot.id, slot.col_name, slot.col_physical_name, slot.col_unique_id
+                    "id={:?},col_name={:?},col_physical_name={:?}",
+                    slot.id, slot.col_name, slot.col_physical_name
                 )
-            })
-            .collect::<Vec<_>>();
-        let output_expr_summary = output_exprs
-            .unwrap_or(&[])
-            .iter()
-            .map(|expr| {
-                let Some(root) = expr.nodes.first() else {
-                    return "empty".to_string();
-                };
-                let slot_id = root.slot_ref.as_ref().map(|slot| slot.slot_id);
-                format!("node_type={:?},slot_id={:?}", root.node_type, slot_id)
             })
             .collect::<Vec<_>>();
         info!(
             target: "novarocks::sink",
-            table_id = sink.table_id,
+            table_id = descriptor.table_id,
             schema_id,
             index_column_names = ?index_column_names,
             slot_descs = ?slot_desc_summary,
-            output_exprs = ?output_expr_summary,
+            output_expr_slot_ids = ?output_expr_slot_ids,
             "OLAP_TABLE_SINK cannot resolve __op slot from sink schema.slot_descs"
         );
     }
@@ -1020,71 +949,49 @@ fn resolve_write_slot_bindings(
         tablet_schema.column.iter().enumerate().any(|(idx, col)| {
             col.is_key.unwrap_or(false) && out.get(idx).and_then(|v| *v).is_none()
         });
-    if sink.keys_type == Some(types::TKeysType::PRIMARY_KEYS) {
-        let slot_desc_summary = sink
+    if descriptor.keys_type == KeysType::PrimaryKeys {
+        let slot_desc_summary = descriptor
             .schema
             .slot_descs
             .iter()
             .map(|slot| {
                 format!(
-                    "id={:?},col_name={:?},col_physical_name={:?},col_unique_id={:?}",
-                    slot.id, slot.col_name, slot.col_physical_name, slot.col_unique_id
+                    "id={:?},col_name={:?},col_physical_name={:?}",
+                    slot.id, slot.col_name, slot.col_physical_name
                 )
-            })
-            .collect::<Vec<_>>();
-        let output_expr_summary = output_exprs
-            .unwrap_or(&[])
-            .iter()
-            .map(|expr| {
-                let Some(root) = expr.nodes.first() else {
-                    return "empty".to_string();
-                };
-                let slot_id = root.slot_ref.as_ref().map(|slot| slot.slot_id);
-                format!("node_type={:?},slot_id={:?}", root.node_type, slot_id)
             })
             .collect::<Vec<_>>();
         info!(
             target: "novarocks::sink",
-            table_id = sink.table_id,
+            table_id = descriptor.table_id,
             schema_id,
             index_column_names = ?index_column_names,
             slot_descs = ?slot_desc_summary,
-            output_exprs = ?output_expr_summary,
+            output_expr_slot_ids = ?output_expr_slot_ids,
             schema_slot_bindings = ?out,
             op_slot_id = ?op_slot_id,
             "OLAP_TABLE_SINK resolved write slot bindings for primary key table"
         );
     }
     if has_missing_key_binding {
-        let slot_desc_summary = sink
+        let slot_desc_summary = descriptor
             .schema
             .slot_descs
             .iter()
             .map(|slot| {
                 format!(
-                    "id={:?},col_name={:?},col_physical_name={:?},col_unique_id={:?}",
-                    slot.id, slot.col_name, slot.col_physical_name, slot.col_unique_id
+                    "id={:?},col_name={:?},col_physical_name={:?}",
+                    slot.id, slot.col_name, slot.col_physical_name
                 )
-            })
-            .collect::<Vec<_>>();
-        let output_expr_summary = output_exprs
-            .unwrap_or(&[])
-            .iter()
-            .map(|expr| {
-                let Some(root) = expr.nodes.first() else {
-                    return "empty".to_string();
-                };
-                let slot_id = root.slot_ref.as_ref().map(|slot| slot.slot_id);
-                format!("node_type={:?},slot_id={:?}", root.node_type, slot_id)
             })
             .collect::<Vec<_>>();
         info!(
             target: "novarocks::sink",
-            table_id = sink.table_id,
+            table_id = descriptor.table_id,
             schema_id,
             index_column_names = ?index_column_names,
             slot_descs = ?slot_desc_summary,
-            output_exprs = ?output_expr_summary,
+            output_expr_slot_ids = ?output_expr_slot_ids,
             schema_slot_bindings = ?out,
             op_slot_id = ?op_slot_id,
             "OLAP_TABLE_SINK resolved write slot bindings contain missing key columns"
@@ -1124,38 +1031,12 @@ fn resolve_effective_tablet_schema_for_index(
     fallback_schema.clone()
 }
 
-fn resolve_column_to_expr_value_for_write(
-    sink: &data_sinks::TOlapTableSink,
-    schema_id: i64,
-) -> Result<HashMap<String, String>, String> {
-    let index = sink
-        .schema
-        .indexes
-        .iter()
-        .find(|idx| idx.schema_id.filter(|v| *v > 0).unwrap_or(idx.id) == schema_id)
-        .ok_or_else(|| {
-            format!("OLAP_TABLE_SINK cannot resolve schema index for schema_id={schema_id}")
-        })?;
-    let mut out = HashMap::new();
-    if let Some(expr_map) = index.column_to_expr_value.as_ref() {
-        for (key, value) in expr_map {
-            let normalized_key = key.trim().to_ascii_lowercase();
-            if normalized_key.is_empty() {
-                continue;
-            }
-            out.insert(normalized_key, value.clone());
-        }
-    }
-    Ok(out)
-}
-
 fn resolve_auto_increment_write_policy(
-    sink: &data_sinks::TOlapTableSink,
+    descriptor: &StarRocksSinkDescriptor,
     tablet_schema: &TabletSchemaPb,
-    fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<AutoIncrementWritePolicy, String> {
-    let null_expr_in_auto_increment = sink.null_expr_in_auto_increment.unwrap_or(false);
-    let miss_auto_increment_column = sink.miss_auto_increment_column.unwrap_or(false);
+    let null_expr_in_auto_increment = descriptor.null_expr_in_auto_increment;
+    let miss_auto_increment_column = descriptor.miss_auto_increment_column;
 
     let mut auto_increment_column_idx = None;
     for (idx, column) in tablet_schema.column.iter().enumerate() {
@@ -1192,145 +1073,12 @@ fn resolve_auto_increment_write_policy(
         auto_increment_column_idx,
         auto_increment_column_name,
         auto_increment_in_sort_key,
-        fe_addr: resolve_frontend_addr(fe_addr),
+        fe_addr: descriptor.frontend.clone(),
     })
 }
 
-fn build_output_expr_slot_name_map_for_write(
-    sink: &data_sinks::TOlapTableSink,
-    schema_id: i64,
-    output_exprs: Option<&[exprs::TExpr]>,
-) -> Result<HashMap<String, SlotId>, String> {
-    let Some(output_exprs) = output_exprs else {
-        return Ok(HashMap::new());
-    };
-    if output_exprs.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let mut slot_map = HashMap::new();
-    let named_slot_count = sink
-        .schema
-        .slot_descs
-        .iter()
-        .filter(|slot| {
-            slot.col_name
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|name| !name.is_empty())
-        })
-        .count();
-    let skip_load_op = output_exprs.len() < named_slot_count;
-    // Prefer slot descriptor order because it matches sink output tuple in DELETE/partial plans.
-    // Only consume one output expr after we find a valid column slot, so hidden/empty slots
-    // cannot shift all subsequent bindings.
-    let mut expr_iter = output_exprs.iter();
-    for slot_desc in &sink.schema.slot_descs {
-        let Some(column_name) = slot_desc
-            .col_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_ascii_lowercase)
-        else {
-            continue;
-        };
-        if skip_load_op && column_name == LOAD_OP_COLUMN {
-            continue;
-        }
-        let Some(expr) = expr_iter.next() else {
-            break;
-        };
-        let Some(root) = expr.nodes.first() else {
-            continue;
-        };
-        if root.node_type != exprs::TExprNodeType::SLOT_REF {
-            continue;
-        }
-        let Some(slot_ref) = root.slot_ref.as_ref() else {
-            continue;
-        };
-        let Ok(slot_id) = SlotId::try_from(slot_ref.slot_id) else {
-            continue;
-        };
-        slot_map.insert(column_name, slot_id);
-    }
-    if !slot_map.is_empty() {
-        return Ok(slot_map);
-    }
-
-    let column_names = resolve_index_column_names_for_write(sink, schema_id)?;
-    if column_names.is_empty() {
-        return Ok(HashMap::new());
-    }
-    for (column_name, expr) in column_names.iter().zip(output_exprs.iter()) {
-        let Some(root) = expr.nodes.first() else {
-            continue;
-        };
-        if root.node_type != exprs::TExprNodeType::SLOT_REF {
-            continue;
-        }
-        let Some(slot_ref) = root.slot_ref.as_ref() else {
-            continue;
-        };
-        let Ok(slot_id) = SlotId::try_from(slot_ref.slot_id) else {
-            continue;
-        };
-        slot_map.insert(column_name.clone(), slot_id);
-    }
-    Ok(slot_map)
-}
-
-fn build_output_expr_slot_id_overrides_for_write(
-    slot_descs: &[descriptors::TSlotDescriptor],
-    slot_name_overrides: Option<&HashMap<String, SlotId>>,
-) -> Result<HashMap<SlotId, SlotId>, String> {
-    let Some(slot_name_overrides) = slot_name_overrides else {
-        return Ok(HashMap::new());
-    };
-    if slot_name_overrides.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let schema_slot_by_name = build_slot_name_map(slot_descs)?;
-    let mut slot_id_overrides = HashMap::new();
-    for (column_name, schema_slot_id) in schema_slot_by_name {
-        let Some(output_slot_id) = slot_name_overrides.get(&column_name).copied() else {
-            continue;
-        };
-        if output_slot_id != schema_slot_id {
-            slot_id_overrides.insert(schema_slot_id, output_slot_id);
-        }
-    }
-    Ok(slot_id_overrides)
-}
-
-fn resolve_output_expr_slot_ids_for_write(
-    output_exprs: Option<&[exprs::TExpr]>,
-) -> Result<Vec<Option<SlotId>>, String> {
-    let Some(output_exprs) = output_exprs else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::with_capacity(output_exprs.len());
-    for expr in output_exprs {
-        let Some(root) = expr.nodes.first() else {
-            out.push(None);
-            continue;
-        };
-        if root.node_type != exprs::TExprNodeType::SLOT_REF {
-            out.push(None);
-            continue;
-        }
-        let Some(slot_ref) = root.slot_ref.as_ref() else {
-            out.push(None);
-            continue;
-        };
-        out.push(SlotId::try_from(slot_ref.slot_id).ok());
-    }
-    Ok(out)
-}
-
 fn filter_hidden_op_slot_ids_by_ordinal(
-    slot_descs: &[descriptors::TSlotDescriptor],
+    slot_descs: &[SinkSlotDescriptor],
     slot_ids: Vec<Option<SlotId>>,
     filter_load_op: bool,
 ) -> Vec<Option<SlotId>> {
@@ -1351,347 +1099,65 @@ fn filter_hidden_op_slot_ids_by_ordinal(
         .collect()
 }
 
-fn build_output_projection_plan(
-    sink: &data_sinks::TOlapTableSink,
-    output_exprs: Option<&[exprs::TExpr]>,
-    layout: Option<&Layout>,
-    session_time_zone: Option<&str>,
-    last_query_id: Option<&str>,
-    fe_addr: Option<&types::TNetworkAddress>,
-) -> Result<Option<SinkOutputProjectionPlan>, String> {
-    let Some(output_exprs) = output_exprs.filter(|exprs| !exprs.is_empty()) else {
-        return Ok(None);
-    };
-    let has_index_where_clause = sink.schema.indexes.iter().any(|index| {
-        index
-            .where_clause
-            .as_ref()
-            .is_some_and(|expr| !expr.nodes.is_empty())
-    });
-    // Slot-ref-only output exprs can usually reuse the upstream chunk directly.
-    // When FE attaches index where-clause expressions, we must still remap slot ids
-    // to the sink output tuple so predicate evaluation sees the expected slots.
-    if output_exprs_are_plain_slot_refs(output_exprs) && !has_index_where_clause {
-        return Ok(None);
-    }
-    let layout = layout.ok_or_else(|| {
-        "OLAP_TABLE_SINK requires layout for output expression projection".to_string()
-    })?;
-    let output_slots = resolve_output_projection_slots(sink, output_exprs)?;
-    if output_slots.len() != output_exprs.len() {
-        return Err(format!(
-            "OLAP_TABLE_SINK output projection slot count mismatch: slots={} output_exprs={}",
-            output_slots.len(),
-            output_exprs.len()
-        ));
-    }
-
-    let mut arena = ExprArena::default();
-    arena.set_session_time_zone(session_time_zone.map(|s| s.to_string()));
-    let mut expr_ids = Vec::with_capacity(output_exprs.len());
-    for expr in output_exprs {
-        let expr_id = lower_t_expr(expr, &mut arena, layout, last_query_id, fe_addr)?;
-        expr_ids.push(expr_id);
-    }
-    let (output_slot_ids, output_field_names): (Vec<_>, Vec<_>) = output_slots.into_iter().unzip();
-    Ok(Some(SinkOutputProjectionPlan {
-        arena: Arc::new(arena),
-        expr_ids,
-        output_slot_ids,
-        output_field_names,
-    }))
+fn resolve_schema_slot_ids_by_ordinal(slot_descs: &[SinkSlotDescriptor]) -> Vec<Option<SlotId>> {
+    slot_descs.iter().map(|slot| slot.id).collect()
 }
 
-fn output_exprs_are_plain_slot_refs(output_exprs: &[exprs::TExpr]) -> bool {
-    output_exprs.iter().all(|expr| {
-        expr.nodes.len() == 1
-            && expr.nodes.first().is_some_and(|node| {
-                node.node_type == exprs::TExprNodeType::SLOT_REF && node.slot_ref.is_some()
-            })
-    })
-}
-
-fn resolve_output_projection_slots(
-    sink: &data_sinks::TOlapTableSink,
-    output_exprs: &[exprs::TExpr],
-) -> Result<Vec<(SlotId, String)>, String> {
-    if let Some(mapped) = resolve_slots_from_expr_output_column(sink, output_exprs)? {
-        return Ok(mapped);
-    }
-
-    let collect_named_slots = |skip_load_op: bool| -> Result<Vec<(SlotId, String)>, String> {
-        let mut out = Vec::new();
-        for (idx, slot_desc) in sink.schema.slot_descs.iter().enumerate() {
-            let Some(raw_name) = slot_desc
-                .col_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            if skip_load_op && raw_name.eq_ignore_ascii_case(LOAD_OP_COLUMN) {
-                continue;
-            }
-            let slot_id = slot_desc.id.ok_or_else(|| {
-                format!(
-                    "OLAP_TABLE_SINK schema.slot_descs[{}] missing id while resolving output projection slots",
-                    idx
-                )
-            })?;
-            if slot_id < 0 {
-                return Err(format!(
-                    "OLAP_TABLE_SINK schema.slot_descs[{}] has invalid id {} while resolving output projection slots",
-                    idx, slot_id
-                ));
-            }
-            let slot_id = SlotId::try_from(slot_id)?;
-            let name = if raw_name.eq_ignore_ascii_case(LOAD_OP_COLUMN) {
-                LOAD_OP_COLUMN.to_string()
-            } else {
-                raw_name.to_string()
-            };
-            out.push((slot_id, name));
-        }
-        Ok(out)
-    };
-
-    let named_slot_count = sink
-        .schema
-        .slot_descs
+fn resolve_index_descriptor(
+    schema: &SinkSchemaDescriptor,
+    schema_id: i64,
+) -> Result<&SinkIndexDescriptor, String> {
+    schema
+        .indexes
         .iter()
-        .filter(|slot| {
-            slot.col_name
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|name| !name.is_empty())
+        .find(|idx| idx.schema_id == schema_id)
+        .ok_or_else(|| {
+            format!("OLAP_TABLE_SINK cannot resolve schema index for schema_id={schema_id}")
         })
-        .count();
-    let skip_load_op = output_exprs.len() < named_slot_count;
-    let named_slots = collect_named_slots(skip_load_op)?;
-    if named_slots.len() == output_exprs.len() {
-        return Ok(named_slots);
-    }
-
-    let mut ordinal_slots = Vec::new();
-    for (idx, slot_desc) in sink.schema.slot_descs.iter().enumerate() {
-        let Some(id) = slot_desc.id.filter(|id| *id >= 0) else {
-            continue;
-        };
-        let slot_id = SlotId::try_from(id)?;
-        let name = slot_desc
-            .col_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|name| {
-                if name.eq_ignore_ascii_case(LOAD_OP_COLUMN) {
-                    LOAD_OP_COLUMN.to_string()
-                } else {
-                    name.to_string()
-                }
-            })
-            .unwrap_or_else(|| format!("col_{idx}"));
-        ordinal_slots.push((slot_id, name));
-    }
-    if ordinal_slots.len() == output_exprs.len() {
-        return Ok(ordinal_slots);
-    }
-
-    let mut slot_name_by_id = HashMap::new();
-    for (slot_id, name) in &ordinal_slots {
-        slot_name_by_id
-            .entry(*slot_id)
-            .or_insert_with(|| name.clone());
-    }
-    let mut expr_slots = Vec::with_capacity(output_exprs.len());
-    for (idx, expr) in output_exprs.iter().enumerate() {
-        let root = expr.nodes.first().ok_or_else(|| {
-            format!(
-                "OLAP_TABLE_SINK output_exprs[{}] is empty while resolving output projection slots",
-                idx
-            )
-        })?;
-        if root.node_type != exprs::TExprNodeType::SLOT_REF {
-            return Err(format!(
-                "OLAP_TABLE_SINK cannot resolve output projection slot for output_exprs[{}] node_type={:?}",
-                idx, root.node_type
-            ));
-        }
-        let slot_ref = root.slot_ref.as_ref().ok_or_else(|| {
-            format!(
-                "OLAP_TABLE_SINK output_exprs[{}] SLOT_REF missing slot_ref payload",
-                idx
-            )
-        })?;
-        let slot_id = SlotId::try_from(slot_ref.slot_id)?;
-        let name = slot_name_by_id
-            .get(&slot_id)
-            .cloned()
-            .unwrap_or_else(|| format!("col_{idx}"));
-        expr_slots.push((slot_id, name));
-    }
-    Ok(expr_slots)
-}
-
-fn resolve_slots_from_expr_output_column(
-    sink: &data_sinks::TOlapTableSink,
-    output_exprs: &[exprs::TExpr],
-) -> Result<Option<Vec<(SlotId, String)>>, String> {
-    if output_exprs.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
-
-    let mut out = Vec::with_capacity(output_exprs.len());
-    for (expr_idx, expr) in output_exprs.iter().enumerate() {
-        let Some(root) = expr.nodes.first() else {
-            return Ok(None);
-        };
-        let Some(output_column) = root.output_column else {
-            return Ok(None);
-        };
-        if output_column < 0 {
-            return Ok(None);
-        }
-        let output_idx = usize::try_from(output_column).map_err(|_| {
-            format!(
-                "OLAP_TABLE_SINK output_exprs[{}] has invalid output_column={}",
-                expr_idx, output_column
-            )
-        })?;
-        let Some(slot_desc) = sink.schema.slot_descs.get(output_idx) else {
-            return Ok(None);
-        };
-        let Some(slot_id_i32) = slot_desc.id else {
-            return Ok(None);
-        };
-        if slot_id_i32 < 0 {
-            return Ok(None);
-        }
-        let slot_id = SlotId::try_from(slot_id_i32)?;
-        let name = slot_desc
-            .col_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|name| {
-                if name.eq_ignore_ascii_case(LOAD_OP_COLUMN) {
-                    LOAD_OP_COLUMN.to_string()
-                } else {
-                    name.to_string()
-                }
-            })
-            .unwrap_or_else(|| format!("col_{output_idx}"));
-        out.push((slot_id, name));
-    }
-
-    Ok(Some(out))
-}
-
-fn resolve_schema_slot_ids_by_ordinal(
-    slot_descs: &[descriptors::TSlotDescriptor],
-) -> Result<Vec<Option<SlotId>>, String> {
-    let mut out = Vec::with_capacity(slot_descs.len());
-    for slot in slot_descs {
-        let slot_id = match slot.id {
-            Some(id) if id >= 0 => SlotId::try_from(id).ok(),
-            None => None,
-            _ => None,
-        };
-        out.push(slot_id);
-    }
-    Ok(out)
 }
 
 fn resolve_index_column_names_for_write(
-    sink: &data_sinks::TOlapTableSink,
+    schema: &SinkSchemaDescriptor,
     schema_id: i64,
 ) -> Result<Vec<String>, String> {
-    let index = sink
-        .schema
-        .indexes
+    Ok(resolve_index_descriptor(schema, schema_id)?
+        .column_names
         .iter()
-        .find(|idx| idx.schema_id.filter(|v| *v > 0).unwrap_or(idx.id) == schema_id)
-        .ok_or_else(|| {
-            format!("OLAP_TABLE_SINK cannot resolve schema index for schema_id={schema_id}")
-        })?;
-
-    let mut column_names = if let Some(param) = index.column_param.as_ref() {
-        param
-            .columns
-            .iter()
-            .map(|c| c.column_name.trim())
-            .filter(|name| !name.is_empty())
-            .map(|name| name.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    if column_names.is_empty() {
-        column_names = index
-            .columns
-            .iter()
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-            .map(|name| name.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-    }
-    Ok(column_names)
-}
-
-fn resolve_index_column_names(index: &descriptors::TOlapTableIndexSchema) -> Vec<String> {
-    let mut column_names = if let Some(param) = index.column_param.as_ref() {
-        param
-            .columns
-            .iter()
-            .map(|c| c.column_name.trim())
-            .filter(|name| !name.is_empty())
-            .map(|name| name.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    if column_names.is_empty() {
-        column_names = index
-            .columns
-            .iter()
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-            .map(|name| name.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-    }
-    column_names
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_ascii_lowercase())
+        .collect())
 }
 
 fn resolve_sink_write_index_selections(
-    sink: &data_sinks::TOlapTableSink,
+    descriptor: &StarRocksSinkDescriptor,
 ) -> Result<Vec<SinkWriteIndexSelection>, String> {
     let mut schema_id_by_index_id = HashMap::<i64, i64>::new();
-    let mut index_by_id = HashMap::<i64, &descriptors::TOlapTableIndexSchema>::new();
-    for index in &sink.schema.indexes {
-        if index.id <= 0 {
+    let mut index_by_id = HashMap::<i64, &SinkIndexDescriptor>::new();
+    for index in &descriptor.schema.indexes {
+        if index.index_id <= 0 {
             continue;
         }
-        let schema_id = index.schema_id.filter(|v| *v > 0).unwrap_or(index.id);
+        let schema_id = index.schema_id;
         if schema_id <= 0 {
             return Err(format!(
                 "OLAP_TABLE_SINK schema.indexes contains non-positive schema_id/index_id: index_id={} schema_id={}",
-                index.id, schema_id
+                index.index_id, schema_id
             ));
         }
-        schema_id_by_index_id.insert(index.id, schema_id);
-        index_by_id.insert(index.id, index);
+        schema_id_by_index_id.insert(index.index_id, schema_id);
+        index_by_id.insert(index.index_id, index);
     }
     if schema_id_by_index_id.is_empty() {
         return Err("OLAP_TABLE_SINK schema.indexes has no valid index_id/schema_id".to_string());
     }
 
     let mut candidate_index_ids = BTreeSet::<i64>::new();
-    for partition in sink
+    for partition in descriptor
         .partition
         .partitions
         .iter()
-        .filter(|part| !part.is_shadow_partition.unwrap_or(false))
+        .filter(|part| !part.is_shadow)
     {
         for index in &partition.indexes {
             if index.index_id > 0 {
@@ -1700,11 +1166,15 @@ fn resolve_sink_write_index_selections(
         }
     }
     if candidate_index_ids.is_empty() {
-        let fallback_schema_id = resolve_schema_id(&sink.schema)?;
-        for index in &sink.schema.indexes {
-            let schema_id = index.schema_id.filter(|v| *v > 0).unwrap_or(index.id);
-            if schema_id == fallback_schema_id && index.id > 0 {
-                candidate_index_ids.insert(index.id);
+        let fallback_schema_id = descriptor
+            .schema
+            .indexes
+            .iter()
+            .find_map(|index| (index.schema_id > 0).then_some(index.schema_id))
+            .ok_or_else(|| "OLAP_TABLE_SINK schema.indexes has no valid schema_id".to_string())?;
+        for index in &descriptor.schema.indexes {
+            if index.schema_id == fallback_schema_id && index.index_id > 0 {
+                candidate_index_ids.insert(index.index_id);
             }
         }
     }
@@ -1715,16 +1185,18 @@ fn resolve_sink_write_index_selections(
         );
     }
 
-    let slot_names = sink
+    let slot_names = descriptor
         .schema
         .slot_descs
         .iter()
-        .filter_map(|slot| {
-            slot.col_name
-                .as_deref()
+        .flat_map(|slot| {
+            [slot.col_name.as_deref(), slot.col_physical_name.as_deref()]
+                .into_iter()
+                .flatten()
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
                 .map(|name| name.to_ascii_lowercase())
+                .collect::<Vec<_>>()
         })
         .filter(|name| name != LOAD_OP_COLUMN)
         .collect::<HashSet<_>>();
@@ -1746,7 +1218,7 @@ fn resolve_sink_write_index_selections(
                 index_id
             )
         })?;
-        let index_columns = resolve_index_column_names(index);
+        let index_columns = index.column_names.clone();
         let overlap = if slot_names.is_empty() {
             0
         } else {
@@ -1758,7 +1230,7 @@ fn resolve_sink_write_index_selections(
         scored.push((
             index_id,
             schema_id,
-            index.is_shadow.unwrap_or(false),
+            index.is_shadow,
             overlap,
             index_columns.len(),
         ));
@@ -1835,17 +1307,17 @@ impl OperatorFactory for OlapTableSinkFactory {
 }
 
 fn build_lake_table_identity_with_schema_id(
-    sink: &data_sinks::TOlapTableSink,
+    descriptor: &StarRocksSinkDescriptor,
     schema_id: i64,
 ) -> Result<LakeTableIdentity, String> {
-    let db_name = sink
+    let db_name = descriptor
         .db_name
         .as_ref()
         .map(|v| v.trim())
         .filter(|v| !v.is_empty())
         .ok_or_else(|| "OLAP_TABLE_SINK missing db_name".to_string())?
         .to_string();
-    let table_name = sink
+    let table_name = descriptor
         .table_name
         .as_ref()
         .map(|v| v.trim())
@@ -1862,8 +1334,8 @@ fn build_lake_table_identity_with_schema_id(
         catalog: load_lake_catalog()?,
         db_name,
         table_name,
-        db_id: sink.db_id,
-        table_id: sink.table_id,
+        db_id: descriptor.db_id,
+        table_id: descriptor.table_id,
         schema_id,
     })
 }
@@ -1880,938 +1352,4 @@ fn load_lake_catalog() -> Result<String, String> {
 fn load_lake_data_write_format() -> Result<StarRocksWriteFormat, String> {
     let cfg = novarocks_app_config().map_err(|e| e.to_string())?;
     StarRocksWriteFormat::parse(&cfg.starrocks.lake_data_write_format)
-}
-
-fn resolve_schema_id(schema: &descriptors::TOlapTableSchemaParam) -> Result<i64, String> {
-    for index in &schema.indexes {
-        if let Some(schema_id) = index.schema_id.filter(|v| *v > 0) {
-            return Ok(schema_id);
-        }
-        if index.id > 0 {
-            return Ok(index.id);
-        }
-    }
-    Err("OLAP_TABLE_SINK schema.indexes has no valid schema_id".to_string())
-}
-
-fn map_sink_keys_type(keys_type: Option<types::TKeysType>) -> Result<KeysType, String> {
-    match keys_type.unwrap_or(types::TKeysType::DUP_KEYS) {
-        types::TKeysType::DUP_KEYS => Ok(KeysType::DupKeys),
-        types::TKeysType::AGG_KEYS => Ok(KeysType::AggKeys),
-        types::TKeysType::PRIMARY_KEYS => Ok(KeysType::PrimaryKeys),
-        types::TKeysType::UNIQUE_KEYS => Ok(KeysType::UniqueKeys),
-        other => Err(format!(
-            "OLAP_TABLE_SINK does not support keys_type={:?} in simplified path",
-            other
-        )),
-    }
-}
-
-#[allow(dead_code)]
-fn collect_required_tablets(partition: &descriptors::TOlapTablePartitionParam) -> Vec<i64> {
-    let mut tablets = BTreeSet::new();
-    for part in &partition.partitions {
-        for index in &part.indexes {
-            for tablet_id in &index.tablet_ids {
-                tablets.insert(*tablet_id);
-            }
-        }
-    }
-    tablets.into_iter().collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    use super::{
-        LOAD_OP_COLUMN, SinkWriteIndexSelection, build_auto_partition_plan,
-        build_output_projection_plan, extract_partition_literal_value,
-        resolve_effective_tablet_schema_for_index, resolve_write_slot_bindings,
-    };
-    use crate::common::ids::SlotId;
-    use crate::connector::starrocks::lake::context::{
-        TabletWriteContext, lock_runtime_test_state, register_tablet_runtime,
-    };
-    use crate::lower::layout::Layout;
-    use crate::service::frontend_rpc::test_clear_shared_host_pools;
-    use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
-    use crate::thrift::{data_sinks, descriptors, exprs, types};
-    use tempfile::tempdir;
-    mod fe_rpc_server {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/common/fe_rpc_server.rs"
-        ));
-    }
-    use fe_rpc_server::{FakeFeRpcServer, ServerAction, read_struct_arg, write_struct_reply};
-
-    fn test_sink_with_aliased_agg_slots() -> data_sinks::TOlapTableSink {
-        data_sinks::TOlapTableSink {
-            load_id: types::TUniqueId { hi: 1, lo: 2 },
-            txn_id: 10,
-            db_id: 1,
-            table_id: 2,
-            tuple_id: 1,
-            num_replicas: 1,
-            need_gen_rollup: false,
-            db_name: Some("db".to_string()),
-            table_name: Some("tbl".to_string()),
-            schema: descriptors::TOlapTableSchemaParam {
-                db_id: 1,
-                table_id: 2,
-                version: 1,
-                slot_descs: vec![
-                    descriptors::TSlotDescriptor {
-                        id: Some(1),
-                        parent: None,
-                        slot_type: None,
-                        column_pos: None,
-                        byte_offset: None,
-                        null_indicator_byte: None,
-                        null_indicator_bit: None,
-                        col_name: Some("ds".to_string()),
-                        slot_idx: None,
-                        is_materialized: None,
-                        is_output_column: None,
-                        is_nullable: Some(false),
-                        col_unique_id: None,
-                        col_physical_name: None,
-                        is_virtual_column: None,
-                    },
-                    descriptors::TSlotDescriptor {
-                        id: Some(2),
-                        parent: None,
-                        slot_type: None,
-                        column_pos: None,
-                        byte_offset: None,
-                        null_indicator_byte: None,
-                        null_indicator_bit: None,
-                        col_name: Some("tag".to_string()),
-                        slot_idx: None,
-                        is_materialized: None,
-                        is_output_column: None,
-                        is_nullable: Some(true),
-                        col_unique_id: None,
-                        col_physical_name: None,
-                        is_virtual_column: None,
-                    },
-                    descriptors::TSlotDescriptor {
-                        id: Some(3),
-                        parent: None,
-                        slot_type: None,
-                        column_pos: None,
-                        byte_offset: None,
-                        null_indicator_byte: None,
-                        null_indicator_bit: None,
-                        col_name: Some("sum_v1".to_string()),
-                        slot_idx: None,
-                        is_materialized: None,
-                        is_output_column: None,
-                        is_nullable: Some(true),
-                        col_unique_id: None,
-                        col_physical_name: None,
-                        is_virtual_column: None,
-                    },
-                    descriptors::TSlotDescriptor {
-                        id: Some(4),
-                        parent: None,
-                        slot_type: None,
-                        column_pos: None,
-                        byte_offset: None,
-                        null_indicator_byte: None,
-                        null_indicator_bit: None,
-                        col_name: Some("uv".to_string()),
-                        slot_idx: None,
-                        is_materialized: None,
-                        is_output_column: None,
-                        is_nullable: Some(true),
-                        col_unique_id: None,
-                        col_physical_name: None,
-                        is_virtual_column: None,
-                    },
-                ],
-                tuple_desc: descriptors::TTupleDescriptor {
-                    id: Some(1),
-                    byte_size: Some(16),
-                    num_null_bytes: Some(0),
-                    table_id: Some(2),
-                    num_null_slots: Some(0),
-                },
-                indexes: vec![descriptors::TOlapTableIndexSchema {
-                    id: 10,
-                    columns: vec![
-                        "ds".to_string(),
-                        "tag".to_string(),
-                        "mv_sum_v1".to_string(),
-                        "mv_bitmap_union_user_id".to_string(),
-                    ],
-                    schema_hash: 1,
-                    column_param: None,
-                    where_clause: None,
-                    schema_id: Some(10),
-                    column_to_expr_value: None,
-                    is_shadow: None,
-                }],
-            },
-            partition: descriptors::TOlapTablePartitionParam {
-                db_id: 1,
-                table_id: 2,
-                version: 1,
-                partition_column: None,
-                distributed_columns: Some(vec!["ds".to_string()]),
-                partitions: Vec::new(),
-                partition_columns: None,
-                partition_exprs: None,
-                enable_automatic_partition: Some(false),
-                distribution_type: None,
-            },
-            location: descriptors::TOlapTableLocationParam {
-                db_id: 1,
-                table_id: 2,
-                version: 1,
-                tablets: Vec::new(),
-            },
-            nodes_info: descriptors::TNodesInfo {
-                version: 1,
-                nodes: Vec::new(),
-            },
-            load_channel_timeout_s: None,
-            is_lake_table: Some(true),
-            txn_trace_parent: None,
-            keys_type: Some(types::TKeysType::AGG_KEYS),
-            write_quorum_type: None,
-            enable_replicated_storage: None,
-            merge_condition: None,
-            null_expr_in_auto_increment: None,
-            miss_auto_increment_column: None,
-            abort_delete: None,
-            auto_increment_slot_id: None,
-            partial_update_mode: None,
-            label: None,
-            enable_colocate_mv_index: None,
-            automatic_bucket_size: None,
-            write_txn_log: None,
-            ignore_out_of_partition: None,
-            encryption_meta: None,
-            dynamic_overwrite: None,
-            enable_data_file_bundling: None,
-            is_multi_statements_txn: None,
-        }
-    }
-
-    fn test_mv_tablet_schema() -> TabletSchemaPb {
-        TabletSchemaPb {
-            keys_type: Some(KeysType::AggKeys as i32),
-            column: vec![
-                ColumnPb {
-                    unique_id: 1,
-                    name: Some("ds".to_string()),
-                    r#type: "DATE".to_string(),
-                    is_key: Some(true),
-                    aggregation: None,
-                    is_nullable: Some(false),
-                    default_value: None,
-                    precision: None,
-                    frac: None,
-                    length: None,
-                    index_length: None,
-                    is_bf_column: None,
-                    referenced_column_id: None,
-                    referenced_column: None,
-                    has_bitmap_index: None,
-                    visible: None,
-                    children_columns: Vec::new(),
-                    is_auto_increment: Some(false),
-                    agg_state_desc: None,
-                },
-                ColumnPb {
-                    unique_id: 2,
-                    name: Some("tag".to_string()),
-                    r#type: "VARCHAR".to_string(),
-                    is_key: Some(true),
-                    aggregation: None,
-                    is_nullable: Some(true),
-                    default_value: None,
-                    precision: None,
-                    frac: None,
-                    length: Some(32),
-                    index_length: None,
-                    is_bf_column: None,
-                    referenced_column_id: None,
-                    referenced_column: None,
-                    has_bitmap_index: None,
-                    visible: None,
-                    children_columns: Vec::new(),
-                    is_auto_increment: Some(false),
-                    agg_state_desc: None,
-                },
-                ColumnPb {
-                    unique_id: 3,
-                    name: Some("mv_sum_v1".to_string()),
-                    r#type: "BIGINT".to_string(),
-                    is_key: Some(false),
-                    aggregation: Some("SUM".to_string()),
-                    is_nullable: Some(true),
-                    default_value: None,
-                    precision: None,
-                    frac: None,
-                    length: None,
-                    index_length: None,
-                    is_bf_column: None,
-                    referenced_column_id: None,
-                    referenced_column: None,
-                    has_bitmap_index: None,
-                    visible: None,
-                    children_columns: Vec::new(),
-                    is_auto_increment: Some(false),
-                    agg_state_desc: None,
-                },
-                ColumnPb {
-                    unique_id: 4,
-                    name: Some("mv_bitmap_union_user_id".to_string()),
-                    r#type: "BITMAP".to_string(),
-                    is_key: Some(false),
-                    aggregation: Some("BITMAP_UNION".to_string()),
-                    is_nullable: Some(true),
-                    default_value: None,
-                    precision: None,
-                    frac: None,
-                    length: None,
-                    index_length: None,
-                    is_bf_column: None,
-                    referenced_column_id: None,
-                    referenced_column: None,
-                    has_bitmap_index: None,
-                    visible: None,
-                    children_columns: Vec::new(),
-                    is_auto_increment: Some(false),
-                    agg_state_desc: None,
-                },
-            ],
-            num_short_key_columns: Some(2),
-            num_rows_per_row_block: None,
-            bf_fpp: None,
-            next_column_unique_id: Some(5),
-            deprecated_is_in_memory: None,
-            deprecated_id: None,
-            compression_type: None,
-            sort_key_idxes: vec![0, 1],
-            schema_version: Some(0),
-            sort_key_unique_ids: vec![1, 2],
-            table_indices: Vec::new(),
-            compression_level: None,
-            id: Some(10),
-        }
-    }
-
-    fn test_pk_sink_with_hidden_op_slot() -> data_sinks::TOlapTableSink {
-        data_sinks::TOlapTableSink {
-            load_id: types::TUniqueId { hi: 1, lo: 2 },
-            txn_id: 10,
-            db_id: 1,
-            table_id: 2,
-            tuple_id: 1,
-            num_replicas: 1,
-            need_gen_rollup: false,
-            db_name: Some("db".to_string()),
-            table_name: Some("tbl".to_string()),
-            schema: descriptors::TOlapTableSchemaParam {
-                db_id: 1,
-                table_id: 2,
-                version: 1,
-                slot_descs: vec![
-                    descriptors::TSlotDescriptor {
-                        id: Some(0),
-                        parent: None,
-                        slot_type: None,
-                        column_pos: None,
-                        byte_offset: None,
-                        null_indicator_byte: None,
-                        null_indicator_bit: None,
-                        col_name: Some("k1".to_string()),
-                        slot_idx: None,
-                        is_materialized: None,
-                        is_output_column: None,
-                        is_nullable: Some(false),
-                        col_unique_id: Some(0),
-                        col_physical_name: None,
-                        is_virtual_column: None,
-                    },
-                    descriptors::TSlotDescriptor {
-                        id: Some(1),
-                        parent: None,
-                        slot_type: None,
-                        column_pos: None,
-                        byte_offset: None,
-                        null_indicator_byte: None,
-                        null_indicator_bit: None,
-                        col_name: Some(LOAD_OP_COLUMN.to_string()),
-                        slot_idx: None,
-                        is_materialized: None,
-                        is_output_column: None,
-                        is_nullable: Some(false),
-                        col_unique_id: None,
-                        col_physical_name: None,
-                        is_virtual_column: None,
-                    },
-                ],
-                tuple_desc: descriptors::TTupleDescriptor {
-                    id: Some(1),
-                    byte_size: Some(16),
-                    num_null_bytes: Some(0),
-                    table_id: Some(2),
-                    num_null_slots: Some(0),
-                },
-                indexes: vec![descriptors::TOlapTableIndexSchema {
-                    id: 10,
-                    columns: vec!["k1".to_string(), "v".to_string()],
-                    schema_hash: 1,
-                    column_param: None,
-                    where_clause: None,
-                    schema_id: Some(10),
-                    column_to_expr_value: None,
-                    is_shadow: None,
-                }],
-            },
-            partition: descriptors::TOlapTablePartitionParam {
-                db_id: 1,
-                table_id: 2,
-                version: 1,
-                partition_column: None,
-                distributed_columns: Some(vec!["k1".to_string()]),
-                partitions: Vec::new(),
-                partition_columns: None,
-                partition_exprs: None,
-                enable_automatic_partition: Some(false),
-                distribution_type: None,
-            },
-            location: descriptors::TOlapTableLocationParam {
-                db_id: 1,
-                table_id: 2,
-                version: 1,
-                tablets: Vec::new(),
-            },
-            nodes_info: descriptors::TNodesInfo {
-                version: 1,
-                nodes: Vec::new(),
-            },
-            load_channel_timeout_s: None,
-            is_lake_table: Some(true),
-            txn_trace_parent: None,
-            keys_type: Some(types::TKeysType::PRIMARY_KEYS),
-            write_quorum_type: None,
-            enable_replicated_storage: None,
-            merge_condition: None,
-            null_expr_in_auto_increment: None,
-            miss_auto_increment_column: None,
-            abort_delete: None,
-            auto_increment_slot_id: None,
-            partial_update_mode: None,
-            label: None,
-            enable_colocate_mv_index: None,
-            automatic_bucket_size: None,
-            write_txn_log: None,
-            ignore_out_of_partition: None,
-            encryption_meta: None,
-            dynamic_overwrite: None,
-            enable_data_file_bundling: None,
-            is_multi_statements_txn: None,
-        }
-    }
-
-    fn test_pk_tablet_schema_two_cols() -> TabletSchemaPb {
-        TabletSchemaPb {
-            keys_type: Some(KeysType::PrimaryKeys as i32),
-            column: vec![
-                ColumnPb {
-                    unique_id: 1,
-                    name: Some("k1".to_string()),
-                    r#type: "BIGINT".to_string(),
-                    is_key: Some(true),
-                    aggregation: None,
-                    is_nullable: Some(false),
-                    default_value: None,
-                    precision: None,
-                    frac: None,
-                    length: None,
-                    index_length: None,
-                    is_bf_column: None,
-                    referenced_column_id: None,
-                    referenced_column: None,
-                    has_bitmap_index: None,
-                    visible: None,
-                    children_columns: Vec::new(),
-                    is_auto_increment: Some(false),
-                    agg_state_desc: None,
-                },
-                ColumnPb {
-                    unique_id: 2,
-                    name: Some("v".to_string()),
-                    r#type: "VARCHAR".to_string(),
-                    is_key: Some(false),
-                    aggregation: None,
-                    is_nullable: Some(true),
-                    default_value: None,
-                    precision: None,
-                    frac: None,
-                    length: Some(32),
-                    index_length: None,
-                    is_bf_column: None,
-                    referenced_column_id: None,
-                    referenced_column: None,
-                    has_bitmap_index: None,
-                    visible: None,
-                    children_columns: Vec::new(),
-                    is_auto_increment: Some(false),
-                    agg_state_desc: None,
-                },
-            ],
-            num_short_key_columns: Some(1),
-            num_rows_per_row_block: None,
-            bf_fpp: None,
-            next_column_unique_id: Some(3),
-            deprecated_is_in_memory: None,
-            deprecated_id: None,
-            compression_type: None,
-            sort_key_idxes: vec![0],
-            schema_version: Some(0),
-            sort_key_unique_ids: vec![1],
-            table_indices: Vec::new(),
-            compression_level: None,
-            id: Some(10),
-        }
-    }
-
-    fn test_dup_keys_mv_like_fallback_schema() -> TabletSchemaPb {
-        let mut schema = test_mv_tablet_schema();
-        schema.keys_type = Some(KeysType::DupKeys as i32);
-        for column in schema
-            .column
-            .iter_mut()
-            .filter(|column| !column.is_key.unwrap_or(false))
-        {
-            column.aggregation = None;
-        }
-        schema
-    }
-
-    fn dummy_type_desc() -> types::TTypeDesc {
-        types::TTypeDesc {
-            types: Some(vec![types::TTypeNode {
-                type_: types::TTypeNodeType::SCALAR,
-                scalar_type: None,
-                struct_fields: None,
-                is_named: None,
-            }]),
-        }
-    }
-
-    fn default_expr_node() -> exprs::TExprNode {
-        exprs::TExprNode {
-            node_type: exprs::TExprNodeType::INT_LITERAL,
-            type_: dummy_type_desc(),
-            opcode: None,
-            num_children: 0,
-            agg_expr: None,
-            bool_literal: None,
-            case_expr: None,
-            date_literal: None,
-            float_literal: None,
-            int_literal: None,
-            in_predicate: None,
-            is_null_pred: None,
-            like_pred: None,
-            literal_pred: None,
-            slot_ref: None,
-            string_literal: None,
-            tuple_is_null_pred: None,
-            info_func: None,
-            decimal_literal: None,
-            output_scale: 0,
-            fn_call_expr: None,
-            large_int_literal: None,
-            output_column: None,
-            output_type: None,
-            vector_opcode: None,
-            fn_: None,
-            vararg_start_idx: None,
-            child_type: None,
-            vslot_ref: None,
-            used_subfield_names: None,
-            binary_literal: None,
-            copy_flag: None,
-            check_is_out_of_bounds: None,
-            use_vectorized: None,
-            has_nullable_child: None,
-            is_nullable: None,
-            child_type_desc: None,
-            is_monotonic: None,
-            dict_query_expr: None,
-            dictionary_get_expr: None,
-            is_index_only_filter: None,
-            is_nondeterministic: None,
-        }
-    }
-
-    fn slot_ref_expr(slot_id: i32) -> exprs::TExpr {
-        exprs::TExpr {
-            nodes: vec![exprs::TExprNode {
-                node_type: exprs::TExprNodeType::SLOT_REF,
-                type_: dummy_type_desc(),
-                num_children: 0,
-                slot_ref: Some(exprs::TSlotRef {
-                    slot_id,
-                    tuple_id: 0,
-                }),
-                ..default_expr_node()
-            }],
-        }
-    }
-
-    #[test]
-    fn write_slot_bindings_use_projected_output_ordinals_for_rollup_agg_columns() {
-        let _guard = lock_runtime_test_state();
-        let sink = test_sink_with_aliased_agg_slots();
-        let projected_output_slot_ids = vec![
-            SlotId::new(1),
-            SlotId::new(2),
-            SlotId::new(3),
-            SlotId::new(4),
-        ];
-        let (bindings, op_slot_id) = resolve_write_slot_bindings(
-            &sink,
-            10,
-            None,
-            Some(projected_output_slot_ids.as_slice()),
-            &test_mv_tablet_schema(),
-        )
-        .expect("resolve write slot bindings");
-        assert_eq!(
-            bindings,
-            vec![
-                Some(SlotId::new(1)),
-                Some(SlotId::new(2)),
-                Some(SlotId::new(3)),
-                Some(SlotId::new(4)),
-            ]
-        );
-        assert_eq!(op_slot_id, None);
-    }
-
-    #[test]
-    fn write_slot_bindings_use_output_expr_ordinals_when_aliases_do_not_match_physical_mv_names() {
-        let _guard = lock_runtime_test_state();
-        let sink = test_sink_with_aliased_agg_slots();
-        let output_exprs = vec![
-            slot_ref_expr(1),
-            slot_ref_expr(2),
-            slot_ref_expr(3),
-            slot_ref_expr(4),
-        ];
-        let (bindings, op_slot_id) = resolve_write_slot_bindings(
-            &sink,
-            10,
-            Some(output_exprs.as_slice()),
-            None,
-            &test_mv_tablet_schema(),
-        )
-        .expect("resolve write slot bindings from output expr ordinals");
-        assert_eq!(
-            bindings,
-            vec![
-                Some(SlotId::new(1)),
-                Some(SlotId::new(2)),
-                Some(SlotId::new(3)),
-                Some(SlotId::new(4)),
-            ]
-        );
-        assert_eq!(op_slot_id, None);
-    }
-
-    #[test]
-    fn write_slot_bindings_skip_hidden_op_for_primary_key_delete_plan() {
-        let _guard = lock_runtime_test_state();
-        let sink = test_pk_sink_with_hidden_op_slot();
-        let output_exprs = vec![slot_ref_expr(1), slot_ref_expr(6)];
-        let (bindings, op_slot_id) = resolve_write_slot_bindings(
-            &sink,
-            10,
-            Some(output_exprs.as_slice()),
-            None,
-            &test_pk_tablet_schema_two_cols(),
-        )
-        .expect("resolve write slot bindings for pk delete");
-
-        assert_eq!(bindings, vec![Some(SlotId::new(1)), None]);
-        assert_eq!(op_slot_id, Some(SlotId::new(6)));
-    }
-
-    #[test]
-    fn automatic_partition_plan_does_not_require_shadow_partitions() {
-        let _guard = lock_runtime_test_state();
-        let mut sink = test_sink_with_aliased_agg_slots();
-        sink.partition.partition_columns = Some(vec!["ds".to_string()]);
-        sink.partition.enable_automatic_partition = Some(true);
-        sink.partition.partitions.clear();
-
-        let plan = build_auto_partition_plan(
-            &sink,
-            &[SinkWriteIndexSelection {
-                index_id: 10,
-                schema_id: 10,
-                where_clause: None,
-            }],
-            10,
-            None,
-            None,
-            Some(&types::TNetworkAddress::new("127.0.0.1".to_string(), 9030)),
-        )
-        .expect("build automatic partition plan without shadow partitions");
-
-        let plan = plan.expect("automatic partition plan should stay enabled");
-        assert_eq!(plan.partition_column_names, vec!["ds".to_string()]);
-        assert_eq!(plan.partition_slot_ids, vec![SlotId::new(1)]);
-    }
-
-    #[test]
-    fn extract_partition_literal_value_formats_bool_as_uppercase() {
-        let _guard = lock_runtime_test_state();
-        let expr = exprs::TExpr {
-            nodes: vec![exprs::TExprNode {
-                node_type: exprs::TExprNodeType::BOOL_LITERAL,
-                type_: dummy_type_desc(),
-                num_children: 0,
-                bool_literal: Some(exprs::TBoolLiteral { value: true }),
-                ..default_expr_node()
-            }],
-        };
-
-        assert_eq!(
-            extract_partition_literal_value(&expr),
-            Some("TRUE".to_string())
-        );
-    }
-
-    #[test]
-    fn write_index_prefers_registered_runtime_schema_for_rollup_tablets() {
-        let _guard = lock_runtime_test_state();
-        let dir = tempdir().expect("create tempdir");
-        let runtime_schema = test_mv_tablet_schema();
-        register_tablet_runtime(&TabletWriteContext {
-            db_id: 1,
-            table_id: 2,
-            tablet_id: 100,
-            tablet_root_path: dir.path().to_string_lossy().to_string(),
-            tablet_schema: runtime_schema.clone(),
-            s3_config: None,
-            partial_update: Default::default(),
-        })
-        .expect("register runtime schema");
-
-        let resolved = resolve_effective_tablet_schema_for_index(
-            2,
-            10,
-            10,
-            &[100],
-            &test_dup_keys_mv_like_fallback_schema(),
-        );
-        assert_eq!(resolved.keys_type, Some(KeysType::AggKeys as i32));
-        assert_eq!(resolved.column[2].aggregation.as_deref(), Some("SUM"));
-        assert_eq!(
-            resolved.column[3].aggregation.as_deref(),
-            Some("BITMAP_UNION")
-        );
-    }
-
-    #[test]
-    fn plain_slot_ref_output_projection_is_forced_for_index_where_clause() {
-        let _guard = lock_runtime_test_state();
-        let mut sink = test_sink_with_aliased_agg_slots();
-        sink.schema.indexes[0].where_clause = Some(exprs::TExpr {
-            nodes: vec![exprs::TExprNode {
-                node_type: exprs::TExprNodeType::SLOT_REF,
-                type_: dummy_type_desc(),
-                num_children: 0,
-                slot_ref: Some(exprs::TSlotRef {
-                    slot_id: 2,
-                    tuple_id: 0,
-                }),
-                ..default_expr_node()
-            }],
-        });
-        let output_exprs = vec![
-            slot_ref_expr(1),
-            slot_ref_expr(2),
-            slot_ref_expr(3),
-            slot_ref_expr(4),
-        ];
-        let projection = build_output_projection_plan(
-            &sink,
-            Some(output_exprs.as_slice()),
-            Some(&Layout {
-                order: Vec::new(),
-                index: HashMap::new(),
-            }),
-            None,
-            None,
-            None,
-        )
-        .expect("build output projection plan")
-        .expect("where-clause indexes should force slot remapping projection");
-        assert_eq!(
-            projection.output_slot_ids,
-            vec![
-                SlotId::new(1),
-                SlotId::new(2),
-                SlotId::new(3),
-                SlotId::new(4),
-            ]
-        );
-    }
-
-    #[test]
-    fn create_automatic_partitions_retries_end_of_file() {
-        let _guard = lock_runtime_test_state();
-        test_clear_shared_host_pools();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_server = Arc::clone(&calls);
-        let server = FakeFeRpcServer::start(
-            0,
-            Box::new(move |method, seq, i_prot, o_prot| match method {
-                "createPartition" => {
-                    let _req: crate::thrift::frontend_service::TCreatePartitionRequest =
-                        read_struct_arg(i_prot)?;
-                    if calls_for_server.fetch_add(1, Ordering::AcqRel) == 0 {
-                        return Ok(ServerAction::Close);
-                    }
-                    let response = crate::thrift::frontend_service::TCreatePartitionResult {
-                        status: Some(crate::thrift::status::TStatus::new(
-                            crate::thrift::status_code::TStatusCode::OK,
-                            None,
-                        )),
-                        partitions: None,
-                        tablets: None,
-                        nodes: None,
-                    };
-                    write_struct_reply(o_prot, method, seq, &response)?;
-                    Ok(ServerAction::Continue)
-                }
-                other => panic!("unexpected FE RPC method: {other}"),
-            }),
-        );
-
-        let response = super::create_automatic_partitions(
-            server.addr(),
-            1,
-            2,
-            10,
-            false,
-            vec![vec!["2025-01-01".to_string()]],
-        )
-        .expect("createPartition retries after EOF");
-
-        assert_eq!(
-            response.status.map(|status| status.status_code),
-            Some(crate::thrift::status_code::TStatusCode::OK)
-        );
-        assert_eq!(calls.load(Ordering::Acquire), 2);
-        assert!(server.accepts() >= 2);
-        test_clear_shared_host_pools();
-    }
-
-    #[test]
-    fn create_automatic_partitions_marks_temp_for_dynamic_overwrite() {
-        let _guard = lock_runtime_test_state();
-        test_clear_shared_host_pools();
-        let saw_temp = Arc::new(AtomicBool::new(false));
-        let saw_temp_for_server = Arc::clone(&saw_temp);
-        let server = FakeFeRpcServer::start(
-            0,
-            Box::new(move |method, seq, i_prot, o_prot| match method {
-                "createPartition" => {
-                    let req: crate::thrift::frontend_service::TCreatePartitionRequest =
-                        read_struct_arg(i_prot)?;
-                    saw_temp_for_server.store(req.is_temp.unwrap_or(false), Ordering::Release);
-                    let response = crate::thrift::frontend_service::TCreatePartitionResult {
-                        status: Some(crate::thrift::status::TStatus::new(
-                            crate::thrift::status_code::TStatusCode::OK,
-                            None,
-                        )),
-                        partitions: None,
-                        tablets: None,
-                        nodes: None,
-                    };
-                    write_struct_reply(o_prot, method, seq, &response)?;
-                    Ok(ServerAction::Continue)
-                }
-                other => panic!("unexpected FE RPC method: {other}"),
-            }),
-        );
-
-        super::create_automatic_partitions(
-            server.addr(),
-            1,
-            2,
-            10,
-            true,
-            vec![vec!["2025-01-01".to_string()]],
-        )
-        .expect("createPartition succeeds");
-
-        assert!(saw_temp.load(Ordering::Acquire));
-        test_clear_shared_host_pools();
-    }
-
-    #[test]
-    fn create_automatic_partitions_retries_multiple_end_of_file() {
-        let _guard = lock_runtime_test_state();
-        test_clear_shared_host_pools();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_server = Arc::clone(&calls);
-        let server = FakeFeRpcServer::start(
-            0,
-            Box::new(move |method, seq, i_prot, o_prot| match method {
-                "createPartition" => {
-                    let _req: crate::thrift::frontend_service::TCreatePartitionRequest =
-                        read_struct_arg(i_prot)?;
-                    if calls_for_server.fetch_add(1, Ordering::AcqRel) < 2 {
-                        return Ok(ServerAction::Close);
-                    }
-                    let response = crate::thrift::frontend_service::TCreatePartitionResult {
-                        status: Some(crate::thrift::status::TStatus::new(
-                            crate::thrift::status_code::TStatusCode::OK,
-                            None,
-                        )),
-                        partitions: None,
-                        tablets: None,
-                        nodes: None,
-                    };
-                    write_struct_reply(o_prot, method, seq, &response)?;
-                    Ok(ServerAction::Continue)
-                }
-                other => panic!("unexpected FE RPC method: {other}"),
-            }),
-        );
-
-        let response = super::create_automatic_partitions(
-            server.addr(),
-            1,
-            2,
-            10,
-            false,
-            vec![vec!["2025-01-01".to_string()]],
-        )
-        .expect("createPartition retries across multiple EOF transport errors");
-
-        assert_eq!(
-            response.status.map(|status| status.status_code),
-            Some(crate::thrift::status_code::TStatusCode::OK)
-        );
-        assert_eq!(calls.load(Ordering::Acquire), 3);
-        assert!(server.accepts() >= 3);
-        test_clear_shared_host_pools();
-    }
 }

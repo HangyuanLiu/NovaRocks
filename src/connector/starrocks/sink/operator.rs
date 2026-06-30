@@ -45,27 +45,26 @@ use crate::connector::starrocks::lake::{
 use crate::connector::starrocks::sink::auto_increment::allocate_auto_increment_ids;
 use crate::connector::starrocks::sink::factory::{
     OlapTableSinkPlan, STARROCKS_DEFAULT_PARTITION_VALUE, SinkIndexWritePlan, TabletWriteTarget,
-    create_automatic_partitions,
 };
+use crate::connector::starrocks::sink::frontend_wire::create_automatic_partitions;
 use crate::connector::starrocks::sink::partition_key::{
     PartitionKeySource, PartitionMode, PartitionRoutingEntry, build_partition_key_arrays,
-    parse_partition_boundary_key, parse_partition_in_keys, partition_key_source_len,
-    validate_partition_key_length,
+    partition_key_source_len, validate_partition_key_length,
+};
+use crate::connector::starrocks::sink::plan::{CreatePartitionResult, SinkPredicatePlan};
+use crate::connector::starrocks::sink::report_wire::{
+    TabletCommitInfo, TabletFailInfo, tablet_commit_info, tablet_fail_info,
 };
 use crate::connector::starrocks::sink::routing::{
     RowRejectReason, RowRoutingPlan, route_chunk_rows,
 };
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-use crate::exec::expr::ExprArena;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
-use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::Layout;
 use crate::novarocks_logging::{debug, info};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::starlet_shard_registry;
 use crate::service::grpc_client::proto::starrocks::KeysType;
-use crate::thrift::types;
 
 const LOAD_OP_COLUMN: &str = "__op";
 
@@ -83,7 +82,7 @@ pub(crate) struct OlapTableSinkOperator {
     write_targets: HashMap<i64, TabletWriteTarget>,
     all_write_targets: HashMap<i64, TabletWriteTarget>,
     index_write_plans: Vec<SinkIndexWritePlan>,
-    tablet_commit_infos: Vec<types::TTabletCommitInfo>,
+    tablet_commit_infos: Vec<TabletCommitInfo>,
     seen_partition_values: HashSet<Vec<String>>,
     auto_partition_initialized: bool,
     auto_partition_debug_logged: bool,
@@ -106,7 +105,7 @@ pub(crate) struct OlapSinkFinalizeSharedState {
     write_targets: Mutex<HashMap<i64, TabletWriteTarget>>,
     dirty_partitions: Mutex<HashSet<i64>>,
     written_tablets: Mutex<HashSet<i64>>,
-    tablet_commit_infos: Mutex<Vec<types::TTabletCommitInfo>>,
+    tablet_commit_infos: Mutex<Vec<TabletCommitInfo>>,
     first_error: Mutex<Option<String>>,
     fail_infos_reported: AtomicBool,
     commit_infos_reported: AtomicBool,
@@ -131,7 +130,7 @@ impl OlapSinkFinalizeSharedState {
         write_targets: &HashMap<i64, TabletWriteTarget>,
         written_tablets: &HashSet<i64>,
         dirty_partitions: &HashSet<i64>,
-        tablet_commit_infos: &[types::TTabletCommitInfo],
+        tablet_commit_infos: &[TabletCommitInfo],
     ) {
         if !write_targets.is_empty()
             && let Ok(mut guard) = self.write_targets.lock()
@@ -170,7 +169,7 @@ impl OlapSinkFinalizeSharedState {
         HashMap<i64, TabletWriteTarget>,
         HashSet<i64>,
         HashSet<i64>,
-        Vec<types::TTabletCommitInfo>,
+        Vec<TabletCommitInfo>,
     ) {
         let write_targets = self
             .write_targets
@@ -798,35 +797,26 @@ fn apply_index_where_clause(
     predicate_chunk: &Chunk,
     target_chunk: &Chunk,
     index_id: i64,
-    where_clause: Option<&crate::thrift::exprs::TExpr>,
+    where_clause: Option<&SinkPredicatePlan>,
 ) -> Result<Option<Chunk>, String> {
-    let Some(where_clause) = where_clause.filter(|expr| !expr.nodes.is_empty()) else {
+    let Some(where_clause) = where_clause else {
         return Ok(Some(target_chunk.clone()));
     };
     if predicate_chunk.is_empty() {
         return Ok(Some(target_chunk.clone()));
     }
 
-    let mut arena = ExprArena::default();
-    let empty_layout = Layout {
-        order: Vec::new(),
-        index: HashMap::new(),
-    };
-    let expr_id =
-        lower_t_expr(where_clause, &mut arena, &empty_layout, None, None).map_err(|e| {
+    let predicate = where_clause
+        .arena
+        .eval(where_clause.expr_id, predicate_chunk)
+        .map_err(|e| {
             format!(
-                "OLAP_TABLE_SINK lower index where_clause failed: index_id={} error={}",
-                index_id, e
+                "OLAP_TABLE_SINK evaluate index where_clause failed: index_id={} rows={} error={}",
+                index_id,
+                predicate_chunk.len(),
+                e
             )
         })?;
-    let predicate = arena.eval(expr_id, predicate_chunk).map_err(|e| {
-        format!(
-            "OLAP_TABLE_SINK evaluate index where_clause failed: index_id={} rows={} error={}",
-            index_id,
-            predicate_chunk.len(),
-            e
-        )
-    })?;
     let predicate_bool = if predicate.data_type() == &DataType::Boolean {
         predicate
     } else {
@@ -1083,10 +1073,10 @@ impl OlapTableSinkOperator {
         Ok(())
     }
 
-    fn all_tablet_fail_infos(&self) -> Vec<types::TTabletFailInfo> {
+    fn all_tablet_fail_infos(&self) -> Vec<TabletFailInfo> {
         self.tablet_commit_infos
             .iter()
-            .map(|info| types::TTabletFailInfo::new(Some(info.tablet_id), Some(info.backend_id)))
+            .map(|info| tablet_fail_info(info.tablet_id, info.backend_id))
             .collect::<Vec<_>>()
     }
 
@@ -1110,7 +1100,7 @@ impl OlapTableSinkOperator {
         &self,
         state: &RuntimeState,
         merged_written_tablets: &HashSet<i64>,
-        merged_tablet_commit_infos: &[types::TTabletCommitInfo],
+        merged_tablet_commit_infos: &[TabletCommitInfo],
     ) {
         if !self.finalize_shared.mark_commit_infos_reported() {
             return;
@@ -1326,10 +1316,10 @@ impl OlapTableSinkOperator {
     fn ingest_auto_partition_response(
         &mut self,
         auto_partition: &crate::connector::starrocks::sink::factory::AutomaticPartitionPlan,
-        response: crate::thrift::frontend_service::TCreatePartitionResult,
+        response: CreatePartitionResult,
     ) -> Result<(), String> {
-        let partitions = response.partitions.unwrap_or_default();
-        let tablets = response.tablets.unwrap_or_default();
+        let partitions = response.partitions;
+        let tablets = response.tablets;
 
         let primary_index_id = self
             .index_write_plans
@@ -1345,29 +1335,20 @@ impl OlapTableSinkOperator {
         let mut tablet_to_partition = HashMap::<i64, i64>::new();
         let partition_key_len = partition_key_source_len(&auto_partition.partition_key_source);
         for partition in partitions {
-            if partition.is_shadow_partition.unwrap_or(false) {
+            if partition.is_shadow {
                 continue;
             }
-            let start_key = parse_partition_boundary_key(
-                partition.start_keys.as_deref(),
-                partition.start_key.as_ref(),
-            )?;
-            let end_key = parse_partition_boundary_key(
-                partition.end_keys.as_deref(),
-                partition.end_key.as_ref(),
-            )?;
-            let in_keys = parse_partition_in_keys(partition.in_keys.as_deref())?;
             validate_partition_key_length(
-                partition.id,
+                partition.partition_id,
                 partition_key_len,
-                start_key.as_deref(),
-                end_key.as_deref(),
-                &in_keys,
+                partition.start_key.as_deref(),
+                partition.end_key.as_deref(),
+                &partition.in_keys,
             )?;
-            if !in_keys.is_empty() && end_key.is_some() {
+            if !partition.in_keys.is_empty() && partition.end_key.is_some() {
                 return Err(format!(
                     "OLAP_TABLE_SINK createPartition returned mixed range/list metadata for partition {}",
-                    partition.id
+                    partition.partition_id
                 ));
             }
 
@@ -1380,7 +1361,7 @@ impl OlapTableSinkOperator {
                 if !partition_index_ids.contains(index_id) {
                     return Err(format!(
                         "OLAP_TABLE_SINK createPartition returned partition {} without write index {} (write_index_ids={:?})",
-                        partition.id, index_id, write_index_ids
+                        partition.partition_id, index_id, write_index_ids
                     ));
                 }
             }
@@ -1393,11 +1374,11 @@ impl OlapTableSinkOperator {
                 if index.tablet_ids.is_empty() {
                     return Err(format!(
                         "OLAP_TABLE_SINK createPartition returned partition {} index {} with empty tablet_ids",
-                        partition.id, index.index_id
+                        partition.partition_id, index.index_id
                     ));
                 }
                 for tablet_id in &index.tablet_ids {
-                    tablet_to_partition.insert(*tablet_id, partition.id);
+                    tablet_to_partition.insert(*tablet_id, partition.partition_id);
                 }
                 let already_present = self
                     .index_write_plans
@@ -1407,7 +1388,7 @@ impl OlapTableSinkOperator {
                         plan.row_routing
                             .partitions
                             .iter()
-                            .any(|entry| entry.partition_id == partition.id)
+                            .any(|entry| entry.partition_id == partition.partition_id)
                     });
                 if already_present {
                     continue;
@@ -1416,11 +1397,11 @@ impl OlapTableSinkOperator {
                     .entry(index.index_id)
                     .or_default()
                     .push(PartitionRoutingEntry {
-                        partition_id: partition.id,
+                        partition_id: partition.partition_id,
                         tablet_ids: index.tablet_ids.clone(),
-                        start_key: start_key.clone(),
-                        end_key: end_key.clone(),
-                        in_keys: in_keys.clone(),
+                        start_key: partition.start_key.clone(),
+                        end_key: partition.end_key.clone(),
+                        in_keys: partition.in_keys.clone(),
                     });
             }
         }
@@ -1472,13 +1453,8 @@ impl OlapTableSinkOperator {
                 current.tablet_id == tablet.tablet_id && current.backend_id == backend_id
             });
             if !exists {
-                self.tablet_commit_infos.push(types::TTabletCommitInfo::new(
-                    tablet.tablet_id,
-                    backend_id,
-                    Option::<Vec<String>>::None,
-                    Option::<Vec<String>>::None,
-                    Option::<Vec<i64>>::None,
-                ));
+                self.tablet_commit_infos
+                    .push(tablet_commit_info(tablet.tablet_id, backend_id));
             }
         }
 
@@ -1503,12 +1479,8 @@ impl OlapTableSinkOperator {
                     tablet_id: *tablet_id,
                 })
                 .collect::<Vec<_>>();
-            let path_map = resolve_tablet_paths_for_olap_sink(
-                None,
-                Some(&auto_partition.fe_addr),
-                &self.plan.table_identity,
-                &refs,
-            )?;
+            let path_map =
+                resolve_tablet_paths_for_olap_sink(None, None, &self.plan.table_identity, &refs)?;
             let shard_infos = starlet_shard_registry::select_infos(&new_tablets);
             for index_plan in &mut self.index_write_plans {
                 let Some(index_new_tablets) = new_tablets_by_index.get(&index_plan.index_id) else {
@@ -2658,11 +2630,15 @@ mod tests {
     use crate::connector::starrocks::lake::{TabletWriteContext, txn_log::read_txn_log_if_exists};
     use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_test;
     use crate::connector::starrocks::sink::factory::{
-        AutomaticPartitionPlan, OlapTableSinkPlan, SinkIndexWritePlan, SinkOutputProjectionPlan,
-        TabletWriteTarget,
+        AutomaticPartitionPlan, OlapTableSinkPlan, SinkIndexWritePlan, TabletWriteTarget,
     };
+    use crate::connector::starrocks::sink::frontend_wire::frontend_address_from_thrift;
     use crate::connector::starrocks::sink::partition_key::{
         PartitionKeySource, PartitionMode, PartitionRoutingEntry,
+    };
+    use crate::connector::starrocks::sink::plan::{
+        CreatePartitionResult, FrontendAddress, SinkOutputProjectionPlan, SinkPartitionEntry,
+        SinkPartitionIndex, SinkPredicatePlan, SinkTabletLocation,
     };
     use crate::connector::starrocks::sink::routing::RowRoutingPlan;
     use crate::exec::chunk::Chunk;
@@ -2674,11 +2650,7 @@ mod tests {
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, KeysType, PUniqueId, TabletSchemaPb,
     };
-    use crate::thrift::descriptors::{
-        TOlapTableIndexTablets, TOlapTablePartition, TTabletLocation,
-    };
     use crate::thrift::frontend_service;
-    use crate::thrift::frontend_service::TCreatePartitionResult;
     use crate::thrift::{exprs, opcodes, status, status_code, types};
     mod fe_rpc_server {
         include!(concat!(
@@ -2939,7 +2911,7 @@ mod tests {
     }
 
     fn primary_key_auto_increment_policy(
-        fe_addr: Option<types::TNetworkAddress>,
+        fe_addr: Option<FrontendAddress>,
     ) -> AutoIncrementWritePolicy {
         AutoIncrementWritePolicy {
             null_expr_in_auto_increment: false,
@@ -3057,6 +3029,20 @@ mod tests {
                 left,
                 right,
             ],
+        }
+    }
+
+    fn sink_predicate_plan(expr: &exprs::TExpr) -> SinkPredicatePlan {
+        let mut arena = ExprArena::default();
+        let layout = crate::lower::layout::Layout {
+            order: Vec::new(),
+            index: HashMap::new(),
+        };
+        let expr_id = crate::lower::expr::lower_t_expr(expr, &mut arena, &layout, None, None)
+            .expect("lower predicate expr");
+        SinkPredicatePlan {
+            arena: Arc::new(arena),
+            expr_id,
         }
     }
 
@@ -3428,7 +3414,10 @@ mod tests {
                 table_id: 7005,
                 txn_id: 8001,
                 dynamic_overwrite: false,
-                fe_addr: types::TNetworkAddress::new("127.0.0.1".to_string(), 9031),
+                fe_addr: FrontendAddress {
+                    hostname: "127.0.0.1".to_string(),
+                    port: 9031,
+                },
                 partition_key_source: PartitionKeySource::None,
                 partition_column_names: Vec::new(),
                 partition_slot_ids: Vec::new(),
@@ -3450,36 +3439,36 @@ mod tests {
         register_test_runtime(9916, new_primary_root.clone(), primary_tablet_schema);
         register_test_runtime(9917, new_secondary_root.clone(), secondary_tablet_schema);
 
-        let response = TCreatePartitionResult::new(
-            None::<crate::thrift::status::TStatus>,
-            Some(vec![TOlapTablePartition::new(
-                3005,
-                None::<crate::thrift::exprs::TExprNode>,
-                None::<crate::thrift::exprs::TExprNode>,
-                None::<i32>,
-                vec![
-                    TOlapTableIndexTablets::new(
-                        10,
-                        vec![9916],
-                        None::<Vec<crate::thrift::descriptors::TOlapTableTablet>>,
-                    ),
-                    TOlapTableIndexTablets::new(
-                        20,
-                        vec![9917],
-                        None::<Vec<crate::thrift::descriptors::TOlapTableTablet>>,
-                    ),
+        let response = CreatePartitionResult {
+            partitions: vec![SinkPartitionEntry {
+                partition_id: 3005,
+                is_shadow: false,
+                indexes: vec![
+                    SinkPartitionIndex {
+                        index_id: 10,
+                        tablet_ids: vec![9916],
+                    },
+                    SinkPartitionIndex {
+                        index_id: 20,
+                        tablet_ids: vec![9917],
+                    },
                 ],
-                None::<Vec<crate::thrift::exprs::TExprNode>>,
-                None::<Vec<crate::thrift::exprs::TExprNode>>,
-                None::<Vec<Vec<crate::thrift::exprs::TExprNode>>>,
-                Some(false),
-            )]),
-            Some(vec![
-                TTabletLocation::new(9916, vec![1001]),
-                TTabletLocation::new(9917, vec![1001]),
-            ]),
-            None::<Vec<crate::thrift::descriptors::TNodeInfo>>,
-        );
+                start_key: None,
+                end_key: None,
+                in_keys: Vec::new(),
+            }],
+            tablets: vec![
+                SinkTabletLocation {
+                    tablet_id: 9916,
+                    node_ids: vec![1001],
+                },
+                SinkTabletLocation {
+                    tablet_id: 9917,
+                    node_ids: vec![1001],
+                },
+            ],
+            nodes: Vec::new(),
+        };
 
         let auto_partition = op.plan.auto_partition.clone().expect("auto partition plan");
         op.ingest_auto_partition_response(&auto_partition, response)
@@ -3724,7 +3713,7 @@ mod tests {
             &batch,
             &primary_key_auto_increment_schema(),
             Some(&primary_key_auto_increment_policy(Some(
-                server.addr().clone(),
+                frontend_address_from_thrift(server.addr()),
             ))),
             97145,
         )
@@ -3808,6 +3797,7 @@ mod tests {
             int_literal_node(2),
         );
 
+        let where_clause = sink_predicate_plan(&where_clause);
         let filtered = apply_index_where_clause(&chunk, &chunk, 10, Some(&where_clause))
             .expect("apply where clause")
             .expect("where clause should keep one row");
@@ -3855,6 +3845,7 @@ mod tests {
             string_literal_node("a"),
         );
 
+        let where_clause = sink_predicate_plan(&where_clause);
         let filtered = apply_index_where_clause(&chunk, &chunk, 11, Some(&where_clause))
             .expect("apply string where clause")
             .expect("where clause should keep one row");
@@ -3923,6 +3914,7 @@ mod tests {
             string_literal_node("a"),
         );
 
+        let where_clause = sink_predicate_plan(&where_clause);
         let filtered =
             apply_index_where_clause(&predicate_chunk, &target_chunk, 12, Some(&where_clause))
                 .expect("apply projected target where clause")

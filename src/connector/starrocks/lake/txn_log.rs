@@ -4082,6 +4082,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::common::largeint;
     use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_test;
+    use crate::connector::starrocks::sink::frontend_wire::frontend_address_from_thrift;
     use crate::exec::chunk::Chunk;
     use crate::formats::starrocks::metadata::{
         collect_delete_predicates, lake_rowset_visibility_version,
@@ -5472,7 +5473,8 @@ mod tests {
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let mut ctx = test_pk_auto_increment_context(&root, 7021, 88112, 4021);
-        ctx.partial_update.auto_increment.fe_addr = Some(server.addr().clone());
+        ctx.partial_update.auto_increment.fe_addr =
+            Some(frontend_address_from_thrift(server.addr()));
 
         let batch = pk_auto_increment_batch(vec![1, 2], vec![Some(10), None]);
         let routing = super::resolve_lake_batch_write_routing_with_slots(&ctx, &batch, None, None)

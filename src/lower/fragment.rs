@@ -571,8 +571,8 @@ pub(crate) fn execute_fragment(
                     .olap_table_sink
                     .as_ref()
                     .ok_or_else(|| "OLAP_TABLE_SINK missing olap_table_sink payload".to_string())?;
-                let sink_factory = OlapTableSinkFactory::try_new(
-                    olap_sink.clone(),
+                let sink_input = crate::lower::sink::starrocks::lower_starrocks_sink_factory_input(
+                    olap_sink,
                     fragment.output_exprs.as_deref(),
                     Some(&exec_plan),
                     Some(&lowered.layout),
@@ -580,6 +580,7 @@ pub(crate) fn execute_fragment(
                     session_time_zone,
                     fe_addr,
                 )?;
+                let sink_factory = OlapTableSinkFactory::try_new(sink_input)?;
                 let _exec_timer = profiler
                     .as_ref()
                     .map(|p| p.scoped_timer("PipelineExecuteTime"));

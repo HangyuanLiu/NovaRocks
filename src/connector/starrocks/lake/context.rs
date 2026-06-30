@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::common::ids::SlotId;
+use crate::connector::starrocks::sink::plan::FrontendAddress;
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig, StarletShardInfo};
 use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
@@ -101,7 +102,7 @@ pub(crate) struct AutoIncrementWritePolicy {
     pub(crate) auto_increment_column_idx: Option<usize>,
     pub(crate) auto_increment_column_name: Option<String>,
     pub(crate) auto_increment_in_sort_key: bool,
-    pub(crate) fe_addr: Option<types::TNetworkAddress>,
+    pub(crate) fe_addr: Option<FrontendAddress>,
 }
 
 #[derive(Clone, Debug)]

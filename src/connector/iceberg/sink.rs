@@ -2349,14 +2349,15 @@ mod tests {
     use super::{
         ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
         ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL, IcebergSinkMode, IcebergSinkPlan,
-        IcebergTableSinkBackend, IcebergTableSinkFactory, PositionDeleteDataFilePartition,
-        align_arrays_to_schema, collect_theta_sketches_by_name, iceberg_partition_key_for_row,
+        IcebergTableSinkBackend, IcebergTableSinkFactory, align_arrays_to_schema,
+        collect_theta_sketches_by_name, iceberg_partition_key_for_row,
         iceberg_schema_from_arrow_schema, merge_deletion_vectors_by_file, row_lineage_row_id_index,
         schema_has_reserved_row_lineage_columns, unique_file_path, write_parquet_to_bytes,
     };
     use crate::connector::iceberg::commit::EqualityDeleteColumn;
     use crate::connector::iceberg::data_writer::{StagedWriteOptions, write_record_batches};
     use crate::connector::iceberg::delete_file::IcebergFileContent;
+    use crate::connector::iceberg::sink_plan::PositionDeleteDataFilePartition;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::ExprNode;
     use crate::exec::pipeline::async_sink::AsyncSinkBackend;
