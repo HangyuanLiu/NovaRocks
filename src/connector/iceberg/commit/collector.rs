@@ -431,6 +431,11 @@ impl IcebergCommitCollector {
         let nan_value_counts = i64_map_to_u64(Some(stats.nan_value_counts), "nan_value_counts")?;
         let lower_bounds = self.decode_bounds(Some(stats.lower_bounds), "lower_bounds")?;
         let upper_bounds = self.decode_bounds(Some(stats.upper_bounds), "upper_bounds")?;
+        let split_offsets = i64_vec_non_negative(file.split_offsets, "split_offsets")?;
+        let first_row_id = i64_option_non_negative(file.first_row_id, "first_row_id")?;
+        let content_offset = i64_option_non_negative(file.content_offset, "content_offset")?;
+        let content_size_in_bytes =
+            i64_option_non_negative(file.content_size_in_bytes, "content_size_in_bytes")?;
 
         Ok(WrittenFile {
             path: file.path,
@@ -440,7 +445,7 @@ impl IcebergCommitCollector {
             partition_spec_id: partition.partition_spec_id,
             record_count: i64_to_u64(file.record_count, "record_count")?,
             file_size_in_bytes: i64_to_u64(file.file_size_in_bytes, "file_size_in_bytes")?,
-            split_offsets: file.split_offsets.unwrap_or_default(),
+            split_offsets,
             column_sizes,
             value_counts,
             null_value_counts,
@@ -450,9 +455,9 @@ impl IcebergCommitCollector {
             key_metadata: file.key_metadata,
             referenced_data_file: file.referenced_data_file,
             equality_ids: file.equality_ids,
-            first_row_id: file.first_row_id,
-            content_offset: file.content_offset,
-            content_size_in_bytes: file.content_size_in_bytes,
+            first_row_id,
+            content_offset,
+            content_size_in_bytes,
             cardinality: file
                 .cardinality
                 .map(|c| i64_to_u64(c, "cardinality"))
@@ -569,6 +574,30 @@ fn validate_puffin_dv_descriptor(
 /// `HashMap<i32, u64>` representation. Inverse of `data_writer::u64_stats_to_i64`.
 fn i64_to_u64(value: i64, field: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| format!("iceberg {field} value {value} is negative"))
+}
+
+fn i64_option_non_negative(value: Option<i64>, field: &str) -> Result<Option<i64>, String> {
+    if let Some(value) = value
+        && value < 0
+    {
+        return Err(format!("iceberg {field} value {value} is negative"));
+    }
+    Ok(value)
+}
+
+fn i64_vec_non_negative(values: Option<Vec<i64>>, field: &str) -> Result<Vec<i64>, String> {
+    values
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            if value < 0 {
+                Err(format!("iceberg {field}[{idx}] value {value} is negative"))
+            } else {
+                Ok(value)
+            }
+        })
+        .collect()
 }
 
 fn i64_map_to_u64(
@@ -1982,6 +2011,66 @@ mod tests {
                 .expect("take files")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn convert_writer_report_rejects_negative_first_row_id() {
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let collector = test_collector_with_metadata(metadata);
+        let mut report = test_writer_report("file:///warehouse/t/data/a.parquet", spec_id);
+        report.file.first_row_id = Some(-1);
+
+        let err = collector
+            .convert_writer_report(report)
+            .expect_err("negative first_row_id should fail");
+
+        assert!(err.contains("first_row_id"), "got: {err}");
+    }
+
+    #[test]
+    fn convert_writer_report_rejects_negative_split_offsets() {
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let collector = test_collector_with_metadata(metadata);
+        let mut report = test_writer_report("file:///warehouse/t/data/a.parquet", spec_id);
+        report.file.split_offsets = Some(vec![0, -1]);
+
+        let err = collector
+            .convert_writer_report(report)
+            .expect_err("negative split_offsets should fail");
+
+        assert!(err.contains("split_offsets"), "got: {err}");
+    }
+
+    #[test]
+    fn convert_writer_report_rejects_negative_content_offset() {
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let collector = test_collector_with_metadata(metadata);
+        let mut report = test_writer_report("file:///warehouse/t/data/a.parquet", spec_id);
+        report.file.content_offset = Some(-1);
+
+        let err = collector
+            .convert_writer_report(report)
+            .expect_err("negative content_offset should fail");
+
+        assert!(err.contains("content_offset"), "got: {err}");
+    }
+
+    #[test]
+    fn convert_writer_report_rejects_negative_content_size_in_bytes() {
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let collector = test_collector_with_metadata(metadata);
+        let mut report = test_writer_report("file:///warehouse/t/data/a.parquet", spec_id);
+        report.file.content_size_in_bytes = Some(-1);
+
+        let err = collector
+            .convert_writer_report(report)
+            .expect_err("negative content_size_in_bytes should fail");
+
+        assert!(err.contains("content_size_in_bytes"), "got: {err}");
     }
 
     #[test]

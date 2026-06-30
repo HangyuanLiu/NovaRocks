@@ -105,6 +105,18 @@ pub(crate) fn sink_commit_info_to_writer_report(
     let path = df
         .path
         .ok_or_else(|| "TIcebergDataFile missing path".to_string())?;
+    let format = df
+        .format
+        .ok_or_else(|| "TIcebergDataFile missing format".to_string())?;
+    let record_count = df
+        .record_count
+        .ok_or_else(|| "TIcebergDataFile missing record_count".to_string())?;
+    let file_size_in_bytes = df
+        .file_size_in_bytes
+        .ok_or_else(|| "TIcebergDataFile missing file_size_in_bytes".to_string())?;
+    let file_content = df
+        .file_content
+        .ok_or_else(|| "TIcebergDataFile missing file_content".to_string())?;
     let partition_spec_id = df.partition_spec_id.ok_or_else(|| {
         EngineError::iceberg_write_descriptor_mismatch("TIcebergDataFile missing partition_spec_id")
             .to_bracketed_user_message()
@@ -122,10 +134,10 @@ pub(crate) fn sink_commit_info_to_writer_report(
     Ok(IcebergWriterReport {
         file: IcebergWrittenFileReport {
             path,
-            format: df.format.unwrap_or_else(|| "PARQUET".to_string()),
-            content: file_content_from_thrift(df.file_content)?,
-            record_count: df.record_count.unwrap_or(0),
-            file_size_in_bytes: df.file_size_in_bytes.unwrap_or(0),
+            format,
+            content: file_content_from_thrift(file_content)?,
+            record_count,
+            file_size_in_bytes,
             partition: IcebergPartitionReport {
                 partition_path: df.partition_path.unwrap_or_default(),
                 null_fingerprint: df.partition_null_fingerprint.unwrap_or_default(),
@@ -207,9 +219,9 @@ fn file_content_to_thrift(content: IcebergFileContent) -> types::TIcebergFileCon
 }
 
 fn file_content_from_thrift(
-    content: Option<types::TIcebergFileContent>,
+    content: types::TIcebergFileContent,
 ) -> Result<IcebergFileContent, String> {
-    match content.unwrap_or(types::TIcebergFileContent::DATA) {
+    match content {
         types::TIcebergFileContent::DATA => Ok(IcebergFileContent::Data),
         types::TIcebergFileContent::POSITION_DELETES => Ok(IcebergFileContent::PositionDeletes),
         types::TIcebergFileContent::EQUALITY_DELETES => Ok(IcebergFileContent::EqualityDeletes),
@@ -332,6 +344,65 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn sink_commit_info_to_writer_report_rejects_missing_required_data_file_fields() {
+        let metadata = test_unpartitioned_metadata();
+        let report = IcebergWriterReport {
+            file: IcebergWrittenFileReport {
+                path: "file:///warehouse/t/data-1.parquet".to_string(),
+                format: "parquet".to_string(),
+                content: IcebergFileContent::Data,
+                record_count: 2,
+                file_size_in_bytes: 128,
+                partition: IcebergPartitionReport {
+                    partition_path: String::new(),
+                    null_fingerprint: String::new(),
+                    partition_spec_id: metadata.default_partition_spec_id(),
+                    partition_values: Struct::empty(),
+                },
+                split_offsets: None,
+                column_stats: None,
+                referenced_data_file: None,
+                first_row_id: None,
+                equality_ids: None,
+                key_metadata: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            },
+            is_overwrite: None,
+            is_rewrite: None,
+        };
+        let info = writer_report_to_sink_commit_info(report, &metadata).expect("wire encode");
+
+        let cases: [(&str, fn(&mut types::TIcebergDataFile)); 4] = [
+            ("format", |df: &mut types::TIcebergDataFile| {
+                df.format = None
+            }),
+            ("record_count", |df: &mut types::TIcebergDataFile| {
+                df.record_count = None
+            }),
+            ("file_size_in_bytes", |df: &mut types::TIcebergDataFile| {
+                df.file_size_in_bytes = None
+            }),
+            ("file_content", |df: &mut types::TIcebergDataFile| {
+                df.file_content = None
+            }),
+        ];
+        for (field, mutate) in cases {
+            let mut missing = info.clone();
+            mutate(missing.iceberg_data_file.as_mut().expect("data file"));
+
+            let err = sink_commit_info_to_writer_report(missing, &metadata)
+                .expect_err("missing required field should fail");
+
+            assert!(
+                err.contains(&format!("TIcebergDataFile missing {field}")),
+                "field {field} got: {err}"
+            );
+        }
     }
 
     #[test]
