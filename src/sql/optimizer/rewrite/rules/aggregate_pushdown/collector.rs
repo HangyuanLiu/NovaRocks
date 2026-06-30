@@ -433,6 +433,7 @@ mod tests {
     fn sum_spec(col: &str, arena: &mut ScalarArena) -> ScalarAggregateSpec {
         let arg = col_ref_typed(col, DataType::Int64);
         ScalarAggregateSpec {
+            output_column_id: test_col_id(None, &format!("sum({col})")),
             name: "sum".into(),
             args: vec![intern_typed(arena, &arg)],
             distinct: false,
@@ -587,6 +588,7 @@ mod tests {
     fn rejects_count_star() {
         let mut arena = make_arena();
         let count_star = ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(9001),
             name: "count".into(),
             args: vec![],
             distinct: false,
@@ -606,6 +608,7 @@ mod tests {
         let mut arena = make_arena();
         let avg_arg = intern_typed(&mut arena, &col_ref_typed("v", DataType::Int64));
         let avg = ScalarAggregateSpec {
+            output_column_id: test_col_id(None, "avg(v)"),
             name: "avg".into(),
             args: vec![avg_arg],
             distinct: false,
@@ -635,6 +638,7 @@ mod tests {
         };
         let arg_id = intern_typed(&mut arena, &non_col);
         let spec = ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(9002),
             name: "sum".into(),
             args: vec![arg_id],
             distinct: false,
@@ -663,6 +667,7 @@ mod tests {
         };
         let arg_id = intern_typed(&mut arena, &rand_expr);
         let spec = ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(9003),
             name: "sum".into(),
             args: vec![arg_id],
             distinct: false,
@@ -847,6 +852,7 @@ mod tests {
                 DataType::Int64,
             )],
             vec![ScalarAggregateSpec {
+                output_column_id: test_col_id(Some("cs"), "sum(cs_sales_price)"),
                 name: "sum".into(),
                 args: vec![sum_arg],
                 distinct: false,
@@ -1041,6 +1047,7 @@ mod tests {
             &qualified_col_ref_typed("l", "c0", DataType::Int64),
         );
         let count_spec = ScalarAggregateSpec {
+            output_column_id: test_col_id(Some("l"), "count(c0)"),
             name: "count".into(),
             args: vec![count_arg],
             distinct: false,

@@ -312,6 +312,7 @@ mod tests {
 
     fn sum_spec(sales: crate::sql::optimizer::scalar::ScalarId) -> ScalarAggregateSpec {
         ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(9001),
             name: "sum".to_string(),
             args: vec![sales],
             distinct: false,

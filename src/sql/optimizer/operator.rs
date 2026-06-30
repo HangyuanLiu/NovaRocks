@@ -84,10 +84,116 @@ pub(crate) struct ScalarProjectItem {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScalarAggregateSpec {
+    pub output_column_id: ColumnId,
     pub name: String,
     pub args: Vec<ScalarId>,
     pub distinct: bool,
     pub order_by: Vec<SortKey>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AggregateOutputLayout {
+    pub group_key_columns: Vec<OutputColumn>,
+    pub aggregate_columns: Vec<OutputColumn>,
+}
+
+impl AggregateOutputLayout {
+    pub(crate) fn new(
+        group_key_columns: Vec<OutputColumn>,
+        aggregate_columns: Vec<OutputColumn>,
+    ) -> Self {
+        Self {
+            group_key_columns,
+            aggregate_columns,
+        }
+    }
+
+    pub(crate) fn full_output_columns(&self) -> Vec<OutputColumn> {
+        self.group_key_columns
+            .iter()
+            .chain(self.aggregate_columns.iter())
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn contains_column_id(&self, column_id: ColumnId) -> bool {
+        self.group_key_columns
+            .iter()
+            .chain(self.aggregate_columns.iter())
+            .any(|column| column.column_id == column_id)
+    }
+
+    pub(crate) fn validate_visible_outputs(
+        &self,
+        output_columns: &[OutputColumn],
+    ) -> Result<(), String> {
+        for output in output_columns {
+            if !self.contains_column_id(output.column_id) {
+                return Err(format!(
+                    "visible aggregate output column id {} is not in AggregateOutputLayout",
+                    output.column_id.0
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_aggregate_calls(
+        &self,
+        aggregates: &[ScalarAggregateSpec],
+        is_merge_len: usize,
+    ) -> Result<(), String> {
+        if self.aggregate_columns.len() != aggregates.len() || is_merge_len != aggregates.len() {
+            return Err(format!(
+                "AggregateOutputLayout arity mismatch: group_keys={}, aggregate_columns={}, aggregates={}, is_merge={}",
+                self.group_key_columns.len(),
+                self.aggregate_columns.len(),
+                aggregates.len(),
+                is_merge_len
+            ));
+        }
+        let mut seen_specs = HashSet::new();
+        for aggregate in aggregates {
+            if aggregate.output_column_id == ColumnId::UNSET {
+                return Err(format!(
+                    "ScalarAggregateSpec {} must carry output_column_id",
+                    aggregate.name
+                ));
+            }
+            if !seen_specs.insert(aggregate.output_column_id) {
+                return Err(format!(
+                    "duplicate ScalarAggregateSpec output_column_id {}",
+                    aggregate.output_column_id.0
+                ));
+            }
+        }
+
+        let mut seen_layout = HashSet::new();
+        for (idx, column) in self.aggregate_columns.iter().enumerate() {
+            if column.column_id == ColumnId::UNSET {
+                return Err(format!(
+                    "AggregateOutputLayout.aggregate_columns[{idx}] must carry column_id"
+                ));
+            }
+            if !seen_layout.insert(column.column_id) {
+                return Err(format!(
+                    "duplicate aggregate output column id {}",
+                    column.column_id.0
+                ));
+            }
+        }
+
+        for (idx, aggregate) in aggregates.iter().enumerate() {
+            let layout_id = self.aggregate_columns[idx].column_id;
+            if aggregate.output_column_id != layout_id {
+                return Err(format!(
+                    "aggregate output layout mismatch at index {}: spec id {} != layout id {}",
+                    idx, aggregate.output_column_id.0, layout_id.0
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -591,8 +697,19 @@ mod aggregate_stage_tests {
 
     fn count_call(arena: &mut ScalarArena) -> ScalarAggregateSpec {
         ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(3),
             name: "count".to_string(),
             args: vec![scalar_col_ref(arena, 2, "v")],
+            distinct: false,
+            order_by: vec![],
+        }
+    }
+
+    fn aggregate_spec(id: u32, name: &str) -> ScalarAggregateSpec {
+        ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            args: vec![],
             distinct: false,
             order_by: vec![],
         }
@@ -629,5 +746,69 @@ mod aggregate_stage_tests {
         assert_eq!(op.stage.to_physical_mode(), AggMode::Global);
         assert_eq!(op.is_merge, vec![true]);
         assert!(op.is_split);
+    }
+
+    #[test]
+    fn aggregate_output_layout_rejects_duplicate_spec_output_id() {
+        let layout = AggregateOutputLayout::new(
+            vec![],
+            vec![output_column(11, "sum_a"), output_column(12, "count_b")],
+        );
+
+        let err = layout
+            .validate_aggregate_calls(&[aggregate_spec(11, "sum"), aggregate_spec(11, "count")], 2)
+            .unwrap_err();
+
+        assert_eq!(err, "duplicate ScalarAggregateSpec output_column_id 11");
+    }
+
+    #[test]
+    fn aggregate_output_layout_rejects_unset_layout_output_id() {
+        let mut output = output_column(11, "sum_a");
+        output.column_id = ColumnId::UNSET;
+        let layout = AggregateOutputLayout::new(vec![], vec![output]);
+
+        let err = layout
+            .validate_aggregate_calls(&[aggregate_spec(11, "sum")], 1)
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            "AggregateOutputLayout.aggregate_columns[0] must carry column_id"
+        );
+    }
+
+    #[test]
+    fn aggregate_output_layout_rejects_duplicate_layout_output_id() {
+        let layout = AggregateOutputLayout::new(
+            vec![],
+            vec![
+                output_column(11, "sum_a"),
+                output_column(11, "sum_a_duplicate"),
+            ],
+        );
+
+        let err = layout
+            .validate_aggregate_calls(&[aggregate_spec(11, "sum"), aggregate_spec(12, "count")], 2)
+            .unwrap_err();
+
+        assert_eq!(err, "duplicate aggregate output column id 11");
+    }
+
+    #[test]
+    fn aggregate_output_layout_rejects_positional_mismatch() {
+        let layout = AggregateOutputLayout::new(
+            vec![],
+            vec![output_column(12, "count_b"), output_column(11, "sum_a")],
+        );
+
+        let err = layout
+            .validate_aggregate_calls(&[aggregate_spec(11, "sum"), aggregate_spec(12, "count")], 2)
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            "aggregate output layout mismatch at index 0: spec id 11 != layout id 12"
+        );
     }
 }

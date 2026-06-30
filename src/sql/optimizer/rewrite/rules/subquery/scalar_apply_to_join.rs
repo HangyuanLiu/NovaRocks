@@ -253,8 +253,8 @@ fn apply_opt(
         Operator::LogicalAggregate(LogicalAggregateOp::single(
             group_by,
             vec![
-                scalar_utils::count_one_spec(arena),
-                scalar_utils::any_value_spec(inner_scalar_ref),
+                scalar_utils::count_one_spec(arena, cnt_id),
+                scalar_utils::any_value_spec(inner_scalar_ref, anyval_id),
             ],
             agg_output_cols,
         )),

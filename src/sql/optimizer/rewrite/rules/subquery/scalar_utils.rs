@@ -542,8 +542,12 @@ pub(super) fn assert_true(
     )
 }
 
-pub(super) fn count_one_spec(arena: &mut ScalarArena) -> ScalarAggregateSpec {
+pub(super) fn count_one_spec(
+    arena: &mut ScalarArena,
+    output_column_id: ColumnId,
+) -> ScalarAggregateSpec {
     ScalarAggregateSpec {
+        output_column_id,
         name: "count".to_string(),
         args: vec![int_literal(arena, 1)],
         distinct: false,
@@ -551,8 +555,9 @@ pub(super) fn count_one_spec(arena: &mut ScalarArena) -> ScalarAggregateSpec {
     }
 }
 
-pub(super) fn any_value_spec(arg: ScalarId) -> ScalarAggregateSpec {
+pub(super) fn any_value_spec(arg: ScalarId, output_column_id: ColumnId) -> ScalarAggregateSpec {
     ScalarAggregateSpec {
+        output_column_id,
         name: "any_value".to_string(),
         args: vec![arg],
         distinct: false,

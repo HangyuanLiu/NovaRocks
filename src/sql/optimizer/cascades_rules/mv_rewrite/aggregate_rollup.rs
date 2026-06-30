@@ -187,14 +187,19 @@ mod tests {
     }
 
     /// Build an aggregate call over `args` with the given name/distinct.
-    fn agg(name: &str, args: Vec<TypedExpr>, distinct: bool) -> AggregateCall {
+    fn agg(
+        output_column_id: ColumnId,
+        name: &str,
+        args: Vec<TypedExpr>,
+        distinct: bool,
+    ) -> AggregateCall {
         AggregateCall {
             name: name.to_string(),
             args,
             distinct,
             result_type: DataType::Int64,
             order_by: vec![],
-            output_column_id: ColumnId::UNSET,
+            output_column_id,
         }
     }
 
@@ -246,10 +251,14 @@ mod tests {
             dim_out(&col(102, "b"), col_ref(&mv_b), &mut mv_arena),
             agg_out(
                 &mv_s,
-                agg("sum", vec![col_ref(&mv_v)], false),
+                agg(mv_s.column_id, "sum", vec![col_ref(&mv_v)], false),
                 &mut mv_arena,
             ),
-            agg_out(&mv_c, agg("count", vec![], false), &mut mv_arena),
+            agg_out(
+                &mv_c,
+                agg(mv_c.column_id, "count", vec![], false),
+                &mut mv_arena,
+            ),
         ];
 
         // query: SELECT a, sum(v), count(*) GROUP BY a (subset of {a, b}).
@@ -261,8 +270,13 @@ mod tests {
         let q_aggs = scalar_aggs(
             &mut q_arena,
             vec![
-                agg("sum", vec![col_ref(&q_v)], false),
-                agg("count", vec![], false),
+                agg(
+                    ColumnId::new_for_test(201),
+                    "sum",
+                    vec![col_ref(&q_v)],
+                    false,
+                ),
+                agg(ColumnId::new_for_test(202), "count", vec![], false),
             ],
         );
 
@@ -308,10 +322,14 @@ mod tests {
             dim_out(&col(101, "a"), col_ref(&mv_a), &mut mv_arena),
             agg_out(
                 &mv_s,
-                agg("sum", vec![col_ref(&mv_v)], false),
+                agg(mv_s.column_id, "sum", vec![col_ref(&mv_v)], false),
                 &mut mv_arena,
             ),
-            agg_out(&mv_c, agg("count", vec![], false), &mut mv_arena),
+            agg_out(
+                &mv_c,
+                agg(mv_c.column_id, "count", vec![], false),
+                &mut mv_arena,
+            ),
         ];
 
         // query: SELECT a, sum(v), count(*) GROUP BY a (== MV group-by).
@@ -323,8 +341,13 @@ mod tests {
         let q_aggs = scalar_aggs(
             &mut q_arena,
             vec![
-                agg("sum", vec![col_ref(&q_v)], false),
-                agg("count", vec![], false),
+                agg(
+                    ColumnId::new_for_test(211),
+                    "sum",
+                    vec![col_ref(&q_v)],
+                    false,
+                ),
+                agg(ColumnId::new_for_test(212), "count", vec![], false),
             ],
         );
 
@@ -368,7 +391,7 @@ mod tests {
             dim_out(&col(101, "a"), col_ref(&mv_a), &mut mv_arena),
             agg_out(
                 &mv_d,
-                agg("count", vec![col_ref(&mv_x)], true),
+                agg(mv_d.column_id, "count", vec![col_ref(&mv_x)], true),
                 &mut mv_arena,
             ),
         ];
@@ -379,7 +402,15 @@ mod tests {
         let q_names = names(&[(21, "a"), (24, "x")]);
         let mut q_arena = ScalarArena::new();
         let q_group_by = scalar_exprs(&mut q_arena, vec![col_ref(&q_a)]);
-        let q_aggs = scalar_aggs(&mut q_arena, vec![agg("count", vec![col_ref(&q_x)], true)]);
+        let q_aggs = scalar_aggs(
+            &mut q_arena,
+            vec![agg(
+                ColumnId::new_for_test(221),
+                "count",
+                vec![col_ref(&q_x)],
+                true,
+            )],
+        );
 
         assert!(
             plan_rollup(
@@ -415,7 +446,7 @@ mod tests {
             dim_out(&col(102, "b"), col_ref(&mv_b), &mut mv_arena),
             agg_out(
                 &mv_m,
-                agg("avg", vec![col_ref(&mv_v)], false),
+                agg(mv_m.column_id, "avg", vec![col_ref(&mv_v)], false),
                 &mut mv_arena,
             ),
         ];
@@ -426,7 +457,15 @@ mod tests {
         let q_names = names(&[(21, "a"), (23, "v")]);
         let mut q_arena = ScalarArena::new();
         let q_group_by_subset = scalar_exprs(&mut q_arena, vec![col_ref(&q_a)]);
-        let q_aggs = scalar_aggs(&mut q_arena, vec![agg("avg", vec![col_ref(&q_v)], false)]);
+        let q_aggs = scalar_aggs(
+            &mut q_arena,
+            vec![agg(
+                ColumnId::new_for_test(231),
+                "avg",
+                vec![col_ref(&q_v)],
+                false,
+            )],
+        );
         assert!(
             plan_rollup(
                 &q_group_by_subset,
@@ -476,7 +515,11 @@ mod tests {
         };
         let mv_outputs = vec![
             dim_out(&col(101, "a"), col_ref(&mv_a), &mut mv_arena),
-            agg_out(&mv_c, agg("count", vec![], false), &mut mv_arena),
+            agg_out(
+                &mv_c,
+                agg(mv_c.column_id, "count", vec![], false),
+                &mut mv_arena,
+            ),
         ];
 
         // query: SELECT count(*) with NO group-by (scalar). Group-by {} is a
@@ -484,7 +527,10 @@ mod tests {
         // is NULL where COUNT must be 0 -> needs_coalesce.
         let q_names = names(&[]);
         let mut q_arena = ScalarArena::new();
-        let q_aggs = scalar_aggs(&mut q_arena, vec![agg("count", vec![], false)]);
+        let q_aggs = scalar_aggs(
+            &mut q_arena,
+            vec![agg(ColumnId::new_for_test(241), "count", vec![], false)],
+        );
 
         let plan = plan_rollup(
             &[],

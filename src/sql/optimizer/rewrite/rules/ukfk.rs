@@ -940,12 +940,14 @@ mod tests {
         );
 
         let count_one = ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(9001),
             name: "count".to_string(),
             args: vec![one],
             distinct: false,
             order_by: vec![],
         };
         let count_null = ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(9002),
             name: "count".to_string(),
             args: vec![null],
             distinct: false,

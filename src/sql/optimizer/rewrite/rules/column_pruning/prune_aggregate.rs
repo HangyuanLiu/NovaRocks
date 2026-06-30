@@ -140,12 +140,14 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![
                     ScalarAggregateSpec {
+                        output_column_id: id_count_oc,
                         name: "count".to_string(),
                         args: vec![],
                         distinct: false,
                         order_by: vec![],
                     },
                     ScalarAggregateSpec {
+                        output_column_id: id_sum_oc,
                         name: "sum".to_string(),
                         args: vec![],
                         distinct: false,
@@ -184,6 +186,7 @@ mod tests {
                 stage: AggStage::Single,
                 group_by: vec![],
                 aggregates: vec![ScalarAggregateSpec {
+                    output_column_id: id_sum,
                     name: "sum".to_string(),
                     args: vec![],
                     distinct: false,

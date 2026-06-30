@@ -515,6 +515,7 @@ fn substitute_aggregate(
         return None;
     }
     Some(ScalarAggregateSpec {
+        output_column_id: call.output_column_id,
         name: call.name.clone(),
         args: call
             .args

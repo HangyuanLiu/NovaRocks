@@ -1357,12 +1357,14 @@ mod tests {
                 vec![col1],
                 vec![
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(301),
                         name: "count".to_string(),
                         args: vec![],
                         distinct: false,
                         order_by: vec![],
                     },
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(302),
                         name: "sum".to_string(),
                         args: vec![col2],
                         distinct: false,
@@ -1408,6 +1410,7 @@ mod tests {
             Operator::LogicalAggregate(LogicalAggregateOp::single(
                 vec![col1],
                 vec![ScalarAggregateSpec {
+                    output_column_id: ColumnId::new_for_test(301),
                     name: "sum".to_string(),
                     args: vec![col2],
                     distinct: false,

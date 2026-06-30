@@ -296,6 +296,7 @@ mod tests {
     fn make_agg(arena: &mut ScalarArena, input: OptExpr) -> OptExpr {
         let group_by = vec![intern_typed(arena, &col_typed_expr("a"))];
         let count_spec = ScalarAggregateSpec {
+            output_column_id: test_col_id("sum_b"),
             name: "sum".into(),
             args: vec![intern_typed(arena, &col_typed_expr("b"))],
             distinct: false,

@@ -7,7 +7,9 @@ use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::operator::{ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec};
+use crate::sql::optimizer::operator::{
+    AggregateOutputLayout, ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec,
+};
 use crate::sql::optimizer::scalar::{
     ColumnDisplay, HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey,
 };
@@ -104,7 +106,13 @@ pub(crate) fn intern_aggregate_call(
     arena: &mut ScalarArena,
     call: &AggregateCall,
 ) -> ScalarAggregateSpec {
+    assert!(
+        call.output_column_id != ColumnId::UNSET,
+        "AggregateCall {} must carry output_column_id before optimizer bridge",
+        call.name
+    );
     ScalarAggregateSpec {
+        output_column_id: call.output_column_id,
         name: call.name.clone(),
         args: intern_exprs(arena, &call.args),
         distinct: call.distinct,
@@ -122,38 +130,79 @@ pub(crate) fn intern_aggregate_calls(
         .collect()
 }
 
+fn aggregate_output_column<'a>(
+    call: &ScalarAggregateSpec,
+    output_layout: &'a AggregateOutputLayout,
+) -> &'a OutputColumn {
+    assert!(
+        call.output_column_id != ColumnId::UNSET,
+        "ScalarAggregateSpec {} must carry output_column_id before materialization",
+        call.name
+    );
+    let mut matches = output_layout
+        .aggregate_columns
+        .iter()
+        .filter(|column| column.column_id == call.output_column_id);
+    let Some(output_column) = matches.next() else {
+        panic!(
+            "aggregate output column id {} missing from AggregateOutputLayout.aggregate_columns",
+            call.output_column_id.0
+        );
+    };
+    assert!(
+        matches.next().is_none(),
+        "duplicate aggregate output column id {}",
+        call.output_column_id.0
+    );
+    output_column
+}
+
+pub(crate) fn aggregate_output_layout_from_legacy_outputs(
+    group_by_len: usize,
+    aggregate_len: usize,
+    output_columns: &[OutputColumn],
+) -> AggregateOutputLayout {
+    assert!(
+        output_columns.len() >= group_by_len + aggregate_len,
+        "aggregate output layout must be [group_by..., aggregates...]"
+    );
+    AggregateOutputLayout::new(
+        output_columns[..group_by_len].to_vec(),
+        output_columns[group_by_len..group_by_len + aggregate_len].to_vec(),
+    )
+}
+
 pub(crate) fn materialize_aggregate_call(
     arena: &ScalarArena,
     call: &ScalarAggregateSpec,
-    output_column: Option<&OutputColumn>,
+    output_layout: &AggregateOutputLayout,
 ) -> AggregateCall {
-    let output_column =
-        output_column.expect("aggregate ScalarId bridge requires output column metadata");
+    let output_column = aggregate_output_column(call, output_layout);
     AggregateCall {
         name: call.name.clone(),
         args: materialize_exprs(arena, &call.args),
         distinct: call.distinct,
         result_type: output_column.data_type.clone(),
         order_by: materialize_sort_keys(arena, &call.order_by),
-        output_column_id: output_column.column_id,
+        output_column_id: call.output_column_id,
     }
 }
 
 pub(crate) fn materialize_aggregate_calls(
     arena: &ScalarArena,
     calls: &[ScalarAggregateSpec],
-    group_by_len: usize,
-    output_columns: &[OutputColumn],
+    output_layout: &AggregateOutputLayout,
 ) -> Vec<AggregateCall> {
-    assert!(
-        output_columns.len() >= group_by_len + calls.len(),
-        "aggregate output layout must be [group_by..., aggregates...]"
-    );
+    let mut seen = std::collections::HashSet::new();
     calls
         .iter()
-        .enumerate()
-        .map(|(idx, call)| {
-            materialize_aggregate_call(arena, call, output_columns.get(group_by_len + idx))
+        .map(|call| {
+            assert!(
+                seen.insert(call.output_column_id),
+                "duplicate ScalarAggregateSpec output_column_id {}",
+                call.output_column_id.0
+            );
+            materialize_aggregate_call(arena, call, output_layout)
         })
         .collect()
 }
@@ -292,6 +341,37 @@ mod tests {
         }
     }
 
+    fn aggregate_call(output_column_id: ColumnId, name: &str) -> AggregateCall {
+        AggregateCall {
+            name: name.to_string(),
+            args: vec![],
+            distinct: false,
+            result_type: DataType::Int64,
+            order_by: vec![],
+            output_column_id,
+        }
+    }
+
+    fn aggregate_spec(output_column_id: ColumnId, name: &str) -> ScalarAggregateSpec {
+        ScalarAggregateSpec {
+            output_column_id,
+            name: name.to_string(),
+            args: vec![],
+            distinct: false,
+            order_by: vec![],
+        }
+    }
+
+    fn aggregate_output_column(id: ColumnId, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: id,
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
     fn output_column(id: ColumnId, name: &str, data_type: DataType) -> OutputColumn {
         OutputColumn {
             column_id: id,
@@ -313,6 +393,115 @@ mod tests {
             window_frame: None,
             ignore_nulls: false,
         }
+    }
+
+    #[test]
+    fn intern_aggregate_call_preserves_output_column_id() {
+        let output_id = ColumnId::new_for_test(701);
+        let mut arena = ScalarArena::new();
+
+        let spec = intern_aggregate_call(&mut arena, &aggregate_call(output_id, "sum"));
+
+        assert_eq!(spec.output_column_id, output_id);
+        assert_eq!(spec.name, "sum");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "AggregateCall sum must carry output_column_id before optimizer bridge"
+    )]
+    fn intern_aggregate_call_rejects_unset_output_column_id() {
+        let mut arena = ScalarArena::new();
+
+        let _ = intern_aggregate_call(&mut arena, &aggregate_call(ColumnId::UNSET, "sum"));
+    }
+
+    #[test]
+    fn materialize_aggregate_calls_matches_outputs_by_id_not_position() {
+        let id_sum = ColumnId::new_for_test(801);
+        let id_count = ColumnId::new_for_test(802);
+        let layout = AggregateOutputLayout::new(
+            vec![],
+            vec![
+                aggregate_output_column(id_count, "count_b"),
+                aggregate_output_column(id_sum, "sum_a"),
+            ],
+        );
+        let arena = ScalarArena::new();
+
+        let calls = materialize_aggregate_calls(
+            &arena,
+            &[
+                aggregate_spec(id_sum, "sum"),
+                aggregate_spec(id_count, "count"),
+            ],
+            &layout,
+        );
+
+        assert_eq!(calls[0].output_column_id, id_sum);
+        assert_eq!(calls[0].result_type, DataType::Int64);
+        assert_eq!(calls[1].output_column_id, id_count);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "aggregate output column id 803 missing from AggregateOutputLayout.aggregate_columns"
+    )]
+    fn materialize_aggregate_calls_rejects_missing_output_id() {
+        let missing_id = ColumnId::new_for_test(803);
+        let layout = AggregateOutputLayout::new(vec![], vec![]);
+        let arena = ScalarArena::new();
+
+        let _ = materialize_aggregate_calls(&arena, &[aggregate_spec(missing_id, "sum")], &layout);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate aggregate output column id 804")]
+    fn materialize_aggregate_calls_rejects_duplicate_output_id() {
+        let duplicate_id = ColumnId::new_for_test(804);
+        let layout = AggregateOutputLayout::new(
+            vec![],
+            vec![
+                aggregate_output_column(duplicate_id, "sum_a"),
+                aggregate_output_column(duplicate_id, "sum_a_duplicate"),
+            ],
+        );
+        let arena = ScalarArena::new();
+
+        let _ =
+            materialize_aggregate_calls(&arena, &[aggregate_spec(duplicate_id, "sum")], &layout);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate ScalarAggregateSpec output_column_id 806")]
+    fn materialize_aggregate_calls_rejects_duplicate_spec_output_id() {
+        let duplicate_id = ColumnId::new_for_test(806);
+        let layout = AggregateOutputLayout::new(
+            vec![],
+            vec![aggregate_output_column(duplicate_id, "sum_a")],
+        );
+        let arena = ScalarArena::new();
+
+        let _ = materialize_aggregate_calls(
+            &arena,
+            &[
+                aggregate_spec(duplicate_id, "sum"),
+                aggregate_spec(duplicate_id, "count"),
+            ],
+            &layout,
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ScalarAggregateSpec sum must carry output_column_id before materialization"
+    )]
+    fn materialize_aggregate_calls_rejects_unset_output_id() {
+        let layout = AggregateOutputLayout::new(vec![], vec![]);
+        let arena = ScalarArena::new();
+
+        let _ =
+            materialize_aggregate_calls(&arena, &[aggregate_spec(ColumnId::UNSET, "sum")], &layout);
     }
 
     #[test]

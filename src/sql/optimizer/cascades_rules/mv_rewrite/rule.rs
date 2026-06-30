@@ -306,9 +306,11 @@ fn try_rewrite(
                     let aggregates = plan
                         .items
                         .iter()
-                        .map(|item| {
+                        .enumerate()
+                        .map(|(idx, item)| {
                             let mv_col = agg_cols[item.mv_output_index].clone()?;
                             Some(ScalarAggregateSpec {
+                                output_column_id: agg_outputs[n_keys + idx].column_id,
                                 name: item.rollup_fn.to_string(),
                                 args: vec![column_ref(&mut memo.scalars, &mv_col)],
                                 distinct: false,
@@ -399,6 +401,7 @@ fn rewrite_aggregate_to_mv(
     query_base_names: &std::collections::HashMap<crate::sql::column_id::ColumnId, String>,
 ) -> Option<ScalarAggregateSpec> {
     Some(ScalarAggregateSpec {
+        output_column_id: call.output_column_id,
         name: call.name.clone(),
         args: call
             .args

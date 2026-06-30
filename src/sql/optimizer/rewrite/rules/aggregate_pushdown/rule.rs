@@ -206,6 +206,7 @@ mod tests {
         let gb_id = intern_typed(&mut arena, &col_typed("k"));
         let sum_arg = intern_typed(&mut arena, &col_typed("v"));
         let sum_spec = ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(9001),
             name: "sum".into(),
             args: vec![sum_arg],
             distinct: false,

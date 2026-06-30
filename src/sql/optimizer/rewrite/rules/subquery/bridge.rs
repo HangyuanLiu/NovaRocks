@@ -11,8 +11,8 @@ use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::optimizer_bridge::scalar::materialize;
 use crate::sql::planner::optimizer_bridge::scalar::{
-    materialize_aggregate_call, materialize_exprs, materialize_project_items,
-    materialize_sort_keys, materialize_window_exprs,
+    aggregate_output_layout_from_legacy_outputs, materialize_aggregate_call, materialize_exprs,
+    materialize_project_items, materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::planner::plan::{
     LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalApplyNode,
@@ -61,13 +61,15 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
         Operator::LogicalAggregate(op) => {
             let group_by = materialize_exprs(arena, &op.group_by);
             let group_by_len = op.group_by.len();
+            let output_layout = aggregate_output_layout_from_legacy_outputs(
+                group_by_len,
+                op.aggregates.len(),
+                &op.output_columns,
+            );
             let aggregates = op
                 .aggregates
                 .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    materialize_aggregate_call(arena, a, op.output_columns.get(group_by_len + i))
-                })
+                .map(|a| materialize_aggregate_call(arena, a, &output_layout))
                 .collect();
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by,

@@ -2466,12 +2466,14 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(201),
                         name: "sum".to_string(),
                         args: vec![a_mul_b],
                         distinct: false,
                         order_by: vec![],
                     },
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(202),
                         name: "avg".to_string(),
                         args: vec![a_mul_b],
                         distinct: false,
@@ -2560,12 +2562,14 @@ mod tests {
                 group_by: vec![a, grouping],
                 aggregates: vec![
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(201),
                         name: "sum".to_string(),
                         args: vec![a_plus_b],
                         distinct: false,
                         order_by: vec![],
                     },
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(202),
                         name: "avg".to_string(),
                         args: vec![a_plus_b],
                         distinct: false,
@@ -2623,12 +2627,14 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(201),
                         name: "sum".to_string(),
                         args: vec![a_mul_b],
                         distinct: false,
                         order_by: vec![],
                     },
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(202),
                         name: "avg".to_string(),
                         args: vec![a_mul_b],
                         distinct: false,
@@ -2671,12 +2677,14 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(201),
                         name: "array_agg".to_string(),
                         args: vec![a],
                         distinct: false,
                         order_by: vec![sort_key(a_mul_b)],
                     },
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(202),
                         name: "array_agg".to_string(),
                         args: vec![b],
                         distinct: false,

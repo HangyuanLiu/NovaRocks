@@ -551,7 +551,8 @@ mod tests {
     use crate::sql::optimizer::operator::{AggMode, LogicalAggregateOp, ScanOp};
     use crate::sql::planner::optimizer_bridge::scalar::materialize;
     use crate::sql::planner::optimizer_bridge::scalar::{
-        intern_aggregate_calls, intern_exprs, materialize_aggregate_calls,
+        aggregate_output_layout_from_legacy_outputs, intern_aggregate_calls, intern_exprs,
+        materialize_aggregate_calls,
     };
     use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
@@ -565,6 +566,12 @@ mod tests {
             "g" => ColumnId::new_for_test(4),
             "name" => ColumnId::new_for_test(5),
             "id" => ColumnId::new_for_test(6),
+            "count_distinct_x" => ColumnId::new_for_test(101),
+            "count_distinct_a" => ColumnId::new_for_test(102),
+            "count_distinct_b" => ColumnId::new_for_test(103),
+            "count_distinct_name" => ColumnId::new_for_test(104),
+            "array_agg_distinct_x" => ColumnId::new_for_test(105),
+            "sum_a" => ColumnId::new_for_test(106),
             _ => ColumnId::new_for_test(100),
         }
     }
@@ -641,7 +648,7 @@ mod tests {
             distinct: true,
             result_type: DataType::Int64,
             order_by: vec![],
-            output_column_id: ColumnId::UNSET,
+            output_column_id: test_col_id(&format!("count_distinct_{arg_name}")),
         }
     }
 
@@ -656,7 +663,7 @@ mod tests {
                 true,
             ))),
             order_by: vec![],
-            output_column_id: ColumnId::UNSET,
+            output_column_id: test_col_id(&format!("array_agg_distinct_{arg_name}")),
         }
     }
 
@@ -667,7 +674,7 @@ mod tests {
             distinct: false,
             result_type: DataType::Int64,
             order_by: vec![],
-            output_column_id: ColumnId::UNSET,
+            output_column_id: test_col_id(&format!("sum_{arg_name}")),
         }
     }
 
@@ -719,15 +726,15 @@ mod tests {
     }
 
     fn aggregate_call_output_ids(memo: &Memo, op: &PhysicalHashAggregateOp) -> Vec<ColumnId> {
-        materialize_aggregate_calls(
-            &memo.scalars,
-            &op.aggregates,
+        let output_layout = aggregate_output_layout_from_legacy_outputs(
             op.group_by.len(),
+            op.aggregates.len(),
             &op.output_columns,
-        )
-        .iter()
-        .map(|call| call.output_column_id)
-        .collect()
+        );
+        materialize_aggregate_calls(&memo.scalars, &op.aggregates, &output_layout)
+            .iter()
+            .map(|call| call.output_column_id)
+            .collect()
     }
 
     fn assert_hash_aggregate_layout(memo: &Memo, op: &PhysicalHashAggregateOp) {
@@ -780,7 +787,7 @@ mod tests {
             distinct: true,
             result_type: DataType::Int64,
             order_by: vec![],
-            output_column_id: ColumnId::UNSET,
+            output_column_id: fallback_output_id(0),
         };
         let id = memo.next_expr_id();
         let mexpr = MExpr {
@@ -834,7 +841,7 @@ mod tests {
                             asc: true,
                             nulls_first: true,
                         }],
-                        output_column_id: ColumnId::UNSET,
+                        output_column_id: fallback_output_id(1),
                     },
                     count_distinct("name"),
                 ],
@@ -863,7 +870,7 @@ mod tests {
                         distinct: false,
                         result_type: DataType::Int64,
                         order_by: vec![],
-                        output_column_id: ColumnId::UNSET,
+                        output_column_id: fallback_output_id(1),
                     },
                 ],
                 vec![],
@@ -897,7 +904,7 @@ mod tests {
                         asc: true,
                         nulls_first: true,
                     }],
-                    output_column_id: ColumnId::UNSET,
+                    output_column_id: fallback_output_id(1),
                 }],
                 vec![],
             )),
@@ -915,7 +922,7 @@ mod tests {
             distinct: true,
             result_type: DataType::Int64,
             order_by: vec![],
-            output_column_id: ColumnId::UNSET,
+            output_column_id: fallback_output_id(1),
         };
         let mut memo = Memo::new();
         let calls =

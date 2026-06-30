@@ -112,13 +112,15 @@ pub(crate) fn rewrite(
             .iter()
             .enumerate()
             .map(|(idx, spec)| {
-                let partial_spec = ScalarAggregateSpec {
-                    name: partial_fn_name(&spec.name),
-                    args: spec.args.clone(),
-                    distinct: false,
-                    order_by: vec![],
-                };
-                let display_name = agg_spec_display_name(&partial_spec, arena);
+                let partial_name = partial_fn_name(&spec.name);
+                let partial_args = spec.args.clone();
+                let display_name = scalar_expr::aggregate_display_name(
+                    arena,
+                    &partial_name,
+                    &partial_args,
+                    false,
+                    &[],
+                );
                 // Result type comes from the original aggregate's output column.
                 let result_type = original
                     .output_columns
@@ -135,6 +137,13 @@ pub(crate) fn rewrite(
                     result_type.clone(),
                     true,
                 );
+                let partial_spec = ScalarAggregateSpec {
+                    output_column_id: partial_col_id,
+                    name: partial_name,
+                    args: partial_args,
+                    distinct: false,
+                    order_by: vec![],
+                };
                 let output_col = OutputColumn {
                     column_id: partial_col_id,
                     name: display_name,
@@ -204,7 +213,7 @@ pub(crate) fn rewrite(
 
     // 4. Rewrite top-level aggregate specs to reference partial outputs.
     //    The final aggregate's args are ColumnRefs into the partial output cols.
-    let final_specs: Vec<ScalarAggregateSpec> = original
+    let mut final_specs: Vec<ScalarAggregateSpec> = original
         .aggregates
         .iter()
         .zip(partial_agg_output_cols.iter())
@@ -217,6 +226,7 @@ pub(crate) fn rewrite(
                 pc.nullable,
             );
             ScalarAggregateSpec {
+                output_column_id: orig_spec.output_column_id,
                 name: final_fn_name(&orig_spec.name),
                 args: vec![arg_id],
                 distinct: false,
@@ -265,6 +275,12 @@ pub(crate) fn rewrite(
         });
     }
     final_output_cols.extend(final_agg_output_cols);
+    for (spec, output_col) in final_specs
+        .iter_mut()
+        .zip(final_output_cols[group_by_len..].iter())
+    {
+        spec.output_column_id = output_col.column_id;
+    }
 
     let is_merge_final = vec![false; final_specs.len()];
     let final_aggregate = OptExpr::new(
@@ -515,6 +531,7 @@ mod tests {
     fn count_spec(col: &str, arena: &mut ScalarArena) -> ScalarAggregateSpec {
         let arg = col_ref_typed(col, DataType::Int64);
         ScalarAggregateSpec {
+            output_column_id: test_col_id(&format!("count({col})")),
             name: "count".into(),
             args: vec![intern_typed(arena, &arg)],
             distinct: false,
@@ -525,6 +542,7 @@ mod tests {
     fn sum_spec(col: &str, arena: &mut ScalarArena) -> ScalarAggregateSpec {
         let arg = col_ref_typed(col, DataType::Int64);
         ScalarAggregateSpec {
+            output_column_id: test_col_id(&format!("sum({col})")),
             name: "sum".into(),
             args: vec![intern_typed(arena, &arg)],
             distinct: false,
@@ -737,6 +755,7 @@ mod tests {
             &qualified_col("t1", "c_key", c_key, DataType::Int32),
         );
         let sum = ScalarAggregateSpec {
+            output_column_id: c_key,
             name: "sum".into(),
             args: vec![sum_arg],
             distinct: false,
@@ -878,6 +897,7 @@ mod tests {
             &qualified_col("cs", "cs_sales_price", sales_price, DataType::Int64),
         );
         let sum = ScalarAggregateSpec {
+            output_column_id: sales_price,
             name: "sum".into(),
             args: vec![sum_arg],
             distinct: false,
@@ -988,6 +1008,7 @@ mod tests {
             &qualified_col("t1", "c_key", c_key, DataType::Int32),
         );
         let count_spec = ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(9003),
             name: "count".into(),
             args: vec![count_arg],
             distinct: false,

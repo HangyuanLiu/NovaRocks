@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 use crate::sql::codegen::scalar_materialize::{
-    materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
-    materialize_sort_keys, materialize_window_exprs,
+    aggregate_output_layout_from_legacy_outputs, materialize, materialize_aggregate_calls,
+    materialize_exprs, materialize_project_items, materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
@@ -198,12 +198,12 @@ fn verify_hash_aggregate(
     for expr in &group_by {
         verify_expr(expr, input, "PhysicalHashAggregate group-by")?;
     }
-    let aggregates = materialize_aggregate_calls(
-        scalars,
-        &op.aggregates,
+    let output_layout = aggregate_output_layout_from_legacy_outputs(
         op.group_by.len(),
+        op.aggregates.len(),
         &op.output_columns,
     );
+    let aggregates = materialize_aggregate_calls(scalars, &op.aggregates, &output_layout);
     for (idx, aggregate) in aggregates.iter().enumerate() {
         if !op.is_merge.get(idx).copied().unwrap_or(false) {
             for arg in &aggregate.args {
