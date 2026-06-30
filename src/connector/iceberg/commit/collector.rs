@@ -418,7 +418,10 @@ impl IcebergCommitCollector {
         let partition_descriptor =
             crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(
                 df.partition_values_descriptor,
-            );
+            )
+            .map_err(|e| {
+                crate::common::engine_error::EngineError::from(e).to_bracketed_user_message()
+            })?;
         let partition_values =
             crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
                 partition_descriptor,

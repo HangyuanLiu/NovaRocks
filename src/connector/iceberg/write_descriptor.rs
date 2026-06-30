@@ -788,7 +788,8 @@ mod tests {
         };
 
         let decoded = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
+            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+                .expect("wire descriptor"),
             spec_id,
             &metadata,
         )
@@ -814,7 +815,8 @@ mod tests {
             };
 
             let err = decode_partition_descriptor(
-                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
+                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+                    .expect("wire descriptor"),
                 spec_id,
                 &metadata,
             )
@@ -841,7 +843,8 @@ mod tests {
             };
 
             let err = decode_partition_descriptor(
-                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
+                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+                    .expect("wire descriptor"),
                 spec_id,
                 &metadata,
             )
@@ -882,7 +885,8 @@ mod tests {
         };
 
         let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
+            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+                .expect("wire descriptor"),
             spec_id,
             &metadata,
         )
@@ -918,7 +922,8 @@ mod tests {
         };
 
         let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
+            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+                .expect("wire descriptor"),
             spec_id,
             &metadata,
         )
@@ -940,7 +945,8 @@ mod tests {
         };
 
         let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
+            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+                .expect("wire descriptor"),
             spec_id,
             &metadata,
         )
@@ -954,9 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_descriptor_defaults_missing_null_marker_to_non_null() {
-        let metadata = metadata_with_identity_partition();
-        let spec_id = metadata.default_partition_spec_id();
+    fn descriptor_rejects_missing_null_marker() {
         let desc = crate::thrift::types::TIcebergPartitionDescriptor {
             values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
                 is_null: None,
@@ -964,18 +968,13 @@ mod tests {
             }]),
         };
 
-        let decoded = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
-            spec_id,
-            &metadata,
-        )
-        .expect("decode missing null marker default");
+        let err = crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+            .expect_err("expected missing null marker");
 
-        assert_eq!(
-            decoded,
-            Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::String(
-                "west".to_string()
-            )))])
+        assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+        assert!(
+            err.to_string().contains("null marker"),
+            "missing null marker should be rejected, got: {err}"
         );
     }
 
@@ -992,7 +991,8 @@ mod tests {
             };
 
             let err = decode_partition_descriptor(
-                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
+                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+                    .expect("wire descriptor"),
                 spec_id,
                 &metadata,
             )
@@ -1018,7 +1018,8 @@ mod tests {
         };
 
         let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
+            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+                .expect("wire descriptor"),
             spec_id,
             &metadata,
         )
@@ -1043,7 +1044,8 @@ mod tests {
         };
 
         let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
+            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+                .expect("wire descriptor"),
             spec_id,
             &metadata,
         )
@@ -1105,7 +1107,8 @@ mod tests {
             };
 
             let err = decode_partition_descriptor(
-                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
+                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+                    .expect("wire descriptor"),
                 spec_id,
                 &metadata,
             )
@@ -1138,7 +1141,8 @@ mod tests {
         };
 
         let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
+            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+                .expect("wire descriptor"),
             99,
             &metadata,
         )
@@ -1159,7 +1163,8 @@ mod tests {
         };
 
         let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc)),
+            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
+                .expect("wire descriptor"),
             spec_id,
             &metadata,
         )

@@ -69,6 +69,7 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/engine/write_transaction.rs": BaselineEntry("domain-leak", "B2", 0, "Standalone write transaction still shares thrift sink-commit payload handling"),
     "src/engine/insert_flow.rs": BaselineEntry("domain-leak", "B2", 2, "Standalone insert flow still shares thrift sink-commit payload handling"),
     "src/runtime/sink_commit.rs": BaselineEntry("legal-boundary", "B2-wire", 4, "Runtime sink commit is the wire boundary for sink commit reports"),
+    "src/runtime/sink_commit_wire.rs": BaselineEntry("legal-boundary", "B2-wire", 4, "Runtime sink commit wire adapter converts partition descriptors to and from thrift payloads"),
     "src/runtime/write_coordinator.rs": BaselineEntry("legal-boundary", "B2-wire", 3, "Runtime write coordinator transports sink commit control-plane payloads"),
     "src/runtime/write_operation_lifecycle.rs": BaselineEntry("legal-boundary", "B2-wire", 1, "Runtime write lifecycle transports sink commit control-plane payloads"),
     "src/exec/runtime_filter/min_max.rs": BaselineEntry("domain-leak", "B3", 0, "Runtime min/max filter uses RuntimeFilterType internally"),

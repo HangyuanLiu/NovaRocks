@@ -2791,7 +2791,8 @@ mod tests {
         let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
             crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(
                 data_file.partition_values_descriptor.clone(),
-            ),
+            )
+            .expect("wire descriptor"),
             data_file
                 .partition_spec_id
                 .expect("writer report partition spec id"),
@@ -3214,7 +3215,8 @@ mod tests {
         let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
             crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(
                 data_file.partition_values_descriptor.clone(),
-            ),
+            )
+            .expect("wire descriptor"),
             data_file
                 .partition_spec_id
                 .expect("writer report partition spec id"),
@@ -3366,7 +3368,8 @@ mod tests {
         assert_eq!(reports[1].1, old_spec_id);
         for (_, spec_id, descriptor) in reports {
             crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
-                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(descriptor),
+                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(descriptor)
+                    .expect("wire descriptor"),
                 spec_id,
                 &target_metadata,
             )
@@ -3574,7 +3577,8 @@ mod tests {
         let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
             crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(
                 data_file.partition_values_descriptor.clone(),
-            ),
+            )
+            .expect("wire descriptor"),
             data_file
                 .partition_spec_id
                 .expect("writer report partition spec id"),
