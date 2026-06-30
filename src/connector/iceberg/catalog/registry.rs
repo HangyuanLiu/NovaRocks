@@ -1552,10 +1552,11 @@ pub(crate) fn build_catalog_entry(
         let (bucket, _root_prefix) =
             crate::connector::iceberg::catalog::add_files::parse_s3_path(&raw_warehouse)
                 .map_err(|e| format!("parse warehouse URI: {e}"))?;
-        let credentials = object_store_credentials_from_props(&props).map_err(|_| {
-            "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
-                .to_string()
-        })?;
+        let credentials =
+            optional_object_store_credentials_from_props(&props)?.ok_or_else(|| {
+                "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
+                    .to_string()
+            })?;
         let cfg = object_store_config_from_credentials(credentials, &bucket);
         // S3 warehouse: keep URI as-is, use a temp local path for metadata cache
         let cache_dir = std::env::temp_dir()
@@ -1613,16 +1614,7 @@ fn optional_object_store_config_from_props(
     props: &HashMap<String, String>,
     warehouse: &str,
 ) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String> {
-    let props_map: BTreeMap<String, String> = props
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    let Some(credentials) =
-        crate::fs::object_store_credentials::ObjectStoreCredentials::optional_from_aws_s3_properties(
-            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
-            &props_map,
-        )?
-    else {
+    let Some(credentials) = optional_object_store_credentials_from_props(props)? else {
         return Ok(None);
     };
     let bucket = warehouse
@@ -1638,14 +1630,14 @@ fn optional_object_store_config_from_props(
     )))
 }
 
-fn object_store_credentials_from_props(
+fn optional_object_store_credentials_from_props(
     props: &HashMap<String, String>,
-) -> Result<crate::fs::object_store_credentials::ObjectStoreCredentials, String> {
+) -> Result<Option<crate::fs::object_store_credentials::ObjectStoreCredentials>, String> {
     let props_map: BTreeMap<String, String> = props
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    crate::fs::object_store_credentials::ObjectStoreCredentials::from_aws_s3_properties(
+    crate::fs::object_store_credentials::ObjectStoreCredentials::optional_from_aws_s3_properties(
         crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
         &props_map,
     )
@@ -3795,6 +3787,34 @@ mod rest_catalog_tests {
         assert_eq!(cfg.retry_max_delay_ms, Some(34));
         assert_eq!(cfg.timeout_ms, Some(5678));
         assert_eq!(cfg.io_timeout_ms, Some(8765));
+    }
+
+    #[test]
+    fn build_catalog_entry_s3_warehouse_rejects_invalid_present_s3_bool() {
+        let err = build_catalog_entry(
+            "ice_s3",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    "s3://bucket-a/warehouse".to_string(),
+                ),
+                (
+                    "aws.s3.endpoint_url".to_string(),
+                    "http://localhost:9000".to_string(),
+                ),
+                ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+                ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+                (
+                    "aws.s3.enable_path_style_access".to_string(),
+                    "maybe".to_string(),
+                ),
+            ],
+        )
+        .map(|_| ())
+        .expect_err("invalid present bool should be rejected");
+
+        assert!(err.contains("invalid boolean value: maybe"), "{err}");
     }
 
     #[test]
