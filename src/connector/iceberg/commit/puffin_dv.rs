@@ -415,7 +415,50 @@ pub async fn read_deletion_vector_puffin(
         .await
         .with_context(|| format!("failed to read Puffin deletion vector byte range: {path}"))?;
 
-    DeletionVector::from_iceberg_payload(payload.as_ref())
+    decode_deletion_vector_payload(payload.as_ref())
+}
+
+pub(crate) fn decode_deletion_vector_payload(payload: &[u8]) -> Result<DeletionVector> {
+    DeletionVector::from_iceberg_payload(payload)
+}
+
+pub async fn read_deletion_vector_puffin_with_range_reader(
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    path: &str,
+    content_offset: i64,
+    content_size_in_bytes: i64,
+) -> Result<DeletionVector> {
+    ensure!(
+        content_offset >= 0,
+        "Puffin deletion vector content offset must be non-negative"
+    );
+    ensure!(
+        content_size_in_bytes >= 0,
+        "Puffin deletion vector content size must be non-negative"
+    );
+
+    let start = u64::try_from(content_offset).context("invalid Puffin content offset")?;
+    let size =
+        u64::try_from(content_size_in_bytes).context("invalid Puffin content size in bytes")?;
+    let end = start
+        .checked_add(size)
+        .context("Puffin deletion vector byte range overflows u64")?;
+    let read_payload = || -> Result<Bytes> {
+        let reader = factory
+            .open(path)
+            .with_context(|| format!("failed to open Puffin input file reader: {path}"))?;
+        reader
+            .read_remote_range(start, end)
+            .with_context(|| format!("failed to read Puffin deletion vector byte range: {path}"))
+    };
+    let payload = std::thread::scope(|scope| {
+        scope
+            .spawn(read_payload)
+            .join()
+            .map_err(|_| anyhow!("Puffin deletion vector range reader thread panicked"))
+    })??;
+
+    decode_deletion_vector_payload(payload.as_ref())
 }
 
 #[cfg(test)]
@@ -423,6 +466,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
     use iceberg::io::{FileIO, LocalFsStorageFactory};
 
     struct TestFsFileIOBuilder {
@@ -486,6 +530,11 @@ mod tests {
             err.contains(expected),
             "expected error containing {expected:?}, got {err:?}"
         );
+    }
+
+    fn factory_for_dir(dir: &std::path::Path) -> OpendalRangeReaderFactory {
+        let op = build_fs_operator(dir.to_str().expect("utf8 dir")).expect("fs operator");
+        OpendalRangeReaderFactory::from_operator(op).expect("reader factory")
     }
 
     async fn read_puffin_footer_metadata(
@@ -572,6 +621,35 @@ mod tests {
         let decoded = read_deletion_vector_puffin(
             &file_io,
             &written.path,
+            written.content_offset,
+            written.content_size_in_bytes,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(decoded, dv);
+    }
+
+    #[tokio::test]
+    async fn single_blob_puffin_round_trips_through_range_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_io = iceberg::io::FileIOBuilder::new_fs_io()
+            .with_root(dir.path().to_str().unwrap())
+            .build();
+        let path = format!("{}/dv-range.puffin", dir.path().to_str().unwrap());
+        let referenced_data_file = "file:///warehouse/t/data/data-1.parquet";
+        let mut dv = DeletionVector::new();
+        dv.insert(2).unwrap();
+        dv.insert(u32::MAX as u64 + 7).unwrap();
+
+        let written =
+            write_single_deletion_vector_puffin(&file_io, &path, referenced_data_file, &dv)
+                .await
+                .unwrap();
+
+        let decoded = read_deletion_vector_puffin_with_range_reader(
+            &factory_for_dir(dir.path()),
+            "dv-range.puffin",
             written.content_offset,
             written.content_size_in_bytes,
         )
@@ -723,6 +801,14 @@ mod tests {
         payload[..4].copy_from_slice(&1u32.to_be_bytes());
 
         assert_payload_error_contains(&payload, "length mismatch");
+    }
+
+    #[test]
+    fn decode_deletion_vector_payload_rejects_invalid_payload() {
+        let err = decode_deletion_vector_payload(b"not-a-dv")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too short"));
     }
 
     #[test]

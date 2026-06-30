@@ -134,7 +134,6 @@ pub(crate) fn build_delta_source_files(
             crate::connector::iceberg::scan_deletes::scan_deletes_with_base_row_id_lookup_and_path_normalizer(
                 &batch.deletes,
                 &factory,
-                input.loaded.table.file_io(),
                 size_lookup,
                 lineage_lookup,
                 &deleted_data_file_paths,

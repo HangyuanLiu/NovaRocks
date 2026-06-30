@@ -88,10 +88,6 @@ pub(crate) fn lower_iceberg_delta_scan_node(
             object_store_config.as_ref(),
         )?,
     );
-    let file_io = crate::connector::iceberg::changes::file_io_for_table_location(
-        &table_payload.table_location,
-        object_store_config.as_ref(),
-    )?;
     let delete_side =
         build_delete_side_from_payload(delete_side_payload, object_store_config.as_ref())?;
 
@@ -123,7 +119,6 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         iceberg_runtime: Arc::new(IcebergRuntimeHandles {
             table: table_payload,
             object_store_factory,
-            file_io,
             delete_side,
         }),
         node_id: node.node_id,

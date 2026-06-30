@@ -738,7 +738,6 @@ fn open_position_delete_scanner(
         &delete_side.deleted_data_file_paths,
         &delete_side.previously_deleted_positions_per_file,
         node.iceberg_runtime.object_store_factory.as_ref(),
-        &node.iceberg_runtime.file_io,
         node.object_store_config.as_ref(),
         expected_bucket.as_deref(),
     )?;

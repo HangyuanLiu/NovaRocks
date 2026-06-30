@@ -678,9 +678,9 @@ where
 /// input must be split by the caller (`scan_deletes` handles this).
 pub(crate) async fn read_dv_positions_per_data_file(
     delete_files: &[PositionDeleteRef],
-    file_io: &iceberg::io::FileIO,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
 ) -> Result<HashMap<String, RoaringTreemap>, ChangeError> {
-    use crate::connector::iceberg::commit::read_deletion_vector_puffin;
+    use crate::connector::iceberg::commit::read_deletion_vector_puffin_with_range_reader;
     use iceberg::spec::DataFileFormat;
 
     let mut out: HashMap<String, RoaringTreemap> = HashMap::new();
@@ -700,14 +700,19 @@ pub(crate) async fn read_dv_positions_per_data_file(
         })?;
         let offset = r.content_offset.expect("invariant-checked");
         let length = r.content_size_in_bytes.expect("invariant-checked");
-        let dv = read_deletion_vector_puffin(file_io, &r.delete_file_path, offset, length)
-            .await
-            .map_err(|e| {
-                ChangeError::InternalInconsistency(format!(
-                    "read Puffin DV {}: {e}",
-                    r.delete_file_path
-                ))
-            })?;
+        let dv = read_deletion_vector_puffin_with_range_reader(
+            factory,
+            &r.delete_file_path,
+            offset,
+            length,
+        )
+        .await
+        .map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "read Puffin DV {}: {e}",
+                r.delete_file_path
+            ))
+        })?;
         let treemap = dv.to_roaring_treemap();
         *out.entry(referenced.clone()).or_default() |= treemap;
     }
@@ -829,15 +834,13 @@ where
         delete_file_path_normalizer,
     )?;
     if !puffin_dels.is_empty() {
-        let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(
-            &puffin_dels,
-            table.file_io(),
-        ))
-        .map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "previously_deleted_positions: block_on_dv_read: {e}"
-            ))
-        })??;
+        let puffin_dels = normalize_delete_file_paths(&puffin_dels, delete_file_path_normalizer)?;
+        let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(&puffin_dels, factory))
+            .map_err(|e| {
+                ChangeError::InternalInconsistency(format!(
+                    "previously_deleted_positions: block_on_dv_read: {e}"
+                ))
+            })??;
         for (raw_path, treemap) in dv_positions {
             *positions_per_file.entry(raw_path).or_default() |= treemap;
         }
@@ -877,7 +880,6 @@ where
 pub(crate) fn scan_deletes<F>(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    file_io: &iceberg::io::FileIO,
     data_file_size_lookup: F,
 ) -> Result<Vec<RecordBatch>, ChangeError>
 where
@@ -886,7 +888,6 @@ where
     scan_deletes_with_path_normalizer(
         delete_files,
         factory,
-        file_io,
         data_file_size_lookup,
         normalize_local_fs_path_owned,
     )
@@ -895,7 +896,6 @@ where
 pub(crate) fn scan_deletes_with_path_normalizer<F, N>(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    file_io: &iceberg::io::FileIO,
     data_file_size_lookup: F,
     normalize_path: N,
 ) -> Result<Vec<RecordBatch>, ChangeError>
@@ -920,7 +920,8 @@ where
         &normalize_path,
     )?;
     if !puffin_dels.is_empty() {
-        let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(&puffin_dels, file_io))
+        let puffin_dels = normalize_delete_file_paths(&puffin_dels, &normalize_path)?;
+        let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(&puffin_dels, factory))
             .map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
                     "scan_deletes: block_on_dv_read for Puffin DV: {e}"
@@ -955,7 +956,6 @@ where
 pub(crate) fn scan_deletes_with_base_row_id_lookup<F, R>(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    file_io: &iceberg::io::FileIO,
     data_file_size_lookup: F,
     first_row_id_lookup: R,
 ) -> Result<Vec<RecordBatch>, ChangeError>
@@ -966,7 +966,6 @@ where
     scan_deletes_with_base_row_id_lookup_and_path_normalizer(
         delete_files,
         factory,
-        file_io,
         data_file_size_lookup,
         first_row_id_lookup,
         &std::collections::HashSet::new(),
@@ -995,7 +994,6 @@ where
 pub(crate) fn scan_deletes_with_base_row_id_lookup_and_path_normalizer<F, R, N>(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    file_io: &iceberg::io::FileIO,
     data_file_size_lookup: F,
     first_row_id_lookup: R,
     suppressed_data_files: &std::collections::HashSet<String>,
@@ -1024,7 +1022,8 @@ where
         &normalize_path,
     )?;
     if !puffin_dels.is_empty() {
-        let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(&puffin_dels, file_io))
+        let puffin_dels = normalize_delete_file_paths(&puffin_dels, &normalize_path)?;
+        let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(&puffin_dels, factory))
             .map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
                     "scan_deletes: block_on_dv_read for Puffin DV: {e}"
@@ -1084,7 +1083,6 @@ where
 pub(crate) fn scan_deletes_with_lineage_lookup_and_path_normalizer<F, R, N>(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    file_io: &iceberg::io::FileIO,
     data_file_size_lookup: F,
     lineage_lookup: R,
     suppressed_data_files: &std::collections::HashSet<String>,
@@ -1113,7 +1111,8 @@ where
         &normalize_path,
     )?;
     if !puffin_dels.is_empty() {
-        let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(&puffin_dels, file_io))
+        let puffin_dels = normalize_delete_file_paths(&puffin_dels, &normalize_path)?;
+        let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(&puffin_dels, factory))
             .map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
                     "scan_deletes: block_on_dv_read for Puffin DV: {e}"
@@ -1155,6 +1154,23 @@ where
         out.extend(batches);
     }
     Ok(out)
+}
+
+fn normalize_delete_file_paths<N>(
+    delete_files: &[PositionDeleteRef],
+    normalize_path: &N,
+) -> Result<Vec<PositionDeleteRef>, ChangeError>
+where
+    N: Fn(&str) -> Result<String, ChangeError>,
+{
+    delete_files
+        .iter()
+        .map(|delete_file| {
+            let mut delete_file = delete_file.clone();
+            delete_file.delete_file_path = normalize_path(&delete_file.delete_file_path)?;
+            Ok(delete_file)
+        })
+        .collect()
 }
 
 fn read_data_file_at_positions_with_v3_lineage_and_path_normalizer<N>(
@@ -1422,13 +1438,7 @@ mod tests {
     #[test]
     fn scan_deletes_returns_empty_for_empty_input() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let batches = scan_deletes(
-            &[],
-            &factory_for_dir(dir.path()),
-            &make_local_file_io(),
-            |_| None,
-        )
-        .expect("ok");
+        let batches = scan_deletes(&[], &factory_for_dir(dir.path()), |_| None).expect("ok");
         assert!(batches.is_empty());
     }
 
@@ -1450,13 +1460,7 @@ mod tests {
             content_size_in_bytes: None,
             partition_values: Vec::new(),
         }];
-        let batches = scan_deletes(
-            &refs,
-            &factory_for_dir(dir.path()),
-            &make_local_file_io(),
-            |_| None,
-        )
-        .expect("ok");
+        let batches = scan_deletes(&refs, &factory_for_dir(dir.path()), |_| None).expect("ok");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2);
     }
@@ -1506,7 +1510,6 @@ mod tests {
         let batches = super::scan_deletes_with_base_row_id_lookup_and_path_normalizer(
             &refs,
             &factory_for_dir(dir.path()),
-            &make_local_file_io(),
             |_| None,
             |path| (path == data_uri).then_some(1_000),
             &std::collections::HashSet::new(),
@@ -1572,7 +1575,6 @@ mod tests {
         let batches = super::scan_deletes_with_base_row_id_lookup_and_path_normalizer(
             &refs,
             &factory_for_dir(dir.path()),
-            &make_local_file_io(),
             |_| None,
             |path| (path == data_uri).then_some(7_000),
             &std::collections::HashSet::new(),
@@ -1619,7 +1621,6 @@ mod tests {
         let batches = super::scan_deletes_with_lineage_lookup_and_path_normalizer(
             &refs,
             &factory_for_dir(dir.path()),
-            &make_local_file_io(),
             |_| None,
             |path| (path == data_uri).then_some(lineage),
             &std::collections::HashSet::new(),
@@ -1679,7 +1680,6 @@ mod tests {
         let batches = super::scan_deletes_with_lineage_lookup_and_path_normalizer(
             &refs,
             &factory_for_dir(dir.path()),
-            &make_local_file_io(),
             |_| None,
             |path| (path == data_uri).then_some(lineage),
             &std::collections::HashSet::new(),
@@ -1728,7 +1728,6 @@ mod tests {
         let batches = scan_deletes_with_base_row_id_lookup(
             &refs,
             &factory_for_dir(dir.path()),
-            &make_local_file_io(),
             |_| None,
             |path| (path == data_uri).then_some(100),
         )
@@ -1767,7 +1766,6 @@ mod tests {
         let batches = scan_deletes_with_path_normalizer(
             &refs,
             &factory_for_dir(dir.path()),
-            &make_local_file_io(),
             |_| None,
             |path| {
                 path.strip_prefix("s3://lake/")
@@ -1813,13 +1811,7 @@ mod tests {
             content_size_in_bytes: None,
             partition_values: Vec::new(),
         }];
-        let batches = scan_deletes(
-            &refs,
-            &factory_for_dir(dir.path()),
-            &make_local_file_io(),
-            |_| None,
-        )
-        .expect("ok");
+        let batches = scan_deletes(&refs, &factory_for_dir(dir.path()), |_| None).expect("ok");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         // 1 row from data1 (id=1) + 1 row from data2 (id=200) = 2 rows total.
         assert_eq!(total, 2);
@@ -1833,9 +1825,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_file = format!("file://{}/data.parquet", dir.path().display());
         let written = write_puffin_dv_file(dir.path(), "dv-1.puffin", &data_file, &[1, 3, 5]).await;
-        let file_io = make_local_file_io();
         let refs = vec![PositionDeleteRef {
-            delete_file_path: written.path.clone(),
+            delete_file_path: "dv-1.puffin".to_string(),
             delete_file_size: written.file_size_in_bytes as i64,
             record_count: Some(written.cardinality as i64),
             referenced_data_file: Some(data_file.clone()),
@@ -1844,7 +1835,7 @@ mod tests {
             content_size_in_bytes: Some(written.content_size_in_bytes),
             partition_values: Vec::new(),
         }];
-        let map = read_dv_positions_per_data_file(&refs, &file_io)
+        let map = read_dv_positions_per_data_file(&refs, &factory_for_dir(dir.path()))
             .await
             .expect("read DV positions");
         assert_eq!(map.len(), 1);
@@ -1892,7 +1883,7 @@ mod tests {
                 partition_values: Vec::new(),
             },
             PositionDeleteRef {
-                delete_file_path: dv_written.path.clone(),
+                delete_file_path: "dv.puffin".to_string(),
                 delete_file_size: dv_written.file_size_in_bytes as i64,
                 record_count: Some(dv_written.cardinality as i64),
                 referenced_data_file: Some(data_uri.to_string()),
@@ -1904,18 +1895,16 @@ mod tests {
         ];
 
         let factory = factory_for_dir(dir.path());
-        let file_io = make_local_file_io();
         // scan_deletes is sync but bridges to read_dv_positions_per_data_file
         // (async) via block_on_iceberg, which requires a blocking thread (not
         // an async tokio worker). spawn_blocking gives us such a thread, where
         // block_on_iceberg's Handle::try_current() -> handle.block_on path is
         // safe to invoke. Calling scan_deletes directly from this #[tokio::test]
         // would panic.
-        let batches =
-            tokio::task::spawn_blocking(move || scan_deletes(&refs, &factory, &file_io, |_| None))
-                .await
-                .expect("spawn_blocking ok")
-                .expect("scan_deletes ok");
+        let batches = tokio::task::spawn_blocking(move || scan_deletes(&refs, &factory, |_| None))
+            .await
+            .expect("spawn_blocking ok")
+            .expect("scan_deletes ok");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2, "merged v2 + DV must yield exactly 2 deleted rows");
         let mut all_ids: Vec<i32> = Vec::new();

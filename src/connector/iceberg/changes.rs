@@ -4,8 +4,6 @@
 //! error enum so that CREATE-time PRIMARY KEY validation has a stable type
 //! to return.
 
-use std::sync::Arc;
-
 use crate::exec::node::iceberg_delta_scan::{
     DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat,
     PositionDeleteSourceData,
@@ -957,7 +955,6 @@ pub(crate) fn scan_position_delete_rows_for_targets(
         roaring::RoaringTreemap,
     >,
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    file_io: &iceberg::io::FileIO,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
@@ -965,7 +962,6 @@ pub(crate) fn scan_position_delete_rows_for_targets(
     crate::connector::iceberg::scan_deletes::scan_deletes_with_lineage_lookup_and_path_normalizer(
         deletes,
         factory,
-        file_io,
         size_lookup,
         |path| base_data_file_lineage.get(path).copied(),
         suppressed_data_files,
@@ -2038,40 +2034,6 @@ pub(crate) fn expected_object_store_bucket_for_table(
     table: &iceberg::table::Table,
 ) -> Result<Option<String>, String> {
     expected_object_store_bucket_from_location(table.metadata().location())
-}
-
-pub(crate) fn file_io_for_table_location(
-    location: &str,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
-) -> Result<iceberg::io::FileIO, String> {
-    if location.starts_with("s3://")
-        || location.starts_with("s3a://")
-        || location.starts_with("oss://")
-    {
-        let cfg = object_store_config.ok_or_else(|| {
-            format!(
-                "ICEBERG_DELTA_SCAN_NODE table location {location} requires object_store_config"
-            )
-        })?;
-        let factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory {
-            endpoint: cfg.endpoint.clone(),
-            access_key_id: cfg.access_key_id.clone(),
-            access_key_secret: cfg.access_key_secret.clone(),
-            session_token: cfg.session_token.clone(),
-            region: cfg
-                .region
-                .clone()
-                .unwrap_or_else(|| "us-east-1".to_string()),
-            enable_path_style: cfg.enable_path_style_access.unwrap_or(false),
-            retry_max_times: cfg.retry_max_times,
-            retry_min_delay_ms: cfg.retry_min_delay_ms,
-            retry_max_delay_ms: cfg.retry_max_delay_ms,
-            timeout_ms: cfg.timeout_ms,
-            io_timeout_ms: cfg.io_timeout_ms,
-        };
-        return Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build());
-    }
-    Ok(iceberg::io::FileIO::new_with_fs())
 }
 
 /// Build a filesystem factory that can read both data files and

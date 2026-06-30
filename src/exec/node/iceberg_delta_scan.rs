@@ -168,14 +168,13 @@ pub struct DeletedFileVisibility {
 /// to open planned data/delete files. Constructed by `lower_iceberg_delta_scan`
 /// when lowering `ICEBERG_DELTA_SCAN_NODE` from the typed Thrift payload:
 /// - `table` is the codegen-produced table descriptor, not full Iceberg metadata
-/// - `object_store_factory` is built once from table location and shared across role scanners
-/// - `file_io` is used only for Puffin deletion-vector blobs
+/// - `object_store_factory` is built once from table location and shared across data,
+///   delete, and Puffin deletion-vector scanners
 /// - `delete_side` is populated only when the change batch contains DELETE-side roles.
 #[derive(Debug)]
 pub struct IcebergRuntimeHandles {
     pub(crate) table: IcebergDeltaTablePayload,
     pub(crate) object_store_factory: Arc<OpendalRangeReaderFactory>,
-    pub(crate) file_io: iceberg::io::FileIO,
     pub(crate) delete_side: Option<DeltaScanDeleteSide>,
 }
 
