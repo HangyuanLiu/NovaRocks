@@ -28,8 +28,10 @@
 //! - A **non-scan fragment** gets `max(upstream_N)` over incoming
 //!   `HashPartitioned` / `BucketShuffleHashPartitioned` edges, or 1 if no such
 //!   edge exists.
-//! - The **root fragment** is always forced to 1 instance (it holds the
-//!   ResultSink; the FE fetches exactly one finst).
+//! - The **result root fragment** is forced to 1 instance (it holds the
+//!   ResultSink; the FE fetches exactly one finst). Write-only DAGs may have
+//!   multiple terminal write fragments; in that case one writer instance is
+//!   selected as the execution anchor without changing writer parallelism.
 //!
 //! # Backend assignment
 //!
@@ -54,6 +56,7 @@ use crate::sql::codegen::{
     FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
     RuntimeFilterPlanResult,
 };
+use crate::thrift::data_sinks;
 use crate::thrift::data_sinks::TPlanFragmentDestination;
 use crate::thrift::internal_service::TScanRangeParams;
 use crate::thrift::partitions::TPartitionType;
@@ -93,6 +96,8 @@ pub(crate) struct FragmentInstancePlacement {
 /// The result of scheduling a multi-fragment plan.
 #[derive(Debug)]
 pub(crate) struct SchedulingPlan {
+    /// Fragment chosen as the execution anchor for fetch/write coordination.
+    pub(crate) root_fragment_id: FragmentId,
     /// All instance placements, indexed by fragment id.
     pub(crate) by_fragment: BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
     /// The finst id of the root fragment's (single) instance.
@@ -171,8 +176,9 @@ impl FragmentScheduler {
         // Step 1: topological sort (leaves first, root last).
         let topo = topological_sort_bottom_up(fragments, edges)?;
 
-        // Step 2: identify the root fragment.
-        let root_fragment_id = identify_root_fragment(fragments, edges)?;
+        // Step 2: identify the execution root fragment.
+        let root_selection = select_execution_root_fragment(fragments, edges)?;
+        let root_fragment_id = root_selection.fragment_id;
 
         // Build lookup from fragment_id -> FragmentBuildResult index.
         let fr_by_id: BTreeMap<FragmentId, &FragmentBuildResult> =
@@ -239,11 +245,14 @@ impl FragmentScheduler {
             instance_counts.insert(fid, count);
         }
 
-        // Step 4: force root to 1 instance.
-        instance_counts.insert(root_fragment_id, 1);
+        // Step 4: force only result roots to 1 instance. Write-only DAG
+        // anchors keep their exchange-derived parallelism.
+        if root_selection.force_single_instance {
+            instance_counts.insert(root_fragment_id, 1);
+        }
 
         // Step 5: determine root backend index.
-        let root_backend_idx = live[(query_id.lo as usize) % n].0;
+        let preferred_root_backend_idx = live[(query_id.lo as usize) % n].0;
 
         // Step 6: build placements.
         let mut by_fragment: BTreeMap<FragmentId, Vec<FragmentInstancePlacement>> = BTreeMap::new();
@@ -257,7 +266,7 @@ impl FragmentScheduler {
                 .map(
                     |instance_index| -> Result<FragmentInstancePlacement, String> {
                         let backend_idx = if count == 1 {
-                            root_backend_idx
+                            preferred_root_backend_idx
                         } else {
                             live[instance_index].0
                         };
@@ -308,14 +317,18 @@ impl FragmentScheduler {
             by_fragment.insert(fid, instances);
         }
 
-        // Compute root_finst_id from the single root instance.
-        let root_finst_id = by_fragment
+        // Compute root_finst_id from the selected execution anchor. Result
+        // roots have one instance; write-only anchors may have multiple, so the
+        // first placement is the coordination anchor.
+        let root_placement = by_fragment
             .get(&root_fragment_id)
             .and_then(|insts| insts.first())
-            .map(|inst| inst.finst_id.clone())
             .ok_or_else(|| "root fragment has no instances".to_string())?;
+        let root_finst_id = root_placement.finst_id.clone();
+        let root_backend_idx = root_placement.backend_idx;
 
         Ok(SchedulingPlan {
+            root_fragment_id,
             by_fragment,
             root_finst_id,
             root_backend_idx,
@@ -533,23 +546,64 @@ pub(crate) fn topological_sort_bottom_up(
     Ok(order)
 }
 
-/// Return the single fragment that has no outgoing edge (the root / result sink).
-pub(crate) fn identify_root_fragment(
+#[derive(Clone, Copy, Debug)]
+struct ExecutionRootSelection {
+    fragment_id: FragmentId,
+    force_single_instance: bool,
+}
+
+fn select_execution_root_fragment(
     fragments: &[FragmentBuildResult],
     edges: &[FragmentEdge],
-) -> Result<FragmentId, String> {
+) -> Result<ExecutionRootSelection, String> {
     use std::collections::BTreeSet;
+
     let sources: BTreeSet<FragmentId> = edges.iter().map(|e| e.source_fragment_id).collect();
-    let roots: Vec<FragmentId> = fragments
+    let terminal_fragments: Vec<&FragmentBuildResult> = fragments
         .iter()
-        .map(|fr| fr.fragment_id)
-        .filter(|id| !sources.contains(id))
+        .filter(|fr| !sources.contains(&fr.fragment_id))
         .collect();
-    match roots.len() {
-        1 => Ok(roots[0]),
+
+    match terminal_fragments.len() {
+        1 => Ok(ExecutionRootSelection {
+            fragment_id: terminal_fragments[0].fragment_id,
+            force_single_instance: true,
+        }),
         0 => Err("no root fragment found (every fragment has an outgoing edge)".into()),
-        _ => Err(format!("multiple root fragments: {roots:?}")),
+        _ if terminal_fragments
+            .iter()
+            .all(|fr| data_sink_is_terminal_write_sink(&fr.output_sink)) =>
+        {
+            let fragment_id = terminal_fragments
+                .iter()
+                .map(|fr| fr.fragment_id)
+                .min()
+                .expect("terminal fragments checked non-empty");
+            Ok(ExecutionRootSelection {
+                fragment_id,
+                force_single_instance: false,
+            })
+        }
+        _ => Err(format!(
+            "multiple root fragments: {:?}",
+            terminal_fragments
+                .iter()
+                .map(|fr| fr.fragment_id)
+                .collect::<Vec<_>>()
+        )),
     }
+}
+
+fn data_sink_is_terminal_write_sink(sink: &data_sinks::TDataSink) -> bool {
+    matches!(
+        sink.type_,
+        data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
+            | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
+            | data_sinks::TDataSinkType::ICEBERG_DV_SINK
+            | data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK
+            | data_sinks::TDataSinkType::HIVE_TABLE_SINK
+            | data_sinks::TDataSinkType::OLAP_TABLE_SINK
+    )
 }
 
 /// Return the plan-node ids of all scan nodes in `plan`.
@@ -648,8 +702,16 @@ mod tests {
     }
 
     fn minimal_noop_sink() -> data_sinks::TDataSink {
+        minimal_sink(data_sinks::TDataSinkType::NOOP_SINK)
+    }
+
+    fn minimal_write_sink() -> data_sinks::TDataSink {
+        minimal_sink(data_sinks::TDataSinkType::ICEBERG_TABLE_SINK)
+    }
+
+    fn minimal_sink(sink_type: data_sinks::TDataSinkType) -> data_sinks::TDataSink {
         data_sinks::TDataSink::new(
-            data_sinks::TDataSinkType::NOOP_SINK,
+            sink_type,
             None::<data_sinks::TDataStreamSink>,
             None::<data_sinks::TResultSink>,
             None::<data_sinks::TMysqlTableSink>,
@@ -746,6 +808,16 @@ mod tests {
             query_global_dicts: None,
             query_global_dict_exprs: None,
         }
+    }
+
+    fn fake_write_fragment(
+        fid: FragmentId,
+        scan_node_id: Option<i32>,
+        n_ranges: usize,
+    ) -> FragmentBuildResult {
+        let mut fragment = fake_fragment(fid, scan_node_id, n_ranges);
+        fragment.output_sink = minimal_write_sink();
+        fragment
     }
 
     /// Build a `FragmentEdge` with the given partition type.
@@ -1119,6 +1191,52 @@ mod tests {
             .assign(&fragments, &edges, make_query_id(5, 5))
             .expect("assign");
         assert_eq!(plan.by_fragment[&1].len(), 1, "root always 1");
+    }
+
+    #[test]
+    fn multi_terminal_write_dag_keeps_writer_parallelism() {
+        let backends = three_backends();
+        let scheduler = FragmentScheduler::new(backends);
+        let fragments = vec![
+            fake_fragment(0, Some(1), 6),
+            fake_write_fragment(10, None, 0),
+            fake_write_fragment(11, None, 0),
+        ];
+        let edges = vec![
+            fake_router_edge(
+                0,
+                10,
+                partitions::TPartitionType::HASH_PARTITIONED,
+                100,
+                FragmentStreamKind::Partitioned,
+            ),
+            fake_router_edge(
+                0,
+                11,
+                partitions::TPartitionType::HASH_PARTITIONED,
+                101,
+                FragmentStreamKind::Partitioned,
+            ),
+        ];
+
+        let plan = scheduler
+            .assign(&fragments, &edges, make_query_id(5, 5))
+            .expect("assign");
+
+        assert_eq!(plan.root_fragment_id, 10);
+        assert_eq!(
+            plan.by_fragment[&0].len(),
+            3,
+            "scan source stays distributed"
+        );
+        assert_eq!(
+            plan.by_fragment[&10].len(),
+            3,
+            "write anchor is not forced to a single instance"
+        );
+        assert_eq!(plan.by_fragment[&11].len(), 3);
+        assert_eq!(plan.root_backend_idx, plan.by_fragment[&10][0].backend_idx);
+        assert_eq!(plan.root_finst_id, plan.by_fragment[&10][0].finst_id);
     }
 
     #[test]

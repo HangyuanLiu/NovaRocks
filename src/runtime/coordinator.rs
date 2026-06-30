@@ -155,6 +155,7 @@ impl ExecutionCoordinator {
             scheduler.fill_runtime_filter_params_with_live(&mut plan, rf, &live)?;
         }
         scheduler.fill_per_exch_num_senders(&mut plan, &edges);
+        let execution_root_fragment_id = plan.root_fragment_id;
 
         // ---------------------------------------------------------------
         // 2. Build per-edge / CTE consumer indices used for sink wiring.
@@ -209,9 +210,9 @@ impl ExecutionCoordinator {
         // ---------------------------------------------------------------
         // 3. Inject the designated runtime-filter merge node into descriptors.
         // ---------------------------------------------------------------
-        // The merge node is the backend that hosts the (single) root instance.
-        // At one backend this equals the local exchange address, matching the
-        // prior `dispatcher.exchange_addr()` behavior exactly.
+        // The merge node is the backend that hosts the execution anchor. For
+        // result roots this is the single root instance; for write-only DAGs it
+        // is the first instance of the selected writer anchor.
         let merge_addr = backend_to_network_addr(&live, plan.root_backend_idx)?;
         if rf_plan.is_some() {
             inject_runtime_filter_merge_nodes(&mut fragment_results, &merge_addr);
@@ -289,15 +290,24 @@ impl ExecutionCoordinator {
             let fr = *fr_by_id
                 .get(&fragment_id)
                 .ok_or_else(|| format!("fragment {fragment_id} missing from build results"))?;
-            let is_root = fragment_id == root_fragment_id;
+            let is_root = fragment_id == execution_root_fragment_id;
             let stream_edge = stream_edge_by_source.get(&fragment_id).copied();
             let router_edges = router_edges_by_source.get(&fragment_id);
+            let is_terminal_write = stream_edge.is_none()
+                && router_edges.is_none()
+                && fr.cte_id.is_none()
+                && data_sink_requires_write_report(&fr.output_sink);
 
             // Classify the fragment once.
-            if !is_root && fr.cte_id.is_none() && stream_edge.is_none() && router_edges.is_none() {
+            if !is_root
+                && !is_terminal_write
+                && fr.cte_id.is_none()
+                && stream_edge.is_none()
+                && router_edges.is_none()
+            {
                 return Err(format!(
                     "fragment {fragment_id} is neither root, CTE producer, stream producer, nor \
-                     Iceberg change-stream router producer; \
+                     Iceberg change-stream router producer or terminal write fragment; \
                      stream fan-out is not supported in standalone coordinator"
                 ));
             }
@@ -340,6 +350,8 @@ impl ExecutionCoordinator {
                     )?;
                     // Router branches carry their own destinations in the sink payload.
                     (output_sink, unpartitioned_partition(), None)
+                } else if is_terminal_write {
+                    (fr.output_sink.clone(), unpartitioned_partition(), None)
                 } else {
                     // CTE producer.
                     let cte_id = fr
@@ -457,7 +469,7 @@ impl ExecutionCoordinator {
             }
         }
 
-        if !submissions_by_fragment.contains_key(&root_fragment_id) {
+        if !submissions_by_fragment.contains_key(&execution_root_fragment_id) {
             return Err("root fragment produced no placement".to_string());
         }
         let mut submissions: Vec<(
@@ -495,7 +507,7 @@ impl ExecutionCoordinator {
             .map(|t| t as i64 * 1000)
             .unwrap_or(300_000); // 5 minute default
         let root_fragment = fr_by_id
-            .get(&root_fragment_id)
+            .get(&execution_root_fragment_id)
             .ok_or_else(|| "root fragment not found in build results".to_string())?;
         let expected_root_chunk_schema =
             if root_uses_typed_result_sink(&submissions, &plan.root_finst_id)? {

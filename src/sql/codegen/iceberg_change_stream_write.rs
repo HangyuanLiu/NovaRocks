@@ -127,6 +127,73 @@ impl ChangeStreamWriteBranchSpec {
             writer_fragment_id: None,
         }
     }
+
+    pub(crate) fn delete_dv_for_test(stream_output_slots: Vec<i32>) -> Self {
+        Self::for_test_with_slots(
+            0,
+            ChangeStreamWriteBranchKind::DeleteDv,
+            stream_output_slots,
+        )
+    }
+
+    pub(crate) fn reuse_data_for_test(stream_output_slots: Vec<i32>) -> Self {
+        Self::for_test_with_slots(
+            1,
+            ChangeStreamWriteBranchKind::ReuseData,
+            stream_output_slots,
+        )
+    }
+
+    pub(crate) fn fresh_data_for_test(stream_output_slots: Vec<i32>) -> Self {
+        Self::for_test_with_slots(
+            2,
+            ChangeStreamWriteBranchKind::FreshData,
+            stream_output_slots,
+        )
+    }
+
+    fn for_test_with_slots(
+        branch_id: i32,
+        branch_kind: ChangeStreamWriteBranchKind,
+        stream_output_slots: Vec<i32>,
+    ) -> Self {
+        use arrow::datatypes::DataType;
+
+        let mut branch = Self::for_test(branch_id, branch_kind);
+        branch.stream_output_slots = stream_output_slots;
+        branch.sink_spec.mode = match branch_kind {
+            ChangeStreamWriteBranchKind::DeleteDv => {
+                crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode::DeletionVectors
+            }
+            ChangeStreamWriteBranchKind::ReuseData => {
+                crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode::RowLineageData
+            }
+            ChangeStreamWriteBranchKind::FreshData => {
+                crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode::Data
+            }
+        };
+        branch.sink_spec.iceberg.serialized_metadata = Some(
+            crate::sql::codegen::iceberg_write_sink::test_support::unpartitioned_metadata_json(),
+        );
+
+        let target_columns = branch
+            .stream_output_slots
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| crate::sql::catalog::ColumnDef {
+                name: format!("c{}", idx + 1),
+                data_type: DataType::Int32,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            })
+            .collect::<Vec<_>>();
+        if !target_columns.is_empty() {
+            branch.sink_spec.target_columns = target_columns.clone();
+            branch.sink_spec.target_table.columns = target_columns;
+        }
+        branch
+    }
 }
 
 #[cfg(test)]
