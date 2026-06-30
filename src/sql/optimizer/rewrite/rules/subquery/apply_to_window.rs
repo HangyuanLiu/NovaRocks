@@ -165,6 +165,7 @@ fn apply_plan_inner(
         true,
     );
     let win_expr = crate::sql::optimizer::operator::ScalarWindowSpec {
+        output_column_id: win_id,
         name: m.inner_agg.name.clone(),
         args: agg_args,
         distinct: false,
@@ -1018,9 +1019,15 @@ mod tests {
         ctx
     }
 
+    fn column_ref_factory_for_fixtures() -> Rc<RefCell<ColumnRefFactory>> {
+        let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
+        factory.borrow_mut().reserve_until(101);
+        factory
+    }
+
     fn ctx_with_factory() -> RewriteContext {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
-        ctx.set_column_ref_factory(Rc::new(RefCell::new(ColumnRefFactory::new())));
+        ctx.set_column_ref_factory(column_ref_factory_for_fixtures());
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx
     }
@@ -2040,7 +2047,7 @@ mod tests {
         let plan = winmagic_pre_pushdown_filter_apply();
 
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
-        ctx.set_column_ref_factory(Rc::new(RefCell::new(ColumnRefFactory::new())));
+        ctx.set_column_ref_factory(column_ref_factory_for_fixtures());
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         let expr = to_opt_expr(&plan, &mut ctx);
 
@@ -2083,7 +2090,7 @@ mod tests {
 
         // Disable ApplyToWindow → should fall back to ScalarApplyToJoin (LEFT OUTER JOIN form).
         let mut ctx = RewriteContext::for_query(vec!["ApplyToWindow".to_string()]);
-        ctx.set_column_ref_factory(Rc::new(RefCell::new(ColumnRefFactory::new())));
+        ctx.set_column_ref_factory(column_ref_factory_for_fixtures());
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         let expr = to_opt_expr(&plan, &mut ctx);
 
