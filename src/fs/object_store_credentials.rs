@@ -47,7 +47,9 @@ pub const AWS_S3_CREDENTIAL_PROPERTY_KEYS: &[&str] = &[
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObjectStoreCredentialsSource {
     AwsS3Properties,
+    IcebergSinkCloudProperties,
     StandaloneConfig,
+    StarRocksObjectStoreProfile,
     StarletProfile,
 }
 
@@ -55,7 +57,9 @@ impl ObjectStoreCredentialsSource {
     fn label(self) -> &'static str {
         match self {
             Self::AwsS3Properties => "aws_s3_properties",
+            Self::IcebergSinkCloudProperties => "iceberg_sink_cloud_properties",
             Self::StandaloneConfig => "standalone_config",
+            Self::StarRocksObjectStoreProfile => "starrocks_object_store_profile",
             Self::StarletProfile => "starlet_profile",
         }
     }

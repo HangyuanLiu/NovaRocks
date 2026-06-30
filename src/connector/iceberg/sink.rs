@@ -1485,17 +1485,6 @@ pub(crate) fn parse_object_store_bucket_and_root(path: &str) -> Option<(String, 
     None
 }
 
-pub(crate) fn parse_true_false(value: &str) -> Option<bool> {
-    let trimmed = value.trim();
-    if trimmed.eq_ignore_ascii_case("true") || trimmed == "1" {
-        return Some(true);
-    }
-    if trimmed.eq_ignore_ascii_case("false") || trimmed == "0" {
-        return Some(false);
-    }
-    None
-}
-
 fn normalize_path(path: &str) -> Result<String, String> {
     if path.starts_with("file:") {
         let url = url::Url::parse(path).map_err(|e| format!("invalid file url: {e}"))?;

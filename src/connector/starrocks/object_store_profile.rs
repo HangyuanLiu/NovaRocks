@@ -17,7 +17,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::fs::object_store::{ObjectStoreConfig, ObjectStoreRetrySettings};
+use crate::fs::object_store::ObjectStoreConfig;
+use crate::fs::object_store_credentials::{
+    AWS_S3_ENDPOINT_KEYS, ObjectStoreCredentials, ObjectStoreCredentialsSource,
+};
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 
 const UNSUPPORTED_OBJECT_STORE_PREFIXES: [&str; 7] = [
@@ -79,26 +82,15 @@ impl ObjectStoreProfile {
 
     pub(crate) fn from_s3_store_config(config: &S3StoreConfig) -> Result<Self, String> {
         let endpoint = normalize_endpoint(&config.endpoint, None)?;
-        let access_key_id = non_empty("S3 access_key_id", &config.access_key_id)?;
-        let access_key_secret = non_empty("S3 access_key_secret", &config.access_key_secret)?;
-        Ok(Self {
-            endpoint,
-            access_key_id,
-            access_key_secret,
-            session_token: None,
-            region: config
-                .region
-                .as_ref()
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-                .map(|v| v.to_string()),
-            enable_path_style_access: config.enable_path_style_access,
-            retry_max_times: None,
-            retry_min_delay_ms: None,
-            retry_max_delay_ms: None,
-            timeout_ms: None,
-            io_timeout_ms: None,
-        })
+        let credentials = ObjectStoreCredentials::from_parts(
+            ObjectStoreCredentialsSource::StarletProfile,
+            &endpoint,
+            &config.access_key_id,
+            &config.access_key_secret,
+            config.region.as_deref(),
+            config.enable_path_style_access,
+        )?;
+        Ok(Self::from_credentials(credentials))
     }
 
     pub(crate) fn to_object_store_config(&self, bucket: &str, root: &str) -> ObjectStoreConfig {
@@ -122,64 +114,41 @@ impl ObjectStoreProfile {
     }
 
     fn from_aws_s3_properties(props: &BTreeMap<String, String>) -> Result<Self, String> {
-        let enable_ssl = props.get("aws.s3.enable_ssl").map(|v| is_true_value(v));
-        let endpoint_raw = props
-            .get("aws.s3.endpoint")
-            .ok_or_else(|| "missing aws.s3.endpoint for object_store mode".to_string())?;
-        let endpoint = normalize_endpoint(endpoint_raw, enable_ssl)?;
-        let access_key_id = non_empty(
-            "aws.s3.accessKeyId/aws.s3.access_key",
-            props
-                .get("aws.s3.accessKeyId")
-                .or_else(|| props.get("aws.s3.access_key"))
-                .map(String::as_str)
-                .unwrap_or(""),
+        let endpoint = normalize_endpoint_from_properties(props)?;
+        let mut normalized_props = props.clone();
+        normalized_props.insert(AWS_S3_ENDPOINT_KEYS[0].to_string(), endpoint);
+        for key in AWS_S3_ENDPOINT_KEYS.iter().skip(1) {
+            normalized_props.remove(*key);
+        }
+        let credentials = ObjectStoreCredentials::from_aws_s3_properties(
+            ObjectStoreCredentialsSource::StarRocksObjectStoreProfile,
+            &normalized_props,
         )?;
-        let access_key_secret = non_empty(
-            "aws.s3.accessKeySecret/aws.s3.secret_key",
-            props
-                .get("aws.s3.accessKeySecret")
-                .or_else(|| props.get("aws.s3.secret_key"))
-                .map(String::as_str)
-                .unwrap_or(""),
-        )?;
-        let session_token = props
-            .get("aws.s3.session_token")
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-            .map(|v| v.to_string());
-        let region = props
-            .get("aws.s3.region")
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-            .map(|v| v.to_string());
-        let enable_path_style_access = props
-            .get("aws.s3.enable_path_style_access")
-            .map(|v| is_true_value(v));
-        let retry_settings = ObjectStoreRetrySettings::from_aws_s3_props(Some(props));
+        Ok(Self::from_credentials(credentials))
+    }
 
-        Ok(Self {
-            endpoint,
-            access_key_id,
-            access_key_secret,
-            session_token,
-            region,
-            enable_path_style_access,
-            retry_max_times: retry_settings.retry_max_times,
-            retry_min_delay_ms: retry_settings.retry_min_delay_ms,
-            retry_max_delay_ms: retry_settings.retry_max_delay_ms,
-            timeout_ms: retry_settings.timeout_ms,
-            io_timeout_ms: retry_settings.io_timeout_ms,
-        })
+    fn from_credentials(credentials: ObjectStoreCredentials) -> Self {
+        Self {
+            endpoint: credentials.endpoint,
+            access_key_id: credentials.access_key_id,
+            access_key_secret: credentials.access_key_secret,
+            session_token: credentials.session_token,
+            region: credentials.region,
+            enable_path_style_access: credentials.enable_path_style_access,
+            retry_max_times: credentials.retry_max_times,
+            retry_min_delay_ms: credentials.retry_min_delay_ms,
+            retry_max_delay_ms: credentials.retry_max_delay_ms,
+            timeout_ms: credentials.timeout_ms,
+            io_timeout_ms: credentials.io_timeout_ms,
+        }
     }
 }
 
-fn non_empty(field: &str, value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(format!("missing {field} for object_store mode"));
-    }
-    Ok(trimmed.to_string())
+fn normalize_endpoint_from_properties(props: &BTreeMap<String, String>) -> Result<String, String> {
+    let enable_ssl = props.get("aws.s3.enable_ssl").map(|v| is_true_value(v));
+    let endpoint_raw = first_nonempty_property(props, AWS_S3_ENDPOINT_KEYS)
+        .ok_or_else(|| format!("missing {} for object_store mode", AWS_S3_ENDPOINT_KEYS[0]))?;
+    normalize_endpoint(endpoint_raw, enable_ssl)
 }
 
 fn is_unsupported_object_storage_key(key: &str) -> bool {
@@ -188,13 +157,26 @@ fn is_unsupported_object_storage_key(key: &str) -> bool {
         .any(|prefix| key.starts_with(prefix))
 }
 
+fn first_nonempty_property<'a>(
+    props: &'a BTreeMap<String, String>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter()
+        .filter_map(|key| props.get(*key))
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty())
+}
+
 fn normalize_endpoint(
     raw_endpoint: &str,
     explicit_enable_ssl: Option<bool>,
 ) -> Result<String, String> {
     let mut view = raw_endpoint.trim();
     if view.is_empty() {
-        return Err("empty aws.s3.endpoint for object_store mode".to_string());
+        return Err(format!(
+            "empty {} for object_store mode",
+            AWS_S3_ENDPOINT_KEYS[0]
+        ));
     }
     let mut inferred_enable_ssl = None;
     if let Some(rest) = view.strip_prefix("http://") {
@@ -210,7 +192,8 @@ fn normalize_endpoint(
     let host = view.trim_end_matches('/');
     if host.is_empty() {
         return Err(format!(
-            "invalid aws.s3.endpoint for object_store mode: {raw_endpoint}"
+            "invalid {} for object_store mode: {raw_endpoint}",
+            AWS_S3_ENDPOINT_KEYS[0]
         ));
     }
 
@@ -273,6 +256,31 @@ mod tests {
             .expect("build profile")
             .expect("profile should exist");
         assert_eq!(profile.enable_path_style_access, None);
+    }
+
+    #[test]
+    fn rejects_invalid_path_style_property() {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "aws.s3.endpoint".to_string(),
+            "https://oss-cn-zhangjiakou.aliyuncs.com".to_string(),
+        );
+        props.insert("aws.s3.accessKeyId".to_string(), "ak".to_string());
+        props.insert("aws.s3.accessKeySecret".to_string(), "sk".to_string());
+        props.insert(
+            "aws.s3.enable_path_style_access".to_string(),
+            "maybe".to_string(),
+        );
+
+        let err = ObjectStoreProfile::from_properties_optional(&props)
+            .expect_err("invalid path style should fail fast");
+
+        assert!(
+            err.contains(
+                "starrocks_object_store_profile object-store property aws.s3.enable_path_style_access has invalid boolean value: maybe"
+            ),
+            "{err}"
+        );
     }
 
     #[test]
