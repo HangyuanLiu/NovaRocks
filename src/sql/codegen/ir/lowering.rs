@@ -4117,6 +4117,9 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             desired_num_rows: Some(1),
             subquery_string: Some(op.subquery_text.clone()),
             assertion: Some(plan_nodes::TAssertion::LE),
+            group_key_slots: None,
+            group_key_labels: None,
+            keyed_message_prefix: None,
         });
         plan_node
     }

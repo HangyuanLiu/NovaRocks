@@ -16,6 +16,8 @@
 // under the License.
 use crate::exec::node::ExecNode;
 
+use crate::common::ids::SlotId;
+
 #[derive(Clone, Debug)]
 pub enum Assertion {
     Eq,
@@ -27,10 +29,23 @@ pub enum Assertion {
 }
 
 #[derive(Clone, Debug)]
+pub enum AssertNumRowsMode {
+    Global {
+        desired_num_rows: Option<usize>,
+        assertion: Assertion,
+        subquery_string: Option<String>,
+    },
+    PerKeyAtMostOne {
+        // The planner must hash-partition by these slots before this assert for global per-key semantics.
+        key_slots: Vec<SlotId>,
+        key_labels: Vec<String>,
+        message_prefix: String,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub struct AssertNumRowsNode {
     pub input: Box<ExecNode>,
     pub node_id: i32,
-    pub desired_num_rows: Option<usize>,
-    pub assertion: Assertion,
-    pub subquery_string: Option<String>,
+    pub mode: AssertNumRowsMode,
 }

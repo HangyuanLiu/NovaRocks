@@ -30,10 +30,10 @@
 
 use std::sync::Arc;
 
-use crate::exec::expr::ExprArena;
+use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::aggregate::{AggregateNode, StreamingPreaggregationMode};
 use crate::exec::node::analytic::AnalyticNode;
-use crate::exec::node::assert::AssertNumRowsNode;
+use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode};
 use crate::exec::node::filter::FilterNode;
 use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinType};
 use crate::exec::node::limit::LimitNode;
@@ -373,7 +373,7 @@ fn ensure_hash_on_input_slots(
     ctx: &mut PipelineBuildContext,
     owner_node_id: i32,
     partition_slot_ids: Vec<crate::common::ids::SlotId>,
-    distribution_keys: Vec<crate::exec::expr::ExprId>,
+    distribution_keys: Vec<ExprId>,
     partitions: usize,
 ) -> PipelineBuildResult {
     let partitions = partitions.max(1);
@@ -399,6 +399,93 @@ fn ensure_hash_on_input_slots(
         distribution_keys,
         partitions,
     )
+}
+
+fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chunk::ChunkSchemaRef> {
+    match &node.kind {
+        ExecNodeKind::AssertNumRows(AssertNumRowsNode { input, .. }) => {
+            output_chunk_schema_for_node(input)
+        }
+        ExecNodeKind::Values(values) => Some(values.chunk.chunk_schema_ref()),
+        ExecNodeKind::Project(project) => Some(Arc::clone(&project.output_chunk_schema)),
+        ExecNodeKind::Filter(FilterNode { input, .. })
+        | ExecNodeKind::Repeat(RepeatNode { input, .. })
+        | ExecNodeKind::Limit(LimitNode { input, .. })
+        | ExecNodeKind::Sort(SortNode { input, .. }) => output_chunk_schema_for_node(input),
+        ExecNodeKind::ChangeEventExpand(node) => Some(Arc::clone(&node.output_chunk_schema)),
+        ExecNodeKind::UnionAll(UnionAllNode { inputs, .. }) => {
+            inputs.first().and_then(output_chunk_schema_for_node)
+        }
+        ExecNodeKind::ExchangeSource(exchange) => Some(Arc::clone(&exchange.expected_chunk_schema)),
+        ExecNodeKind::Scan(scan) => Some(scan.output_chunk_schema()),
+        ExecNodeKind::IcebergDeltaScan(scan) => Some(Arc::clone(&scan.output_chunk_schema)),
+        ExecNodeKind::AggregateStateMerge(_) | ExecNodeKind::AggregateStatePhysicalize(_) => None,
+        ExecNodeKind::Fetch(fetch) => Some(Arc::clone(&fetch.output_chunk_schema)),
+        ExecNodeKind::LookUp(lookup) => Some(Arc::clone(&lookup.output_chunk_schema)),
+        ExecNodeKind::Aggregate(aggregate) => Some(Arc::clone(&aggregate.output_chunk_schema)),
+        ExecNodeKind::Join(join) => Some(Arc::clone(&join.join_scope_chunk_schema)),
+        ExecNodeKind::NestedLoopJoin(join) => Some(Arc::clone(&join.join_scope_chunk_schema)),
+        ExecNodeKind::TableFunction(table_function) => {
+            Some(Arc::clone(&table_function.output_chunk_schema))
+        }
+        ExecNodeKind::Analytic(analytic) => Some(Arc::clone(&analytic.output_chunk_schema)),
+        ExecNodeKind::SetOp(set_op) => Some(Arc::clone(&set_op.output_chunk_schema)),
+    }
+}
+
+fn keyed_assert_distribution_keys(
+    ctx: &mut PipelineBuildContext,
+    input: &ExecNode,
+    key_slots: &[crate::common::ids::SlotId],
+) -> Result<Vec<ExprId>, String> {
+    let output_schema = output_chunk_schema_for_node(input).ok_or_else(|| {
+        "keyed assert_num_rows local hash requires child output schema".to_string()
+    })?;
+    let mut distribution_keys = Vec::with_capacity(key_slots.len());
+    for slot in key_slots {
+        let slot_schema = output_schema.slot(*slot).cloned().ok_or_else(|| {
+            format!(
+                "keyed assert_num_rows key slot {} is not present in child output schema",
+                slot
+            )
+        })?;
+        let arena = Arc::make_mut(&mut ctx.arena);
+        let expr_id = arena.push_typed(
+            ExprNode::SlotId(*slot),
+            slot_schema.field().data_type().clone(),
+        );
+        arena.set_field_schema(expr_id, slot_schema.field_schema().clone());
+        distribution_keys.push(expr_id);
+    }
+    Ok(distribution_keys)
+}
+
+fn existing_hash_distribution_keys_for_slots(
+    ctx: &PipelineBuildContext,
+    stream: &StreamDesc,
+    key_slots: &[crate::common::ids::SlotId],
+    partitions: usize,
+) -> Option<Vec<ExprId>> {
+    let Distribution::Hash {
+        keys,
+        partitions: existing_partitions,
+        hash_version,
+    } = &stream.distribution
+    else {
+        return None;
+    };
+    if *existing_partitions != partitions || *hash_version != 0 || keys.len() != key_slots.len() {
+        return None;
+    }
+    for (key, slot) in keys.iter().zip(key_slots) {
+        let Some(ExprNode::SlotId(existing_slot)) = ctx.arena.node(*key) else {
+            return None;
+        };
+        if existing_slot != slot {
+            return None;
+        }
+    }
+    Some(keys.clone())
 }
 
 fn build_distinct_set_op_pipeline<S, MakeShared, MakeSink, MakeSource>(
@@ -462,20 +549,35 @@ fn build_pipeline_for_node(
         ExecNodeKind::AssertNumRows(AssertNumRowsNode {
             input,
             node_id,
-            desired_num_rows,
-            assertion,
-            subquery_string,
+            mode,
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
+            if let AssertNumRowsMode::PerKeyAtMostOne { key_slots, .. } = mode {
+                let partition_count = ctx.pipeline_dop.max(1) as usize;
+                let distribution_keys = existing_hash_distribution_keys_for_slots(
+                    ctx,
+                    &build.stream,
+                    key_slots,
+                    partition_count,
+                )
+                .map(Ok)
+                .unwrap_or_else(|| keyed_assert_distribution_keys(ctx, input, key_slots))?;
+                build = ensure_hash_on_input_slots(
+                    build,
+                    ctx,
+                    *node_id,
+                    key_slots.clone(),
+                    distribution_keys,
+                    partition_count,
+                );
+            }
             build
                 .pipeline
                 .factories
                 .push(Box::new(AssertNumRowsProcessorFactory::new(
                     *node_id,
-                    *desired_num_rows,
-                    assertion.clone(),
-                    subquery_string.clone(),
-                )));
+                    mode.clone(),
+                )?));
             Ok(build)
         }
         ExecNodeKind::Project(ProjectNode {
@@ -1441,6 +1543,7 @@ mod tests {
     use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
+    use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
     use crate::exec::node::lookup::LookUpNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::pipeline::dependency::DependencyManager;
@@ -1555,6 +1658,118 @@ mod tests {
             .filter(|f| f.name().starts_with("LOCAL_EXCHANGE_SOURCE"))
             .count();
         assert_eq!(local_exchange_sources, 1);
+    }
+
+    #[test]
+    fn assert_num_rows_requires_local_hash_shuffle_when_dop_gt_one() {
+        let row_id_slot = SlotId::new(7);
+        let lookup_output_chunk_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![Field::new(
+                "_row_id",
+                DataType::Int32,
+                false,
+            )])),
+            &[row_id_slot],
+        );
+
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::AssertNumRows(AssertNumRowsNode {
+                    input: Box::new(ExecNode {
+                        kind: ExecNodeKind::LookUp(LookUpNode {
+                            node_id: 0,
+                            row_pos_descs: HashMap::new(),
+                            output_chunk_schema: Arc::clone(&lookup_output_chunk_schema),
+                        }),
+                    }),
+                    node_id: 11,
+                    mode: AssertNumRowsMode::PerKeyAtMostOne {
+                        key_slots: vec![row_id_slot],
+                        key_labels: vec!["_row_id".to_string()],
+                        message_prefix: "assert_num_rows failed".to_string(),
+                    },
+                }),
+            },
+        };
+
+        let graph = build_pipeline_graph_for_exec_plan_with_dop(
+            &plan,
+            false,
+            DependencyManager::new(),
+            None,
+            2,
+            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
+        )
+        .expect("build pipeline graph");
+
+        let root = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| pipeline.id == graph.root_id)
+            .expect("root pipeline");
+        assert_eq!(root.dop, 2);
+        assert!(
+            root.factories
+                .iter()
+                .any(|factory| factory.name().starts_with("LOCAL_EXCHANGE_SOURCE")),
+            "keyed assert root pipeline should read from local hash exchange"
+        );
+
+        let local_exchange_sources = graph
+            .pipelines
+            .iter()
+            .flat_map(|p| p.factories.iter())
+            .filter(|f| f.name().starts_with("LOCAL_EXCHANGE_SOURCE"))
+            .count();
+        assert_eq!(local_exchange_sources, 1);
+    }
+
+    #[test]
+    fn global_assert_num_rows_does_not_require_local_hash_shuffle_when_dop_gt_one() {
+        let lookup_output_chunk_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)])),
+            &[SlotId::new(1)],
+        );
+
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::AssertNumRows(AssertNumRowsNode {
+                    input: Box::new(ExecNode {
+                        kind: ExecNodeKind::LookUp(LookUpNode {
+                            node_id: 0,
+                            row_pos_descs: HashMap::new(),
+                            output_chunk_schema: Arc::clone(&lookup_output_chunk_schema),
+                        }),
+                    }),
+                    node_id: 11,
+                    mode: AssertNumRowsMode::Global {
+                        desired_num_rows: Some(1),
+                        assertion: Assertion::Eq,
+                        subquery_string: None,
+                    },
+                }),
+            },
+        };
+
+        let graph = build_pipeline_graph_for_exec_plan_with_dop(
+            &plan,
+            false,
+            DependencyManager::new(),
+            None,
+            2,
+            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
+        )
+        .expect("build pipeline graph");
+
+        let local_exchange_sources = graph
+            .pipelines
+            .iter()
+            .flat_map(|p| p.factories.iter())
+            .filter(|f| f.name().starts_with("LOCAL_EXCHANGE_SOURCE"))
+            .count();
+        assert_eq!(local_exchange_sources, 0);
     }
 
     #[test]

@@ -1262,6 +1262,9 @@ struct TAssertNumRowsNode {
     1: optional i64 desired_num_rows;
     2: optional string subquery_string;
     3: optional TAssertion assertion;
+    1000: optional list<Types.TSlotId> group_key_slots;
+    1001: optional list<string> group_key_labels;
+    1002: optional string keyed_message_prefix;
 }
 
 struct TVariantPathColumn {
