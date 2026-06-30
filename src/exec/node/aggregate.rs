@@ -30,9 +30,8 @@ pub struct AggTypeSignature {
 }
 
 /// Structured ORDER BY / DISTINCT metadata for ordered aggregates
-/// (array_agg / group_concat). Replaces the former function-name string encoding
-/// (e.g. `array_agg|a=1,0|n=0,1`, `group_concat|d=1|a=..|n=..|m=1024`). Default
-/// (empty / false / None) means no ORDER BY and not DISTINCT — the common case.
+/// (array_agg / group_concat). Default (empty / false / None) means no ORDER BY
+/// and not DISTINCT — the common case.
 /// array_agg's DISTINCT stays folded into the base name `array_agg_distinct`;
 /// `is_distinct` here carries group_concat's DISTINCT.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -58,7 +57,6 @@ pub struct AggFunction {
     pub input_is_intermediate: bool,
     pub types: Option<AggTypeSignature>,
     /// ORDER BY / DISTINCT metadata for ordered aggregates (array_agg / group_concat).
-    /// Replaces the former function-name string encoding.
     pub order: AggOrderSpec,
 }
 

@@ -287,8 +287,7 @@ fn agg_type_signature_from_node(node: &exprs::TExprNode) -> Result<AggTypeSignat
 /// Resolve an aggregate's execution-layer base name and its structured ORDER BY /
 /// DISTINCT metadata from the thrift node. array_agg's DISTINCT folds into the
 /// base name (`array_agg_distinct`); group_concat's DISTINCT and max-length, and
-/// both functions' ORDER BY, are carried structurally in [`AggOrderSpec`] (no
-/// longer squashed into the function-name string).
+/// both functions' ORDER BY, are carried structurally in [`AggOrderSpec`].
 fn encode_aggregate(
     node: &exprs::TExprNode,
     fn_name: &str,

@@ -768,30 +768,10 @@ mod tests {
         input_is_intermediate: bool,
         intermediate_type: DataType,
         input_arg_type: DataType,
+        order: crate::exec::node::aggregate::AggOrderSpec,
     ) -> AggFunction {
-        // Test shorthand: "group_concat|d=1|a=1|n=0|m=1024" -> base name + structured order.
-        let mut parts = name.split('|');
-        let base = parts.next().unwrap_or(name).to_string();
-        let mut order = crate::exec::node::aggregate::AggOrderSpec::default();
-        let bools = |s: &str| {
-            s.split(',')
-                .filter(|p| !p.is_empty())
-                .map(|p| p == "1")
-                .collect::<Vec<_>>()
-        };
-        for tok in parts {
-            if let Some((k, v)) = tok.split_once('=') {
-                match k {
-                    "d" => order.is_distinct = v == "1",
-                    "a" => order.is_asc_order = bools(v),
-                    "n" => order.nulls_first = bools(v),
-                    "m" => order.group_concat_max_len = v.parse().ok(),
-                    _ => {}
-                }
-            }
-        }
         AggFunction {
-            name: base,
+            name: name.to_string(),
             inputs: vec![],
             input_is_intermediate,
             types: Some(crate::exec::node::aggregate::AggTypeSignature {
@@ -800,6 +780,19 @@ mod tests {
                 input_arg_type: Some(input_arg_type),
             }),
             order,
+        }
+    }
+
+    fn order_spec(
+        is_distinct: bool,
+        is_asc_order: &[bool],
+        nulls_first: &[bool],
+    ) -> crate::exec::node::aggregate::AggOrderSpec {
+        crate::exec::node::aggregate::AggOrderSpec {
+            is_distinct,
+            is_asc_order: is_asc_order.to_vec(),
+            nulls_first: nulls_first.to_vec(),
+            group_concat_max_len: None,
         }
     }
 
@@ -829,10 +822,11 @@ mod tests {
         ]));
         let arg_types = vec![DataType::Utf8, DataType::Utf8, DataType::Int64];
         let func = make_func(
-            "group_concat|d=1|a=1|n=0",
+            "group_concat",
             false,
             intermediate_type(&arg_types),
             input_type.clone(),
+            order_spec(true, &[true], &[false]),
         );
         let spec = GroupConcatAgg
             .build_spec_from_type(&func, Some(&input_type), false)
@@ -861,10 +855,11 @@ mod tests {
         ]));
         let arg_types = vec![DataType::Utf8, DataType::Utf8, DataType::Int64];
         let func = make_func(
-            "string_agg|d=1|a=1|n=0",
+            "string_agg",
             false,
             intermediate_type(&arg_types),
             input_type.clone(),
+            order_spec(true, &[true], &[false]),
         );
         let spec = GroupConcatAgg
             .build_spec_from_type(&func, Some(&input_type), false)
@@ -892,6 +887,7 @@ mod tests {
             false,
             intermediate_type(&[DataType::Int64]),
             input_type.clone(),
+            crate::exec::node::aggregate::AggOrderSpec::default(),
         );
         let spec = GroupConcatAgg
             .build_spec_from_type(&func, Some(&input_type), false)
@@ -909,10 +905,11 @@ mod tests {
             Arc::new(Field::new("sep", DataType::Utf8, true)),
         ]));
         let func = make_func(
-            "group_concat|d=0|a=|n=",
+            "group_concat",
             false,
             intermediate_type(&[DataType::Utf8, DataType::Utf8, DataType::Utf8]),
             input_type.clone(),
+            crate::exec::node::aggregate::AggOrderSpec::default(),
         );
         let spec = GroupConcatAgg
             .build_spec_from_type(&func, Some(&input_type), false)
@@ -943,10 +940,11 @@ mod tests {
             Arc::new(Field::new("sep", DataType::Utf8, true)),
         ]));
         let func = make_func(
-            "group_concat|d=1|a=|n=",
+            "group_concat",
             false,
             intermediate_type(&[DataType::Utf8, DataType::Null, DataType::Utf8]),
             input_type.clone(),
+            order_spec(true, &[], &[]),
         );
         let spec = GroupConcatAgg
             .build_spec_from_type(&func, Some(&input_type), false)
@@ -989,10 +987,11 @@ mod tests {
             Arc::new(Field::new("k", DataType::Int64, true)),
         ]));
         let func = make_func(
-            "group_concat|d=0|a=1|n=0",
+            "group_concat",
             false,
             intermediate_type(&[DataType::Utf8, DataType::Utf8, DataType::Int64]),
             input_type.clone(),
+            order_spec(false, &[true], &[false]),
         );
         let spec = GroupConcatAgg
             .build_spec_from_type(&func, Some(&input_type), false)
@@ -1022,10 +1021,11 @@ mod tests {
             Arc::new(Field::new("k", DataType::Int64, true)),
         ]));
         let func = make_func(
-            "group_concat|d=1|a=1|n=0",
+            "group_concat",
             false,
             intermediate_type(&[DataType::Utf8, DataType::Utf8, DataType::Int64]),
             input_type.clone(),
+            order_spec(true, &[true], &[false]),
         );
         let spec = GroupConcatAgg
             .build_spec_from_type(&func, Some(&input_type), false)
@@ -1056,10 +1056,11 @@ mod tests {
         ]));
         let intermediate_ty = intermediate_type(&[DataType::Utf8, DataType::Utf8, DataType::Int64]);
         let func = make_func(
-            "group_concat|d=1|a=1|n=0",
+            "group_concat",
             false,
             intermediate_ty.clone(),
             input_type.clone(),
+            order_spec(true, &[true], &[false]),
         );
         let spec = GroupConcatAgg
             .build_spec_from_type(&func, Some(&input_type), false)
@@ -1090,10 +1091,11 @@ mod tests {
             .unwrap();
 
         let merge_func = make_func(
-            "group_concat|d=1|a=1|n=0",
+            "group_concat",
             true,
             intermediate_ty.clone(),
             input_type,
+            order_spec(true, &[true], &[false]),
         );
         let merge_spec = GroupConcatAgg
             .build_spec_from_type(&merge_func, Some(&intermediate_ty), true)
