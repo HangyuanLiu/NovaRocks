@@ -37,14 +37,6 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::runtime_state::RuntimeState;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ApplyKeyValueType {
-    Int64,
-    Utf8,
-    BranchInt64,
-    BranchUtf8,
-}
-
 pub struct IcebergMergeSinkPlan {
     pub target_table: iceberg::table::Table,
     pub collector: Arc<IcebergCommitCollector>,

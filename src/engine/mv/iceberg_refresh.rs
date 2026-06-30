@@ -13746,7 +13746,7 @@ fn rewrite_merge_refresh_evidence(apply_key: ApplyKeyContract) -> RewriteMergeRe
         (RewriteEvidence::None, _) => RewriteMergeRefreshEvidence::None,
         (
             RewriteEvidence::Aggregate,
-            crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchUtf8,
+            crate::engine::mv::apply_key::ApplyKeyValueType::BranchUtf8,
         ) => RewriteMergeRefreshEvidence::BranchUnionAggregate,
         (RewriteEvidence::Aggregate, _) => RewriteMergeRefreshEvidence::Aggregate,
         (RewriteEvidence::JoinAggregate, _) => RewriteMergeRefreshEvidence::JoinAggregate,
@@ -14497,7 +14497,7 @@ fn arrow_data_type_to_iceberg_primitive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType;
+    use crate::engine::mv::apply_key::ApplyKeyValueType;
     use crate::engine::mv::refresh_property::PartitionPruningPolicy;
     use crate::sql::planner::plan::*;
     use arrow::array::{BinaryArray, Int32Array, Int64Array, StringArray};

@@ -35,7 +35,7 @@
 //! [`RefreshFragmentProperty::into_refresh_contract`] for the precise narrowing.
 
 use crate::connector::starrocks::table::model::IcebergTableRef;
-use crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType;
+use crate::engine::mv::apply_key::ApplyKeyValueType;
 use crate::engine::mv::refresh_contract::{
     AggregateRefreshContract, ApplyKeyContract, BranchRefreshContract, ImvRefreshContract,
     JoinRefreshContract,
@@ -2537,7 +2537,7 @@ mod tests {
     // Minimal contract builders used only in the parity tests below.
     // ------------------------------------------------------------------
 
-    use crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType;
+    use crate::engine::mv::apply_key::ApplyKeyValueType;
     use crate::engine::mv::refresh_driver::BaseSnapshotPolicy;
     use crate::meta::repository::mv_contract::{
         AggregateStateContract, ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,

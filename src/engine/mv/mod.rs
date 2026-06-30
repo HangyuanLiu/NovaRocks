@@ -1,3 +1,4 @@
+pub(crate) mod apply_key;
 pub(crate) mod dependency;
 pub(crate) mod iceberg_aggregate_state;
 pub(crate) mod iceberg_backend;
