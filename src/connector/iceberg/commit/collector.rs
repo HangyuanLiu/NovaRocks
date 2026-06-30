@@ -21,10 +21,9 @@
 //! before lowering, dropped after `run_iceberg_commit` returns.
 //!
 //! At pipeline finish, [`take_written_files`](IcebergCommitCollector::take_written_files)
-//! drains the per-fragment-instance entries from [`runtime::sink_commit`] and
-//! converts the recorded `TIcebergDataFile` values into [`WrittenFile`]s. Each
-//! file path is mirrored into the [`AbortLog`] so that a later commit failure
-//! can clean up via OpenDAL.
+//! consumes writer reports decoded by the runtime sink-commit wire adapter and
+//! converts them into [`WrittenFile`]s. Each file path is mirrored into the
+//! [`AbortLog`] so that a later commit failure can clean up via OpenDAL.
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -361,7 +360,7 @@ impl IcebergCommitCollector {
         let IcebergWriterReport { file, .. } = report;
         let format_name = file.format.clone();
         let format = DataFileFormat::from_str(&format_name).map_err(|e| {
-            format!("unsupported TIcebergDataFile format `{format_name}` in sink_commit_info: {e}")
+            format!("unsupported Iceberg writer report format `{format_name}`: {e}")
         })?;
         let content = match file.content {
             IcebergFileContent::Data => DataContentType::Data,
@@ -516,8 +515,8 @@ fn validate_puffin_dv_descriptor(
     }
 }
 
-/// Convert a thrift `map<i32, i64>` column-stat map into the `WrittenFile`
-/// `HashMap<i32, u64>` representation. Inverse of `data_writer::u64_stats_to_i64`.
+/// Convert signed writer-report counts into the `WrittenFile`
+/// `HashMap<i32, u64>` representation.
 fn i64_to_u64(value: i64, field: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| format!("iceberg {field} value {value} is negative"))
 }
@@ -1464,7 +1463,7 @@ mod tests {
             .convert_writer_report(report)
             .expect_err("unsupported format should fail");
 
-        assert!(err.contains("unsupported TIcebergDataFile format `csv`"));
+        assert!(err.contains("unsupported Iceberg writer report format `csv`"));
     }
 
     fn fixture_schema_and_spec() -> (SchemaRef, PartitionSpecRef) {

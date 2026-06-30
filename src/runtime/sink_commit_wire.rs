@@ -232,13 +232,6 @@ fn file_content_from_thrift(
 }
 
 #[cfg(test)]
-pub(crate) fn expected_file_content_for_test(
-    content: IcebergFileContent,
-) -> types::TIcebergFileContent {
-    file_content_to_thrift(content)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::connector::iceberg::delete_file::IcebergFileContent;
@@ -250,6 +243,7 @@ mod tests {
         FormatVersion, Literal, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType,
         Schema, Struct, TableMetadata, TableMetadataBuilder, Transform, Type,
     };
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     fn test_unpartitioned_metadata() -> TableMetadata {
@@ -406,6 +400,178 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn writer_report_to_sink_commit_info_carries_partition_descriptor() {
+        let metadata = test_string_partition_metadata(7);
+        let info = writer_report_to_sink_commit_info(
+            partitioned_writer_report(&metadata, "west"),
+            &metadata,
+        )
+        .expect("wire encode");
+        let df = info.iceberg_data_file.expect("iceberg data file");
+
+        assert_eq!(
+            df.partition_spec_id,
+            Some(metadata.default_partition_spec_id())
+        );
+        let desc = df
+            .partition_values_descriptor
+            .expect("partition descriptor must be present");
+        assert_eq!(desc.values.expect("values").len(), 1);
+    }
+
+    #[test]
+    fn writer_report_to_sink_commit_info_descriptor_failure_uses_engine_code() {
+        let metadata = test_string_partition_metadata(7);
+        let mut report = partitioned_writer_report(&metadata, "west");
+        report.file.partition.partition_values = Struct::from_iter([Some(Literal::int(7))]);
+
+        let err = writer_report_to_sink_commit_info(report, &metadata)
+            .expect_err("descriptor encode should fail");
+
+        assert!(
+            err.starts_with("[IcebergWriteDescriptorMismatch] "),
+            "got: {err}"
+        );
+        assert!(err.contains("incompatible with type String"), "got: {err}");
+    }
+
+    #[test]
+    fn writer_report_to_sink_commit_info_preserves_optional_file_metadata() {
+        let metadata = test_unpartitioned_metadata();
+        let report = IcebergWriterReport {
+            file: IcebergWrittenFileReport {
+                path: "file:///warehouse/t/data-1.parquet".to_string(),
+                format: "parquet".to_string(),
+                content: IcebergFileContent::Data,
+                record_count: 10,
+                file_size_in_bytes: 100,
+                partition: IcebergPartitionReport {
+                    partition_path: String::new(),
+                    null_fingerprint: String::new(),
+                    partition_spec_id: metadata.default_partition_spec_id(),
+                    partition_values: Struct::empty(),
+                },
+                split_offsets: Some(vec![4]),
+                column_stats: None,
+                referenced_data_file: Some("file:///warehouse/t/base.parquet".to_string()),
+                first_row_id: Some(42),
+                equality_ids: Some(vec![1, 2]),
+                key_metadata: Some(vec![1u8, 2, 3]),
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            },
+            is_overwrite: None,
+            is_rewrite: None,
+        };
+
+        let df = writer_report_to_sink_commit_info(report, &metadata)
+            .expect("wire encode")
+            .iceberg_data_file
+            .expect("iceberg data file");
+
+        assert_eq!(df.split_offsets, Some(vec![4]));
+        assert_eq!(
+            df.referenced_data_file.as_deref(),
+            Some("file:///warehouse/t/base.parquet")
+        );
+        assert_eq!(df.first_row_id, Some(42));
+        assert_eq!(df.equality_ids, Some(vec![1, 2]));
+        assert_eq!(df.key_metadata, Some(vec![1u8, 2, 3]));
+    }
+
+    #[test]
+    fn writer_report_to_sink_commit_info_preserves_nan_value_counts() {
+        let metadata = test_unpartitioned_metadata();
+        let report = IcebergWriterReport {
+            file: IcebergWrittenFileReport {
+                path: "file:///warehouse/t/data-1.parquet".to_string(),
+                format: "parquet".to_string(),
+                content: IcebergFileContent::Data,
+                record_count: 2,
+                file_size_in_bytes: 128,
+                partition: IcebergPartitionReport {
+                    partition_path: String::new(),
+                    null_fingerprint: String::new(),
+                    partition_spec_id: metadata.default_partition_spec_id(),
+                    partition_values: Struct::empty(),
+                },
+                split_offsets: None,
+                column_stats: Some(IcebergColumnStats {
+                    nan_value_counts: BTreeMap::from([(1, 1)]),
+                    ..Default::default()
+                }),
+                referenced_data_file: None,
+                first_row_id: None,
+                equality_ids: None,
+                key_metadata: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            },
+            is_overwrite: None,
+            is_rewrite: None,
+        };
+
+        let stats = writer_report_to_sink_commit_info(report, &metadata)
+            .expect("wire encode")
+            .iceberg_data_file
+            .expect("iceberg data file")
+            .column_stats
+            .expect("column stats");
+
+        assert_eq!(
+            stats.nan_value_counts.expect("nan value counts").get(&1),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn writer_report_to_sink_commit_info_preserves_puffin_dv_descriptor() {
+        let metadata = test_unpartitioned_metadata();
+        let report = IcebergWriterReport {
+            file: IcebergWrittenFileReport {
+                path: "file:///warehouse/t/dv-00000000.puffin".to_string(),
+                format: "puffin".to_string(),
+                content: IcebergFileContent::PositionDeletes,
+                record_count: 3,
+                file_size_in_bytes: 40,
+                partition: IcebergPartitionReport {
+                    partition_path: String::new(),
+                    null_fingerprint: String::new(),
+                    partition_spec_id: metadata.default_partition_spec_id(),
+                    partition_values: Struct::empty(),
+                },
+                split_offsets: Some(vec![]),
+                column_stats: None,
+                referenced_data_file: Some("file:///warehouse/t/data-1.parquet".to_string()),
+                first_row_id: None,
+                equality_ids: None,
+                key_metadata: None,
+                content_offset: Some(4),
+                content_size_in_bytes: Some(12),
+                cardinality: Some(3),
+            },
+            is_overwrite: None,
+            is_rewrite: None,
+        };
+
+        let df = writer_report_to_sink_commit_info(report, &metadata)
+            .expect("wire encode")
+            .iceberg_data_file
+            .expect("iceberg data file");
+
+        assert_eq!(df.format.as_deref(), Some("puffin"));
+        assert_eq!(
+            df.file_content,
+            Some(types::TIcebergFileContent::POSITION_DELETES)
+        );
+        assert_eq!(df.content_offset, Some(4));
+        assert_eq!(df.content_size_in_bytes, Some(12));
+        assert_eq!(df.cardinality, Some(3));
     }
 
     #[test]

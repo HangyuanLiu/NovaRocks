@@ -320,4 +320,61 @@ mod tests {
             Some(&1)
         );
     }
+
+    #[test]
+    fn writer_report_from_written_file_rejects_cardinality_overflow() {
+        let metadata = iceberg::spec::TableMetadataBuilder::from_table_creation(
+            iceberg::TableCreation::builder()
+                .name("t".to_string())
+                .location("file:///warehouse/db/t".to_string())
+                .schema(
+                    iceberg::spec::Schema::builder()
+                        .with_schema_id(1)
+                        .with_fields(vec![std::sync::Arc::new(
+                            iceberg::spec::NestedField::required(
+                                1,
+                                "id",
+                                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+                            ),
+                        )])
+                        .build()
+                        .expect("schema"),
+                )
+                .partition_spec(iceberg::spec::PartitionSpec::unpartition_spec())
+                .format_version(iceberg::spec::FormatVersion::V2)
+                .build(),
+        )
+        .expect("table metadata builder")
+        .build()
+        .expect("table metadata")
+        .metadata;
+        let file = crate::connector::iceberg::commit::WrittenFile {
+            path: "file:///warehouse/t/dv-00000000.puffin".to_string(),
+            format: iceberg::spec::DataFileFormat::Puffin,
+            content: iceberg::spec::DataContentType::PositionDeletes,
+            partition_values: Struct::empty(),
+            partition_spec_id: metadata.default_partition_spec_id(),
+            record_count: 3,
+            file_size_in_bytes: 40,
+            split_offsets: Vec::new(),
+            column_sizes: Default::default(),
+            value_counts: Default::default(),
+            null_value_counts: Default::default(),
+            nan_value_counts: Default::default(),
+            lower_bounds: Default::default(),
+            upper_bounds: Default::default(),
+            key_metadata: None,
+            referenced_data_file: Some("file:///warehouse/t/data-1.parquet".to_string()),
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: Some(4),
+            content_size_in_bytes: Some(12),
+            cardinality: Some(i64::MAX as u64 + 1),
+        };
+
+        let err = writer_report_from_written_file(&file, &metadata)
+            .expect_err("cardinality overflow should fail");
+
+        assert!(err.contains("cardinality"), "got: {err}");
+    }
 }

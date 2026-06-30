@@ -95,9 +95,9 @@ pub const NOVAROCKS_UPDATE_MODE: &str = "novarocks.update.mode";
 pub const NOVAROCKS_UPDATE_MODE_COW: &str = "copy-on-write";
 pub const NOVAROCKS_UPDATE_MODE_MOR: &str = "merge-on-read";
 
-/// Metadata about a single Parquet file produced by `IcebergSink` during a
-/// pipeline run. Mirrors the subset of `TIcebergDataFile` we need for commit
-/// and abort flows. Constructed from `TSinkCommitInfo` after pipeline finish.
+/// Metadata about a single file produced by an Iceberg write path and consumed
+/// by commit and abort flows. Constructed from internal writer reports or from
+/// direct engine-side file injection.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WrittenFile {
     pub path: String,
