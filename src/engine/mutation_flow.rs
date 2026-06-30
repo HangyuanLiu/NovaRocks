@@ -1422,6 +1422,7 @@ impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
             &self.state,
             &self.target,
             write,
+            self.commit_executor.table.metadata(),
             &self.commit_executor.collector,
             // Pure UPDATE appends no net-new data files; only a folded MERGE
             // not-matched INSERT (M3b) populates `appended_files`.
@@ -1499,14 +1500,21 @@ fn run_cow_update_file_rewrites(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     write: CowUpdateDistributedWrite,
+    metadata: &iceberg::spec::TableMetadata,
     collector: &Arc<IcebergCommitCollector>,
     appended_files: Vec<crate::connector::iceberg::commit::WrittenFile>,
 ) -> Result<CowUpdateRewriteRun, String> {
     let mut merged_commit: Option<WriteCommitInput> = None;
     let mut touched_data_files = Vec::with_capacity(write.file_plans.len());
     for plan in write.file_plans {
-        let new_files =
-            run_one_cow_file_rewrite(state, target, &plan, &write.data_sink_spec, collector)?;
+        let new_files = run_one_cow_file_rewrite(
+            state,
+            target,
+            &plan,
+            &write.data_sink_spec,
+            metadata,
+            collector,
+        )?;
         // Merge this file's writer commits into the single transaction-wide
         // `WriteCommitInput`; the collector turns all of them into committed
         // data files in one `CowUpdateCommit`.
@@ -1552,6 +1560,7 @@ fn run_one_cow_file_rewrite(
     target: &crate::engine::backend_resolver::TargetBackend,
     plan: &CowFileRewritePlan,
     data_sink_spec: &IcebergWriteSinkSpec,
+    metadata: &iceberg::spec::TableMetadata,
     collector: &Arc<IcebergCommitCollector>,
 ) -> Result<CowFileRewriteOutput, String> {
     crate::engine::query_prep::register_synthetic_table_for_query(
@@ -1592,15 +1601,19 @@ fn run_one_cow_file_rewrite(
             plan.rewrite_query
         ));
     };
-    // Extract the replacement file paths from the writer-reported sink
-    // commit infos. These go through the same `convert_sink_commit_info`
-    // the commit collector uses, so the recorded `new_files` paths match
+    // Extract the replacement file paths from the writer reports. These go
+    // through the same domain conversion the commit collector uses, so the
+    // recorded `new_files` paths match
     // the collector's `written` paths exactly (CowUpdateCommit requires
     // bidirectional set equality).
     let mut paths = Vec::new();
     for writer in &commit.writers {
-        for info in &writer.sink_commit_infos {
-            let file = collector.convert_sink_commit_info(info.clone())?;
+        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+            writer.sink_commit_infos.clone(),
+            metadata,
+        )?;
+        for report in reports {
+            let file = collector.convert_writer_report(report)?;
             paths.push(file.path);
         }
     }
@@ -2813,11 +2826,15 @@ impl DistributedMergeExecutor {
         };
         let mut files = Vec::new();
         for writer in &commit.writers {
-            for info in &writer.sink_commit_infos {
+            let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+                writer.sink_commit_infos.clone(),
+                self.commit_executor.table.metadata(),
+            )?;
+            for report in reports {
                 files.push(
                     self.commit_executor
                         .collector
-                        .convert_sink_commit_info(info.clone())?,
+                        .convert_writer_report(report)?,
                 );
             }
         }
@@ -2902,6 +2919,7 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
                     &self.state,
                     &self.target,
                     write,
+                    self.commit_executor.table.metadata(),
                     &self.commit_executor.collector,
                     insert_files,
                 )?;

@@ -127,8 +127,18 @@ impl IcebergWriteCommitExecutor {
     ) -> Result<CommitOutcome, CommitServiceError> {
         let mut writer_files = Vec::new();
         for writer in &write_commit.writers {
-            for info in &writer.sink_commit_infos {
-                match self.collector.convert_sink_commit_info(info.clone()) {
+            let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+                writer.sink_commit_infos.clone(),
+                self.table.metadata(),
+            )
+            .map_err(|message| {
+                CommitServiceError::known_uncommitted(
+                    message,
+                    self.cleanup_converted_writer_files(&writer_files),
+                )
+            })?;
+            for report in reports {
+                match self.collector.convert_writer_report(report) {
                     Ok(file) => writer_files.push(file),
                     Err(message) => {
                         let cleanup = self.cleanup_converted_writer_files(&writer_files);
