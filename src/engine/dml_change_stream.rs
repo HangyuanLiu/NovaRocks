@@ -16,6 +16,14 @@ pub(crate) const DML_CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_rout
 pub(crate) struct DmlChangeStreamWritePlan {
     pub(crate) producer: OptimizerPhysicalNode,
     pub(crate) dag: IcebergChangeStreamWriteDagSpec,
+    pub(crate) pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DmlPreExpandKeyedAssert {
+    pub(crate) key_column_name: String,
+    pub(crate) key_label: String,
+    pub(crate) message_prefix: String,
 }
 
 #[derive(Debug)]
@@ -138,7 +146,130 @@ pub(crate) fn build_dml_change_stream_write_plan(
         &producer.output_columns,
         sink_specs,
     )?;
-    Ok(DmlChangeStreamWritePlan { producer, dag })
+    Ok(DmlChangeStreamWritePlan {
+        producer,
+        dag,
+        pre_expand_keyed_assert: None,
+    })
+}
+
+pub(crate) fn inject_dml_pre_expand_keyed_assert(
+    build_result: &mut crate::sql::codegen::MultiFragmentBuildResult,
+    keyed_assert: Option<&DmlPreExpandKeyedAssert>,
+) -> Result<(), String> {
+    let Some(keyed_assert) = keyed_assert else {
+        return Ok(());
+    };
+
+    let mut injected = false;
+    let mut next_node_id = next_plan_node_id(build_result);
+    for fragment in &mut build_result.fragment_results {
+        let Some(expand_idx) = fragment.plan.nodes.iter().position(|node| {
+            node.node_type == crate::thrift::plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE
+        }) else {
+            continue;
+        };
+        if injected {
+            return Err(
+                "DML change-stream keyed assert found multiple ChangeEventExpand nodes".to_string(),
+            );
+        }
+        inject_keyed_assert_before_expand_node(fragment, expand_idx, keyed_assert, next_node_id)?;
+        next_node_id += 1;
+        injected = true;
+    }
+
+    if !injected {
+        return Err("DML change-stream keyed assert found no ChangeEventExpand node".to_string());
+    }
+    Ok(())
+}
+
+fn inject_keyed_assert_before_expand_node(
+    fragment: &mut crate::sql::codegen::FragmentBuildResult,
+    expand_idx: usize,
+    keyed_assert: &DmlPreExpandKeyedAssert,
+    node_id: i32,
+) -> Result<(), String> {
+    let expand = fragment
+        .plan
+        .nodes
+        .get(expand_idx)
+        .ok_or_else(|| "DML change-stream ChangeEventExpand index out of range".to_string())?;
+    if expand.num_children != 1 {
+        return Err(format!(
+            "DML change-stream ChangeEventExpand node_id={} expected one child, got {}",
+            expand.node_id, expand.num_children
+        ));
+    }
+    let child = fragment.plan.nodes.get(expand_idx + 1).ok_or_else(|| {
+        format!(
+            "DML change-stream ChangeEventExpand node_id={} missing child node",
+            expand.node_id
+        )
+    })?;
+    let key_slot = find_slot_id_in_row_tuples(
+        &fragment.desc_tbl,
+        &child.row_tuples,
+        &keyed_assert.key_column_name,
+    )?;
+    let mut assert_node = crate::sql::codegen::nodes::default_plan_node();
+    assert_node.node_id = node_id;
+    assert_node.node_type = crate::thrift::plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE;
+    assert_node.num_children = 1;
+    assert_node.limit = -1;
+    assert_node.row_tuples = child.row_tuples.clone();
+    assert_node.nullable_tuples = child.nullable_tuples.clone();
+    assert_node.compact_data = true;
+    assert_node.assert_num_rows_node = Some(crate::thrift::plan_nodes::TAssertNumRowsNode {
+        desired_num_rows: Some(1),
+        subquery_string: Some("DML change-stream matched row uniqueness".to_string()),
+        assertion: Some(crate::thrift::plan_nodes::TAssertion::LE),
+        group_key_slots: Some(vec![key_slot]),
+        group_key_labels: Some(vec![keyed_assert.key_label.clone()]),
+        keyed_message_prefix: Some(keyed_assert.message_prefix.clone()),
+    });
+    fragment.plan.nodes.insert(expand_idx + 1, assert_node);
+    Ok(())
+}
+
+fn find_slot_id_in_row_tuples(
+    desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
+    row_tuples: &[i32],
+    column_name: &str,
+) -> Result<i32, String> {
+    let slots = desc_tbl.slot_descriptors.as_ref().ok_or_else(|| {
+        "DML change-stream keyed assert descriptor table has no slots".to_string()
+    })?;
+    let mut matches = slots.iter().filter(|slot| {
+        slot.parent
+            .is_some_and(|tuple_id| row_tuples.contains(&tuple_id))
+            && slot
+                .col_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+    });
+    let slot = matches.next().ok_or_else(|| {
+        format!("DML change-stream keyed assert column `{column_name}` not found in child layout")
+    })?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "DML change-stream keyed assert column `{column_name}` is ambiguous in child layout"
+        ));
+    }
+    slot.id.ok_or_else(|| {
+        format!("DML change-stream keyed assert column `{column_name}` has no slot id")
+    })
+}
+
+fn next_plan_node_id(build_result: &crate::sql::codegen::MultiFragmentBuildResult) -> i32 {
+    build_result
+        .fragment_results
+        .iter()
+        .flat_map(|fragment| fragment.plan.nodes.iter().map(|node| node.node_id))
+        .max()
+        .unwrap_or(0)
+        + 1
 }
 
 fn build_dml_change_stream_dag_from_sink_specs(
@@ -553,6 +684,7 @@ mod tests {
                 Some(2),
                 vec![branch],
             ),
+            pre_expand_keyed_assert: None,
         }
     }
 
@@ -585,6 +717,155 @@ mod tests {
 
         assert!(execution.result.write_commit.is_some());
         assert!(execution.commit_plan.is_empty());
+    }
+
+    #[test]
+    fn pre_expand_keyed_assert_inserts_assert_num_rows_before_expand() {
+        let fragment = crate::sql::codegen::FragmentBuildResult {
+            fragment_id: 0,
+            plan: crate::thrift::plan_nodes::TPlan::new(vec![
+                {
+                    let mut node = crate::sql::codegen::nodes::default_plan_node();
+                    node.node_id = 10;
+                    node.node_type =
+                        crate::thrift::plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE;
+                    node.num_children = 1;
+                    node.row_tuples = vec![2];
+                    node.change_event_expand_node =
+                        Some(crate::thrift::plan_nodes::TChangeEventExpandNode {
+                            events: Vec::new(),
+                            output_slot_ids: Vec::new(),
+                            change_op_slot_id: 4,
+                            data_route_slot_id: Some(5),
+                        });
+                    node
+                },
+                {
+                    let mut node = crate::sql::codegen::nodes::default_plan_node();
+                    node.node_id = 11;
+                    node.node_type = crate::thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE;
+                    node.num_children = 0;
+                    node.row_tuples = vec![1];
+                    node
+                },
+            ]),
+            desc_tbl: crate::thrift::descriptors::TDescriptorTable::new(
+                Some(vec![crate::thrift::descriptors::TSlotDescriptor::new(
+                    Some(7),
+                    Some(1),
+                    None,
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                    Some("__nr_row_id".to_string()),
+                    Some(0),
+                    Some(true),
+                    Some(true),
+                    Some(false),
+                    None,
+                    None::<String>,
+                    None::<bool>,
+                )]),
+                Vec::new(),
+                None::<Vec<crate::thrift::descriptors::TTableDescriptor>>,
+                None::<bool>,
+            ),
+            exec_params: crate::thrift::internal_service::TPlanFragmentExecParams::new(
+                crate::thrift::types::TUniqueId::new(1, 1),
+                crate::thrift::types::TUniqueId::new(2, 2),
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+                None::<Vec<crate::thrift::data_sinks::TPlanFragmentDestination>>,
+                None::<i32>,
+                None::<i32>,
+                None::<bool>,
+                None::<bool>,
+                None::<crate::thrift::runtime_filter::TRuntimeFilterParams>,
+                None::<i32>,
+                None::<bool>,
+                None::<
+                    std::collections::BTreeMap<
+                        crate::thrift::types::TPlanNodeId,
+                        std::collections::BTreeMap<
+                            i32,
+                            Vec<crate::thrift::internal_service::TScanRangeParams>,
+                        >,
+                    >,
+                >,
+                None::<bool>,
+                None::<i32>,
+                None::<bool>,
+                None::<Vec<crate::thrift::internal_service::TExecDebugOption>>,
+            ),
+            output_sink: crate::thrift::data_sinks::TDataSink::new(
+                crate::thrift::data_sinks::TDataSinkType::RESULT_SINK,
+                None::<crate::thrift::data_sinks::TDataStreamSink>,
+                None::<crate::thrift::data_sinks::TResultSink>,
+                None::<crate::thrift::data_sinks::TMysqlTableSink>,
+                None::<crate::thrift::data_sinks::TExportSink>,
+                None::<crate::thrift::data_sinks::TOlapTableSink>,
+                None::<crate::thrift::data_sinks::TMemoryScratchSink>,
+                None::<crate::thrift::data_sinks::TMultiCastDataStreamSink>,
+                None::<crate::thrift::data_sinks::TSchemaTableSink>,
+                None::<crate::thrift::data_sinks::TIcebergTableSink>,
+                None::<crate::thrift::data_sinks::THiveTableSink>,
+                None::<crate::thrift::data_sinks::TTableFunctionTableSink>,
+                None::<crate::thrift::data_sinks::TDictionaryCacheSink>,
+                None::<Vec<Box<crate::thrift::data_sinks::TDataSink>>>,
+                None::<i64>,
+                None::<crate::thrift::data_sinks::TSplitDataStreamSink>,
+                None::<crate::thrift::data_sinks::TIcebergChangeStreamRouterSink>,
+            ),
+            output_exprs: None,
+            output_columns: Vec::new(),
+            direct_exec: None,
+            boundary_schemas: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+            query_global_dicts: None,
+            query_global_dict_exprs: None,
+        };
+        let mut build_result = crate::sql::codegen::MultiFragmentBuildResult {
+            fragment_results: vec![fragment],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+            boundary_schemas: Vec::new(),
+            rf_plan: None,
+        };
+
+        inject_dml_pre_expand_keyed_assert(
+            &mut build_result,
+            Some(&DmlPreExpandKeyedAssert {
+                key_column_name: "__nr_row_id".to_string(),
+                key_label: "_row_id".to_string(),
+                message_prefix: "MOR UPDATE matched target row".to_string(),
+            }),
+        )
+        .expect("inject assert");
+
+        let nodes = &build_result.fragment_results[0].plan.nodes;
+        assert_eq!(
+            nodes[0].node_type,
+            crate::thrift::plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE
+        );
+        assert_eq!(
+            nodes[1].node_type,
+            crate::thrift::plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE
+        );
+        assert_eq!(
+            nodes[2].node_type,
+            crate::thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE
+        );
+        let assert_payload = nodes[1]
+            .assert_num_rows_node
+            .as_ref()
+            .expect("assert payload");
+        assert_eq!(assert_payload.group_key_slots.as_deref(), Some(&[7][..]));
+        assert_eq!(
+            assert_payload.group_key_labels.as_deref(),
+            Some(&["_row_id".to_string()][..])
+        );
     }
 
     #[test]
