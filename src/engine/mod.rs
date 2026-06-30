@@ -12,10 +12,10 @@ use arrow::record_batch::RecordBatch;
 use tokio::runtime::Handle;
 
 use crate::engine::mv::refresh_context::MvRefreshPruningLimits;
+use crate::engine::query_options::StandaloneQueryOptions;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
-use crate::thrift::{internal_service::TQueryOptions, plan_nodes::TFileFormatType};
 
 use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, normalize_identifier};
 use crate::connector::{
@@ -58,6 +58,8 @@ pub(crate) mod mv_scheduler;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
 pub(crate) mod procedure;
+pub(crate) mod query_options;
+pub(crate) mod query_options_wire;
 pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod sql_expr;
@@ -342,11 +344,18 @@ pub struct StandaloneStarRocksTableInfo {
     pub tablets: Vec<StandaloneStarRocksTabletInfo>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StandaloneStreamLoadFormat {
+    Json,
+    CsvPlain,
+    Unsupported(&'static str),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StandaloneStreamLoadRequest {
     pub database: String,
     pub table: String,
-    pub format_type: TFileFormatType,
+    pub format_type: StandaloneStreamLoadFormat,
     pub columns: Option<String>,
     pub column_separator: Option<String>,
     pub row_delimiter: Option<String>,
@@ -793,7 +802,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<TQueryOptions>,
+        query_opts: Option<StandaloneQueryOptions>,
     ) -> Result<StatementResult, String> {
         // Install the per-statement dictionary provider so optimizer
         // calls reached through nested engine entry points (insert,
@@ -815,7 +824,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<TQueryOptions>,
+        query_opts: Option<StandaloneQueryOptions>,
     ) -> Result<StatementResult, String> {
         use crate::sql::parser::dialect::{
             StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
@@ -1946,7 +1955,7 @@ impl StandaloneSession {
         insert: &sqlparser::ast::Insert,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<&TQueryOptions>,
+        query_opts: Option<&StandaloneQueryOptions>,
     ) -> Result<StatementResult, String> {
         self.execute_insert_via_custom_parser(insert, current_catalog, current_database, query_opts)
     }
@@ -1958,7 +1967,7 @@ impl StandaloneSession {
         insert: &sqlparser::ast::Insert,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<&TQueryOptions>,
+        query_opts: Option<&StandaloneQueryOptions>,
     ) -> Result<StatementResult, String> {
         let insert_stmt = convert_sqlparser_insert_to_custom(insert)?;
         execute_insert_statement(
@@ -2789,7 +2798,7 @@ fn execute_query_direct_for_explicit_exception(
     codegen_catalog: &dyn crate::sql::catalog::CatalogProvider,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3095,7 +3104,7 @@ fn explain_analyze_query(
     codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     use crate::sql::codegen::ir::explain_distributed_plan_analyze;
@@ -3147,9 +3156,11 @@ fn explain_analyze_query(
     let planning_elapsed = planning_start.elapsed();
 
     let mut query_opts = query_opts.unwrap_or_default();
-    query_opts.enable_profile = Some(true);
+    query_opts.enable_profile = true;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     let execution_start = std::time::Instant::now();
+    let query_opts =
+        crate::engine::query_options_wire::standalone_query_options_to_thrift(&query_opts);
     let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
         dispatcher,
@@ -3310,7 +3321,7 @@ pub(crate) fn execute_query(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
 ) -> Result<QueryResult, String> {
     execute_query_with_catalog_provider(
         query,
@@ -3329,7 +3340,7 @@ pub(crate) fn execute_query_with_catalog_mgr(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
 ) -> Result<QueryResult, String> {
     let catalog_snapshot = state
         .catalog
@@ -3428,7 +3439,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink_spec: crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
@@ -3509,7 +3520,9 @@ pub(crate) fn execute_query_as_iceberg_write(
         build_result,
         dispatcher,
         scheduler,
-        query_opts,
+        crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
+            query_opts.as_ref(),
+        ),
     )
     .execute_with_write_outcome()
 }
@@ -3522,7 +3535,7 @@ pub(crate) fn execute_query_with_catalog_provider(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     execute_query_with_options_and_imv_validator_with_catalog_provider(
@@ -3564,7 +3577,7 @@ pub(crate) fn execute_query_with_options(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3591,7 +3604,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3622,7 +3635,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3652,7 +3665,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3767,7 +3780,9 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         build_result,
         dispatcher,
         scheduler,
-        query_opts,
+        crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
+            query_opts.as_ref(),
+        ),
     )
     .execute()
 }
@@ -3780,7 +3795,7 @@ pub(crate) fn execute_logical_plan_with_options(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3843,7 +3858,9 @@ pub(crate) fn execute_logical_plan_with_options(
         build_result,
         dispatcher,
         scheduler,
-        query_opts,
+        crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
+            query_opts.as_ref(),
+        ),
     )
     .execute()
 }
@@ -4070,7 +4087,7 @@ fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
 fn lower_plan_build_result(
     result: PlanBuildResult,
     arena: &mut crate::exec::expr::ExprArena,
-    query_opts: Option<&TQueryOptions>,
+    query_opts: Option<&StandaloneQueryOptions>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
 ) -> Result<crate::exec::node::ExecNode, String> {
     use crate::lower::thrift::layout::{build_tuple_slot_order, reorder_tuple_slots};
@@ -4141,6 +4158,8 @@ fn lower_plan_build_result(
     let layout_hints = tuple_slots.clone();
 
     let connectors = crate::connector::ConnectorRegistry::default();
+    let thrift_query_opts =
+        crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(query_opts);
     let lowered = lower_plan(
         &plan,
         arena,
@@ -4149,7 +4168,7 @@ fn lower_plan_build_result(
         query_global_dicts.as_deref(),
         query_global_dict_exprs.as_ref(),
         Some(&exec_params),
-        query_opts,
+        thrift_query_opts.as_ref(),
         None,
         &connectors,
         &layout_hints,
@@ -4161,7 +4180,7 @@ fn lower_plan_build_result(
 
 fn execute_plan(
     result: PlanBuildResult,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     profiler: Option<crate::runtime::profile::Profiler>,
@@ -4189,12 +4208,16 @@ fn execute_plan(
             None => Box::new(ResultSinkFactory::new(handle.clone())),
         };
 
-    // Unified pipeline DOP: a per-session `SET pipeline_dop = N` override (on TQueryOptions) is
+    // Unified pipeline DOP: a per-session `SET pipeline_dop = N` override is
     // honored; otherwise auto = cores/2 via the shared exec_env helper (no hardcoded min(4) cap).
     let session_dop = query_opts
         .as_ref()
         .and_then(|opts| opts.pipeline_dop)
         .unwrap_or(0);
+    let runtime_query_opts =
+        crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
+            query_opts.as_ref(),
+        );
     let pipeline_dop = crate::runtime::exec_env::calc_pipeline_dop(session_dop) as usize;
     execute_plan_with_pipeline(
         exec_plan,
@@ -4205,7 +4228,15 @@ fn execute_plan(
         profiler,
         pipeline_dop as _,
         std::sync::Arc::new(RuntimeState::new(
-            query_opts, None, None, None, None, None, None, None, None,
+            runtime_query_opts,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )),
         None,
         None,
@@ -4631,13 +4662,13 @@ fn stream_load_starrocks_table(
     };
     let insert_columns = parse_stream_load_columns(request.columns.as_deref(), &table_def)?;
     let rows = match request.format_type {
-        TFileFormatType::FORMAT_JSON => parse_json_stream_load_rows(
+        StandaloneStreamLoadFormat::Json => parse_json_stream_load_rows(
             &request.payload,
             &insert_columns,
             request.jsonpaths.as_deref(),
             request.strip_outer_array.unwrap_or(false),
         )?,
-        TFileFormatType::FORMAT_CSV_PLAIN => parse_csv_stream_load_rows(
+        StandaloneStreamLoadFormat::CsvPlain => parse_csv_stream_load_rows(
             &request.payload,
             &insert_columns,
             request.column_separator.as_deref(),
@@ -4647,10 +4678,9 @@ fn stream_load_starrocks_table(
             request.enclose,
             request.escape,
         )?,
-        other => {
+        StandaloneStreamLoadFormat::Unsupported(format_name) => {
             return Err(format!(
-                "standalone stream load only supports CSV/JSON, got {:?}",
-                other
+                "standalone stream load only supports CSV/JSON, got {format_name}",
             ));
         }
     };
