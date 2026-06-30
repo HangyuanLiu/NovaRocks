@@ -937,7 +937,7 @@ mod tests {
                     "ice",
                     &[
                         ("type".to_string(), "iceberg".to_string()),
-                        ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
                         (
                             "iceberg.catalog.warehouse".to_string(),
                             "file:///tmp/novarocks-per-table-binding".to_string(),

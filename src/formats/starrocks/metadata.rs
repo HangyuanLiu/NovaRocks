@@ -164,8 +164,9 @@ fn load_tablet_snapshot_at_version(
 ) -> Result<StarRocksTabletSnapshot, String> {
     let standalone_metadata_rel = metadata_rel_path(tablet_id, version)?;
     for candidate_rel in metadata_rel_path_candidates(tablet_id, &standalone_metadata_rel) {
-        if object_exists(rt, op, &candidate_rel)? {
-            let metadata_bytes = read_all_bytes(rt, op, &candidate_rel)?;
+        let candidate_operator_rel = root.operator_relative_path(&candidate_rel);
+        if object_exists(rt, op, &candidate_operator_rel)? {
+            let metadata_bytes = read_all_bytes(rt, op, &candidate_operator_rel)?;
             let metadata_path = root.join_relative_path(&candidate_rel);
             return parse_standalone_snapshot(
                 tablet_id,
@@ -180,8 +181,9 @@ fn load_tablet_snapshot_at_version(
     if version == INITIAL_VERSION && tablet_id != 0 {
         let initial_metadata_rel = metadata_rel_path(0, INITIAL_VERSION)?;
         for candidate_rel in metadata_rel_path_candidates(tablet_id, &initial_metadata_rel) {
-            if object_exists(rt, op, &candidate_rel)? {
-                let metadata_bytes = read_all_bytes(rt, op, &candidate_rel)?;
+            let candidate_operator_rel = root.operator_relative_path(&candidate_rel);
+            if object_exists(rt, op, &candidate_operator_rel)? {
+                let metadata_bytes = read_all_bytes(rt, op, &candidate_operator_rel)?;
                 let metadata_path = root.join_relative_path(&candidate_rel);
                 return parse_initial_snapshot(
                     tablet_id,
@@ -196,8 +198,9 @@ fn load_tablet_snapshot_at_version(
 
     let bundle_metadata_rel = metadata_rel_path(0, version)?;
     for candidate_rel in metadata_rel_path_candidates(tablet_id, &bundle_metadata_rel) {
-        if object_exists(rt, op, &candidate_rel)? {
-            let metadata_bytes = read_all_bytes(rt, op, &candidate_rel)?;
+        let candidate_operator_rel = root.operator_relative_path(&candidate_rel);
+        if object_exists(rt, op, &candidate_operator_rel)? {
+            let metadata_bytes = read_all_bytes(rt, op, &candidate_operator_rel)?;
             let metadata_path = root.join_relative_path(&candidate_rel);
             return parse_bundle_snapshot(
                 tablet_id,
@@ -286,6 +289,13 @@ fn read_segment_bytes_for_footer(
     }
 }
 
+pub(crate) fn tablet_operator_relative_path(
+    tablet_root_path: &str,
+    rel_path: &str,
+) -> Result<String, String> {
+    Ok(TabletRoot::parse(tablet_root_path)?.operator_relative_path(rel_path))
+}
+
 fn parse_standalone_snapshot(
     tablet_id: i64,
     version: i64,
@@ -352,7 +362,7 @@ fn build_standalone_snapshot(
     }
     let (segment_files, delete_predicates) = collect_segment_files(root, &metadata)?;
     let total_num_rows = collect_total_num_rows(&metadata, tablet_id, metadata_path)?;
-    let delvec_meta = collect_delvec_meta(&metadata)?;
+    let delvec_meta = collect_delvec_meta(root, &metadata)?;
     let mut historical_schemas = metadata
         .historical_schemas
         .clone()
@@ -403,7 +413,7 @@ fn parse_bundle_snapshot(
     })?;
     let (segment_files, delete_predicates) = collect_segment_files(root, &metadata)?;
     let total_num_rows = collect_total_num_rows(&metadata, tablet_id, metadata_path)?;
-    let delvec_meta = collect_delvec_meta(&metadata)?;
+    let delvec_meta = collect_delvec_meta(root, &metadata)?;
     let mut historical_schemas = metadata
         .historical_schemas
         .clone()
@@ -719,7 +729,7 @@ fn collect_segment_files(
             let rel_path = format!("{DATA_DIR}/{name}");
             files.push(StarRocksSegmentFile {
                 name,
-                relative_path: rel_path.clone(),
+                relative_path: root.operator_relative_path(&rel_path),
                 path: root.join_relative_path(&rel_path),
                 rowset_version,
                 schema_id: rowset_schema_id,
@@ -859,7 +869,10 @@ pub(crate) fn collect_delete_predicates(
     Ok(delete_predicates)
 }
 
-fn collect_delvec_meta(metadata: &TabletMetadataPb) -> Result<StarRocksDelvecMetaRaw, String> {
+fn collect_delvec_meta(
+    root: &TabletRoot,
+    metadata: &TabletMetadataPb,
+) -> Result<StarRocksDelvecMetaRaw, String> {
     let mut out = StarRocksDelvecMetaRaw::default();
     let Some(raw) = metadata.delvec_meta.as_ref() else {
         return Ok(out);
@@ -877,7 +890,8 @@ fn collect_delvec_meta(metadata: &TabletMetadataPb) -> Result<StarRocksDelvecMet
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .ok_or_else(|| format!("delvec file name is missing for version {}", version))?;
-        let rel = format!("{DATA_DIR}/{}", name.trim_start_matches('/'));
+        let rel_path = format!("{DATA_DIR}/{}", name.trim_start_matches('/'));
+        let rel = root.operator_relative_path(&rel_path);
         if out
             .version_to_file_rel_path
             .insert(*version, rel.clone())
@@ -1140,6 +1154,23 @@ impl TabletRoot {
             }
         }
     }
+
+    fn operator_relative_path(&self, rel_path: &str) -> String {
+        let rel = rel_path.trim_start_matches('/');
+        match self {
+            Self::Local { .. } => rel.to_string(),
+            Self::ObjectStore { root_path, .. } => {
+                let root = root_path.trim_matches('/');
+                if root.is_empty() {
+                    rel.to_string()
+                } else if rel.is_empty() {
+                    root.to_string()
+                } else {
+                    format!("{root}/{rel}")
+                }
+            }
+        }
+    }
 }
 
 fn split_bucket_and_root(value: &str) -> Result<(String, String), String> {
@@ -1200,6 +1231,26 @@ mod tests {
     };
     use prost::Message;
     use tempfile::TempDir;
+
+    #[test]
+    fn object_store_root_maps_display_and_operator_relative_paths() {
+        let root = TabletRoot::parse("s3://bucket/warehouse/db_1/table_2/100")
+            .expect("parse object-store tablet root");
+
+        assert_eq!(
+            root.join_relative_path("meta/0000000000000000_0000000000000001.meta"),
+            "s3://bucket/warehouse/db_1/table_2/100/meta/0000000000000000_0000000000000001.meta"
+        );
+        assert_eq!(
+            root.operator_relative_path("meta/0000000000000000_0000000000000001.meta"),
+            "warehouse/db_1/table_2/100/meta/0000000000000000_0000000000000001.meta"
+        );
+        assert_eq!(
+            tablet_operator_relative_path("s3://bucket/warehouse/db_1/table_2/100", "data/seg.dat")
+                .expect("operator relative path"),
+            "warehouse/db_1/table_2/100/data/seg.dat"
+        );
+    }
 
     #[test]
     fn load_bundle_metadata_snapshot_from_local_file() {
@@ -1946,7 +1997,8 @@ mod tests {
             ..Default::default()
         };
 
-        let delvec_meta = collect_delvec_meta(&metadata).expect("collect delvec meta");
+        let root = TabletRoot::parse("/tmp/starrocks_tablet").expect("parse local root");
+        let delvec_meta = collect_delvec_meta(&root, &metadata).expect("collect delvec meta");
         assert_eq!(
             delvec_meta
                 .version_to_file_rel_path

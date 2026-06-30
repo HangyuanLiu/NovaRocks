@@ -410,7 +410,7 @@ fn standalone_mysql_server_supports_minimal_iceberg_flow() {
     let mut conn = server.connect_root(port);
 
     conn.query_drop(format!(
-        r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+        r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
         warehouse.path().display()
     ))
     .expect("create iceberg catalog");
@@ -530,7 +530,7 @@ fn standalone_mysql_server_supports_catalog_session_context() {
     let mut conn = server.connect_root(port);
 
     conn.query_drop(format!(
-        r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+        r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
         warehouse.path().display()
     ))
     .expect("create iceberg catalog");
@@ -594,7 +594,7 @@ fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
     let mut conn = server.connect_root(port);
 
     conn.query_drop(format!(
-        r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+        r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
         warehouse.path().display()
     ))
     .expect("create iceberg catalog");

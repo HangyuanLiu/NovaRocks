@@ -50,10 +50,6 @@ pub(crate) enum IcebergCatalogKind {
     /// owns the warehouse directly via `HadoopFileSystemCatalog`. Metadata
     /// lives at `<warehouse>/<ns>/<table>/metadata/v{N}.metadata.json`.
     Hadoop,
-    /// `iceberg.catalog.type = memory` — testing-only, in-memory table
-    /// registry; not yet used by the catalog pipeline but accepted by
-    /// `build_catalog_entry` as a no-op kind.
-    Memory,
     /// `iceberg.catalog.type = rest` — speak Iceberg REST Catalog
     /// protocol against an external server (`uri`). Used by Lakekeeper /
     /// Polaris / Tabular / Snowflake Open Catalog / etc.
@@ -75,7 +71,7 @@ pub(crate) struct IcebergCatalogEntry {
     pub(crate) kind: IcebergCatalogKind,
     pub(crate) warehouse_uri: String,
     /// REST endpoint URL (`uri` property) — populated only when
-    /// `kind == IcebergCatalogKind::Rest`. None for Hadoop / Memory.
+    /// `kind == IcebergCatalogKind::Rest`. None for Hadoop.
     #[allow(dead_code)]
     pub(crate) rest_uri: Option<String>,
     /// HMS endpoint in `host:port` form (no `thrift://`) — populated only when
@@ -154,7 +150,7 @@ impl IcebergCatalogEntry {
 
     /// True when namespace/table state is owned by a remote Iceberg catalog
     /// service (REST server or Hive Metastore) rather than NovaRocks' direct
-    /// filesystem / object-store warehouse layout (Hadoop / Memory). These
+    /// filesystem / object-store warehouse layout (Hadoop). These
     /// catalogs route namespace + table operations through the iceberg-rust
     /// `Catalog` trait via `build_iceberg_catalog`.
     pub(crate) fn uses_remote_catalog(&self) -> bool {
@@ -574,7 +570,7 @@ pub(crate) fn create_table(
     // TableCreation; the typed `format_version` builder field never makes it
     // to the wire, so v3 tables would otherwise be created as v2 on REST.
     // Re-insert `format-version` into the property list for REST only.
-    // Hadoop / Memory catalogs route through `TableMetadataBuilder::from_
+    // Hadoop catalogs route through `TableMetadataBuilder::from_
     // table_creation`, which calls `set_properties` and rejects reserved
     // properties (`format-version` is reserved); the typed `format_version`
     // builder field is the supported channel there.
@@ -597,7 +593,7 @@ pub(crate) fn create_table(
         table_creation.build()
     };
 
-    // For Hadoop/Memory catalogs, ensure the namespace exists before table creation.
+    // For Hadoop catalogs, ensure the namespace exists before table creation.
     // Remote catalogs (REST / Hive) manage namespace separately via CREATE DATABASE.
     if !entry.uses_remote_catalog() {
         let _ =
@@ -1076,7 +1072,7 @@ pub(crate) fn insert_rows(
     ])
     .map_err(|e| format!("build iceberg table ident: {e}"))?;
 
-    // For Hadoop/Memory catalogs: ensure namespace exists and register the table
+    // For Hadoop catalogs: ensure namespace exists and register the table
     // by its metadata location so the catalog can resolve it for the commit.
     // Remote catalogs (REST / Hive) already track tables through the metastore /
     // REST API; skip registration.
@@ -1522,12 +1518,11 @@ pub(crate) fn build_catalog_entry(
     let kind = match props.get("iceberg.catalog.type") {
         None => IcebergCatalogKind::Hadoop,
         Some(v) if v.eq_ignore_ascii_case("hadoop") => IcebergCatalogKind::Hadoop,
-        Some(v) if v.eq_ignore_ascii_case("memory") => IcebergCatalogKind::Memory,
         Some(v) if v.eq_ignore_ascii_case("rest") => IcebergCatalogKind::Rest,
         Some(v) if v.eq_ignore_ascii_case("hive") => IcebergCatalogKind::Hive,
         Some(v) => {
             return Err(format!(
-                "standalone iceberg catalog supports iceberg.catalog.type=memory|hadoop|rest|hive, got {v}"
+                "standalone iceberg catalog supports iceberg.catalog.type=hadoop|rest|hive, got {v}"
             ));
         }
     };
@@ -1949,7 +1944,7 @@ pub(crate) fn build_iceberg_catalog(
     entry: &IcebergCatalogEntry,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
     match entry.kind {
-        IcebergCatalogKind::Hadoop | IcebergCatalogKind::Memory => {
+        IcebergCatalogKind::Hadoop => {
             let hadoop = build_hadoop_catalog(entry)?;
             Ok(Arc::new(hadoop) as Arc<dyn iceberg::Catalog>)
         }
@@ -1976,6 +1971,11 @@ fn normalize_warehouse_location(raw: &str) -> Result<(String, PathBuf), String> 
         let path = PathBuf::from(stripped);
         let path = canonicalize_or_join(&path)?;
         return Ok((format!("file://{}", path.display()), path));
+    }
+    if raw.contains("://") {
+        return Err(format!(
+            "standalone iceberg hadoop catalog warehouse only supports local paths or file:// URIs, got {raw}"
+        ));
     }
 
     let path = PathBuf::from(raw);
@@ -3975,7 +3975,37 @@ mod rest_catalog_tests {
         )
         .map(|_| ())
         .expect_err("unknown type should be rejected");
-        assert!(err.contains("memory|hadoop|rest|hive"), "{err}");
+        assert!(err.contains("hadoop|rest|hive"), "{err}");
+        assert!(!err.contains("memory"), "{err}");
+    }
+
+    #[test]
+    fn build_catalog_entry_rejects_memory_catalog_type() {
+        let err = build_catalog_entry(
+            "ice",
+            &[("iceberg.catalog.type".to_string(), "memory".to_string())],
+        )
+        .map(|_| ())
+        .expect_err("memory catalog should be unsupported");
+        assert!(err.contains("hadoop|rest|hive"), "{err}");
+        assert!(!err.contains("memory|"), "{err}");
+    }
+
+    #[test]
+    fn build_catalog_entry_rejects_memory_warehouse_uri_for_hadoop_catalog() {
+        let err = build_catalog_entry(
+            "ice",
+            &[
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    format!("{}://warehouse", "memory"),
+                ),
+            ],
+        )
+        .map(|_| ())
+        .expect_err("memory warehouse URI should be unsupported");
+        assert!(err.contains("local paths or file:// URIs"), "{err}");
     }
 
     fn hive_props(uris: &str) -> Vec<(String, String)> {

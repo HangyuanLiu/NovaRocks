@@ -275,9 +275,9 @@ mod tests {
     #[tokio::test]
     async fn enumerate_files_empty_set_returns_empty() {
         // Empty snapshot_ids → no I/O, empty result.
-        // Use an empty in-memory table (no snapshots at all) so metadata is valid.
+        // Use an empty local table metadata object (no snapshots at all) so metadata is valid.
         let metadata = build_test_metadata_with_snapshots(vec![], vec![]);
-        let file_io = iceberg::io::FileIO::new_with_memory();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         let result = enumerate_files_for_snapshots(&file_io, &metadata, &HashSet::new())
             .await
             .expect("enumerate should succeed for empty set");

@@ -796,24 +796,17 @@ mod tests {
     #[tokio::test]
     async fn empty_write_to_partitioned_v3_table_writes_noop_overwrite_snapshot() {
         // Build a partitioned table with 2 data files in region=us, 1 in region=eu.
-        let fixture = v3_partitioned_table_with_data().await;
+        let mut fixture = v3_partitioned_table_with_data().await;
 
         // Reload so the table handle reflects the seeded snapshot.
-        let fixture = {
-            let table = fixture
-                .catalog
-                .load_table(&fixture.table_ident)
-                .await
-                .expect("reload fixture table");
-            crate::connector::iceberg::commit::test_helpers::IcebergTestFixture {
-                catalog: fixture.catalog.clone(),
-                table,
-                table_ident: fixture.table_ident.clone(),
-            }
-        };
+        fixture.table = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload fixture table");
 
         // Run OverwritePartitionsCommit with zero written files.
-        let outcome = run_overwrite_partitions_commit(fixture.clone(), vec![])
+        let outcome = run_overwrite_partitions_commit(&fixture, vec![])
             .await
             .expect("OverwritePartitionsCommit succeeds on empty written");
 
@@ -852,19 +845,12 @@ mod tests {
         use iceberg::spec::{DataFileFormat, Literal, PrimitiveLiteral, Struct};
         use std::collections::HashMap;
 
-        let fixture = v3_partitioned_table_with_data().await;
-        let fixture = {
-            let table = fixture
-                .catalog
-                .load_table(&fixture.table_ident)
-                .await
-                .expect("reload fixture table");
-            crate::connector::iceberg::commit::test_helpers::IcebergTestFixture {
-                catalog: fixture.catalog.clone(),
-                table,
-                table_ident: fixture.table_ident.clone(),
-            }
-        };
+        let mut fixture = v3_partitioned_table_with_data().await;
+        fixture.table = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload fixture table");
 
         // Sanity: 3 live files before the overwrite.
         let pre = enumerate_live_all_files(&fixture.table, &fixture.table.file_io().clone())
@@ -914,7 +900,7 @@ mod tests {
             cardinality: None,
         };
 
-        let outcome = run_overwrite_partitions_commit(fixture.clone(), vec![new_file])
+        let outcome = run_overwrite_partitions_commit(&fixture, vec![new_file])
             .await
             .expect("OverwritePartitionsCommit succeeds");
         assert_ne!(outcome.new_snapshot_id, 0);

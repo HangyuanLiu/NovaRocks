@@ -78,7 +78,7 @@ pub(crate) fn execute(
     };
 
     // 6. Execute via async bridge.
-    //    build_iceberg_catalog dispatches Hadoop / Memory / REST.
+    //    build_iceberg_catalog dispatches Hadoop / REST / Hive.
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
         crate::connector::iceberg::commit::execute_ref_action(catalog.as_ref(), &connector_plan)

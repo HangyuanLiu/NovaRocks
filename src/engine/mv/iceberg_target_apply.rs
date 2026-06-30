@@ -1635,33 +1635,35 @@ mod tests {
     use iceberg::spec::Struct;
     use std::sync::Arc;
 
-    /// Build a minimal `MemoryCatalog`-backed iceberg table that can serve as
+    /// Build a minimal local Hadoop-catalog iceberg table that can serve as
     /// the target for `locate_target_rows_by_apply_key` tests.  The table has
     /// a single `i64` column named `ICEBERG_MV_APPLY_KEY_COLUMN` and no data
     /// files.  The `_row_ids` slice is accepted for future extension but
     /// currently unused (no data is written; tests that exercise the no-request
     /// path need an empty target table).
-    fn build_memory_iceberg_apply_key_target(_row_ids: &[i64]) -> iceberg::table::Table {
+    fn build_local_iceberg_apply_key_target(_row_ids: &[i64]) -> iceberg::table::Table {
         use iceberg::Catalog;
-        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
         use iceberg::spec::{
             FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, Type,
         };
-        use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
-        use std::collections::HashMap;
-        use uuid::Uuid;
+        use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 
+        let warehouse_dir = tempfile::TempDir::new()
+            .expect("target warehouse tempdir")
+            .keep();
+        let warehouse = format!("file://{}", warehouse_dir.join("warehouse").display());
+        let entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "apply_key_target_test",
+            &[
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                ("iceberg.catalog.warehouse".to_string(), warehouse),
+            ],
+        )
+        .expect("build hadoop catalog entry");
+        let catalog = crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&entry)
+            .expect("build hadoop catalog");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let warehouse = format!("memory://test-warehouse-{}", Uuid::new_v4());
-            let catalog = MemoryCatalogBuilder::default()
-                .load(
-                    "memory",
-                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
-                )
-                .await
-                .expect("MemoryCatalog::load");
-
             let namespace = NamespaceIdent::new("db".to_string());
             catalog
                 .create_namespace(&namespace, std::collections::HashMap::new())
@@ -2158,7 +2160,7 @@ mod tests {
     fn empty_request_with_filter_none_returns_empty_groups() {
         // No request → no scan → empty groups, regardless of filter shape.
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let target_table = build_memory_iceberg_apply_key_target(&[]);
+        let target_table = build_local_iceberg_apply_key_target(&[]);
         let existing = std::collections::HashMap::new();
         let referenced = std::collections::HashMap::new();
         let groups = rt
@@ -2176,7 +2178,7 @@ mod tests {
     #[test]
     fn empty_request_with_empty_allow_list_returns_empty_groups() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let target_table = build_memory_iceberg_apply_key_target(&[]);
+        let target_table = build_local_iceberg_apply_key_target(&[]);
         let existing = std::collections::HashMap::new();
         let referenced = std::collections::HashMap::new();
         let filter = TargetPartitionFilter::AllowList(std::collections::BTreeSet::new());

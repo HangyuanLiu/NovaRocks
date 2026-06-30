@@ -5138,7 +5138,7 @@ path = "{metadata_path}"
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open");
         let warehouse = TempDir::new().expect("warehouse");
         let sql = format!(
-            r#"CREATE EXTERNAL CATALOG ice PROPERTIES("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            r#"CREATE EXTERNAL CATALOG ice PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
             warehouse.path().display()
         );
         engine.session().execute(&sql).expect("create catalog");
@@ -5220,7 +5220,7 @@ path = "{metadata_path}"
                     table_uuid: Some("uuid-parted".to_string()),
                     current_snapshot_id: Some(1),
                     schema_id: 1,
-                    location: "memory://ice/db/parted".to_string(),
+                    location: "file:///ice/db/parted".to_string(),
                     schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
                     serialized_metadata: None,
                     serialized_metadata_rows: None,
@@ -6246,30 +6246,17 @@ enable_path_style_access = true
 
     fn dummy_mv_refresh_context_for_validator_test()
     -> crate::engine::mv::refresh_context::IcebergMvRefreshContext {
-        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
         use iceberg::spec::{
             FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
             TableMetadataBuilder, Type,
         };
         use iceberg::table::Table;
-        use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
+        use iceberg::{NamespaceIdent, TableIdent};
 
-        let warehouse = format!(
-            "memory://novarocks-imv-validator-test-{}",
-            uuid::Uuid::new_v4()
-        );
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
-            runtime
-                .block_on(MemoryCatalogBuilder::default().load(
-                    "memory",
-                    std::collections::HashMap::from([(
-                        MEMORY_CATALOG_WAREHOUSE.to_string(),
-                        warehouse.clone(),
-                    )]),
-                ))
-                .expect("memory catalog"),
-        );
+        let warehouse_dir = tempfile::TempDir::new()
+            .expect("target warehouse tempdir")
+            .keep();
+        let warehouse = format!("file://{}", warehouse_dir.join("warehouse").display());
 
         let schema = Schema::builder()
             .with_fields(vec![
@@ -6282,7 +6269,7 @@ enable_path_style_access = true
             schema,
             PartitionSpec::unpartition_spec().into_unbound(),
             SortOrder::unsorted_order(),
-            "memory://validator-target/table".to_string(),
+            format!("{warehouse}/validator-target/table"),
             FormatVersion::V3,
             std::collections::HashMap::from([(
                 "write.row-lineage".to_string(),
@@ -6294,7 +6281,7 @@ enable_path_style_access = true
         .expect("metadata")
         .metadata;
         let target_table = Table::builder()
-            .file_io(iceberg::io::FileIO::new_with_memory())
+            .file_io(iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .identifier(TableIdent::new(
                 NamespaceIdent::new("db".to_string()),
@@ -6306,11 +6293,15 @@ enable_path_style_access = true
             crate::connector::iceberg::catalog::registry::build_catalog_entry(
                 "tgt",
                 &[
-                    ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
                     ("iceberg.catalog.warehouse".to_string(), warehouse),
                 ],
             )
             .expect("catalog entry"),
+        );
+        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&target_entry)
+                .expect("build hadoop catalog"),
         );
 
         crate::engine::mv::refresh_context::IcebergMvRefreshContext {
@@ -6362,7 +6353,7 @@ enable_path_style_access = true
                             table_uuid: Some("uuid-b".to_string()),
                             current_snapshot_id: Some(22),
                             schema_id: 1,
-                            location: "memory://ice/db/b".to_string(),
+                            location: "file:///ice/db/b".to_string(),
                             schema: crate::sql::catalog::IcebergSchemaDef {
                                 fields: vec![
                                     crate::sql::catalog::IcebergSchemaFieldDef {
@@ -7034,7 +7025,7 @@ enable_path_style_access = true
         let session = engine.session();
 
         let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
             warehouse.path().display()
         );
         let create_catalog = session
@@ -7087,7 +7078,7 @@ enable_path_style_access = true
         let session = engine.session();
 
         let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
             warehouse.path().display()
         );
         let create_catalog = session
@@ -7208,7 +7199,7 @@ enable_path_style_access = true
         let session = engine.session();
 
         let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
             warehouse.path().display()
         );
         let create_catalog = session
@@ -7287,7 +7278,7 @@ enable_path_style_access = true
             let session = engine.session();
 
             let create_catalog_sql = format!(
-                r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+                r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
                 warehouse.path().display()
             );
             let create_catalog = session
@@ -7358,7 +7349,7 @@ enable_path_style_access = true
             let session = engine.session();
 
             let create_catalog_sql = format!(
-                r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+                r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
                 warehouse.path().display()
             );
             assert!(matches!(
@@ -7921,7 +7912,7 @@ path = "meta/operations.sqlite"
         let engine = open_test_engine_with_metadata(warehouse);
         let session = engine.session();
         let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
             warehouse.path().display()
         );
         session
@@ -7954,7 +7945,7 @@ path = "meta/operations.sqlite"
         let engine = open_test_engine_with_metadata(warehouse);
         let session = engine.session();
         let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
             warehouse.path().display()
         );
         session
@@ -8306,7 +8297,7 @@ path = "meta/operations.sqlite"
         let engine = open_test_engine_with_metadata(&warehouse);
         let session = engine.session();
         let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
             warehouse.path().display()
         );
         session
@@ -9365,7 +9356,7 @@ path = "meta/operations.sqlite"
         let engine = open_test_engine_with_metadata(warehouse);
         let session = engine.session();
         let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
             warehouse.path().display()
         );
         session
@@ -9510,7 +9501,7 @@ path = "meta/operations.sqlite"
             .expect("open standalone engine");
         let session = engine.session();
         let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
             warehouse.path().display()
         );
         session
@@ -9544,7 +9535,7 @@ path = "meta/operations.sqlite"
             .expect("open standalone engine");
         let session = engine.session();
         let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
             warehouse.path().display()
         );
         session
@@ -9581,7 +9572,7 @@ path = "meta/operations.sqlite"
             .expect("open standalone engine");
         let session = engine.session();
         let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
             warehouse.path().display()
         );
         session
@@ -10094,7 +10085,7 @@ path = "meta/operations.sqlite"
         let engine = open_test_engine_with_metadata(warehouse);
         let session = engine.session();
         let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
             warehouse.path().display()
         );
         session

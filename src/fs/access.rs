@@ -697,11 +697,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_memory_scheme_as_unsupported() {
+    fn rejects_unknown_scheme_as_unsupported() {
         let resolver = FsAccessResolver::new();
         let err = resolver
-            .parse_location("memory://warehouse/table/data.parquet")
-            .expect_err("memory is not a NovaRocks filesystem scheme");
+            .parse_location("unsupported://warehouse/table/data.parquet")
+            .expect_err("unknown scheme is not a NovaRocks filesystem scheme");
 
         assert!(err.contains("unsupported fs location scheme"), "{err}");
     }

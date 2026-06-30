@@ -199,9 +199,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_scan_paths_rejects_memory_uri() {
-        let err = classify_scan_paths(["memory://warehouse/table/data.parquet"])
-            .expect_err("memory is not a NovaRocks scan path");
+    fn classify_scan_paths_rejects_unknown_uri_scheme() {
+        let err = classify_scan_paths(["unsupported://warehouse/table/data.parquet"])
+            .expect_err("unknown scheme is not a NovaRocks scan path");
         assert!(err.contains("unsupported scan path scheme"), "{err}");
     }
 

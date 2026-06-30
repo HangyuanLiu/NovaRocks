@@ -312,7 +312,7 @@ pub(crate) mod test_utils {
             schema,
             PartitionSpec::unpartition_spec().into_unbound(),
             SortOrder::unsorted_order(),
-            "memory://test/table".to_string(),
+            "file:///novarocks-test/table".to_string(),
             FormatVersion::V2,
             HashMap::new(),
         )
@@ -337,7 +337,7 @@ pub(crate) mod test_utils {
                 operation: Operation::Append,
                 additional_properties: HashMap::new(),
             })
-            .with_manifest_list("memory://test/table/metadata/snap-1.avro".to_string())
+            .with_manifest_list("file:///novarocks-test/table/metadata/snap-1.avro".to_string())
             .with_schema_id(0)
             .build();
 
@@ -370,7 +370,7 @@ pub(crate) mod test_utils {
                 operation: Operation::Append,
                 additional_properties: HashMap::new(),
             })
-            .with_manifest_list("memory://test/table/metadata/snap-2.avro".to_string())
+            .with_manifest_list("file:///novarocks-test/table/metadata/snap-2.avro".to_string())
             .with_schema_id(0)
             .build();
 
@@ -406,7 +406,7 @@ pub(crate) mod test_utils {
                 operation: Operation::Append,
                 additional_properties: HashMap::new(),
             })
-            .with_manifest_list("memory://test/table/metadata/snap-1.avro".to_string())
+            .with_manifest_list("file:///novarocks-test/table/metadata/snap-1.avro".to_string())
             .with_schema_id(0)
             .build();
 
@@ -452,7 +452,7 @@ pub(crate) mod test_utils {
                 operation: Operation::Append,
                 additional_properties: HashMap::new(),
             })
-            .with_manifest_list("memory://test/table/metadata/snap-1.avro".to_string())
+            .with_manifest_list("file:///novarocks-test/table/metadata/snap-1.avro".to_string())
             .with_schema_id(0)
             .build();
 

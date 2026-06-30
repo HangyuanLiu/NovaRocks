@@ -2044,9 +2044,6 @@ pub(crate) fn file_io_for_table_location(
     location: &str,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<iceberg::io::FileIO, String> {
-    if location.starts_with("memory://") {
-        return Ok(iceberg::io::FileIO::new_with_memory());
-    }
     if location.starts_with("s3://")
         || location.starts_with("s3a://")
         || location.starts_with("oss://")

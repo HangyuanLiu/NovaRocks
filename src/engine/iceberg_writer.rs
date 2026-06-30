@@ -1514,7 +1514,7 @@ mod tests {
                 NamespaceIdent::new("test_db".to_string()),
                 "target_orders".to_string(),
             ))
-            .file_io(iceberg::io::FileIO::new_with_memory())
+            .file_io(iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .build()
             .expect("iceberg table")

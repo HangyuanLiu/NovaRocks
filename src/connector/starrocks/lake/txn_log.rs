@@ -46,7 +46,7 @@ use crate::connector::starrocks::sink::auto_increment::allocate_auto_increment_i
 use crate::exec::chunk::Chunk;
 use crate::formats::starrocks::metadata::{
     StarRocksDeletePredicateRaw, StarRocksSegmentFile, StarRocksTabletSnapshot,
-    load_bundle_segment_footers, load_tablet_snapshot,
+    load_bundle_segment_footers, load_tablet_snapshot, tablet_operator_relative_path,
 };
 use crate::formats::starrocks::plan::{
     StarRocksOutputColumnHint, build_native_read_plan_with_output_hints,
@@ -2188,6 +2188,8 @@ fn build_rowset_snapshot_for_partial_update(
     for (idx, segment_name) in rowset.segments.iter().enumerate() {
         let relative_path = format!("{DATA_DIR}/{}", segment_name.trim_start_matches('/'));
         let path = join_tablet_path(&ctx.tablet_root_path, &relative_path)?;
+        let operator_relative_path =
+            tablet_operator_relative_path(&ctx.tablet_root_path, &relative_path)?;
         let segment_id = rowset_id
             .checked_add(u32::try_from(idx).map_err(|_| {
                 format!(
@@ -2203,7 +2205,7 @@ fn build_rowset_snapshot_for_partial_update(
             })?;
         segment_files.push(StarRocksSegmentFile {
             name: segment_name.clone(),
-            relative_path,
+            relative_path: operator_relative_path,
             path,
             rowset_version: rowset_visibility_version,
             schema_id,

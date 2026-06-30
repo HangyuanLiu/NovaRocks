@@ -319,9 +319,6 @@ async fn best_effort_delete_files(file_io: &FileIO, files: &FileSet) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::Arc;
-
     use super::*;
     use crate::connector::iceberg::commit::snapshot_lifecycle_helpers::compute_live_snapshot_set;
     use crate::connector::iceberg::commit::snapshot_lifecycle_helpers::test_support::build_test_metadata_with_snapshots;
@@ -540,7 +537,7 @@ mod tests {
         assert!(candidates.is_empty());
     }
 
-    // ---- Real V3 table tests (async, use MemoryCatalog) ----
+    // ---- Real V3 table tests (async, use local Hadoop catalog) ----
 
     #[tokio::test]
     async fn expire_real_table_prunes_old_main_chain() {
@@ -618,7 +615,7 @@ mod tests {
     }
 
     // NOTE: `expire_real_table_prunes_old_main_chain` above already exercises the
-    // end-to-end commit path against a live MemoryCatalog: it lands a real
+    // end-to-end commit path against a live local Hadoop catalog: it lands a real
     // `RemoveSnapshots` commit (mid-chain removal of an old main-chain snapshot),
     // validates the OCC requirements, and confirms the table reloads with only
     // the protected head snapshot. Physical-delete coverage over a real object

@@ -467,7 +467,7 @@ mod tests {
         let mut b = DataFileBuilder::default();
         b.content(content)
             .file_path(format!(
-                "memory://test/data/{:?}-{record_count}.parquet",
+                "file:///novarocks-test/data/{:?}-{record_count}.parquet",
                 content
             ))
             .file_format(DataFileFormat::Parquet)
@@ -487,14 +487,9 @@ mod tests {
     #[tokio::test]
     async fn truncate_empty_table_writes_noop_delete_snapshot() {
         let fixture = empty_v3_iceberg_table().await;
-        let outcome = run_commit_with(
-            TruncateCommit,
-            CommitOpKind::Truncate,
-            fixture.clone(),
-            "main",
-        )
-        .await
-        .expect("TruncateCommit succeeds on empty table");
+        let outcome = run_commit_with(TruncateCommit, CommitOpKind::Truncate, &fixture, "main")
+            .await
+            .expect("TruncateCommit succeeds on empty table");
 
         assert_ne!(outcome.new_snapshot_id, 0, "expected a fresh snapshot id");
 
@@ -526,7 +521,7 @@ mod tests {
             ManifestContentType, NestedField, PartitionSpec, PrimitiveType, Schema, SchemaRef, Type,
         };
         use std::sync::Arc;
-        let file_io = FileIO::new_with_memory();
+        let file_io = FileIO::new_with_fs();
         let schema: SchemaRef = Arc::new(
             Schema::builder()
                 .with_fields(vec![
@@ -541,10 +536,17 @@ mod tests {
             test_entry(DataContentType::PositionDeletes, 4, 60),
             test_entry(DataContentType::EqualityDeletes, 2, 30),
         ];
-        let path = "memory:///metadata/test-truncate-deletes.avro";
+        let tempdir = tempfile::TempDir::new().expect("manifest tempdir");
+        let path = format!(
+            "file://{}",
+            tempdir
+                .path()
+                .join("metadata/test-truncate-deletes.avro")
+                .display()
+        );
         let mf = write_truncate_deletes_manifest(
             &file_io,
-            path,
+            &path,
             &entries,
             partition_spec,
             schema,
@@ -581,14 +583,9 @@ mod tests {
         // in the validator that would silently advance row lineage.
         let pre_next_row_id = fixture.table.metadata().next_row_id();
 
-        let outcome = run_commit_with(
-            TruncateCommit,
-            CommitOpKind::Truncate,
-            fixture.clone(),
-            "main",
-        )
-        .await
-        .expect("TruncateCommit succeeds on data-only table");
+        let outcome = run_commit_with(TruncateCommit, CommitOpKind::Truncate, &fixture, "main")
+            .await
+            .expect("TruncateCommit succeeds on data-only table");
         assert_ne!(outcome.new_snapshot_id, 0);
 
         let reloaded = fixture
