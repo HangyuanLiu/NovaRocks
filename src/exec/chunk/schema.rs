@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check};
+use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check, nested_path_label};
 use crate::lower::type_lowering::arrow_field_from_desc;
 use crate::thrift::types;
 use crate::types::logical::{LogicalType, logical_type_of_field};
@@ -336,13 +336,20 @@ fn type_desc_node_span(nodes: &[types::TTypeNode], start: usize) -> Result<usize
     }
 }
 
-fn is_compatible_chunk_field_type(expected: &DataType, actual: &DataType) -> bool {
-    // The shared compatibility check governs chunk-construction semantics: same-scale
-    // decimal (precision may differ), timestamp, utf8<->binary, and recursion into
-    // list/largelist/map/struct. This tightens the previous any-scale decimal
-    // tolerance to same-scale, failing fast on a real scale mismatch instead of
-    // silently adopting the batch's scale.
-    check(expected, actual, CompatibilityPolicy::SameScaleWiden).is_ok()
+fn check_chunk_data_type(
+    expected: &DataType,
+    actual: &DataType,
+    root_label: &str,
+) -> Result<(), String> {
+    check(expected, actual, CompatibilityPolicy::ExactArrow).map_err(|m| {
+        format!(
+            "chunk schema type mismatch at {}: expected {:?}, got {:?} ({:?})",
+            nested_path_label(root_label, &m.nested_path),
+            expected,
+            actual,
+            m.kind
+        )
+    })
 }
 
 fn reconcile_chunk_field_to_field(expected: &Field, actual: &Field) -> Result<Arc<Field>, String> {
@@ -377,17 +384,7 @@ fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<D
     if expected == actual {
         return Ok(expected.clone());
     }
-    crate::exec::chunk::type_compatibility::check(
-        expected,
-        actual,
-        crate::exec::chunk::type_compatibility::CompatibilityPolicy::SameScaleWiden,
-    )
-    .map_err(|_| {
-        format!(
-            "chunk schema type mismatch: expected {:?}, got {:?}",
-            expected, actual
-        )
-    })?;
+    check_chunk_data_type(expected, actual, "column")?;
     Ok(expected.clone())
 }
 
@@ -548,9 +545,7 @@ pub(super) fn align_chunk_schema_to_batch(
         // can flow through a non-nullable contract because source-level NOT
         // NULL enforcement happens downstream, and a non-nullable batch is a
         // valid runtime instance of a nullable contract.
-        if field.name() != expected.name()
-            || !is_compatible_chunk_field_type(expected.data_type(), field.data_type())
-        {
+        if field.name() != expected.name() {
             return Err(format!(
                 "chunk schema field mismatch at index {}: batch=({}, {:?}, {}) contract=({}, {:?}, {})",
                 idx,
@@ -562,6 +557,8 @@ pub(super) fn align_chunk_schema_to_batch(
                 expected.nullable()
             ));
         }
+        let root = format!("slot {} ({})", expected.slot_id(), expected.name());
+        check_chunk_data_type(expected.data_type(), field.data_type(), &root)?;
         let reconciled_field = reconcile_chunk_field_to_field(expected.field(), field.as_ref())?;
         slots.push(
             expected
@@ -588,6 +585,8 @@ pub(super) fn align_chunk_schema_to_columns(
             .slots()
             .get(idx)
             .ok_or_else(|| format!("missing chunk schema slot at index {}", idx))?;
+        let root = format!("slot {} ({})", expected.slot_id(), expected.name());
+        check_chunk_data_type(expected.data_type(), column.data_type(), &root)?;
         let reconciled_field = reconcile_chunk_field_to_data_type(
             expected.field(),
             column.data_type(),
@@ -606,8 +605,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        Array, ArrayRef, BinaryArray, Int8Array, Int32Array, Int64Array, MapArray, StringArray,
-        StructArray, TimestampMicrosecondArray,
+        Array, ArrayRef, BinaryArray, Decimal128Array, Int8Array, Int32Array, Int64Array, MapArray,
+        StringArray, StructArray, TimestampMicrosecondArray,
     };
     use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
@@ -870,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn align_chunk_schema_to_columns_keeps_descriptor_type_for_retaggable_columns() {
+    fn align_chunk_schema_to_columns_rejects_utf8_binary_type_drift() {
         let schema = ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
             SlotId::new(9),
             Field::new("payload", DataType::Binary, true),
@@ -880,13 +879,14 @@ mod tests {
         .expect("chunk schema");
         let column = Arc::new(arrow::array::StringArray::from(vec![Some("abc")])) as ArrayRef;
 
-        let aligned =
-            super::align_chunk_schema_to_columns(&[column], &schema).expect("align schema");
-        assert_eq!(aligned.slots()[0].data_type(), &DataType::Binary);
+        let err = super::align_chunk_schema_to_columns(&[column], &schema)
+            .expect_err("runtime schema must reject Utf8/Binary descriptor drift");
+        assert!(err.contains("chunk schema type mismatch"), "err={err}");
+        assert!(err.contains("slot 9 (payload)"), "err={err}");
     }
 
     #[test]
-    fn try_new_with_columns_retags_utf8_column_to_binary_descriptor() {
+    fn try_new_with_columns_rejects_utf8_binary_type_drift() {
         let chunk_schema = Arc::new(
             ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                 SlotId::new(9),
@@ -898,23 +898,14 @@ mod tests {
         );
         let column = Arc::new(StringArray::from(vec![Some("abc"), Some("xyz")])) as ArrayRef;
 
-        let chunk = Chunk::try_new_with_columns(chunk_schema, vec![column]).expect("chunk");
-
-        assert_eq!(chunk.schema().field(0).data_type(), &DataType::Binary);
-        assert_eq!(
-            chunk.chunk_schema().slots()[0].data_type(),
-            &DataType::Binary
-        );
-        let binary = chunk.columns()[0]
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .expect("binary array");
-        assert_eq!(binary.value(0), b"abc");
-        assert_eq!(binary.value(1), b"xyz");
+        let err = Chunk::try_new_with_columns(chunk_schema, vec![column])
+            .expect_err("runtime schema must reject Utf8/Binary descriptor drift");
+        assert!(err.contains("chunk schema type mismatch"), "err={err}");
+        assert!(err.contains("slot 9 (payload)"), "err={err}");
     }
 
     #[test]
-    fn try_new_with_chunk_schema_retags_utf8_batch_to_binary_descriptor() {
+    fn try_new_with_chunk_schema_rejects_utf8_binary_type_drift() {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "payload",
@@ -934,19 +925,47 @@ mod tests {
             .expect("chunk schema"),
         );
 
-        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+        let err = Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+            .expect_err("runtime schema must reject Utf8/Binary descriptor drift");
 
-        assert_eq!(chunk.schema().field(0).data_type(), &DataType::Binary);
-        assert_eq!(
-            chunk.chunk_schema().slots()[0].data_type(),
-            &DataType::Binary
+        assert!(err.contains("chunk schema type mismatch"), "err={err}");
+        assert!(err.contains("slot 9 (payload)"), "err={err}");
+        assert!(err.contains("Binary"), "err={err}");
+        assert!(err.contains("Utf8"), "err={err}");
+    }
+
+    #[test]
+    fn try_new_with_chunk_schema_rejects_same_scale_decimal_precision_drift() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "price",
+                DataType::Decimal128(10, 2),
+                true,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![Some(1234_i128)])
+                    .with_precision_and_scale(10, 2)
+                    .expect("decimal array"),
+            ) as ArrayRef],
+        )
+        .expect("record batch");
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(11),
+                Field::new("price", DataType::Decimal128(38, 2), true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
         );
-        let binary = chunk.columns()[0]
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .expect("binary array");
-        assert_eq!(binary.value(0), b"abc");
-        assert_eq!(binary.value(1), b"xyz");
+
+        let err = Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+            .expect_err("runtime schema must reject decimal precision drift");
+
+        assert!(err.contains("chunk schema type mismatch"), "err={err}");
+        assert!(err.contains("slot 11 (price)"), "err={err}");
+        assert!(err.contains("Decimal128(38, 2)"), "err={err}");
+        assert!(err.contains("Decimal128(10, 2)"), "err={err}");
     }
 
     #[test]
@@ -976,7 +995,7 @@ mod tests {
         let err = Chunk::try_new_with_chunk_schema(batch, chunk_schema)
             .expect_err("timestamp metadata retag should fail");
 
-        assert!(err.contains("column 0"), "err={err}");
+        assert!(err.contains("slot 10 (ts)"), "err={err}");
         assert!(err.contains("Timestamp(Nanosecond, None)"), "err={err}");
     }
 }

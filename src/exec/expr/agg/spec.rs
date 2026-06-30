@@ -61,7 +61,7 @@ fn apply_type_signature(
     if check(
         &out.output_type,
         output_type,
-        CompatibilityPolicy::SameScaleWiden,
+        CompatibilityPolicy::ExactArrow,
     )
     .is_err()
     {
@@ -77,7 +77,7 @@ fn apply_type_signature(
         if check(
             &out.intermediate_type,
             intermediate_type,
-            CompatibilityPolicy::SameScaleWiden,
+            CompatibilityPolicy::ExactArrow,
         )
         .is_err()
         {
@@ -118,6 +118,36 @@ fn validate_state_combinator_binary_signature(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_signature_rejects_decimal_precision_drift() {
+        let func = AggFunction {
+            name: "sum".to_string(),
+            inputs: vec![],
+            input_is_intermediate: false,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(DataType::Decimal128(20, 2)),
+                output_type: Some(DataType::Decimal128(20, 2)),
+                input_arg_type: Some(DataType::Decimal128(10, 2)),
+            }),
+            order: Default::default(),
+        };
+
+        let err = build_spec_from_type(&func, Some(&DataType::Decimal128(10, 2)), false)
+            .expect_err("aggregate signature must reject decimal precision drift");
+
+        assert!(
+            err.contains("aggregate output type signature mismatch"),
+            "{err}"
+        );
+        assert!(err.contains("Decimal128(38, 2)"), "{err}");
+        assert!(err.contains("Decimal128(20, 2)"), "{err}");
+    }
 }
 
 fn is_opaque_state_combinator_kind(kind: &AggKind) -> bool {
