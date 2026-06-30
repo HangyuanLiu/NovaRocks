@@ -805,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_hash_aggregate_outputs_hidden_group_key_layout_ids() {
+    fn p3_verify_id_binding_accepts_hidden_group_key_layout_output() {
         let input_id = ColumnId::new_for_test(1);
         let group_output_id = ColumnId::new_for_test(4);
         let aggregate_output_id = ColumnId::new_for_test(5);
