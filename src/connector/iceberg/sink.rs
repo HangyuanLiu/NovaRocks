@@ -50,7 +50,7 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::{Statistics, ValueStatistics};
 
 use super::data_writer::{
-    StagedWriteContext, StagedWriteOptions, to_sink_commit_info, write_record_batches,
+    StagedWriteContext, StagedWriteOptions, staged_data_file_to_writer_report, write_record_batches,
 };
 use crate::common::config;
 use crate::connector::iceberg::commit::{
@@ -401,17 +401,23 @@ impl IcebergTableSinkBackend {
                 write_record_batches(&staged_ctx, [part_batch], &staged_opts).await?;
             let partition_path = self.partition_path_for_key(&key);
             for staged in staged_files {
-                let (commit_info, sketch_set) = to_sink_commit_info(
+                let partition_report = IcebergPartitionReport {
+                    partition_path: partition_path.clone(),
+                    null_fingerprint: key.null_fingerprint.clone(),
+                    partition_spec_id: staged.partition_spec_id,
+                    partition_values: staged.data_file.partition().clone(),
+                };
+                let (report, sketch_set) = staged_data_file_to_writer_report(
                     &staged,
-                    partition_path.clone(),
-                    key.null_fingerprint.clone(),
+                    partition_report,
                     self.plan.report_file_format.clone(),
                     IcebergFileContent::Data,
                 )?;
                 if let Some(sketch_set) = sketch_set {
                     state.add_iceberg_sketch_set(sketch_set);
                 }
-                state.add_sink_commit_info(commit_info);
+                let metadata = staged.metadata.as_ref();
+                state.add_iceberg_writer_report(report, metadata)?;
             }
         }
 
@@ -488,28 +494,29 @@ impl IcebergTableSinkBackend {
                     .map_err(|e| format!("iceberg row-lineage sink write failed: {e}"))?;
                 let mut first_row_id_cursor = first_row_id;
                 for staged in staged_files {
-                    let (mut commit_info, sketch_set) = to_sink_commit_info(
+                    let partition_report = IcebergPartitionReport {
+                        partition_path: partition_path.clone(),
+                        null_fingerprint: key.null_fingerprint.clone(),
+                        partition_spec_id: staged.partition_spec_id,
+                        partition_values: staged.data_file.partition().clone(),
+                    };
+                    let (mut report, sketch_set) = staged_data_file_to_writer_report(
                         &staged,
-                        partition_path.clone(),
-                        key.null_fingerprint.clone(),
+                        partition_report,
                         self.plan.report_file_format.clone(),
                         IcebergFileContent::Data,
                     )?;
-                    if let Some(data_file) = commit_info.iceberg_data_file.as_mut() {
-                        data_file.first_row_id = Some(first_row_id_cursor);
-                        let record_count = data_file.record_count.ok_or_else(|| {
-                            "iceberg row-lineage sink report missing record_count".to_string()
+                    report.file.first_row_id = Some(first_row_id_cursor);
+                    first_row_id_cursor = first_row_id_cursor
+                        .checked_add(report.file.record_count)
+                        .ok_or_else(|| {
+                            "iceberg row-lineage sink first_row_id overflow".to_string()
                         })?;
-                        first_row_id_cursor = first_row_id_cursor
-                            .checked_add(record_count)
-                            .ok_or_else(|| {
-                                "iceberg row-lineage sink first_row_id overflow".to_string()
-                            })?;
-                    }
                     if let Some(sketch_set) = sketch_set {
                         state.add_iceberg_sketch_set(sketch_set);
                     }
-                    state.add_sink_commit_info(commit_info);
+                    let metadata = staged.metadata.as_ref();
+                    state.add_iceberg_writer_report(report, metadata)?;
                 }
                 start = end;
             }
