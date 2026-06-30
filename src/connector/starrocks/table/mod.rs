@@ -36,7 +36,4 @@ pub(crate) use catalog::{
     StarRocksTableCatalog, register_starrocks_tables_in_catalog, runtime_registered,
 };
 pub(crate) use config::StarRocksTableConfig;
-pub(crate) use scan_planner::{
-    StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle, StarRocksTableScanPlanner,
-    starrocks_to_thrift_scan,
-};
+pub(crate) use scan_planner::StarRocksTableScanPlanner;

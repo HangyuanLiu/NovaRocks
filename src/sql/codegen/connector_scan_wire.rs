@@ -1,8 +1,22 @@
 use std::collections::BTreeMap;
 
 use crate::common::min_max_predicate::MinMaxPredicate;
+use crate::connector::iceberg::scan_planner::{
+    IcebergScanHandle, iceberg_scan_handle, iceberg_split,
+};
 use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
-use crate::thrift::{exprs, internal_service, plan_nodes, types};
+use crate::connector::starrocks::table::scan_planner::{
+    StarRocksScanHandle, StarRocksSplit, starrocks_scan_handle, starrocks_split,
+};
+use crate::sql::catalog::{
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
+};
+use crate::thrift::{descriptors, exprs, internal_service, partitions, plan_nodes, types};
+
+const DEFAULT_FE_CATALOG: &str = "default_catalog";
+const ICEBERG_SCAN_SPLIT_TARGET_BYTES: i64 = 128 * 1024 * 1024;
+const ICEBERG_DELETE_APPLY_MAX_FILES_PER_DATA_FILE: usize = 1024;
+const ICEBERG_DELETE_APPLY_MAX_BYTES_PER_DATA_FILE: i64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ThriftScanContext {
@@ -30,16 +44,445 @@ pub(crate) fn to_thrift_scan(
 ) -> Result<ThriftScanPlan, String> {
     validate_split_connectors(scan, splits)?;
     match connector_id {
-        "iceberg" => {
-            crate::connector::iceberg::scan_planner::iceberg_to_thrift_scan(scan, splits, ctx)
-        }
-        "starrocks" => {
-            crate::connector::starrocks::table::starrocks_to_thrift_scan(scan, splits, ctx)
-        }
+        "iceberg" => iceberg_to_thrift_scan(scan, splits, ctx),
+        "starrocks" => starrocks_to_thrift_scan(scan, splits, ctx),
         other => Err(format!(
             "unsupported connector scan thrift emitter: {other}"
         )),
     }
+}
+
+fn iceberg_to_thrift_scan(
+    scan: &ScanHandle,
+    splits: &[Split],
+    ctx: ThriftScanContext,
+) -> Result<ThriftScanPlan, String> {
+    validate_split_connectors(scan, splits)?;
+    let scan = iceberg_scan_handle(scan)?;
+    let scan_ranges = build_iceberg_scan_ranges(splits, &ctx)?;
+    let node = build_iceberg_hdfs_scan_node(scan, &ctx);
+    Ok(ThriftScanPlan {
+        node: Some(node),
+        scan_ranges,
+    })
+}
+
+fn build_iceberg_scan_ranges(
+    splits: &[Split],
+    ctx: &ThriftScanContext,
+) -> Result<Vec<internal_service::TScanRangeParams>, String> {
+    let mut ranges = Vec::new();
+    for split in splits {
+        let file = &iceberg_split(split)?.data_file;
+        if !crate::sql::codegen::nodes::file_may_satisfy_min_max(file, &ctx.min_max_predicates) {
+            continue;
+        }
+        ranges.extend(build_hdfs_scan_range_params_for_file(
+            file,
+            ctx.change_op_slot,
+        )?);
+    }
+    Ok(ranges)
+}
+
+fn build_iceberg_hdfs_scan_node(
+    scan: &IcebergScanHandle,
+    ctx: &ThriftScanContext,
+) -> plan_nodes::TPlanNode {
+    let mut node = crate::sql::codegen::nodes::default_plan_node();
+    node.node_id = ctx.node_id;
+    node.node_type = plan_nodes::TPlanNodeType::HDFS_SCAN_NODE;
+    node.num_children = 0;
+    node.limit = -1;
+    node.row_tuples = vec![ctx.scan_tuple_id];
+    node.nullable_tuples = vec![];
+    let min_max_conjuncts = if ctx.conjuncts.is_empty() {
+        None
+    } else {
+        Some(ctx.conjuncts.clone())
+    };
+    let min_max_tuple_id = min_max_conjuncts.as_ref().map(|_| ctx.scan_tuple_id);
+    node.conjuncts = if ctx.conjuncts.is_empty() {
+        None
+    } else {
+        Some(ctx.conjuncts.clone())
+    };
+    node.compact_data = true;
+    node.hdfs_scan_node = Some(plan_nodes::THdfsScanNode::new(
+        Some(ctx.scan_tuple_id),
+        None::<BTreeMap<types::TTupleId, Vec<exprs::TExpr>>>,
+        min_max_conjuncts,
+        min_max_tuple_id,
+        None::<BTreeMap<types::TSlotId, Vec<i32>>>,
+        None::<Vec<exprs::TExpr>>,
+        Some(scan.table.column_names.clone()),
+        Some(ctx.table.clone()),
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        Some(true),
+        Some(
+            crate::thrift::cloud_configuration::TCloudConfiguration::new(
+                None::<crate::thrift::cloud_configuration::TCloudType>,
+                None::<Vec<crate::thrift::cloud_configuration::TCloudProperty>>,
+                Some(ctx.cloud_properties.clone()),
+                None::<bool>,
+            ),
+        ),
+        None::<bool>,
+        None::<bool>,
+        None::<bool>,
+        None::<types::TTupleId>,
+        None::<String>,
+        None::<String>,
+        None::<bool>,
+        None::<String>,
+        None::<crate::thrift::data_cache::TDataCacheOptions>,
+        None::<Vec<types::TSlotId>>,
+        None::<bool>,
+        None::<Vec<partitions::TBucketProperty>>,
+        None::<bool>,
+        None::<i64>,
+        None::<Vec<plan_nodes::TColumnAccessPath>>,
+        None::<Vec<plan_nodes::TVariantPathColumn>>,
+    ));
+    node
+}
+
+fn build_hdfs_scan_range_params_for_file(
+    file: &IcebergDataFileInfo,
+    change_op_slot: Option<types::TSlotId>,
+) -> Result<Vec<internal_service::TScanRangeParams>, String> {
+    validate_iceberg_delete_apply_cost(&file.path, &file.delete_files)?;
+    let splits = plan_hdfs_file_splits(file);
+    splits
+        .into_iter()
+        .map(|(offset, length)| {
+            build_hdfs_scan_range_params(
+                &file.path,
+                file.size,
+                offset,
+                length,
+                file.first_row_id,
+                file.data_sequence_number,
+                file.ivm_change_op,
+                file.included_positions.as_ref(),
+                change_op_slot,
+                &file.delete_files,
+            )
+        })
+        .collect()
+}
+
+fn plan_hdfs_file_splits(file: &IcebergDataFileInfo) -> Vec<(i64, i64)> {
+    let file_len = file.size.max(0);
+    if file_len <= ICEBERG_SCAN_SPLIT_TARGET_BYTES
+        || file.first_row_id.is_some()
+        || !file.delete_files.is_empty()
+        || file.included_positions.is_some()
+    {
+        return vec![(0, file_len)];
+    }
+
+    let mut out = Vec::new();
+    let mut offset = 0_i64;
+    while offset < file_len {
+        let remaining = file_len - offset;
+        let length = remaining.min(ICEBERG_SCAN_SPLIT_TARGET_BYTES);
+        out.push((offset, length));
+        offset += length;
+    }
+    if out.is_empty() {
+        out.push((0, 0));
+    }
+    out
+}
+
+fn validate_iceberg_delete_apply_cost(
+    data_path: &str,
+    delete_files: &[IcebergDeleteFileInfo],
+) -> Result<(), String> {
+    if delete_files.len() > ICEBERG_DELETE_APPLY_MAX_FILES_PER_DATA_FILE {
+        return Err(format!(
+            "too many Iceberg delete files attached to data file {data_path}: count={} max={}",
+            delete_files.len(),
+            ICEBERG_DELETE_APPLY_MAX_FILES_PER_DATA_FILE
+        ));
+    }
+    let total_bytes = delete_files.iter().try_fold(0_i64, |acc, delete_file| {
+        let Some(length) = delete_file.length else {
+            return Ok(acc);
+        };
+        acc.checked_add(length.max(0))
+            .ok_or_else(|| format!("Iceberg delete file length overflow for data file {data_path}"))
+    })?;
+    if total_bytes > ICEBERG_DELETE_APPLY_MAX_BYTES_PER_DATA_FILE {
+        return Err(format!(
+            "Iceberg delete files attached to data file {data_path} are too large: bytes={total_bytes} max={ICEBERG_DELETE_APPLY_MAX_BYTES_PER_DATA_FILE}"
+        ));
+    }
+    Ok(())
+}
+
+fn int_literal_expr(value: i64) -> exprs::TExpr {
+    exprs::TExpr::new(vec![crate::sql::codegen::expr_compiler::int_literal_node(
+        value,
+    )])
+}
+
+pub(crate) fn build_hdfs_scan_range_params(
+    full_path: &str,
+    file_len: i64,
+    offset: i64,
+    length: i64,
+    first_row_id: Option<i64>,
+    data_sequence_number: Option<i64>,
+    ivm_change_op: Option<i8>,
+    included_positions: Option<&Vec<i64>>,
+    change_op_slot: Option<types::TSlotId>,
+    delete_files: &[IcebergDeleteFileInfo],
+) -> Result<internal_service::TScanRangeParams, String> {
+    let mut parquet_delete_files = Vec::new();
+    let mut deletion_vector_descriptor = None;
+    for delete_file in delete_files {
+        match delete_file.file_format {
+            IcebergDeleteFileFormat::Parquet => {
+                let file_content = match delete_file.file_content {
+                    IcebergDeleteFileContent::Position => {
+                        types::TIcebergFileContent::POSITION_DELETES
+                    }
+                    IcebergDeleteFileContent::Equality => {
+                        // Equality field IDs are read from the equality-delete Parquet schema by
+                        // the Rust scan runner. The Thrift scan range only needs to identify the
+                        // delete file as an equality-delete file.
+                        types::TIcebergFileContent::EQUALITY_DELETES
+                    }
+                };
+                parquet_delete_files.push(plan_nodes::TIcebergDeleteFile::new(
+                    Some(delete_file.path.clone()),
+                    Some(descriptors::THdfsFileFormat::PARQUET),
+                    Some(file_content),
+                    delete_file.length,
+                ));
+            }
+            IcebergDeleteFileFormat::Puffin => {
+                if deletion_vector_descriptor.is_some() {
+                    return Err(format!(
+                        "multiple Puffin deletion vectors are attached to data file {}",
+                        full_path
+                    ));
+                }
+                let offset = delete_file.content_offset.ok_or_else(|| {
+                    format!(
+                        "Puffin deletion vector {} for data file {} is missing content_offset",
+                        delete_file.path, full_path
+                    )
+                })?;
+                let size = delete_file.content_size_in_bytes.ok_or_else(|| {
+                    format!(
+                        "Puffin deletion vector {} for data file {} is missing content_size_in_bytes",
+                        delete_file.path, full_path
+                    )
+                })?;
+                deletion_vector_descriptor = Some(plan_nodes::TDeletionVectorDescriptor::new(
+                    Some("PUFFIN".to_string()),
+                    Some(delete_file.path.clone()),
+                    Some(offset),
+                    Some(size),
+                    None::<i64>,
+                ));
+            }
+        }
+    }
+    let parquet_delete_files = if parquet_delete_files.is_empty() {
+        None
+    } else {
+        Some(parquet_delete_files)
+    };
+    let extended_columns = match (ivm_change_op, change_op_slot) {
+        (Some(op), Some(slot_id)) => {
+            crate::exec::change_op::validate_change_op_value(op)?;
+            Some(BTreeMap::from([(slot_id, int_literal_expr(op as i64))]))
+        }
+        _ => None,
+    };
+    let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
+        None::<String>,
+        Some(offset),
+        Some(length),
+        None::<i64>,
+        Some(file_len),
+        Some(descriptors::THdfsFileFormat::PARQUET),
+        None::<descriptors::TTextFileDesc>,
+        Some(full_path.to_string()),
+        None::<Vec<String>>,
+        None::<bool>,
+        parquet_delete_files,
+        None::<i64>,
+        None::<bool>,
+        None::<String>,
+        None::<String>,
+        None::<i64>,
+        None::<crate::thrift::data_cache::TDataCacheOptions>,
+        None::<Vec<types::TSlotId>>,
+        None::<bool>,
+        None::<BTreeMap<String, String>>,
+        None::<Vec<types::TSlotId>>,
+        None::<bool>,
+        None::<String>,
+        None::<bool>,
+        None::<String>,
+        None::<String>,
+        None::<plan_nodes::TPaimonDeletionFile>,
+        extended_columns,
+        None::<descriptors::THdfsPartition>,
+        None::<types::TTableId>,
+        deletion_vector_descriptor,
+        None::<String>,
+        None::<i64>,
+        None::<bool>,
+        None::<BTreeMap<i32, exprs::TExprMinMaxValue>>,
+        None::<i32>,
+        first_row_id,
+        data_sequence_number,
+        included_positions.cloned(),
+    );
+
+    Ok(internal_service::TScanRangeParams::new(
+        plan_nodes::TScanRange::new(
+            None::<plan_nodes::TInternalScanRange>,
+            None::<Vec<u8>>,
+            None::<plan_nodes::TBrokerScanRange>,
+            None::<plan_nodes::TEsScanRange>,
+            Some(hdfs_scan_range),
+            None::<plan_nodes::TBinlogScanRange>,
+            None::<plan_nodes::TBenchmarkScanRange>,
+        ),
+        None::<i32>,
+        Some(false),
+        Some(false),
+    ))
+}
+
+fn starrocks_to_thrift_scan(
+    scan: &ScanHandle,
+    splits: &[Split],
+    ctx: ThriftScanContext,
+) -> Result<ThriftScanPlan, String> {
+    validate_split_connectors(scan, splits)?;
+    let scan = starrocks_scan_handle(scan)?;
+    let scan_ranges = splits
+        .iter()
+        .map(|split| {
+            let split = starrocks_split(split)?;
+            Ok(build_starrocks_internal_scan_range_params(
+                &ctx.database,
+                &ctx.table,
+                scan.schema_id,
+                split,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let node = build_starrocks_lake_scan_node(scan, &ctx);
+    Ok(ThriftScanPlan {
+        node: Some(node),
+        scan_ranges,
+    })
+}
+
+fn build_starrocks_internal_scan_range_params(
+    database: &str,
+    table: &str,
+    schema_id: i64,
+    split: &StarRocksSplit,
+) -> internal_service::TScanRangeParams {
+    let internal_scan_range = plan_nodes::TInternalScanRange::new(
+        vec![],
+        schema_id.to_string(),
+        split.version.to_string(),
+        split.version.to_string(),
+        split.tablet_id,
+        database.to_string(),
+        None::<Vec<plan_nodes::TKeyRange>>,
+        None::<String>,
+        Some(table.to_string()),
+        Some(split.partition_id),
+        None::<i64>,
+        Some(true),
+        None::<i32>,
+        Some(false),
+        Some(false),
+        None::<i64>,
+        Some(DEFAULT_FE_CATALOG.to_string()),
+    );
+
+    internal_service::TScanRangeParams::new(
+        plan_nodes::TScanRange::new(
+            Some(internal_scan_range),
+            None::<Vec<u8>>,
+            None::<plan_nodes::TBrokerScanRange>,
+            None::<plan_nodes::TEsScanRange>,
+            None::<plan_nodes::THdfsScanRange>,
+            None::<plan_nodes::TBinlogScanRange>,
+            None::<plan_nodes::TBenchmarkScanRange>,
+        ),
+        None::<i32>,
+        Some(false),
+        Some(false),
+    )
+}
+
+fn build_starrocks_lake_scan_node(
+    scan: &StarRocksScanHandle,
+    ctx: &ThriftScanContext,
+) -> plan_nodes::TPlanNode {
+    let mut node = crate::sql::codegen::nodes::default_plan_node();
+    node.node_id = ctx.node_id;
+    node.node_type = plan_nodes::TPlanNodeType::LAKE_SCAN_NODE;
+    node.num_children = 0;
+    node.limit = -1;
+    node.row_tuples = vec![ctx.scan_tuple_id];
+    node.nullable_tuples = vec![];
+    node.conjuncts = if ctx.conjuncts.is_empty() {
+        None
+    } else {
+        Some(ctx.conjuncts.clone())
+    };
+    node.compact_data = true;
+    node.lake_scan_node = Some(plan_nodes::TLakeScanNode {
+        tuple_id: ctx.scan_tuple_id,
+        key_column_name: vec![],
+        key_column_type: vec![],
+        is_preaggregation: false,
+        sort_column: None,
+        rollup_name: None,
+        sql_predicates: None,
+        enable_column_expr_predicate: None,
+        dict_string_id_to_int_ids: None,
+        unused_output_column_name: None,
+        sort_key_column_names: None,
+        bucket_exprs: None,
+        column_access_paths: None,
+        sorted_by_keys_per_tablet: None,
+        output_chunk_by_bucket: None,
+        output_asc_hint: None,
+        partition_order_hint: None,
+        enable_topn_filter_back_pressure: None,
+        back_pressure_max_rounds: None,
+        back_pressure_throttle_time: None,
+        back_pressure_throttle_time_upper_bound: None,
+        back_pressure_num_rows: None,
+        schema_key: Some(descriptors::TTableSchemaKey::new(
+            Some(scan.table.db_id),
+            Some(scan.table.table_id),
+            Some(scan.schema_id),
+        )),
+        enable_prune_column_after_index_filter: None,
+        enable_gin_filter: None,
+        next_uniq_id: None,
+        enable_global_late_materialization: None,
+    });
+    node
 }
 
 #[cfg(test)]
@@ -47,10 +490,14 @@ mod tests {
     use std::any::Any;
 
     use super::*;
-    use crate::connector::scan_planning::{ConnectorScanHandle, ConnectorSplit};
-    use crate::connector::starrocks::table::{
+    use crate::connector::iceberg::IcebergConnectorScanPlanner;
+    use crate::connector::scan_planning::{
+        ConnectorScanHandle, ConnectorScanPlanner, ConnectorSplit,
+    };
+    use crate::connector::starrocks::table::scan_planner::{
         StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle,
     };
+    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
 
     #[derive(Debug)]
     struct DummyScanHandle;
@@ -67,6 +514,39 @@ mod tests {
     impl ConnectorSplit for DummySplit {
         fn as_any(&self) -> &dyn Any {
             self
+        }
+    }
+
+    fn dummy_iceberg_table_info() -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "memory".to_string(),
+            namespace: "default".to_string(),
+            table: "orders".to_string(),
+            table_uuid: None,
+            current_snapshot_id: None,
+            schema_id: 1,
+            location: String::new(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
+        }
+    }
+
+    fn dummy_iceberg_file() -> IcebergDataFileInfo {
+        IcebergDataFileInfo {
+            path: "s3://bucket/data/file.parquet".to_string(),
+            size: 1024,
+            row_count: Some(1),
+            column_stats: None,
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
         }
     }
 
@@ -137,6 +617,12 @@ mod tests {
         let node = plan.node.expect("lake scan node");
         assert_eq!(node.node_id, 11);
         assert_eq!(node.node_type, plan_nodes::TPlanNodeType::LAKE_SCAN_NODE);
+        let lake = node.lake_scan_node.expect("lake scan payload");
+        assert_eq!(lake.tuple_id, 1);
+        let schema_key = lake.schema_key.expect("schema key");
+        assert_eq!(schema_key.db_id, Some(10));
+        assert_eq!(schema_key.table_id, Some(20));
+        assert_eq!(schema_key.schema_id, Some(30));
         assert_eq!(plan.scan_ranges.len(), 1);
         let internal = plan.scan_ranges[0]
             .scan_range
@@ -144,5 +630,87 @@ mod tests {
             .as_ref()
             .expect("internal scan range");
         assert_eq!(internal.tablet_id, 300);
+    }
+
+    #[test]
+    fn position_bound_iceberg_file_carries_included_positions_without_splitting() {
+        let mut file = dummy_iceberg_file();
+        file.size = ICEBERG_SCAN_SPLIT_TARGET_BYTES + 1;
+        file.included_positions = Some(vec![3, 9, 11]);
+
+        let ranges = build_hdfs_scan_range_params_for_file(&file, None).expect("scan ranges");
+
+        assert_eq!(ranges.len(), 1);
+        let hdfs_range = ranges[0]
+            .scan_range
+            .hdfs_scan_range
+            .as_ref()
+            .expect("hdfs scan range");
+        assert_eq!(hdfs_range.offset, Some(0));
+        assert_eq!(hdfs_range.length, Some(file.size));
+        assert_eq!(hdfs_range.included_positions, Some(vec![3, 9, 11]));
+    }
+
+    #[test]
+    fn to_thrift_scan_dispatches_iceberg_wire_emission() {
+        let planner = IcebergConnectorScanPlanner::new();
+        let table_info = dummy_iceberg_table_info();
+        let catalog = table_info.catalog.clone();
+        let namespace = table_info.namespace.clone();
+        let table = table_info.table.clone();
+        let snapshot_id = table_info.current_snapshot_id;
+        let table_handle = IcebergConnectorScanPlanner::table_handle_from_source(
+            &catalog,
+            &namespace,
+            &table,
+            snapshot_id,
+            table_info,
+            vec![dummy_iceberg_file()],
+            vec!["id".to_string()],
+        );
+        let scan = planner
+            .begin_scan(table_handle, Default::default())
+            .expect("begin_scan");
+        let splits = planner
+            .plan_splits(&scan, Default::default())
+            .expect("plan_splits");
+
+        let plan = to_thrift_scan(
+            "iceberg",
+            &scan,
+            &splits,
+            ThriftScanContext {
+                database: "default".to_string(),
+                table: "orders".to_string(),
+                node_id: 17,
+                scan_tuple_id: 2,
+                cloud_properties: BTreeMap::from([(
+                    "aws.s3.endpoint".to_string(),
+                    "http://localhost:9000".to_string(),
+                )]),
+                ..ThriftScanContext::default()
+            },
+        )
+        .expect("iceberg thrift scan");
+
+        let node = plan.node.expect("hdfs scan node");
+        assert_eq!(node.node_id, 17);
+        assert_eq!(node.node_type, plan_nodes::TPlanNodeType::HDFS_SCAN_NODE);
+        let hdfs = node.hdfs_scan_node.as_ref().expect("hdfs scan payload");
+        assert_eq!(hdfs.tuple_id, Some(2));
+        assert_eq!(hdfs.hive_column_names, Some(vec!["id".to_string()]));
+        assert_eq!(hdfs.table_name.as_deref(), Some("orders"));
+        assert!(hdfs.cloud_configuration.is_some());
+
+        assert_eq!(plan.scan_ranges.len(), 1);
+        let range = plan.scan_ranges[0]
+            .scan_range
+            .hdfs_scan_range
+            .as_ref()
+            .expect("hdfs scan range");
+        assert_eq!(
+            range.full_path.as_deref(),
+            Some("s3://bucket/data/file.parquet")
+        );
     }
 }

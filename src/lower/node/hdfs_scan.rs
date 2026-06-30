@@ -53,9 +53,9 @@ use crate::runtime::descriptor_snapshot::{
 use crate::runtime::descriptor_snapshot_thrift::descriptor_snapshot_from_thrift;
 use crate::thrift::{descriptors, exprs, internal_service, plan_nodes, types};
 
-/// Cache Iceberg table locations from descriptor table for later use in HDFS scan lowering.
-pub(crate) fn cache_iceberg_table_locations(desc_tbl: Option<&descriptors::TDescriptorTable>) {
-    crate::connector::iceberg::cache_iceberg_table_locations(desc_tbl);
+/// Cache Iceberg table locations from the normalized descriptor snapshot for HDFS scan lowering.
+pub(crate) fn cache_iceberg_table_locations(snapshot: Option<&DescriptorSnapshot>) {
+    crate::connector::iceberg::cache_iceberg_table_locations(snapshot);
 }
 
 fn next_hidden_slot_id(visible_slot_ids: &[SlotId]) -> Result<SlotId, String> {
@@ -103,6 +103,18 @@ fn iceberg_file_format_from_thrift(
         crate::thrift::descriptors::THdfsFileFormat::PARQUET => IcebergFileFormat::Parquet,
         crate::thrift::descriptors::THdfsFileFormat::UNKNOWN => IcebergFileFormat::Unknown,
         _ => IcebergFileFormat::Unknown,
+    }
+}
+
+fn hdfs_scan_file_format_from_thrift(
+    format: descriptors::THdfsFileFormat,
+) -> crate::exec::node::scan::HdfsScanFileFormat {
+    match format {
+        descriptors::THdfsFileFormat::PARQUET => {
+            crate::exec::node::scan::HdfsScanFileFormat::Parquet
+        }
+        descriptors::THdfsFileFormat::ORC => crate::exec::node::scan::HdfsScanFileFormat::Orc,
+        _ => crate::exec::node::scan::HdfsScanFileFormat::Other,
     }
 }
 
@@ -1784,7 +1796,7 @@ pub(crate) fn lower_hdfs_scan_node(
     let row_position_scan = row_position_spec.as_ref().and_then(|_| {
         scan_format.map(
             |file_format| crate::exec::node::scan::RowPositionScanConfig {
-                file_format,
+                file_format: hdfs_scan_file_format_from_thrift(file_format),
                 case_sensitive,
                 batch_size,
                 enable_file_metacache,

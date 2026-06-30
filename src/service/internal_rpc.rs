@@ -354,7 +354,7 @@ mod tests {
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::ExprId;
     use crate::exec::node::RuntimeFilterProbeSpec;
-    use crate::exec::node::scan::RowPositionScanConfig;
+    use crate::exec::node::scan::{HdfsScanFileFormat, RowPositionScanConfig};
     use crate::exec::row_position::{RowPositionDescriptor, RowPositionType};
     use crate::exec::runtime_filter::{RuntimeInFilter, encode_starrocks_in_filter};
     #[cfg(feature = "compat")]
@@ -945,7 +945,7 @@ mod tests {
                 query_id,
                 SlotId::new(1),
                 RowPositionScanConfig {
-                    file_format: descriptors::THdfsFileFormat::PARQUET,
+                    file_format: HdfsScanFileFormat::Parquet,
                     case_sensitive: true,
                     batch_size: Some(1024),
                     enable_file_metacache: false,

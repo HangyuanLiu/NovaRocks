@@ -1315,7 +1315,8 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             observe_total_fragments(ctx, exec_params);
             Ok(())
         })?;
-        cache_iceberg_table_locations(desc_tbl.as_ref());
+        let desc_snapshot = mgr.descriptor_snapshot(query_id);
+        cache_iceberg_table_locations(desc_snapshot.as_deref());
         let pipeline_dop = resolve_pipeline_dop(one);
         let group_execution_scan_dop = one.group_execution_scan_dop;
         let query_opts = query_opts.cloned();
@@ -1427,7 +1428,8 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
     let desc_tbl =
         resolve_desc_tbl_for_instance(mgr.as_ref(), query_id, one.desc_tbl.as_ref(), None)?;
-    cache_iceberg_table_locations(desc_tbl.as_ref());
+    let desc_snapshot = mgr.descriptor_snapshot(query_id);
+    cache_iceberg_table_locations(desc_snapshot.as_deref());
     // Result buffer timeout is derived from QueryContext by finst_id.
     let enable_profile = query_opts
         .and_then(|opts| opts.enable_profile)
@@ -1564,7 +1566,8 @@ pub(crate) fn execute_plan_fragment_sync(
     let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
     let desc_tbl =
         resolve_desc_tbl_for_instance(mgr.as_ref(), query_id, one.desc_tbl.as_ref(), None)?;
-    cache_iceberg_table_locations(desc_tbl.as_ref());
+    let desc_snapshot = mgr.descriptor_snapshot(query_id);
+    cache_iceberg_table_locations(desc_snapshot.as_deref());
 
     let pipeline_dop = resolve_pipeline_dop(&one);
     let group_execution_scan_dop = one.group_execution_scan_dop;
