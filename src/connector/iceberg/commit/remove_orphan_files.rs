@@ -46,6 +46,7 @@ use super::snapshot_lifecycle_helpers::{
     FileSet, enumerate_files_for_snapshots, puffin_half_reference_protection,
 };
 
+use crate::connector::iceberg::fs_io;
 use crate::fs::object_store::ObjectStoreConfig;
 
 /// Result of a successful REMOVE ORPHAN FILES execution.
@@ -214,10 +215,9 @@ struct ScannedFile {
 ///
 /// Handles:
 ///  * `file://` and bare filesystem paths: uses `std::fs` walk.
-///  * `s3://`, `s3a://`, `oss://`: uses an opendal S3 operator built from
-///    `object_store_config`. If `object_store_config` is `None` for these
-///    schemes, returns empty (safe — won't delete).
-///  * Unrecognised schemes: returns empty (safe — won't delete).
+///  * `s3://`, `s3a://`, `oss://`, and `hdfs://`: resolves an adapter-backed
+///    OpenDAL operator and lists through it.
+///  * Unsupported or unconfigured schemes return an explicit error.
 ///
 /// The returned paths use the same scheme-prefixed format as the live_files
 /// set populated from manifest entries (e.g. `file:///abs/path` for local,
@@ -237,24 +237,13 @@ async fn list_files_for_location(
     } else if location.starts_with("s3://")
         || location.starts_with("s3a://")
         || location.starts_with("oss://")
+        || location.starts_with("hdfs://")
     {
-        let Some(cfg) = object_store_config else {
-            tracing::debug!(
-                location = %location,
-                "remove_orphan_files: S3/OSS location but no object_store_config supplied; \
-                 returning empty scan (no files will be deleted)"
-            );
-            return Ok(Vec::new());
-        };
-        list_files_opendal(location, cfg).await
+        list_files_opendal(location, object_store_config).await
     } else {
-        // hdfs:// or unrecognised scheme.
-        tracing::debug!(
-            location = %location,
-            "remove_orphan_files: listing not implemented for this scheme; \
-             returning empty scan (no files will be deleted)"
-        );
-        Ok(Vec::new())
+        Err(format!(
+            "remove_orphan_files listing unsupported for table location {location}"
+        ))
     }
 }
 
@@ -276,33 +265,20 @@ fn list_files_local(
     Ok(result)
 }
 
-/// List files under `<location>/data/` and `<location>/metadata/` using opendal.
-///
-/// `location` must have an `s3://`, `s3a://`, or `oss://` prefix.
-/// The full path returned for each file matches the format Iceberg uses in
-/// manifest entries: `<scheme>://<bucket>/<key>`.
+/// List files under `<location>/data/` and `<location>/metadata/` using an
+/// adapter-resolved OpenDAL operator.
 async fn list_files_opendal(
     location: &str,
-    cfg: &ObjectStoreConfig,
+    object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<Vec<ScannedFile>, String> {
-    use crate::connector::iceberg::fs_io::parse_object_store_path_parse_only;
-    use crate::fs::object_store::build_object_store_operator;
-
-    let scheme = if location.starts_with("oss://") {
-        "oss"
-    } else {
-        "s3"
-    };
-
-    let (bucket, location_key) = parse_object_store_path_parse_only(location)
-        .map_err(|e| format!("parse table location for opendal scan: {e}"))?;
-
-    // Build an operator rooted at the bucket level so keys we pass match
-    // exactly the key portion of the full URIs we reconstruct.
-    let op = build_object_store_operator(&bucket, cfg)
-        .map_err(|e| format!("build opendal operator: {e}"))?;
-
-    let location_key = location_key.trim_matches('/');
+    let access = fs_io::resolve_access_for_location(location, object_store_config)
+        .map_err(|e| format!("resolve table location for opendal scan {location}: {e}"))?;
+    let op = access.operator();
+    let location_key = access
+        .single_relative_path()
+        .map_err(|e| format!("resolve table location key for opendal scan {location}: {e}"))?
+        .trim_matches('/')
+        .to_string();
 
     let mut result = Vec::new();
     for sub in ["data", "metadata"] {
@@ -319,7 +295,7 @@ async fn list_files_opendal(
                 continue;
             }
             Err(e) => {
-                return Err(format!("opendal list {scheme}://{bucket}/{prefix}: {e}"));
+                return Err(format!("opendal list {location}/{sub}: {e}"));
             }
         };
 
@@ -329,9 +305,8 @@ async fn list_files_opendal(
                 continue;
             }
 
-            // `entry.path()` is relative to the operator root (the bucket).
-            // Reconstruct the full URI: `<scheme>://<bucket>/<key>`.
-            let full_path = format!("{scheme}://{bucket}/{}", entry.path());
+            let full_path = fs_io::format_resolved_location(access.handle(), entry.path())
+                .map_err(|e| format!("format scanned location {}: {e}", entry.path()))?;
 
             // last_modified from opendal metadata; None → conservatively skip.
             // opendal::raw::Timestamp wraps jiff::Timestamp; use into_inner() +
@@ -352,7 +327,7 @@ async fn list_files_opendal(
     tracing::debug!(
         location = %location,
         scanned = result.len(),
-        "remove_orphan_files: opendal scan complete"
+        "remove_orphan_files: adapter opendal scan complete"
     );
     Ok(result)
 }
@@ -529,7 +504,8 @@ mod tests {
         // Use file:// scheme so iceberg storage factory resolves to local FS.
         let warehouse_uri = format!("file://{warehouse_path}");
 
-        let file_io = iceberg::io::FileIO::new_with_fs();
+        let file_io =
+            crate::connector::iceberg::fs_io::build_file_io_for_location(&warehouse_uri, None);
         let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
             crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
                 file_io,
@@ -895,7 +871,8 @@ mod tests {
         let warehouse_path = tmpdir.path().to_str().expect("path").to_string();
         let warehouse_uri = format!("file://{warehouse_path}");
 
-        let file_io = iceberg::io::FileIO::new_with_fs();
+        let file_io =
+            crate::connector::iceberg::fs_io::build_file_io_for_location(&warehouse_uri, None);
         let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
             crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
                 file_io,
@@ -1048,20 +1025,10 @@ mod tests {
         );
     }
 
-    // ---- Test 12: opendal fs operator — orphan file is detected and deleted ----
-    //
-    // Uses the opendal `Fs` service rooted at a tempdir to exercise the
-    // `list_files_opendal` code path indirectly: we build an ObjectStoreConfig
-    // from a fake S3 endpoint and verify that passing it succeeds (the opendal
-    // operator itself is internal to `list_files_opendal`).
-    //
-    // Because setting up a real S3/MinIO endpoint in unit tests is too heavy,
-    // we test the opendal-based listing path using the opendal `Fs` backend
-    // directly through `list_files_for_location` (the internal helper) to
-    // confirm the async dispatch works and returns correct results.
+    // ---- Test 12: local listing through the internal helper ----
 
     #[tokio::test]
-    async fn opendal_fs_listing_finds_orphan_file() {
+    async fn local_listing_finds_orphan_file() {
         use opendal::Operator;
         use opendal::services::Fs;
 
@@ -1105,5 +1072,29 @@ mod tests {
         );
 
         drop(tmpdir);
+    }
+
+    #[tokio::test]
+    async fn object_store_listing_requires_config() {
+        let err = list_files_for_location("s3a://bucket/warehouse/table", None)
+            .await
+            .expect_err("s3a listing without object store config should fail");
+
+        assert!(
+            err.contains("object-store location requires object store config"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_listing_scheme_returns_explicit_error() {
+        let err = list_files_for_location("memory://warehouse/table", None)
+            .await
+            .expect_err("unsupported scheme should fail");
+
+        assert!(
+            err.contains("unsupported"),
+            "unsupported scheme should be explicit, got: {err}"
+        );
     }
 }

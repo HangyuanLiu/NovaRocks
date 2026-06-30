@@ -1434,7 +1434,10 @@ mod tests {
         let manifest = dir.path().join("manifest.avro");
         fs::write(&puffin, b"dv").unwrap();
         fs::write(&manifest, b"manifest").unwrap();
-        let file_io = FileIO::new_with_fs();
+        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(
+            &path_string(&puffin),
+            None,
+        );
 
         let artifacts = RewriteArtifacts::default();
         artifacts.record_puffin(path_string(&puffin));
@@ -1455,8 +1458,9 @@ mod tests {
     #[tokio::test]
     async fn write_repacked_dvs_packs_multiple_candidates_into_one_puffin() {
         let dir = tempfile::tempdir().unwrap();
-        let file_io = FileIO::new_with_fs();
         let table_location = path_string(dir.path());
+        let file_io =
+            crate::connector::iceberg::fs_io::build_file_io_for_location(&table_location, None);
         let commit_uuid = Uuid::new_v4();
         fs::create_dir_all(
             dir.path()

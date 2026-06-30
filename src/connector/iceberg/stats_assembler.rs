@@ -506,14 +506,13 @@ mod tests {
     /// Round-trip: write a Puffin file via `write_puffin` for one field with
     /// ~500 distinct values, then read its Theta blob back through the same
     /// `PuffinReader` path the loader uses and assert the recovered NDV is
-    /// within +/-10% of 500. FileIO is constructed the same way the
-    /// `stats_loader` tests do (`FileIO::new_with_fs()` + a `file://` path).
+    /// within +/-10% of 500.
     #[tokio::test]
     async fn write_puffin_then_read_ndv_roundtrips() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("rt.puffin");
         let path_str = format!("file://{}", path.display());
-        let file_io = FileIO::new_with_fs();
+        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(&path_str, None);
 
         let mut sketch = ThetaSketchHandle::new(12);
         for i in 0..500_i64 {
