@@ -211,6 +211,18 @@ fn build_target_locator_join(
         DataType::Int64,
         false,
     )?;
+    let right_row_id_id = allocate_imv_column(
+        ctx,
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        DataType::Int64,
+        false,
+    )?;
+    let right_last_updated_seq_id = allocate_imv_column(
+        ctx,
+        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        DataType::Int64,
+        true,
+    )?;
 
     let right_scan = build_target_locator_scan(
         ext,
@@ -219,6 +231,8 @@ fn build_target_locator_join(
         right_branch_id,
         right_file_id,
         right_pos_id,
+        right_row_id_id,
+        right_last_updated_seq_id,
     );
     let join = LogicalPlanNode::new(
         PlanNodeKind::Join(LogicalJoinNode {
@@ -236,6 +250,7 @@ fn build_target_locator_join(
     let mut items = input
         .output
         .iter()
+        .filter(|column| !is_row_lineage_locator_name(&column.name))
         .map(project_item_for_output_column)
         .collect::<Vec<_>>();
     items.push(nullable_locator_project_item(
@@ -246,6 +261,16 @@ fn build_target_locator_join(
     items.push(nullable_locator_project_item(
         right_pos_id,
         crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        DataType::Int64,
+    ));
+    items.push(nullable_locator_project_item(
+        right_row_id_id,
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        DataType::Int64,
+    ));
+    items.push(nullable_locator_project_item(
+        right_last_updated_seq_id,
+        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
         DataType::Int64,
     ));
     Ok(LogicalPlanNode::new(
@@ -265,6 +290,8 @@ fn build_target_locator_scan(
     right_branch_id: Option<ColumnId>,
     right_file_id: ColumnId,
     right_pos_id: ColumnId,
+    right_row_id_id: ColumnId,
+    right_last_updated_seq_id: ColumnId,
 ) -> LogicalPlanNode {
     let target = &ext.mv_ctx.target;
     let mut columns = vec![ColumnDef {
@@ -298,6 +325,20 @@ fn build_target_locator_scan(
             write_default: None,
             logical_type: None,
         },
+        ColumnDef {
+            name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        ColumnDef {
+            name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        },
     ];
     let mut scan_columns = vec![output_column(
         right_apply_key_id,
@@ -327,6 +368,20 @@ fn build_target_locator_scan(
         crate::exec::row_position::ICEBERG_ROW_POS_COL,
         DataType::Int64,
         false,
+        true,
+    ));
+    scan_columns.push(output_column(
+        right_row_id_id,
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        DataType::Int64,
+        false,
+        true,
+    ));
+    scan_columns.push(output_column(
+        right_last_updated_seq_id,
+        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        DataType::Int64,
+        true,
         true,
     ));
 
@@ -461,6 +516,11 @@ fn subtree_has_target_locator_join(plan: &LogicalPlanNode) -> bool {
     is_target_locator_join(plan) || plan.children.iter().any(subtree_has_target_locator_join)
 }
 
+fn is_row_lineage_locator_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
+}
+
 fn project_item_for_output_column(column: &OutputColumn) -> ProjectItem {
     ProjectItem {
         expr: column_ref(column),
@@ -533,7 +593,8 @@ fn is_internal_output_name(name: &str) -> bool {
     name.eq_ignore_ascii_case(ImvActionColumn::NAME)
         || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
         || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
-        || name.eq_ignore_ascii_case("_row_id")
+        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
         || name.eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
         || name.eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
         || name.eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)

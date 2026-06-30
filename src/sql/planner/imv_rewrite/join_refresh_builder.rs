@@ -123,6 +123,8 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
     net_column_id: u32,
     locator_file_column_id: u32,
     locator_pos_column_id: u32,
+    locator_row_id_column_id: u32,
+    locator_last_updated_seq_column_id: u32,
 ) -> Result<LogicalPlanNode, String> {
     desc.validate()?;
     if desc.mode != JoinRefreshMode::Coalesce {
@@ -163,6 +165,14 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         (
             crate::exec::row_position::ICEBERG_ROW_POS_COL,
             ColumnId(locator_pos_column_id),
+        ),
+        (
+            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            ColumnId(locator_row_id_column_id),
+        ),
+        (
+            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            ColumnId(locator_last_updated_seq_column_id),
         ),
     ];
     validate_generated_column_ids(&input_columns, desc, &explicit_generated_ids)?;
@@ -219,6 +229,8 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         locator_apply_key_id,
         ColumnId(locator_file_column_id),
         ColumnId(locator_pos_column_id),
+        ColumnId(locator_row_id_column_id),
+        ColumnId(locator_last_updated_seq_column_id),
     )?;
     let locator_checked = build_locator_assert_filter(
         locator_join,
@@ -235,6 +247,8 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &net_column,
         ColumnId(locator_file_column_id),
         ColumnId(locator_pos_column_id),
+        ColumnId(locator_row_id_column_id),
+        ColumnId(locator_last_updated_seq_column_id),
     )?)
 }
 
@@ -456,6 +470,8 @@ fn build_locator_join_shell(
     right_apply_key_id: ColumnId,
     locator_file_column_id: ColumnId,
     locator_pos_column_id: ColumnId,
+    locator_row_id_column_id: ColumnId,
+    locator_last_updated_seq_column_id: ColumnId,
 ) -> Result<LogicalPlanNode, String> {
     let right_scan = build_target_locator_scan(
         desc,
@@ -464,6 +480,8 @@ fn build_locator_join_shell(
         right_apply_key_id,
         locator_file_column_id,
         locator_pos_column_id,
+        locator_row_id_column_id,
+        locator_last_updated_seq_column_id,
     );
     let delete_only = binary(
         column_ref(net_column),
@@ -500,6 +518,8 @@ fn build_target_locator_scan(
     right_apply_key_id: ColumnId,
     locator_file_column_id: ColumnId,
     locator_pos_column_id: ColumnId,
+    locator_row_id_column_id: ColumnId,
+    locator_last_updated_seq_column_id: ColumnId,
 ) -> LogicalPlanNode {
     let columns = vec![ColumnDef {
         name: apply_key.name.clone(),
@@ -520,6 +540,20 @@ fn build_target_locator_scan(
             name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
             data_type: DataType::Int64,
             nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        ColumnDef {
+            name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        ColumnDef {
+            name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
             write_default: None,
             logical_type: None,
         },
@@ -544,6 +578,20 @@ fn build_target_locator_scan(
             crate::exec::row_position::ICEBERG_ROW_POS_COL,
             DataType::Int64,
             false,
+            true,
+        ),
+        output_column(
+            locator_row_id_column_id,
+            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            DataType::Int64,
+            false,
+            true,
+        ),
+        output_column(
+            locator_last_updated_seq_column_id,
+            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            DataType::Int64,
+            true,
             true,
         ),
     ];
@@ -622,6 +670,8 @@ fn build_final_coalesce_project(
     net_column: &OutputColumn,
     locator_file_column_id: ColumnId,
     locator_pos_column_id: ColumnId,
+    locator_row_id_column_id: ColumnId,
+    locator_last_updated_seq_column_id: ColumnId,
 ) -> Result<LogicalPlanNode, String> {
     let action_output = mapped_output_column(
         desc,
@@ -657,6 +707,24 @@ fn build_final_coalesce_project(
         ),
         output_name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
         output_column_id: locator_pos_column_id,
+    });
+    items.push(ProjectItem {
+        expr: locator_column_ref(
+            locator_row_id_column_id,
+            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            DataType::Int64,
+        ),
+        output_name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+        output_column_id: locator_row_id_column_id,
+    });
+    items.push(ProjectItem {
+        expr: locator_column_ref(
+            locator_last_updated_seq_column_id,
+            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            DataType::Int64,
+        ),
+        output_name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+        output_column_id: locator_last_updated_seq_column_id,
     });
     Ok(LogicalPlanNode::new(
         PlanNodeKind::Project(LogicalProjectNode {
@@ -1240,6 +1308,8 @@ mod tests {
             100,
             101,
             102,
+            103,
+            104,
         )
         .expect("coalesce plan");
 
@@ -1265,6 +1335,8 @@ mod tests {
             100,
             101,
             102,
+            103,
+            104,
         )
         .expect("coalesce plan");
 
@@ -1285,6 +1357,8 @@ mod tests {
             100,
             101,
             102,
+            103,
+            104,
         )
         .expect("coalesce plan");
         let physical = optimize_for_test(plan);
@@ -1319,6 +1393,8 @@ mod tests {
             100,
             101,
             102,
+            103,
+            104,
         )
         .expect_err("coalesce requires locator");
 
@@ -1335,6 +1411,8 @@ mod tests {
             80,
             101,
             102,
+            103,
+            104,
         )
         .expect_err("net id collision should fail closed");
 
@@ -1351,6 +1429,8 @@ mod tests {
             100,
             100,
             102,
+            103,
+            104,
         )
         .expect_err("duplicate generated ids should fail closed");
 
@@ -1373,6 +1453,8 @@ mod tests {
                 100,
                 101,
                 102,
+                103,
+                104,
             )
             .expect_err("reserved locator payload output should fail closed");
 

@@ -209,15 +209,61 @@ impl IcebergCommitCollector {
             .sum()
     }
 
-    /// Sum of `positions.len()` across all currently-injected
-    /// [`PositionDeleteGroup`]s. Non-destructive; used by IVM-A1 refresh
-    /// accounting (deleted-row count for the MV row total).
+    /// Sum of data rows across both preserved/reuse files and net-new appended
+    /// files. Used by change-stream based IMV refresh accounting: both channels
+    /// materialize rows into the target snapshot, even though RowDeltaDvFromFiles
+    /// keeps them separate for row-lineage assignment.
+    pub fn injected_or_appended_data_record_count(&self) -> i64 {
+        use iceberg::spec::DataContentType;
+        let injected_rows: i64 = {
+            let guard = self
+                .injected
+                .lock()
+                .expect("collector injected lock poisoned");
+            guard
+                .iter()
+                .filter(|wf| matches!(wf.content, DataContentType::Data))
+                .map(|wf| wf.record_count as i64)
+                .sum()
+        };
+        let appended_rows: i64 = {
+            let guard = self
+                .appended
+                .lock()
+                .expect("collector appended lock poisoned");
+            guard
+                .iter()
+                .filter(|wf| matches!(wf.content, DataContentType::Data))
+                .map(|wf| wf.record_count as i64)
+                .sum()
+        };
+        injected_rows + appended_rows
+    }
+
+    /// Sum of delete-side rows across coordinator-built delete groups and
+    /// BE-written delete files. Non-destructive; used by IVM-A1 refresh
+    /// accounting and empty-write gating.
     pub fn injected_delete_record_count(&self) -> i64 {
-        let guard = self
-            .delete_groups
-            .lock()
-            .expect("collector delete_groups lock poisoned");
-        guard.iter().map(|g| g.positions.len() as i64).sum()
+        use iceberg::spec::DataContentType;
+        let group_rows: i64 = {
+            let guard = self
+                .delete_groups
+                .lock()
+                .expect("collector delete_groups lock poisoned");
+            guard.iter().map(|g| g.positions.len() as i64).sum()
+        };
+        let injected_delete_rows: i64 = {
+            let guard = self
+                .injected
+                .lock()
+                .expect("collector injected lock poisoned");
+            guard
+                .iter()
+                .filter(|wf| matches!(wf.content, DataContentType::PositionDeletes))
+                .map(|wf| wf.record_count as i64)
+                .sum()
+        };
+        group_rows + injected_delete_rows
     }
 
     /// Pre-load a written file into the collector. Used by the standalone
@@ -1299,8 +1345,8 @@ mod tests {
     use super::*;
 
     use iceberg::spec::{
-        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, TableMetadata,
-        TableMetadataBuilder, Transform, Type,
+        DataContentType, DataFileFormat, FormatVersion, NestedField, PartitionSpec, PrimitiveType,
+        Schema, Struct, TableMetadata, TableMetadataBuilder, Transform, Type,
     };
 
     fn int_schema() -> SchemaRef {
@@ -1372,6 +1418,59 @@ mod tests {
             is_overwrite: None,
             is_rewrite: None,
         }
+    }
+
+    fn written_file_with_content(
+        path: &str,
+        content: DataContentType,
+        format: DataFileFormat,
+        record_count: u64,
+    ) -> WrittenFile {
+        WrittenFile {
+            path: path.to_string(),
+            format,
+            content,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count,
+            file_size_in_bytes: 128,
+            split_offsets: Vec::new(),
+            column_sizes: Default::default(),
+            value_counts: Default::default(),
+            null_value_counts: Default::default(),
+            nan_value_counts: Default::default(),
+            lower_bounds: Default::default(),
+            upper_bounds: Default::default(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
+        }
+    }
+
+    #[test]
+    fn injected_delete_record_count_includes_be_written_dv_files() {
+        let collector = unpartitioned_collector(int_schema());
+        collector.inject_written_files(vec![
+            written_file_with_content(
+                "file:///warehouse/t/data/a.parquet",
+                DataContentType::Data,
+                DataFileFormat::Parquet,
+                7,
+            ),
+            written_file_with_content(
+                "file:///warehouse/t/data/dv.puffin",
+                DataContentType::PositionDeletes,
+                DataFileFormat::Puffin,
+                3,
+            ),
+        ]);
+
+        assert_eq!(collector.injected_data_record_count(), 7);
+        assert_eq!(collector.injected_delete_record_count(), 3);
     }
 
     #[test]

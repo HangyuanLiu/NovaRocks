@@ -16,6 +16,7 @@ use crate::engine::query_options::StandaloneQueryOptions;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
+use crate::thrift::internal_service::TQueryOptions;
 
 use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, normalize_identifier};
 use crate::connector::{
@@ -3604,7 +3605,7 @@ fn install_change_stream_write_test_observer(
 }
 
 #[cfg(test)]
-fn observe_change_stream_write_build_for_test(
+pub(crate) fn observe_change_stream_write_build_for_test(
     dag: &crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec,
 ) -> Option<crate::runtime::coordinator::CoordinatedQueryResult> {
     let mut observer = change_stream_write_test_observer()
@@ -3848,6 +3849,113 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
         None,
         false,
     )
+}
+
+pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
+    pub(crate) physical_plan: crate::sql::optimizer::PhysicalPlanNode,
+    pub(crate) output_columns: Vec<crate::sql::analysis::OutputColumn>,
+    pub(crate) change_stream:
+        crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
+    run_imv_rewrite: bool,
+) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
+    let (resolved, cte_registry, mut factory) =
+        crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
+    let mut logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    let mut change_stream =
+        crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default();
+    if run_imv_rewrite {
+        let mv_ctx =
+            mv_refresh_ctx.ok_or_else(|| "IMV rewrite requires MV refresh context".to_string())?;
+        logical = crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical);
+        let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
+        let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
+            crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
+                plan: logical,
+                disabled_rules: crate::sql::optimizer::options::current_session_optimizer_settings(
+                )
+                .disabled_rules
+                .clone(),
+                mv_ctx: std::sync::Arc::clone(&mv_ctx.rewrite),
+                deadline: None,
+                column_ref_factory: std::rc::Rc::clone(&factory_cell),
+            },
+        )
+        .map_err(|e| format!("imv rewrite: {e}"))?;
+        if let Some(validator) = imv_rewrite_validator {
+            validator(&outcome)?;
+        }
+        factory = std::rc::Rc::try_unwrap(factory_cell)
+            .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
+            .into_inner();
+        change_stream = outcome.annotation.change_stream.clone();
+        logical = outcome.plan;
+    } else if imv_rewrite_validator.is_some() {
+        return Err("IMV rewrite validator requires MV refresh context".to_string());
+    }
+
+    let output_columns = crate::sql::planner::plan_output_columns(&logical)?;
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        &logical,
+        &mut scalar_arena,
+    )?;
+    let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
+    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+    snapshot_effective_backend_count_into_session();
+    let physical_plan = crate::sql::optimizer::optimize(
+        opt_expr,
+        scalar_arena,
+        &query_stats.snapshot,
+        factory,
+        None,
+        Vec::new(),
+    )?;
+    Ok(PlannedIcebergChangeStreamRefreshQuery {
+        physical_plan,
+        output_columns,
+        change_stream,
+    })
+}
+
+pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
+    logical: crate::sql::planner::plan::LogicalPlanNode,
+    factory: crate::sql::column_id::ColumnRefFactory,
+    connectors: &crate::connector::ConnectorRegistry,
+) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
+    let output_columns = crate::sql::planner::plan_output_columns(&logical)?;
+    let change_stream =
+        crate::sql::planner::imv_rewrite::change_stream::build_change_stream_descriptor(&logical);
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        &logical,
+        &mut scalar_arena,
+    )?;
+    let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
+    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+    snapshot_effective_backend_count_into_session();
+    let physical_plan = crate::sql::optimizer::optimize(
+        opt_expr,
+        scalar_arena,
+        &query_stats.snapshot,
+        factory,
+        None,
+        Vec::new(),
+    )?;
+    Ok(PlannedIcebergChangeStreamRefreshQuery {
+        physical_plan,
+        output_columns,
+        change_stream,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4391,9 +4499,9 @@ fn execute_plan(
     push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
 
     // Default to the result-capturing sink unless the caller supplied a
-    // custom terminal sink (e.g. IVM-A1 IcebergMergeSinkFactory). When a
-    // custom sink is in use, output chunks are intercepted by the sink so
-    // the returned `QueryResult` only carries the column metadata.
+    // custom terminal sink. When a custom sink is in use, output chunks are
+    // intercepted by the sink so the returned `QueryResult` only carries the
+    // column metadata.
     let handle = ResultSinkHandle::new();
     let sink: Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory> =
         match terminal_sink {
@@ -10226,11 +10334,9 @@ path = "meta/operations.sqlite"
         };
         attach_scalar_arena(&mut physical_plan, Arc::new(ScalarArena::new()));
         let state = Arc::new(StandaloneState::default());
-        let mut dag = IcebergChangeStreamWriteDagSpec::for_test(
-            1,
-            Some(2),
-            vec![ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![3])],
-        );
+        let mut branch = ChangeStreamWriteBranchSpec::reuse_data_for_test(Vec::new());
+        branch.stream_output_ordinals = Some(vec![0]);
+        let mut dag = IcebergChangeStreamWriteDagSpec::for_test(1, Some(2), vec![branch]);
 
         let result = super::execute_physical_plan_as_iceberg_change_stream_write(
             &state,

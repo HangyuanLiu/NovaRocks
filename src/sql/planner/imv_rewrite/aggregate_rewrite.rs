@@ -283,6 +283,20 @@ fn target_state_locator_metadata_columns() -> Vec<ColumnDef> {
             write_default: None,
             logical_type: None,
         },
+        ColumnDef {
+            name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        ColumnDef {
+            name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        },
     ]
 }
 
@@ -750,6 +764,10 @@ fn aggregate_insert_expr_for_output(
         }
     }
 
+    if is_reuse_lineage_metadata_column(&output.name) {
+        return source_expr_by_name(input_outputs, old_outputs, &output.name);
+    }
+
     if is_locator_metadata_column(&output.name) {
         return Ok(typed_null(output.data_type.clone()));
     }
@@ -882,6 +900,20 @@ fn aggregate_change_stream_output_columns(
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        DataType::Int64,
+        true,
+        true,
+    )?);
+    columns.push(allocate_imv_output_column(
+        ctx,
+        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        DataType::Int64,
+        true,
+        true,
+    )?);
+    columns.push(allocate_imv_output_column(
+        ctx,
         ImvActionColumn::NAME,
         DataType::Int8,
         false,
@@ -893,6 +925,12 @@ fn aggregate_change_stream_output_columns(
 fn is_locator_metadata_column(name: &str) -> bool {
     name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
         || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
+        || is_reuse_lineage_metadata_column(name)
+}
+
+fn is_reuse_lineage_metadata_column(name: &str) -> bool {
+    name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
 }
 
 fn column_ref(column: &OutputColumn) -> TypedExpr {
@@ -1107,6 +1145,8 @@ fn aggregate_physical_passthrough_items(
     for name in [
         crate::exec::row_position::ICEBERG_FILE_PATH_COL,
         crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
     ] {
         let source = find_output_column_by_name(outputs, name)?;
         items.push(ProjectItem {
@@ -3036,6 +3076,8 @@ mod tests {
                 "__agg_state___ivm_row_count",
                 crate::exec::row_position::ICEBERG_FILE_PATH_COL,
                 crate::exec::row_position::ICEBERG_ROW_POS_COL,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
                 "__change_op"
             ]
         );

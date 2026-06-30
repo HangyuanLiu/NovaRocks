@@ -4738,24 +4738,20 @@ fn refresh_scan_table_for_codegen(
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(&column.name))
             });
-            if projected
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case("_row_id"))
-                && !out
-                    .columns
-                    .iter()
-                    .chain(out.iceberg_row_lineage_metadata_columns.iter())
-                    .any(|column| column.name.eq_ignore_ascii_case("_row_id"))
-            {
-                out.iceberg_row_lineage_metadata_columns
-                    .push(crate::sql::catalog::ColumnDef {
-                        name: "_row_id".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        write_default: None,
-                        logical_type: None,
-                    });
-            }
+            ensure_iceberg_metadata_column(
+                &mut out,
+                &projected,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+            );
+            ensure_iceberg_metadata_column(
+                &mut out,
+                &projected,
+                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                DataType::Int64,
+                true,
+            );
             ensure_iceberg_metadata_column(
                 &mut out,
                 &projected,
@@ -4790,6 +4786,20 @@ fn refresh_scan_table_for_codegen(
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(&column.name))
             });
+            ensure_iceberg_metadata_column(
+                &mut out,
+                &projected,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+            );
+            ensure_iceberg_metadata_column(
+                &mut out,
+                &projected,
+                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                DataType::Int64,
+                true,
+            );
             ensure_iceberg_metadata_column(
                 &mut out,
                 &projected,

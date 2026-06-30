@@ -122,8 +122,17 @@ impl ChangeStreamRoutedWriterFiles {
     }
 
     pub(crate) fn inject(self, collector: &IcebergCommitCollector) {
-        collector.inject_written_files(self.reuse_or_dv);
-        collector.inject_appended_files(self.fresh);
+        if matches!(
+            collector.op_kind,
+            crate::connector::iceberg::commit::CommitOpKind::FastAppend
+        ) {
+            let mut files = self.reuse_or_dv;
+            files.extend(self.fresh);
+            collector.inject_written_files(files);
+        } else {
+            collector.inject_written_files(self.reuse_or_dv);
+            collector.inject_appended_files(self.fresh);
+        }
     }
 }
 

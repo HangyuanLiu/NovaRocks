@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::array::{Array, Int8Array, Int32Array, UInt32Array};
+use arrow::array::{Array, Int8Array, Int16Array, Int32Array, Int64Array, NullArray, UInt32Array};
 use arrow::compute::take;
 
 use crate::common::ids::SlotId;
@@ -47,14 +47,27 @@ fn int32_value(array: &dyn Array, row: usize, label: &str) -> Result<Option<i32>
             array.len()
         ));
     }
-    let Some(values) = array.as_any().downcast_ref::<Int32Array>() else {
-        return Err(format!("{label} must be Int32"));
-    };
-    if values.is_null(row) {
-        Ok(None)
-    } else {
-        Ok(Some(values.value(row)))
+    if array.as_any().downcast_ref::<NullArray>().is_some() {
+        return Ok(None);
     }
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int8Array>() {
+        return Ok(Some(i32::from(values.value(row))));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int16Array>() {
+        return Ok(Some(i32::from(values.value(row))));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
+        return Ok(Some(values.value(row)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+        return i32::try_from(values.value(row))
+            .map(Some)
+            .map_err(|_| format!("{label} value exceeds Int32 range"));
+    }
+    Err(format!("{label} must be an integer route column"))
 }
 
 fn int8_value(array: &dyn Array, row: usize, label: &str) -> Result<Option<i8>, String> {
@@ -98,11 +111,10 @@ fn route_key_for_row(
             })
         }
         CHANGE_OP_INSERT => {
-            let Some(route) = data_route
-                .map(|array| int32_value(array, row, "data_route"))
-                .transpose()?
-                .flatten()
-            else {
+            let Some(data_route) = data_route else {
+                return Err("+1 data route requires non-NULL data_route".to_string());
+            };
+            let Some(route) = int32_value(data_route, row, "data_route")? else {
                 return Err("+1 data route requires non-NULL data_route".to_string());
             };
             if route != DATA_ROUTE_REUSE && route != DATA_ROUTE_FRESH {
@@ -227,7 +239,19 @@ impl IcebergChangeStreamRouterSinkFactory {
                 Some("ICEBERG_CHANGE_STREAM_ROUTER_SINK requires at least one branch".to_string());
         }
 
-        for branch in router.branches {
+        let raw_branches = router.branches;
+        let data_branch_count = raw_branches
+            .iter()
+            .filter(|branch| {
+                matches!(
+                    ChangeStreamWriteBranchKind::from_thrift(branch.branch_kind),
+                    Ok(ChangeStreamWriteBranchKind::ReuseData)
+                        | Ok(ChangeStreamWriteBranchKind::FreshData)
+                )
+            })
+            .count();
+
+        for branch in raw_branches {
             let branch_kind = match ChangeStreamWriteBranchKind::from_thrift(branch.branch_kind) {
                 Ok(kind) => kind,
                 Err(err) => {
@@ -261,7 +285,6 @@ impl IcebergChangeStreamRouterSinkFactory {
                     branch_kind
                 ));
             }
-
             let mut branch_exec_params = exec_params.clone();
             branch_exec_params.destinations = Some(branch.destinations);
             branches.push(IcebergChangeStreamRouterBranchFactory {
@@ -278,15 +301,7 @@ impl IcebergChangeStreamRouterSinkFactory {
             });
         }
 
-        if data_route_slot_id.is_none()
-            && branches.iter().any(|branch| {
-                matches!(
-                    branch.branch_kind,
-                    ChangeStreamWriteBranchKind::ReuseData | ChangeStreamWriteBranchKind::FreshData
-                )
-            })
-            && init_error.is_none()
-        {
+        if data_route_slot_id.is_none() && data_branch_count > 0 && init_error.is_none() {
             init_error = Some(
                 "ICEBERG_CHANGE_STREAM_ROUTER_SINK: data_route_slot_id is required when data branches are declared"
                     .to_string(),
@@ -612,7 +627,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int8Array, Int32Array};
+    use arrow::array::{ArrayRef, Int8Array, Int32Array, Int64Array};
 
     use super::*;
 
@@ -622,6 +637,10 @@ mod tests {
 
     fn int32(values: Vec<Option<i32>>) -> ArrayRef {
         Arc::new(Int32Array::from(values))
+    }
+
+    fn int64(values: Vec<Option<i64>>) -> ArrayRef {
+        Arc::new(Int64Array::from(values))
     }
 
     #[test]
@@ -663,6 +682,67 @@ mod tests {
         .expect("routes");
 
         assert_eq!(routes, vec![0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn route_rows_accepts_integral_data_route_literals() {
+        let branch_map = BTreeMap::from([
+            (
+                ChangeStreamRouteKey {
+                    change_op: CHANGE_OP_INSERT,
+                    data_route: Some(DATA_ROUTE_REUSE),
+                },
+                0usize,
+            ),
+            (
+                ChangeStreamRouteKey {
+                    change_op: CHANGE_OP_INSERT,
+                    data_route: Some(DATA_ROUTE_FRESH),
+                },
+                1usize,
+            ),
+        ]);
+
+        let routes = route_indices_for_test(
+            int8(vec![Some(1), Some(1)]),
+            Some(int64(vec![
+                Some(i64::from(DATA_ROUTE_REUSE)),
+                Some(i64::from(DATA_ROUTE_FRESH)),
+            ])),
+            &branch_map,
+        )
+        .expect("routes");
+
+        assert_eq!(routes, vec![0, 1]);
+    }
+
+    #[test]
+    fn route_rows_without_data_route_rejects_data_branch() {
+        let branch_map = BTreeMap::from([
+            (
+                ChangeStreamRouteKey {
+                    change_op: CHANGE_OP_DELETE,
+                    data_route: None,
+                },
+                0usize,
+            ),
+            (
+                ChangeStreamRouteKey {
+                    change_op: CHANGE_OP_INSERT,
+                    data_route: Some(DATA_ROUTE_REUSE),
+                },
+                1usize,
+            ),
+        ]);
+
+        let err = route_indices_for_test(
+            int8(vec![Some(-1), Some(1), Some(1), Some(-1)]),
+            None,
+            &branch_map,
+        )
+        .expect_err("missing data_route");
+
+        assert!(err.contains("+1 data route requires non-NULL data_route"));
     }
 
     #[test]

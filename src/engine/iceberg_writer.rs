@@ -837,7 +837,7 @@ fn source_index_for_write_column(
         })
 }
 
-fn iceberg_insert_columns_from_schema(
+pub(crate) fn iceberg_insert_columns_from_schema(
     schema: &iceberg::spec::Schema,
 ) -> Result<Vec<ColumnDef>, String> {
     let arrow_schema = iceberg::arrow::schema_to_arrow_schema(schema)

@@ -69,6 +69,7 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             RewritePhase::StructuralRewrite,
             vec![
                 Box::new(PushDeltaThroughUnaryRule) as Box<dyn LogicalRewriteRule>,
+                Box::new(RewriteTopLevelUnionDeltaRule) as Box<dyn LogicalRewriteRule>,
                 Box::new(RewriteJoinDeltaRule) as Box<dyn LogicalRewriteRule>,
             ],
         ),

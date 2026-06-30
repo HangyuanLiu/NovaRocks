@@ -69,7 +69,9 @@ pub(crate) struct ChangeStreamWriteBranchSpec {
     pub(crate) branch_id: i32,
     pub(crate) branch_kind: ChangeStreamWriteBranchKind,
     pub(crate) stream_output_slots: Vec<i32>,
+    pub(crate) stream_output_ordinals: Option<Vec<usize>>,
     pub(crate) output_partition: partitions::TDataPartition,
+    pub(crate) output_partition_ordinals: Option<Vec<usize>>,
     pub(crate) sink_spec: IcebergWriteSinkSpec,
     pub(crate) writer_fragment_id: Option<FragmentId>,
 }
@@ -77,7 +79,9 @@ pub(crate) struct ChangeStreamWriteBranchSpec {
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergChangeStreamWriteDagSpec {
     pub(crate) change_op_slot: i32,
+    pub(crate) change_op_output_ordinal: Option<usize>,
     pub(crate) data_route_slot: Option<i32>,
+    pub(crate) data_route_output_ordinal: Option<usize>,
     pub(crate) branches: Vec<ChangeStreamWriteBranchSpec>,
 }
 
@@ -97,12 +101,15 @@ pub(crate) fn validate_branch_set(branches: &[ChangeStreamWriteBranchSpec]) -> R
 impl IcebergChangeStreamWriteDagSpec {
     pub(crate) fn validate(&mut self) -> Result<(), String> {
         validate_branch_set(&self.branches)?;
-        if self.branches.iter().any(|b| {
+        let has_data_branch = self.branches.iter().any(|b| {
             matches!(
                 b.branch_kind,
                 ChangeStreamWriteBranchKind::ReuseData | ChangeStreamWriteBranchKind::FreshData
             )
-        }) && self.data_route_slot.is_none()
+        });
+        if has_data_branch
+            && self.data_route_slot.is_none()
+            && self.data_route_output_ordinal.is_none()
         {
             return Err("data_route_slot is required when data branches are declared".to_string());
         }
@@ -117,12 +124,14 @@ impl ChangeStreamWriteBranchSpec {
             branch_id,
             branch_kind,
             stream_output_slots: Vec::new(),
+            stream_output_ordinals: None,
             output_partition: partitions::TDataPartition::new(
                 partitions::TPartitionType::UNPARTITIONED,
                 None::<Vec<crate::thrift::exprs::TExpr>>,
                 None::<Vec<partitions::TRangePartition>>,
                 None::<Vec<partitions::TBucketProperty>>,
             ),
+            output_partition_ordinals: None,
             sink_spec: crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec(),
             writer_fragment_id: None,
         }
@@ -205,7 +214,9 @@ impl IcebergChangeStreamWriteDagSpec {
     ) -> Self {
         Self {
             change_op_slot,
+            change_op_output_ordinal: None,
             data_route_slot,
+            data_route_output_ordinal: None,
             branches,
         }
     }
@@ -310,5 +321,19 @@ mod tests {
         );
         spec.validate()
             .expect("delete-only does not require data route");
+    }
+
+    #[test]
+    fn validate_allows_delete_and_one_data_branch_with_data_route() {
+        let mut spec = IcebergChangeStreamWriteDagSpec::for_test(
+            10,
+            Some(11),
+            vec![
+                ChangeStreamWriteBranchSpec::for_test(0, ChangeStreamWriteBranchKind::DeleteDv),
+                ChangeStreamWriteBranchSpec::for_test(1, ChangeStreamWriteBranchKind::FreshData),
+            ],
+        );
+        spec.validate()
+            .expect("change_op alone distinguishes delete from one data branch");
     }
 }

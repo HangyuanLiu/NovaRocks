@@ -230,15 +230,14 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
 
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         let plan = opt_expr_to_plan(expr.clone(), ctx);
-        let PlanNodeKind::ImvDelta(delta) = &plan.kind else {
+        let PlanNodeKind::ImvDelta(_) = &plan.kind else {
             return false;
         };
-        delta.is_root
-            && matches!(
-                &plan.unary_input().kind,
-                PlanNodeKind::Union(union)
-                    if union.all && !plan_contains_imv_marker(plan.unary_input())
-            )
+        matches!(
+            &plan.unary_input().kind,
+            PlanNodeKind::Union(union)
+                if union.all && !plan_contains_imv_marker(plan.unary_input())
+        )
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -249,9 +248,6 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
             let PlanNodeKind::ImvDelta(delta) = kind else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
-            if !delta.is_root {
-                return Ok(PlanRewriteResult::Unchanged);
-            }
             let union_plan = take_unary_child(&mut children);
             if !matches!(&union_plan.kind, PlanNodeKind::Union(_)) {
                 return Ok(PlanRewriteResult::Unchanged);
@@ -588,6 +584,53 @@ mod tests {
 
         assert_top_level_union_branch(&rewritten.children[0], action_column, ColumnId(101), 0);
         assert_top_level_union_branch(&rewritten.children[1], action_column, ColumnId(101), 1);
+    }
+
+    #[test]
+    fn rewrite_top_level_union_delta_accepts_non_root_marker_after_unary_pushdown() {
+        let rule = RewriteTopLevelUnionDeltaRule;
+        let mut ctx = build_ctx();
+        let plan = LogicalPlanNode::new(
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                is_root: false,
+                action_column: None,
+                branch_scope: None,
+            }),
+            vec![project_filter_union(true)],
+            None,
+        );
+
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
+        let RewriteResult::Changed(rewritten_expr) = rule
+            .apply(expr, &mut ctx)
+            .expect("non-root UNION ALL delta must rewrite after unary pushdown")
+        else {
+            panic!("expected Changed(Union)");
+        };
+        let arena_ref = ctx.scalar_arena();
+        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            rewritten_expr,
+            &arena_ref.borrow(),
+        );
+        let PlanNodeKind::Union(union) = &rewritten.kind else {
+            panic!("expected Changed(Union), got {rewritten:?}");
+        };
+
+        assert!(
+            union
+                .output_columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
+            "rewritten union must expose action output"
+        );
+        assert!(
+            union.output_columns.iter().any(|column| column
+                .name
+                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)),
+            "rewritten union must expose branch id output"
+        );
     }
 
     #[test]

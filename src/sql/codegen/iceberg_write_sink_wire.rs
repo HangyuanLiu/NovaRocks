@@ -53,6 +53,7 @@ pub(crate) fn build_iceberg_write_sink_thrift(
         None::<Vec<Box<data_sinks::TDataSink>>>,
         None::<i64>,
         None::<data_sinks::TSplitDataStreamSink>,
+        None::<data_sinks::TIcebergChangeStreamRouterSink>,
     )
 }
 

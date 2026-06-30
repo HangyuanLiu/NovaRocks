@@ -565,17 +565,20 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
     match &plan.kind {
         PlanNodeKind::Scan(node) => Ok(node.columns.clone()),
         PlanNodeKind::Filter(_) => plan_output_columns(plan.unary_input()),
-        PlanNodeKind::Project(node) => Ok(node
-            .items
-            .iter()
-            .map(|item| OutputColumn {
-                column_id: item.output_column_id,
-                name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
-                is_internal: false,
-            })
-            .collect()),
+        PlanNodeKind::Project(node) => {
+            let input_columns = plan_output_columns(plan.unary_input())?;
+            Ok(node
+                .items
+                .iter()
+                .map(|item| OutputColumn {
+                    column_id: item.output_column_id,
+                    name: item.output_name.clone(),
+                    data_type: item.expr.data_type.clone(),
+                    nullable: item.expr.nullable,
+                    is_internal: project_item_refs_internal_column(item, &input_columns),
+                })
+                .collect())
+        }
         PlanNodeKind::Aggregate(node) => Ok(node.output_columns.clone()),
         PlanNodeKind::Join(node) => {
             let left = plan_output_columns(plan.left())?;
@@ -625,6 +628,23 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
             "distributed plan node {} leaked into logical planner output adaptation",
             plan.kind.variant_name()
         )),
+    }
+}
+
+fn project_item_refs_internal_column(item: &ProjectItem, input_columns: &[OutputColumn]) -> bool {
+    expr_refs_internal_column(&item.expr, input_columns)
+}
+
+fn expr_refs_internal_column(expr: &TypedExpr, input_columns: &[OutputColumn]) -> bool {
+    match &expr.kind {
+        ExprKind::ColumnRef {
+            column_id, column, ..
+        } => input_columns.iter().any(|input| {
+            input.is_internal
+                && (input.column_id == *column_id || input.name.eq_ignore_ascii_case(column))
+        }),
+        ExprKind::Cast { expr, .. } => expr_refs_internal_column(expr, input_columns),
+        _ => false,
     }
 }
 

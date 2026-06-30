@@ -172,8 +172,7 @@ impl IcebergWriteCommitExecutor {
                 self.cleanup_converted_writer_files(&converted_files),
             )
         })?;
-        self.collector.inject_written_files(routed.reuse_or_dv);
-        self.collector.inject_appended_files(routed.fresh);
+        routed.inject(&self.collector);
         self.run_commit_after_collector_injection()
     }
 
