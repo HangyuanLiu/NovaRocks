@@ -217,7 +217,7 @@ fn branch_union_aggregate_change_stream_output_columns(
 ) -> Result<Vec<OutputColumn>, String> {
     let (_shape, layout) = ext.mv_ctx.aggregate_shape_and_layout_for_execution()?;
     let mut columns =
-        Vec::with_capacity(1 + layout.visible_columns.len() + layout.state_columns.len() + 4);
+        Vec::with_capacity(1 + layout.visible_columns.len() + layout.state_columns.len() + 6);
     columns.push(allocate_imv_output_column(
         ctx,
         &layout.row_id_column.column.name,
@@ -268,6 +268,20 @@ fn branch_union_aggregate_change_stream_output_columns(
     columns.push(allocate_imv_output_column(
         ctx,
         crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        DataType::Int64,
+        true,
+        true,
+    )?);
+    columns.push(allocate_imv_output_column(
+        ctx,
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        DataType::Int64,
+        true,
+        true,
+    )?);
+    columns.push(allocate_imv_output_column(
+        ctx,
+        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
         DataType::Int64,
         true,
         true,
@@ -634,13 +648,37 @@ mod tests {
                 name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
             })
             .expect("branch-union aggregate output must include row-position locator");
+        let row_id_idx = output_names
+            .iter()
+            .position(|name| {
+                name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+            })
+            .expect("branch-union aggregate output must include row-lineage id");
+        let last_updated_seq_idx = output_names
+            .iter()
+            .position(|name| {
+                name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
+            })
+            .expect("branch-union aggregate output must include last-updated sequence");
         let action_idx = output_names
             .iter()
             .position(|name| name.eq_ignore_ascii_case(ImvActionColumn::NAME))
             .expect("branch-union aggregate output must include action column");
         assert_eq!(
-            [branch_idx + 1, branch_idx + 2, branch_idx + 3],
-            [file_idx, pos_idx, action_idx],
+            [
+                branch_idx + 1,
+                branch_idx + 2,
+                branch_idx + 3,
+                branch_idx + 4,
+                branch_idx + 5,
+            ],
+            [
+                file_idx,
+                pos_idx,
+                row_id_idx,
+                last_updated_seq_idx,
+                action_idx
+            ],
             "branch-union aggregate output must keep branch id, locator metadata, and action column contiguous: {output_names:?}"
         );
     }

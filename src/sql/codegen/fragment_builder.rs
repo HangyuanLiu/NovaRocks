@@ -5,12 +5,14 @@
 //! `PhysicalCTEProduce` / `PhysicalCTEConsume` create multicast fragments
 //! whose sinks are wired by the `ExecutionCoordinator` after building.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use arrow::datatypes::DataType;
 
 use crate::thrift::data_sinks;
+use crate::thrift::descriptors;
 use crate::thrift::exprs;
+use crate::thrift::partitions;
 use crate::thrift::plan_nodes;
 
 use crate::sql::catalog::{CatalogProvider, IcebergSchemaDef};
@@ -20,6 +22,9 @@ use crate::sql::codegen::boundary_schema::{
 };
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler;
+use crate::sql::codegen::iceberg_change_stream_write::{
+    ChangeStreamWriteBranchSpec, IcebergChangeStreamWriteDagSpec,
+};
 use crate::sql::codegen::iceberg_write_sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use crate::sql::codegen::iceberg_write_sink_wire::{
     build_iceberg_write_sink_thrift, partition_info_from_serialized_metadata,
@@ -27,7 +32,8 @@ use crate::sql::codegen::iceberg_write_sink_wire::{
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::scalar_materialize::materialize;
 use crate::sql::codegen::{
-    DirectExecPlan, FragmentBuildResult, MultiFragmentBuildResult, OutputColumn,
+    DirectExecPlan, FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+    MultiFragmentBuildResult, OutputColumn,
 };
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::operator::ProjectOp;
@@ -495,6 +501,140 @@ impl PlanFragmentBuilder {
         apply_iceberg_sink_to_build(build, current_database, sink_spec)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_via_distributed_plan_with_change_stream_write<'a>(
+        plan: &PhysicalPlanNode,
+        catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
+        current_database: &str,
+        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+        dag: &mut IcebergChangeStreamWriteDagSpec,
+    ) -> Result<MultiFragmentBuildResult, String> {
+        dag.validate()?;
+        if dag.branches.is_empty() {
+            return Err("Iceberg change-stream write DAG requires at least one branch".to_string());
+        }
+
+        if dag.branches.len() == 1 {
+            let mut build = Self::build_via_distributed_plan_with_mv_refresh_ctx(
+                plan,
+                catalog,
+                connectors,
+                current_database,
+                mv_refresh_ctx,
+            )?;
+            let source_root_index = root_fragment_index(&build)?;
+            let source_slots_by_id =
+                source_slot_descs_by_id(&build.fragment_results[source_root_index])?;
+            let branch = dag
+                .branches
+                .first_mut()
+                .expect("single branch checked above");
+            resolve_branch_stream_output_slots(branch, &source_slots_by_id)?;
+            build = apply_iceberg_sink_to_build_with_output_slots(
+                build,
+                current_database,
+                &branch.sink_spec,
+                &branch.stream_output_slots,
+            )?;
+            branch.writer_fragment_id = Some(build.root_fragment_id);
+            return Ok(build);
+        }
+
+        let mut build = Self::build_via_distributed_plan_with_mv_refresh_ctx(
+            plan,
+            catalog,
+            connectors,
+            current_database,
+            mv_refresh_ctx,
+        )?;
+        let source_fragment_id = build.root_fragment_id;
+        let source_root_index = root_fragment_index(&build)?;
+        let source_slots_by_id =
+            source_slot_descs_by_id(&build.fragment_results[source_root_index])?;
+        resolve_change_stream_dag_slots(dag, &source_slots_by_id)?;
+        assign_change_stream_branch_sink_table_ids(dag)?;
+
+        let mut desc_builder = DescriptorTableBuilder::from_existing(
+            build.fragment_results[source_root_index].desc_tbl.clone(),
+        );
+        let mut next_tuple_id = next_tuple_id(&build.fragment_results[source_root_index].desc_tbl);
+        let mut next_slot_id = next_slot_id(&build.fragment_results[source_root_index].desc_tbl);
+        let mut next_fragment_id = next_fragment_id(&build);
+        let mut next_exchange_node_id = next_plan_node_id(&build);
+        let mut writer_plans = Vec::with_capacity(dag.branches.len());
+        for (branch_index, branch) in dag.branches.iter().enumerate() {
+            add_iceberg_sink_target_table_to_desc_builder(
+                &mut desc_builder,
+                current_database,
+                &branch.sink_spec,
+            )?;
+            let writer_tuple_id = next_tuple_id;
+            next_tuple_id += 1;
+            let writer_schema = add_branch_writer_tuple_to_desc_builder(
+                &mut desc_builder,
+                &source_slots_by_id,
+                branch,
+                writer_tuple_id,
+                &mut next_slot_id,
+            )?;
+            writer_plans.push(ChangeStreamWriterPlan {
+                branch_index,
+                writer_fragment_id: next_fragment_id,
+                exchange_node_id: next_exchange_node_id,
+                writer_schema,
+            });
+            next_fragment_id += 1;
+            next_exchange_node_id += 1;
+        }
+        let desc_tbl = desc_builder.build();
+        for fragment in &mut build.fragment_results {
+            fragment.desc_tbl = desc_tbl.clone();
+        }
+
+        for writer_plan in writer_plans {
+            let branch = dag
+                .branches
+                .get_mut(writer_plan.branch_index)
+                .expect("writer plan branch index");
+            let writer_fragment_id = append_change_stream_writer_fragment(
+                &mut build,
+                connectors,
+                mv_refresh_ctx,
+                branch,
+                &desc_tbl,
+                &writer_plan.writer_schema,
+                writer_plan.writer_fragment_id,
+                writer_plan.exchange_node_id,
+            )?;
+            branch.writer_fragment_id = Some(writer_fragment_id);
+            build.edges.push(FragmentEdge {
+                source_fragment_id,
+                target_fragment_id: writer_fragment_id,
+                target_exchange_node_id: writer_plan.exchange_node_id,
+                output_partition: branch.output_partition.clone(),
+                stream_kind: stream_kind_for_partition(&branch.output_partition),
+                edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
+                    router_group_id: 0,
+                    branch_id: branch.branch_id,
+                    branch_kind: branch.branch_kind,
+                },
+            });
+            append_change_stream_edge_boundary_schemas(
+                &mut build,
+                source_fragment_id,
+                writer_fragment_id,
+                writer_plan.exchange_node_id,
+                &writer_plan.writer_schema.output_columns,
+            );
+        }
+
+        build.fragment_results[source_root_index].output_sink = build_router_sink_template(dag);
+        build.fragment_results[source_root_index].output_exprs = None;
+
+        Ok(build)
+    }
+
     fn build_aggregate_state_merge_direct_via_ir<'a>(
         plan: &PhysicalPlanNode,
         catalog: &'a dyn CatalogProvider,
@@ -803,16 +943,7 @@ fn apply_iceberg_sink_to_build(
     current_database: &str,
     sink_spec: &IcebergWriteSinkSpec,
 ) -> Result<MultiFragmentBuildResult, String> {
-    let root_index = build
-        .fragment_results
-        .iter()
-        .position(|fragment| fragment.fragment_id == build.root_fragment_id)
-        .ok_or_else(|| {
-            format!(
-                "Iceberg sink codegen could not find root fragment id={}",
-                build.root_fragment_id
-            )
-        })?;
+    let root_index = root_fragment_index(&build)?;
     let sink_tuple_id = root_output_tuple_id_for_sink(&build.fragment_results[root_index])?;
     let output_exprs = iceberg_sink_output_exprs_for_tuple(
         &build.fragment_results[root_index].desc_tbl,
@@ -825,6 +956,76 @@ fn apply_iceberg_sink_to_build(
 
     let mut desc_builder =
         DescriptorTableBuilder::from_existing(build.fragment_results[root_index].desc_tbl.clone());
+    add_iceberg_sink_target_table_to_desc_builder(&mut desc_builder, current_database, sink_spec)?;
+    let desc_tbl = desc_builder.build();
+    for fragment in &mut build.fragment_results {
+        fragment.desc_tbl = desc_tbl.clone();
+    }
+
+    Ok(build)
+}
+
+fn apply_iceberg_sink_to_build_with_output_slots(
+    mut build: MultiFragmentBuildResult,
+    current_database: &str,
+    sink_spec: &IcebergWriteSinkSpec,
+    output_slots: &[i32],
+) -> Result<MultiFragmentBuildResult, String> {
+    let root_index = root_fragment_index(&build)?;
+    let sink_tuple_id = root_output_tuple_id_for_sink(&build.fragment_results[root_index])?;
+    let output_exprs = iceberg_sink_output_exprs_for_slots(
+        &build.fragment_results[root_index].desc_tbl,
+        sink_tuple_id,
+        output_slots,
+        sink_spec.target_columns.len(),
+    )?;
+    build.fragment_results[root_index].output_sink =
+        build_iceberg_write_sink_thrift(sink_spec, sink_tuple_id);
+    build.fragment_results[root_index].output_exprs = Some(output_exprs);
+    build.fragment_results[root_index].output_columns =
+        output_columns_for_sink_target_columns(sink_spec);
+
+    let mut desc_builder =
+        DescriptorTableBuilder::from_existing(build.fragment_results[root_index].desc_tbl.clone());
+    add_iceberg_sink_target_table_to_desc_builder(&mut desc_builder, current_database, sink_spec)?;
+    let desc_tbl = desc_builder.build();
+    for fragment in &mut build.fragment_results {
+        fragment.desc_tbl = desc_tbl.clone();
+    }
+
+    Ok(build)
+}
+
+fn output_columns_for_sink_target_columns(sink_spec: &IcebergWriteSinkSpec) -> Vec<OutputColumn> {
+    sink_spec
+        .target_columns
+        .iter()
+        .map(|column| OutputColumn {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+        })
+        .collect()
+}
+
+fn root_fragment_index(build: &MultiFragmentBuildResult) -> Result<usize, String> {
+    build
+        .fragment_results
+        .iter()
+        .position(|fragment| fragment.fragment_id == build.root_fragment_id)
+        .ok_or_else(|| {
+            format!(
+                "Iceberg sink codegen could not find root fragment id={}",
+                build.root_fragment_id
+            )
+        })
+}
+
+fn add_iceberg_sink_target_table_to_desc_builder(
+    desc_builder: &mut DescriptorTableBuilder,
+    current_database: &str,
+    sink_spec: &IcebergWriteSinkSpec,
+) -> Result<(), String> {
     let partition_info = partition_info_from_serialized_metadata(&sink_spec.iceberg)?;
     let equality_delete_schema = equality_delete_schema_for_sink(sink_spec)?;
     desc_builder.add_iceberg_target_table(
@@ -835,12 +1036,514 @@ fn apply_iceberg_sink_to_build(
         partition_info,
         equality_delete_schema.as_ref(),
     );
-    let desc_tbl = desc_builder.build();
-    for fragment in &mut build.fragment_results {
-        fragment.desc_tbl = desc_tbl.clone();
+    Ok(())
+}
+
+struct ChangeStreamWriterPlan {
+    branch_index: usize,
+    writer_fragment_id: FragmentId,
+    exchange_node_id: i32,
+    writer_schema: BranchWriterSchema,
+}
+
+struct BranchWriterSchema {
+    tuple_id: i32,
+    slots: Vec<BranchWriterSlot>,
+    output_columns: Vec<OutputColumn>,
+}
+
+struct BranchWriterSlot {
+    slot_id: i32,
+    type_desc: crate::thrift::types::TTypeDesc,
+}
+
+fn next_fragment_id(build: &MultiFragmentBuildResult) -> FragmentId {
+    build
+        .fragment_results
+        .iter()
+        .map(|fragment| fragment.fragment_id)
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn next_plan_node_id(build: &MultiFragmentBuildResult) -> i32 {
+    build
+        .fragment_results
+        .iter()
+        .flat_map(|fragment| fragment.plan.nodes.iter().map(|node| node.node_id))
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn next_tuple_id(desc_tbl: &descriptors::TDescriptorTable) -> i32 {
+    desc_tbl
+        .tuple_descriptors
+        .iter()
+        .filter_map(|tuple| tuple.id)
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn next_slot_id(desc_tbl: &descriptors::TDescriptorTable) -> i32 {
+    desc_tbl
+        .slot_descriptors
+        .as_ref()
+        .map(|slots| slots.iter().filter_map(|slot| slot.id).max().unwrap_or(0))
+        .unwrap_or(0)
+        + 1
+}
+
+fn root_output_tuple_ids_for_sink(
+    fragment: &FragmentBuildResult,
+    context: &str,
+) -> Result<Vec<i32>, String> {
+    let Some(root_node) = fragment.plan.nodes.first() else {
+        return Err(format!(
+            "{context} requires fragment id={} to have a thrift root plan node",
+            fragment.fragment_id
+        ));
+    };
+    if root_node.row_tuples.is_empty() {
+        return Err(format!(
+            "{context} root fragment id={} has no output tuple",
+            fragment.fragment_id
+        ));
+    }
+    Ok(root_node.row_tuples.clone())
+}
+
+fn source_slot_descs_by_id(
+    fragment: &FragmentBuildResult,
+) -> Result<HashMap<i32, descriptors::TSlotDescriptor>, String> {
+    let tuple_ids: HashSet<i32> =
+        root_output_tuple_ids_for_sink(fragment, "Iceberg change-stream router source")?
+            .into_iter()
+            .collect();
+    let slots = fragment.desc_tbl.slot_descriptors.as_ref().ok_or_else(|| {
+        format!(
+            "Iceberg change-stream router source fragment id={} has no slot descriptors",
+            fragment.fragment_id
+        )
+    })?;
+    let mut slots_by_id = HashMap::new();
+    for slot in slots {
+        if !slot
+            .parent
+            .is_some_and(|tuple_id| tuple_ids.contains(&tuple_id))
+            || !slot.is_materialized.unwrap_or(true)
+        {
+            continue;
+        }
+        let slot_id = slot.id.ok_or_else(|| {
+            format!(
+                "Iceberg change-stream router source fragment id={} contains a slot without id",
+                fragment.fragment_id
+            )
+        })?;
+        if slot.slot_type.is_none() {
+            return Err(format!(
+                "Iceberg change-stream router source slot {slot_id} is missing slot_type"
+            ));
+        }
+        if slots_by_id.insert(slot_id, slot.clone()).is_some() {
+            return Err(format!(
+                "Iceberg change-stream router source repeats slot id {slot_id}"
+            ));
+        }
+    }
+    if slots_by_id.is_empty() {
+        return Err(format!(
+            "Iceberg change-stream router source fragment id={} has no materialized output slots",
+            fragment.fragment_id
+        ));
+    }
+    Ok(slots_by_id)
+}
+
+fn resolve_change_stream_dag_slots(
+    dag: &mut IcebergChangeStreamWriteDagSpec,
+    source_slots_by_id: &HashMap<i32, descriptors::TSlotDescriptor>,
+) -> Result<(), String> {
+    if dag.change_op_slot < 0 {
+        let ordinal = dag.change_op_output_ordinal.ok_or_else(|| {
+            "Iceberg change-stream write DAG requires change_op_slot or change_op_output_ordinal"
+                .to_string()
+        })?;
+        dag.change_op_slot =
+            source_slot_id_by_output_ordinal(source_slots_by_id, ordinal, "change_op")?;
+    }
+    if dag.data_route_slot.is_none()
+        && let Some(ordinal) = dag.data_route_output_ordinal
+    {
+        dag.data_route_slot = Some(source_slot_id_by_output_ordinal(
+            source_slots_by_id,
+            ordinal,
+            "data_route",
+        )?);
+    }
+    for branch in &mut dag.branches {
+        resolve_branch_stream_output_slots(branch, source_slots_by_id)?;
+    }
+    dag.validate()
+}
+
+fn resolve_branch_stream_output_slots(
+    branch: &mut ChangeStreamWriteBranchSpec,
+    source_slots_by_id: &HashMap<i32, descriptors::TSlotDescriptor>,
+) -> Result<(), String> {
+    if let Some(ordinals) = branch.stream_output_ordinals.as_ref() {
+        branch.stream_output_slots = ordinals
+            .iter()
+            .copied()
+            .map(|ordinal| {
+                source_slot_id_by_output_ordinal(
+                    source_slots_by_id,
+                    ordinal,
+                    &format!("branch {:?} output", branch.branch_kind),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    if let Some(ordinals) = branch.output_partition_ordinals.as_ref() {
+        branch.output_partition =
+            hash_partition_for_output_ordinals(source_slots_by_id, ordinals, branch.branch_kind)?;
+    }
+    Ok(())
+}
+
+fn source_slot_id_by_output_ordinal(
+    source_slots_by_id: &HashMap<i32, descriptors::TSlotDescriptor>,
+    ordinal: usize,
+    label: &str,
+) -> Result<i32, String> {
+    let ordinal = i32::try_from(ordinal).map_err(|_| {
+        format!("Iceberg change-stream {label} output ordinal {ordinal} is out of range")
+    })?;
+    let mut matches = source_slots_by_id
+        .iter()
+        .filter(|(_, slot)| slot.column_pos == Some(ordinal))
+        .map(|(slot_id, _)| *slot_id);
+    let slot_id = matches.next().ok_or_else(|| {
+        format!("Iceberg change-stream {label} output ordinal {ordinal} has no materialized slot")
+    })?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "Iceberg change-stream {label} output ordinal {ordinal} is ambiguous"
+        ));
+    }
+    Ok(slot_id)
+}
+
+fn hash_partition_for_output_ordinals(
+    source_slots_by_id: &HashMap<i32, descriptors::TSlotDescriptor>,
+    ordinals: &[usize],
+    branch_kind: crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind,
+) -> Result<partitions::TDataPartition, String> {
+    if ordinals.is_empty() {
+        return Ok(partitions::TDataPartition::new(
+            partitions::TPartitionType::UNPARTITIONED,
+            None::<Vec<exprs::TExpr>>,
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
+        ));
+    }
+    let exprs = ordinals
+        .iter()
+        .copied()
+        .map(|ordinal| {
+            let slot_id = source_slot_id_by_output_ordinal(
+                source_slots_by_id,
+                ordinal,
+                &format!("branch {:?} partition", branch_kind),
+            )?;
+            let slot = source_slots_by_id.get(&slot_id).ok_or_else(|| {
+                format!(
+                    "Iceberg change-stream branch {:?} partition slot {slot_id} missing",
+                    branch_kind
+                )
+            })?;
+            let tuple_id = slot.parent.ok_or_else(|| {
+                format!(
+                    "Iceberg change-stream branch {:?} partition slot {slot_id} missing tuple id",
+                    branch_kind
+                )
+            })?;
+            let slot_type = slot.slot_type.clone().ok_or_else(|| {
+                format!(
+                    "Iceberg change-stream branch {:?} partition slot {slot_id} missing slot_type",
+                    branch_kind
+                )
+            })?;
+            Ok(expr_compiler::build_slot_ref_texpr(
+                slot_id, tuple_id, slot_type,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(partitions::TDataPartition::new(
+        partitions::TPartitionType::HASH_PARTITIONED,
+        Some(exprs),
+        None::<Vec<partitions::TRangePartition>>,
+        None::<Vec<partitions::TBucketProperty>>,
+    ))
+}
+
+fn add_branch_writer_tuple_to_desc_builder(
+    desc_builder: &mut DescriptorTableBuilder,
+    source_slots_by_id: &HashMap<i32, descriptors::TSlotDescriptor>,
+    branch: &ChangeStreamWriteBranchSpec,
+    writer_tuple_id: i32,
+    next_slot_id: &mut i32,
+) -> Result<BranchWriterSchema, String> {
+    if branch.stream_output_slots.len() != branch.sink_spec.target_columns.len() {
+        return Err(format!(
+            "Iceberg change-stream branch {:?} output slot count {} does not match target column count {}",
+            branch.branch_kind,
+            branch.stream_output_slots.len(),
+            branch.sink_spec.target_columns.len()
+        ));
     }
 
-    Ok(build)
+    desc_builder.add_tuple(writer_tuple_id, None);
+    let mut slots = Vec::with_capacity(branch.stream_output_slots.len());
+    let mut output_columns = Vec::with_capacity(branch.stream_output_slots.len());
+    for (idx, source_slot_id) in branch.stream_output_slots.iter().copied().enumerate() {
+        let source_slot = source_slots_by_id.get(&source_slot_id).ok_or_else(|| {
+            format!(
+                "Iceberg change-stream branch {:?} references missing source slot {}",
+                branch.branch_kind, source_slot_id
+            )
+        })?;
+        let source_type = source_slot.slot_type.clone().ok_or_else(|| {
+            format!(
+                "Iceberg change-stream branch {:?} source slot {} is missing slot_type",
+                branch.branch_kind, source_slot_id
+            )
+        })?;
+        let nullable = source_slot.is_nullable.unwrap_or(true);
+        let name = slot_display_name(source_slot, source_slot_id);
+        let writer_slot_id = *next_slot_id;
+        *next_slot_id += 1;
+        desc_builder.add_slot_with_type_desc(
+            writer_slot_id,
+            writer_tuple_id,
+            &name,
+            source_type.clone(),
+            nullable,
+            idx as i32,
+        );
+        slots.push(BranchWriterSlot {
+            slot_id: writer_slot_id,
+            type_desc: source_type,
+        });
+        output_columns.push(output_column_from_slot_desc(source_slot, source_slot_id)?);
+    }
+
+    Ok(BranchWriterSchema {
+        tuple_id: writer_tuple_id,
+        slots,
+        output_columns,
+    })
+}
+
+fn assign_change_stream_branch_sink_table_ids(
+    dag: &mut IcebergChangeStreamWriteDagSpec,
+) -> Result<(), String> {
+    let base = crate::sql::codegen::iceberg_write_sink::synthetic_iceberg_write_table_id();
+    for (idx, branch) in dag.branches.iter_mut().enumerate() {
+        let offset = i64::try_from(idx).map_err(|_| {
+            "Iceberg change-stream branch index overflow while assigning sink table ids".to_string()
+        })?;
+        branch.sink_spec.target_table_id = base
+            .checked_sub(offset)
+            .ok_or_else(|| "Iceberg change-stream synthetic sink table id underflow".to_string())?;
+    }
+    Ok(())
+}
+
+fn slot_display_name(slot: &descriptors::TSlotDescriptor, slot_id: i32) -> String {
+    slot.col_name
+        .as_ref()
+        .filter(|name| !name.is_empty())
+        .cloned()
+        .or_else(|| {
+            slot.col_physical_name
+                .as_ref()
+                .filter(|name| !name.is_empty())
+                .cloned()
+        })
+        .unwrap_or_else(|| format!("slot_{slot_id}"))
+}
+
+fn output_column_from_slot_desc(
+    slot: &descriptors::TSlotDescriptor,
+    slot_id: i32,
+) -> Result<OutputColumn, String> {
+    let slot_type = slot.slot_type.as_ref().ok_or_else(|| {
+        format!("Iceberg change-stream source slot {slot_id} is missing slot_type")
+    })?;
+    let data_type =
+        crate::lower::type_lowering::arrow_type_from_desc(slot_type).ok_or_else(|| {
+            format!("Iceberg change-stream source slot {slot_id} has unsupported thrift type")
+        })?;
+    Ok(OutputColumn {
+        name: slot_display_name(slot, slot_id),
+        data_type,
+        nullable: slot.is_nullable.unwrap_or(true),
+    })
+}
+
+fn append_change_stream_writer_fragment(
+    build: &mut MultiFragmentBuildResult,
+    connectors: &crate::connector::ConnectorRegistry,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    branch: &ChangeStreamWriteBranchSpec,
+    desc_tbl: &descriptors::TDescriptorTable,
+    writer_schema: &BranchWriterSchema,
+    writer_fragment_id: FragmentId,
+    exchange_node_id: i32,
+) -> Result<FragmentId, String> {
+    let output_exprs = iceberg_sink_output_exprs_for_writer_schema(
+        writer_schema,
+        branch.sink_spec.target_columns.len(),
+    )?;
+    let root_boundary = result_root_boundary_schema_report(
+        writer_fragment_id,
+        exchange_node_id,
+        &writer_schema.output_columns,
+    );
+    let fragment = FragmentBuildResult {
+        fragment_id: writer_fragment_id,
+        plan: plan_nodes::TPlan::new(vec![nodes::build_exchange_node(
+            exchange_node_id,
+            vec![writer_schema.tuple_id],
+            branch.output_partition.type_,
+        )]),
+        desc_tbl: desc_tbl.clone(),
+        exec_params: nodes::build_exec_params_multi_with_refresh_context(
+            connectors,
+            &[],
+            mv_refresh_ctx,
+        )?,
+        output_sink: build_iceberg_write_sink_thrift(&branch.sink_spec, writer_schema.tuple_id),
+        output_exprs: Some(output_exprs),
+        output_columns: writer_schema.output_columns.clone(),
+        direct_exec: None,
+        boundary_schemas: vec![root_boundary.clone()],
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+        query_global_dicts: None,
+        query_global_dict_exprs: None,
+    };
+    build.boundary_schemas.push(root_boundary);
+    build.fragment_results.push(fragment);
+    Ok(writer_fragment_id)
+}
+
+fn iceberg_sink_output_exprs_for_writer_schema(
+    writer_schema: &BranchWriterSchema,
+    target_column_count: usize,
+) -> Result<Vec<exprs::TExpr>, String> {
+    if writer_schema.slots.len() != target_column_count {
+        return Err(format!(
+            "Iceberg change-stream writer tuple {} output column count mismatch: root has {} materialized slots, target table has {target_column_count} columns",
+            writer_schema.tuple_id,
+            writer_schema.slots.len()
+        ));
+    }
+    Ok(writer_schema
+        .slots
+        .iter()
+        .map(|slot| {
+            expr_compiler::build_slot_ref_texpr(
+                slot.slot_id,
+                writer_schema.tuple_id,
+                slot.type_desc.clone(),
+            )
+        })
+        .collect())
+}
+
+fn stream_kind_for_partition(partition: &partitions::TDataPartition) -> FragmentStreamKind {
+    match partition.type_ {
+        partitions::TPartitionType::HASH_PARTITIONED
+        | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
+            FragmentStreamKind::Partitioned
+        }
+        partitions::TPartitionType::UNPARTITIONED => FragmentStreamKind::Gather,
+        _ => FragmentStreamKind::Other,
+    }
+}
+
+fn append_change_stream_edge_boundary_schemas(
+    build: &mut MultiFragmentBuildResult,
+    source_fragment_id: FragmentId,
+    writer_fragment_id: FragmentId,
+    exchange_node_id: i32,
+    output_columns: &[OutputColumn],
+) {
+    let columns = output_columns_to_boundary_columns(output_columns);
+    build.boundary_schemas.push(BoundarySchemaReport {
+        fragment_id: Some(source_fragment_id as i32),
+        node_id: exchange_node_id,
+        boundary_kind: BoundaryKind::ExchangeSender,
+        columns: columns.clone(),
+    });
+    build.boundary_schemas.push(BoundarySchemaReport {
+        fragment_id: Some(writer_fragment_id as i32),
+        node_id: exchange_node_id,
+        boundary_kind: BoundaryKind::ExchangeReceiver,
+        columns,
+    });
+}
+
+fn build_router_sink_template(dag: &IcebergChangeStreamWriteDagSpec) -> data_sinks::TDataSink {
+    let branches = dag
+        .branches
+        .iter()
+        .map(|branch| {
+            let stream_sink = data_sinks::TDataStreamSink::new(
+                -1,
+                branch.output_partition.clone(),
+                None::<bool>,
+                None::<bool>,
+                None::<i32>,
+                Some(branch.stream_output_slots.clone()),
+                None::<i64>,
+            );
+            data_sinks::TIcebergChangeStreamRouterBranch::new(
+                branch.branch_id,
+                branch.branch_kind.to_thrift(),
+                stream_sink,
+                Vec::new(),
+            )
+        })
+        .collect::<Vec<_>>();
+    data_sinks::TDataSink::new(
+        data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK,
+        None::<data_sinks::TDataStreamSink>,
+        None::<data_sinks::TResultSink>,
+        None::<data_sinks::TMysqlTableSink>,
+        None::<data_sinks::TExportSink>,
+        None::<data_sinks::TOlapTableSink>,
+        None::<data_sinks::TMemoryScratchSink>,
+        None::<data_sinks::TMultiCastDataStreamSink>,
+        None::<data_sinks::TSchemaTableSink>,
+        None::<data_sinks::TIcebergTableSink>,
+        None::<data_sinks::THiveTableSink>,
+        None::<data_sinks::TTableFunctionTableSink>,
+        None::<data_sinks::TDictionaryCacheSink>,
+        None::<Vec<Box<data_sinks::TDataSink>>>,
+        None::<i64>,
+        None::<data_sinks::TSplitDataStreamSink>,
+        Some(data_sinks::TIcebergChangeStreamRouterSink::new(
+            dag.change_op_slot,
+            dag.data_route_slot,
+            branches,
+        )),
+    )
 }
 
 fn equality_delete_schema_for_sink(
@@ -938,6 +1641,48 @@ fn iceberg_sink_output_exprs_for_tuple(
         .collect())
 }
 
+fn iceberg_sink_output_exprs_for_slots(
+    desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
+    tuple_id: i32,
+    output_slots: &[i32],
+    target_column_count: usize,
+) -> Result<Vec<exprs::TExpr>, String> {
+    if output_slots.len() != target_column_count {
+        return Err(format!(
+            "Iceberg sink projected output column count mismatch for tuple {tuple_id}: projection has {} slots, target table has {target_column_count} columns",
+            output_slots.len()
+        ));
+    }
+    let slots = desc_tbl
+        .slot_descriptors
+        .as_ref()
+        .ok_or_else(|| "Iceberg sink codegen requires slot descriptors".to_string())?;
+    output_slots
+        .iter()
+        .copied()
+        .map(|slot_id| {
+            let slot = slots
+                .iter()
+                .find(|slot| slot.id == Some(slot_id))
+                .ok_or_else(|| {
+                    format!("Iceberg sink projected slot {slot_id} does not exist in desc table")
+                })?;
+            if slot.parent != Some(tuple_id) {
+                return Err(format!(
+                    "Iceberg sink projected slot {slot_id} belongs to tuple {:?}, expected {tuple_id}",
+                    slot.parent
+                ));
+            }
+            let slot_type = slot.slot_type.clone().ok_or_else(|| {
+                format!("Iceberg sink projected slot {slot_id} missing slot_type")
+            })?;
+            Ok(expr_compiler::build_slot_ref_texpr(
+                slot_id, tuple_id, slot_type,
+            ))
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -960,6 +1705,7 @@ pub(in crate::sql::codegen) fn build_result_sink() -> data_sinks::TDataSink {
         None::<Vec<Box<data_sinks::TDataSink>>>,
         None::<i64>,
         None::<data_sinks::TSplitDataStreamSink>,
+        None::<data_sinks::TIcebergChangeStreamRouterSink>,
     )
 }
 
@@ -984,6 +1730,7 @@ pub(in crate::sql::codegen) fn build_noop_sink() -> data_sinks::TDataSink {
         None::<Vec<Box<data_sinks::TDataSink>>>,
         None::<i64>,
         None::<data_sinks::TSplitDataStreamSink>,
+        None::<data_sinks::TIcebergChangeStreamRouterSink>,
     )
 }
 
@@ -5163,6 +5910,206 @@ mod tests {
         assert_eq!(expr_node.node_type, exprs::TExprNodeType::SLOT_REF);
         let slot_ref = expr_node.slot_ref.as_ref().expect("slot ref");
         assert_eq!(slot_ref.slot_id, file_slot);
+    }
+
+    #[test]
+    fn change_stream_single_branch_degenerates_to_plain_iceberg_sink() {
+        let plan = values_plan_for_test(vec![output_col_for_test(
+            1,
+            "delete_id",
+            DataType::Int32,
+            false,
+        )]);
+        let connectors = crate::connector::ConnectorRegistry::new();
+        let mut dag = IcebergChangeStreamWriteDagSpec::for_test(
+            1,
+            None,
+            vec![ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![1])],
+        );
+
+        let build = PlanFragmentBuilder::build_via_distributed_plan_with_change_stream_write(
+            &plan,
+            &DummyCatalog,
+            &connectors,
+            "default",
+            None,
+            &mut dag,
+        )
+        .expect("build change stream single branch");
+
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        assert_eq!(
+            root.output_sink.type_,
+            data_sinks::TDataSinkType::ICEBERG_DV_SINK
+        );
+        assert!(
+            root.output_sink
+                .iceberg_change_stream_router_sink
+                .as_ref()
+                .is_none()
+        );
+        assert!(build.edges.iter().all(|edge| !matches!(
+            edge.edge_kind,
+            FragmentEdgeKind::IcebergChangeStreamRouter { .. }
+        )));
+        assert_eq!(
+            dag.branches[0].writer_fragment_id,
+            Some(build.root_fragment_id)
+        );
+    }
+
+    #[test]
+    fn change_stream_multi_branch_builds_router_and_writer_legs() {
+        let output_columns = vec![
+            output_col_for_test(1, "__change_op", DataType::Int32, false),
+            output_col_for_test(2, "data_route", DataType::Int32, true),
+            output_col_for_test(3, "delete_id", DataType::Int32, false),
+            output_col_for_test(4, "reuse_id", DataType::Int32, false),
+            output_col_for_test(5, "fresh_id", DataType::Int32, false),
+        ];
+        let plan = values_plan_for_test(output_columns);
+        let connectors = crate::connector::ConnectorRegistry::new();
+        let mut dag = IcebergChangeStreamWriteDagSpec::for_test(
+            1,
+            Some(2),
+            vec![
+                ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![3]),
+                ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![4]),
+                ChangeStreamWriteBranchSpec::fresh_data_for_test(vec![5]),
+            ],
+        );
+
+        let build = PlanFragmentBuilder::build_via_distributed_plan_with_change_stream_write(
+            &plan,
+            &DummyCatalog,
+            &connectors,
+            "default",
+            None,
+            &mut dag,
+        )
+        .expect("build change stream multi branch");
+
+        let source = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("source fragment");
+        assert_eq!(
+            source.output_sink.type_,
+            data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK
+        );
+        assert!(source.output_exprs.is_none());
+        let source_root_tuple_id = source
+            .plan
+            .nodes
+            .first()
+            .and_then(|node| node.row_tuples.first())
+            .copied()
+            .expect("source root tuple");
+        let router = source
+            .output_sink
+            .iceberg_change_stream_router_sink
+            .as_ref()
+            .expect("router sink");
+        assert_eq!(router.change_op_slot_id, 1);
+        assert_eq!(router.data_route_slot_id, Some(2));
+        assert_eq!(router.branches.len(), 3);
+        assert_eq!(
+            router.branches[0].stream_sink.output_columns.as_deref(),
+            Some(&[3][..])
+        );
+        assert_eq!(
+            router.branches[1].stream_sink.output_columns.as_deref(),
+            Some(&[4][..])
+        );
+        assert_eq!(
+            router.branches[2].stream_sink.output_columns.as_deref(),
+            Some(&[5][..])
+        );
+        assert!(
+            router
+                .branches
+                .iter()
+                .all(|branch| branch.destinations.is_empty())
+        );
+
+        let router_edges = build
+            .edges
+            .iter()
+            .filter(|edge| {
+                matches!(
+                    edge.edge_kind,
+                    FragmentEdgeKind::IcebergChangeStreamRouter { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(router_edges.len(), 3);
+        let mut sink_table_ids = dag
+            .branches
+            .iter()
+            .map(|branch| branch.sink_spec.target_table_id)
+            .collect::<Vec<_>>();
+        sink_table_ids.sort_unstable();
+        sink_table_ids.dedup();
+        assert_eq!(
+            sink_table_ids.len(),
+            dag.branches.len(),
+            "each change-stream write branch needs an independent table descriptor"
+        );
+
+        for branch in &dag.branches {
+            let writer_fragment_id = branch.writer_fragment_id.expect("writer fragment id");
+            let writer = build
+                .fragment_results
+                .iter()
+                .find(|fragment| fragment.fragment_id == writer_fragment_id)
+                .expect("writer fragment");
+            let edge = router_edges
+                .iter()
+                .find(|edge| edge.target_fragment_id == writer_fragment_id)
+                .expect("router edge for writer");
+            assert_eq!(edge.source_fragment_id, build.root_fragment_id);
+            assert_eq!(edge.output_partition.type_, branch.output_partition.type_);
+            assert_eq!(writer.plan.nodes.len(), 1);
+            let exchange = writer.plan.nodes.first().expect("writer exchange");
+            assert_eq!(exchange.node_type, plan_nodes::TPlanNodeType::EXCHANGE_NODE);
+            assert_eq!(exchange.node_id, edge.target_exchange_node_id);
+            assert_eq!(
+                writer
+                    .output_sink
+                    .iceberg_table_sink
+                    .as_ref()
+                    .expect("writer iceberg sink")
+                    .target_table_id,
+                Some(branch.sink_spec.target_table_id)
+            );
+            assert_eq!(exchange.row_tuples.len(), 1);
+            let writer_tuple_id = exchange.row_tuples[0];
+            assert_ne!(
+                writer_tuple_id, source_root_tuple_id,
+                "writer leg must use its own narrowed tuple"
+            );
+            assert_eq!(
+                writer.output_columns.len(),
+                branch.stream_output_slots.len()
+            );
+            let output_exprs = writer.output_exprs.as_ref().expect("writer output exprs");
+            assert_eq!(output_exprs.len(), branch.stream_output_slots.len());
+            for expr in output_exprs {
+                let node = expr.nodes.first().expect("slot ref node");
+                assert_eq!(node.node_type, exprs::TExprNodeType::SLOT_REF);
+                let slot_ref = node.slot_ref.as_ref().expect("slot ref");
+                assert_eq!(slot_ref.tuple_id, writer_tuple_id);
+                assert!(
+                    !branch.stream_output_slots.contains(&slot_ref.slot_id),
+                    "writer output must reference writer slots, not source slots"
+                );
+            }
+        }
     }
 
     #[test]

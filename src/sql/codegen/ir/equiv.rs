@@ -1074,6 +1074,13 @@ mod tests {
                         "{case_name}: CTE edge {idx} target fragment must record exchange node"
                     );
                 }
+                FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
+                    // Task 2 only models the edge; execution wiring must reject it elsewhere.
+                    assert_ne!(
+                        edge.source_fragment_id, edge.target_fragment_id,
+                        "{case_name}: Iceberg change-stream router edge {idx} must cross fragments"
+                    );
+                }
             }
         }
     }

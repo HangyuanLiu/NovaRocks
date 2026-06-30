@@ -142,6 +142,7 @@ mod tests {
             None::<Vec<Box<data_sinks::TDataSink>>>,
             None::<i64>,
             None::<data_sinks::TSplitDataStreamSink>,
+            None::<data_sinks::TIcebergChangeStreamRouterSink>,
         );
 
         FragmentBuildResult {
@@ -183,6 +184,7 @@ mod tests {
             None::<Vec<Box<data_sinks::TDataSink>>>,
             None::<i64>,
             None::<data_sinks::TSplitDataStreamSink>,
+            None::<data_sinks::TIcebergChangeStreamRouterSink>,
         );
         planner::TPlanFragment::new(
             None::<crate::thrift::plan_nodes::TPlan>,

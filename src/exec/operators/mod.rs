@@ -35,6 +35,7 @@ mod exchange_source;
 mod fetch_processor;
 mod filter_processor;
 pub(crate) mod hashjoin;
+pub(crate) mod iceberg_change_stream_router_sink;
 mod iceberg_delta_scan;
 mod limit_processor;
 mod local_exchange_sink;
@@ -77,6 +78,8 @@ pub use hashjoin::{
     BroadcastJoinProbeProcessorFactory, HashJoinBuildSinkFactory,
     PartitionedJoinProbeProcessorFactory,
 };
+#[allow(unused_imports)]
+pub(crate) use iceberg_change_stream_router_sink::IcebergChangeStreamRouterSinkFactory;
 pub use iceberg_delta_scan::IcebergDeltaScanFactory;
 pub use limit_processor::LimitProcessorFactory;
 pub use local_exchange_sink::LocalExchangeSinkFactory;

@@ -31,7 +31,9 @@ use crate::novarocks_logging::debug;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
 use crate::runtime::exec_params::{ExecPlanFragmentParamOptions, build_exec_plan_fragment_params};
 use crate::runtime::query_state::QueryState;
-use crate::runtime::scheduler::{FragmentScheduler, topological_sort_bottom_up};
+use crate::runtime::scheduler::{
+    FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
+};
 use crate::runtime::write_coordinator::{
     WriteAbortInput, WriteCommitInput, WriteCoordinator, WriterKey, register_query,
     unregister_query,
@@ -137,6 +139,9 @@ impl ExecutionCoordinator {
                 match &e.edge_kind {
                     FragmentEdgeKind::Stream => "Stream",
                     FragmentEdgeKind::CteMulticast { .. } => "CteMulticast",
+                    FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
+                        "IcebergChangeStreamRouter"
+                    }
                 },
                 e.output_partition.type_,
             );
@@ -150,30 +155,34 @@ impl ExecutionCoordinator {
             scheduler.fill_runtime_filter_params_with_live(&mut plan, rf, &live)?;
         }
         scheduler.fill_per_exch_num_senders(&mut plan, &edges);
+        let execution_root_fragment_id = plan.root_fragment_id;
 
         // ---------------------------------------------------------------
         // 2. Build per-edge / CTE consumer indices used for sink wiring.
         // ---------------------------------------------------------------
-        // Stream producer fragment id -> its single outgoing edge index.
-        let mut stream_edge_by_source: BTreeMap<FragmentId, &FragmentEdge> = BTreeMap::new();
+        // Stream producer fragment id -> its single outgoing plain stream edge.
+        let stream_edge_by_source = build_stream_edge_by_source(&edges)?;
+        let router_edge_groups = group_router_edges_by_source(&edges)?;
+        let mut router_edges_by_source: BTreeMap<FragmentId, (i32, Vec<&FragmentEdge>)> =
+            BTreeMap::new();
+        for ((source_fragment_id, router_group_id), branch_edges) in router_edge_groups {
+            if router_edges_by_source
+                .insert(source_fragment_id, (router_group_id, branch_edges))
+                .is_some()
+            {
+                return Err(format!(
+                    "fragment {source_fragment_id} has multiple Iceberg change-stream router groups; \
+                     one source fragment can only use one router sink template"
+                ));
+            }
+        }
         // CTE id -> list of (consumer_fragment_id, exchange_node_id, partition).
         let mut cte_consumers: BTreeMap<CteId, Vec<(FragmentId, i32, partitions::TDataPartition)>> =
             BTreeMap::new();
 
         for e in &edges {
             match &e.edge_kind {
-                FragmentEdgeKind::Stream => {
-                    if stream_edge_by_source
-                        .insert(e.source_fragment_id, e)
-                        .is_some()
-                    {
-                        return Err(format!(
-                            "fragment {} has multiple outgoing Stream edges; \
-                             stream fan-out is not supported",
-                            e.source_fragment_id
-                        ));
-                    }
-                }
+                FragmentEdgeKind::Stream => {}
                 FragmentEdgeKind::CteMulticast { cte_id } => {
                     cte_consumers.entry(*cte_id).or_default().push((
                         e.target_fragment_id,
@@ -181,6 +190,7 @@ impl ExecutionCoordinator {
                         e.output_partition.clone(),
                     ));
                 }
+                FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {}
             }
         }
         // CTE consumers may also be expressed via `cte_exchange_nodes` on the
@@ -200,9 +210,9 @@ impl ExecutionCoordinator {
         // ---------------------------------------------------------------
         // 3. Inject the designated runtime-filter merge node into descriptors.
         // ---------------------------------------------------------------
-        // The merge node is the backend that hosts the (single) root instance.
-        // At one backend this equals the local exchange address, matching the
-        // prior `dispatcher.exchange_addr()` behavior exactly.
+        // The merge node is the backend that hosts the execution anchor. For
+        // result roots this is the single root instance; for write-only DAGs it
+        // is the first instance of the selected writer anchor.
         let merge_addr = backend_to_network_addr(&live, plan.root_backend_idx)?;
         if rf_plan.is_some() {
             inject_runtime_filter_merge_nodes(&mut fragment_results, &merge_addr);
@@ -280,13 +290,24 @@ impl ExecutionCoordinator {
             let fr = *fr_by_id
                 .get(&fragment_id)
                 .ok_or_else(|| format!("fragment {fragment_id} missing from build results"))?;
-            let is_root = fragment_id == root_fragment_id;
+            let is_root = fragment_id == execution_root_fragment_id;
             let stream_edge = stream_edge_by_source.get(&fragment_id).copied();
+            let router_edges = router_edges_by_source.get(&fragment_id);
+            let is_terminal_write = stream_edge.is_none()
+                && router_edges.is_none()
+                && fr.cte_id.is_none()
+                && data_sink_requires_write_report(&fr.output_sink);
 
             // Classify the fragment once.
-            if !is_root && fr.cte_id.is_none() && stream_edge.is_none() {
+            if !is_root
+                && !is_terminal_write
+                && fr.cte_id.is_none()
+                && stream_edge.is_none()
+                && router_edges.is_none()
+            {
                 return Err(format!(
-                    "fragment {fragment_id} is neither root, CTE producer, nor stream producer; \
+                    "fragment {fragment_id} is neither root, CTE producer, stream producer, nor \
+                     Iceberg change-stream router producer or terminal write fragment; \
                      stream fan-out is not supported in standalone coordinator"
                 ));
             }
@@ -311,6 +332,26 @@ impl ExecutionCoordinator {
                         edge.output_partition.clone(),
                         Some(placement.destinations.clone()),
                     )
+                } else if let Some((router_group_id, branch_edges)) = router_edges {
+                    let template = fr
+                        .output_sink
+                        .iceberg_change_stream_router_sink
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!(
+                                "fragment {fragment_id} is router source for group {router_group_id} \
+                                 but output sink is missing ICEBERG_CHANGE_STREAM_ROUTER_SINK payload"
+                            )
+                        })?;
+                    let output_sink = wrap_iceberg_change_stream_router_sink(
+                        template,
+                        branch_edges,
+                        &plan.by_fragment,
+                    )?;
+                    // Router branches carry their own destinations in the sink payload.
+                    (output_sink, unpartitioned_partition(), None)
+                } else if is_terminal_write {
+                    (fr.output_sink.clone(), unpartitioned_partition(), None)
                 } else {
                     // CTE producer.
                     let cte_id = fr
@@ -428,7 +469,7 @@ impl ExecutionCoordinator {
             }
         }
 
-        if !submissions_by_fragment.contains_key(&root_fragment_id) {
+        if !submissions_by_fragment.contains_key(&execution_root_fragment_id) {
             return Err("root fragment produced no placement".to_string());
         }
         let mut submissions: Vec<(
@@ -466,7 +507,7 @@ impl ExecutionCoordinator {
             .map(|t| t as i64 * 1000)
             .unwrap_or(300_000); // 5 minute default
         let root_fragment = fr_by_id
-            .get(&root_fragment_id)
+            .get(&execution_root_fragment_id)
             .ok_or_else(|| "root fragment not found in build results".to_string())?;
         let expected_root_chunk_schema =
             if root_uses_typed_result_sink(&submissions, &plan.root_finst_id)? {
@@ -725,6 +766,7 @@ fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks
         None::<Vec<Box<data_sinks::TDataSink>>>,
         None::<i64>,
         None::<data_sinks::TSplitDataStreamSink>,
+        None::<data_sinks::TIcebergChangeStreamRouterSink>,
     )
 }
 
@@ -749,7 +791,214 @@ fn wrap_multi_cast_sink(
         None::<Vec<Box<data_sinks::TDataSink>>>,
         None::<i64>,
         None::<data_sinks::TSplitDataStreamSink>,
+        None::<data_sinks::TIcebergChangeStreamRouterSink>,
     )
+}
+
+fn build_stream_edge_by_source<'a>(
+    edges: &'a [FragmentEdge],
+) -> Result<BTreeMap<FragmentId, &'a FragmentEdge>, String> {
+    let router_sources: BTreeSet<FragmentId> = edges
+        .iter()
+        .filter_map(|edge| {
+            matches!(
+                edge.edge_kind,
+                FragmentEdgeKind::IcebergChangeStreamRouter { .. }
+            )
+            .then_some(edge.source_fragment_id)
+        })
+        .collect();
+    let mut stream_edge_by_source = BTreeMap::new();
+    for edge in edges {
+        if !matches!(edge.edge_kind, FragmentEdgeKind::Stream) {
+            continue;
+        }
+        if router_sources.contains(&edge.source_fragment_id) {
+            return Err(format!(
+                "fragment {} has both plain Stream and Iceberg change-stream router edges",
+                edge.source_fragment_id
+            ));
+        }
+        if stream_edge_by_source
+            .insert(edge.source_fragment_id, edge)
+            .is_some()
+        {
+            return Err(format!(
+                "fragment {} has multiple outgoing stream edges; stream fan-out is not supported",
+                edge.source_fragment_id
+            ));
+        }
+    }
+    Ok(stream_edge_by_source)
+}
+
+fn group_router_edges_by_source<'a>(
+    edges: &'a [FragmentEdge],
+) -> Result<BTreeMap<(FragmentId, i32), Vec<&'a FragmentEdge>>, String> {
+    let stream_sources: BTreeSet<FragmentId> = edges
+        .iter()
+        .filter_map(|edge| {
+            matches!(edge.edge_kind, FragmentEdgeKind::Stream).then_some(edge.source_fragment_id)
+        })
+        .collect();
+    let mut grouped: BTreeMap<(FragmentId, i32), Vec<&FragmentEdge>> = BTreeMap::new();
+    let mut branch_ids_by_group: BTreeMap<(FragmentId, i32), BTreeSet<i32>> = BTreeMap::new();
+    let mut branch_kinds_by_group = BTreeMap::new();
+    let mut target_exchanges_by_group = BTreeMap::new();
+
+    for edge in edges {
+        let FragmentEdgeKind::IcebergChangeStreamRouter {
+            router_group_id,
+            branch_id,
+            branch_kind,
+        } = edge.edge_kind
+        else {
+            continue;
+        };
+        if stream_sources.contains(&edge.source_fragment_id) {
+            return Err(format!(
+                "fragment {} has both plain Stream and Iceberg change-stream router edges",
+                edge.source_fragment_id
+            ));
+        }
+        let key = (edge.source_fragment_id, router_group_id);
+        if !branch_ids_by_group
+            .entry(key)
+            .or_default()
+            .insert(branch_id)
+        {
+            return Err(format!(
+                "Iceberg change-stream router group source={} group={} repeats branch_id {}",
+                edge.source_fragment_id, router_group_id, branch_id
+            ));
+        }
+        if !branch_kinds_by_group
+            .entry(key)
+            .or_insert_with(BTreeSet::new)
+            .insert(branch_kind)
+        {
+            return Err(format!(
+                "Iceberg change-stream router group source={} group={} repeats branch_kind {:?}",
+                edge.source_fragment_id, router_group_id, branch_kind
+            ));
+        }
+        let target_exchange = (edge.target_fragment_id, edge.target_exchange_node_id);
+        if !target_exchanges_by_group
+            .entry(key)
+            .or_insert_with(BTreeSet::new)
+            .insert(target_exchange)
+        {
+            return Err(format!(
+                "Iceberg change-stream router group source={} group={} repeats target exchange \
+                 fragment={} node={}",
+                edge.source_fragment_id,
+                router_group_id,
+                edge.target_fragment_id,
+                edge.target_exchange_node_id
+            ));
+        }
+        grouped.entry(key).or_default().push(edge);
+    }
+
+    Ok(grouped)
+}
+
+fn wrap_iceberg_change_stream_router_sink(
+    template: &data_sinks::TIcebergChangeStreamRouterSink,
+    branch_edges: &[&FragmentEdge],
+    placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
+) -> Result<data_sinks::TDataSink, String> {
+    if branch_edges.is_empty() {
+        return Err("Iceberg change-stream router sink has no branch edges".to_string());
+    }
+
+    let mut branches = Vec::with_capacity(branch_edges.len());
+    for edge in branch_edges {
+        let FragmentEdgeKind::IcebergChangeStreamRouter {
+            router_group_id,
+            branch_id,
+            branch_kind,
+        } = edge.edge_kind
+        else {
+            return Err(format!(
+                "fragment {} edge to fragment {} is not an Iceberg change-stream router edge",
+                edge.source_fragment_id, edge.target_fragment_id
+            ));
+        };
+        let thrift_branch_kind = branch_kind.to_thrift();
+        let template_branch = template
+            .branches
+            .iter()
+            .find(|branch| {
+                branch.branch_id == branch_id && branch.branch_kind == thrift_branch_kind
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Iceberg change-stream router source={} group={} branch_id={} branch_kind={:?} \
+                     has no matching template branch",
+                    edge.source_fragment_id, router_group_id, branch_id, branch_kind
+                )
+            })?;
+
+        let mut stream_sink = template_branch.stream_sink.clone();
+        stream_sink.dest_node_id = edge.target_exchange_node_id;
+        stream_sink.output_partition = edge.output_partition.clone();
+        let destinations = placements
+            .get(&edge.target_fragment_id)
+            .ok_or_else(|| {
+                format!(
+                    "Iceberg change-stream router source={} group={} branch_id={} target fragment {} \
+                     has no placements",
+                    edge.source_fragment_id,
+                    router_group_id,
+                    branch_id,
+                    edge.target_fragment_id
+                )
+            })?
+            .iter()
+            .map(|placement| {
+                data_sinks::TPlanFragmentDestination::new(
+                    placement.finst_id.clone(),
+                    None::<types::TNetworkAddress>,
+                    Some(placement.brpc_server.clone()),
+                    None::<i32>,
+                )
+            })
+            .collect();
+
+        branches.push(data_sinks::TIcebergChangeStreamRouterBranch::new(
+            branch_id,
+            thrift_branch_kind,
+            stream_sink,
+            destinations,
+        ));
+    }
+
+    let router_sink = data_sinks::TIcebergChangeStreamRouterSink::new(
+        template.change_op_slot_id,
+        template.data_route_slot_id,
+        branches,
+    );
+
+    Ok(data_sinks::TDataSink::new(
+        data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK,
+        None::<data_sinks::TDataStreamSink>,
+        None::<data_sinks::TResultSink>,
+        None::<data_sinks::TMysqlTableSink>,
+        None::<data_sinks::TExportSink>,
+        None::<data_sinks::TOlapTableSink>,
+        None::<data_sinks::TMemoryScratchSink>,
+        None::<data_sinks::TMultiCastDataStreamSink>,
+        None::<data_sinks::TSchemaTableSink>,
+        None::<data_sinks::TIcebergTableSink>,
+        None::<data_sinks::THiveTableSink>,
+        None::<data_sinks::TTableFunctionTableSink>,
+        None::<data_sinks::TDictionaryCacheSink>,
+        None::<Vec<Box<data_sinks::TDataSink>>>,
+        None::<i64>,
+        None::<data_sinks::TSplitDataStreamSink>,
+        Some(router_sink),
+    ))
 }
 
 fn is_write_sink(params: &crate::thrift::internal_service::TExecPlanFragmentParams) -> bool {
@@ -2109,6 +2358,7 @@ mod tests {
             None::<Vec<Box<data_sinks::TDataSink>>>,
             None::<i64>,
             None::<data_sinks::TSplitDataStreamSink>,
+            None::<data_sinks::TIcebergChangeStreamRouterSink>,
         );
         let fragment = crate::thrift::planner::TPlanFragment::new(
             None::<crate::thrift::plan_nodes::TPlan>,
@@ -2210,6 +2460,88 @@ mod tests {
             .expect("output sink")
             .type_ = sink_type;
         params
+    }
+
+    fn fake_stream_edge(
+        source_fragment_id: FragmentId,
+        target_fragment_id: FragmentId,
+        target_exchange_node_id: i32,
+    ) -> FragmentEdge {
+        FragmentEdge {
+            source_fragment_id,
+            target_fragment_id,
+            target_exchange_node_id,
+            output_partition: unpartitioned_partition(),
+            stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::Stream,
+        }
+    }
+
+    fn fake_router_edge(
+        source_fragment_id: FragmentId,
+        target_fragment_id: FragmentId,
+        target_exchange_node_id: i32,
+        router_group_id: i32,
+        branch_id: i32,
+        branch_kind: crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind,
+    ) -> FragmentEdge {
+        FragmentEdge {
+            source_fragment_id,
+            target_fragment_id,
+            target_exchange_node_id,
+            output_partition: unpartitioned_partition(),
+            stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
+                router_group_id,
+                branch_id,
+                branch_kind,
+            },
+        }
+    }
+
+    fn empty_router_sink_for_test() -> data_sinks::TIcebergChangeStreamRouterSink {
+        data_sinks::TIcebergChangeStreamRouterSink::new(1, None::<i32>, vec![])
+    }
+
+    fn empty_data_sink_for_test(sink_type: data_sinks::TDataSinkType) -> data_sinks::TDataSink {
+        data_sinks::TDataSink::new(
+            sink_type,
+            None::<data_sinks::TDataStreamSink>,
+            None::<data_sinks::TResultSink>,
+            None::<data_sinks::TMysqlTableSink>,
+            None::<data_sinks::TExportSink>,
+            None::<data_sinks::TOlapTableSink>,
+            None::<data_sinks::TMemoryScratchSink>,
+            None::<data_sinks::TMultiCastDataStreamSink>,
+            None::<data_sinks::TSchemaTableSink>,
+            None::<data_sinks::TIcebergTableSink>,
+            None::<data_sinks::THiveTableSink>,
+            None::<data_sinks::TTableFunctionTableSink>,
+            None::<data_sinks::TDictionaryCacheSink>,
+            None::<Vec<Box<data_sinks::TDataSink>>>,
+            None::<i64>,
+            None::<data_sinks::TSplitDataStreamSink>,
+            None::<data_sinks::TIcebergChangeStreamRouterSink>,
+        )
+    }
+
+    fn fake_placement(
+        fragment_id: FragmentId,
+        instance_index: usize,
+        finst_lo: i64,
+        host: &str,
+    ) -> FragmentInstancePlacement {
+        FragmentInstancePlacement {
+            fragment_id,
+            instance_index,
+            finst_id: types::TUniqueId::new(11, finst_lo),
+            backend_idx: instance_index,
+            brpc_server: types::TNetworkAddress::new(host.to_string(), 9010),
+            scan_ranges: BTreeMap::new(),
+            destinations: Vec::new(),
+            runtime_filter_prober_params: BTreeMap::new(),
+            per_exch_num_senders: BTreeMap::new(),
+        }
     }
 
     fn is_write_sink_for_test(
@@ -2498,6 +2830,122 @@ mod tests {
                 "{sink_type:?} must not register with the write coordinator"
             );
         }
+    }
+
+    #[test]
+    fn coordinator_groups_multiple_router_edges_from_same_source() {
+        use crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind;
+
+        let edges = vec![
+            fake_router_edge(1, 2, 11, 7, 0, ChangeStreamWriteBranchKind::DeleteDv),
+            fake_router_edge(1, 3, 12, 7, 1, ChangeStreamWriteBranchKind::ReuseData),
+        ];
+        let grouped = group_router_edges_by_source(&edges).expect("router groups");
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[&(1, 7)].len(), 2);
+    }
+
+    #[test]
+    fn coordinator_rejects_router_edges_with_duplicate_target_exchange() {
+        use crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind;
+
+        let edges = vec![
+            fake_router_edge(1, 2, 11, 7, 0, ChangeStreamWriteBranchKind::DeleteDv),
+            fake_router_edge(1, 2, 11, 7, 1, ChangeStreamWriteBranchKind::ReuseData),
+        ];
+        let err = group_router_edges_by_source(&edges).expect_err("duplicate target exchange");
+        assert!(
+            err.contains("repeats target exchange"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn coordinator_still_rejects_multiple_plain_stream_edges_from_same_source() {
+        let edges = vec![fake_stream_edge(1, 2, 11), fake_stream_edge(1, 3, 12)];
+        let err = build_stream_edge_by_source(&edges).expect_err("multiple plain streams");
+        assert!(err.contains("multiple outgoing stream edges"));
+    }
+
+    #[test]
+    fn router_sink_does_not_require_write_report() {
+        let sink = data_sinks::TDataSink {
+            type_: data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK,
+            iceberg_change_stream_router_sink: Some(empty_router_sink_for_test()),
+            ..empty_data_sink_for_test(data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK)
+        };
+        assert!(!data_sink_requires_write_report(&sink));
+    }
+
+    #[test]
+    fn router_sink_wrapper_uses_edge_exchange_node_and_preserves_projection() {
+        use crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind;
+
+        let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamWriteBranchKind::DeleteDv);
+        edge.output_partition = partitions::TDataPartition::new(
+            partitions::TPartitionType::HASH_PARTITIONED,
+            None::<Vec<crate::thrift::exprs::TExpr>>,
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
+        );
+        let placeholder_partition = unpartitioned_partition();
+        let template_stream_sink = data_sinks::TDataStreamSink::new(
+            999,
+            placeholder_partition,
+            None::<bool>,
+            None::<bool>,
+            None::<i32>,
+            Some(vec![10, 11]),
+            None::<i64>,
+        );
+        let template = data_sinks::TIcebergChangeStreamRouterSink::new(
+            3,
+            Some(4),
+            vec![data_sinks::TIcebergChangeStreamRouterBranch::new(
+                0,
+                ChangeStreamWriteBranchKind::DeleteDv.to_thrift(),
+                template_stream_sink,
+                vec![],
+            )],
+        );
+        let placements = BTreeMap::from([(
+            2,
+            vec![
+                fake_placement(2, 0, 200, "10.0.0.20"),
+                fake_placement(2, 1, 201, "10.0.0.21"),
+            ],
+        )]);
+
+        let wrapped =
+            wrap_iceberg_change_stream_router_sink(&template, &[&edge], &placements).expect("wrap");
+        let router = wrapped
+            .iceberg_change_stream_router_sink
+            .as_ref()
+            .expect("router sink");
+        assert_eq!(router.change_op_slot_id, 3);
+        assert_eq!(router.data_route_slot_id, Some(4));
+        assert_eq!(router.branches.len(), 1);
+        let branch = &router.branches[0];
+        assert_eq!(
+            branch.stream_sink.dest_node_id, 77,
+            "branch stream sink must route to the edge exchange node"
+        );
+        assert_eq!(branch.stream_sink.output_columns, Some(vec![10, 11]));
+        assert_eq!(
+            branch.stream_sink.output_partition.type_,
+            partitions::TPartitionType::HASH_PARTITIONED
+        );
+        assert_eq!(branch.destinations.len(), 2);
+        assert_eq!(branch.destinations[0].fragment_instance_id.lo, 200);
+        assert_eq!(
+            branch.destinations[0]
+                .brpc_server
+                .as_ref()
+                .expect("brpc")
+                .hostname,
+            "10.0.0.20"
+        );
+        assert_eq!(branch.destinations[1].fragment_instance_id.lo, 201);
     }
 
     #[test]

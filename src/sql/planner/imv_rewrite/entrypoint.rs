@@ -1990,6 +1990,17 @@ mod tests {
                     .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)),
             "root output must include target _pos locator metadata; items: {output_names:?}"
         );
+        assert!(
+            output_names.iter().any(
+                |name| name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+            ),
+            "root output must include target _row_id lineage metadata; items: {output_names:?}"
+        );
+        assert!(
+            output_names.iter().any(|name| name
+                .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)),
+            "root output must include target _last_updated_sequence_number lineage metadata; items: {output_names:?}"
+        );
     }
 
     #[test]
@@ -2479,6 +2490,8 @@ mod tests {
             200,
             201,
             202,
+            203,
+            204,
         )
         .expect("join projection coalesce plan");
 
@@ -2515,6 +2528,8 @@ mod tests {
                     200,
                     201,
                     202,
+                    203,
+                    204,
                 )
                 .expect("join projection coalesce plan");
                 let physical = optimize_logical_for_test(coalesce);
@@ -2556,6 +2571,8 @@ mod tests {
                     200,
                     201,
                     202,
+                    203,
+                    204,
                 )
                 .expect("join projection/filter coalesce plan");
                 let physical = optimize_logical_for_test(coalesce);
@@ -2599,6 +2616,8 @@ mod tests {
                     200,
                     201,
                     202,
+                    203,
+                    204,
                 )
                 .expect("join side-filter coalesce plan");
                 let physical = optimize_logical_for_test(coalesce);
@@ -2642,6 +2661,8 @@ mod tests {
                     200,
                     201,
                     202,
+                    203,
+                    204,
                 )
                 .expect("join projection coalesce plan");
                 let physical = optimize_logical_for_test(coalesce);

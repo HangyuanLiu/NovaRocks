@@ -9353,8 +9353,8 @@ async fn commit_iceberg_mv_target_files_with_ref(
 /// the caller can share the collector with the sink.
 ///
 /// The collector's `op_kind` must be set by the caller before any inject
-/// calls — typically `CommitOpKind::RowDeltaDv` when the change batch has
-/// any DELETE-side rows, `CommitOpKind::FastAppend` otherwise.
+/// calls — typically `CommitOpKind::RowDeltaDvFromFiles` when the change batch
+/// has any DELETE-side rows, `CommitOpKind::FastAppend` otherwise.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) async fn commit_iceberg_mv_with_populated_collector(
@@ -9390,10 +9390,9 @@ pub(crate) async fn commit_iceberg_mv_with_populated_collector(
 }
 
 /// IVM-A1 helper: construct an empty `IcebergCommitCollector` configured for
-/// the supplied target table and branch. The caller (refresh driver) hands
-/// the resulting `Arc` to `IcebergMergeSinkPlan` so the sink can inject
-/// written files / position-delete groups during pipeline execution, then
-/// later passes the same `Arc` to
+/// the supplied target table and branch. The refresh driver hands the
+/// resulting `Arc` to the change-stream write DAG routing step so writer
+/// reports can be injected during execution, then later passes the same `Arc` to
 /// [`commit_iceberg_mv_with_populated_collector`].
 #[allow(dead_code)]
 pub(crate) fn new_iceberg_mv_commit_collector(
@@ -10493,7 +10492,6 @@ fn first_refresh_iceberg_join_mv(
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
-    let current_database = ctx.rewrite.current_database.as_str();
     if let Err(err) = ensure_iceberg_mv_staging_branch(
         iceberg_catalog,
         target,
@@ -10545,49 +10543,46 @@ fn first_refresh_iceberg_join_mv(
         staging_branch,
         CommitOpKind::FastAppend,
     );
-    let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
-        target_table: target_table.clone(),
-        collector: Arc::clone(&collector),
-    };
-    let merge_sink =
-        crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
-    {
-        let connectors_snapshot = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock")
-            .clone();
-        let catalogs_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        let codegen_catalog = crate::engine::catalog::InMemoryCatalog::default();
-        if let Err(err) = crate::engine::execute_logical_plan_with_options(
-            logical_plan.plan,
-            logical_plan.factory,
-            &codegen_catalog,
-            &connectors_snapshot,
-            current_database,
-            state.exchange_port,
-            None,
-            Some(Box::new(merge_sink)),
-            Some(&*catalogs_guard),
-            Some(ctx),
-            None,
-        ) {
-            drop(catalogs_guard);
-            return Err(handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-            ));
-        }
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let planned_query = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
+        logical_plan.plan,
+        logical_plan.factory,
+        &connectors_snapshot,
+    )
+    .map_err(|err| {
+        handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
+    })?;
+    let target_backend = iceberg_mv_target_backend(target);
+    if let Err(err) = execute_imv_change_stream_write(
+        state,
+        &target_backend,
+        Arc::clone(iceberg_catalog),
+        target_table.clone(),
+        Arc::clone(&collector),
+        ImvRefreshPlannedChangeStream {
+            physical_plan: planned_query.physical_plan,
+            output_columns: planned_query.output_columns,
+            change_stream: planned_query.change_stream,
+            producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
+            mv_refresh_ctx: Some(ctx),
+        },
+        staging_branch,
+    ) {
+        return Err(handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            refresh_id,
+            err,
+        ));
     }
 
-    let added_rows = collector.injected_data_record_count();
+    let added_rows = collector.injected_or_appended_data_record_count();
     if added_rows == 0 {
         drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
         abort_iceberg_mv_refresh(state, refresh_id)?;
@@ -12529,6 +12524,22 @@ fn build_join_incremental_refresh_logical_plan(
                     true,
                 )
                 .0;
+            let locator_row_id_column_id = factory
+                .create(
+                    None,
+                    crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                )
+                .0;
+            let locator_last_updated_seq_column_id = factory
+                .create(
+                    None,
+                    crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                )
+                .0;
             crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
                 outcome.plan,
                 &descriptor,
@@ -12536,6 +12547,8 @@ fn build_join_incremental_refresh_logical_plan(
                 net_column_id,
                 locator_file_column_id,
                 locator_pos_column_id,
+                locator_row_id_column_id,
+                locator_last_updated_seq_column_id,
             )
             .map_err(|e| format!("build join refresh coalesce logical plan: {e}"))?
         }
@@ -12629,7 +12642,6 @@ fn execute_join_delta_branches_logical(
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
-    let current_database = ctx.rewrite.current_database.as_str();
     let mv_definition = &*ctx.rewrite.mv_definition;
     let pin = &*ctx.rewrite.pin;
     let snapshots = pin.to_snapshot_map();
@@ -12685,54 +12697,67 @@ fn execute_join_delta_branches_logical(
     };
     let op_kind = match route {
         JoinIncrementalRefreshRoute::LogicalAppendOnly => CommitOpKind::FastAppend,
-        JoinIncrementalRefreshRoute::LogicalCoalesce => CommitOpKind::RowDeltaDv,
+        JoinIncrementalRefreshRoute::LogicalCoalesce => CommitOpKind::RowDeltaDvFromFiles,
     };
     let collector =
         new_iceberg_mv_commit_collector(&target_table, &ident, &staging_branch, op_kind);
-    let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
-        target_table: target_table.clone(),
-        collector: Arc::clone(&collector),
-    };
-    let merge_sink =
-        crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
-    {
-        let connectors_snapshot = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock")
-            .clone();
-        let catalogs_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        let codegen_catalog = crate::engine::catalog::InMemoryCatalog::default();
-        if let Err(err) = crate::engine::execute_logical_plan_with_options(
-            logical_plan.plan,
-            logical_plan.factory,
-            &codegen_catalog,
-            &connectors_snapshot,
-            current_database,
-            state.exchange_port,
-            None,
-            Some(Box::new(merge_sink)),
-            Some(&*catalogs_guard),
-            Some(ctx),
-            None,
-        ) {
-            drop(catalogs_guard);
-            return Err(handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            ));
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let planned_query = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
+        logical_plan.plan,
+        logical_plan.factory,
+        &connectors_snapshot,
+    )
+    .map_err(|err| {
+        handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            refresh_id,
+            err,
+        )
+    })?;
+    let producer_branches = match route {
+        JoinIncrementalRefreshRoute::LogicalAppendOnly => {
+            vec![ImvChangeStreamProducerBranch::FreshData]
         }
-        drop(catalogs_guard);
+        JoinIncrementalRefreshRoute::LogicalCoalesce => vec![
+            ImvChangeStreamProducerBranch::DeleteDv,
+            ImvChangeStreamProducerBranch::ReuseData,
+            ImvChangeStreamProducerBranch::FreshData,
+        ],
+    };
+    let target_backend = iceberg_mv_target_backend(target);
+    if let Err(err) = execute_imv_change_stream_write(
+        state,
+        &target_backend,
+        Arc::clone(iceberg_catalog),
+        target_table.clone(),
+        Arc::clone(&collector),
+        ImvRefreshPlannedChangeStream {
+            physical_plan: planned_query.physical_plan,
+            output_columns: planned_query.output_columns,
+            change_stream: planned_query.change_stream,
+            producer_branches,
+            mv_refresh_ctx: Some(ctx),
+        },
+        &staging_branch,
+    ) {
+        return Err(handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            refresh_id,
+            err,
+        ));
     }
 
-    let added_rows = collector.injected_data_record_count();
+    let added_rows = collector.injected_or_appended_data_record_count();
     let deleted_rows = collector.injected_delete_record_count();
     let new_total_rows = match route {
         JoinIncrementalRefreshRoute::LogicalAppendOnly if added_rows == 0 => {
@@ -13011,34 +13036,49 @@ fn execute_append_only_join_delta_branches(
                 err,
             )
         })?;
-        let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
-            target_table: target_table.clone(),
-            collector: Arc::clone(&collector),
-        };
-        let merge_sink =
-            crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
         let connectors_snapshot = state
             .connectors
             .read()
             .expect("standalone connector registry read lock")
             .clone();
-        let catalogs_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        let execute_result = crate::engine::execute_preexpanded_mv_refresh_query_with_options(
+        let planned_query = crate::engine::plan_query_for_iceberg_change_stream_refresh(
             &query,
             &branch_catalog,
             &connectors_snapshot,
             current_database,
-            state.exchange_port,
-            None,
-            Some(Box::new(merge_sink)),
-            Some(&*catalogs_guard),
             Some(ctx),
+            None,
+            false,
         );
-        if let Err(err) = execute_result {
-            drop(catalogs_guard);
+        let planned_query = match planned_query {
+            Ok(planned_query) => planned_query,
+            Err(err) => {
+                return Err(handle_iceberg_mv_commit_error(
+                    state,
+                    target,
+                    target_entry,
+                    &staging_branch,
+                    refresh_id,
+                    err,
+                ));
+            }
+        };
+        let target_backend = iceberg_mv_target_backend(target);
+        if let Err(err) = execute_imv_change_stream_write(
+            state,
+            &target_backend,
+            Arc::clone(iceberg_catalog),
+            target_table.clone(),
+            Arc::clone(&collector),
+            ImvRefreshPlannedChangeStream {
+                physical_plan: planned_query.physical_plan,
+                output_columns: planned_query.output_columns,
+                change_stream: planned_query.change_stream,
+                producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
+                mv_refresh_ctx: Some(ctx),
+            },
+            &staging_branch,
+        ) {
             return Err(handle_iceberg_mv_commit_error(
                 state,
                 target,
@@ -13048,10 +13088,9 @@ fn execute_append_only_join_delta_branches(
                 err,
             ));
         }
-        drop(catalogs_guard);
     }
 
-    let added_rows = collector.injected_data_record_count();
+    let added_rows = collector.injected_or_appended_data_record_count();
     if added_rows == 0 {
         tracing::info!(
             snapshots = ?snapshots,
@@ -13316,50 +13355,63 @@ fn execute_join_delta_branches(
         &target_table,
         &ident,
         &staging_branch,
-        CommitOpKind::RowDeltaDv,
+        CommitOpKind::RowDeltaDvFromFiles,
     );
-    let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
-        target_table: target_table.clone(),
-        collector: Arc::clone(&collector),
-    };
-    let merge_sink =
-        crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
-    {
-        let connectors_snapshot = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock")
-            .clone();
-        let catalogs_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        let execute_result = crate::engine::execute_preexpanded_mv_refresh_query_with_options(
-            &query,
-            &branch_catalog,
-            &connectors_snapshot,
-            current_database,
-            state.exchange_port,
-            None,
-            Some(Box::new(merge_sink)),
-            Some(&*catalogs_guard),
-            Some(ctx),
-        );
-        if let Err(err) = execute_result {
-            drop(catalogs_guard);
-            return Err(handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            ));
-        }
-        drop(catalogs_guard);
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let planned_query = crate::engine::plan_query_for_iceberg_change_stream_refresh(
+        &query,
+        &branch_catalog,
+        &connectors_snapshot,
+        current_database,
+        Some(ctx),
+        None,
+        false,
+    )
+    .map_err(|err| {
+        handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            refresh_id,
+            err,
+        )
+    })?;
+    let target_backend = iceberg_mv_target_backend(target);
+    if let Err(err) = execute_imv_change_stream_write(
+        state,
+        &target_backend,
+        Arc::clone(iceberg_catalog),
+        target_table.clone(),
+        Arc::clone(&collector),
+        ImvRefreshPlannedChangeStream {
+            physical_plan: planned_query.physical_plan,
+            output_columns: planned_query.output_columns,
+            change_stream: planned_query.change_stream,
+            producer_branches: vec![
+                ImvChangeStreamProducerBranch::DeleteDv,
+                ImvChangeStreamProducerBranch::ReuseData,
+                ImvChangeStreamProducerBranch::FreshData,
+            ],
+            mv_refresh_ctx: Some(ctx),
+        },
+        &staging_branch,
+    ) {
+        return Err(handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            refresh_id,
+            err,
+        ));
     }
 
-    let added_rows = collector.injected_data_record_count();
+    let added_rows = collector.injected_or_appended_data_record_count();
     let deleted_rows = collector.injected_delete_record_count();
     if added_rows == 0 && deleted_rows == 0 {
         drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
@@ -13706,14 +13758,10 @@ fn normalize_join_branch_snapshot_tables(
 
 /// Execute the incremental refresh of an iceberg-backed MV.
 ///
-/// IVM-A1 path: rewrite the MV SELECT AST so its single base-table reference
-/// becomes `__nr_ivm_delta('cat.ns.tbl', from, to)`, register the base table
-/// in a one-shot `InMemoryCatalog` via `build_iceberg_table_def_for_delta_scan`,
-/// and execute the resulting `Query` through `execute_query_with_options`
-/// with a custom `IcebergMergeSinkFactory`. The sink fans inserts to a
-/// streaming data-file writer and routes DELETE rows carrying `_file` / `_pos`
-/// into a shared `IcebergCommitCollector`. After the pipeline completes, the
-/// refresh driver hands the populated collector to
+/// IVM-A1 path: plan the MV change stream, execute it through the distributed
+/// Iceberg change-stream write DAG, and route writer reports into a shared
+/// `IcebergCommitCollector`. After the pipeline completes, the refresh driver
+/// hands the populated collector to
 /// `commit_iceberg_mv_with_populated_collector` for the staging-branch commit,
 /// then publishes and finalizes.
 ///
@@ -13722,9 +13770,8 @@ fn normalize_join_branch_snapshot_tables(
 ///    (also used to short-circuit empty-delta finalize).
 /// 2. If the delta yields no inserts and no deletes, advance lineage without
 ///    committing an empty Iceberg snapshot.
-/// 3. Otherwise: begin staging branch, build the AST-mutated query, build the
-///    collector + merge sink, run `execute_query_with_options`, commit, publish,
-///    and finalize.
+/// 3. Otherwise: begin staging branch, build the collector, run the distributed
+///    change-stream write DAG, commit, publish, and finalize.
 ///
 /// Metadata-only empty deltas keep the old finalize path because no Iceberg
 /// snapshot is created.
@@ -13746,10 +13793,627 @@ fn rewrite_merge_refresh_evidence(apply_key: ApplyKeyContract) -> RewriteMergeRe
         (RewriteEvidence::None, _) => RewriteMergeRefreshEvidence::None,
         (
             RewriteEvidence::Aggregate,
-            crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchUtf8,
+            crate::engine::mv::apply_key::ApplyKeyValueType::BranchUtf8,
         ) => RewriteMergeRefreshEvidence::BranchUnionAggregate,
         (RewriteEvidence::Aggregate, _) => RewriteMergeRefreshEvidence::Aggregate,
         (RewriteEvidence::JoinAggregate, _) => RewriteMergeRefreshEvidence::JoinAggregate,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImvChangeStreamProducerBranch {
+    DeleteDv,
+    ReuseData,
+    FreshData,
+}
+
+const IMV_CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
+
+struct ImvRefreshPlannedChangeStream<'a> {
+    physical_plan: crate::sql::optimizer::PhysicalPlanNode,
+    output_columns: Vec<OutputColumn>,
+    change_stream: crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
+    producer_branches: Vec<ImvChangeStreamProducerBranch>,
+    mv_refresh_ctx: Option<&'a IcebergMvRefreshContext>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_imv_change_stream_write(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    _catalog: Arc<dyn iceberg::Catalog>,
+    table: iceberg::table::Table,
+    collector: Arc<IcebergCommitCollector>,
+    refresh_plan: ImvRefreshPlannedChangeStream<'_>,
+    target_ref: &str,
+) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+    let (refresh_plan, data_route_output_ordinal) =
+        ensure_imv_change_stream_data_route(refresh_plan)?;
+    let entry = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?
+        .get(&target.catalog)?;
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let resolved = connectors_snapshot
+        .catalog_backend(target.backend_name)?
+        .load_table(&target.catalog, &target.namespace, &target.table)?;
+    let mut dag = iceberg_change_stream_write_dag_for_imv_refresh(
+        target,
+        &resolved,
+        &table,
+        &entry,
+        &refresh_plan,
+        target_ref,
+        data_route_output_ordinal,
+    )?;
+    let planned = crate::engine::build_physical_plan_as_iceberg_change_stream_write(
+        state,
+        Some(&target.catalog),
+        &target.namespace,
+        &refresh_plan.physical_plan,
+        &mut dag,
+        refresh_plan.mv_refresh_ctx,
+    )?;
+    #[cfg(test)]
+    if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&dag) {
+        return Ok(result);
+    }
+    let commit_plan = planned.commit_plan.clone();
+    let result =
+        crate::engine::execute_planned_iceberg_change_stream_write(planned.build_result, None)?;
+    if let Some(abort) = result.write_abort.as_ref() {
+        return Err(abort.reason.clone());
+    }
+    let write_commit = result
+        .write_commit
+        .as_ref()
+        .ok_or_else(|| "IMV change-stream write completed without writer commit".to_string())?;
+    let routed = crate::engine::iceberg_change_stream_write::route_change_stream_writer_reports(
+        &collector,
+        table.metadata(),
+        write_commit,
+        &commit_plan,
+    )
+    .map_err(|err| err.into_parts().0)?;
+    routed.inject(&collector);
+    Ok(result)
+}
+
+fn ensure_imv_change_stream_data_route(
+    mut refresh_plan: ImvRefreshPlannedChangeStream<'_>,
+) -> Result<(ImvRefreshPlannedChangeStream<'_>, Option<usize>), String> {
+    let Some(route_mode) = imv_data_route_mode(&refresh_plan.producer_branches)? else {
+        return Ok((refresh_plan, None));
+    };
+
+    let has_delete_branch = refresh_plan
+        .producer_branches
+        .iter()
+        .any(|branch| matches!(branch, ImvChangeStreamProducerBranch::DeleteDv));
+    let action_output = if has_delete_branch {
+        let action_ordinal = imv_change_op_output_ordinal(&refresh_plan)?;
+        Some(refresh_plan.output_columns[action_ordinal].clone())
+    } else {
+        None
+    };
+    let row_lineage_output = match route_mode {
+        ImvDataRouteMode::Constant(_) => None,
+        ImvDataRouteMode::ByRowLineage => Some(
+            output_column_by_name(
+                &refresh_plan.output_columns,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                "reuse/fresh route row-lineage column",
+            )?
+            .clone(),
+        ),
+    };
+
+    let route_output = imv_data_route_output_column(&refresh_plan.output_columns);
+    let route_output_ordinal = refresh_plan.output_columns.len();
+    let physical_plan = add_imv_data_route_project(
+        refresh_plan.physical_plan,
+        &refresh_plan.output_columns,
+        action_output.as_ref(),
+        row_lineage_output.as_ref(),
+        route_mode,
+        route_output.clone(),
+    )?;
+    refresh_plan.physical_plan = physical_plan;
+    refresh_plan.output_columns.push(route_output);
+
+    Ok((refresh_plan, Some(route_output_ordinal)))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImvDataRouteMode {
+    Constant(i32),
+    ByRowLineage,
+}
+
+fn imv_data_route_mode(
+    producer_branches: &[ImvChangeStreamProducerBranch],
+) -> Result<Option<ImvDataRouteMode>, String> {
+    use crate::sql::codegen::iceberg_change_stream_write::{DATA_ROUTE_FRESH, DATA_ROUTE_REUSE};
+
+    let has_reuse = producer_branches
+        .iter()
+        .any(|branch| matches!(branch, ImvChangeStreamProducerBranch::ReuseData));
+    let has_fresh = producer_branches
+        .iter()
+        .any(|branch| matches!(branch, ImvChangeStreamProducerBranch::FreshData));
+    Ok(match (has_reuse, has_fresh) {
+        (false, false) => None,
+        (true, false) => Some(ImvDataRouteMode::Constant(DATA_ROUTE_REUSE)),
+        (false, true) => Some(ImvDataRouteMode::Constant(DATA_ROUTE_FRESH)),
+        (true, true) => Some(ImvDataRouteMode::ByRowLineage),
+    })
+}
+
+fn imv_data_route_output_column(existing: &[OutputColumn]) -> OutputColumn {
+    OutputColumn {
+        column_id: ColumnId(
+            existing
+                .iter()
+                .map(|column| column.column_id.0)
+                .max()
+                .unwrap_or(0)
+                + 1,
+        ),
+        name: IMV_CHANGE_STREAM_DATA_ROUTE_COLUMN.to_string(),
+        data_type: DataType::Int32,
+        nullable: true,
+        is_internal: true,
+    }
+}
+
+fn add_imv_data_route_project(
+    child: crate::sql::optimizer::PhysicalPlanNode,
+    child_output_columns: &[OutputColumn],
+    action_output: Option<&OutputColumn>,
+    row_lineage_output: Option<&OutputColumn>,
+    route_mode: ImvDataRouteMode,
+    route_output: OutputColumn,
+) -> Result<crate::sql::optimizer::PhysicalPlanNode, String> {
+    use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
+    use crate::sql::optimizer::physical_plan::{PlanExecutionProps, attach_scalar_arena};
+    use crate::sql::optimizer::scalar::ScalarNode;
+
+    let existing_arena =
+        child.execution_props.scalar_arena.as_ref().ok_or_else(|| {
+            "IMV change-stream route projection requires a scalar arena".to_string()
+        })?;
+    let mut arena = (**existing_arena).clone();
+    let mut items = Vec::with_capacity(child_output_columns.len() + 1);
+    for column in child_output_columns {
+        arena.remember_source_column_display(column.column_id, None, column.name.clone());
+        let expr = arena.intern(
+            ScalarNode::ColumnRef(column.column_id),
+            column.data_type.clone(),
+            column.nullable,
+        );
+        items.push(ScalarProjectItem {
+            expr,
+            output_name: column.name.clone(),
+            output_column_id: column.column_id,
+            expr_display: None,
+        });
+    }
+
+    let route_expr =
+        imv_data_route_scalar(&mut arena, action_output, row_lineage_output, route_mode)?;
+    arena.remember_project_output_display(route_output.column_id, None, route_output.name.clone());
+    items.push(ScalarProjectItem {
+        expr: route_expr,
+        output_name: route_output.name.clone(),
+        output_column_id: route_output.column_id,
+        expr_display: None,
+    });
+
+    let output_property = child.execution_props.output_property.clone();
+    let stats = child.stats.clone();
+    let mut output_columns = child_output_columns.to_vec();
+    output_columns.push(route_output);
+    let arena = Arc::new(arena);
+    let mut plan = crate::sql::optimizer::PhysicalPlanNode {
+        op: Operator::PhysicalProject(ProjectOp {
+            items,
+            output_qualifier: None,
+        }),
+        children: vec![child],
+        stats,
+        output_columns,
+        execution_props: PlanExecutionProps {
+            output_property: output_property.clone(),
+            child_output_properties: vec![output_property],
+            join_distribution: None,
+            scalar_arena: Some(Arc::clone(&arena)),
+        },
+        build_runtime_filters: Vec::new(),
+        probe_runtime_filters: Vec::new(),
+    };
+    attach_scalar_arena(&mut plan, arena);
+    Ok(plan)
+}
+
+fn imv_data_route_scalar(
+    arena: &mut crate::sql::optimizer::scalar::ScalarArena,
+    action_output: Option<&OutputColumn>,
+    row_lineage_output: Option<&OutputColumn>,
+    route_mode: ImvDataRouteMode,
+) -> Result<crate::sql::optimizer::scalar::ScalarId, String> {
+    use crate::sql::codegen::iceberg_change_stream_write::{
+        CHANGE_OP_INSERT, DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
+    };
+    use crate::sql::common::{BinOp, LiteralValue};
+    use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
+
+    let route_value_expr = match route_mode {
+        ImvDataRouteMode::Constant(route_value) => arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(route_value as i64))),
+            DataType::Int32,
+            false,
+        ),
+        ImvDataRouteMode::ByRowLineage => {
+            let row_lineage_output = row_lineage_output.ok_or_else(|| {
+                "IMV reuse/fresh route requires preserved row-lineage output".to_string()
+            })?;
+            let row_lineage_ref = arena.intern(
+                ScalarNode::ColumnRef(row_lineage_output.column_id),
+                row_lineage_output.data_type.clone(),
+                row_lineage_output.nullable,
+            );
+            let is_fresh = arena.intern(
+                ScalarNode::IsNull {
+                    child: row_lineage_ref,
+                    negated: false,
+                },
+                DataType::Boolean,
+                false,
+            );
+            let fresh_route = arena.intern(
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(DATA_ROUTE_FRESH as i64))),
+                DataType::Int32,
+                false,
+            );
+            let reuse_route = arena.intern(
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(DATA_ROUTE_REUSE as i64))),
+                DataType::Int32,
+                false,
+            );
+            arena.intern(
+                ScalarNode::Case {
+                    operand: None,
+                    when_then: vec![(is_fresh, fresh_route)],
+                    else_expr: Some(reuse_route),
+                },
+                DataType::Int32,
+                false,
+            )
+        }
+    };
+    let Some(action_output) = action_output else {
+        return Ok(route_value_expr);
+    };
+
+    let action_ref = arena.intern(
+        ScalarNode::ColumnRef(action_output.column_id),
+        action_output.data_type.clone(),
+        action_output.nullable,
+    );
+    let insert_literal = arena.intern(
+        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_INSERT as i64))),
+        action_output.data_type.clone(),
+        false,
+    );
+    let is_insert = arena.intern(
+        ScalarNode::BinaryOp {
+            op: BinOp::Eq,
+            left: action_ref,
+            right: insert_literal,
+        },
+        DataType::Boolean,
+        action_output.nullable,
+    );
+    let null_route = arena.intern(
+        ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
+        DataType::Int32,
+        true,
+    );
+    Ok(arena.intern(
+        ScalarNode::Case {
+            operand: None,
+            when_then: vec![(is_insert, route_value_expr)],
+            else_expr: Some(null_route),
+        },
+        DataType::Int32,
+        true,
+    ))
+}
+
+fn iceberg_mv_target_backend(
+    target: &IcebergMvTarget,
+) -> crate::engine::backend_resolver::TargetBackend {
+    crate::engine::backend_resolver::TargetBackend {
+        backend_name: "iceberg",
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+    }
+}
+
+fn iceberg_change_stream_write_dag_for_imv_refresh(
+    target: &crate::engine::backend_resolver::TargetBackend,
+    resolved: &crate::connector::backend::ResolvedTable,
+    table: &iceberg::table::Table,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    refresh_plan: &ImvRefreshPlannedChangeStream<'_>,
+    target_ref: &str,
+    data_route_output_ordinal: Option<usize>,
+) -> Result<crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec, String>
+{
+    let branches = build_imv_change_stream_branches(
+        target,
+        resolved,
+        table,
+        entry,
+        &refresh_plan.output_columns,
+        &refresh_plan.producer_branches,
+        target_ref,
+    )?;
+    let change_op_output_ordinal = if branches.len() > 1 {
+        Some(imv_change_op_output_ordinal(refresh_plan)?)
+    } else {
+        None
+    };
+    Ok(
+        crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec {
+            change_op_slot: -1,
+            change_op_output_ordinal,
+            data_route_slot: None,
+            data_route_output_ordinal,
+            branches,
+        },
+    )
+}
+
+fn imv_change_op_output_ordinal(
+    refresh_plan: &ImvRefreshPlannedChangeStream<'_>,
+) -> Result<usize, String> {
+    if let Some(aggregate) = refresh_plan.change_stream.aggregate() {
+        return output_ordinal_by_column_id(
+            &refresh_plan.output_columns,
+            aggregate.action_column_id,
+            "aggregate change-stream action column",
+        );
+    }
+    if let Some(join_refresh) = refresh_plan.change_stream.join_refresh.as_ref() {
+        return output_ordinal_by_column_id(
+            &refresh_plan.output_columns,
+            join_refresh.action_column.column_id,
+            "join change-stream action column",
+        );
+    }
+    refresh_plan
+        .output_columns
+        .iter()
+        .position(crate::sql::planner::imv_rewrite::action_column::ImvActionColumn::matches)
+        .ok_or_else(|| "IMV change-stream write requires __change_op output column".to_string())
+}
+
+fn build_imv_change_stream_branches(
+    target: &crate::engine::backend_resolver::TargetBackend,
+    resolved: &crate::connector::backend::ResolvedTable,
+    table: &iceberg::table::Table,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    output_columns: &[OutputColumn],
+    producer_branches: &[ImvChangeStreamProducerBranch],
+    target_ref: &str,
+) -> Result<
+    Vec<crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchSpec>,
+    String,
+> {
+    use crate::sql::codegen::iceberg_change_stream_write::{
+        ChangeStreamWriteBranchKind, ChangeStreamWriteBranchSpec,
+    };
+    use crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode;
+
+    producer_branches
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(idx, producer_branch)| {
+            let branch_kind = match producer_branch {
+                ImvChangeStreamProducerBranch::DeleteDv => ChangeStreamWriteBranchKind::DeleteDv,
+                ImvChangeStreamProducerBranch::ReuseData => ChangeStreamWriteBranchKind::ReuseData,
+                ImvChangeStreamProducerBranch::FreshData => ChangeStreamWriteBranchKind::FreshData,
+            };
+            let (sink_spec, partition_ordinals) = match producer_branch {
+                ImvChangeStreamProducerBranch::DeleteDv => {
+                    let planned_snapshot_id = if target_ref == "main" {
+                        table.metadata().current_snapshot().map(|s| s.snapshot_id())
+                    } else {
+                        crate::engine::delete_flow::resolve_branch_head_snapshot_id(
+                            table.metadata(),
+                            target_ref,
+                        )?
+                    };
+                    let mut spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
+                        target, resolved, table, entry,
+                    )?;
+                    spec.mode = IcebergWriteSinkMode::DeletionVectors;
+                    spec.set_planned_snapshot_id(planned_snapshot_id)?;
+                    let file_ordinal = output_ordinal_by_name(
+                        output_columns,
+                        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                        "DV file locator",
+                    )?;
+                    (spec, vec![file_ordinal])
+                }
+                ImvChangeStreamProducerBranch::ReuseData => {
+                    let spec = crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
+                        target, resolved, table, entry,
+                    )?;
+                    let partition_ordinals =
+                        target_partition_source_ordinals(table.metadata(), output_columns)?;
+                    (spec, partition_ordinals)
+                }
+                ImvChangeStreamProducerBranch::FreshData => {
+                    let write_columns =
+                        crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
+                            table.metadata().current_schema(),
+                        )?;
+                    let spec = crate::engine::iceberg_writer::build_insert_write_sink_spec(
+                        target,
+                        resolved,
+                        table,
+                        entry,
+                        &write_columns,
+                    )?;
+                    let partition_ordinals =
+                        target_partition_source_ordinals(table.metadata(), output_columns)?;
+                    (spec, partition_ordinals)
+                }
+            };
+            let stream_output_ordinals =
+                output_ordinals_for_sink_columns(output_columns, &sink_spec.target_columns)?;
+            Ok(ChangeStreamWriteBranchSpec {
+                branch_id: i32::try_from(idx).map_err(|_| {
+                    "IMV change-stream branch id overflow while building DAG".to_string()
+                })?,
+                branch_kind,
+                stream_output_slots: Vec::new(),
+                stream_output_ordinals: Some(stream_output_ordinals),
+                output_partition: unpartitioned_change_stream_output(),
+                output_partition_ordinals: Some(partition_ordinals),
+                sink_spec,
+                writer_fragment_id: None,
+            })
+        })
+        .collect()
+}
+
+fn unpartitioned_change_stream_output() -> crate::thrift::partitions::TDataPartition {
+    crate::thrift::partitions::TDataPartition::new(
+        crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+        None::<Vec<crate::thrift::exprs::TExpr>>,
+        None::<Vec<crate::thrift::partitions::TRangePartition>>,
+        None::<Vec<crate::thrift::partitions::TBucketProperty>>,
+    )
+}
+
+fn output_ordinals_for_sink_columns(
+    output_columns: &[OutputColumn],
+    sink_columns: &[crate::engine::catalog::ColumnDef],
+) -> Result<Vec<usize>, String> {
+    sink_columns
+        .iter()
+        .map(|column| output_ordinal_by_name(output_columns, &column.name, "sink input column"))
+        .collect()
+}
+
+fn output_column_by_name<'a>(
+    output_columns: &'a [OutputColumn],
+    name: &str,
+    label: &str,
+) -> Result<&'a OutputColumn, String> {
+    let ordinal = output_ordinal_by_name(output_columns, name, label)?;
+    Ok(&output_columns[ordinal])
+}
+
+fn target_partition_source_ordinals(
+    metadata: &iceberg::spec::TableMetadata,
+    output_columns: &[OutputColumn],
+) -> Result<Vec<usize>, String> {
+    let schema = metadata.current_schema();
+    metadata
+        .default_partition_spec()
+        .fields()
+        .iter()
+        .map(|field| {
+            let source = schema.field_by_id(field.source_id).ok_or_else(|| {
+                format!(
+                    "IMV change-stream partition source field id {} not found in target schema",
+                    field.source_id
+                )
+            })?;
+            output_ordinal_by_name(
+                output_columns,
+                &source.name,
+                "target partition source column",
+            )
+        })
+        .collect()
+}
+
+fn output_ordinal_by_column_id(
+    output_columns: &[OutputColumn],
+    column_id: ColumnId,
+    label: &str,
+) -> Result<usize, String> {
+    let mut matches = output_columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.column_id == column_id)
+        .map(|(idx, _)| idx);
+    let ordinal = matches.next().ok_or_else(|| {
+        format!(
+            "IMV change-stream {label} ColumnId({}) not found",
+            column_id.0
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "IMV change-stream {label} ColumnId({}) is ambiguous",
+            column_id.0
+        ));
+    }
+    Ok(ordinal)
+}
+
+fn output_ordinal_by_name(
+    output_columns: &[OutputColumn],
+    name: &str,
+    label: &str,
+) -> Result<usize, String> {
+    let mut matches = output_columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.name.eq_ignore_ascii_case(name))
+        .map(|(idx, _)| idx);
+    let ordinal = matches
+        .next()
+        .ok_or_else(|| format!("IMV change-stream {label} `{name}` not found in plan output"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "IMV change-stream {label} `{name}` is ambiguous in plan output"
+        ));
+    }
+    Ok(ordinal)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImvBranchShape {
+    DeleteAndReuse,
+}
+
+#[cfg(test)]
+fn build_imv_change_stream_branches_for_test(
+    shape: ImvBranchShape,
+) -> Vec<crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchSpec> {
+    use crate::sql::codegen::iceberg_change_stream_write::{
+        ChangeStreamWriteBranchKind, ChangeStreamWriteBranchSpec,
+    };
+    match shape {
+        ImvBranchShape::DeleteAndReuse => vec![
+            ChangeStreamWriteBranchSpec::for_test(0, ChangeStreamWriteBranchKind::DeleteDv),
+            ChangeStreamWriteBranchSpec::for_test(1, ChangeStreamWriteBranchKind::ReuseData),
+        ],
     }
 }
 
@@ -14093,82 +14757,87 @@ fn incremental_refresh_iceberg_mv_with_changes(
     let can_emit_delete_rows =
         has_delete_changes || apply_key.preload_locator_for_change_stream_deletes;
 
-    // 7. Build the shared commit collector + merge sink factory. The sink
-    // injects WrittenFile / PositionDeleteGroup descriptors into the
-    // collector during pipeline execution; the commit driver below
-    // consumes the populated collector.
+    // 7. Build the shared commit collector. The change-stream write DAG routes
+    // writer reports back into this collector; the commit driver below consumes
+    // the populated collector.
     let op_kind = if can_emit_delete_rows {
-        CommitOpKind::RowDeltaDv
+        CommitOpKind::RowDeltaDvFromFiles
     } else {
         CommitOpKind::FastAppend
     };
     let collector =
         new_iceberg_mv_commit_collector(&target_table, &ident, &staging_branch, op_kind);
-    let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
-        target_table: target_table.clone(),
-        collector: Arc::clone(&collector),
-    };
-    let merge_sink =
-        crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
-
-    // 8. Execute the mutated query with the merge sink as the terminal
-    // operator. lower_plan is given the iceberg catalog registry so it
-    // can resolve the IcebergRuntimeHandles for the IcebergDeltaScan
-    // operator.
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let aggregate_rewrite_validator;
+    let imv_rewrite_validator: Option<&crate::engine::ImvRewriteValidator<'_>> = if rewrite_evidence
+        != RewriteMergeRefreshEvidence::None
     {
-        let connectors_snapshot = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock")
-            .clone();
-        let catalogs_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        let aggregate_rewrite_validator;
-        let imv_rewrite_validator: Option<&crate::engine::ImvRewriteValidator<'_>> =
-            if rewrite_evidence != RewriteMergeRefreshEvidence::None {
-                aggregate_rewrite_validator =
-                    |outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome| {
-                        validate_aggregate_refresh_rewrite_outcome(
-                            &ctx.rewrite,
-                            outcome,
-                            rewrite_evidence,
-                        )
-                    };
-                Some(&aggregate_rewrite_validator)
-            } else {
-                None
+        aggregate_rewrite_validator =
+            |outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome| {
+                validate_aggregate_refresh_rewrite_outcome(&ctx.rewrite, outcome, rewrite_evidence)
             };
-        if let Err(err) = crate::engine::execute_query_with_options_and_imv_validator(
-            &query,
-            &catalog,
-            &connectors_snapshot,
-            current_database,
-            state.exchange_port,
-            None,
-            Some(Box::new(merge_sink)),
-            Some(&*catalogs_guard),
-            Some(&ctx),
-            imv_rewrite_validator,
-            // MV refresh must never rewrite onto a materialized view (and the
-            // mv_refresh_ctx gate would block it anyway): no MV rewrite here.
-            None,
-        ) {
-            drop(catalogs_guard);
-            return Err(handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            ));
-        }
-        drop(catalogs_guard);
+        Some(&aggregate_rewrite_validator)
+    } else {
+        None
+    };
+    let planned_query = crate::engine::plan_query_for_iceberg_change_stream_refresh(
+        &query,
+        &catalog,
+        &connectors_snapshot,
+        current_database,
+        Some(&ctx),
+        imv_rewrite_validator,
+        true,
+    )
+    .map_err(|err| {
+        handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            refresh_id,
+            err,
+        )
+    })?;
+    let mut producer_branches = Vec::new();
+    if can_emit_delete_rows {
+        producer_branches.push(ImvChangeStreamProducerBranch::DeleteDv);
+        producer_branches.push(ImvChangeStreamProducerBranch::ReuseData);
+        producer_branches.push(ImvChangeStreamProducerBranch::FreshData);
+    } else {
+        producer_branches.push(ImvChangeStreamProducerBranch::FreshData);
+    }
+    let target_backend = iceberg_mv_target_backend(target);
+    if let Err(err) = execute_imv_change_stream_write(
+        state,
+        &target_backend,
+        Arc::clone(iceberg_catalog),
+        target_table.clone(),
+        Arc::clone(&collector),
+        ImvRefreshPlannedChangeStream {
+            physical_plan: planned_query.physical_plan,
+            output_columns: planned_query.output_columns,
+            change_stream: planned_query.change_stream,
+            producer_branches,
+            mv_refresh_ctx: Some(ctx),
+        },
+        &staging_branch,
+    ) {
+        return Err(handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            refresh_id,
+            err,
+        ));
     }
 
-    let added_rows = collector.injected_data_record_count();
+    let added_rows = collector.injected_or_appended_data_record_count();
     let deleted_rows = collector.injected_delete_record_count();
 
     // 8b. Post-execution empty-delta short-circuit.
@@ -14497,14 +15166,39 @@ fn arrow_data_type_to_iceberg_primitive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType;
+    use crate::engine::mv::apply_key::ApplyKeyValueType;
     use crate::engine::mv::refresh_property::PartitionPruningPolicy;
-    use crate::sql::planner::plan::*;
     use arrow::array::{BinaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc as StdArc;
     use tempfile::TempDir;
+
+    #[test]
+    fn imv_refresh_no_longer_uses_terminal_merge_sink_factory() {
+        let source = include_str!("iceberg_refresh.rs");
+        assert!(!source.contains(concat!("Iceberg", "Merge", "Sink", "Factory", "::new")));
+        assert!(!source.contains(concat!("terminal", "_sink")));
+    }
+
+    #[test]
+    fn imv_refresh_uses_change_stream_write_helper() {
+        let source = include_str!("iceberg_refresh.rs");
+        assert!(source.contains("execute_imv_change_stream_write"));
+    }
+
+    #[test]
+    fn imv_change_stream_branch_set_can_include_zero_row_branch() {
+        let branches = build_imv_change_stream_branches_for_test(ImvBranchShape::DeleteAndReuse);
+        assert!(branches.iter().any(|b| {
+            b.branch_kind
+                == crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind::DeleteDv
+        }));
+        assert!(branches.iter().any(|b| {
+            b.branch_kind
+                == crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind::ReuseData
+        }));
+    }
 
     #[test]
     fn join_base_schema_contract_returns_rebind_for_rename() {

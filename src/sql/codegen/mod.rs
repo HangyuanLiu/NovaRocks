@@ -11,6 +11,7 @@ pub(crate) mod expr_compiler;
 pub(crate) mod fallback_audit;
 pub(crate) mod fragment_builder;
 pub(crate) mod helpers;
+pub(crate) mod iceberg_change_stream_write;
 pub(crate) mod iceberg_write_sink;
 pub(crate) mod iceberg_write_sink_wire;
 pub(crate) mod id_binding_verifier;
@@ -94,7 +95,14 @@ pub(crate) struct OutputColumn {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FragmentEdgeKind {
     Stream,
-    CteMulticast { cte_id: CteId },
+    CteMulticast {
+        cte_id: CteId,
+    },
+    IcebergChangeStreamRouter {
+        router_group_id: i32,
+        branch_id: i32,
+        branch_kind: crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

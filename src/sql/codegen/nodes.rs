@@ -1189,6 +1189,17 @@ pub(crate) fn projected_target_state_column_names(
     {
         names.push(scan.row_id_column_name.clone());
     }
+    for name in [
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+    ] {
+        if !names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(name))
+        {
+            names.push(name.to_string());
+        }
+    }
     if let crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
         branch_scope: Some(scope),
         ..
@@ -1202,6 +1213,8 @@ pub(crate) fn projected_target_state_column_names(
     for name in [
         crate::exec::row_position::ICEBERG_FILE_PATH_COL,
         crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
     ] {
         if !names
             .iter()
@@ -1227,6 +1240,8 @@ pub(crate) fn projected_target_locator_column_names(
     for name in [
         crate::exec::row_position::ICEBERG_FILE_PATH_COL,
         crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
     ] {
         if !names
             .iter()
@@ -2263,6 +2278,8 @@ mod tests {
                 "k".to_string(),
                 "visible_sum".to_string(),
                 "sum_v".to_string(),
+                "_row_id".to_string(),
+                "_last_updated_sequence_number".to_string(),
                 "_file".to_string(),
                 "_pos".to_string(),
             ]

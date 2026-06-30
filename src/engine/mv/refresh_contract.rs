@@ -1,4 +1,5 @@
 use crate::connector::starrocks::table::model::IcebergTableRef;
+use crate::engine::mv::apply_key::ApplyKeyValueType;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RewriteEvidence {
@@ -10,7 +11,7 @@ pub(crate) enum RewriteEvidence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ApplyKeyContract {
     pub(crate) column_name: &'static str,
-    pub(crate) value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType,
+    pub(crate) value_type: ApplyKeyValueType,
     pub(crate) rewrite_evidence: RewriteEvidence,
     pub(crate) allow_full_rebuild_on_policy_full_refresh: bool,
     pub(crate) preload_locator_for_change_stream_deletes: bool,
@@ -20,7 +21,7 @@ impl ApplyKeyContract {
     pub(crate) fn projection_filter() -> Self {
         Self {
             column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN,
-            value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Int64,
+            value_type: ApplyKeyValueType::Int64,
             rewrite_evidence: RewriteEvidence::None,
             allow_full_rebuild_on_policy_full_refresh: true,
             preload_locator_for_change_stream_deletes: false,
@@ -30,7 +31,7 @@ impl ApplyKeyContract {
     pub(crate) fn union_projection_filter() -> Self {
         Self {
             column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN,
-            value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchInt64,
+            value_type: ApplyKeyValueType::BranchInt64,
             rewrite_evidence: RewriteEvidence::None,
             allow_full_rebuild_on_policy_full_refresh: false,
             preload_locator_for_change_stream_deletes: false,
@@ -40,7 +41,7 @@ impl ApplyKeyContract {
     pub(crate) fn join_projection_filter() -> Self {
         Self {
             column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
-            value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
+            value_type: ApplyKeyValueType::Utf8,
             rewrite_evidence: RewriteEvidence::None,
             allow_full_rebuild_on_policy_full_refresh: false,
             preload_locator_for_change_stream_deletes: false,
@@ -50,7 +51,7 @@ impl ApplyKeyContract {
     pub(crate) fn aggregate_group_row() -> Self {
         Self {
             column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
-            value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
+            value_type: ApplyKeyValueType::Utf8,
             rewrite_evidence: RewriteEvidence::Aggregate,
             allow_full_rebuild_on_policy_full_refresh: false,
             preload_locator_for_change_stream_deletes: true,
@@ -60,7 +61,7 @@ impl ApplyKeyContract {
     pub(crate) fn join_aggregate_group_row() -> Self {
         Self {
             column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
-            value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
+            value_type: ApplyKeyValueType::Utf8,
             rewrite_evidence: RewriteEvidence::JoinAggregate,
             allow_full_rebuild_on_policy_full_refresh: false,
             preload_locator_for_change_stream_deletes: true,
@@ -70,7 +71,7 @@ impl ApplyKeyContract {
     pub(crate) fn branch_union_aggregate_group_row() -> Self {
         Self {
             column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
-            value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchUtf8,
+            value_type: ApplyKeyValueType::BranchUtf8,
             rewrite_evidence: RewriteEvidence::Aggregate,
             allow_full_rebuild_on_policy_full_refresh: false,
             preload_locator_for_change_stream_deletes: true,
@@ -536,10 +537,7 @@ mod tests {
             contract.apply_key,
             ApplyKeyContract::branch_union_aggregate_group_row()
         );
-        assert_eq!(
-            contract.apply_key.value_type,
-            crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchUtf8
-        );
+        assert_eq!(contract.apply_key.value_type, ApplyKeyValueType::BranchUtf8);
         assert_eq!(
             contract.aggregate,
             Some(AggregateRefreshContract {
@@ -568,10 +566,7 @@ mod tests {
             contract.apply_key.column_name,
             crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
         );
-        assert_eq!(
-            contract.apply_key.value_type,
-            crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8
-        );
+        assert_eq!(contract.apply_key.value_type, ApplyKeyValueType::Utf8);
         assert!(!contract.apply_key.allow_full_rebuild_on_policy_full_refresh);
         assert_eq!(contract.apply_key.rewrite_evidence, RewriteEvidence::None);
         assert_eq!(
