@@ -334,6 +334,11 @@ fn build_stats_file_io(
             .region
             .unwrap_or_else(|| "us-east-1".to_string()),
         enable_path_style: credentials.enable_path_style_access.unwrap_or(false),
+        retry_max_times: credentials.retry_max_times,
+        retry_min_delay_ms: credentials.retry_min_delay_ms,
+        retry_max_delay_ms: credentials.retry_max_delay_ms,
+        timeout_ms: credentials.timeout_ms,
+        io_timeout_ms: credentials.io_timeout_ms,
     };
     Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build())
 }

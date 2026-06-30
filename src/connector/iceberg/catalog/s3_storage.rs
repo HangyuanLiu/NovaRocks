@@ -33,6 +33,16 @@ pub(crate) struct S3Storage {
     session_token: Option<String>,
     region: String,
     enable_path_style: bool,
+    #[serde(default)]
+    retry_max_times: Option<usize>,
+    #[serde(default)]
+    retry_min_delay_ms: Option<u64>,
+    #[serde(default)]
+    retry_max_delay_ms: Option<u64>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    io_timeout_ms: Option<u64>,
     #[serde(skip)]
     operators: std::sync::Mutex<HashMap<String, Operator>>,
 }
@@ -45,6 +55,11 @@ impl S3Storage {
         session_token: Option<&str>,
         region: &str,
         enable_path_style: bool,
+        retry_max_times: Option<usize>,
+        retry_min_delay_ms: Option<u64>,
+        retry_max_delay_ms: Option<u64>,
+        timeout_ms: Option<u64>,
+        io_timeout_ms: Option<u64>,
     ) -> Self {
         Self {
             endpoint: endpoint.to_string(),
@@ -53,6 +68,11 @@ impl S3Storage {
             session_token: session_token.map(str::to_string),
             region: region.to_string(),
             enable_path_style,
+            retry_max_times,
+            retry_min_delay_ms,
+            retry_max_delay_ms,
+            timeout_ms,
+            io_timeout_ms,
             operators: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -98,11 +118,11 @@ impl S3Storage {
             session_token: self.session_token.clone(),
             enable_path_style_access: Some(self.enable_path_style),
             region: Some(self.region.clone()),
-            retry_max_times: Some(3),
-            retry_min_delay_ms: Some(100),
-            retry_max_delay_ms: Some(2000),
-            timeout_ms: Some(30000),
-            io_timeout_ms: Some(30000),
+            retry_max_times: self.retry_max_times,
+            retry_min_delay_ms: self.retry_min_delay_ms,
+            retry_max_delay_ms: self.retry_max_delay_ms,
+            timeout_ms: self.timeout_ms,
+            io_timeout_ms: self.io_timeout_ms,
         };
         let op = crate::fs::object_store::build_oss_operator(&cfg)
             .map_err(|e| Error::new(ErrorKind::Unexpected, format!("build S3 operator: {e}")))?;
@@ -203,6 +223,11 @@ impl Storage for S3Storage {
             self.session_token.as_deref(),
             &self.region,
             self.enable_path_style,
+            self.retry_max_times,
+            self.retry_min_delay_ms,
+            self.retry_max_delay_ms,
+            self.timeout_ms,
+            self.io_timeout_ms,
         ));
         Ok(InputFile::new(storage, path.to_string()))
     }
@@ -215,6 +240,11 @@ impl Storage for S3Storage {
             self.session_token.as_deref(),
             &self.region,
             self.enable_path_style,
+            self.retry_max_times,
+            self.retry_min_delay_ms,
+            self.retry_max_delay_ms,
+            self.timeout_ms,
+            self.io_timeout_ms,
         ));
         Ok(OutputFile::new(storage, path.to_string()))
     }
@@ -298,6 +328,16 @@ pub(crate) struct S3StorageFactory {
     pub session_token: Option<String>,
     pub region: String,
     pub enable_path_style: bool,
+    #[serde(default)]
+    pub retry_max_times: Option<usize>,
+    #[serde(default)]
+    pub retry_min_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub retry_max_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub io_timeout_ms: Option<u64>,
 }
 
 impl S3StorageFactory {
@@ -323,6 +363,11 @@ impl S3StorageFactory {
                 .region
                 .unwrap_or_else(|| "us-east-1".to_string()),
             enable_path_style: credentials.enable_path_style_access.unwrap_or(false),
+            retry_max_times: credentials.retry_max_times,
+            retry_min_delay_ms: credentials.retry_min_delay_ms,
+            retry_max_delay_ms: credentials.retry_max_delay_ms,
+            timeout_ms: credentials.timeout_ms,
+            io_timeout_ms: credentials.io_timeout_ms,
         })
     }
 }
@@ -337,6 +382,11 @@ impl StorageFactory for S3StorageFactory {
             self.session_token.as_deref(),
             &self.region,
             self.enable_path_style,
+            self.retry_max_times,
+            self.retry_min_delay_ms,
+            self.retry_max_delay_ms,
+            self.timeout_ms,
+            self.io_timeout_ms,
         )))
     }
 }
@@ -384,5 +434,30 @@ mod tests {
         let factory = S3StorageFactory::from_catalog_properties(&props).expect("parse factory");
 
         assert_eq!(factory.session_token.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn s3_storage_factory_preserves_retry_and_timeout_policy() {
+        let props = vec![
+            (
+                "aws.s3.endpoint_url".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+            ("aws.s3.max_retries".to_string(), "7".to_string()),
+            ("aws.s3.retry_min_delay_ms".to_string(), "11".to_string()),
+            ("aws.s3.retry_max_delay_ms".to_string(), "99".to_string()),
+            ("aws.s3.request_timeout_ms".to_string(), "1234".to_string()),
+            ("aws.s3.io_timeout_ms".to_string(), "5678".to_string()),
+        ];
+
+        let factory = S3StorageFactory::from_catalog_properties(&props).expect("parse factory");
+
+        assert_eq!(factory.retry_max_times, Some(7));
+        assert_eq!(factory.retry_min_delay_ms, Some(11));
+        assert_eq!(factory.retry_max_delay_ms, Some(99));
+        assert_eq!(factory.timeout_ms, Some(1234));
+        assert_eq!(factory.io_timeout_ms, Some(5678));
     }
 }

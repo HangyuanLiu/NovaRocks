@@ -1980,6 +1980,11 @@ pub(crate) fn file_io_for_table_location(
                 .clone()
                 .unwrap_or_else(|| "us-east-1".to_string()),
             enable_path_style: cfg.enable_path_style_access.unwrap_or(false),
+            retry_max_times: cfg.retry_max_times,
+            retry_min_delay_ms: cfg.retry_min_delay_ms,
+            retry_max_delay_ms: cfg.retry_max_delay_ms,
+            timeout_ms: cfg.timeout_ms,
+            io_timeout_ms: cfg.io_timeout_ms,
         };
         return Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build());
     }

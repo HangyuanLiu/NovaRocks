@@ -1460,6 +1460,11 @@ pub(crate) fn build_staged_file_io(
             session_token: None,
             region: s3.region.clone().unwrap_or_else(|| "us-east-1".to_string()),
             enable_path_style: s3.enable_path_style_access.unwrap_or(false),
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
         };
         return Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build());
     }
