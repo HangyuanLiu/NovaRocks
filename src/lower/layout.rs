@@ -272,6 +272,24 @@ pub(crate) fn infer_tuple_slot_order(
                     }
                 }
             }
+            data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK => {
+                for expr in sink
+                    .iceberg_change_stream_router_sink
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|router| router.branches.iter())
+                    .flat_map(|branch| {
+                        branch
+                            .stream_sink
+                            .output_partition
+                            .partition_exprs
+                            .iter()
+                            .flatten()
+                    })
+                {
+                    collect_expr(expr, &mut out);
+                }
+            }
             _ => {}
         }
     }
@@ -734,12 +752,12 @@ pub(crate) fn reorder_tuple_slots(
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, chunk_schema_for_layout, chunk_slot_schemas_for_layout, slot_arrow_type_lookup,
-        slot_display_name_from_desc, slot_name_from_desc,
+        Layout, chunk_schema_for_layout, chunk_slot_schemas_for_layout, infer_tuple_slot_order,
+        slot_arrow_type_lookup, slot_display_name_from_desc, slot_name_from_desc,
     };
     use crate::lower::type_lowering::scalar_type_desc;
-    use crate::thrift::descriptors;
     use crate::thrift::types::TPrimitiveType;
+    use crate::thrift::{data_sinks, descriptors, exprs, partitions, plan_nodes, planner};
     use arrow::datatypes::DataType;
 
     fn slot_desc(
@@ -765,6 +783,56 @@ mod tests {
             col_physical_name: col_physical_name.map(ToString::to_string),
             is_virtual_column: None,
         }
+    }
+
+    fn empty_partition() -> partitions::TDataPartition {
+        partitions::TDataPartition::new(
+            partitions::TPartitionType::UNPARTITIONED,
+            None::<Vec<exprs::TExpr>>,
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
+        )
+    }
+
+    fn empty_data_sink_for_test(type_: data_sinks::TDataSinkType) -> data_sinks::TDataSink {
+        data_sinks::TDataSink::new(
+            type_,
+            None::<data_sinks::TDataStreamSink>,
+            None::<data_sinks::TResultSink>,
+            None::<data_sinks::TMysqlTableSink>,
+            None::<data_sinks::TExportSink>,
+            None::<data_sinks::TOlapTableSink>,
+            None::<data_sinks::TMemoryScratchSink>,
+            None::<data_sinks::TMultiCastDataStreamSink>,
+            None::<data_sinks::TSchemaTableSink>,
+            None::<data_sinks::TIcebergTableSink>,
+            None::<data_sinks::THiveTableSink>,
+            None::<data_sinks::TTableFunctionTableSink>,
+            None::<data_sinks::TDictionaryCacheSink>,
+            None::<Vec<Box<data_sinks::TDataSink>>>,
+            None::<i64>,
+            None::<data_sinks::TSplitDataStreamSink>,
+            None::<data_sinks::TIcebergChangeStreamRouterSink>,
+        )
+    }
+
+    fn stream_sink_with_partition_exprs_for_test(
+        partition_exprs: Vec<exprs::TExpr>,
+    ) -> data_sinks::TDataStreamSink {
+        data_sinks::TDataStreamSink::new(
+            100,
+            partitions::TDataPartition::new(
+                partitions::TPartitionType::HASH_PARTITIONED,
+                Some(partition_exprs),
+                None::<Vec<partitions::TRangePartition>>,
+                None::<Vec<partitions::TBucketProperty>>,
+            ),
+            None::<bool>,
+            None::<bool>,
+            None::<i32>,
+            None::<Vec<i32>>,
+            None::<i64>,
+        )
     }
 
     #[test]
@@ -937,5 +1005,42 @@ mod tests {
         let lookup = slot_arrow_type_lookup(&desc_tbl).expect("slot arrow type lookup");
         assert_eq!(lookup.get(&(2, 7)), Some(&DataType::Binary));
         assert_eq!(lookup.get(&(3, 7)), Some(&DataType::Int64));
+    }
+
+    #[test]
+    fn infer_tuple_slot_order_collects_router_branch_partition_exprs() {
+        let partition_expr = crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
+            9,
+            3,
+            scalar_type_desc(TPrimitiveType::INT),
+        );
+        let branch = data_sinks::TIcebergChangeStreamRouterBranch::new(
+            0,
+            data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV,
+            stream_sink_with_partition_exprs_for_test(vec![partition_expr]),
+            Vec::new(),
+        );
+        let mut sink =
+            empty_data_sink_for_test(data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK);
+        sink.iceberg_change_stream_router_sink = Some(
+            data_sinks::TIcebergChangeStreamRouterSink::new(7, None::<i32>, vec![branch]),
+        );
+        let fragment = planner::TPlanFragment::new(
+            None::<plan_nodes::TPlan>,
+            None::<Vec<exprs::TExpr>>,
+            Some(sink),
+            empty_partition(),
+            None::<i64>,
+            None::<i64>,
+            None::<Vec<crate::thrift::data::TGlobalDict>>,
+            None::<Vec<crate::thrift::data::TGlobalDict>>,
+            None::<planner::TCacheParam>,
+            None::<std::collections::BTreeMap<i32, exprs::TExpr>>,
+            None::<planner::TGroupExecutionParam>,
+        );
+
+        let slots = infer_tuple_slot_order(&fragment);
+
+        assert_eq!(slots.get(&3), Some(&vec![9]));
     }
 }

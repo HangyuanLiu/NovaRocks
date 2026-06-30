@@ -31,8 +31,9 @@ use crate::common::config::{
 };
 use crate::common::types::UniqueId;
 use crate::exec::operators::{
-    DataStreamSinkFactory, IcebergTableSinkFactory, MultiCastDataStreamSinkFactory,
-    NoopSinkFactory, OlapTableSinkFactory, ResultBufferSinkFactory, SplitDataStreamSinkFactory,
+    DataStreamSinkFactory, IcebergChangeStreamRouterSinkFactory, IcebergTableSinkFactory,
+    MultiCastDataStreamSinkFactory, NoopSinkFactory, OlapTableSinkFactory, ResultBufferSinkFactory,
+    SplitDataStreamSinkFactory,
 };
 use crate::exec::pipeline::executor::{
     execute_plan_with_pipeline, execute_plan_with_pipeline_with_root_sink_dop,
@@ -434,6 +435,44 @@ pub(crate) fn execute_fragment(
                     backend_num,
                 )?;
             }
+            data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK => {
+                let router = sink.iceberg_change_stream_router_sink.as_ref().ok_or_else(|| {
+                    "ICEBERG_CHANGE_STREAM_ROUTER_SINK missing iceberg_change_stream_router_sink"
+                        .to_string()
+                })?;
+                let exec_params = exec_params.ok_or_else(|| {
+                    "ICEBERG_CHANGE_STREAM_ROUTER_SINK requires exec_params".to_string()
+                })?;
+
+                let sink_factory = IcebergChangeStreamRouterSinkFactory::try_new(
+                    router.clone(),
+                    exec_params.clone(),
+                    lowered.layout.clone(),
+                    root_plan_node_id,
+                    last_query_id.map(|id| id.to_string()),
+                    fe_addr.cloned(),
+                )?;
+                let exchange_finst_id = Some((
+                    exec_params.fragment_instance_id.hi,
+                    exec_params.fragment_instance_id.lo,
+                ));
+                let _exec_timer = profiler
+                    .as_ref()
+                    .map(|p| p.scoped_timer("PipelineExecuteTime"));
+                execute_plan_with_pipeline(
+                    exec_plan,
+                    debug_exec_node_output(),
+                    Duration::from_millis(50),
+                    Box::new(sink_factory),
+                    exchange_finst_id,
+                    profiler.clone(),
+                    pipeline_dop,
+                    Arc::clone(&runtime_state),
+                    query_id,
+                    fe_addr.cloned(),
+                    backend_num,
+                )?;
+            }
             data_sinks::TDataSinkType::RESULT_SINK => {
                 let result_sink = sink
                     .result_sink
@@ -602,7 +641,7 @@ pub(crate) fn execute_fragment(
             }
             other => {
                 return Err(format!(
-                    "unsupported sink type: {:?}. Only DATA_STREAM_SINK, MULTI_CAST_DATA_STREAM_SINK, SPLIT_DATA_STREAM_SINK, RESULT_SINK, NOOP_SINK, SCHEMA_TABLE_SINK, ICEBERG_TABLE_SINK, ICEBERG_DELETE_SINK, ICEBERG_DV_SINK, ICEBERG_EQUALITY_DELETE_SINK, and OLAP_TABLE_SINK are supported",
+                    "unsupported sink type: {:?}. Only DATA_STREAM_SINK, MULTI_CAST_DATA_STREAM_SINK, SPLIT_DATA_STREAM_SINK, ICEBERG_CHANGE_STREAM_ROUTER_SINK, RESULT_SINK, NOOP_SINK, SCHEMA_TABLE_SINK, ICEBERG_TABLE_SINK, ICEBERG_DELETE_SINK, ICEBERG_DV_SINK, ICEBERG_EQUALITY_DELETE_SINK, and OLAP_TABLE_SINK are supported",
                     other
                 ));
             }
@@ -615,7 +654,12 @@ pub(crate) fn execute_fragment(
 
 #[cfg(test)]
 mod tests {
-    use crate::thrift::data_sinks;
+    use std::collections::BTreeMap;
+
+    use crate::lower::type_lowering::scalar_type_desc;
+    use crate::thrift::{
+        data_sinks, exprs, internal_service, partitions, plan_nodes, planner, types,
+    };
 
     #[test]
     fn iceberg_dv_sink_lowers_to_deletion_vectors_mode() {
@@ -644,6 +688,191 @@ mod tests {
         assert_eq!(
             crate::lower::sink::iceberg::iceberg_sink_mode_for_type(sink_type),
             crate::connector::iceberg::IcebergSinkMode::EqualityDeletes
+        );
+    }
+
+    fn empty_partition() -> partitions::TDataPartition {
+        partitions::TDataPartition::new(
+            partitions::TPartitionType::UNPARTITIONED,
+            None::<Vec<exprs::TExpr>>,
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
+        )
+    }
+
+    fn empty_data_sink_for_test(type_: data_sinks::TDataSinkType) -> data_sinks::TDataSink {
+        data_sinks::TDataSink::new(
+            type_,
+            None::<data_sinks::TDataStreamSink>,
+            None::<data_sinks::TResultSink>,
+            None::<data_sinks::TMysqlTableSink>,
+            None::<data_sinks::TExportSink>,
+            None::<data_sinks::TOlapTableSink>,
+            None::<data_sinks::TMemoryScratchSink>,
+            None::<data_sinks::TMultiCastDataStreamSink>,
+            None::<data_sinks::TSchemaTableSink>,
+            None::<data_sinks::TIcebergTableSink>,
+            None::<data_sinks::THiveTableSink>,
+            None::<data_sinks::TTableFunctionTableSink>,
+            None::<data_sinks::TDictionaryCacheSink>,
+            None::<Vec<Box<data_sinks::TDataSink>>>,
+            None::<i64>,
+            None::<data_sinks::TSplitDataStreamSink>,
+            None::<data_sinks::TIcebergChangeStreamRouterSink>,
+        )
+    }
+
+    fn stream_sink_for_test(dest_node_id: i32) -> data_sinks::TDataStreamSink {
+        data_sinks::TDataStreamSink::new(
+            dest_node_id,
+            empty_partition(),
+            None::<bool>,
+            None::<bool>,
+            None::<i32>,
+            None::<Vec<i32>>,
+            None::<i64>,
+        )
+    }
+
+    fn router_branch_for_test(
+        branch_id: i32,
+        branch_kind: data_sinks::TIcebergChangeStreamRouterBranchKind,
+    ) -> data_sinks::TIcebergChangeStreamRouterBranch {
+        data_sinks::TIcebergChangeStreamRouterBranch::new(
+            branch_id,
+            branch_kind,
+            stream_sink_for_test(100 + branch_id),
+            Vec::new(),
+        )
+    }
+
+    fn raw_values_plan_for_test() -> plan_nodes::TPlan {
+        let mut node =
+            crate::lower::node::test_plan_node(1, plan_nodes::TPlanNodeType::RAW_VALUES_NODE, 0);
+        node.raw_values_node = Some(plan_nodes::TRawValuesNode::new(
+            0,
+            scalar_type_desc(types::TPrimitiveType::INT),
+            None::<Vec<i64>>,
+            None::<Vec<String>>,
+        ));
+        plan_nodes::TPlan::new(vec![node])
+    }
+
+    fn fragment_with_sink_for_test(sink: data_sinks::TDataSink) -> planner::TPlanFragment {
+        planner::TPlanFragment::new(
+            Some(raw_values_plan_for_test()),
+            None::<Vec<exprs::TExpr>>,
+            Some(sink),
+            empty_partition(),
+            None::<i64>,
+            None::<i64>,
+            None::<Vec<crate::thrift::data::TGlobalDict>>,
+            None::<Vec<crate::thrift::data::TGlobalDict>>,
+            None::<planner::TCacheParam>,
+            None::<BTreeMap<i32, exprs::TExpr>>,
+            None::<planner::TGroupExecutionParam>,
+        )
+    }
+
+    fn exec_params_for_test() -> internal_service::TPlanFragmentExecParams {
+        internal_service::TPlanFragmentExecParams::new(
+            types::TUniqueId::new(0, 1),
+            types::TUniqueId::new(0, 2),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            None::<Vec<data_sinks::TPlanFragmentDestination>>,
+            None::<i32>,
+            None::<i32>,
+            None::<bool>,
+            None::<bool>,
+            None::<crate::thrift::runtime_filter::TRuntimeFilterParams>,
+            None::<i32>,
+            None::<bool>,
+            None::<
+                BTreeMap<
+                    types::TPlanNodeId,
+                    BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
+                >,
+            >,
+            None::<bool>,
+            None::<i32>,
+            None::<bool>,
+            None::<Vec<internal_service::TExecDebugOption>>,
+        )
+    }
+
+    #[test]
+    fn lower_router_sink_requires_router_payload() {
+        let sink =
+            empty_data_sink_for_test(data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK);
+        let fragment = fragment_with_sink_for_test(sink);
+
+        let err = super::execute_fragment(
+            &fragment,
+            None,
+            Some(&exec_params_for_test()),
+            None,
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect_err("missing router payload must fail");
+
+        assert_eq!(
+            err,
+            "ICEBERG_CHANGE_STREAM_ROUTER_SINK missing iceberg_change_stream_router_sink"
+        );
+    }
+
+    #[test]
+    fn lower_router_sink_rejects_duplicate_branch_kind() {
+        let mut sink =
+            empty_data_sink_for_test(data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK);
+        sink.iceberg_change_stream_router_sink =
+            Some(data_sinks::TIcebergChangeStreamRouterSink::new(
+                7,
+                None::<i32>,
+                vec![
+                    router_branch_for_test(
+                        0,
+                        data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV,
+                    ),
+                    router_branch_for_test(
+                        1,
+                        data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV,
+                    ),
+                ],
+            ));
+        let fragment = fragment_with_sink_for_test(sink);
+
+        let err = super::execute_fragment(
+            &fragment,
+            None,
+            Some(&exec_params_for_test()),
+            None,
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect_err("duplicate branch kind must fail");
+
+        assert!(
+            err.contains("duplicate change-stream branch kind"),
+            "unexpected error: {err}"
         );
     }
 }

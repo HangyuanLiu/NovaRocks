@@ -245,7 +245,7 @@ impl IcebergChangeStreamRouterSinkFactory {
             }
             if !seen_branch_kinds.insert(branch_kind) && init_error.is_none() {
                 init_error = Some(format!(
-                    "ICEBERG_CHANGE_STREAM_ROUTER_SINK: duplicate branch kind {:?}",
+                    "ICEBERG_CHANGE_STREAM_ROUTER_SINK: duplicate change-stream branch kind {:?}",
                     branch_kind
                 ));
             }
@@ -301,6 +301,29 @@ impl IcebergChangeStreamRouterSinkFactory {
             branches,
             route_to_branch,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        router: data_sinks::TIcebergChangeStreamRouterSink,
+        exec_params: internal_service::TPlanFragmentExecParams,
+        layout: Layout,
+        plan_node_id: i32,
+        last_query_id: Option<String>,
+        fe_addr: Option<types::TNetworkAddress>,
+    ) -> Result<Self, String> {
+        let factory = Self::new(
+            router,
+            exec_params,
+            layout,
+            plan_node_id,
+            last_query_id,
+            fe_addr,
+        );
+        if let Some(err) = factory.init_error.as_ref() {
+            return Err(err.clone());
+        }
+        Ok(factory)
     }
 }
 
