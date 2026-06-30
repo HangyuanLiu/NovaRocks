@@ -891,7 +891,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_manifest_group_preserves_non_none_first_row_id() {
-        // Build a minimal V3 table fixture so we have real file IO backed by MemoryCatalog.
+        // Build a minimal V3 table fixture so we have real file IO backed by a local Hadoop catalog.
         use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
 
         let fixture = empty_v3_iceberg_table().await;

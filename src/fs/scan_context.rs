@@ -16,8 +16,8 @@
 // under the License.
 use crate::cache::ExternalDataCacheRangeOptions;
 use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
+use crate::fs::access::{FsAccessResolver, FsScheme};
 use crate::fs::opendal::OpendalRangeReaderFactory;
-use crate::fs::path::{ScanPathScheme, classify_scan_paths, resolve_opendal_paths};
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::RuntimeProfile;
 
@@ -48,7 +48,7 @@ pub struct FileScanRange {
 pub struct FileScanContext {
     pub ranges: Vec<FileScanRange>,
     pub factory: OpendalRangeReaderFactory,
-    pub scheme: ScanPathScheme,
+    pub scheme: FsScheme,
     pub root: Option<String>,
 }
 
@@ -64,48 +64,31 @@ impl FileScanContext {
         profile: Option<RuntimeProfile>,
         oss_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
     ) -> Result<Self, String> {
-        let paths = ranges.iter().map(|r| r.path.clone()).collect::<Vec<_>>();
-        let scheme = classify_scan_paths(paths.iter().map(|s| s.as_str()))?;
-        let object_store_cfg = match scheme {
-            ScanPathScheme::Oss => {
-                let cfg = oss_config.ok_or_else(|| {
-                    let first = paths.first().map(|s| s.as_str()).unwrap_or("<empty>");
-                    format!(
-                        "missing object store config for OSS path={first}; \
-                        provide credentials via THdfsScanNode.cloud_configuration \
-                        (Iceberg external tables) or ensure AddShard / tablet runtime \
-                        has been registered (native lake tablets)"
-                    )
-                })?;
-                Some(cfg.clone())
-            }
-            ScanPathScheme::Local | ScanPathScheme::Hdfs => None,
-        };
-
-        let (op, resolved) = resolve_opendal_paths(&paths, object_store_cfg.as_ref())?;
-        let factory = OpendalRangeReaderFactory::from_operator(op)
-            .map_err(|e| e.to_string())?
-            .with_profile(profile);
+        let paths = ranges.iter().map(|r| r.path.as_str()).collect::<Vec<_>>();
+        let handle = FsAccessResolver::new().resolve_locations(paths, oss_config)?;
+        let factory = handle.reader_factory()?.with_profile(profile);
+        let resolved_paths = handle
+            .paths()
+            .iter()
+            .map(|path| path.operator_relative_path().to_string())
+            .collect::<Vec<_>>();
 
         let ranges = ranges
             .into_iter()
-            .zip(resolved.paths)
+            .zip(resolved_paths)
             .map(|(range, path)| FileScanRange { path, ..range })
             .collect::<Vec<_>>();
 
-        match resolved.scheme {
-            ScanPathScheme::Local => {
-                let root = resolved.root.clone().unwrap_or_else(|| ".".to_string());
+        match handle.scheme() {
+            FsScheme::Local => {
+                let root = handle.root().unwrap_or(".");
                 debug!("file scan (local): {} ranges root={}", ranges.len(), root);
             }
-            ScanPathScheme::Oss => {
-                debug!("file scan (oss): {} ranges", ranges.len());
+            FsScheme::ObjectStore => {
+                debug!("file scan (object-store): {} ranges", ranges.len());
             }
-            ScanPathScheme::Hdfs => {
-                let root = resolved
-                    .root
-                    .clone()
-                    .unwrap_or_else(|| "<unknown>".to_string());
+            FsScheme::Hdfs => {
+                let root = handle.root().unwrap_or("<unknown>");
                 debug!(
                     "file scan (hdfs): {} ranges namenode={}",
                     ranges.len(),
@@ -117,8 +100,61 @@ impl FileScanContext {
         Ok(Self {
             ranges,
             factory,
-            scheme: resolved.scheme,
-            root: resolved.root,
+            scheme: handle.scheme(),
+            root: handle.root().map(str::to_string),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::access::FsScheme;
+
+    fn range(path: &str) -> FileScanRange {
+        FileScanRange {
+            path: path.to_string(),
+            file_len: 1,
+            offset: 0,
+            length: 1,
+            scan_range_id: 0,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn build_local_scan_context_uses_resolver_relative_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.parquet");
+        std::fs::write(&file, b"data").expect("write fixture");
+
+        let ctx = FileScanContext::build(vec![range(file.to_string_lossy().as_ref())], None, None)
+            .expect("build scan context");
+
+        assert_eq!(ctx.ranges.len(), 1);
+        assert_eq!(ctx.ranges[0].path, "a.parquet");
+        assert_eq!(ctx.scheme, FsScheme::Local);
+    }
+
+    #[test]
+    fn build_object_store_context_requires_credentials_only_config() {
+        let err = match FileScanContext::build(
+            vec![range("s3://bucket-a/warehouse/t/a.parquet")],
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("object-store scan requires credentials"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("object-store location requires object store config"),
+            "{err}"
+        );
     }
 }

@@ -1856,8 +1856,7 @@ mod tests {
     fn mv_refresh_context_for_test(
         target_snapshot_id: Option<i64>,
     ) -> crate::engine::mv::refresh_context::IcebergMvRefreshContext {
-        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-        use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
+        use iceberg::{NamespaceIdent, TableIdent};
 
         let target_schema = Arc::new(
             Schema::builder()
@@ -2067,31 +2066,29 @@ mod tests {
             )
             .expect("aggregate rewrite context"),
         );
-        let warehouse = format!("memory://equiv-{}", uuid::Uuid::new_v4());
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
-            runtime
-                .block_on(MemoryCatalogBuilder::default().load(
-                    "memory",
-                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
-                ))
-                .expect("memory catalog"),
-        );
+        let warehouse_dir = tempfile::TempDir::new()
+            .expect("target warehouse tempdir")
+            .keep();
+        let warehouse = format!("file://{}", warehouse_dir.join("warehouse").display());
         let target_entry = Arc::new(
             crate::connector::iceberg::catalog::registry::build_catalog_entry(
                 "tgt",
                 &[
-                    ("iceberg.catalog.type".to_string(), "memory".to_string()),
-                    ("iceberg.catalog.warehouse".to_string(), warehouse),
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse.clone()),
                 ],
             )
             .expect("target entry"),
+        );
+        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&target_entry)
+                .expect("build hadoop catalog"),
         );
         let metadata = iceberg::spec::TableMetadataBuilder::new(
             target_schema.as_ref().clone(),
             iceberg::spec::PartitionSpec::unpartition_spec().into_unbound(),
             iceberg::spec::SortOrder::unsorted_order(),
-            "memory://target/orders_mv".to_string(),
+            format!("{warehouse}/target/orders_mv"),
             iceberg::spec::FormatVersion::V3,
             HashMap::new(),
         )
@@ -2100,7 +2097,7 @@ mod tests {
         .expect("metadata")
         .metadata;
         let target_table = iceberg::table::Table::builder()
-            .file_io(iceberg::io::FileIO::new_with_memory())
+            .file_io(iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .identifier(TableIdent::new(
                 NamespaceIdent::new("ns".to_string()),

@@ -6,8 +6,9 @@ use sqlparser::ast::{Expr, Ident, SelectItem, SetExpr, Statement};
 
 use crate::connector::iceberg::changes::{
     DeletedDataFileRef, IcebergChangeBatch, build_factory_for_table,
-    normalize_delete_projection_path, previous_snapshot_data_file_lineage_index,
-    scan_deleted_data_file_rows, scan_equality_delete_rows_for_table_at,
+    expected_object_store_bucket_for_table, normalize_delete_projection_path,
+    previous_snapshot_data_file_lineage_index, scan_deleted_data_file_rows,
+    scan_equality_delete_rows_for_table_at,
 };
 use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::engine::catalog::InMemoryCatalog;
@@ -58,6 +59,8 @@ pub(crate) fn build_delta_source_files(
     if needs_delete_scan {
         let object_store_config = input.loaded.object_store_config.as_ref();
         let factory = build_factory_for_table(&input.loaded.table, object_store_config)?;
+        let expected_object_store_bucket =
+            expected_object_store_bucket_for_table(&input.loaded.table)?;
         let size_lookup = |path: &str| -> Option<u64> {
             let _ = path;
             None
@@ -65,7 +68,13 @@ pub(crate) fn build_delta_source_files(
         let deleted_data_file_paths = batch
             .deleted_data_files
             .iter()
-            .map(|file| normalize_delete_projection_path(&file.path, object_store_config))
+            .map(|file| {
+                normalize_delete_projection_path(
+                    &file.path,
+                    object_store_config,
+                    expected_object_store_bucket.as_deref(),
+                )
+            })
             .collect::<Result<HashSet<_>, _>>()
             .map_err(|e| e.to_string())?;
         let current_lineage = if !batch.deletes.is_empty() {
@@ -108,7 +117,13 @@ pub(crate) fn build_delta_source_files(
                 &input.loaded.table,
                 batch.previous_snapshot_id,
                 &factory,
-                &|path: &str| normalize_delete_projection_path(path, object_store_config),
+                &|path: &str| {
+                    normalize_delete_projection_path(
+                        path,
+                        object_store_config,
+                        expected_object_store_bucket.as_deref(),
+                    )
+                },
                 |data_file_path: &str| touched_referenced_data_files.contains(data_file_path),
             )
             .map_err(|e| e.to_string())?
@@ -124,7 +139,13 @@ pub(crate) fn build_delta_source_files(
                 lineage_lookup,
                 &deleted_data_file_paths,
                 &previously_deleted_positions,
-                |path| normalize_delete_projection_path(path, object_store_config),
+                |path| {
+                    normalize_delete_projection_path(
+                        path,
+                        object_store_config,
+                        expected_object_store_bucket.as_deref(),
+                    )
+                },
             )
             .map_err(|e| e.to_string())?;
         deleted_rows.extend(scan_equality_delete_rows_for_table_at(

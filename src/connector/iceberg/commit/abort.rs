@@ -115,17 +115,21 @@ impl AbortLog {
 mod tests {
     use std::sync::Arc;
 
-    use opendal::services::Memory;
+    use opendal::services::Fs;
 
     use super::*;
 
-    fn mem_op() -> Operator {
-        Operator::new(Memory::default()).unwrap().finish()
+    fn local_op() -> Operator {
+        let dir = tempfile::TempDir::new()
+            .expect("local operator tempdir")
+            .keep();
+        let builder = Fs::default().root(dir.to_string_lossy().as_ref());
+        Operator::new(builder).unwrap().finish()
     }
 
     #[tokio::test]
     async fn cleanup_deletes_recorded_paths() {
-        let fs = mem_op();
+        let fs = local_op();
         // Pre-populate files so delete has something to remove.
         fs.write("a.parquet", b"x".to_vec()).await.unwrap();
         fs.write("b.parquet", b"y".to_vec()).await.unwrap();
@@ -146,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_maps_absolute_iceberg_locations_to_operator_paths() {
-        let fs = mem_op();
+        let fs = local_op();
         fs.write("warehouse/ns/t/data/file.parquet", b"x".to_vec())
             .await
             .unwrap();
@@ -167,7 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_is_idempotent() {
-        let fs = mem_op();
+        let fs = local_op();
         fs.write("a.parquet", b"x".to_vec()).await.unwrap();
 
         let log = AbortLog::new();
@@ -181,12 +185,12 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_collects_errors_for_missing_files() {
-        let fs = mem_op();
+        let fs = local_op();
         let log = AbortLog::new();
         log.record_data_file("does-not-exist.parquet".into());
 
         let errs = log.cleanup(&fs).await;
-        // The Memory backend may or may not error on delete-of-missing-key;
+        // Backends may differ on delete-of-missing-key;
         // either behaviour is acceptable. Zero or one error is expected.
         assert!(errs.len() <= 1);
     }

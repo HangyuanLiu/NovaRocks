@@ -179,11 +179,9 @@ impl ObjectStoreCredentials {
         })
     }
 
-    pub fn to_object_store_config(&self, bucket: &str, root: &str) -> ObjectStoreConfig {
+    pub fn to_object_store_config(&self) -> ObjectStoreConfig {
         ObjectStoreConfig {
             endpoint: self.endpoint.clone(),
-            bucket: bucket.to_string(),
-            root: root.to_string(),
             access_key_id: self.access_key_id.clone(),
             access_key_secret: self.access_key_secret.clone(),
             session_token: self.session_token.clone(),
@@ -405,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_to_legacy_object_store_config_with_explicit_path_state() {
+    fn converts_to_credentials_only_object_store_config() {
         let credentials = ObjectStoreCredentials::from_aws_s3_properties(
             ObjectStoreCredentialsSource::AwsS3Properties,
             &props(&[
@@ -416,11 +414,9 @@ mod tests {
         )
         .expect("parse credentials");
 
-        let cfg = credentials.to_object_store_config("bucket-a", "warehouse/root");
+        let cfg = credentials.to_object_store_config();
 
         assert_eq!(cfg.endpoint, "http://localhost:9000");
-        assert_eq!(cfg.bucket, "bucket-a");
-        assert_eq!(cfg.root, "warehouse/root");
         assert_eq!(cfg.access_key_id, "ak");
         assert_eq!(cfg.access_key_secret, "sk");
     }

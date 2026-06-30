@@ -964,7 +964,7 @@ mod tests {
             schema,
             PartitionSpec::unpartition_spec().into_unbound(),
             SortOrder::unsorted_order(),
-            "memory://test/table".to_string(),
+            "file:///novarocks-test/table".to_string(),
             format_version,
             properties,
         )
@@ -973,7 +973,7 @@ mod tests {
         .expect("metadata")
         .metadata;
         let table = Table::builder()
-            .file_io(iceberg::io::FileIO::new_with_memory())
+            .file_io(iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .identifier(TableIdent::new(
                 NamespaceIdent::new("db".to_string()),

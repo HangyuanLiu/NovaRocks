@@ -35,6 +35,7 @@ use crate::connector::starrocks::lake::txn_log::{
 };
 use crate::formats::starrocks::metadata::{
     StarRocksSegmentFile, StarRocksTabletSnapshot, load_bundle_segment_footers,
+    tablet_operator_relative_path,
 };
 use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::reader::build_native_record_batch;
@@ -434,6 +435,8 @@ fn scan_rowset_primary_key_rows(
         }
         let relative_path = format!("{DATA_DIR}/{}", segment_name.trim_start_matches('/'));
         let path = join_tablet_path(tablet_root_path, &relative_path)?;
+        let operator_relative_path =
+            tablet_operator_relative_path(tablet_root_path, &relative_path)?;
         let segment_id = rowset_id
             .checked_add(u32::try_from(idx).map_err(|_| {
                 format!(
@@ -472,7 +475,7 @@ fn scan_rowset_primary_key_rows(
             rowset_count: 1,
             segment_files: vec![StarRocksSegmentFile {
                 name: segment_name.clone(),
-                relative_path: relative_path.clone(),
+                relative_path: operator_relative_path,
                 path,
                 rowset_version: rowset.version.unwrap_or(0),
                 schema_id,

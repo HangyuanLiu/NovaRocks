@@ -184,15 +184,24 @@ mod tests {
     use std::sync::Arc;
 
     use opendal::Operator;
-    use opendal::services::Memory;
+    use opendal::services::Fs;
 
     use super::super::service::{CleanupAttempt, CommitServiceError, RecoveryEvidence};
     use super::super::test_helpers::IcebergTestFixture;
     use super::super::test_helpers::empty_v3_iceberg_table;
     use super::*;
 
+    fn local_op() -> Operator {
+        let dir = tempfile::TempDir::new()
+            .expect("local operator tempdir")
+            .keep();
+        let builder = Fs::default().root(dir.to_string_lossy().as_ref());
+        Operator::new(builder).expect("local fs operator").finish()
+    }
+
     fn input_for_op(fixture: IcebergTestFixture, op_kind: CommitOpKind) -> RunInput {
         let metadata = fixture.table.metadata();
+        let file_io = fixture.table.file_io().clone();
         let collector = Arc::new(
             IcebergCommitCollector::new(
                 op_kind,
@@ -210,10 +219,8 @@ mod tests {
             collector,
             catalog: fixture.catalog,
             table: fixture.table,
-            fs: Operator::new(Memory::default())
-                .expect("memory operator")
-                .finish(),
-            file_io: iceberg::io::FileIO::new_with_memory(),
+            fs: local_op(),
+            file_io,
             cleanup_path_mapper: None,
             cow_update_rewrite: None,
             target_ref: "main".to_string(),
@@ -267,11 +274,12 @@ mod tests {
     async fn invalid_dispatch_errors_are_invalid_input_not_known_uncommitted() {
         let fixture = empty_v3_iceberg_table().await;
 
-        let cow_err = run_iceberg_commit(input_for_op(fixture.clone(), CommitOpKind::CowUpdate))
+        let cow_err = run_iceberg_commit(input_for_op(fixture, CommitOpKind::CowUpdate))
             .await
             .expect_err("missing CowUpdate rewrite set should fail before dispatch");
         assert!(matches!(cow_err, CommitServiceError::InvalidInput { .. }));
 
+        let fixture = empty_v3_iceberg_table().await;
         let rewrite_manifests_err =
             run_iceberg_commit(input_for_op(fixture, CommitOpKind::RewriteManifests))
                 .await

@@ -21,11 +21,11 @@ use std::sync::{Mutex, OnceLock};
 ///
 /// This type intentionally does NOT carry any per-tablet/per-path state
 /// (e.g. tablet root, partition prefix). A tablet's location lives in
-/// [`StarletShardInfo::full_path`]; the OpenDAL operator is built with an
-/// empty `root` and `normalize_oss_path` resolves the bucket-relative key
-/// from the full_path being accessed. Mixing path state into this struct
-/// (as earlier revisions did via `path_prefix`) causes `full_path` and
-/// the OpenDAL `root` to drift apart and resolve to the wrong object.
+/// [`StarletShardInfo::full_path`]; the object-store resolver returns the
+/// bucket-relative key from the full_path being accessed. Mixing path state
+/// into this struct (as earlier revisions did via `path_prefix`) causes
+/// `full_path` and operator path state to drift apart and resolve to the wrong
+/// object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct S3StoreConfig {
     pub(crate) endpoint: String,
@@ -47,7 +47,7 @@ impl S3StoreConfig {
             self.enable_path_style_access,
         )
         .expect("validated Starlet S3 profile");
-        let mut cfg = credentials.to_object_store_config(&self.bucket, "");
+        let mut cfg = credentials.to_object_store_config();
         crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
         cfg
     }
@@ -243,8 +243,7 @@ pub(crate) fn find_s3_config_for_path(path: &str) -> Option<S3StoreConfig> {
 }
 
 /// Look up the OSS credentials for a native lake tablet path from the shard registry and
-/// return an [`ObjectStoreConfig`] ready for use with
-/// [`resolve_oss_operator_and_path_with_config`].
+/// return credentials ready for use with the object-store path resolver.
 ///
 /// This is the entry point for the native lake write/read paths.  Iceberg external tables
 /// must not call this — they receive credentials from `THdfsScanNode.cloud_configuration`.
@@ -483,18 +482,16 @@ mod tests {
     }
 
     #[test]
-    fn s3_store_config_to_object_store_config_has_empty_root() {
+    fn s3_store_config_to_object_store_config_is_credentials_only() {
         let cfg = sample_s3_config();
         let object_cfg = cfg.to_object_store_config();
-        assert_eq!(
-            object_cfg.root, "",
-            "S3StoreConfig is cluster-level only; root must always be empty"
-        );
-        assert_eq!(object_cfg.bucket, "bucket");
+        assert_eq!(cfg.bucket, "bucket");
+        assert_eq!(object_cfg.access_key_id, "ak");
+        assert_eq!(object_cfg.access_key_secret, "sk");
     }
 
     #[test]
-    fn s3_store_config_uses_shared_credentials_for_legacy_config() {
+    fn s3_store_config_uses_shared_credentials_for_object_store_config() {
         let cfg = S3StoreConfig {
             endpoint: " http://localhost:9000 ".to_string(),
             bucket: "bucket-a".to_string(),
@@ -506,9 +503,8 @@ mod tests {
 
         let legacy = cfg.to_object_store_config();
 
+        assert_eq!(cfg.bucket, "bucket-a");
         assert_eq!(legacy.endpoint, "http://localhost:9000");
-        assert_eq!(legacy.bucket, "bucket-a");
-        assert_eq!(legacy.root, "");
         assert_eq!(legacy.access_key_id, "ak");
         assert_eq!(legacy.access_key_secret, "sk");
         assert_eq!(legacy.region.as_deref(), Some("us-east-1"));
@@ -522,13 +518,11 @@ mod tests {
         // longer carries path state, so any tablet path is normalized to a
         // bucket-relative key without depending on cached root state.
         let s3 = sample_s3_config();
-        let cfg = s3.to_object_store_config();
-        let key = crate::fs::object_store::normalize_oss_path(
+        let (_op, key) = crate::fs::path::resolve_object_store_operator_and_path(
             "s3://bucket/brand/new/root/tablet-42/data/seg_0.parquet",
-            &cfg.bucket,
-            &cfg.root,
+            &s3.to_object_store_config(),
         )
-        .expect("normalize bucket-relative key");
+        .expect("resolve bucket-relative key");
         assert_eq!(key, "brand/new/root/tablet-42/data/seg_0.parquet");
     }
 
@@ -558,14 +552,11 @@ mod tests {
         assert_eq!(info.full_path, new_path);
         let preserved = info.s3.expect("cluster S3 profile should be preserved");
         assert_eq!(preserved, sample_s3_config());
-        let cfg = preserved.to_object_store_config();
-        assert_eq!(cfg.root, "");
-        let key = crate::fs::object_store::normalize_oss_path(
+        let (_op, key) = crate::fs::path::resolve_object_store_operator_and_path(
             &format!("{new_path}/meta/0001.meta"),
-            &cfg.bucket,
-            &cfg.root,
+            &preserved.to_object_store_config(),
         )
-        .expect("normalize key");
+        .expect("resolve key");
         assert_eq!(key, "totally/different/place/tablet-9001/meta/0001.meta");
     }
 

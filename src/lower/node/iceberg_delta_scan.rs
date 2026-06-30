@@ -113,6 +113,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
             namespace: payload.iceberg_namespace.clone(),
             table: payload.table.clone(),
         },
+        table_location: table_payload.table_location.clone(),
         from_snapshot_id: payload.from_snapshot_id,
         to_snapshot_id: payload.to_snapshot_id,
         output_chunk_schema,
@@ -433,7 +434,7 @@ fn lower_delete_visibility_content(
 
 fn object_store_config_from_cloud_configuration(
     cloud: Option<&crate::thrift::cloud_configuration::TCloudConfiguration>,
-    table_location: &str,
+    _table_location: &str,
 ) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String> {
     let Some(cloud) = cloud else {
         return Ok(None);
@@ -450,22 +451,9 @@ fn object_store_config_from_cloud_configuration(
         return Ok(None);
     };
 
-    let bucket = bucket_from_table_location(table_location).unwrap_or_default();
-    let mut config = credentials.to_object_store_config(&bucket, "");
+    let mut config = credentials.to_object_store_config();
     crate::fs::object_store::apply_object_store_runtime_defaults(&mut config);
     Ok(Some(config))
-}
-
-fn bucket_from_table_location(location: &str) -> Option<String> {
-    for scheme in ["s3://", "s3a://", "oss://"] {
-        if let Some(rest) = location.strip_prefix(scheme) {
-            let bucket = rest.split('/').next()?.trim();
-            if !bucket.is_empty() {
-                return Some(bucket.to_string());
-            }
-        }
-    }
-    None
 }
 
 fn build_delete_side_from_payload(
@@ -575,7 +563,6 @@ mod tests {
         .expect("credentials present");
 
         assert_eq!(cfg.endpoint, "http://localhost:9000");
-        assert_eq!(cfg.bucket, "bucket-a");
         assert_eq!(cfg.access_key_id, "ak");
         assert_eq!(cfg.access_key_secret, "sk");
         assert_eq!(cfg.enable_path_style_access, Some(true));

@@ -88,57 +88,41 @@ pub fn resolve_opendal_paths(
     paths: &[String],
     object_store_cfg: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<(opendal::Operator, ResolvedScanPaths), String> {
-    let scheme = classify_scan_paths(paths.iter().map(|s| s.as_str()))?;
-    match scheme {
-        ScanPathScheme::Local => {
-            let normalized = paths
-                .iter()
-                .map(|s| normalize_local_scan_path(s))
-                .collect::<Result<Vec<_>, _>>()?;
-            let raw = normalized.iter().map(|s| s.as_str()).collect::<Vec<_>>();
-            let (root, rel_paths) = crate::fs::local::normalize_local_paths(&raw)?;
-            let op = crate::fs::local::build_fs_operator(&root).map_err(|e| e.to_string())?;
-            Ok((
-                op,
-                ResolvedScanPaths {
-                    scheme,
-                    root: Some(root),
-                    paths: rel_paths,
-                },
-            ))
-        }
-        ScanPathScheme::Oss => {
-            let cfg = object_store_cfg.ok_or_else(|| "missing object store config".to_string())?;
-            let op = crate::fs::oss::build_oss_operator(cfg).map_err(|e| e.to_string())?;
-            let mut normalized = Vec::with_capacity(paths.len());
-            for path in paths {
-                let p = crate::fs::oss::normalize_oss_path(path, &cfg.bucket, &cfg.root)?;
-                normalized.push(p);
-            }
-            Ok((
-                op,
-                ResolvedScanPaths {
-                    scheme,
-                    root: None,
-                    paths: normalized,
-                },
-            ))
-        }
-        ScanPathScheme::Hdfs => {
-            let resolved = crate::fs::hdfs::resolve_hdfs_scan_paths(paths)?;
-            let op =
-                crate::fs::hdfs::build_hdfs_operator(&resolved.name_node, resolved.user.as_deref())
-                    .map_err(|e| e.to_string())?;
-            Ok((
-                op,
-                ResolvedScanPaths {
-                    scheme,
-                    root: Some(resolved.name_node),
-                    paths: resolved.paths,
-                },
-            ))
-        }
+    let handle = crate::fs::access::FsAccessResolver::new()
+        .resolve_locations(paths.iter().map(|s| s.as_str()), object_store_cfg)?;
+    let scheme = match handle.scheme() {
+        crate::fs::access::FsScheme::Local => ScanPathScheme::Local,
+        crate::fs::access::FsScheme::ObjectStore => ScanPathScheme::Oss,
+        crate::fs::access::FsScheme::Hdfs => ScanPathScheme::Hdfs,
+    };
+    let resolved = ResolvedScanPaths {
+        scheme,
+        root: handle.root().map(str::to_string),
+        paths: handle
+            .paths()
+            .iter()
+            .map(|path| path.operator_relative_path().to_string())
+            .collect(),
+    };
+    Ok((handle.operator(), resolved))
+}
+
+pub fn resolve_object_store_operator_and_path(
+    full_path: &str,
+    cfg: &crate::fs::object_store::ObjectStoreConfig,
+) -> Result<(opendal::Operator, String), String> {
+    let handle =
+        crate::fs::access::FsAccessResolver::new().resolve_location(full_path, Some(cfg))?;
+    if handle.scheme() != crate::fs::access::FsScheme::ObjectStore {
+        return Err(format!("expected object-store path, got {full_path}"));
     }
+    let rel = handle
+        .paths()
+        .first()
+        .ok_or_else(|| format!("resolved empty path list for {full_path}"))?
+        .operator_relative_path()
+        .to_string();
+    Ok((handle.operator(), rel))
 }
 
 #[cfg(test)]
@@ -188,5 +172,57 @@ mod tests {
         let scheme = classify_scan_paths(["s3a://bucket/warehouse/t/data.parquet"])
             .expect("classify s3a URI path");
         assert_eq!(scheme, ScanPathScheme::Oss);
+    }
+
+    #[test]
+    fn resolve_opendal_paths_uses_credentials_only_object_store_config() {
+        let cfg = crate::fs::object_store::ObjectStoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            session_token: None,
+            enable_path_style_access: Some(true),
+            region: Some("us-east-1".to_string()),
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        };
+
+        let paths = vec!["s3://bucket-a/warehouse/t/data.parquet".to_string()];
+        let (_op, resolved) = resolve_opendal_paths(&paths, Some(&cfg)).expect("resolve paths");
+
+        assert_eq!(resolved.scheme, ScanPathScheme::Oss);
+        assert_eq!(resolved.paths, vec!["warehouse/t/data.parquet"]);
+        assert_eq!(resolved.root, None);
+    }
+
+    #[test]
+    fn classify_scan_paths_rejects_unknown_uri_scheme() {
+        let err = classify_scan_paths(["unsupported://warehouse/table/data.parquet"])
+            .expect_err("unknown scheme is not a NovaRocks scan path");
+        assert!(err.contains("unsupported scan path scheme"), "{err}");
+    }
+
+    #[test]
+    fn resolve_object_store_operator_and_path_rejects_local_path() {
+        let cfg = crate::fs::object_store::ObjectStoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            session_token: None,
+            enable_path_style_access: Some(true),
+            region: Some("us-east-1".to_string()),
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        };
+
+        let err = resolve_object_store_operator_and_path("/tmp/data.parquet", &cfg)
+            .expect_err("local path should be rejected");
+        assert!(err.contains("expected object-store path"), "{err}");
     }
 }

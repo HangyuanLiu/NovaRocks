@@ -23,7 +23,6 @@ pub enum FsScheme {
     Local,
     ObjectStore,
     Hdfs,
-    Memory,
 }
 
 impl FsScheme {
@@ -74,16 +73,6 @@ impl FsLocation {
                 Ok(Self {
                     original: original.to_string(),
                     scheme: FsScheme::Hdfs,
-                    uri_scheme: Some(uri_scheme),
-                    authority,
-                    path,
-                })
-            }
-            "memory" => {
-                let (authority, path) = parse_authority_and_path(original, rest, false, "memory")?;
-                Ok(Self {
-                    original: original.to_string(),
-                    scheme: FsScheme::Memory,
                     uri_scheme: Some(uri_scheme),
                     authority,
                     path,
@@ -186,6 +175,7 @@ impl ResolvedFsPath {
 pub struct FsAccessHandle {
     scheme: FsScheme,
     operator: Operator,
+    authority: Option<String>,
     root: Option<String>,
     paths: Vec<ResolvedFsPath>,
 }
@@ -194,12 +184,14 @@ impl FsAccessHandle {
     pub fn new(
         scheme: FsScheme,
         operator: Operator,
+        authority: Option<String>,
         root: Option<String>,
         paths: Vec<ResolvedFsPath>,
     ) -> Self {
         Self {
             scheme,
             operator,
+            authority,
             root,
             paths,
         }
@@ -217,8 +209,19 @@ impl FsAccessHandle {
         self.root.as_deref()
     }
 
+    pub fn authority(&self) -> Option<&str> {
+        self.authority.as_deref()
+    }
+
     pub fn paths(&self) -> &[ResolvedFsPath] {
         &self.paths
+    }
+
+    pub fn operator_relative_paths(&self) -> Vec<&str> {
+        self.paths
+            .iter()
+            .map(ResolvedFsPath::operator_relative_path)
+            .collect()
     }
 
     pub fn reader_factory(&self) -> Result<OpendalRangeReaderFactory, String> {
@@ -247,6 +250,129 @@ impl FsAccessResolver {
             .into_iter()
             .map(|location| self.parse_location(location))
             .collect()
+    }
+
+    pub fn resolve_location(
+        &self,
+        location: impl AsRef<str>,
+        object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    ) -> Result<FsAccessHandle, String> {
+        self.resolve_locations(std::iter::once(location), object_store_config)
+    }
+
+    pub fn resolve_locations<I, S>(
+        &self,
+        locations: I,
+        object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    ) -> Result<FsAccessHandle, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let locations = self.parse_locations(locations)?;
+        let first = locations
+            .first()
+            .ok_or_else(|| "fs access locations are empty".to_string())?;
+        let scheme = first.scheme();
+        if locations.iter().any(|location| location.scheme() != scheme) {
+            return Err("mixed fs location schemes are not allowed".to_string());
+        }
+
+        match scheme {
+            FsScheme::Local => self.resolve_local_locations(locations),
+            FsScheme::ObjectStore => {
+                self.resolve_object_store_locations(locations, object_store_config)
+            }
+            FsScheme::Hdfs => self.resolve_hdfs_locations(locations),
+        }
+    }
+
+    fn resolve_local_locations(
+        &self,
+        locations: Vec<FsLocation>,
+    ) -> Result<FsAccessHandle, String> {
+        let raw_paths = locations
+            .iter()
+            .map(|location| location.path())
+            .collect::<Vec<_>>();
+        let (root, relative_paths) = crate::fs::local::normalize_local_paths(&raw_paths)?;
+        let operator = crate::fs::local::build_fs_operator(&root).map_err(|e| e.to_string())?;
+        let paths = locations
+            .into_iter()
+            .zip(relative_paths)
+            .map(|(location, relative_path)| ResolvedFsPath::new(location, relative_path))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(FsAccessHandle::new(
+            FsScheme::Local,
+            operator,
+            None,
+            Some(root),
+            paths,
+        ))
+    }
+
+    fn resolve_object_store_locations(
+        &self,
+        locations: Vec<FsLocation>,
+        object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    ) -> Result<FsAccessHandle, String> {
+        let cfg = object_store_config
+            .ok_or_else(|| "object-store location requires object store config".to_string())?;
+        let bucket = locations
+            .first()
+            .and_then(FsLocation::authority)
+            .ok_or_else(|| "object-store location missing bucket".to_string())?
+            .to_string();
+        if locations
+            .iter()
+            .any(|location| location.authority() != Some(bucket.as_str()))
+        {
+            return Err("mixed object-store buckets are not allowed".to_string());
+        }
+
+        let operator = crate::fs::object_store::build_object_store_operator(&bucket, cfg)
+            .map_err(|e| e.to_string())?;
+        let paths = locations
+            .into_iter()
+            .map(|location| {
+                let relative_path = location.path().trim_start_matches('/').to_string();
+                ResolvedFsPath::new(location, relative_path)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(FsAccessHandle::new(
+            FsScheme::ObjectStore,
+            operator,
+            Some(bucket),
+            None,
+            paths,
+        ))
+    }
+
+    fn resolve_hdfs_locations(&self, locations: Vec<FsLocation>) -> Result<FsAccessHandle, String> {
+        let raw_paths = locations
+            .iter()
+            .map(|location| location.original().to_string())
+            .collect::<Vec<_>>();
+        let resolved = crate::fs::hdfs::resolve_hdfs_scan_paths(&raw_paths)?;
+        let operator =
+            crate::fs::hdfs::build_hdfs_operator(&resolved.name_node, resolved.user.as_deref())
+                .map_err(|e| e.to_string())?;
+        let name_node = resolved.name_node;
+        let paths = locations
+            .into_iter()
+            .zip(resolved.paths)
+            .map(|(location, relative_path)| ResolvedFsPath::new(location, relative_path))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(FsAccessHandle::new(
+            FsScheme::Hdfs,
+            operator,
+            Some(name_node.clone()),
+            Some(name_node),
+            paths,
+        ))
     }
 }
 
@@ -426,28 +552,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_memory_locations() {
-        let loc = FsLocation::parse("memory://warehouse/table/data.parquet")
-            .expect("parse memory location");
-        assert_eq!(loc.scheme(), FsScheme::Memory);
-        assert_eq!(loc.uri_scheme(), Some("memory"));
-        assert_eq!(loc.authority(), Some("warehouse"));
-        assert_eq!(loc.path(), "table/data.parquet");
-
-        let metadata = FsLocation::parse("memory:///metadata/test.avro")
-            .expect("parse memory URI without authority");
-        assert_eq!(metadata.scheme(), FsScheme::Memory);
-        assert_eq!(metadata.authority(), None);
-        assert_eq!(metadata.path(), "metadata/test.avro");
-    }
-
-    #[test]
-    fn rejects_memory_location_without_path() {
-        let err = FsLocation::parse("memory://warehouse").expect_err("memory path is required");
-        assert!(err.contains("memory location missing path"), "{err}");
-    }
-
-    #[test]
     fn rejects_unsupported_scheme() {
         let err = FsLocation::parse("ftp://host/path").expect_err("ftp is unsupported");
         assert!(err.contains("unsupported fs location scheme"), "{err}");
@@ -488,25 +592,11 @@ mod tests {
     }
 
     #[test]
-    fn object_store_config_keeps_bucket_root_for_fs1_compatibility() {
-        let cfg = crate::fs::object_store::ObjectStoreConfig {
-            endpoint: "http://localhost:9000".to_string(),
-            bucket: "bucket-a".to_string(),
-            root: "warehouse/root".to_string(),
-            access_key_id: "ak".to_string(),
-            access_key_secret: "sk".to_string(),
-            session_token: None,
-            enable_path_style_access: Some(true),
-            region: Some("us-east-1".to_string()),
-            retry_max_times: None,
-            retry_min_delay_ms: None,
-            retry_max_delay_ms: None,
-            timeout_ms: None,
-            io_timeout_ms: None,
-        };
+    fn object_store_config_is_credentials_only_for_fs3() {
+        let cfg = test_object_store_config();
 
-        assert_eq!(cfg.bucket, "bucket-a");
-        assert_eq!(cfg.root, "warehouse/root");
+        assert_eq!(cfg.endpoint, "http://localhost:9000");
+        assert_eq!(cfg.access_key_id, "ak");
     }
 
     #[test]
@@ -518,9 +608,10 @@ mod tests {
             FsLocation::parse(format!("file://{root}/a.parquet")).expect("parse local file URI");
         let path = ResolvedFsPath::new(loc, "a.parquet").expect("resolved path");
 
-        let handle = FsAccessHandle::new(FsScheme::Local, op, Some(root.clone()), vec![path]);
+        let handle = FsAccessHandle::new(FsScheme::Local, op, None, Some(root.clone()), vec![path]);
 
         assert_eq!(handle.scheme(), FsScheme::Local);
+        assert_eq!(handle.authority(), None);
         assert_eq!(handle.root(), Some(root.as_str()));
         assert_eq!(handle.paths().len(), 1);
         let _op = handle.operator();
@@ -533,5 +624,85 @@ mod tests {
             let err = FsLocation::parse(raw).expect_err("malformed URI scheme is unsupported");
             assert!(err.contains("unsupported fs location scheme"), "{err}");
         }
+    }
+
+    fn test_object_store_config() -> crate::fs::object_store::ObjectStoreConfig {
+        crate::fs::object_store::ObjectStoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            session_token: None,
+            enable_path_style_access: Some(true),
+            region: Some("us-east-1".to_string()),
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn resolver_resolves_object_store_locations_with_bucket_from_location() {
+        let resolver = FsAccessResolver::new();
+        let cfg = test_object_store_config();
+
+        let handle = resolver
+            .resolve_locations(
+                [
+                    "s3://bucket-a/warehouse/t/data-a.parquet",
+                    "s3a://bucket-a/warehouse/t/data-b.parquet",
+                ],
+                Some(&cfg),
+            )
+            .expect("resolve object-store locations");
+
+        assert_eq!(handle.scheme(), FsScheme::ObjectStore);
+        assert_eq!(handle.authority(), Some("bucket-a"));
+        assert_eq!(
+            handle.operator_relative_paths(),
+            vec!["warehouse/t/data-a.parquet", "warehouse/t/data-b.parquet"]
+        );
+        let _factory = handle.reader_factory().expect("range reader factory");
+    }
+
+    #[test]
+    fn resolver_rejects_object_store_without_credentials() {
+        let resolver = FsAccessResolver::new();
+        let err = resolver
+            .resolve_location("s3://bucket-a/warehouse/t/data.parquet", None)
+            .expect_err("object-store credentials are required");
+
+        assert!(
+            err.contains("object-store location requires object store config"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn resolver_rejects_mixed_object_store_buckets() {
+        let resolver = FsAccessResolver::new();
+        let cfg = test_object_store_config();
+        let err = resolver
+            .resolve_locations(
+                [
+                    "s3://bucket-a/warehouse/t/a.parquet",
+                    "s3://bucket-b/warehouse/t/b.parquet",
+                ],
+                Some(&cfg),
+            )
+            .expect_err("mixed buckets must fail");
+
+        assert!(err.contains("mixed object-store buckets"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unknown_scheme_as_unsupported() {
+        let resolver = FsAccessResolver::new();
+        let err = resolver
+            .parse_location("unsupported://warehouse/table/data.parquet")
+            .expect_err("unknown scheme is not a NovaRocks filesystem scheme");
+
+        assert!(err.contains("unsupported fs location scheme"), "{err}");
     }
 }

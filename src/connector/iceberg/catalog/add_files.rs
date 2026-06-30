@@ -13,7 +13,7 @@ use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_hadoop_catalog, load_table,
 };
 use crate::engine::catalog::normalize_identifier;
-use crate::fs::object_store::{ObjectStoreConfig, build_oss_operator};
+use crate::fs::object_store::{ObjectStoreConfig, build_object_store_operator};
 
 /// Execute ADD FILES: register parquet files from an S3 directory into an Iceberg table.
 pub(crate) fn add_files(
@@ -113,7 +113,7 @@ fn build_s3_config_from_properties(
             crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
             &props_map,
         )?;
-    let mut cfg = credentials.to_object_store_config("", "");
+    let mut cfg = credentials.to_object_store_config();
     crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
     Ok(cfg)
 }
@@ -145,8 +145,6 @@ mod tests {
         let cfg = build_s3_config_from_properties(&props).expect("build S3 config");
 
         assert_eq!(cfg.endpoint, "http://localhost:9000");
-        assert_eq!(cfg.bucket, "");
-        assert_eq!(cfg.root, "");
         assert_eq!(cfg.access_key_id, "ak");
         assert_eq!(cfg.access_key_secret, "sk");
         assert_eq!(cfg.session_token, None);
@@ -209,9 +207,8 @@ fn list_parquet_files(
     } else {
         "s3"
     };
-    let mut cfg = base_config.clone();
-    cfg.bucket = bucket.clone();
-    let op = build_oss_operator(&cfg).map_err(|e| format!("build S3 operator: {e}"))?;
+    let op = build_object_store_operator(&bucket, base_config)
+        .map_err(|e| format!("build S3 operator: {e}"))?;
 
     let prefix = if prefix.ends_with('/') {
         prefix
@@ -248,9 +245,8 @@ fn read_parquet_record_count(
     file_size: u64,
 ) -> Result<u64, String> {
     let (bucket, key) = parse_s3_path(s3_path)?;
-    let mut cfg = base_config.clone();
-    cfg.bucket = bucket;
-    let op = build_oss_operator(&cfg).map_err(|e| format!("build operator: {e}"))?;
+    let op = build_object_store_operator(&bucket, base_config)
+        .map_err(|e| format!("build operator: {e}"))?;
 
     block_on_iceberg(async {
         if file_size < 12 {

@@ -16075,7 +16075,7 @@ mod tests {
                     catalog,
                     &[
                         ("type".to_string(), "iceberg".to_string()),
-                        ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
                         (
                             "iceberg.catalog.warehouse".to_string(),
                             warehouse_dir.path().display().to_string(),
@@ -16116,7 +16116,7 @@ mod tests {
                     catalog,
                     &[
                         ("type".to_string(), "iceberg".to_string()),
-                        ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
                         (
                             "iceberg.catalog.warehouse".to_string(),
                             warehouse_dir.path().display().to_string(),

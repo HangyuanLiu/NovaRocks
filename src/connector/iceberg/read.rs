@@ -604,7 +604,7 @@ mod tests {
             schema,
             PartitionSpec::unpartition_spec().into_unbound(),
             SortOrder::unsorted_order(),
-            "memory://test/table".to_string(),
+            "file:///novarocks-test/table".to_string(),
             FormatVersion::V2,
             HashMap::new(),
         )
@@ -613,7 +613,7 @@ mod tests {
         .unwrap()
         .metadata;
 
-        let file_io = FileIO::new_with_memory();
+        let file_io = FileIO::new_with_fs();
         let ident = TableIdent::new(NamespaceIdent::new("db".to_string()), "table".to_string());
 
         let table = Table::builder()

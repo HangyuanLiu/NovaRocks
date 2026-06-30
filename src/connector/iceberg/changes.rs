@@ -959,6 +959,7 @@ pub(crate) fn scan_position_delete_rows_for_targets(
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
     file_io: &iceberg::io::FileIO,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    expected_object_store_bucket: Option<&str>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let size_lookup = |_path: &str| -> Option<u64> { None };
     crate::connector::iceberg::scan_deletes::scan_deletes_with_lineage_lookup_and_path_normalizer(
@@ -969,7 +970,13 @@ pub(crate) fn scan_position_delete_rows_for_targets(
         |path| base_data_file_lineage.get(path).copied(),
         suppressed_data_files,
         previously_deleted_positions_per_file,
-        |path| normalize_delete_projection_path(path, object_store_config),
+        |path| {
+            normalize_delete_projection_path(
+                path,
+                object_store_config,
+                expected_object_store_bucket,
+            )
+        },
     )
     .map_err(|e| e.to_string())
 }
@@ -1018,11 +1025,16 @@ pub(crate) fn scan_equality_delete_rows_for_targets_with_v3_lineage(
     targets: &[EqualityDeleteTargetData],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    expected_object_store_bucket: Option<&str>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     if targets.is_empty() {
         return Ok(Vec::new());
     }
-    let delete_specs = vec![equality_change_to_delete_spec(delete, object_store_config)?];
+    let delete_specs = vec![equality_change_to_delete_spec(
+        delete,
+        object_store_config,
+        expected_object_store_bucket,
+    )?];
     let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
         &delete_specs,
         factory,
@@ -1049,8 +1061,12 @@ pub(crate) fn scan_equality_delete_rows_for_targets_with_v3_lineage(
             data_sequence_number,
             factory,
             |path| {
-                normalize_delete_projection_path(path, object_store_config)
-                    .map_err(|e| e.to_string())
+                normalize_delete_projection_path(
+                    path,
+                    object_store_config,
+                    expected_object_store_bucket,
+                )
+                .map_err(|e| e.to_string())
             },
         )?);
     }
@@ -1068,7 +1084,14 @@ pub(crate) fn scan_one_added_data_file(
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let factory = build_factory_for_table(base_table, object_store_config)?;
-    scan_one_added_data_file_with_factory(path, size, &factory, object_store_config)
+    let expected_bucket = expected_object_store_bucket_for_table(base_table)?;
+    scan_one_added_data_file_with_factory(
+        path,
+        size,
+        &factory,
+        object_store_config,
+        expected_bucket.as_deref(),
+    )
 }
 
 pub(crate) fn scan_one_added_data_file_with_factory(
@@ -1076,9 +1099,11 @@ pub(crate) fn scan_one_added_data_file_with_factory(
     size: i64,
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    expected_object_store_bucket: Option<&str>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
-    let normalized = normalize_delete_projection_path(path, object_store_config)
-        .map_err(|e| format!("normalize added data file `{path}`: {e}"))?;
+    let normalized =
+        normalize_delete_projection_path(path, object_store_config, expected_object_store_bucket)
+            .map_err(|e| format!("normalize added data file `{path}`: {e}"))?;
     let len = u64::try_from(size).ok();
     read_full_data_file(&normalized, len, factory)
 }
@@ -1097,10 +1122,12 @@ pub(crate) fn scan_one_deleted_data_file(
     previous_delete_visibility: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let factory = build_factory_for_table(base_table, object_store_config)?;
+    let expected_bucket = expected_object_store_bucket_for_table(base_table)?;
     scan_one_deleted_data_file_with_factory(
         deleted_file,
         &factory,
         object_store_config,
+        expected_bucket.as_deref(),
         previous_delete_visibility,
     )
 }
@@ -1109,12 +1136,14 @@ pub(crate) fn scan_one_deleted_data_file_with_factory(
     deleted_file: &DeletedDataFileRef,
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    expected_object_store_bucket: Option<&str>,
     previous_delete_visibility: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     scan_deleted_data_file_rows_with_visibility_and_v3_lineage(
         std::slice::from_ref(deleted_file),
         factory,
         object_store_config,
+        expected_object_store_bucket,
         previous_delete_visibility,
     )
 }
@@ -1130,11 +1159,13 @@ pub(crate) fn scan_equality_delete_rows_for_table(
         return Ok(Vec::new());
     }
     let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    let expected_bucket = expected_object_store_bucket_for_table(table)?;
     scan_equality_delete_rows_for_snapshot(
         &read_snapshot,
         equality_deletes,
         factory,
         object_store_config,
+        expected_bucket.as_deref(),
     )
 }
 
@@ -1150,11 +1181,13 @@ pub(crate) fn scan_equality_delete_rows_for_table_at(
     }
     let read_snapshot =
         crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
+    let expected_bucket = expected_object_store_bucket_for_table(table)?;
     scan_equality_delete_rows_for_snapshot(
         &read_snapshot,
         equality_deletes,
         factory,
         object_store_config,
+        expected_bucket.as_deref(),
     )
 }
 
@@ -1163,11 +1196,16 @@ fn scan_equality_delete_rows_for_snapshot(
     equality_deletes: &[EqualityDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    expected_object_store_bucket: Option<&str>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let mut out = Vec::new();
     for delete in equality_deletes {
         let delete_file = equality_change_to_read_delete(delete);
-        let delete_specs = vec![equality_change_to_delete_spec(delete, object_store_config)?];
+        let delete_specs = vec![equality_change_to_delete_spec(
+            delete,
+            object_store_config,
+            expected_object_store_bucket,
+        )?];
         let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
             &delete_specs,
             factory,
@@ -1187,8 +1225,12 @@ fn scan_equality_delete_rows_for_snapshot(
                 data_file.first_row_id,
                 factory,
                 |path| {
-                    normalize_delete_projection_path(path, object_store_config)
-                        .map_err(|e| e.to_string())
+                    normalize_delete_projection_path(
+                        path,
+                        object_store_config,
+                        expected_object_store_bucket,
+                    )
+                    .map_err(|e| e.to_string())
                 },
             )?);
         }
@@ -1208,11 +1250,13 @@ pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage(
         return Ok(Vec::new());
     }
     let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    let expected_bucket = expected_object_store_bucket_for_table(table)?;
     scan_equality_delete_rows_for_snapshot_with_v3_lineage(
         &read_snapshot,
         equality_deletes,
         factory,
         object_store_config,
+        expected_bucket.as_deref(),
     )
 }
 
@@ -1231,11 +1275,13 @@ pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage_at(
     }
     let read_snapshot =
         crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
+    let expected_bucket = expected_object_store_bucket_for_table(table)?;
     scan_equality_delete_rows_for_snapshot_with_v3_lineage(
         &read_snapshot,
         equality_deletes,
         factory,
         object_store_config,
+        expected_bucket.as_deref(),
     )
 }
 
@@ -1244,11 +1290,16 @@ fn scan_equality_delete_rows_for_snapshot_with_v3_lineage(
     equality_deletes: &[EqualityDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    expected_object_store_bucket: Option<&str>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let mut out = Vec::new();
     for delete in equality_deletes {
         let delete_file = equality_change_to_read_delete(delete);
-        let delete_specs = vec![equality_change_to_delete_spec(delete, object_store_config)?];
+        let delete_specs = vec![equality_change_to_delete_spec(
+            delete,
+            object_store_config,
+            expected_object_store_bucket,
+        )?];
         let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
             &delete_specs,
             factory,
@@ -1277,8 +1328,12 @@ fn scan_equality_delete_rows_for_snapshot_with_v3_lineage(
                 data_sequence_number,
                 factory,
                 |path| {
-                    normalize_delete_projection_path(path, object_store_config)
-                        .map_err(|e| e.to_string())
+                    normalize_delete_projection_path(
+                        path,
+                        object_store_config,
+                        expected_object_store_bucket,
+                    )
+                    .map_err(|e| e.to_string())
                 },
             )?);
         }
@@ -1592,11 +1647,16 @@ fn equality_change_to_read_delete(
 fn equality_change_to_delete_spec(
     delete: &EqualityDeleteRef,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    expected_object_store_bucket: Option<&str>,
 ) -> Result<crate::connector::iceberg::delete_file::IcebergDeleteFileSpec, String> {
     Ok(
         crate::connector::iceberg::delete_file::IcebergDeleteFileSpec {
-            path: normalize_delete_projection_path(&delete.delete_file_path, object_store_config)
-                .map_err(|e| e.to_string())?,
+            path: normalize_delete_projection_path(
+                &delete.delete_file_path,
+                object_store_config,
+                expected_object_store_bucket,
+            )
+            .map_err(|e| e.to_string())?,
             file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
             file_content:
                 crate::connector::iceberg::delete_file::IcebergFileContent::EqualityDeletes,
@@ -1626,9 +1686,10 @@ pub(crate) fn scan_deleted_data_file_rows(
         return Ok(Vec::new());
     }
     let factory = build_factory_for_table(base_table, object_store_config)?;
+    let expected_bucket = expected_object_store_bucket_for_table(base_table)?;
 
     scan_deleted_data_file_rows_with_factory(deleted_data_files, &factory, |path| {
-        normalize_delete_projection_path(path, object_store_config)
+        normalize_delete_projection_path(path, object_store_config, expected_bucket.as_deref())
     })
     .map_err(|e| e.to_string())
 }
@@ -1639,6 +1700,7 @@ fn scan_deleted_data_file_rows_with_visibility_and_v3_lineage(
     deleted_data_files: &[DeletedDataFileRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    expected_object_store_bucket: Option<&str>,
     existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     if deleted_data_files.is_empty() {
@@ -1667,8 +1729,12 @@ fn scan_deleted_data_file_rows_with_visibility_and_v3_lineage(
                 file.path
             )
         })?;
-        let normalized = normalize_delete_projection_path(&file.path, object_store_config)
-            .map_err(|e| format!("normalize deleted data file `{}`: {e}", file.path))?;
+        let normalized = normalize_delete_projection_path(
+            &file.path,
+            object_store_config,
+            expected_object_store_bucket,
+        )
+        .map_err(|e| format!("normalize deleted data file `{}`: {e}", file.path))?;
         let size = u64::try_from(file.size).ok();
         let batches = read_full_data_file_with_v3_lineage_and_visibility(
             &file.path,
@@ -1938,7 +2004,8 @@ pub(crate) fn build_factory_for_table_location(
                     "missing object store config for delete reverse projection: table_location={location}"
                 )
             })?;
-            crate::fs::oss::build_oss_operator(cfg).map_err(|e| {
+            let bucket = crate::fs::oss::object_store_bucket_from_path(location)?;
+            crate::fs::oss::build_object_store_operator(&bucket, cfg).map_err(|e| {
                 format!("build object-store operator for delete reverse projection: {e}")
             })?
         }
@@ -1954,13 +2021,29 @@ pub(crate) fn build_factory_for_table_location(
         .map_err(|e| format!("build opendal range reader factory: {e}"))
 }
 
+pub(crate) fn expected_object_store_bucket_from_location(
+    location: &str,
+) -> Result<Option<String>, String> {
+    match crate::fs::path::classify_scan_paths(std::iter::once(location))
+        .map_err(|e| format!("classify iceberg object-store table location {location}: {e}"))?
+    {
+        crate::fs::path::ScanPathScheme::Oss => {
+            crate::fs::oss::object_store_bucket_from_path(location).map(Some)
+        }
+        crate::fs::path::ScanPathScheme::Local | crate::fs::path::ScanPathScheme::Hdfs => Ok(None),
+    }
+}
+
+pub(crate) fn expected_object_store_bucket_for_table(
+    table: &iceberg::table::Table,
+) -> Result<Option<String>, String> {
+    expected_object_store_bucket_from_location(table.metadata().location())
+}
+
 pub(crate) fn file_io_for_table_location(
     location: &str,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<iceberg::io::FileIO, String> {
-    if location.starts_with("memory://") {
-        return Ok(iceberg::io::FileIO::new_with_memory());
-    }
     if location.starts_with("s3://")
         || location.starts_with("s3a://")
         || location.starts_with("oss://")
@@ -2005,6 +2088,7 @@ pub(crate) fn build_factory_for_table(
 pub(crate) fn normalize_delete_projection_path(
     path: &str,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    expected_object_store_bucket: Option<&str>,
 ) -> Result<String, ChangeError> {
     let scheme = crate::fs::path::classify_scan_paths(std::iter::once(path)).map_err(|e| {
         ChangeError::InternalInconsistency(format!(
@@ -2021,11 +2105,25 @@ pub(crate) fn normalize_delete_projection_path(
                     "missing object store config for delete reverse projection path {path}"
                 ))
             })?;
-            crate::fs::oss::normalize_oss_path(path, &cfg.bucket, &cfg.root).map_err(|e| {
+            let bucket = crate::fs::oss::object_store_bucket_from_path(path).map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
-                    "normalize object-store delete reverse projection path {path}: {e}"
+                    "parse object-store delete reverse projection path {path}: {e}"
                 ))
-            })
+            })?;
+            if let Some(expected) = expected_object_store_bucket
+                && bucket != expected
+            {
+                return Err(ChangeError::InternalInconsistency(format!(
+                    "bucket mismatch for object-store delete reverse projection path {path}: path bucket={bucket} expected bucket={expected}"
+                )));
+            }
+            let (_op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, cfg)
+                .map_err(|e| {
+                    ChangeError::InternalInconsistency(format!(
+                        "normalize object-store delete reverse projection path {path}: {e}"
+                    ))
+                })?;
+            Ok(rel)
         }
         crate::fs::path::ScanPathScheme::Hdfs => {
             let paths = vec![path.to_string()];
@@ -2832,8 +2930,6 @@ mod tests {
     fn test_object_store_config() -> ObjectStoreConfig {
         ObjectStoreConfig {
             endpoint: "http://127.0.0.1:9000".to_string(),
-            bucket: "lake".to_string(),
-            root: "warehouse".to_string(),
             access_key_id: "ak".to_string(),
             access_key_secret: "sk".to_string(),
             session_token: None,
@@ -2853,16 +2949,35 @@ mod tests {
         let path = normalize_delete_projection_path(
             "s3://lake/warehouse/db/orders/data.parquet",
             Some(&cfg),
+            Some("lake"),
         )
         .expect("normalize");
-        assert_eq!(path, "db/orders/data.parquet");
+        // Object-store operators are bucket-root scoped in FS-3, so the key
+        // passed to OpenDAL must remain relative to the bucket, not to a table
+        // warehouse prefix.
+        assert_eq!(path, "warehouse/db/orders/data.parquet");
+    }
+
+    #[test]
+    fn normalize_delete_projection_path_rejects_mismatched_s3_bucket() {
+        let cfg = test_object_store_config();
+        let err = normalize_delete_projection_path(
+            "s3://other/warehouse/db/orders/data.parquet",
+            Some(&cfg),
+            Some("lake"),
+        )
+        .expect_err("must reject mismatched bucket");
+        assert!(format!("{err}").contains("bucket mismatch"), "{err}");
     }
 
     #[test]
     fn normalize_delete_projection_path_rejects_s3_uri_without_object_store_config() {
-        let err =
-            normalize_delete_projection_path("s3://lake/warehouse/db/orders/data.parquet", None)
-                .expect_err("must reject");
+        let err = normalize_delete_projection_path(
+            "s3://lake/warehouse/db/orders/data.parquet",
+            None,
+            Some("lake"),
+        )
+        .expect_err("must reject");
         assert!(format!("{err}").contains("missing object store config"));
     }
 

@@ -108,7 +108,7 @@ pub async fn run_remove_orphan_files(
     // Add the current metadata.json path. Note: it is usually also in the log as
     // the last entry, but we add it explicitly to be safe (spec §4.4 invariant 1).
     // The current metadata location is available from the table's metadata_location().
-    // table.metadata_location() returns Option<&str> — None only for in-memory or
+    // table.metadata_location() returns Option<&str> — None for
     // freshly-created tables that haven't been committed.
     if let Some(current_meta_location) = table.metadata_location() {
         live_files.insert(current_meta_location.to_string());
@@ -217,7 +217,7 @@ struct ScannedFile {
 ///  * `s3://`, `s3a://`, `oss://`: uses an opendal S3 operator built from
 ///    `object_store_config`. If `object_store_config` is `None` for these
 ///    schemes, returns empty (safe — won't delete).
-///  * `memory://` or unrecognised schemes: returns empty (safe — won't delete).
+///  * Unrecognised schemes: returns empty (safe — won't delete).
 ///
 /// The returned paths use the same scheme-prefixed format as the live_files
 /// set populated from manifest entries (e.g. `file:///abs/path` for local,
@@ -248,7 +248,7 @@ async fn list_files_for_location(
         };
         list_files_opendal(location, cfg).await
     } else {
-        // memory://, hdfs://, or unrecognised scheme.
+        // hdfs:// or unrecognised scheme.
         tracing::debug!(
             location = %location,
             "remove_orphan_files: listing not implemented for this scheme; \
@@ -286,7 +286,7 @@ async fn list_files_opendal(
     cfg: &ObjectStoreConfig,
 ) -> Result<Vec<ScannedFile>, String> {
     use crate::connector::iceberg::catalog::add_files::parse_s3_path;
-    use crate::fs::object_store::build_oss_operator;
+    use crate::fs::object_store::build_object_store_operator;
 
     let scheme = if location.starts_with("oss://") {
         "oss"
@@ -297,12 +297,10 @@ async fn list_files_opendal(
     let (bucket, location_key) = parse_s3_path(location)
         .map_err(|e| format!("parse table location for opendal scan: {e}"))?;
 
-    // Build an operator rooted at the bucket level (empty root) so keys we pass
-    // match exactly the key portion of the full URIs we reconstruct.
-    let mut op_cfg = cfg.clone();
-    op_cfg.bucket = bucket.clone();
-    op_cfg.root = String::new();
-    let op = build_oss_operator(&op_cfg).map_err(|e| format!("build opendal operator: {e}"))?;
+    // Build an operator rooted at the bucket level so keys we pass match
+    // exactly the key portion of the full URIs we reconstruct.
+    let op = build_object_store_operator(&bucket, cfg)
+        .map_err(|e| format!("build opendal operator: {e}"))?;
 
     let location_key = location_key.trim_matches('/');
 
@@ -500,9 +498,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::connector::iceberg::commit::test_helpers::{
-        empty_v3_iceberg_table, v3_table_with_multi_batch_appends,
-    };
+    use crate::connector::iceberg::commit::test_helpers::empty_v3_iceberg_table;
 
     // ---- Helper: build a Hadoop-catalog table on a real tempdir ----
 
@@ -526,7 +522,7 @@ mod tests {
             DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema,
             Struct, Type,
         };
-        use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation};
+        use iceberg::{NamespaceIdent, TableCreation};
 
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let warehouse_path = tmpdir.path().to_str().expect("path").to_string();
@@ -998,40 +994,16 @@ mod tests {
         drop(tmpdir);
     }
 
-    // ---- Test 8: MemoryCatalog (memory:// scheme) → returns Ok, 0 deletions ----
+    // ---- Test 8: empty local Hadoop table → no error ----
 
     #[tokio::test]
-    async fn orphan_memory_catalog_returns_ok_no_deletions() {
-        // MemoryCatalog uses memory:// paths — listing is not supported, but
-        // the operation should succeed gracefully (returning 0 deletions).
-        let fixture = v3_table_with_multi_batch_appends(&[2]).await;
-
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let outcome = run_remove_orphan_files(
-            fixture.catalog,
-            fixture.table_ident,
-            now_ms + 86_400_000, // far-future threshold
-            None,
-        )
-        .await
-        .expect("ORPHAN on memory catalog should succeed");
-
-        assert_eq!(
-            outcome.deleted_count, 0,
-            "memory:// catalog has no listable filesystem — 0 deletions expected"
-        );
-    }
-
-    // ---- Test 9: empty table (MemoryCatalog) → no error ----
-
-    #[tokio::test]
-    async fn orphan_empty_memory_table_succeeds() {
+    async fn orphan_empty_local_table_succeeds() {
         let fixture = empty_v3_iceberg_table().await;
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let outcome = run_remove_orphan_files(fixture.catalog, fixture.table_ident, now_ms, None)
             .await
-            .expect("ORPHAN on empty memory table should succeed");
+            .expect("ORPHAN on empty local table should succeed");
 
         assert_eq!(outcome.deleted_count, 0, "empty table → 0 deletions");
     }

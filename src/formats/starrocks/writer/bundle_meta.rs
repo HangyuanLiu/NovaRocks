@@ -582,8 +582,7 @@ fn discover_latest_metadata_version_local(
 #[allow(dead_code)]
 pub fn discover_latest_bundle_version_oss(meta_root: &str) -> Result<Option<i64>, String> {
     let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(meta_root)?;
-    let (op, rel_root) =
-        crate::fs::oss::resolve_oss_operator_and_path_with_config(meta_root, &cfg)?;
+    let (op, rel_root) = crate::fs::path::resolve_object_store_operator_and_path(meta_root, &cfg)?;
     let list_prefix = if rel_root.is_empty() {
         String::new()
     } else if rel_root.ends_with('/') {
@@ -628,8 +627,7 @@ fn discover_latest_metadata_version_oss(
     max_version: i64,
 ) -> Result<Option<i64>, String> {
     let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(meta_root)?;
-    let (op, rel_root) =
-        crate::fs::oss::resolve_oss_operator_and_path_with_config(meta_root, &cfg)?;
+    let (op, rel_root) = crate::fs::path::resolve_object_store_operator_and_path(meta_root, &cfg)?;
     let list_prefix = if rel_root.is_empty() {
         String::new()
     } else if rel_root.ends_with('/') {

@@ -252,6 +252,8 @@ fn build_iceberg_delta_scan_plan(
             entry.object_store_config(),
         )?;
         let object_store_factory = std::sync::Arc::new(object_store_factory);
+        let expected_object_store_bucket =
+            crate::connector::iceberg::changes::expected_object_store_bucket_for_table(&loaded)?;
         let base_data_file_lineage =
             crate::connector::iceberg::changes::base_data_file_lineage_index_at(
                 &loaded,
@@ -284,6 +286,7 @@ fn build_iceberg_delta_scan_plan(
                     crate::connector::iceberg::changes::normalize_delete_projection_path(
                         path,
                         entry.object_store_config(),
+                        expected_object_store_bucket.as_deref(),
                     )
                 },
                 |data_file_path: &str| touched_referenced_data_files.contains(data_file_path),

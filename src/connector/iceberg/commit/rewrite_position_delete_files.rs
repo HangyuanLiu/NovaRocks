@@ -1575,10 +1575,10 @@ mod tests {
 
     #[test]
     fn sum_rewritten_bytes_counts_shared_input_puffin_once() {
-        let shared_path = "memory://warehouse/table/data/shared-input.puffin".to_string();
+        let shared_path = "file:///warehouse/table/data/shared-input.puffin".to_string();
         let written_a = WrittenPuffinDv {
             path: shared_path.clone(),
-            referenced_data_file: "memory://warehouse/table/data/a.parquet".to_string(),
+            referenced_data_file: "file:///warehouse/table/data/a.parquet".to_string(),
             cardinality: 2,
             content_offset: 4,
             content_size_in_bytes: 32,
@@ -1586,7 +1586,7 @@ mod tests {
         };
         let written_b = WrittenPuffinDv {
             path: shared_path,
-            referenced_data_file: "memory://warehouse/table/data/b.parquet".to_string(),
+            referenced_data_file: "file:///warehouse/table/data/b.parquet".to_string(),
             cardinality: 2,
             content_offset: 64,
             content_size_in_bytes: 32,

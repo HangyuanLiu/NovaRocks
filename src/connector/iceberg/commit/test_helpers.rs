@@ -19,18 +19,18 @@
 //!
 //! Used by `truncate.rs::tests` and `overwrite_partitions.rs::tests`.
 //! Kept in its own module so the pattern can be reused for any future
-//! commit-action whose unit tests need a `MemoryCatalog`-backed table fixture.
+//! commit-action whose unit tests need a local Hadoop-catalog table fixture.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
     DataContentType, DataFileFormat, FormatVersion, Literal, NestedField, PrimitiveLiteral,
     PrimitiveType, Schema, Struct, Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction};
@@ -39,33 +39,45 @@ use super::fast_append::FastAppendCommit;
 use super::overwrite_partitions::OverwritePartitionsCommit;
 use super::types::{CommitOpKind, CommitOutcome, WrittenFile};
 
-/// A minimal in-memory iceberg fixture: a `MemoryCatalog`, the freshly
+/// A minimal local iceberg fixture: a Hadoop catalog, the freshly
 /// `create_table`-ed `Table`, and the matching `TableIdent`. The catalog is
 /// `Arc`-wrapped so it can be cloned cheaply for use as both the
 /// `commit()` argument and the `reload after commit` handle.
-#[derive(Clone)]
 pub(crate) struct IcebergTestFixture {
     pub catalog: Arc<dyn Catalog>,
     pub table: Table,
     pub table_ident: TableIdent,
+    #[allow(dead_code)]
+    pub warehouse_dir: TempDir,
 }
 
-/// Build a `MemoryCatalog`-backed v3 iceberg table with a single `id long`
+fn local_hadoop_catalog(warehouse_dir: &TempDir) -> Arc<dyn Catalog> {
+    let warehouse_uri = format!(
+        "file://{}",
+        warehouse_dir.path().join("warehouse").display()
+    );
+    let entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+        "iceberg_commit_test",
+        &[
+            ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+            ("iceberg.catalog.warehouse".to_string(), warehouse_uri),
+        ],
+    )
+    .expect("build hadoop catalog entry");
+    Arc::new(
+        crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&entry)
+            .expect("build hadoop catalog"),
+    )
+}
+
+/// Build a local Hadoop-catalog v3 iceberg table with a single `id long`
 /// column, no partitioning, and no current snapshot. Suitable as the base for
 /// the empty-table TRUNCATE test; for tests that need actual data files,
 /// drive a `FastAppendCommit` through `run_iceberg_commit` against the
 /// returned catalog before the action under test.
 pub(crate) async fn empty_v3_iceberg_table() -> IcebergTestFixture {
-    let warehouse = format!("memory://test-warehouse-{}", Uuid::new_v4());
-    let catalog: Arc<dyn Catalog> = Arc::new(
-        MemoryCatalogBuilder::default()
-            .load(
-                "memory",
-                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
-            )
-            .await
-            .expect("MemoryCatalog::load"),
-    );
+    let warehouse_dir = TempDir::new().expect("warehouse tempdir");
+    let catalog = local_hadoop_catalog(&warehouse_dir);
 
     let namespace = NamespaceIdent::new("db".to_string());
     catalog
@@ -98,6 +110,7 @@ pub(crate) async fn empty_v3_iceberg_table() -> IcebergTestFixture {
         catalog,
         table,
         table_ident,
+        warehouse_dir,
     }
 }
 
@@ -108,7 +121,7 @@ pub(crate) async fn empty_v3_iceberg_table() -> IcebergTestFixture {
 pub(crate) async fn run_commit_with<A>(
     action: A,
     op_kind: CommitOpKind,
-    fixture: IcebergTestFixture,
+    fixture: &IcebergTestFixture,
     target_ref: &str,
 ) -> Result<CommitOutcome, String>
 where
@@ -147,7 +160,7 @@ where
     action.commit(ctx).await
 }
 
-/// Build a `MemoryCatalog`-backed v3 iceberg table seeded with `n` synthetic
+/// Build a local Hadoop-catalog v3 iceberg table seeded with `n` synthetic
 /// data files via a single `FastAppendCommit`. Each file claims
 /// `record_count = 10` and a unique synthetic path under
 /// `<table-location>/data/`. The actual Parquet bytes are NOT written —
@@ -232,7 +245,7 @@ pub(crate) async fn v3_table_with_n_data_files(n: usize) -> IcebergTestFixture {
     fixture
 }
 
-/// Build a `MemoryCatalog`-backed v3 iceberg table seeded with multiple
+/// Build a local Hadoop-catalog v3 iceberg table seeded with multiple
 /// sequential `FastAppendCommit` batches. Each element of `batches` gives the
 /// number of synthetic data files for that commit. File paths are assigned a
 /// globally unique index across all batches to avoid path collisions.
@@ -312,7 +325,7 @@ pub(crate) async fn v3_table_with_multi_batch_appends(batches: &[usize]) -> Iceb
     fixture
 }
 
-/// Build a `MemoryCatalog`-backed v3 iceberg table with an identity partition
+/// Build a local Hadoop-catalog v3 iceberg table with an identity partition
 /// on the `region` column, pre-seeded with:
 /// - 2 data files in partition `region=us`
 /// - 1 data file in partition `region=eu`
@@ -320,16 +333,8 @@ pub(crate) async fn v3_table_with_multi_batch_appends(batches: &[usize]) -> Iceb
 /// Used by `overwrite_partitions.rs::tests` to validate that OVERWRITE
 /// PARTITIONS replaces only the touched partition while preserving others.
 pub(crate) async fn v3_partitioned_table_with_data() -> IcebergTestFixture {
-    let warehouse = format!("memory://test-warehouse-{}", Uuid::new_v4());
-    let catalog: Arc<dyn Catalog> = Arc::new(
-        MemoryCatalogBuilder::default()
-            .load(
-                "memory",
-                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
-            )
-            .await
-            .expect("MemoryCatalog::load"),
-    );
+    let warehouse_dir = TempDir::new().expect("warehouse tempdir");
+    let catalog = local_hadoop_catalog(&warehouse_dir);
 
     let namespace = NamespaceIdent::new("db".to_string());
     catalog
@@ -370,6 +375,7 @@ pub(crate) async fn v3_partitioned_table_with_data() -> IcebergTestFixture {
         catalog,
         table,
         table_ident,
+        warehouse_dir,
     };
 
     let table_location = fixture.table.metadata().location().to_string();
@@ -501,7 +507,7 @@ pub(crate) async fn v3_partitioned_table_with_data() -> IcebergTestFixture {
 /// Run `OverwritePartitionsCommit` against the given fixture with the
 /// supplied written files pre-loaded into the collector.
 pub(crate) async fn run_overwrite_partitions_commit(
-    fixture: IcebergTestFixture,
+    fixture: &IcebergTestFixture,
     written: Vec<WrittenFile>,
 ) -> Result<CommitOutcome, String> {
     let metadata = fixture.table.metadata();

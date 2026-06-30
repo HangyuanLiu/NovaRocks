@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::connector::starrocks::table::config::StarRocksTableConfig;
 use crate::engine::StandaloneState;
-use crate::fs::oss::{oss_block_on, resolve_oss_operator_and_path_with_config};
+use crate::fs::oss::oss_block_on;
 use crate::novarocks_logging::warn;
 
 const ERASE_RETRY_DELAY_MS: i64 = 5_000;
@@ -144,21 +144,23 @@ fn erase_worker_loop(state: Weak<StandaloneState>) {
 fn erase_root(root_path: &str, config: &StarRocksTableConfig) -> Result<(), String> {
     let object_store_cfg = config.s3.to_object_store_config();
     let (operator, rel_path) =
-        resolve_oss_operator_and_path_with_config(root_path, &object_store_cfg)
+        crate::fs::path::resolve_object_store_operator_and_path(root_path, &object_store_cfg)
             .map_err(|e| format!("resolve erase root `{root_path}` failed: {e}"))?;
     // Normalize the warehouse URI through the same resolver so the safety
     // check below compares the requested erase target against the same
     // bucket-relative key shape (the OpenDAL operator now always operates
     // from the bucket root, so the warehouse path component lives entirely
     // in the key prefix).
-    let (_, warehouse_rel) =
-        resolve_oss_operator_and_path_with_config(&config.warehouse_uri, &object_store_cfg)
-            .map_err(|e| {
-                format!(
-                    "resolve StarRocks table warehouse `{}` failed: {e}",
-                    config.warehouse_uri
-                )
-            })?;
+    let (_, warehouse_rel) = crate::fs::path::resolve_object_store_operator_and_path(
+        &config.warehouse_uri,
+        &object_store_cfg,
+    )
+    .map_err(|e| {
+        format!(
+            "resolve StarRocks table warehouse `{}` failed: {e}",
+            config.warehouse_uri
+        )
+    })?;
     let erase_prefix = erase_prefix_path(&rel_path, &warehouse_rel)
         .map_err(|e| format!("refuse to erase StarRocks table root `{root_path}`: {e}"))?;
     let remove_result = oss_block_on(operator.remove_all(&erase_prefix))

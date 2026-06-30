@@ -79,8 +79,6 @@ impl IcebergSinkObjectStoreConfig {
     pub(crate) fn to_object_store_config(&self) -> ObjectStoreConfig {
         ObjectStoreConfig {
             endpoint: self.endpoint.clone(),
-            bucket: self.bucket.clone(),
-            root: String::new(),
             access_key_id: self.access_key_id.clone(),
             access_key_secret: self.access_key_secret.clone(),
             session_token: self.session_token.clone(),

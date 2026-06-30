@@ -1,5 +1,5 @@
 //! Iceberg view metadata operations. Views are only supported on REST
-//! catalogs: Hadoop/Memory catalogs reject every operation here. Views
+//! catalogs: Hadoop catalogs reject every operation here. Views
 //! are deliberately not cached — each query re-loads the view metadata
 //! so external changes are visible immediately.
 

@@ -50,10 +50,6 @@ pub(crate) enum IcebergCatalogKind {
     /// owns the warehouse directly via `HadoopFileSystemCatalog`. Metadata
     /// lives at `<warehouse>/<ns>/<table>/metadata/v{N}.metadata.json`.
     Hadoop,
-    /// `iceberg.catalog.type = memory` — testing-only, in-memory table
-    /// registry; not yet used by the catalog pipeline but accepted by
-    /// `build_catalog_entry` as a no-op kind.
-    Memory,
     /// `iceberg.catalog.type = rest` — speak Iceberg REST Catalog
     /// protocol against an external server (`uri`). Used by Lakekeeper /
     /// Polaris / Tabular / Snowflake Open Catalog / etc.
@@ -75,7 +71,7 @@ pub(crate) struct IcebergCatalogEntry {
     pub(crate) kind: IcebergCatalogKind,
     pub(crate) warehouse_uri: String,
     /// REST endpoint URL (`uri` property) — populated only when
-    /// `kind == IcebergCatalogKind::Rest`. None for Hadoop / Memory.
+    /// `kind == IcebergCatalogKind::Rest`. None for Hadoop.
     #[allow(dead_code)]
     pub(crate) rest_uri: Option<String>,
     /// HMS endpoint in `host:port` form (no `thrift://`) — populated only when
@@ -154,7 +150,7 @@ impl IcebergCatalogEntry {
 
     /// True when namespace/table state is owned by a remote Iceberg catalog
     /// service (REST server or Hive Metastore) rather than NovaRocks' direct
-    /// filesystem / object-store warehouse layout (Hadoop / Memory). These
+    /// filesystem / object-store warehouse layout (Hadoop). These
     /// catalogs route namespace + table operations through the iceberg-rust
     /// `Catalog` trait via `build_iceberg_catalog`.
     pub(crate) fn uses_remote_catalog(&self) -> bool {
@@ -234,6 +230,21 @@ impl IcebergCatalogEntry {
     }
 }
 
+fn build_s3_operator_for_entry(
+    entry: &IcebergCatalogEntry,
+    context: &str,
+) -> Result<opendal::Operator, String> {
+    let s3_config = entry
+        .s3_config
+        .as_ref()
+        .ok_or_else(|| format!("missing S3 config for {context}"))?;
+    let (bucket, _) =
+        crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
+            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+    crate::fs::object_store::build_object_store_operator(&bucket, s3_config)
+        .map_err(|e| format!("build S3 operator for {context}: {e}"))
+}
+
 pub(crate) fn create_namespace(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,
@@ -249,9 +260,8 @@ pub(crate) fn create_namespace(
         .map(|_| ())
         .map_err(|e| format!("create iceberg namespace {namespace}: {e}"));
     }
-    if let Some(s3_config) = &entry.s3_config {
-        let op = crate::fs::object_store::build_oss_operator(s3_config)
-            .map_err(|e| format!("build S3 operator for namespace create: {e}"))?;
+    if entry.s3_config.is_some() {
+        let op = build_s3_operator_for_entry(entry, "namespace create")?;
         let root_marker_key = s3_namespace_root_marker_key(entry, &ns_name)?;
         let marker_key = s3_namespace_marker_key(entry, &ns_name)?;
         block_on_iceberg(async {
@@ -286,9 +296,8 @@ pub(crate) fn namespace_exists(
             .map_err(|e| format!("check iceberg namespace runtime: {e}"))?
             .map_err(|e| format!("check iceberg namespace failed: {e}"));
     }
-    if let Some(s3_config) = &entry.s3_config {
-        let op = crate::fs::object_store::build_oss_operator(s3_config)
-            .map_err(|e| format!("build S3 operator for namespace check: {e}"))?;
+    if entry.s3_config.is_some() {
+        let op = build_s3_operator_for_entry(entry, "namespace check")?;
         let ns_prefix = s3_namespace_prefix(entry, &ns_name)?;
         let root_marker_key = s3_namespace_root_marker_key(entry, &ns_name)?;
         let marker_key = format!("{ns_prefix}{S3_NAMESPACE_MARKER_FILE}");
@@ -334,9 +343,8 @@ pub(crate) fn list_namespaces(entry: &IcebergCatalogEntry) -> Result<Vec<String>
         names.dedup();
         return Ok(names);
     }
-    if let Some(s3_config) = &entry.s3_config {
-        let op = crate::fs::object_store::build_oss_operator(s3_config)
-            .map_err(|e| format!("build S3 operator for list namespaces: {e}"))?;
+    if entry.s3_config.is_some() {
+        let op = build_s3_operator_for_entry(entry, "list namespaces")?;
         let (_, root_prefix) =
             crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
                 .map_err(|e| format!("parse warehouse URI: {e}"))?;
@@ -405,9 +413,8 @@ pub(crate) fn drop_namespace(
             .map_err(|e| format!("drop iceberg namespace runtime: {e}"))?
             .map_err(|e| format!("drop iceberg namespace {namespace}: {e}"));
     }
-    if let Some(s3_config) = &entry.s3_config {
-        let op = crate::fs::object_store::build_oss_operator(s3_config)
-            .map_err(|e| format!("build S3 operator for namespace drop: {e}"))?;
+    if entry.s3_config.is_some() {
+        let op = build_s3_operator_for_entry(entry, "namespace drop")?;
         let root_marker_key = s3_namespace_root_marker_key(entry, &ns_name)?;
         let marker_key = s3_namespace_marker_key(entry, &ns_name)?;
         block_on_iceberg(async {
@@ -495,9 +502,8 @@ pub(crate) fn list_tables(
         tables.sort();
         return Ok(tables);
     }
-    if let Some(s3_config) = &entry.s3_config {
-        let op = crate::fs::object_store::build_oss_operator(s3_config)
-            .map_err(|e| format!("build S3 operator for list tables: {e}"))?;
+    if entry.s3_config.is_some() {
+        let op = build_s3_operator_for_entry(entry, "list tables")?;
         let (_, root_prefix) =
             crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
                 .map_err(|e| format!("parse warehouse URI: {e}"))?;
@@ -564,7 +570,7 @@ pub(crate) fn create_table(
     // TableCreation; the typed `format_version` builder field never makes it
     // to the wire, so v3 tables would otherwise be created as v2 on REST.
     // Re-insert `format-version` into the property list for REST only.
-    // Hadoop / Memory catalogs route through `TableMetadataBuilder::from_
+    // Hadoop catalogs route through `TableMetadataBuilder::from_
     // table_creation`, which calls `set_properties` and rejects reserved
     // properties (`format-version` is reserved); the typed `format_version`
     // builder field is the supported channel there.
@@ -587,7 +593,7 @@ pub(crate) fn create_table(
         table_creation.build()
     };
 
-    // For Hadoop/Memory catalogs, ensure the namespace exists before table creation.
+    // For Hadoop catalogs, ensure the namespace exists before table creation.
     // Remote catalogs (REST / Hive) manage namespace separately via CREATE DATABASE.
     if !entry.uses_remote_catalog() {
         let _ =
@@ -847,12 +853,7 @@ fn drop_s3_table_prefix(
     ns_name: &str,
     tbl_name: &str,
 ) -> Result<(), String> {
-    let s3_config = entry
-        .s3_config
-        .as_ref()
-        .ok_or_else(|| "missing S3 config for table prefix drop".to_string())?;
-    let op = crate::fs::object_store::build_oss_operator(s3_config)
-        .map_err(|e| format!("build S3 operator for table drop: {e}"))?;
+    let op = build_s3_operator_for_entry(entry, "table drop")?;
     let table_prefix = s3_table_prefix(entry, ns_name, tbl_name)?;
     if table_prefix.trim_matches('/').is_empty() {
         return Err(format!(
@@ -1071,7 +1072,7 @@ pub(crate) fn insert_rows(
     ])
     .map_err(|e| format!("build iceberg table ident: {e}"))?;
 
-    // For Hadoop/Memory catalogs: ensure namespace exists and register the table
+    // For Hadoop catalogs: ensure namespace exists and register the table
     // by its metadata location so the catalog can resolve it for the commit.
     // Remote catalogs (REST / Hive) already track tables through the metastore /
     // REST API; skip registration.
@@ -1517,12 +1518,11 @@ pub(crate) fn build_catalog_entry(
     let kind = match props.get("iceberg.catalog.type") {
         None => IcebergCatalogKind::Hadoop,
         Some(v) if v.eq_ignore_ascii_case("hadoop") => IcebergCatalogKind::Hadoop,
-        Some(v) if v.eq_ignore_ascii_case("memory") => IcebergCatalogKind::Memory,
         Some(v) if v.eq_ignore_ascii_case("rest") => IcebergCatalogKind::Rest,
         Some(v) if v.eq_ignore_ascii_case("hive") => IcebergCatalogKind::Hive,
         Some(v) => {
             return Err(format!(
-                "standalone iceberg catalog supports iceberg.catalog.type=memory|hadoop|rest|hive, got {v}"
+                "standalone iceberg catalog supports iceberg.catalog.type=hadoop|rest|hive, got {v}"
             ));
         }
     };
@@ -1549,7 +1549,7 @@ pub(crate) fn build_catalog_entry(
         || raw_warehouse.starts_with("oss://");
 
     let (warehouse_uri, warehouse_path, s3_config) = if is_s3 {
-        let (bucket, _root_prefix) =
+        let (_bucket, _root_prefix) =
             crate::connector::iceberg::catalog::add_files::parse_s3_path(&raw_warehouse)
                 .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let credentials =
@@ -1557,7 +1557,7 @@ pub(crate) fn build_catalog_entry(
                 "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
                     .to_string()
             })?;
-        let cfg = object_store_config_from_credentials(credentials, &bucket);
+        let cfg = object_store_config_from_credentials(credentials);
         // S3 warehouse: keep URI as-is, use a temp local path for metadata cache
         let cache_dir = std::env::temp_dir()
             .join("novarocks_iceberg_cache")
@@ -1606,28 +1606,17 @@ fn normalize_catalog_property_key(key: &str) -> String {
         .unwrap_or_else(|| key.to_ascii_lowercase())
 }
 
-/// Build an object-store config from catalog S3 properties, deriving the
-/// bucket from an `s3://` / `s3a://` / `oss://` warehouse URI. Shared by the
-/// REST and Hive entry builders (both point at object-store warehouses and
-/// inject a `StorageFactory` rather than touching a local warehouse path).
+/// Build an object-store credential config from catalog S3 properties. Shared
+/// by the REST and Hive entry builders (both point at object-store warehouses
+/// and inject a `StorageFactory` rather than touching a local warehouse path).
 fn optional_object_store_config_from_props(
     props: &HashMap<String, String>,
-    warehouse: &str,
+    _warehouse: &str,
 ) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String> {
     let Some(credentials) = optional_object_store_credentials_from_props(props)? else {
         return Ok(None);
     };
-    let bucket = warehouse
-        .strip_prefix("s3://")
-        .or_else(|| warehouse.strip_prefix("s3a://"))
-        .or_else(|| warehouse.strip_prefix("oss://"))
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or_default()
-        .to_string();
-    Ok(Some(object_store_config_from_credentials(
-        credentials,
-        &bucket,
-    )))
+    Ok(Some(object_store_config_from_credentials(credentials)))
 }
 
 fn optional_object_store_credentials_from_props(
@@ -1645,9 +1634,8 @@ fn optional_object_store_credentials_from_props(
 
 fn object_store_config_from_credentials(
     credentials: crate::fs::object_store_credentials::ObjectStoreCredentials,
-    bucket: &str,
 ) -> crate::fs::object_store::ObjectStoreConfig {
-    let mut cfg = credentials.to_object_store_config(bucket, "");
+    let mut cfg = credentials.to_object_store_config();
     if cfg.region.is_none() {
         cfg.region = Some("us-east-1".to_string());
     }
@@ -1956,7 +1944,7 @@ pub(crate) fn build_iceberg_catalog(
     entry: &IcebergCatalogEntry,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
     match entry.kind {
-        IcebergCatalogKind::Hadoop | IcebergCatalogKind::Memory => {
+        IcebergCatalogKind::Hadoop => {
             let hadoop = build_hadoop_catalog(entry)?;
             Ok(Arc::new(hadoop) as Arc<dyn iceberg::Catalog>)
         }
@@ -1983,6 +1971,11 @@ fn normalize_warehouse_location(raw: &str) -> Result<(String, PathBuf), String> 
         let path = PathBuf::from(stripped);
         let path = canonicalize_or_join(&path)?;
         return Ok((format!("file://{}", path.display()), path));
+    }
+    if raw.contains("://") {
+        return Err(format!(
+            "standalone iceberg hadoop catalog warehouse only supports local paths or file:// URIs, got {raw}"
+        ));
     }
 
     let path = PathBuf::from(raw);
@@ -2049,12 +2042,7 @@ fn latest_table_metadata_file_s3(
     ns_name: &str,
     tbl_name: &str,
 ) -> Result<(String, Vec<u8>), String> {
-    let s3_config = entry
-        .s3_config
-        .as_ref()
-        .ok_or_else(|| "missing S3 config for iceberg metadata load".to_string())?;
-    let op = crate::fs::object_store::build_oss_operator(s3_config)
-        .map_err(|e| format!("build S3 operator for load_table: {e}"))?;
+    let op = build_s3_operator_for_entry(entry, "load_table")?;
     let (_, root_prefix) =
         crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
             .map_err(|e| format!("parse warehouse URI: {e}"))?;
@@ -3777,8 +3765,6 @@ mod rest_catalog_tests {
 
         let cfg = entry.object_store_config().expect("object-store config");
         assert_eq!(cfg.endpoint, "http://localhost:9000");
-        assert_eq!(cfg.bucket, "bucket-a");
-        assert_eq!(cfg.root, "");
         assert_eq!(cfg.access_key_id, "ak");
         assert_eq!(cfg.access_key_secret, "sk");
         assert_eq!(cfg.enable_path_style_access, Some(true));
@@ -3846,7 +3832,6 @@ mod rest_catalog_tests {
 
         let cfg = entry.object_store_config().expect("object-store config");
         assert_eq!(cfg.endpoint, "http://localhost:9000");
-        assert_eq!(cfg.bucket, "bucket-b");
         assert_eq!(cfg.access_key_id, "ak");
         assert_eq!(cfg.access_key_secret, "sk");
         assert_eq!(cfg.enable_path_style_access, Some(true));
@@ -3990,7 +3975,37 @@ mod rest_catalog_tests {
         )
         .map(|_| ())
         .expect_err("unknown type should be rejected");
-        assert!(err.contains("memory|hadoop|rest|hive"), "{err}");
+        assert!(err.contains("hadoop|rest|hive"), "{err}");
+        assert!(!err.contains("memory"), "{err}");
+    }
+
+    #[test]
+    fn build_catalog_entry_rejects_memory_catalog_type() {
+        let err = build_catalog_entry(
+            "ice",
+            &[("iceberg.catalog.type".to_string(), "memory".to_string())],
+        )
+        .map(|_| ())
+        .expect_err("memory catalog should be unsupported");
+        assert!(err.contains("hadoop|rest|hive"), "{err}");
+        assert!(!err.contains("memory|"), "{err}");
+    }
+
+    #[test]
+    fn build_catalog_entry_rejects_memory_warehouse_uri_for_hadoop_catalog() {
+        let err = build_catalog_entry(
+            "ice",
+            &[
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    format!("{}://warehouse", "memory"),
+                ),
+            ],
+        )
+        .map(|_| ())
+        .expect_err("memory warehouse URI should be unsupported");
+        assert!(err.contains("local paths or file:// URIs"), "{err}");
     }
 
     fn hive_props(uris: &str) -> Vec<(String, String)> {

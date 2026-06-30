@@ -34,7 +34,7 @@ pub fn write_bytes(path: &str, bytes: Vec<u8>) -> Result<(), String> {
         }
         ScanPathScheme::Oss => {
             let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
-            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path_with_config(path, &cfg)?;
+            let (op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, &cfg)?;
             let write_result = crate::fs::oss::oss_block_on(op.write(&rel, bytes))?;
             write_result.map_err(|e| format!("write object failed: {}", e))?;
             Ok(())
@@ -53,7 +53,7 @@ pub fn read_bytes(path: &str) -> Result<Vec<u8>, String> {
         ScanPathScheme::Local => fs::read(path).map_err(|e| format!("read file failed: {}", e)),
         ScanPathScheme::Oss => {
             let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
-            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path_with_config(path, &cfg)?;
+            let (op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, &cfg)?;
             let read_result = crate::fs::oss::oss_block_on(op.read(&rel))?;
             let bytes = read_result.map_err(|e| format!("read object failed: {}", e))?;
             Ok(bytes.to_vec())
@@ -79,7 +79,7 @@ pub fn read_bytes_if_exists(path: &str) -> Result<Option<Vec<u8>>, String> {
         }
         ScanPathScheme::Oss => {
             let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
-            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path_with_config(path, &cfg)?;
+            let (op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, &cfg)?;
             match crate::fs::oss::oss_block_on(op.read(&rel))? {
                 Ok(bytes) => Ok(Some(bytes.to_vec())),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
@@ -105,7 +105,7 @@ pub fn delete_path_if_exists(path: &str) -> Result<(), String> {
         }
         ScanPathScheme::Oss => {
             let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
-            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path_with_config(path, &cfg)?;
+            let (op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, &cfg)?;
             match crate::fs::oss::oss_block_on(op.delete(&rel))? {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),

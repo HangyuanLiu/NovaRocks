@@ -483,12 +483,11 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
-    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{
         DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Struct,
         Type,
     };
-    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+    use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
     use super::*;
     use crate::connector::iceberg::commit::{CommitOpKind, IcebergCommitCollector};
@@ -550,15 +549,22 @@ mod tests {
 
     #[tokio::test]
     async fn v2_fast_append_rejects_branch_target_ref() {
-        let warehouse = format!("memory://test-warehouse-{}", Uuid::new_v4());
+        let warehouse_dir = tempfile::TempDir::new().expect("warehouse tempdir");
+        let warehouse_uri = format!(
+            "file://{}",
+            warehouse_dir.path().join("warehouse").display()
+        );
+        let entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "fast_append_test",
+            &[
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                ("iceberg.catalog.warehouse".to_string(), warehouse_uri),
+            ],
+        )
+        .expect("build hadoop catalog entry");
         let catalog: Arc<dyn Catalog> = Arc::new(
-            MemoryCatalogBuilder::default()
-                .load(
-                    "memory",
-                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
-                )
-                .await
-                .expect("MemoryCatalog::load"),
+            crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&entry)
+                .expect("build hadoop catalog"),
         );
         let namespace = NamespaceIdent::new("db".to_string());
         catalog

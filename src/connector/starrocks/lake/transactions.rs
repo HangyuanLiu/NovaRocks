@@ -2098,7 +2098,7 @@ fn file_size_if_exists(
                 .ok_or_else(|| format!("missing S3 config for object-store stat: path={path}"))?
                 .to_object_store_config();
             let (op, rel) =
-                crate::fs::oss::resolve_oss_operator_and_path_with_config(path, &object_store_cfg)?;
+                crate::fs::path::resolve_object_store_operator_and_path(path, &object_store_cfg)?;
             match crate::fs::oss::oss_block_on(op.stat(&rel))? {
                 Ok(meta) => Ok(Some(
                     i64::try_from(meta.content_length()).unwrap_or(i64::MAX),
