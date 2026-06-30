@@ -1545,7 +1545,8 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::explain::{ExplainLevel, PlanNodeExplainStage};
     use crate::sql::optimizer::operator::{
-        AggMode, Operator, PhysicalDistributionOp, PhysicalHashAggregateOp, ProjectOp, ScanOp,
+        AggMode, AggregateOutputLayout, Operator, PhysicalDistributionOp, PhysicalHashAggregateOp,
+        ProjectOp, ScanOp,
     };
     use crate::sql::optimizer::options::OptimizerOptions;
     use crate::sql::optimizer::physical_tree::{
@@ -2238,6 +2239,7 @@ mod tests {
                     &[column_ref_expr(1, "k", DataType::Int64, false)],
                 ),
                 aggregates: intern_aggregate_calls(&mut scalars, &aggregate_calls),
+                output_layout: AggregateOutputLayout::new(vec![k.clone()], vec![count.clone()]),
                 output_columns: vec![k.clone(), count.clone()],
                 is_merge: vec![false],
             }),
@@ -2275,6 +2277,7 @@ mod tests {
                     }],
                 ),
                 aggregates: intern_aggregate_calls(&mut scalars, &aggregate_calls),
+                output_layout: AggregateOutputLayout::new(vec![id.clone()], vec![count.clone()]),
                 output_columns: vec![id.clone(), count.clone()],
                 is_merge: vec![false],
             }),

@@ -14,7 +14,8 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{
-    AggMode, LogicalAggregateOp, Operator, PhysicalHashAggregateOp, ScalarAggregateSpec,
+    AggMode, AggregateOutputLayout, LogicalAggregateOp, Operator, PhysicalHashAggregateOp,
+    ScalarAggregateSpec,
 };
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
@@ -305,6 +306,18 @@ fn apply_three_phase(
         non_distinct,
         non_distinct_indices,
     );
+    let partial_output_layout = AggregateOutputLayout::new(
+        partial_output_columns
+            .iter()
+            .take(gb_with_distinct.len())
+            .cloned()
+            .collect(),
+        partial_output_columns
+            .iter()
+            .skip(gb_with_distinct.len())
+            .cloned()
+            .collect(),
+    );
 
     // LOCAL: group_by = g + x evaluated over the child; non_distinct aggs
     // computed with update semantics.
@@ -315,6 +328,7 @@ fn apply_three_phase(
             mode: AggMode::Local,
             group_by: gb_with_distinct,
             aggregates: non_distinct.to_vec(),
+            output_layout: partial_output_layout.clone(),
             output_columns: partial_output_columns.clone(),
             is_merge: vec![false; non_distinct.len()],
         }),
@@ -338,6 +352,7 @@ fn apply_three_phase(
             mode: AggMode::DistinctGlobal,
             group_by: dg_group_by,
             aggregates: non_distinct.to_vec(),
+            output_layout: partial_output_layout,
             output_columns: partial_output_columns,
             is_merge: vec![true; non_distinct.len()],
         }),
@@ -391,18 +406,33 @@ fn apply_three_phase(
         &global_indices,
     ));
 
+    let global_group_by = aggregate_group_key_output_ref(
+        &mut memo.scalars,
+        &gb_with_distinct_outputs,
+        group_by.len(),
+    );
+    let global_output_layout = AggregateOutputLayout::new(
+        global_output_columns
+            .iter()
+            .take(global_group_by.len())
+            .cloned()
+            .collect(),
+        global_output_columns
+            .iter()
+            .skip(global_group_by.len())
+            .cloned()
+            .collect(),
+    );
+
     vec![NewExpr {
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Global,
             // Reference DISTINCT_GLOBAL's original group outputs (drop the
             // trailing distinct column), not the raw group expressions which
             // reference child columns no longer produced below the GLOBAL phase.
-            group_by: aggregate_group_key_output_ref(
-                &mut memo.scalars,
-                &gb_with_distinct_outputs,
-                group_by.len(),
-            ),
+            group_by: global_group_by,
             aggregates: global_aggs,
+            output_layout: global_output_layout,
             output_columns: global_output_columns,
             is_merge: global_merge,
         }),
@@ -432,6 +462,18 @@ fn apply_four_phase(
         non_distinct,
         non_distinct_indices,
     );
+    let partial_output_layout = AggregateOutputLayout::new(
+        partial_output_columns
+            .iter()
+            .take(distinct_group_by.len())
+            .cloned()
+            .collect(),
+        partial_output_columns
+            .iter()
+            .skip(distinct_group_by.len())
+            .cloned()
+            .collect(),
+    );
 
     // LOCAL: group_by = [x]; non_distinct aggs with update semantics.
     let local_id = memo.next_expr_id();
@@ -441,6 +483,7 @@ fn apply_four_phase(
             mode: AggMode::Local,
             group_by: vec![distinct_col],
             aggregates: non_distinct.to_vec(),
+            output_layout: partial_output_layout.clone(),
             output_columns: partial_output_columns.clone(),
             is_merge: vec![false; non_distinct.len()],
         }),
@@ -456,6 +499,7 @@ fn apply_four_phase(
             mode: AggMode::DistinctGlobal,
             group_by: distinct_group_by,
             aggregates: non_distinct.to_vec(),
+            output_layout: partial_output_layout,
             output_columns: partial_output_columns,
             is_merge: vec![true; non_distinct.len()],
         }),
@@ -498,18 +542,17 @@ fn apply_four_phase(
         distinct_aggs.len().saturating_sub(1),
     ));
     let dl_id = memo.next_expr_id();
+    let dl_output_columns =
+        aggregate_output_columns(&memo.scalars, agg, &phase_aggs, &phase_indices);
+    let dl_output_layout = AggregateOutputLayout::new(vec![], dl_output_columns.clone());
     let dl = MExpr {
         id: dl_id,
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::DistinctLocal,
             group_by: vec![],
             aggregates: phase_aggs.clone(),
-            output_columns: aggregate_output_columns(
-                &memo.scalars,
-                agg,
-                &phase_aggs,
-                &phase_indices,
-            ),
+            output_layout: dl_output_layout,
+            output_columns: dl_output_columns,
             is_merge: dl_merge,
         }),
         children: vec![dg_group],
@@ -525,18 +568,17 @@ fn apply_four_phase(
     // instance sees a disjoint subset of distinct x values. Bitmap union over
     // disjoint sets is equivalent to sum of partial counts.
     let global_merge = vec![true; phase_aggs.len()];
+    let global_output_columns =
+        aggregate_output_columns(&memo.scalars, agg, &phase_aggs, &phase_indices);
+    let global_output_layout = AggregateOutputLayout::new(vec![], global_output_columns.clone());
 
     vec![NewExpr {
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Global,
             group_by: vec![],
             aggregates: phase_aggs.clone(),
-            output_columns: aggregate_output_columns(
-                &memo.scalars,
-                agg,
-                &phase_aggs,
-                &phase_indices,
-            ),
+            output_layout: global_output_layout,
+            output_columns: global_output_columns,
             is_merge: global_merge,
         }),
         children: vec![dl_group],
@@ -551,8 +593,7 @@ mod tests {
     use crate::sql::optimizer::operator::{AggMode, LogicalAggregateOp, ScanOp};
     use crate::sql::planner::optimizer_bridge::scalar::materialize;
     use crate::sql::planner::optimizer_bridge::scalar::{
-        aggregate_output_layout_from_legacy_outputs, intern_aggregate_calls, intern_exprs,
-        materialize_aggregate_calls,
+        intern_aggregate_calls, intern_exprs, materialize_aggregate_calls,
     };
     use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
@@ -638,7 +679,19 @@ mod tests {
         };
         let group_by = intern_exprs(&mut memo.scalars, &group_by);
         let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
-        LogicalAggregateOp::single(group_by, aggregates, output_columns)
+        let output_layout = AggregateOutputLayout::new(
+            output_columns
+                .iter()
+                .take(group_by.len())
+                .cloned()
+                .collect(),
+            output_columns
+                .iter()
+                .skip(group_by.len())
+                .cloned()
+                .collect(),
+        );
+        LogicalAggregateOp::single(group_by, aggregates, output_layout, output_columns)
     }
 
     fn count_distinct(arg_name: &str) -> AggregateCall {
@@ -726,12 +779,7 @@ mod tests {
     }
 
     fn aggregate_call_output_ids(memo: &Memo, op: &PhysicalHashAggregateOp) -> Vec<ColumnId> {
-        let output_layout = aggregate_output_layout_from_legacy_outputs(
-            op.group_by.len(),
-            op.aggregates.len(),
-            &op.output_columns,
-        );
-        materialize_aggregate_calls(&memo.scalars, &op.aggregates, &output_layout)
+        materialize_aggregate_calls(&memo.scalars, &op.aggregates, &op.output_layout)
             .iter()
             .map(|call| call.output_column_id)
             .collect()

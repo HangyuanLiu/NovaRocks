@@ -58,7 +58,7 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggStage, LogicalAggregateOp, Operator, ScalarAggregateSpec, ScanOp,
+        AggStage, AggregateOutputLayout, LogicalAggregateOp, Operator, ScalarAggregateSpec, ScanOp,
     };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
@@ -134,6 +134,18 @@ mod tests {
         let mut needed = HashSet::new();
         needed.insert(id_count_oc); // only count needed, not sum
 
+        let output_columns = vec![
+            make_output_column(id_y, "y"),
+            make_output_column(id_count_oc, "count"),
+            make_output_column(id_sum_oc, "sum_x"),
+        ];
+        let output_layout = AggregateOutputLayout::new(
+            vec![make_output_column(id_y, "y")],
+            vec![
+                make_output_column(id_count_oc, "count"),
+                make_output_column(id_sum_oc, "sum_x"),
+            ],
+        );
         let mut expr = OptExpr::new(
             Operator::LogicalAggregate(LogicalAggregateOp {
                 stage: AggStage::Single,
@@ -154,11 +166,8 @@ mod tests {
                         order_by: vec![],
                     },
                 ],
-                output_columns: vec![
-                    make_output_column(id_y, "y"),
-                    make_output_column(id_count_oc, "count"),
-                    make_output_column(id_sum_oc, "sum_x"),
-                ],
+                output_layout,
+                output_columns,
                 is_merge: vec![false, false],
                 is_split: false,
             }),
@@ -181,6 +190,14 @@ mod tests {
         let id_k = ColumnId::new_for_test(1);
         let id_sum = ColumnId::new_for_test(201);
 
+        let output_columns = vec![
+            make_output_column(id_k, "k"),
+            make_output_column(id_sum, "sum_a"),
+        ];
+        let output_layout = AggregateOutputLayout::new(
+            vec![make_output_column(id_k, "k")],
+            vec![make_output_column(id_sum, "sum_a")],
+        );
         let expr = OptExpr::new(
             Operator::LogicalAggregate(LogicalAggregateOp {
                 stage: AggStage::Single,
@@ -192,10 +209,8 @@ mod tests {
                     distinct: false,
                     order_by: vec![],
                 }],
-                output_columns: vec![
-                    make_output_column(id_k, "k"),
-                    make_output_column(id_sum, "sum_a"),
-                ],
+                output_layout,
+                output_columns,
                 is_merge: vec![false],
                 is_split: false,
             }),

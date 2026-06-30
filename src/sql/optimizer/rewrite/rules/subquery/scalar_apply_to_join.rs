@@ -24,7 +24,8 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::common::ApplyKind;
 use crate::sql::common::{BinOp, JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{
-    ApplyOp, AssertOneRowOp, LogicalAggregateOp, Operator, ProjectOp, ScalarProjectItem,
+    AggregateOutputLayout, ApplyOp, AssertOneRowOp, LogicalAggregateOp, Operator, ProjectOp,
+    ScalarProjectItem,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::pattern::{OpKind, Pattern};
@@ -249,6 +250,18 @@ fn apply_opt(
     agg_output_cols.push(cnt_output.clone());
     agg_output_cols.push(anyval_output.clone());
 
+    let output_layout = AggregateOutputLayout::new(
+        agg_output_cols
+            .iter()
+            .take(group_by.len())
+            .cloned()
+            .collect(),
+        agg_output_cols
+            .iter()
+            .skip(group_by.len())
+            .cloned()
+            .collect(),
+    );
     let vector_agg = OptExpr::new(
         Operator::LogicalAggregate(LogicalAggregateOp::single(
             group_by,
@@ -256,6 +269,7 @@ fn apply_opt(
                 scalar_utils::count_one_spec(arena, cnt_id),
                 scalar_utils::any_value_spec(inner_scalar_ref, anyval_id),
             ],
+            output_layout,
             agg_output_cols,
         )),
         vec![agg_input],

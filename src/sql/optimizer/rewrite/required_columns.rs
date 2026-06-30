@@ -984,10 +984,10 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::optimizer::operator::{
-        CTEAnchorOp, CTEConsumeOp, CTEProduceOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp,
-        IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp, ProjectOp, RepeatOp,
-        ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec, ScanOp, SortOp, TableFunctionOp,
-        UnionOp, ValuesOp, WindowOp,
+        AggregateOutputLayout, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, ExceptOp, FilterOp,
+        GenerateSeriesOp, ImvDeltaOp, IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp,
+        ProjectOp, RepeatOp, ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec, ScanOp,
+        SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::scalar::{ScalarArena, SortKey};
     use arrow::datatypes::DataType;
@@ -1352,30 +1352,46 @@ mod tests {
         let col2 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(2));
         drop(arena_mut);
 
+        let group_by = vec![col1];
+        let aggregates = vec![
+            ScalarAggregateSpec {
+                output_column_id: ColumnId::new_for_test(301),
+                name: "count".to_string(),
+                args: vec![],
+                distinct: false,
+                order_by: vec![],
+            },
+            ScalarAggregateSpec {
+                output_column_id: ColumnId::new_for_test(302),
+                name: "sum".to_string(),
+                args: vec![col2],
+                distinct: false,
+                order_by: vec![],
+            },
+        ];
+        let output_columns = vec![
+            make_output_column(ColumnId::new_for_test(1), "y"),
+            make_output_column(ColumnId::new_for_test(301), "count"),
+            make_output_column(ColumnId::new_for_test(302), "sum_x"),
+        ];
+        let output_layout = AggregateOutputLayout::new(
+            output_columns
+                .iter()
+                .take(group_by.len())
+                .cloned()
+                .collect(),
+            output_columns
+                .iter()
+                .skip(group_by.len())
+                .cloned()
+                .collect(),
+        );
         let agg = OptExpr::new(
             Operator::LogicalAggregate(LogicalAggregateOp::single(
-                vec![col1],
-                vec![
-                    ScalarAggregateSpec {
-                        output_column_id: ColumnId::new_for_test(301),
-                        name: "count".to_string(),
-                        args: vec![],
-                        distinct: false,
-                        order_by: vec![],
-                    },
-                    ScalarAggregateSpec {
-                        output_column_id: ColumnId::new_for_test(302),
-                        name: "sum".to_string(),
-                        args: vec![col2],
-                        distinct: false,
-                        order_by: vec![],
-                    },
-                ],
-                vec![
-                    make_output_column(ColumnId::new_for_test(1), "y"),
-                    make_output_column(ColumnId::new_for_test(301), "count"),
-                    make_output_column(ColumnId::new_for_test(302), "sum_x"),
-                ],
+                group_by,
+                aggregates,
+                output_layout,
+                output_columns,
             )),
             vec![scan_with_3_cols(&arena_rc)],
         );
@@ -1406,17 +1422,25 @@ mod tests {
         let col2 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(2));
         drop(arena_mut);
 
+        let group_by = vec![col1];
+        let aggregates = vec![ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(301),
+            name: "sum".to_string(),
+            args: vec![col2],
+            distinct: false,
+            order_by: vec![],
+        }];
+        let output_columns = vec![make_output_column(ColumnId::new_for_test(301), "sum_x")];
+        let output_layout = AggregateOutputLayout::new(
+            vec![make_output_column(ColumnId::new_for_test(1), "y")],
+            output_columns.clone(),
+        );
         let agg = OptExpr::new(
             Operator::LogicalAggregate(LogicalAggregateOp::single(
-                vec![col1],
-                vec![ScalarAggregateSpec {
-                    output_column_id: ColumnId::new_for_test(301),
-                    name: "sum".to_string(),
-                    args: vec![col2],
-                    distinct: false,
-                    order_by: vec![],
-                }],
-                vec![make_output_column(ColumnId::new_for_test(301), "sum_x")],
+                group_by,
+                aggregates,
+                output_layout,
+                output_columns,
             )),
             vec![scan_with_3_cols(&arena_rc)],
         );

@@ -1727,7 +1727,9 @@ mod tests {
 
     #[test]
     fn from_memo_rejects_split_aggregate() {
-        use crate::sql::optimizer::operator::{LogicalAggregateOp, Operator};
+        use crate::sql::optimizer::operator::{
+            AggregateOutputLayout, LogicalAggregateOp, Operator,
+        };
         use crate::sql::planner::optimizer_bridge::scalar::{intern_aggregate_calls, intern_exprs};
         // A split (Local) aggregate is not the original Single shape and must
         // be rejected even when it sits at the matched position.
@@ -1755,11 +1757,25 @@ mod tests {
                 output_column_id: sum_out.column_id,
             }],
         );
+        let output_columns = vec![col(1, "a"), sum_out.clone()];
+        let output_layout = AggregateOutputLayout::new(
+            output_columns
+                .iter()
+                .take(group_by.len())
+                .cloned()
+                .collect(),
+            output_columns
+                .iter()
+                .skip(group_by.len())
+                .cloned()
+                .collect(),
+        );
         let split = LogicalAggregateOp::staged(
             AggStage::Local,
             group_by,
             aggregates,
-            vec![col(1, "a"), sum_out.clone()],
+            output_layout,
+            output_columns,
             vec![false],
             true,
         );

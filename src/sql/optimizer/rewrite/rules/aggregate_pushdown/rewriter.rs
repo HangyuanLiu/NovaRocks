@@ -3,7 +3,8 @@
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::operator::{
-    AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem,
+    AggStage, AggregateOutputLayout, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec,
+    ScalarProjectItem,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
@@ -76,6 +77,68 @@ fn column_ref_scalar(
     arena.intern(ScalarNode::ColumnRef(column_id), data_type, nullable)
 }
 
+fn aggregate_result_type(
+    original: &LogicalAggregateOp,
+    idx: usize,
+    spec: &ScalarAggregateSpec,
+    arena: &ScalarArena,
+) -> arrow::datatypes::DataType {
+    original
+        .output_layout
+        .aggregate_columns
+        .get(idx)
+        .map(|c| c.data_type.clone())
+        .or_else(|| spec.args.first().map(|id| arena.data_type(*id).clone()))
+        .unwrap_or(arrow::datatypes::DataType::Int64)
+}
+
+fn group_key_output_column_from_scalar(
+    gb_id: ScalarId,
+    column_ref_factory: &mut ColumnRefFactory,
+    arena: &ScalarArena,
+) -> OutputColumn {
+    let (column_id, name) = match arena.node(gb_id) {
+        ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => {
+            (*column_id, column_ref_name(arena, *column_id))
+        }
+        _ => {
+            let name = group_by_display_name(gb_id, arena);
+            (
+                column_ref_factory.create(
+                    None,
+                    name.clone(),
+                    arena.data_type(gb_id).clone(),
+                    arena.nullable(gb_id),
+                ),
+                name,
+            )
+        }
+    };
+    OutputColumn {
+        column_id,
+        name,
+        data_type: arena.data_type(gb_id).clone(),
+        nullable: arena.nullable(gb_id),
+        is_internal: false,
+    }
+}
+
+fn group_key_output_column(
+    original: &LogicalAggregateOp,
+    idx: usize,
+    gb_id: ScalarId,
+    column_ref_factory: &mut ColumnRefFactory,
+    arena: &ScalarArena,
+) -> OutputColumn {
+    original
+        .output_layout
+        .group_key_columns
+        .get(idx)
+        .filter(|column| column.column_id != ColumnId::UNSET)
+        .cloned()
+        .unwrap_or_else(|| group_key_output_column_from_scalar(gb_id, column_ref_factory, arena))
+}
+
 /// Construct the final OptExpr: a top-level Aggregate (with is_split=true)
 /// whose input is the original Join with one side wrapped by a partial
 /// Aggregate.
@@ -103,8 +166,7 @@ pub(crate) fn rewrite(
     //    can reference the partial output. We derive the output column metadata
     //    from the args (DataType comes from the original spec's output column).
     //
-    //    To obtain the result DataType we look up the original output columns:
-    //    layout is [group_by..., aggregates...].
+    //    To obtain the result DataType we look up the aggregate output layout.
     let group_by_len = original.group_by.len();
 
     let partial_specs_and_output_cols: Vec<(ScalarAggregateSpec, OutputColumn)> =
@@ -122,15 +184,7 @@ pub(crate) fn rewrite(
                     &[],
                 );
                 // Result type comes from the original aggregate's output column.
-                let result_type = original
-                    .output_columns
-                    .get(group_by_len + idx)
-                    .map(|c| c.data_type.clone())
-                    .or_else(|| {
-                        // Fallback: materialize first arg and use its type.
-                        spec.args.first().map(|id| arena.data_type(*id).clone())
-                    })
-                    .unwrap_or(arrow::datatypes::DataType::Int64);
+                let result_type = aggregate_result_type(original, idx, spec, arena);
                 let partial_col_id = column_ref_factory.create(
                     None,
                     display_name.clone(),
@@ -158,24 +212,25 @@ pub(crate) fn rewrite(
     // 2. Partial group-by output columns (column-ref pass-through).
     let partial_groupby_outputs: Vec<OutputColumn> = partial_groupby
         .iter()
-        .filter_map(|gb_id| match arena.node(*gb_id) {
-            ScalarNode::ColumnRef(column_id) => Some(OutputColumn {
-                column_id: *column_id,
-                name: column_ref_name(arena, *column_id),
-                data_type: arena.data_type(*gb_id).clone(),
-                nullable: arena.nullable(*gb_id),
-                is_internal: false,
-            }),
-            _ => None,
+        .enumerate()
+        .map(|(idx, gb_id)| {
+            if idx < group_by_len {
+                group_key_output_column(original, idx, *gb_id, column_ref_factory, arena)
+            } else {
+                group_key_output_column_from_scalar(*gb_id, column_ref_factory, arena)
+            }
         })
         .collect();
 
-    let mut partial_output_cols: Vec<OutputColumn> = partial_groupby_outputs;
     let partial_agg_output_cols: Vec<OutputColumn> = partial_specs_and_output_cols
         .iter()
         .map(|(_, oc)| oc.clone())
         .collect();
-    partial_output_cols.extend(partial_agg_output_cols.clone());
+    let partial_output_layout = AggregateOutputLayout::new(
+        partial_groupby_outputs.clone(),
+        partial_agg_output_cols.clone(),
+    );
+    let partial_output_cols = partial_output_layout.full_output_columns();
 
     let partial_specs: Vec<ScalarAggregateSpec> = partial_specs_and_output_cols
         .into_iter()
@@ -188,6 +243,7 @@ pub(crate) fn rewrite(
             AggStage::Single,
             partial_groupby,
             partial_specs,
+            partial_output_layout,
             partial_output_cols,
             is_merge_partial,
             false, // partial isn't itself a final
@@ -236,34 +292,18 @@ pub(crate) fn rewrite(
         .collect();
 
     // 5. Final aggregate output columns.
-    let mut final_output_cols: Vec<OutputColumn> = original
+    let final_group_output_cols: Vec<OutputColumn> = original
         .group_by
         .iter()
-        .map(|gb_id| {
-            let (column_id, name) = match arena.node(*gb_id) {
-                ScalarNode::ColumnRef(column_id) => {
-                    (*column_id, group_by_display_name(*gb_id, arena))
-                }
-                _ => (ColumnId::UNSET, group_by_display_name(*gb_id, arena)),
-            };
-            OutputColumn {
-                column_id,
-                name,
-                data_type: arena.data_type(*gb_id).clone(),
-                nullable: arena.nullable(*gb_id),
-                is_internal: false,
-            }
+        .enumerate()
+        .map(|(idx, gb_id)| {
+            group_key_output_column(original, idx, *gb_id, column_ref_factory, arena)
         })
         .collect();
     let mut final_agg_output_cols: Vec<OutputColumn> = Vec::with_capacity(final_specs.len());
     for (idx, spec) in final_specs.iter().enumerate() {
         let display_name = agg_spec_display_name(spec, arena);
-        let result_type = original
-            .output_columns
-            .get(group_by_len + idx)
-            .map(|c| c.data_type.clone())
-            .or_else(|| spec.args.first().map(|id| arena.data_type(*id).clone()))
-            .unwrap_or(arrow::datatypes::DataType::Int64);
+        let result_type = aggregate_result_type(original, idx, spec, arena);
         let col_id =
             column_ref_factory.create(None, display_name.clone(), result_type.clone(), true);
         final_agg_output_cols.push(OutputColumn {
@@ -274,20 +314,20 @@ pub(crate) fn rewrite(
             is_internal: false,
         });
     }
-    final_output_cols.extend(final_agg_output_cols);
-    for (spec, output_col) in final_specs
-        .iter_mut()
-        .zip(final_output_cols[group_by_len..].iter())
-    {
+    for (spec, output_col) in final_specs.iter_mut().zip(final_agg_output_cols.iter()) {
         spec.output_column_id = output_col.column_id;
     }
 
     let is_merge_final = vec![false; final_specs.len()];
+    let final_output_layout =
+        AggregateOutputLayout::new(final_group_output_cols, final_agg_output_cols);
+    let final_output_cols = final_output_layout.full_output_columns();
     let final_aggregate = OptExpr::new(
         Operator::LogicalAggregate(LogicalAggregateOp::staged(
             AggStage::Single,
             original.group_by.clone(),
             final_specs.clone(),
+            final_output_layout,
             final_output_cols.clone(),
             is_merge_final,
             true, // is_split = true marks as already-pushed
@@ -334,26 +374,28 @@ fn exposure_project_items(
     let mut items: Vec<ScalarProjectItem> = original
         .group_by
         .iter()
-        .map(|gb_id| {
+        .enumerate()
+        .map(|(idx, gb_id)| {
             let output_name = group_by_display_name(*gb_id, arena);
-            let (column_id, col_name) = match arena.node(*gb_id) {
-                ScalarNode::ColumnRef(column_id) => {
-                    (*column_id, column_ref_name(arena, *column_id))
-                }
-                _ => (ColumnId::UNSET, output_name.clone()),
-            };
+            let final_col = &final_output_cols[idx];
+            let output_column_id = original
+                .output_layout
+                .group_key_columns
+                .get(idx)
+                .map(|column| column.column_id)
+                .unwrap_or(final_col.column_id);
             // The exposure project emits a ColumnRef to the final aggregate's
-            // group-by output column (same ColumnId as the original).
+            // group-by output column under the original layout ColumnId.
             ScalarProjectItem {
                 expr: column_ref_scalar(
                     arena,
-                    column_id,
-                    col_name,
-                    arena.data_type(*gb_id).clone(),
-                    arena.nullable(*gb_id),
+                    final_col.column_id,
+                    final_col.name.clone(),
+                    final_col.data_type.clone(),
+                    final_col.nullable,
                 ),
                 output_name,
-                output_column_id: column_id,
+                output_column_id,
                 expr_display: None,
             }
         })
@@ -374,10 +416,11 @@ fn exposure_project_items(
                 // The output_column_id from the original aggregate's output
                 // columns (if present) so upstream selects resolve correctly.
                 let orig_output_col_id = original
-                    .output_columns
-                    .get(group_by_len + idx)
+                    .output_layout
+                    .aggregate_columns
+                    .get(idx)
                     .map(|c| c.column_id)
-                    .unwrap_or(ColumnId::UNSET);
+                    .unwrap_or(orig_spec.output_column_id);
                 ScalarProjectItem {
                     expr: column_ref_scalar(
                         arena,
@@ -509,19 +552,94 @@ mod tests {
 
     fn make_agg(
         group_by_typed: Vec<crate::sql::analysis::TypedExpr>,
-        agg_specs: Vec<ScalarAggregateSpec>,
+        mut agg_specs: Vec<ScalarAggregateSpec>,
         output_columns: Vec<OutputColumn>,
         arena: &mut ScalarArena,
     ) -> LogicalAggregateOp {
+        let mut output_columns = output_columns;
+        for (idx, column) in output_columns
+            .iter_mut()
+            .take(group_by_typed.len())
+            .enumerate()
+        {
+            if column.column_id == ColumnId::UNSET {
+                column.column_id = match &group_by_typed[idx].kind {
+                    ExprKind::ColumnRef { column_id, .. } => *column_id,
+                    _ => ColumnId::new_for_test(7000 + idx as u32),
+                };
+            }
+        }
+        for (idx, spec) in agg_specs.iter_mut().enumerate() {
+            let output_idx = group_by_typed.len() + idx;
+            if let Some(column) = output_columns.get_mut(output_idx) {
+                let column_id = if column.column_id == ColumnId::UNSET {
+                    spec.output_column_id
+                } else {
+                    column.column_id
+                };
+                column.column_id = column_id;
+                spec.output_column_id = column_id;
+            }
+        }
+        let group_key_columns: Vec<OutputColumn> = if output_columns.is_empty() {
+            group_by_typed
+                .iter()
+                .enumerate()
+                .map(|(idx, expr)| {
+                    let (column_id, name) = match &expr.kind {
+                        ExprKind::ColumnRef {
+                            column_id, column, ..
+                        } => (*column_id, column.clone()),
+                        _ => (
+                            ColumnId::new_for_test(7000 + idx as u32),
+                            format!("group_{idx}"),
+                        ),
+                    };
+                    OutputColumn {
+                        column_id,
+                        name,
+                        data_type: expr.data_type.clone(),
+                        nullable: expr.nullable,
+                        is_internal: false,
+                    }
+                })
+                .collect()
+        } else {
+            output_columns
+                .iter()
+                .take(group_by_typed.len())
+                .cloned()
+                .collect()
+        };
+        let aggregate_columns: Vec<OutputColumn> = if output_columns.is_empty() {
+            agg_specs
+                .iter()
+                .map(|spec| OutputColumn {
+                    column_id: spec.output_column_id,
+                    name: agg_spec_display_name(spec, arena),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                })
+                .collect()
+        } else {
+            output_columns
+                .iter()
+                .skip(group_by_typed.len())
+                .cloned()
+                .collect()
+        };
         let group_by: Vec<ScalarId> = group_by_typed
             .iter()
             .map(|e| intern_typed(arena, e))
             .collect();
         let is_merge = vec![false; agg_specs.len()];
+        let output_layout = AggregateOutputLayout::new(group_key_columns, aggregate_columns);
         LogicalAggregateOp::staged(
             AggStage::Single,
             group_by,
             agg_specs,
+            output_layout,
             output_columns,
             is_merge,
             false,
@@ -765,26 +883,41 @@ mod tests {
             &mut arena,
             &qualified_col("t1", "c_bigint", c_bigint, DataType::Int64),
         );
+        let original_group_by = vec![gb_id];
+        let original_output_columns = vec![
+            OutputColumn {
+                column_id: c_bigint,
+                name: "c_bigint".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: c_key,
+                name: "sum(t1.c_key)".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            },
+        ];
+        let original_output_layout = AggregateOutputLayout::new(
+            original_output_columns
+                .iter()
+                .take(original_group_by.len())
+                .cloned()
+                .collect(),
+            original_output_columns
+                .iter()
+                .skip(original_group_by.len())
+                .cloned()
+                .collect(),
+        );
         let original = LogicalAggregateOp::staged(
             AggStage::Single,
-            vec![gb_id],
+            original_group_by,
             vec![sum.clone()],
-            vec![
-                OutputColumn {
-                    column_id: c_bigint,
-                    name: "c_bigint".into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: c_key,
-                    name: "sum(t1.c_key)".into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: false,
-                },
-            ],
+            original_output_layout,
+            original_output_columns,
             vec![false],
             false,
         );
@@ -907,26 +1040,41 @@ mod tests {
             &mut arena,
             &qualified_col("cs", "cs_call_center_sk", call_center, DataType::Int64),
         );
+        let original_group_by = vec![gb_id];
+        let original_output_columns = vec![
+            OutputColumn {
+                column_id: call_center,
+                name: "cs_call_center_sk".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: sales_price,
+                name: "sum(cs.cs_sales_price)".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            },
+        ];
+        let original_output_layout = AggregateOutputLayout::new(
+            original_output_columns
+                .iter()
+                .take(original_group_by.len())
+                .cloned()
+                .collect(),
+            original_output_columns
+                .iter()
+                .skip(original_group_by.len())
+                .cloned()
+                .collect(),
+        );
         let original = LogicalAggregateOp::staged(
             AggStage::Single,
-            vec![gb_id],
+            original_group_by,
             vec![sum.clone()],
-            vec![
-                OutputColumn {
-                    column_id: call_center,
-                    name: "cs_call_center_sk".into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: sales_price,
-                    name: "sum(cs.cs_sales_price)".into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: false,
-                },
-            ],
+            original_output_layout,
+            original_output_columns,
             vec![false],
             false,
         );
@@ -1020,10 +1168,28 @@ mod tests {
             &mut arena,
             &qualified_col("t1", "c_bigint", c_bigint, DataType::Int64),
         );
+        let original_group_by = vec![gb_id];
+        let original_output_layout = AggregateOutputLayout::new(
+            vec![OutputColumn {
+                column_id: c_bigint,
+                name: "c_bigint".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+            vec![OutputColumn {
+                column_id: count_spec.output_column_id,
+                name: expected_count_display.clone(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+        );
         let original = LogicalAggregateOp::staged(
             AggStage::Single,
-            vec![gb_id],
+            original_group_by,
             vec![count_spec.clone()],
+            original_output_layout,
             vec![],
             vec![false],
             false,

@@ -10,16 +10,16 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
 use crate::sql::codegen::scalar_materialize::{
-    aggregate_output_layout_from_legacy_outputs, materialize, materialize_aggregate_calls,
-    materialize_exprs, materialize_project_items, materialize_sort_keys, materialize_window_exprs,
+    materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
+    materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::cost::{CostInput, broadcast_decision, compute_cost_estimate};
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::operator::{
-    CTEAnchorOp, CTEConsumeOp, CTEProduceOp, LimitOp, Operator, PhysicalDistributionOp, TopNOp,
-    TopNPhase, UnionOp,
+    AggregateOutputLayout, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, LimitOp, Operator,
+    PhysicalDistributionOp, TopNOp, TopNPhase, UnionOp,
 };
 use crate::sql::optimizer::options::{OptimizerOptions, current_session_optimizer_settings};
 use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
@@ -311,19 +311,13 @@ impl<'a> DistributedPlanBuilder<'a> {
                     kind: DistributedPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
                         mode: op.mode,
                         group_by: materialize_exprs(self.scalars, &op.group_by),
-                        aggregates: {
-                            let output_layout = aggregate_output_layout_from_legacy_outputs(
-                                op.group_by.len(),
-                                op.aggregates.len(),
-                                &op.output_columns,
-                            );
-                            materialize_aggregate_calls(
-                                self.scalars,
-                                &op.aggregates,
-                                &output_layout,
-                            )
-                        },
+                        aggregates: materialize_aggregate_calls(
+                            self.scalars,
+                            &op.aggregates,
+                            &op.output_layout,
+                        ),
                         is_merge: op.is_merge.clone(),
+                        output_layout: op.output_layout.clone(),
                         output_columns: op.output_columns.clone(),
                     })),
                 })
@@ -1131,6 +1125,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                 group_by,
                 aggregates: Vec::new(),
                 is_merge: Vec::new(),
+                output_layout: AggregateOutputLayout::new(output_columns.to_vec(), Vec::new()),
                 output_columns: output_columns.to_vec(),
             })),
         })

@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use crate::sql::common::{LiteralValue, OutputColumn};
 use crate::sql::optimizer::memo::{MExpr, MExprId, Memo};
 use crate::sql::optimizer::operator::{
-    FilterOp, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem,
-    ScanOp,
+    AggregateOutputLayout, FilterOp, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec,
+    ScalarProjectItem, ScanOp,
 };
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar::{
@@ -232,6 +232,7 @@ fn try_rewrite(
                 op: Operator::LogicalAggregate(LogicalAggregateOp::single(
                     group_by,
                     aggregates,
+                    original_agg.output_layout.clone(),
                     original_agg.output_columns.clone(),
                 )),
                 children: vec![child_group],
@@ -318,9 +319,14 @@ fn try_rewrite(
                             })
                         })
                         .collect::<Option<Vec<_>>>()?;
+                    let output_layout = AggregateOutputLayout::new(
+                        agg_outputs.iter().take(group_by.len()).cloned().collect(),
+                        agg_outputs.iter().skip(group_by.len()).cloned().collect(),
+                    );
                     let agg_op = Operator::LogicalAggregate(LogicalAggregateOp::single(
                         group_by,
                         aggregates,
+                        output_layout,
                         agg_outputs.clone(),
                     ));
                     if !needs_coalesce {

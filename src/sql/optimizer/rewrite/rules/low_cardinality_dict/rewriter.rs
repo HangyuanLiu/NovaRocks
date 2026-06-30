@@ -65,8 +65,8 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::common::{BinOp, DictionarySnapshot, OutputColumn};
 use crate::sql::common::{DecodeMapping, ScanDictionaryColumn};
 use crate::sql::optimizer::operator::{
-    DecodeOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec,
-    ScalarProjectItem, ScanOp, SortOp, TopNOp, UnionOp,
+    AggregateOutputLayout, DecodeOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp,
+    ScalarAggregateSpec, ScalarProjectItem, ScanOp, SortOp, TopNOp, UnionOp,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarArena, ScalarId, ScalarNode};
@@ -639,26 +639,39 @@ fn rewrite_aggregate(
     // restores the original string name for callers. Output columns
     // that ALREADY carry the dict-column name (post-iteration-1) pass
     // through unchanged — they are the dict slot already.
+    let rewrite_output_column = |out: &OutputColumn| {
+        if let Some((_, binding)) = input_scope.resolve_either(&out.name) {
+            if out.name.eq_ignore_ascii_case(&binding.dict_column) {
+                return out.clone();
+            }
+            OutputColumn {
+                column_id: out.column_id,
+                name: binding.dict_column.clone(),
+                data_type: DataType::Int32,
+                nullable: out.nullable,
+                is_internal: false,
+            }
+        } else {
+            out.clone()
+        }
+    };
     let mut output_columns: Vec<OutputColumn> = node
         .output_columns
         .iter()
-        .map(|out| {
-            if let Some((_, binding)) = input_scope.resolve_either(&out.name) {
-                if out.name.eq_ignore_ascii_case(&binding.dict_column) {
-                    return out.clone();
-                }
-                OutputColumn {
-                    column_id: out.column_id,
-                    name: binding.dict_column.clone(),
-                    data_type: DataType::Int32,
-                    nullable: out.nullable,
-                    is_internal: false,
-                }
-            } else {
-                out.clone()
-            }
-        })
+        .map(rewrite_output_column)
         .collect();
+    let output_layout = AggregateOutputLayout::new(
+        node.output_layout
+            .group_key_columns
+            .iter()
+            .map(rewrite_output_column)
+            .collect(),
+        node.output_layout
+            .aggregate_columns
+            .iter()
+            .map(rewrite_output_column)
+            .collect(),
+    );
     // Task 8 item 5: rewrite individual aggregate-call arguments to the
     // dict slot when the call is on the `DICT_AGG_FUNCTIONS` allowlist
     // (and additionally requires `order_preserving` for `min` / `max`).
@@ -689,6 +702,7 @@ fn rewrite_aggregate(
             stage: node.stage,
             group_by,
             aggregates,
+            output_layout,
             output_columns: output_columns.clone(),
             is_merge: node.is_merge,
             is_split: node.is_split,

@@ -2,14 +2,14 @@ use std::collections::HashSet;
 
 use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 use crate::sql::codegen::scalar_materialize::{
-    aggregate_output_layout_from_legacy_outputs, materialize, materialize_aggregate_calls,
-    materialize_exprs, materialize_project_items, materialize_sort_keys, materialize_window_exprs,
+    materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
+    materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
-    AggregateStateMergeOp, DecodeOp, GenerateSeriesOp, Operator, PhysicalDistributionOp,
-    PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp,
-    TableFunctionOp, WindowOp,
+    AggregateOutputLayout, AggregateStateMergeOp, DecodeOp, GenerateSeriesOp, Operator,
+    PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp,
+    ProjectOp, RepeatOp, TableFunctionOp, WindowOp,
 };
 use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
 use crate::sql::optimizer::property::DistributionSpec;
@@ -198,12 +198,13 @@ fn verify_hash_aggregate(
     for expr in &group_by {
         verify_expr(expr, input, "PhysicalHashAggregate group-by")?;
     }
-    let output_layout = aggregate_output_layout_from_legacy_outputs(
-        op.group_by.len(),
-        op.aggregates.len(),
-        &op.output_columns,
-    );
-    let aggregates = materialize_aggregate_calls(scalars, &op.aggregates, &output_layout);
+    op.output_layout
+        .validate_aggregate_calls(&op.aggregates, op.is_merge.len())
+        .map_err(|err| format!("PhysicalHashAggregate layout contract: {err}"))?;
+    op.output_layout
+        .validate_visible_outputs(&op.output_columns)
+        .map_err(|err| format!("PhysicalHashAggregate visible outputs contract: {err}"))?;
+    let aggregates = materialize_aggregate_calls(scalars, &op.aggregates, &op.output_layout);
     for (idx, aggregate) in aggregates.iter().enumerate() {
         if !op.is_merge.get(idx).copied().unwrap_or(false) {
             for arg in &aggregate.args {
@@ -221,8 +222,15 @@ fn verify_hash_aggregate(
         )?;
     }
     let mut out = HashSet::new();
-    for column in op.output_columns.iter().take(op.group_by.len()) {
-        verify_output_id(column.column_id, "PhysicalHashAggregate group output")?;
+    for column in &op.output_columns {
+        verify_output_id(column.column_id, "PhysicalHashAggregate visible output")?;
+        out.insert(column.column_id);
+    }
+    for column in &op.output_layout.group_key_columns {
+        verify_output_id(
+            column.column_id,
+            "PhysicalHashAggregate group layout output",
+        )?;
         out.insert(column.column_id);
     }
     for aggregate in &aggregates {
@@ -703,6 +711,10 @@ mod tests {
                 mode: AggMode::Single,
                 group_by: vec![],
                 aggregates: intern_aggregate_calls(&mut scalars, &aggregate_calls),
+                output_layout: AggregateOutputLayout::new(
+                    vec![],
+                    vec![int_col(aggregate_output_id, "sum(a)")],
+                ),
                 output_columns: vec![int_col(aggregate_output_id, "sum(a)")],
                 is_merge: vec![false],
             }),
@@ -793,6 +805,51 @@ mod tests {
     }
 
     #[test]
+    fn p3_hash_aggregate_outputs_hidden_group_key_layout_ids() {
+        let input_id = ColumnId::new_for_test(1);
+        let group_output_id = ColumnId::new_for_test(4);
+        let aggregate_output_id = ColumnId::new_for_test(5);
+        let project_output_id = ColumnId::new_for_test(6);
+        let child = values_node(vec![int_col(input_id, "a")]);
+        let mut scalars = ScalarArena::new();
+        let aggregate_calls = vec![AggregateCall {
+            name: "sum".to_string(),
+            args: vec![column_ref(input_id, "a")],
+            distinct: false,
+            result_type: DataType::Int32,
+            order_by: vec![],
+            output_column_id: aggregate_output_id,
+        }];
+        let mut aggregate = PhysicalPlanNode {
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: intern_exprs(&mut scalars, &[column_ref(input_id, "a")]),
+                aggregates: intern_aggregate_calls(&mut scalars, &aggregate_calls),
+                output_layout: AggregateOutputLayout::new(
+                    vec![int_col(group_output_id, "a")],
+                    vec![int_col(aggregate_output_id, "sum(a)")],
+                ),
+                output_columns: vec![int_col(aggregate_output_id, "sum(a)")],
+                is_merge: vec![false],
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![int_col(aggregate_output_id, "sum(a)")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        attach_scalar_arena(&mut aggregate, Arc::new(scalars));
+        let plan = project_over(
+            aggregate,
+            column_ref(group_output_id, "a"),
+            project_output_id,
+        );
+
+        verify_id_binding(&plan).expect("project should bind hidden group layout output id");
+    }
+
+    #[test]
     fn p3_repeat_outputs_grouping_function_ids_not_declared_passthrough_ids() {
         let input_id = ColumnId::new_for_test(1);
         let grouping_output_id = ColumnId::new_for_test(4);
@@ -830,6 +887,10 @@ mod tests {
             probe_runtime_filters: vec![],
         };
         let mut scalars = ScalarArena::new();
+        let aggregate_output_columns = vec![
+            int_col(input_id, "a"),
+            int_col(grouping_output_id, "__grouping_fn_0"),
+        ];
         let mut aggregate = OptimizerPhysicalNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
@@ -841,10 +902,8 @@ mod tests {
                     ],
                 ),
                 aggregates: vec![],
-                output_columns: vec![
-                    int_col(input_id, "a"),
-                    int_col(grouping_output_id, "__grouping_fn_0"),
-                ],
+                output_layout: AggregateOutputLayout::new(aggregate_output_columns.clone(), vec![]),
+                output_columns: aggregate_output_columns,
                 is_merge: vec![],
             }),
             children: vec![distribution],

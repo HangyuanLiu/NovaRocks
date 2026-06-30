@@ -747,7 +747,7 @@ mod tests {
 
     use crate::sql::analysis::{LiteralValue, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
-    use crate::sql::optimizer::operator::LogicalAggregateOp;
+    use crate::sql::optimizer::operator::{AggregateOutputLayout, LogicalAggregateOp};
     use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
 
@@ -835,7 +835,12 @@ mod tests {
 
     fn aggregate_expr(input: OptExpr) -> OptExpr {
         OptExpr::new(
-            Operator::LogicalAggregate(LogicalAggregateOp::single(vec![], vec![], vec![])),
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![],
+                AggregateOutputLayout::new(vec![], vec![]),
+                vec![],
+            )),
             vec![input],
         )
     }

@@ -82,7 +82,9 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator, ScanOp};
+    use crate::sql::optimizer::operator::{
+        AggStage, AggregateOutputLayout, LogicalAggregateOp, Operator, ScanOp,
+    };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -135,6 +137,7 @@ mod tests {
                 AggStage::Single,
                 vec![],
                 vec![],
+                AggregateOutputLayout::new(vec![], vec![]),
                 vec![],
                 vec![],
                 false,
@@ -203,7 +206,16 @@ mod tests {
 
         let mut arena = ScalarArena::new();
 
-        let gb_id = intern_typed(&mut arena, &col_typed("k"));
+        let gb_typed = col_typed("k");
+        let ExprKind::ColumnRef {
+            column_id: gb_output_id,
+            ..
+        } = &gb_typed.kind
+        else {
+            unreachable!("col_typed must build a ColumnRef");
+        };
+        let gb_output_id = *gb_output_id;
+        let gb_id = intern_typed(&mut arena, &gb_typed);
         let sum_arg = intern_typed(&mut arena, &col_typed("v"));
         let sum_spec = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9001),
@@ -212,6 +224,22 @@ mod tests {
             distinct: false,
             order_by: vec![],
         };
+        let output_layout = AggregateOutputLayout::new(
+            vec![OutputColumn {
+                column_id: gb_output_id,
+                name: "k".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+            vec![OutputColumn {
+                column_id: sum_spec.output_column_id,
+                name: "sum".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+        );
 
         let cond_typed = crate::sql::analysis::TypedExpr {
             kind: ExprKind::BinaryOp {
@@ -238,6 +266,7 @@ mod tests {
                 AggStage::Single,
                 vec![gb_id],
                 vec![sum_spec],
+                output_layout,
                 vec![],
                 vec![false],
                 true, // is_split = true: already pushed, must not repush

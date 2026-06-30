@@ -344,8 +344,8 @@ mod tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggStage, FilterOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp,
-        ScalarAggregateSpec, ScalarProjectItem,
+        AggStage, AggregateOutputLayout, FilterOp, LogicalAggregateOp, LogicalJoinOp, Operator,
+        ProjectOp, ScalarAggregateSpec, ScalarProjectItem,
     };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -362,6 +362,45 @@ mod tests {
         let mut ctx = RewriteContext::for_query(std::iter::empty());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
+    }
+
+    fn hidden_aggregate_layout(
+        group_by_typed: &[crate::sql::analysis::TypedExpr],
+        agg_specs: &[ScalarAggregateSpec],
+    ) -> AggregateOutputLayout {
+        let group_key_columns = group_by_typed
+            .iter()
+            .enumerate()
+            .map(|(idx, expr)| {
+                let (column_id, name) = match &expr.kind {
+                    ExprKind::ColumnRef {
+                        column_id, column, ..
+                    } => (*column_id, column.clone()),
+                    _ => (
+                        ColumnId::new_for_test(8000 + idx as u32),
+                        format!("group_{idx}"),
+                    ),
+                };
+                OutputColumn {
+                    column_id,
+                    name,
+                    data_type: expr.data_type.clone(),
+                    nullable: expr.nullable,
+                    is_internal: false,
+                }
+            })
+            .collect();
+        let aggregate_columns = agg_specs
+            .iter()
+            .map(|spec| OutputColumn {
+                column_id: spec.output_column_id,
+                name: spec.name.clone(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            })
+            .collect();
+        AggregateOutputLayout::new(group_key_columns, aggregate_columns)
     }
 
     /// Compute a stable non-zero test column ID from a (qualifier, name) pair.
@@ -416,6 +455,7 @@ mod tests {
         is_split: bool,
         arena: &mut ScalarArena,
     ) -> LogicalAggregateOp {
+        let output_layout = hidden_aggregate_layout(&group_by_typed, &agg_specs);
         let group_by = group_by_typed
             .iter()
             .map(|e| intern_typed(arena, e))
@@ -424,6 +464,7 @@ mod tests {
             AggStage::Single,
             group_by,
             agg_specs.clone(),
+            output_layout,
             vec![],
             vec![false; agg_specs.len()],
             is_split,
@@ -503,6 +544,7 @@ mod tests {
         agg_specs: Vec<ScalarAggregateSpec>,
         arena: &mut ScalarArena,
     ) -> OptExpr {
+        let output_layout = hidden_aggregate_layout(&group_by_typed, &agg_specs);
         let group_by = group_by_typed
             .iter()
             .map(|e| intern_typed(arena, e))
@@ -513,6 +555,7 @@ mod tests {
                 AggStage::Single,
                 group_by,
                 agg_specs,
+                output_layout,
                 vec![],
                 is_merge,
                 false,

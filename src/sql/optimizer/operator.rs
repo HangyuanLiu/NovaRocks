@@ -247,6 +247,7 @@ pub(crate) struct LogicalAggregateOp {
     pub stage: AggStage,
     pub group_by: Vec<ScalarId>,
     pub aggregates: Vec<ScalarAggregateSpec>,
+    pub output_layout: AggregateOutputLayout,
     pub output_columns: Vec<OutputColumn>,
     pub is_merge: Vec<bool>,
     pub is_split: bool,
@@ -256,13 +257,21 @@ impl LogicalAggregateOp {
     pub(crate) fn single(
         group_by: Vec<ScalarId>,
         aggregates: Vec<ScalarAggregateSpec>,
+        output_layout: AggregateOutputLayout,
         output_columns: Vec<OutputColumn>,
     ) -> Self {
         let is_merge = vec![false; aggregates.len()];
+        output_layout
+            .validate_aggregate_calls(&aggregates, is_merge.len())
+            .expect("LogicalAggregateOp::single aggregate layout contract");
+        output_layout
+            .validate_visible_outputs(&output_columns)
+            .expect("LogicalAggregateOp::single visible outputs contract");
         Self {
             stage: AggStage::Single,
             group_by,
             aggregates,
+            output_layout,
             output_columns,
             is_merge,
             is_split: false,
@@ -273,15 +282,22 @@ impl LogicalAggregateOp {
         stage: AggStage,
         group_by: Vec<ScalarId>,
         aggregates: Vec<ScalarAggregateSpec>,
+        output_layout: AggregateOutputLayout,
         output_columns: Vec<OutputColumn>,
         is_merge: Vec<bool>,
         is_split: bool,
     ) -> Self {
-        debug_assert_eq!(aggregates.len(), is_merge.len());
+        output_layout
+            .validate_aggregate_calls(&aggregates, is_merge.len())
+            .expect("LogicalAggregateOp::staged aggregate layout contract");
+        output_layout
+            .validate_visible_outputs(&output_columns)
+            .expect("LogicalAggregateOp::staged visible outputs contract");
         Self {
             stage,
             group_by,
             aggregates,
+            output_layout,
             output_columns,
             is_merge,
             is_split,
@@ -546,6 +562,7 @@ pub(crate) struct PhysicalHashAggregateOp {
     pub mode: AggMode,
     pub group_by: Vec<ScalarId>,
     pub aggregates: Vec<ScalarAggregateSpec>,
+    pub output_layout: AggregateOutputLayout,
     pub output_columns: Vec<OutputColumn>,
     /// Per-aggregate merge flag. `true` → this phase applies the aggregate's
     /// merge function over an intermediate state slot from the child; `false`
@@ -718,11 +735,22 @@ mod aggregate_stage_tests {
     #[test]
     fn single_constructor_sets_unsplit_single_metadata() {
         let mut arena = ScalarArena::new();
-        let op = LogicalAggregateOp::single(
-            vec![scalar_col_ref(&mut arena, 1, "k")],
-            vec![count_call(&mut arena)],
-            vec![output_column(1, "k"), output_column(3, "count(v)")],
+        let group_by = vec![scalar_col_ref(&mut arena, 1, "k")];
+        let aggregates = vec![count_call(&mut arena)];
+        let output_columns = vec![output_column(1, "k"), output_column(3, "count(v)")];
+        let output_layout = AggregateOutputLayout::new(
+            output_columns
+                .iter()
+                .take(group_by.len())
+                .cloned()
+                .collect(),
+            output_columns
+                .iter()
+                .skip(group_by.len())
+                .cloned()
+                .collect(),
         );
+        let op = LogicalAggregateOp::single(group_by, aggregates, output_layout, output_columns);
         assert_eq!(op.stage, AggStage::Single);
         assert_eq!(op.stage.to_physical_mode(), AggMode::Single);
         assert_eq!(op.is_merge, vec![false]);
@@ -734,11 +762,27 @@ mod aggregate_stage_tests {
         assert_eq!(AggStage::Local.to_physical_mode(), AggMode::Local);
 
         let mut arena = ScalarArena::new();
+        let group_by = vec![scalar_col_ref(&mut arena, 1, "k")];
+        let aggregates = vec![count_call(&mut arena)];
+        let output_columns = vec![output_column(1, "k"), output_column(3, "count(v)")];
+        let output_layout = AggregateOutputLayout::new(
+            output_columns
+                .iter()
+                .take(group_by.len())
+                .cloned()
+                .collect(),
+            output_columns
+                .iter()
+                .skip(group_by.len())
+                .cloned()
+                .collect(),
+        );
         let op = LogicalAggregateOp::staged(
             AggStage::Global,
-            vec![scalar_col_ref(&mut arena, 1, "k")],
-            vec![count_call(&mut arena)],
-            vec![output_column(1, "k"), output_column(3, "count(v)")],
+            group_by,
+            aggregates,
+            output_layout,
+            output_columns,
             vec![true],
             true,
         );

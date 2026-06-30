@@ -174,7 +174,7 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        LogicalAggregateOp, RepeatOp, ScalarAggregateSpec, ScanOp,
+        AggregateOutputLayout, LogicalAggregateOp, RepeatOp, ScalarAggregateSpec, ScanOp,
     };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -302,11 +302,22 @@ mod tests {
             distinct: false,
             order_by: vec![],
         };
-        let agg_op = LogicalAggregateOp::single(
-            group_by,
-            vec![count_spec],
-            vec![output_col("a"), output_col("sum_b")],
+        let aggregates = vec![count_spec];
+        let output_columns = vec![output_col("a"), output_col("sum_b")];
+        let output_layout = AggregateOutputLayout::new(
+            output_columns
+                .iter()
+                .take(group_by.len())
+                .cloned()
+                .collect(),
+            output_columns
+                .iter()
+                .skip(group_by.len())
+                .cloned()
+                .collect(),
         );
+        let agg_op =
+            LogicalAggregateOp::single(group_by, aggregates, output_layout, output_columns);
         OptExpr::new(Operator::LogicalAggregate(agg_op), vec![input])
     }
 

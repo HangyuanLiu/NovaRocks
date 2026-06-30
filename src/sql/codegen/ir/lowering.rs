@@ -37,6 +37,7 @@ use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
 };
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
     AggMode, AssertOneRowOp, DecodeOp, GenerateSeriesOp, RepeatOp, ScanDictionaryColumn, TopNPhase,
 };
@@ -1199,6 +1200,62 @@ struct LoweredDistributedNode {
     #[allow(dead_code)]
     output_columns: Vec<AnalysisOutputColumn>,
     ordering: OrderingSpec,
+}
+
+fn hash_aggregate_group_layout_column<'a>(
+    op: &'a super::kind::DistributedHashAggregateNode,
+    node_id: i32,
+    idx: usize,
+) -> Result<&'a AnalysisOutputColumn, String> {
+    let column = op.output_layout.group_key_columns.get(idx).ok_or_else(|| {
+        format!(
+            "HashAggregate node_id={} missing group key output layout at index {} (group_by={}, layout_group_keys={})",
+            node_id,
+            idx,
+            op.group_by.len(),
+            op.output_layout.group_key_columns.len()
+        )
+    })?;
+    if column.column_id == ColumnId::UNSET {
+        return Err(format!(
+            "HashAggregate node_id={} group key output layout column at index {} must carry column_id",
+            node_id, idx
+        ));
+    }
+    Ok(column)
+}
+
+fn hash_aggregate_aggregate_layout_column<'a>(
+    op: &'a super::kind::DistributedHashAggregateNode,
+    node_id: i32,
+    idx: usize,
+) -> Result<&'a AnalysisOutputColumn, String> {
+    let column = op.output_layout.aggregate_columns.get(idx).ok_or_else(|| {
+        format!(
+            "HashAggregate node_id={} missing aggregate output layout at index {} (aggregates={}, layout_aggregates={})",
+            node_id,
+            idx,
+            op.aggregates.len(),
+            op.output_layout.aggregate_columns.len()
+        )
+    })?;
+    if column.column_id == ColumnId::UNSET {
+        return Err(format!(
+            "HashAggregate node_id={} aggregate output layout column at index {} must carry column_id",
+            node_id, idx
+        ));
+    }
+    Ok(column)
+}
+
+fn available_id_bindings(scope: &ExprScope) -> String {
+    let mut bindings = scope.debug_id_bindings();
+    bindings.sort();
+    if bindings.is_empty() {
+        "<none>".to_string()
+    } else {
+        bindings.join(", ")
+    }
 }
 
 fn iceberg_field_id_for_column(table: &crate::sql::catalog::TableDef, column: &str) -> Option<i32> {
@@ -2990,14 +3047,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 type_desc: Some(slot_type_desc),
                 nullable,
             };
-            let gb_column_id = op
-                .output_columns
-                .get(idx)
-                .map(|col| col.column_id)
-                .unwrap_or_else(|| match &gb_expr.kind {
-                    ExprKind::ColumnRef { column_id, .. } => *column_id,
-                    _ => crate::sql::column_id::ColumnId::UNSET,
-                });
+            let gb_column_id = hash_aggregate_group_layout_column(op, agg_node_id, idx)?.column_id;
             agg_scope.add_column_with_id(gb_column_id, None, name, binding.clone());
             if let ExprKind::ColumnRef {
                 qualifier: Some(ref q),
@@ -3038,16 +3088,20 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         for (idx, agg_call) in op.aggregates.iter().enumerate() {
             let texpr = if op.is_merge[idx] {
                 // Global (merge) phase: the child scope contains the Local's
-                // output.  Each intermediate aggregate column sits at position
-                // group_by.len() + idx in the child scope's ordered columns.
-                let child_columns: Vec<_> = child_scope.iter_columns().collect();
-                let child_col_idx = agg_start_col + idx;
-                let (_, binding) = child_columns.get(child_col_idx).ok_or_else(|| {
-                    format!(
-                        "Global agg: child scope missing intermediate column at index {}",
-                        child_col_idx
-                    )
-                })?;
+                // output. Resolve the intermediate column by its layout
+                // ColumnId because visible public outputs may omit internal
+                // group or aggregate columns.
+                let aggregate_layout_column =
+                    hash_aggregate_aggregate_layout_column(op, agg_node_id, idx)?;
+                let binding = child_scope
+                    .resolve_by_id(aggregate_layout_column.column_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "Global agg: child scope missing intermediate aggregate column id {}; available bindings [{}]",
+                            aggregate_layout_column.column_id,
+                            available_id_bindings(child_scope)
+                        )
+                    })?;
                 let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
                 compiler.compile_merge_aggregate_call(
                     agg_call,
@@ -3128,10 +3182,10 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 name.clone(),
                 binding.clone(),
             );
-            if let Some(output_column) = op.output_columns.get(agg_start_col + idx)
-                && output_column.column_id != agg_call.output_column_id
-            {
-                agg_scope.add_id_alias(output_column.column_id, binding.clone());
+            let aggregate_layout_column =
+                hash_aggregate_aggregate_layout_column(op, agg_node_id, idx)?;
+            if aggregate_layout_column.column_id != agg_call.output_column_id {
+                agg_scope.add_id_alias(aggregate_layout_column.column_id, binding.clone());
             }
             let unqualified_name = agg_call_display_name_without_qualifiers(agg_call);
             if !unqualified_name.eq_ignore_ascii_case(&name) {
@@ -4930,7 +4984,8 @@ mod tests {
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::ir::kind::{
         DistributedExchangeNode, DistributedValuesNode, ExchangeFlavor,
-        PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
+        PhysicalHashAggregateNode as DistributedHashAggregateNode, PhysicalHashJoinEqCondition,
+        PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
     };
     use crate::sql::codegen::ir::{
         DataPartition, DataSink, DistributedPlan, DistributedPlanKind, DistributedPlanNode,
@@ -4940,8 +4995,8 @@ mod tests {
     use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        CTEAnchorOp, CTEConsumeOp, CTEProduceOp, JoinDistribution, Operator, ProjectOp, ScanOp,
-        ValuesOp,
+        AggMode, AggregateOutputLayout, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, JoinDistribution,
+        Operator, ProjectOp, ScanOp, ValuesOp,
     };
     use crate::sql::optimizer::physical_tree::{
         OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
@@ -4949,6 +5004,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
+    use crate::sql::planner::plan::AggregateCall;
     use crate::thrift::plan_nodes::TPlanNodeType;
 
     #[test]
@@ -5173,6 +5229,129 @@ mod tests {
         .expect("boundary tuple ids");
 
         assert_eq!(tuple_ids, vec![5]);
+    }
+
+    #[test]
+    fn hash_aggregate_lowering_registers_layout_outputs_when_public_outputs_omit_them() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let mut child_scope = ExprScope::new();
+        child_scope.add_column_with_id(
+            ColumnId::new_for_test(1),
+            None,
+            "k".to_string(),
+            column_binding(1, 11, false),
+        );
+        child_scope.add_column_with_id(
+            ColumnId::new_for_test(2),
+            None,
+            "v".to_string(),
+            column_binding(1, 12, true),
+        );
+        let aggregate_call_output_id = ColumnId::new_for_test(20);
+        let aggregate_layout_output_id = ColumnId::new_for_test(21);
+        let op = DistributedHashAggregateNode {
+            mode: AggMode::Single,
+            group_by: vec![column_ref_expr(1, "k", DataType::Int64, false)],
+            aggregates: vec![AggregateCall {
+                name: "sum".to_string(),
+                args: vec![column_ref_expr(2, "v", DataType::Int64, true)],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: vec![],
+                output_column_id: aggregate_call_output_id,
+            }],
+            is_merge: vec![false],
+            output_layout: AggregateOutputLayout::new(
+                vec![output_col(10, "k", DataType::Int64, false)],
+                vec![OutputColumn {
+                    column_id: aggregate_layout_output_id,
+                    name: "sum(v)".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                }],
+            ),
+            output_columns: vec![output_col(20, "sum(v)", DataType::Int64, true)],
+        };
+
+        let scope = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_hash_aggregate(30, 3, &op, &child_scope)
+                .expect("lower hash aggregate")
+                .1
+        };
+
+        assert!(
+            scope.resolve_by_id(ColumnId::new_for_test(10)).is_some(),
+            "layout group key output id should be registered even when omitted from public outputs"
+        );
+        assert!(
+            scope.resolve_by_id(aggregate_layout_output_id).is_some(),
+            "layout aggregate output alias id should be registered even when omitted from public outputs"
+        );
+        assert!(
+            scope.resolve_by_id(aggregate_call_output_id).is_some(),
+            "aggregate call output id remains registered"
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_merge_resolves_intermediate_input_by_layout_id_not_position() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let mut child_scope = ExprScope::new();
+        child_scope.add_column_with_id(
+            ColumnId::new_for_test(10),
+            None,
+            "k".to_string(),
+            column_binding(1, 110, false),
+        );
+        child_scope.add_column_with_id(
+            ColumnId::new_for_test(99),
+            None,
+            "decoy".to_string(),
+            column_binding(1, 199, true),
+        );
+        child_scope.add_column_with_id(
+            ColumnId::new_for_test(20),
+            None,
+            "sum(v)".to_string(),
+            column_binding(1, 120, true),
+        );
+        let op = DistributedHashAggregateNode {
+            mode: AggMode::Global,
+            group_by: vec![column_ref_expr(10, "k", DataType::Int64, false)],
+            aggregates: vec![AggregateCall {
+                name: "sum".to_string(),
+                args: vec![column_ref_expr(2, "v", DataType::Int64, true)],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: vec![],
+                output_column_id: ColumnId::new_for_test(20),
+            }],
+            is_merge: vec![true],
+            output_layout: AggregateOutputLayout::new(
+                vec![output_col(10, "k", DataType::Int64, false)],
+                vec![output_col(20, "sum(v)", DataType::Int64, true)],
+            ),
+            output_columns: Vec::new(),
+        };
+
+        let plan_node = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_hash_aggregate(31, 4, &op, &child_scope)
+                .expect("lower global hash aggregate")
+                .0
+        };
+        let agg_node = plan_node.agg_node.expect("aggregation node");
+        let merge_input_slot = agg_node.aggregate_functions[0].nodes[1]
+            .slot_ref
+            .as_ref()
+            .expect("merge input slot ref");
+
+        assert_eq!(merge_input_slot.slot_id, 120);
+        assert_eq!(merge_input_slot.tuple_id, 1);
     }
 
     #[test]
