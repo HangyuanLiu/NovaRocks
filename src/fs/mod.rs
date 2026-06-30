@@ -20,6 +20,7 @@ pub mod coalesced_reader;
 pub mod hdfs;
 pub mod local;
 pub mod object_store;
+pub mod object_store_credentials;
 pub mod opendal;
 pub mod path;
 pub mod range_plan;
