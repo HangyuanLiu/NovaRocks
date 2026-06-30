@@ -725,6 +725,7 @@ fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks
         None::<Vec<Box<data_sinks::TDataSink>>>,
         None::<i64>,
         None::<data_sinks::TSplitDataStreamSink>,
+        None::<data_sinks::TIcebergChangeStreamRouterSink>,
     )
 }
 
@@ -749,6 +750,7 @@ fn wrap_multi_cast_sink(
         None::<Vec<Box<data_sinks::TDataSink>>>,
         None::<i64>,
         None::<data_sinks::TSplitDataStreamSink>,
+        None::<data_sinks::TIcebergChangeStreamRouterSink>,
     )
 }
 
@@ -2109,6 +2111,7 @@ mod tests {
             None::<Vec<Box<data_sinks::TDataSink>>>,
             None::<i64>,
             None::<data_sinks::TSplitDataStreamSink>,
+            None::<data_sinks::TIcebergChangeStreamRouterSink>,
         );
         let fragment = crate::thrift::planner::TPlanFragment::new(
             None::<crate::thrift::plan_nodes::TPlan>,

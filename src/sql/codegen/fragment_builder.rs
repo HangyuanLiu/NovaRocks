@@ -960,6 +960,7 @@ pub(in crate::sql::codegen) fn build_result_sink() -> data_sinks::TDataSink {
         None::<Vec<Box<data_sinks::TDataSink>>>,
         None::<i64>,
         None::<data_sinks::TSplitDataStreamSink>,
+        None::<data_sinks::TIcebergChangeStreamRouterSink>,
     )
 }
 
@@ -984,6 +985,7 @@ pub(in crate::sql::codegen) fn build_noop_sink() -> data_sinks::TDataSink {
         None::<Vec<Box<data_sinks::TDataSink>>>,
         None::<i64>,
         None::<data_sinks::TSplitDataStreamSink>,
+        None::<data_sinks::TIcebergChangeStreamRouterSink>,
     )
 }
 

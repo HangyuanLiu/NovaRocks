@@ -653,6 +653,7 @@ mod tests {
             None::<Vec<Box<data_sinks::TDataSink>>>,
             None::<i64>,
             None::<data_sinks::TSplitDataStreamSink>,
+            None::<data_sinks::TIcebergChangeStreamRouterSink>,
         )
     }
 

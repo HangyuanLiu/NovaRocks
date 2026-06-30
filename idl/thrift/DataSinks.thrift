@@ -63,7 +63,8 @@ enum TDataSinkType {
     NOOP_SINK,
     ICEBERG_DELETE_SINK,
     ICEBERG_DV_SINK = 18,
-    ICEBERG_EQUALITY_DELETE_SINK = 19
+    ICEBERG_EQUALITY_DELETE_SINK = 19,
+    ICEBERG_CHANGE_STREAM_ROUTER_SINK = 1000
 }
 
 enum TResultSinkType {
@@ -316,6 +317,25 @@ struct TSplitDataStreamSink {
     3: optional list<Exprs.TExpr> splitExprs;
 }
 
+enum TIcebergChangeStreamRouterBranchKind {
+    DELETE_DV = 1,
+    REUSE_DATA = 2,
+    FRESH_DATA = 3,
+}
+
+struct TIcebergChangeStreamRouterBranch {
+    1: required i32 branch_id
+    2: required TIcebergChangeStreamRouterBranchKind branch_kind
+    3: required TDataStreamSink stream_sink
+    4: required list<TPlanFragmentDestination> destinations
+}
+
+struct TIcebergChangeStreamRouterSink {
+    1: required i32 change_op_slot_id
+    2: optional i32 data_route_slot_id
+    3: required list<TIcebergChangeStreamRouterBranch> branches
+}
+
 struct TDataSink {
   1: required TDataSinkType type
   2: optional TDataStreamSink stream_sink
@@ -333,4 +353,5 @@ struct TDataSink {
   15: optional list<TDataSink> multi_olap_table_sinks
   16: optional i64 sink_id
   17: optional TSplitDataStreamSink split_stream_sink
+  1000: optional TIcebergChangeStreamRouterSink iceberg_change_stream_router_sink
 }
