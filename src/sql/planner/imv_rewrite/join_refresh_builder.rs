@@ -1617,7 +1617,7 @@ mod tests {
         opt_expr_to_logical_plan(opt_result, &arena)
     }
 
-    fn optimize_for_test(plan: LogicalPlanNode) -> crate::sql::optimizer::PhysicalPlanNode {
+    fn optimize_for_test(plan: LogicalPlanNode) -> crate::sql::optimizer::OptimizerPhysicalNode {
         let mut scalar_arena = ScalarArena::new();
         let opt_expr = logical_plan_to_opt_expr(&plan, &mut scalar_arena);
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();

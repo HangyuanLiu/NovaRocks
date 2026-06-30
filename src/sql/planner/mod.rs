@@ -46,11 +46,11 @@ fn expr_column_id(expr: &TypedExpr, name: &str, factory: &mut ColumnRefFactory) 
 #[cfg(test)]
 mod bridge2_export_tests {
     use super::{DistributedPlan, DistributedPlanNode, build_distributed_plan};
-    use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+    use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
 
     #[test]
     fn planner_exports_bridge2_distributed_plan_api() {
-        fn accepts_builder(_: fn(&PhysicalPlanNode) -> Result<DistributedPlan, String>) {}
+        fn accepts_builder(_: fn(&OptimizerPhysicalNode) -> Result<DistributedPlan, String>) {}
         fn accepts_node(_: Option<DistributedPlanNode>) {}
 
         accepts_builder(build_distributed_plan);

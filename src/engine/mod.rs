@@ -2796,7 +2796,7 @@ fn single_fragment_plan(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_query_direct_for_explicit_exception(
-    mut physical: crate::sql::optimizer::PhysicalPlanNode,
+    mut physical: crate::sql::optimizer::OptimizerPhysicalNode,
     codegen_catalog: &dyn crate::sql::catalog::CatalogProvider,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
@@ -2833,9 +2833,9 @@ fn execute_query_direct_for_explicit_exception(
 }
 
 fn collapse_distribution_enforcers_for_single_fragment(
-    node: crate::sql::optimizer::PhysicalPlanNode,
+    node: crate::sql::optimizer::OptimizerPhysicalNode,
     inline_ctes: bool,
-) -> crate::sql::optimizer::PhysicalPlanNode {
+) -> crate::sql::optimizer::OptimizerPhysicalNode {
     let mut scalar_arena = node.execution_props.scalar_arena.as_deref().cloned();
     let mut cte_bindings = Vec::new();
     let mut collapsed = collapse_distribution_enforcers_for_single_fragment_inner(
@@ -2845,7 +2845,7 @@ fn collapse_distribution_enforcers_for_single_fragment(
         &mut cte_bindings,
     );
     if let Some(scalar_arena) = scalar_arena {
-        crate::sql::optimizer::physical_plan::attach_scalar_arena(
+        crate::sql::optimizer::physical_tree::attach_scalar_arena(
             &mut collapsed,
             std::sync::Arc::new(scalar_arena),
         );
@@ -2856,18 +2856,18 @@ fn collapse_distribution_enforcers_for_single_fragment(
 #[derive(Clone)]
 struct DirectLocalCteBinding {
     cte_id: crate::sql::analysis::cte::CteId,
-    plan: crate::sql::optimizer::PhysicalPlanNode,
+    plan: crate::sql::optimizer::OptimizerPhysicalNode,
     output_columns: Vec<crate::sql::analysis::OutputColumn>,
 }
 
 fn collapse_distribution_enforcers_for_single_fragment_inner(
-    mut node: crate::sql::optimizer::PhysicalPlanNode,
+    mut node: crate::sql::optimizer::OptimizerPhysicalNode,
     inline_ctes: bool,
     scalar_arena: &mut Option<crate::sql::optimizer::scalar::ScalarArena>,
     cte_bindings: &mut Vec<DirectLocalCteBinding>,
-) -> crate::sql::optimizer::PhysicalPlanNode {
+) -> crate::sql::optimizer::OptimizerPhysicalNode {
     use crate::sql::optimizer::operator::{JoinDistribution, Operator};
-    use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
+    use crate::sql::optimizer::physical_tree::JoinExecutionDistribution;
 
     if inline_ctes && matches!(&node.op, Operator::PhysicalCTEAnchor(_)) && node.children.len() == 2
     {
@@ -2979,12 +2979,12 @@ fn collapse_distribution_enforcers_for_single_fragment_inner(
 }
 
 fn project_direct_local_columns(
-    mut child: crate::sql::optimizer::PhysicalPlanNode,
+    mut child: crate::sql::optimizer::OptimizerPhysicalNode,
     target_columns: &[crate::sql::analysis::OutputColumn],
     output_qualifier: Option<String>,
-    template: &crate::sql::optimizer::PhysicalPlanNode,
+    template: &crate::sql::optimizer::OptimizerPhysicalNode,
     scalar_arena: &mut Option<crate::sql::optimizer::scalar::ScalarArena>,
-) -> Option<crate::sql::optimizer::PhysicalPlanNode> {
+) -> Option<crate::sql::optimizer::OptimizerPhysicalNode> {
     use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
     use crate::sql::optimizer::scalar::ScalarNode;
 
@@ -3022,7 +3022,7 @@ fn project_direct_local_columns(
         });
     }
 
-    Some(crate::sql::optimizer::PhysicalPlanNode {
+    Some(crate::sql::optimizer::OptimizerPhysicalNode {
         op: Operator::PhysicalProject(ProjectOp {
             items,
             output_qualifier,
@@ -5578,8 +5578,8 @@ path = "{metadata_path}"
         use crate::sql::optimizer::operator::{
             JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp, ValuesOp,
         };
-        use crate::sql::optimizer::physical_plan::{
-            JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
+        use crate::sql::optimizer::physical_tree::{
+            JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps,
         };
         use crate::sql::optimizer::property::DistributionSpec;
         use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
@@ -5593,8 +5593,8 @@ path = "{metadata_path}"
             }
         }
 
-        fn values_node() -> PhysicalPlanNode {
-            PhysicalPlanNode {
+        fn values_node() -> OptimizerPhysicalNode {
+            OptimizerPhysicalNode {
                 op: Operator::PhysicalValues(ValuesOp {
                     rows: Vec::new(),
                     columns: Vec::new(),
@@ -5602,22 +5602,22 @@ path = "{metadata_path}"
                 children: Vec::new(),
                 stats: stats(),
                 output_columns: Vec::new(),
-                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(
                 ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }
         }
 
-        fn distributed_values_node() -> PhysicalPlanNode {
-            PhysicalPlanNode {
+        fn distributed_values_node() -> OptimizerPhysicalNode {
+            OptimizerPhysicalNode {
                 op: Operator::PhysicalDistribution(PhysicalDistributionOp {
                     spec: DistributionSpec::Gather,
                 }),
                 children: vec![values_node()],
                 stats: stats(),
                 output_columns: Vec::new(),
-                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(
                 ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
@@ -5628,7 +5628,7 @@ path = "{metadata_path}"
         let mut rf = RuntimeFilterDesc::placeholder(&mut scalar_arena, 7);
         rf.distribution = JoinDistribution::Shuffle;
 
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: Vec::new(),
@@ -5680,7 +5680,7 @@ path = "{metadata_path}"
         use crate::sql::optimizer::operator::{
             CTEAnchorOp, CTEConsumeOp, CTEProduceOp, Operator, ValuesOp,
         };
-        use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
+        use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
         use crate::sql::optimizer::statistics::Statistics;
         use arrow::datatypes::DataType;
 
@@ -5702,7 +5702,7 @@ path = "{metadata_path}"
             }
         }
 
-        fn contains_cte(node: &PhysicalPlanNode) -> bool {
+        fn contains_cte(node: &OptimizerPhysicalNode) -> bool {
             matches!(
                 node.op,
                 Operator::PhysicalCTEAnchor(_)
@@ -5713,7 +5713,7 @@ path = "{metadata_path}"
 
         let produced = col(1, "id");
         let consumed = col(2, "id");
-        let values = PhysicalPlanNode {
+        let values = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
                 columns: vec![produced.clone()],
@@ -5725,7 +5725,7 @@ path = "{metadata_path}"
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
-        let produce = PhysicalPlanNode {
+        let produce = OptimizerPhysicalNode {
             op: Operator::PhysicalCTEProduce(CTEProduceOp {
                 cte_id: 7,
                 output_columns: vec![produced.clone()],
@@ -5737,7 +5737,7 @@ path = "{metadata_path}"
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
-        let consume = PhysicalPlanNode {
+        let consume = OptimizerPhysicalNode {
             op: Operator::PhysicalCTEConsume(CTEConsumeOp {
                 cte_id: 7,
                 alias: "c".to_string(),
@@ -5750,7 +5750,7 @@ path = "{metadata_path}"
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id: 7 }),
             children: vec![produce, consume],
             stats: stats(),
@@ -5785,7 +5785,7 @@ path = "{metadata_path}"
         use crate::sql::optimizer::operator::{
             CTEAnchorOp, CTEConsumeOp, CTEProduceOp, Operator, ValuesOp,
         };
-        use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
+        use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
         use crate::sql::optimizer::statistics::Statistics;
         use arrow::datatypes::DataType;
 
@@ -5804,7 +5804,7 @@ path = "{metadata_path}"
             nullable: false,
             is_internal: false,
         };
-        let values = PhysicalPlanNode {
+        let values = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
                 columns: vec![column.clone()],
@@ -5816,7 +5816,7 @@ path = "{metadata_path}"
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
-        let produce = PhysicalPlanNode {
+        let produce = OptimizerPhysicalNode {
             op: Operator::PhysicalCTEProduce(CTEProduceOp {
                 cte_id: 7,
                 output_columns: vec![column.clone()],
@@ -5828,7 +5828,7 @@ path = "{metadata_path}"
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
-        let consume = PhysicalPlanNode {
+        let consume = OptimizerPhysicalNode {
             op: Operator::PhysicalCTEConsume(CTEConsumeOp {
                 cte_id: 7,
                 alias: "c".to_string(),
@@ -5841,7 +5841,7 @@ path = "{metadata_path}"
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
-        let plan = PhysicalPlanNode {
+        let plan = OptimizerPhysicalNode {
             op: Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id: 7 }),
             children: vec![produce, consume],
             stats: stats(),

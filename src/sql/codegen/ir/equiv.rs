@@ -41,8 +41,8 @@ mod tests {
         PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp, ScanDictionaryColumn,
         ScanOp, SortOp, TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
     };
-    use crate::sql::optimizer::physical_plan::{
-        PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
+    use crate::sql::optimizer::physical_tree::{
+        OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
@@ -748,7 +748,7 @@ mod tests {
 
     fn assert_distributed_plan_ir_structure(
         case_name: &str,
-        plan: PhysicalPlanNode,
+        plan: OptimizerPhysicalNode,
         expected_fragment_count: usize,
     ) {
         let connectors = ConnectorRegistry::new();
@@ -758,7 +758,7 @@ mod tests {
 
     fn assert_distributed_plan_ir_structure_with_large_stack(
         case_name: &'static str,
-        plan: PhysicalPlanNode,
+        plan: OptimizerPhysicalNode,
         expected_fragment_count: usize,
     ) {
         std::thread::Builder::new()
@@ -774,7 +774,7 @@ mod tests {
 
     fn build_distributed_plan(
         case_name: &str,
-        plan: PhysicalPlanNode,
+        plan: OptimizerPhysicalNode,
         connectors: &ConnectorRegistry,
     ) -> MultiFragmentBuildResult {
         let catalog = DummyCatalog;
@@ -784,7 +784,7 @@ mod tests {
 
     fn build_distributed_plan_with_mv_refresh_ctx(
         case_name: &str,
-        plan: PhysicalPlanNode,
+        plan: OptimizerPhysicalNode,
         connectors: &ConnectorRegistry,
         mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     ) -> MultiFragmentBuildResult {
@@ -801,7 +801,7 @@ mod tests {
 
     fn build_distributed_plan_only(
         case_name: &str,
-        plan: PhysicalPlanNode,
+        plan: OptimizerPhysicalNode,
     ) -> MultiFragmentBuildResult {
         let catalog = DummyCatalog;
         let connectors = ConnectorRegistry::new();
@@ -811,7 +811,7 @@ mod tests {
 
     fn assert_distributed_plan_error_contains(
         case_name: &str,
-        plan: PhysicalPlanNode,
+        plan: OptimizerPhysicalNode,
         expected: &str,
     ) {
         let catalog = DummyCatalog;
@@ -1379,7 +1379,7 @@ mod tests {
         }
     }
 
-    fn scan_plan() -> PhysicalPlanNode {
+    fn scan_plan() -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
@@ -1409,7 +1409,7 @@ mod tests {
         )
     }
 
-    fn iceberg_data_file_scan_plan() -> PhysicalPlanNode {
+    fn iceberg_data_file_scan_plan() -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
@@ -1439,7 +1439,7 @@ mod tests {
         )
     }
 
-    fn values_plan_for_columns(columns: Vec<OutputColumn>) -> PhysicalPlanNode {
+    fn values_plan_for_columns(columns: Vec<OutputColumn>) -> OptimizerPhysicalNode {
         physical_node(
             Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
@@ -1465,7 +1465,7 @@ mod tests {
 
     fn aggregate_state_merge_plan_for_context(
         ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         aggregate_merge_plan_for_test(
             values_plan_for_columns(aggregate_physical_columns_with_locator_metadata_for_test()),
             values_plan_for_columns(aggregate_delta_state_columns_for_test()),
@@ -1475,7 +1475,7 @@ mod tests {
 
     fn target_state_scan_plan_for_context(
         ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let row_id = output_col(110, "__row_id__", DataType::Utf8, false);
         let region = output_col(111, "region", DataType::Utf8, true);
         let scan = target_state_scan_for_context(ctx);
@@ -1704,7 +1704,7 @@ mod tests {
         })
     }
 
-    fn version_scan_plan_for_fixture(fixture: &LocalVersionScanFixture) -> PhysicalPlanNode {
+    fn version_scan_plan_for_fixture(fixture: &LocalVersionScanFixture) -> OptimizerPhysicalNode {
         let id = output_col(120, "id", DataType::Int64, false);
         physical_node(
             Operator::PhysicalScan(ScanOp {
@@ -1733,10 +1733,10 @@ mod tests {
     }
 
     fn aggregate_merge_plan_for_test(
-        old_child: PhysicalPlanNode,
-        delta_child: PhysicalPlanNode,
+        old_child: OptimizerPhysicalNode,
+        delta_child: OptimizerPhysicalNode,
         aggregate_state_names: Vec<String>,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let output_columns = vec![
             output_col(1, "region", DataType::Utf8, true),
             output_col(2, "c", DataType::Int64, false),
@@ -1792,11 +1792,11 @@ mod tests {
     }
 
     fn branch_union_project_for_test(
-        merge: PhysicalPlanNode,
+        merge: OptimizerPhysicalNode,
         branch_id: i32,
         output_id_base: u32,
         seed_scalars: Option<&ScalarArena>,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let mut items = merge
             .output_columns
             .iter()
@@ -2125,7 +2125,7 @@ mod tests {
         }
     }
 
-    fn filter_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn filter_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = child.output_columns.clone();
         physical_node_with_scalars(
@@ -2152,7 +2152,7 @@ mod tests {
         )
     }
 
-    fn project_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn project_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = vec![output_col(101, "k_plus_one", DataType::Int64, false)];
         let items = vec![ProjectItem {
@@ -2171,7 +2171,7 @@ mod tests {
         )
     }
 
-    fn sort_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn sort_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let sort_col = child.output_columns[0].clone();
         let output_columns = child.output_columns.clone();
@@ -2201,10 +2201,10 @@ mod tests {
     }
 
     fn limit_plan(
-        child: PhysicalPlanNode,
+        child: OptimizerPhysicalNode,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let output_columns = child.output_columns.clone();
         physical_node(
             Operator::PhysicalLimit(LimitOp { limit, offset }),
@@ -2214,12 +2214,12 @@ mod tests {
     }
 
     fn top_n_plan(
-        child: PhysicalPlanNode,
+        child: OptimizerPhysicalNode,
         phase: TopNPhase,
         is_split: bool,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let sort_col = child.output_columns[0].clone();
         let output_columns = child.output_columns.clone();
@@ -2249,7 +2249,7 @@ mod tests {
         )
     }
 
-    fn aggregate_group_by_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn aggregate_group_by_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let k = output_col(1, "k", DataType::Int64, false);
         physical_node_with_scalars(
@@ -2269,7 +2269,7 @@ mod tests {
         )
     }
 
-    fn aggregate_count_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn aggregate_count_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let k = output_col(1, "k", DataType::Int64, false);
         let count = output_col(201, "count(*)", DataType::Int64, true);
@@ -2298,7 +2298,7 @@ mod tests {
         )
     }
 
-    fn root_gather_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn root_gather_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let output_columns = child.output_columns.clone();
         physical_node(
             Operator::PhysicalDistribution(PhysicalDistributionOp {
@@ -2309,7 +2309,10 @@ mod tests {
         )
     }
 
-    fn distribution_plan(child: PhysicalPlanNode, spec: DistributionSpec) -> PhysicalPlanNode {
+    fn distribution_plan(
+        child: OptimizerPhysicalNode,
+        spec: DistributionSpec,
+    ) -> OptimizerPhysicalNode {
         let output_columns = child.output_columns.clone();
         physical_node(
             Operator::PhysicalDistribution(PhysicalDistributionOp { spec }),
@@ -2318,7 +2321,7 @@ mod tests {
         )
     }
 
-    fn cte_produce_consume_plan() -> PhysicalPlanNode {
+    fn cte_produce_consume_plan() -> OptimizerPhysicalNode {
         let cte_id = 7;
         let produce = single_column_scan_plan(output_col(1101, "k", DataType::Int64, false));
         let produce_output_columns = produce.output_columns.clone();
@@ -2347,7 +2350,7 @@ mod tests {
         )
     }
 
-    fn inner_hash_join_two_scans_plan() -> PhysicalPlanNode {
+    fn inner_hash_join_two_scans_plan() -> OptimizerPhysicalNode {
         let (mut join, _, _) = hash_join_plan(JoinKind::Inner);
         let Operator::PhysicalHashJoin(hash_join) = &join.op else {
             panic!("expected hash join");
@@ -2368,7 +2371,7 @@ mod tests {
         join
     }
 
-    fn broadcast_join_exchange_plan() -> PhysicalPlanNode {
+    fn broadcast_join_exchange_plan() -> OptimizerPhysicalNode {
         let left = aliased_scan_plan("l", 1, 2);
         let right = distribution_plan(aliased_scan_plan("r", 3, 4), DistributionSpec::Broadcast);
         let left_key = column_ref_expr_with_qualifier(1, "l", "k", DataType::Int64, false);
@@ -2394,7 +2397,7 @@ mod tests {
         )
     }
 
-    fn two_sided_shuffle_join_exchange_plan() -> PhysicalPlanNode {
+    fn two_sided_shuffle_join_exchange_plan() -> OptimizerPhysicalNode {
         let left = distribution_plan(
             aliased_scan_plan("l", 1, 2),
             DistributionSpec::shuffle_agg([ColumnId::new_for_test(1)]),
@@ -2426,16 +2429,16 @@ mod tests {
         )
     }
 
-    fn left_outer_hash_join_plan() -> PhysicalPlanNode {
+    fn left_outer_hash_join_plan() -> OptimizerPhysicalNode {
         let (join, _, _) = hash_join_plan(JoinKind::LeftOuter);
         join
     }
 
-    fn hash_join_plan(join_type: JoinKind) -> (PhysicalPlanNode, TypedExpr, TypedExpr) {
+    fn hash_join_plan(join_type: JoinKind) -> (OptimizerPhysicalNode, TypedExpr, TypedExpr) {
         hash_join_plan_with_options(join_type, None, JoinOutput::Both)
     }
 
-    fn hash_join_other_condition_plan() -> PhysicalPlanNode {
+    fn hash_join_other_condition_plan() -> OptimizerPhysicalNode {
         let left_value = column_ref_expr_with_qualifier(2, "l", "v", DataType::Int64, true);
         let right_value = column_ref_expr_with_qualifier(4, "r", "v", DataType::Int64, true);
         let other_condition = cmp_expr(left_value, BinOp::Gt, right_value);
@@ -2444,7 +2447,7 @@ mod tests {
         join
     }
 
-    fn hash_join_surviving_side_plan(join_type: JoinKind) -> PhysicalPlanNode {
+    fn hash_join_surviving_side_plan(join_type: JoinKind) -> OptimizerPhysicalNode {
         let output = match join_type {
             JoinKind::RightSemi | JoinKind::RightAnti => JoinOutput::RightOnly,
             _ => JoinOutput::LeftOnly,
@@ -2464,7 +2467,7 @@ mod tests {
         join_type: JoinKind,
         other_condition: Option<TypedExpr>,
         output: JoinOutput,
-    ) -> (PhysicalPlanNode, TypedExpr, TypedExpr) {
+    ) -> (OptimizerPhysicalNode, TypedExpr, TypedExpr) {
         let left = aliased_scan_plan("l", 1, 2);
         let right = aliased_scan_plan("r", 3, 4);
         let left_key = column_ref_expr_with_qualifier(1, "l", "k", DataType::Int64, false);
@@ -2495,8 +2498,8 @@ mod tests {
     }
 
     fn join_output_columns(
-        left: &PhysicalPlanNode,
-        right: &PhysicalPlanNode,
+        left: &OptimizerPhysicalNode,
+        right: &OptimizerPhysicalNode,
         output: JoinOutput,
     ) -> Vec<OutputColumn> {
         match output {
@@ -2510,11 +2513,11 @@ mod tests {
         }
     }
 
-    fn nest_loop_cross_join_plan() -> PhysicalPlanNode {
+    fn nest_loop_cross_join_plan() -> OptimizerPhysicalNode {
         nest_loop_plan(JoinKind::Cross, None, JoinOutput::Both)
     }
 
-    fn nest_loop_condition_plan(join_type: JoinKind) -> PhysicalPlanNode {
+    fn nest_loop_condition_plan(join_type: JoinKind) -> OptimizerPhysicalNode {
         let left_value = column_ref_expr_with_qualifier(2, "l", "v", DataType::Int64, true);
         let right_value = column_ref_expr_with_qualifier(4, "r", "v", DataType::Int64, true);
         nest_loop_plan(
@@ -2524,7 +2527,7 @@ mod tests {
         )
     }
 
-    fn nest_loop_surviving_side_plan(join_type: JoinKind) -> PhysicalPlanNode {
+    fn nest_loop_surviving_side_plan(join_type: JoinKind) -> OptimizerPhysicalNode {
         let output = match join_type {
             JoinKind::RightSemi | JoinKind::RightAnti => JoinOutput::RightOnly,
             _ => JoinOutput::LeftOnly,
@@ -2542,7 +2545,7 @@ mod tests {
         join_type: JoinKind,
         condition: Option<TypedExpr>,
         output: JoinOutput,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let left = aliased_scan_plan("l", 1, 2);
         let right = aliased_scan_plan("r", 3, 4);
         let output_columns = join_output_columns(&left, &right, output);
@@ -2561,7 +2564,11 @@ mod tests {
         )
     }
 
-    fn union_plan(all: bool, left: PhysicalPlanNode, right: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn union_plan(
+        all: bool,
+        left: OptimizerPhysicalNode,
+        right: OptimizerPhysicalNode,
+    ) -> OptimizerPhysicalNode {
         let output_columns = set_op_output_columns();
         physical_node(
             Operator::PhysicalUnion(UnionOp {
@@ -2577,7 +2584,10 @@ mod tests {
         )
     }
 
-    fn intersect_plan(left: PhysicalPlanNode, right: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn intersect_plan(
+        left: OptimizerPhysicalNode,
+        right: OptimizerPhysicalNode,
+    ) -> OptimizerPhysicalNode {
         let output_columns = set_op_output_columns();
         physical_node(
             Operator::PhysicalIntersect(IntersectOp {
@@ -2592,7 +2602,10 @@ mod tests {
         )
     }
 
-    fn except_plan(left: PhysicalPlanNode, right: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn except_plan(
+        left: OptimizerPhysicalNode,
+        right: OptimizerPhysicalNode,
+    ) -> OptimizerPhysicalNode {
         let output_columns = set_op_output_columns();
         physical_node(
             Operator::PhysicalExcept(ExceptOp {
@@ -2614,7 +2627,7 @@ mod tests {
         ]
     }
 
-    fn values_rows_plan() -> PhysicalPlanNode {
+    fn values_rows_plan() -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
         let k = output_col(601, "k", DataType::Int64, false);
         let v = output_col(602, "v", DataType::Int64, true);
@@ -2636,7 +2649,7 @@ mod tests {
         )
     }
 
-    fn bad_values_row_length_plan() -> PhysicalPlanNode {
+    fn bad_values_row_length_plan() -> OptimizerPhysicalNode {
         let mut scalars = ScalarArena::new();
         let k = output_col(611, "k", DataType::Int64, false);
         let v = output_col(612, "v", DataType::Int64, true);
@@ -2652,7 +2665,7 @@ mod tests {
         )
     }
 
-    fn reordered_union_values_plan() -> PhysicalPlanNode {
+    fn reordered_union_values_plan() -> OptimizerPhysicalNode {
         let left = two_column_values_plan(621, 622);
         let right = two_column_values_plan(623, 624);
         let output_columns = vec![
@@ -2680,7 +2693,7 @@ mod tests {
         )
     }
 
-    fn two_column_values_plan(k_id: u32, s_id: u32) -> PhysicalPlanNode {
+    fn two_column_values_plan(k_id: u32, s_id: u32) -> OptimizerPhysicalNode {
         let k = output_col(k_id, "k", DataType::Int64, false);
         let s = output_col(s_id, "s", DataType::Utf8, true);
         physical_node(
@@ -2693,7 +2706,7 @@ mod tests {
         )
     }
 
-    fn assert_one_row_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+    fn assert_one_row_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
         let output_columns = child.output_columns.clone();
         physical_node(
             Operator::PhysicalAssertOneRow(AssertOneRowOp {
@@ -2704,7 +2717,7 @@ mod tests {
         )
     }
 
-    fn decode_over_scan_plan() -> PhysicalPlanNode {
+    fn decode_over_scan_plan() -> OptimizerPhysicalNode {
         let source_id = ColumnId::new_for_test(701);
         let output_id = ColumnId::new_for_test(702);
         let scan = physical_node(
@@ -2755,7 +2768,7 @@ mod tests {
         )
     }
 
-    fn repeat_grouping_sets_plan() -> PhysicalPlanNode {
+    fn repeat_grouping_sets_plan() -> OptimizerPhysicalNode {
         let k = output_col(801, "k", DataType::Int64, false);
         let grouping_col = output_col(802, "__grouping_fn_0", DataType::Int64, false);
         physical_node(
@@ -2775,7 +2788,7 @@ mod tests {
         )
     }
 
-    fn window_row_number_over_scan_plan() -> PhysicalPlanNode {
+    fn window_row_number_over_scan_plan() -> OptimizerPhysicalNode {
         let k = output_col(901, "k", DataType::Int64, false);
         let mut child = single_column_scan_plan(k.clone());
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
@@ -2804,7 +2817,7 @@ mod tests {
         )
     }
 
-    fn generate_series_plan() -> PhysicalPlanNode {
+    fn generate_series_plan() -> OptimizerPhysicalNode {
         let value = output_col(911, "value", DataType::Int64, false);
         physical_node(
             Operator::PhysicalGenerateSeries(GenerateSeriesOp {
@@ -2820,7 +2833,7 @@ mod tests {
         )
     }
 
-    fn unnest_table_function_over_scan_plan() -> PhysicalPlanNode {
+    fn unnest_table_function_over_scan_plan() -> OptimizerPhysicalNode {
         let array_type = DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
             DataType::Int64,
@@ -2847,7 +2860,7 @@ mod tests {
         )
     }
 
-    fn aliased_scan_plan(alias: &str, key_id: u32, value_id: u32) -> PhysicalPlanNode {
+    fn aliased_scan_plan(alias: &str, key_id: u32, value_id: u32) -> OptimizerPhysicalNode {
         let k = output_col(key_id, "k", DataType::Int64, false);
         let v = output_col(value_id, "v", DataType::Int64, true);
         physical_node(
@@ -2868,7 +2881,7 @@ mod tests {
         )
     }
 
-    fn single_column_scan_plan(column: OutputColumn) -> PhysicalPlanNode {
+    fn single_column_scan_plan(column: OutputColumn) -> OptimizerPhysicalNode {
         physical_node(
             Operator::PhysicalScan(ScanOp {
                 database: "test_db".to_string(),
@@ -2889,20 +2902,20 @@ mod tests {
 
     fn physical_node(
         op: Operator,
-        children: Vec<PhysicalPlanNode>,
+        children: Vec<OptimizerPhysicalNode>,
         output_columns: Vec<OutputColumn>,
-    ) -> PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
         let scalars = scalars_from_children(&children);
         physical_node_with_scalars(op, children, output_columns, scalars)
     }
 
     fn physical_node_with_scalars(
         op: Operator,
-        children: Vec<PhysicalPlanNode>,
+        children: Vec<OptimizerPhysicalNode>,
         output_columns: Vec<OutputColumn>,
         scalars: ScalarArena,
-    ) -> PhysicalPlanNode {
-        let mut plan = PhysicalPlanNode {
+    ) -> OptimizerPhysicalNode {
+        let mut plan = OptimizerPhysicalNode {
             op,
             children,
             stats: Statistics::default(),
@@ -2915,7 +2928,7 @@ mod tests {
         plan
     }
 
-    fn scalars_from_children(children: &[PhysicalPlanNode]) -> ScalarArena {
+    fn scalars_from_children(children: &[OptimizerPhysicalNode]) -> ScalarArena {
         children
             .iter()
             .find_map(|child| child.execution_props.scalar_arena.as_deref().cloned())

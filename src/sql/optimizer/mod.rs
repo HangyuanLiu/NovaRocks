@@ -15,7 +15,7 @@ pub(crate) mod operator;
 pub(crate) mod opt_expr;
 pub(crate) mod options;
 pub(crate) mod pattern;
-pub(crate) mod physical_plan;
+pub(crate) mod physical_tree;
 pub(crate) mod property;
 pub(crate) mod rewrite;
 pub(crate) mod rule;
@@ -30,7 +30,7 @@ pub(crate) mod topn_proof;
 
 pub(crate) use memo::Memo;
 pub(crate) use operator::Operator;
-pub(crate) use physical_plan::PhysicalPlanNode;
+pub(crate) use physical_tree::OptimizerPhysicalNode;
 pub(crate) use property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 
 use std::cell::RefCell;
@@ -64,7 +64,7 @@ const OPTIMIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Takes an optimizer-native logical tree and query-scoped statistics, applies query logical
 /// rewrites, converts to Memo, explores logical alternatives, generates physical
 /// alternatives, runs top-down cost-based search with property enforcement,
-/// and extracts the best physical plan.
+/// and extracts the best optimizer physical operator tree.
 pub(crate) fn optimize(
     plan_expr: OptExpr,
     scalar_arena: ScalarArena,
@@ -72,7 +72,7 @@ pub(crate) fn optimize(
     factory: ColumnRefFactory,
     dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
-) -> Result<PhysicalPlanNode, String> {
+) -> Result<OptimizerPhysicalNode, String> {
     validate_query_stats_bound(&plan_expr)?;
     let stats_input = OptimizerStatsInput::from_query_stats(query_stats);
     optimize_with_root_property(
@@ -92,7 +92,7 @@ pub(crate) fn optimize_with_root_distribution(
     query_stats: &QueryStatsSnapshot,
     factory: ColumnRefFactory,
     root_distribution: DistributionSpec,
-) -> Result<PhysicalPlanNode, String> {
+) -> Result<OptimizerPhysicalNode, String> {
     validate_query_stats_bound(&plan_expr)?;
     let root_required = PhysicalPropertySet {
         distribution: root_distribution,
@@ -117,7 +117,7 @@ pub(crate) fn optimize_with_legacy_table_stats_for_migration(
     factory: ColumnRefFactory,
     dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
-) -> Result<PhysicalPlanNode, String> {
+) -> Result<OptimizerPhysicalNode, String> {
     // Migration-only entry point for callers that still build unbound scan
     // expressions. The scan estimator ignores this name-keyed map; production
     // query planning must use `optimize` with a bound QueryStatsSnapshot.
@@ -139,7 +139,7 @@ pub(crate) fn optimize_with_root_distribution_and_legacy_table_stats_for_migrati
     table_stats: &HashMap<String, TableStatistics>,
     factory: ColumnRefFactory,
     root_distribution: DistributionSpec,
-) -> Result<PhysicalPlanNode, String> {
+) -> Result<OptimizerPhysicalNode, String> {
     // Migration-only entry point; see `optimize_with_legacy_table_stats_for_migration`.
     let root_required = PhysicalPropertySet {
         distribution: root_distribution,
@@ -165,7 +165,7 @@ fn optimize_with_root_property(
     dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
     root_required: PhysicalPropertySet,
-) -> Result<PhysicalPlanNode, String> {
+) -> Result<OptimizerPhysicalNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
     // Wrap factory in Rc<RefCell<...>> so it can be shared with RewriteContext
@@ -292,7 +292,7 @@ fn optimize_with_root_property(
         &mut memo.factory,
         &options,
     );
-    physical_plan::attach_scalar_arena(&mut physical, Arc::new(memo.scalars.clone()));
+    physical_tree::attach_scalar_arena(&mut physical, Arc::new(memo.scalars.clone()));
 
     Ok(physical)
 }
@@ -842,7 +842,7 @@ mod is_known_rule_name_tests {
         factory: ColumnRefFactory,
         dictionary_provider: Option<Arc<dyn QueryDictionaryProvider>>,
         mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
-    ) -> Result<PhysicalPlanNode, String> {
+    ) -> Result<OptimizerPhysicalNode, String> {
         let mut scalar_arena = ScalarArena::new();
         let plan_expr = try_logical_plan_to_opt_expr(&plan, &mut scalar_arena)?;
         optimize_with_legacy_table_stats_for_migration(
@@ -860,7 +860,7 @@ mod is_known_rule_name_tests {
         table_stats: &HashMap<String, TableStatistics>,
         factory: ColumnRefFactory,
         root_distribution: DistributionSpec,
-    ) -> Result<PhysicalPlanNode, String> {
+    ) -> Result<OptimizerPhysicalNode, String> {
         let mut scalar_arena = ScalarArena::new();
         let plan_expr = try_logical_plan_to_opt_expr(&plan, &mut scalar_arena)?;
         optimize_with_root_distribution_and_legacy_table_stats_for_migration(
@@ -1266,7 +1266,7 @@ mod is_known_rule_name_tests {
     }
 
     fn assert_root_distribution(
-        physical: &crate::sql::optimizer::physical_plan::PhysicalPlanNode,
+        physical: &crate::sql::optimizer::physical_tree::OptimizerPhysicalNode,
         expected: &crate::sql::optimizer::property::DistributionSpec,
     ) {
         match &physical.op {
@@ -1282,7 +1282,7 @@ mod is_known_rule_name_tests {
         use crate::exec::node::sort::SortTopNType;
         use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
         use crate::sql::optimizer::operator::Operator;
-        use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+        use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
 
         struct RankingCatalog;
         impl CatalogProvider for RankingCatalog {
@@ -1317,7 +1317,7 @@ mod is_known_rule_name_tests {
             }
         }
 
-        fn has_rank_partition_topn_sort(plan: &PhysicalPlanNode) -> bool {
+        fn has_rank_partition_topn_sort(plan: &OptimizerPhysicalNode) -> bool {
             if let Operator::PhysicalSort(sort) = &plan.op
                 && sort.partition_limit == Some(2)
                 && sort.topn_type == Some(SortTopNType::Rank)

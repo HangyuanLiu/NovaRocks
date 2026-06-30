@@ -13,7 +13,7 @@ use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::operator::{Operator, ScalarProjectItem};
 use crate::sql::optimizer::options::OptimizerOptions;
-use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::scalar_expr;
 
@@ -22,7 +22,7 @@ pub(crate) const CSE_RULE: &str = "CommonSubexpressionReuse";
 
 /// Entry point: rewrite the physical tree in place. Gated by `CSE_RULE`.
 pub(crate) fn rewrite(
-    root: &mut PhysicalPlanNode,
+    root: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
     options: &OptimizerOptions,
@@ -35,7 +35,7 @@ pub(crate) fn rewrite(
     rewrite_node(root, scalars, factory);
 }
 
-fn max_existing_column_id(node: &PhysicalPlanNode) -> u32 {
+fn max_existing_column_id(node: &OptimizerPhysicalNode) -> u32 {
     let local = node
         .output_columns
         .iter()
@@ -62,7 +62,7 @@ fn max_existing_column_id(node: &PhysicalPlanNode) -> u32 {
 
 /// Post-order walk. Per-operator drivers are added in later tasks.
 fn rewrite_node(
-    node: &mut PhysicalPlanNode,
+    node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
 ) {
@@ -573,7 +573,7 @@ fn output_column_for_project_item(scalars: &ScalarArena, item: &ScalarProjectIte
     }
 }
 
-fn repeat_virtual_output_columns(node: &PhysicalPlanNode) -> Vec<OutputColumn> {
+fn repeat_virtual_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
     let mut columns = match &node.op {
         Operator::PhysicalRepeat(repeat) => repeat
             .grouping_fn_ids
@@ -594,7 +594,7 @@ fn repeat_virtual_output_columns(node: &PhysicalPlanNode) -> Vec<OutputColumn> {
     columns
 }
 
-fn available_output_ids(node: &PhysicalPlanNode) -> HashSet<ColumnId> {
+fn available_output_ids(node: &OptimizerPhysicalNode) -> HashSet<ColumnId> {
     match &node.op {
         Operator::PhysicalScan(scan) => {
             let required = scan
@@ -762,7 +762,7 @@ fn prelude_binds_to_outputs(
 }
 
 fn wrap_project_around_child(
-    child: &mut PhysicalPlanNode,
+    child: &mut OptimizerPhysicalNode,
     prelude: Vec<ScalarProjectItem>,
     scalars: &mut ScalarArena,
 ) {
@@ -806,7 +806,7 @@ fn wrap_project_around_child(
             .map(|item| output_column_for_project_item(scalars, item)),
     );
 
-    *child = PhysicalPlanNode {
+    *child = OptimizerPhysicalNode {
         op: Operator::PhysicalProject(crate::sql::optimizer::operator::ProjectOp {
             items,
             output_qualifier: None,
@@ -821,7 +821,7 @@ fn wrap_project_around_child(
 }
 
 fn insert_or_reuse_project_below(
-    child: &mut PhysicalPlanNode,
+    child: &mut OptimizerPhysicalNode,
     prelude: Vec<ScalarProjectItem>,
     scalars: &mut ScalarArena,
 ) {
@@ -850,7 +850,7 @@ fn insert_or_reuse_project_below(
     wrap_project_around_child(child, prelude, scalars);
 }
 
-fn output_column_set(node: &PhysicalPlanNode) -> HashSet<ColumnId> {
+fn output_column_set(node: &OptimizerPhysicalNode) -> HashSet<ColumnId> {
     node.output_columns
         .iter()
         .map(|column| column.column_id)
@@ -868,7 +868,7 @@ fn side_subset(scalars: &ScalarArena, id: ScalarId, side_columns: &HashSet<Colum
 }
 
 fn rewrite_project(
-    node: &mut PhysicalPlanNode,
+    node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
 ) {
@@ -953,7 +953,7 @@ fn rewrite_project(
     }));
     child_project_items.extend(prelude);
 
-    let cse_project = PhysicalPlanNode {
+    let cse_project = OptimizerPhysicalNode {
         op: Operator::PhysicalProject(crate::sql::optimizer::operator::ProjectOp {
             items: child_project_items,
             output_qualifier: None,
@@ -969,7 +969,7 @@ fn rewrite_project(
 }
 
 fn rewrite_filter(
-    node: &mut PhysicalPlanNode,
+    node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
 ) {
@@ -994,7 +994,7 @@ fn rewrite_filter(
 }
 
 fn rewrite_aggregate(
-    node: &mut PhysicalPlanNode,
+    node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
 ) {
@@ -1040,7 +1040,7 @@ fn rewrite_aggregate(
 }
 
 fn rewrite_join(
-    node: &mut PhysicalPlanNode,
+    node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
 ) {
@@ -1095,7 +1095,7 @@ fn rewrite_join(
 }
 
 fn rewrite_sort(
-    node: &mut PhysicalPlanNode,
+    node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
 ) {
@@ -1126,7 +1126,7 @@ fn rewrite_sort(
 }
 
 fn rewrite_topn(
-    node: &mut PhysicalPlanNode,
+    node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
 ) {
@@ -1153,7 +1153,7 @@ fn rewrite_topn(
 }
 
 fn rewrite_window(
-    node: &mut PhysicalPlanNode,
+    node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
 ) {
@@ -1206,7 +1206,7 @@ mod tests {
         PhysicalNestLoopJoinOp, ProjectOp, RepeatOp, ScalarAggregateSpec, ScalarProjectItem,
         ScalarWindowSpec, SortOp, TopNOp, TopNPhase, ValuesOp, WindowOp,
     };
-    use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
+    use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::{
         HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey,
@@ -1329,8 +1329,8 @@ mod tests {
         }
     }
 
-    fn values_node(columns: Vec<OutputColumn>) -> PhysicalPlanNode {
-        PhysicalPlanNode {
+    fn values_node(columns: Vec<OutputColumn>) -> OptimizerPhysicalNode {
+        OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: columns.clone(),
@@ -1344,7 +1344,7 @@ mod tests {
         }
     }
 
-    fn seed_factory_above_plan(factory: &mut ColumnRefFactory, root: &PhysicalPlanNode) {
+    fn seed_factory_above_plan(factory: &mut ColumnRefFactory, root: &OptimizerPhysicalNode) {
         let next_id = super::max_existing_column_id(root).saturating_add(1);
         while factory.peek_next_id() < next_id {
             let raw = factory.peek_next_id();
@@ -1624,7 +1624,7 @@ mod tests {
         let b = col(&mut arena, 102);
         let a_plus_b = add(&mut arena, a, b);
         let doubled = add(&mut arena, a_plus_b, a_plus_b);
-        let child = PhysicalPlanNode {
+        let child = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![output_column(101, "a"), output_column(102, "b")],
@@ -1646,7 +1646,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: vec![
                     project_item(a_plus_b, 110, "x"),
@@ -1723,7 +1723,7 @@ mod tests {
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 1);
         let child = values_node(vec![output_column(10, "stale")]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: vec![project_item(a, 10, "stale")],
                 output_qualifier: None,
@@ -1755,7 +1755,7 @@ mod tests {
         let mut arena = ScalarArena::new();
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();
         let values = values_node(vec![output_column(1, "a"), output_column(2, "b")]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalRepeat(RepeatOp {
                 repeat_column_ref_list: vec![vec!["a".to_string()]],
                 repeat_column_ref_ids: vec![vec![ColumnId(1)]],
@@ -1797,7 +1797,7 @@ mod tests {
         let a_plus_b = add(&mut arena, a, b);
         let doubled = add(&mut arena, a_plus_b, a_plus_b);
         let values = values_node(vec![output_column(1, "a"), output_column(2, "b")]);
-        let child = PhysicalPlanNode {
+        let child = OptimizerPhysicalNode {
             op: Operator::PhysicalRepeat(RepeatOp {
                 repeat_column_ref_list: vec![vec!["a".to_string()]],
                 repeat_column_ref_ids: vec![vec![ColumnId(1)]],
@@ -1816,7 +1816,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: vec![
                     project_item(a_plus_b, 3, "x"),
@@ -1881,7 +1881,7 @@ mod tests {
             DataType::Int64,
             true,
         );
-        let child = PhysicalPlanNode {
+        let child = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![
@@ -1901,7 +1901,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: vec![
                     project_item(b_plus_c, 110, "x"),
@@ -1942,7 +1942,7 @@ mod tests {
         let b = col(&mut arena, 102);
         let a_plus_b = add(&mut arena, a, b);
         let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
-        let child = PhysicalPlanNode {
+        let child = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![output_column(101, "a"), output_column(102, "b")],
@@ -1957,7 +1957,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let mut parent = PhysicalPlanNode {
+        let mut parent = OptimizerPhysicalNode {
             op: Operator::PhysicalFilter(FilterOp {
                 predicate: gt(&mut arena, a, b),
             }),
@@ -2002,7 +2002,7 @@ mod tests {
         let b = col(&mut arena, 102);
         let a_plus_b = add(&mut arena, a, b);
         let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
-        let values = PhysicalPlanNode {
+        let values = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![output_column(101, "a"), output_column(102, "b")],
@@ -2014,7 +2014,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let mut stale_filter = PhysicalPlanNode {
+        let mut stale_filter = OptimizerPhysicalNode {
             op: Operator::PhysicalFilter(FilterOp {
                 predicate: gt(&mut arena, a, b),
             }),
@@ -2062,7 +2062,7 @@ mod tests {
         let a_plus_b = add(&mut arena, a, b);
         let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
         let values = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
-        let mut repeat = PhysicalPlanNode {
+        let mut repeat = OptimizerPhysicalNode {
             op: Operator::PhysicalRepeat(RepeatOp {
                 repeat_column_ref_list: vec![vec!["a".to_string()]],
                 repeat_column_ref_ids: vec![vec![ColumnId(101)]],
@@ -2132,7 +2132,7 @@ mod tests {
         let y = col(&mut arena, 202);
         let x_plus_y = add(&mut arena, x, y);
         let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[x_plus_y]);
-        let values = PhysicalPlanNode {
+        let values = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![output_column(101, "a"), output_column(102, "b")],
@@ -2144,7 +2144,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let mut child_project = PhysicalPlanNode {
+        let mut child_project = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: vec![project_item(a, 201, "x"), project_item(b, 202, "y")],
                 output_qualifier: None,
@@ -2199,7 +2199,7 @@ mod tests {
         let b = col(&mut arena, 102);
         let a_plus_b = add(&mut arena, a, b);
         let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
-        let values = PhysicalPlanNode {
+        let values = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![output_column(101, "a"), output_column(102, "b")],
@@ -2211,7 +2211,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let mut child_project = PhysicalPlanNode {
+        let mut child_project = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: vec![project_item(a, 101, "a"), project_item(b, 102, "b")],
                 output_qualifier: None,
@@ -2275,7 +2275,7 @@ mod tests {
         let lower = gt(&mut arena, a_plus_b, ten);
         let upper = lt(&mut arena, a_plus_b, twenty);
         let predicate = and(&mut arena, lower, upper);
-        let child = PhysicalPlanNode {
+        let child = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![output_column(101, "a"), output_column(102, "b")],
@@ -2287,7 +2287,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalFilter(FilterOp { predicate }),
             children: vec![child],
             stats: Statistics::default(),
@@ -2355,7 +2355,7 @@ mod tests {
         let lower = gt(&mut arena, x_plus_y, ten);
         let upper = lt(&mut arena, x_plus_y, twenty);
         let predicate = and(&mut arena, lower, upper);
-        let values = PhysicalPlanNode {
+        let values = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![output_column(101, "a"), output_column(102, "b")],
@@ -2367,7 +2367,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let project = PhysicalPlanNode {
+        let project = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: vec![project_item(a, 201, "x"), project_item(b, 202, "y")],
                 output_qualifier: None,
@@ -2379,7 +2379,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalFilter(FilterOp { predicate }),
             children: vec![project],
             stats: Statistics::default(),
@@ -2460,7 +2460,7 @@ mod tests {
         let b = col(&mut arena, 102);
         let a_mul_b = mul(&mut arena, a, b);
         let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: vec![],
@@ -2524,7 +2524,7 @@ mod tests {
         let grouping = col(&mut arena, 109);
         let a_plus_b = add(&mut arena, a, b);
         let values = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
-        let repeat = PhysicalPlanNode {
+        let repeat = OptimizerPhysicalNode {
             op: Operator::PhysicalRepeat(RepeatOp {
                 repeat_column_ref_list: vec![vec!["a".to_string()]],
                 repeat_column_ref_ids: vec![vec![ColumnId(101)]],
@@ -2543,7 +2543,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let distribution = PhysicalPlanNode {
+        let distribution = OptimizerPhysicalNode {
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
                 spec: DistributionSpec::Gather,
             }),
@@ -2554,7 +2554,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: vec![a, grouping],
@@ -2617,7 +2617,7 @@ mod tests {
             output_column(301, "sum_state"),
             output_column(302, "avg_state"),
         ]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Global,
                 group_by: vec![],
@@ -2665,7 +2665,7 @@ mod tests {
         let b = col(&mut arena, 102);
         let a_mul_b = mul(&mut arena, a, b);
         let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: vec![],
@@ -2732,7 +2732,7 @@ mod tests {
         let b = col(&mut arena, 102);
         let a_mul_b = mul(&mut arena, a, b);
         let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalSort(SortOp {
                 items: vec![sort_key(a_mul_b)],
                 analytic_partition_exprs: vec![a_mul_b],
@@ -2779,7 +2779,7 @@ mod tests {
         let b = col(&mut arena, 102);
         let a_mul_b = mul(&mut arena, a, b);
         let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalTopN(TopNOp {
                 items: vec![sort_key(a_mul_b), sort_key(a_mul_b)],
                 limit: Some(10),
@@ -2825,7 +2825,7 @@ mod tests {
         let b = col(&mut arena, 102);
         let a_mul_b = mul(&mut arena, a, b);
         let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalWindow(WindowOp {
                 window_exprs: vec![ScalarWindowSpec {
                     output_column_id: ColumnId::new_for_test(201),
@@ -2895,7 +2895,7 @@ mod tests {
         let condition = and(&mut arena, lower, upper);
         let left = values_node(vec![output_column(101, "left_a")]);
         let right = values_node(vec![output_column(201, "right_b")]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
                 join_type: JoinKind::Inner,
                 condition: Some(condition),
@@ -2959,7 +2959,7 @@ mod tests {
             output_column(201, "right_b"),
             output_column(202, "right_k"),
         ]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
@@ -3028,7 +3028,7 @@ mod tests {
         let condition = and(&mut arena, lower, upper);
         let left = values_node(vec![output_column(101, "left_a")]);
         let right = values_node(vec![output_column(201, "right_b")]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
                 join_type: JoinKind::Inner,
                 condition: Some(condition),
@@ -3065,7 +3065,7 @@ mod tests {
         let condition = and(&mut arena, lower, upper);
         let left = values_node(vec![output_column(101, "shared_left")]);
         let right = values_node(vec![output_column(101, "shared_right")]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
                 join_type: JoinKind::Inner,
                 condition: Some(condition),
@@ -3127,7 +3127,7 @@ mod tests {
         let condition = and(&mut arena, lower, upper);
         let left = values_node(vec![output_column(101, "left_a")]);
         let right = values_node(vec![output_column(201, "right_b")]);
-        let mut node = PhysicalPlanNode {
+        let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
                 join_type: JoinKind::Inner,
                 condition: Some(condition),
