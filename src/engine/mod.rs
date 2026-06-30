@@ -6059,7 +6059,7 @@ enable_path_style_access = true
         use crate::connector::scan_planning::{
             BeginScanContext, ConnectorScanPlanner, SplitPlanningContext,
         };
-        use crate::connector::starrocks::table::{
+        use crate::connector::starrocks::table::scan_planner::{
             StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle,
         };
 

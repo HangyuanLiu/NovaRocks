@@ -18,16 +18,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use crate::cache::ExternalDataCacheRangeOptions;
 use crate::connector::iceberg::delete_file::{IcebergDeleteFileSpec, IcebergFileContent};
 use crate::connector::iceberg::position_delete::load_position_deletes;
 use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp};
+use crate::exec::node::scan::{
+    HdfsScanFileFormat, IncrementalScanRange, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp,
+};
 use crate::formats::{FileFormatConfig, build_format_iter};
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
 use crate::runtime::profile::RuntimeProfile;
-use crate::thrift::descriptors;
-use crate::thrift::internal_service;
 
 fn delete_files_have_position_deletes(delete_files: &[IcebergDeleteFileSpec]) -> bool {
     delete_files
@@ -62,7 +61,7 @@ pub struct HdfsScanConfig {
     pub object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
     /// Cached Iceberg table locations keyed by `table_id`, used to resolve incremental
     /// scan ranges that only carry `relative_path`.
-    pub iceberg_table_locations: HashMap<crate::thrift::types::TTableId, String>,
+    pub iceberg_table_locations: HashMap<i64, String>,
     /// Per-slot global dictionary encode maps (string bytes -> dict id) for
     /// dict-encoded output columns. Empty for all non-dict scans. Injected into
     /// the parquet format config in `execute_iter`; the reader reads the dict
@@ -97,10 +96,10 @@ impl HdfsScanOp {
         }
     }
 
-    fn expected_hdfs_file_format(&self) -> Option<descriptors::THdfsFileFormat> {
+    fn expected_hdfs_file_format(&self) -> Option<HdfsScanFileFormat> {
         match self.cfg.format.as_ref() {
-            Some(FileFormatConfig::Parquet(_)) => Some(descriptors::THdfsFileFormat::PARQUET),
-            Some(FileFormatConfig::Orc(_)) => Some(descriptors::THdfsFileFormat::ORC),
+            Some(FileFormatConfig::Parquet(_)) => Some(HdfsScanFileFormat::Parquet),
+            Some(FileFormatConfig::Orc(_)) => Some(HdfsScanFileFormat::Orc),
             None => None,
         }
     }
@@ -269,32 +268,29 @@ impl ScanOp for HdfsScanOp {
 
     fn build_incremental_morsels(
         &self,
-        scan_ranges: &[internal_service::TScanRangeParams],
+        scan_ranges: &[IncrementalScanRange],
     ) -> Result<ScanMorsels, String> {
         let mut morsels = Vec::new();
         let mut has_more = false;
         let expected_file_format = self.expected_hdfs_file_format();
 
-        for p in scan_ranges {
-            if p.empty.unwrap_or(false) {
-                if let Some(value) = p.has_more {
-                    has_more = value;
-                }
-                continue;
-            }
-            if let Some(value) = p.has_more {
+        for scan_range in scan_ranges {
+            if let Some(value) = scan_range.has_more() {
                 has_more = value;
             }
 
-            let Some(hdfs_range) = p.scan_range.hdfs_scan_range.as_ref() else {
+            let IncrementalScanRange::Hdfs {
+                range: hdfs_range, ..
+            } = scan_range
+            else {
                 continue;
             };
 
             if let Some(expected) = expected_file_format {
-                let file_format = hdfs_range.file_format.as_ref().ok_or_else(|| {
+                let file_format = hdfs_range.file_format.ok_or_else(|| {
                     "incremental hdfs scan range is missing file_format".to_string()
                 })?;
-                if *file_format != expected {
+                if file_format != expected {
                     return Err(format!(
                         "incremental hdfs scan range file_format mismatch: expected {:?}, got {:?}",
                         expected, file_format
@@ -341,11 +337,11 @@ impl ScanOp for HdfsScanOp {
                 );
             };
 
-            let file_len = hdfs_range.file_length.unwrap_or(0);
+            let file_len = hdfs_range.file_length;
             let file_len = if file_len > 0 { file_len as u64 } else { 0 };
-            let offset = hdfs_range.offset.unwrap_or(0);
+            let offset = hdfs_range.offset;
             let offset = if offset >= 0 { offset as u64 } else { 0 };
-            let length = hdfs_range.length.unwrap_or(0);
+            let length = hdfs_range.length;
             let mut length = if length > 0 { length as u64 } else { 0 };
             if length == 0 && file_len > offset {
                 length = file_len - offset;
@@ -362,9 +358,9 @@ impl ScanOp for HdfsScanOp {
             };
 
             let delete_files = self.lowered_delete_files_for_range(&path, offset, length)?;
-            let ivm_change_op = extract_incremental_change_op(scan_range_id, hdfs_range)?;
-            // data_sequence_number is not carried in THdfsScanRange (FE
-            // incremental path). It is populated at initial lowering time from
+            let ivm_change_op = hdfs_range.ivm_change_op;
+            // data_sequence_number is not carried by FE incremental ranges.
+            // It is populated at initial lowering time from
             // the Iceberg manifest entry for V3 row-lineage tables.
             let data_sequence_number: Option<i64> = None;
             morsels.push(ScanMorsel::FileRange {
@@ -377,7 +373,7 @@ impl ScanOp for HdfsScanOp {
                 data_sequence_number,
                 ivm_change_op,
                 included_positions: None,
-                external_datacache: build_external_datacache_options(hdfs_range),
+                external_datacache: hdfs_range.external_datacache.clone(),
                 delete_files,
             });
         }
@@ -559,73 +555,8 @@ impl ScanOp for HdfsScanOp {
     }
 }
 
-fn extract_incremental_change_op(
-    scan_range_id: i32,
-    hdfs_range: &crate::thrift::plan_nodes::THdfsScanRange,
-) -> Result<Option<i8>, String> {
-    let Some(extended_columns) = hdfs_range.extended_columns.as_ref() else {
-        return Ok(None);
-    };
-    if extended_columns.is_empty() {
-        return Ok(None);
-    }
-    if extended_columns.len() != 1 {
-        return Err(format!(
-            "incremental hdfs scan range scan_range_id={scan_range_id} expects exactly one __change_op extended column, got {}",
-            extended_columns.len()
-        ));
-    }
-    let slot_id = *extended_columns
-        .keys()
-        .next()
-        .expect("non-empty extended_columns has a first key");
-    let slot = crate::common::ids::SlotId::try_from(slot_id).map_err(|e| {
-        format!(
-            "incremental hdfs scan range scan_range_id={scan_range_id} has invalid __change_op slot_id={slot_id}: {e}"
-        )
-    })?;
-    crate::lower::node::hdfs_scan::extract_change_op_from_extended_columns(
-        scan_range_id,
-        hdfs_range,
-        Some(slot),
-    )
-}
-
-fn build_external_datacache_options(
-    hdfs_range: &crate::thrift::plan_nodes::THdfsScanRange,
-) -> Option<ExternalDataCacheRangeOptions> {
-    let candidate_node = hdfs_range
-        .candidate_node
-        .as_ref()
-        .map(|node| node.trim())
-        .filter(|node| !node.is_empty())
-        .map(|node| node.to_string());
-    let options = ExternalDataCacheRangeOptions {
-        modification_time: hdfs_range.modification_time,
-        enable_populate_datacache: hdfs_range
-            .datacache_options
-            .as_ref()
-            .and_then(|opts| opts.enable_populate_datacache),
-        datacache_priority: hdfs_range
-            .datacache_options
-            .as_ref()
-            .and_then(|opts| opts.priority),
-        candidate_node,
-    };
-    if options.modification_time.is_some()
-        || options.enable_populate_datacache.is_some()
-        || options.datacache_priority.is_some()
-        || options.candidate_node.is_some()
-    {
-        Some(options)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema};
@@ -637,153 +568,46 @@ mod tests {
         IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
     };
     use crate::exec::chunk::ChunkSchema;
-    use crate::exec::node::scan::{ScanMorsel, ScanOp};
+    use crate::exec::node::scan::{
+        HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange, ScanMorsel, ScanOp,
+    };
     use crate::formats::parquet::{
         ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind, VariantPathPruningPredicate,
     };
     use crate::fs::scan_context::FileScanRange;
-    use crate::thrift::descriptors;
-    use crate::thrift::internal_service;
-    use crate::thrift::plan_nodes;
-    use crate::thrift::{exprs, types};
 
     use super::{HdfsScanConfig, HdfsScanOp, apply_parquet_pruning_gate_for_delete_files};
 
-    fn make_hdfs_range(
+    fn make_hdfs_range(path: &str, first_row_id: Option<i64>) -> IncrementalScanRange {
+        make_hdfs_range_with_change_op(path, first_row_id, None)
+    }
+
+    fn make_hdfs_range_with_change_op(
         path: &str,
         first_row_id: Option<i64>,
-    ) -> internal_service::TScanRangeParams {
-        make_hdfs_range_with_extended(path, first_row_id, None)
+        ivm_change_op: Option<i8>,
+    ) -> IncrementalScanRange {
+        IncrementalScanRange::Hdfs {
+            has_more: None,
+            range: IncrementalHdfsScanRange {
+                file_format: Some(HdfsScanFileFormat::Parquet),
+                full_path: Some(path.to_string()),
+                relative_path: None,
+                table_id: None,
+                file_length: 256,
+                offset: 0,
+                length: 100,
+                first_row_id,
+                ivm_change_op,
+                external_datacache: None,
+            },
+        }
     }
 
-    fn make_hdfs_range_with_extended(
-        path: &str,
-        first_row_id: Option<i64>,
-        extended_columns: Option<
-            BTreeMap<crate::thrift::types::TSlotId, crate::thrift::exprs::TExpr>,
-        >,
-    ) -> internal_service::TScanRangeParams {
-        let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
-            None::<String>,
-            Some(0_i64),
-            Some(100_i64),
-            None::<i64>,
-            Some(256_i64),
-            Some(descriptors::THdfsFileFormat::PARQUET),
-            None::<descriptors::TTextFileDesc>,
-            Some(path.to_string()),
-            None::<Vec<String>>,
-            None::<bool>,
-            None::<Vec<plan_nodes::TIcebergDeleteFile>>,
-            None::<i64>,
-            None::<bool>,
-            None::<String>,
-            None::<String>,
-            None::<i64>,
-            None::<crate::thrift::data_cache::TDataCacheOptions>,
-            None::<Vec<crate::thrift::types::TSlotId>>,
-            None::<bool>,
-            None::<std::collections::BTreeMap<String, String>>,
-            None::<Vec<crate::thrift::types::TSlotId>>,
-            None::<bool>,
-            None::<String>,
-            None::<bool>,
-            None::<String>,
-            None::<String>,
-            None::<plan_nodes::TPaimonDeletionFile>,
-            extended_columns,
-            None::<descriptors::THdfsPartition>,
-            None::<crate::thrift::types::TTableId>,
-            None::<plan_nodes::TDeletionVectorDescriptor>,
-            None::<String>,
-            None::<i64>,
-            None::<bool>,
-            None::<std::collections::BTreeMap<i32, crate::thrift::exprs::TExprMinMaxValue>>,
-            None::<i32>,
-            first_row_id,
-            None::<i64>, // data_sequence_number: not set in test helper
-            None::<Vec<i64>>,
-        );
-        internal_service::TScanRangeParams::new(
-            plan_nodes::TScanRange::new(
-                None::<plan_nodes::TInternalScanRange>,
-                None::<Vec<u8>>,
-                None::<plan_nodes::TBrokerScanRange>,
-                None::<plan_nodes::TEsScanRange>,
-                Some(hdfs_scan_range),
-                None::<plan_nodes::TBinlogScanRange>,
-                None::<plan_nodes::TBenchmarkScanRange>,
-            ),
-            None::<i32>,
-            Some(false),
-            None::<bool>,
-        )
-    }
-
-    fn make_end_marker(has_more: bool) -> internal_service::TScanRangeParams {
-        internal_service::TScanRangeParams::new(
-            plan_nodes::TScanRange::new(
-                None::<plan_nodes::TInternalScanRange>,
-                None::<Vec<u8>>,
-                None::<plan_nodes::TBrokerScanRange>,
-                None::<plan_nodes::TEsScanRange>,
-                None::<plan_nodes::THdfsScanRange>,
-                None::<plan_nodes::TBinlogScanRange>,
-                None::<plan_nodes::TBenchmarkScanRange>,
-            ),
-            None::<i32>,
-            Some(true),
-            Some(has_more),
-        )
-    }
-
-    fn int_expr(value: i64) -> exprs::TExpr {
-        exprs::TExpr::new(vec![exprs::TExprNode {
-            node_type: exprs::TExprNodeType::INT_LITERAL,
-            type_: crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-                types::TPrimitiveType::BIGINT,
-            ),
-            opcode: None,
-            num_children: 0,
-            agg_expr: None,
-            bool_literal: None,
-            case_expr: None,
-            date_literal: None,
-            float_literal: None,
-            int_literal: Some(exprs::TIntLiteral { value }),
-            in_predicate: None,
-            is_null_pred: None,
-            like_pred: None,
-            literal_pred: None,
-            slot_ref: None,
-            string_literal: None,
-            tuple_is_null_pred: None,
-            info_func: None,
-            decimal_literal: None,
-            output_scale: 0,
-            fn_call_expr: None,
-            large_int_literal: None,
-            output_column: None,
-            output_type: None,
-            vector_opcode: None,
-            fn_: None,
-            vararg_start_idx: None,
-            child_type: None,
-            vslot_ref: None,
-            used_subfield_names: None,
-            binary_literal: None,
-            copy_flag: None,
-            check_is_out_of_bounds: None,
-            use_vectorized: None,
-            has_nullable_child: None,
-            is_nullable: None,
-            child_type_desc: None,
-            is_monotonic: None,
-            dict_query_expr: None,
-            dictionary_get_expr: None,
-            is_index_only_filter: None,
-            is_nondeterministic: None,
-        }])
+    fn make_end_marker(has_more: bool) -> IncrementalScanRange {
+        IncrementalScanRange::Empty {
+            has_more: Some(has_more),
+        }
     }
 
     fn test_datacache_context() -> crate::cache::DataCacheContext {
@@ -1114,10 +938,10 @@ mod tests {
         let op = HdfsScanOp::new(cfg);
 
         let morsels = op
-            .build_incremental_morsels(&[make_hdfs_range_with_extended(
+            .build_incremental_morsels(&[make_hdfs_range_with_change_op(
                 "s3://bucket/path/file.parquet",
                 None,
-                Some(BTreeMap::from([(9, int_expr(-1))])),
+                Some(-1),
             )])
             .expect("build incremental morsels");
 
@@ -1128,33 +952,6 @@ mod tests {
             }
             other => panic!("unexpected morsel: {:?}", other),
         }
-    }
-
-    #[test]
-    fn incremental_hdfs_ranges_reject_malformed_change_op_extended_column() {
-        let cfg = HdfsScanConfig {
-            ranges: vec![],
-            original_range_count: 0,
-            has_more: true,
-            limit: None,
-            profile_label: None,
-            format: None,
-            object_store_config: None,
-            iceberg_table_locations: std::collections::HashMap::new(),
-            query_global_dicts: Default::default(),
-        };
-        let op = HdfsScanOp::new(cfg);
-
-        let error = op
-            .build_incremental_morsels(&[make_hdfs_range_with_extended(
-                "s3://bucket/path/file.parquet",
-                None,
-                Some(BTreeMap::from([(9, int_expr(0))])),
-            )])
-            .unwrap_err();
-
-        assert!(error.contains("__change_op"));
-        assert!(error.contains("invalid value"));
     }
 
     #[test]

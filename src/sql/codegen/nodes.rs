@@ -1647,12 +1647,12 @@ mod tests {
     use super::{
         PlannedScanTable, build_exec_params_multi, build_exec_params_multi_with_refresh_context,
     };
-    use crate::connector::iceberg::scan_planner::build_hdfs_scan_range_params;
     use crate::connector::scan_planning::ConnectorScanPlanner;
     use crate::sql::catalog::{
         ColumnDef, IcebergDataFileInfo, IcebergMvTargetStateScan, IcebergSchemaDef,
         IcebergTableInfo, ScanSource, TableDef,
     };
+    use crate::sql::codegen::connector_scan_wire::build_hdfs_scan_range_params;
     use crate::sql::codegen::resolve::ResolvedTable;
     use crate::thrift::internal_service;
 
@@ -1849,7 +1849,7 @@ mod tests {
     #[test]
     fn starrocks_scan_ranges_use_planned_connector_scan_without_physical_layout() {
         use crate::connector::scan_planning::{ScanHandle, Split};
-        use crate::connector::starrocks::table::{
+        use crate::connector::starrocks::table::scan_planner::{
             StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle,
         };
         use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
@@ -1930,7 +1930,7 @@ mod tests {
     #[test]
     fn starrocks_scan_ranges_include_catalog_identity() {
         use crate::connector::scan_planning::{ScanHandle, Split};
-        use crate::connector::starrocks::table::{
+        use crate::connector::starrocks::table::scan_planner::{
             StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle,
         };
         use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};

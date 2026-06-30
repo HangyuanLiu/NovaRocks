@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use arrow::datatypes::Field;
 
 use crate::common::ids::SlotId;
+use crate::exec::node::scan::HdfsScanFileFormat;
 use crate::exec::row_position::RowPositionType;
 use crate::formats::{FileFormatConfig, parquet::ParquetScanConfig};
 use crate::runtime::descriptor_snapshot::{
@@ -75,11 +76,11 @@ pub(crate) fn is_lake_row_position(row_position_type: RowPositionType) -> bool {
 }
 
 pub(crate) fn lookup_file_format_config(
-    file_format: descriptors::THdfsFileFormat,
+    file_format: HdfsScanFileFormat,
     parquet_cfg: ParquetScanConfig,
 ) -> Result<FileFormatConfig, String> {
     match file_format {
-        descriptors::THdfsFileFormat::PARQUET => Ok(FileFormatConfig::Parquet(parquet_cfg)),
+        HdfsScanFileFormat::Parquet => Ok(FileFormatConfig::Parquet(parquet_cfg)),
         other => Err(format!("lookup only supports PARQUET, got {:?}", other)),
     }
 }
@@ -130,9 +131,17 @@ fn descriptor_table_from_thrift(
         .as_ref()
         .and_then(|table| table.iceberg_schema.as_ref())
         .map(descriptor_iceberg_schema_from_thrift);
+    let location = desc
+        .iceberg_table
+        .as_ref()
+        .and_then(|table| table.location.as_ref())
+        .map(|location| location.trim())
+        .filter(|location| !location.is_empty())
+        .map(str::to_string);
     Ok(DescriptorTable {
         id: desc.id,
         kind,
+        location,
         iceberg_schema,
     })
 }
@@ -368,6 +377,7 @@ mod tests {
     ) -> descriptors::TTableDescriptor {
         let mut iceberg = descriptors::TIcebergTable::default();
         iceberg.iceberg_schema = schema;
+        iceberg.location = Some("s3://warehouse/db/t".to_string());
         descriptors::TTableDescriptor::new(
             10,
             types::TTableType::ICEBERG_TABLE,
@@ -484,6 +494,10 @@ mod tests {
         assert_eq!(fields[0].field_id, Some(12));
         assert_eq!(fields[0].name.as_deref(), Some("id"));
         assert_eq!(fields[0].initial_default_json.as_deref(), Some("7"));
+        assert_eq!(
+            snapshot.iceberg_table_locations().collect::<Vec<_>>(),
+            vec![(10, "s3://warehouse/db/t")]
+        );
     }
 
     #[test]

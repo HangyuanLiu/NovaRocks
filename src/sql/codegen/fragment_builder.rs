@@ -2434,7 +2434,7 @@ mod tests {
     #[derive(Debug)]
     struct MockScanPlanner {
         schema_id: i64,
-        splits: Vec<crate::connector::starrocks::table::StarRocksSplit>,
+        splits: Vec<crate::connector::starrocks::table::scan_planner::StarRocksSplit>,
     }
 
     impl crate::connector::scan_planning::ConnectorScanPlanner for MockScanPlanner {
@@ -2448,12 +2448,12 @@ mod tests {
             _ctx: crate::connector::scan_planning::BeginScanContext,
         ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
             let inner = table
-                .downcast_ref::<crate::connector::starrocks::table::StarRocksTableHandle>()
+                .downcast_ref::<crate::connector::starrocks::table::scan_planner::StarRocksTableHandle>()
                 .ok_or_else(|| "MockScanPlanner expected StarRocksTableHandle".to_string())?
                 .clone();
             Ok(crate::connector::scan_planning::ScanHandle::new(
                 "starrocks",
-                crate::connector::starrocks::table::StarRocksScanHandle {
+                crate::connector::starrocks::table::scan_planner::StarRocksScanHandle {
                     table: inner,
                     schema_id: self.schema_id,
                 },
@@ -2537,7 +2537,7 @@ mod tests {
                 .begin_scan
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let inner = table
-                .downcast_ref::<crate::connector::iceberg::IcebergTableHandle>()
+                .downcast_ref::<crate::connector::iceberg::scan_planner::IcebergTableHandle>()
                 .ok_or_else(|| "expected IcebergTableHandle".to_string())?
                 .clone();
             assert!(
@@ -2549,7 +2549,7 @@ mod tests {
             );
             Ok(crate::connector::scan_planning::ScanHandle::new(
                 "iceberg",
-                crate::connector::iceberg::IcebergScanHandle { table: inner },
+                crate::connector::iceberg::scan_planner::IcebergScanHandle { table: inner },
             ))
         }
 
@@ -2569,7 +2569,7 @@ mod tests {
                 .map(|data_file| {
                     crate::connector::scan_planning::Split::new(
                         "iceberg",
-                        crate::connector::iceberg::IcebergSplit { data_file },
+                        crate::connector::iceberg::scan_planner::IcebergSplit { data_file },
                     )
                 })
                 .collect())
@@ -2579,7 +2579,7 @@ mod tests {
     fn mock_starrocks_registry(
         layout: &crate::sql::catalog::PhysicalTableLayout,
     ) -> crate::connector::ConnectorRegistry {
-        use crate::connector::starrocks::table::StarRocksSplit;
+        use crate::connector::starrocks::table::scan_planner::StarRocksSplit;
         let splits = layout
             .tablets
             .iter()
@@ -6059,7 +6059,7 @@ mod tests {
 
     #[test]
     fn ir_scan_lowering_calls_connector_begin_scan_and_plan_splits_for_starrocks() {
-        use crate::connector::starrocks::table::StarRocksSplit;
+        use crate::connector::starrocks::table::scan_planner::StarRocksSplit;
         let layout = starrocks_layout();
         let plan = with_id_predicate(starrocks_scan_plan(), 7);
         let catalog = StarRocksCatalog {
@@ -6381,7 +6381,7 @@ mod tests {
             expected_path: &str,
         ) {
             let table_handle = table_handle
-                .downcast_ref::<crate::connector::iceberg::IcebergTableHandle>()
+                .downcast_ref::<crate::connector::iceberg::scan_planner::IcebergTableHandle>()
                 .expect("IcebergTableHandle");
             let crate::connector::iceberg::scan_planner::IcebergSplitSource::ExplicitFiles(files) =
                 &table_handle.split_source
@@ -6457,7 +6457,7 @@ mod tests {
             vec!["id".to_string()],
         );
         let table_handle = table_handle
-            .downcast_ref::<crate::connector::iceberg::IcebergTableHandle>()
+            .downcast_ref::<crate::connector::iceberg::scan_planner::IcebergTableHandle>()
             .expect("IcebergTableHandle");
         let crate::connector::iceberg::scan_planner::IcebergSplitSource::ExplicitFiles(files) =
             &table_handle.split_source

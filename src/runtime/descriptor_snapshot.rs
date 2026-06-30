@@ -88,6 +88,7 @@ pub(crate) enum DescriptorTableKind {
 pub(crate) struct DescriptorTable {
     pub(crate) id: i64,
     pub(crate) kind: DescriptorTableKind,
+    pub(crate) location: Option<String>,
     pub(crate) iceberg_schema: Option<DescriptorIcebergSchema>,
 }
 
@@ -185,6 +186,16 @@ impl DescriptorSnapshot {
     pub(crate) fn is_iceberg_table_for_tuple(&self, tuple_id: i32) -> bool {
         self.table_for_tuple(tuple_id)
             .is_some_and(|table| matches!(table.kind, DescriptorTableKind::Iceberg))
+    }
+
+    pub(crate) fn iceberg_table_locations(&self) -> impl Iterator<Item = (i64, &str)> {
+        self.tables_by_id.values().filter_map(|table| {
+            if !matches!(table.kind, DescriptorTableKind::Iceberg) {
+                return None;
+            }
+            let location = table.location.as_deref()?.trim();
+            (!location.is_empty()).then_some((table.id, location))
+        })
     }
 
     pub(crate) fn lookup_output_slots(
@@ -288,11 +299,13 @@ mod tests {
                 DescriptorTable {
                     id: 10,
                     kind: DescriptorTableKind::Iceberg,
+                    location: Some("s3://warehouse/t".to_string()),
                     iceberg_schema: Some(DescriptorIcebergSchema { fields: None }),
                 },
                 DescriptorTable {
                     id: 40,
                     kind: DescriptorTableKind::Paimon,
+                    location: None,
                     iceberg_schema: None,
                 },
             ],
@@ -303,6 +316,10 @@ mod tests {
         assert!(snapshot.iceberg_schema_for_tuple(2).is_some());
         assert!(snapshot.is_paimon_table_for_tuple(4));
         assert!(!snapshot.is_paimon_table_for_tuple(2));
+        assert_eq!(
+            snapshot.iceberg_table_locations().collect::<Vec<_>>(),
+            vec![(10, "s3://warehouse/t")]
+        );
     }
 
     #[test]
@@ -314,11 +331,13 @@ mod tests {
                 DescriptorTable {
                     id: 10,
                     kind: DescriptorTableKind::Other,
+                    location: None,
                     iceberg_schema: None,
                 },
                 DescriptorTable {
                     id: 10,
                     kind: DescriptorTableKind::Paimon,
+                    location: None,
                     iceberg_schema: None,
                 },
             ],

@@ -30,8 +30,6 @@ use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::warn;
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime::runtime_filter_hub::{RuntimeFilterHandle, RuntimeFilterSnapshot};
-use crate::thrift::descriptors;
-use crate::thrift::internal_service;
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {
@@ -132,6 +130,51 @@ impl ScanMorsels {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HdfsScanFileFormat {
+    Parquet,
+    Orc,
+    Other,
+}
+
+#[derive(Clone, Debug)]
+pub struct IncrementalHdfsScanRange {
+    pub file_format: Option<HdfsScanFileFormat>,
+    pub full_path: Option<String>,
+    pub relative_path: Option<String>,
+    pub table_id: Option<i64>,
+    pub file_length: i64,
+    pub offset: i64,
+    pub length: i64,
+    pub first_row_id: Option<i64>,
+    pub ivm_change_op: Option<i8>,
+    pub external_datacache: Option<ExternalDataCacheRangeOptions>,
+}
+
+#[derive(Clone, Debug)]
+pub enum IncrementalScanRange {
+    Empty {
+        has_more: Option<bool>,
+    },
+    Hdfs {
+        has_more: Option<bool>,
+        range: IncrementalHdfsScanRange,
+    },
+    Other {
+        has_more: Option<bool>,
+    },
+}
+
+impl IncrementalScanRange {
+    pub fn has_more(&self) -> Option<bool> {
+        match self {
+            Self::Empty { has_more } | Self::Hdfs { has_more, .. } | Self::Other { has_more } => {
+                *has_more
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeFilterContext {
     inner: RuntimeFilterContextInner,
@@ -228,7 +271,7 @@ pub trait ScanOp: Send + Sync {
 
     fn build_incremental_morsels(
         &self,
-        _scan_ranges: &[internal_service::TScanRangeParams],
+        _scan_ranges: &[IncrementalScanRange],
     ) -> Result<ScanMorsels, String> {
         Err("incremental scan ranges are not supported for this scan node".to_string())
     }
@@ -268,7 +311,7 @@ pub struct LakeGlmScanInfo {
 
 #[derive(Clone, Debug)]
 pub struct RowPositionScanConfig {
-    pub file_format: descriptors::THdfsFileFormat,
+    pub file_format: HdfsScanFileFormat,
     pub case_sensitive: bool,
     pub batch_size: Option<usize>,
     pub enable_file_metacache: bool,
@@ -491,7 +534,7 @@ impl ScanNode {
 
     pub fn build_incremental_morsels(
         &self,
-        scan_ranges: &[internal_service::TScanRangeParams],
+        scan_ranges: &[IncrementalScanRange],
     ) -> Result<ScanMorsels, String> {
         self.op.build_incremental_morsels(scan_ranges)
     }
