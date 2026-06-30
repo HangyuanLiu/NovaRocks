@@ -543,6 +543,10 @@ fn build_pipeline_for_node(
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
+        ExecNodeKind::ChangeEventExpand(node) => Err(format!(
+            "CHANGE_EVENT_EXPAND_NODE node_id={} has no pipeline processor yet",
+            node.node_id
+        )),
         ExecNodeKind::Limit(LimitNode {
             input,
             node_id,

@@ -38,6 +38,7 @@ use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
 };
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::operator::{
     AggMode, AssertOneRowOp, DecodeOp, GenerateSeriesOp, RepeatOp, ScanDictionaryColumn, TopNPhase,
 };
@@ -1320,6 +1321,9 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             crate::sql::planner::DistributedPlanKind::Repeat(repeat) => {
                 self.lower_repeat_node(node, repeat)?
             }
+            crate::sql::planner::DistributedPlanKind::ChangeEventExpand(expand) => {
+                self.lower_change_event_expand_node(node, expand)?
+            }
             crate::sql::planner::DistributedPlanKind::SetOp(set_op) => {
                 self.lower_set_op_node(node, set_op)?
             }
@@ -1820,6 +1824,33 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             scope,
             tuple_ids,
             output_columns,
+            ordering: OrderingSpec::Any,
+        })
+    }
+
+    fn lower_change_event_expand_node(
+        &mut self,
+        node: &crate::sql::planner::DistributedPlanNode,
+        expand: &super::kind::DistributedChangeEventExpandNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "DistributedPlan ChangeEventExpand node_id={} expected 1 child, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let child = self.lower_node(&node.children[0])?;
+        let tuple_id = first_tuple_id(node, "ChangeEventExpand")?;
+        let (plan_node, scope) =
+            self.lower_change_event_expand(node.node_id, tuple_id, expand, &child.scope)?;
+        let mut plan_nodes = vec![plan_node];
+        plan_nodes.extend(child.plan_nodes);
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope,
+            tuple_ids: vec![tuple_id],
+            output_columns: expand.output_columns.clone(),
             ordering: OrderingSpec::Any,
         })
     }
@@ -4628,6 +4659,150 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
 
         Ok((plan_node, output_scope))
+    }
+
+    fn lower_change_event_expand(
+        &mut self,
+        node_id: i32,
+        output_tuple_id: i32,
+        expand: &super::kind::DistributedChangeEventExpandNode,
+        child_scope: &ExprScope,
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
+        if expand.output_columns.is_empty() {
+            return Err(format!(
+                "ChangeEventExpand node_id={} has no output columns",
+                node_id
+            ));
+        }
+
+        let state = &mut *self.state;
+        let mut output_scope = ExprScope::new();
+        for (col_pos, column) in expand.output_columns.iter().enumerate() {
+            let slot_id = state.alloc_slot();
+            state.desc_builder().add_slot(
+                slot_id,
+                output_tuple_id,
+                &column.name,
+                &column.data_type,
+                column.nullable,
+                col_pos as i32,
+            );
+            output_scope.add_column_with_id(
+                column.column_id,
+                None,
+                column.name.clone(),
+                ColumnBinding {
+                    tuple_id: output_tuple_id,
+                    slot_id,
+                    data_type: column.data_type.clone(),
+                    type_desc: None,
+                    nullable: column.nullable,
+                },
+            );
+        }
+        state.desc_builder().add_tuple(output_tuple_id, None);
+
+        let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+        let mut events = Vec::with_capacity(expand.events.len());
+        for event in &expand.events {
+            let predicate = event
+                .predicate
+                .as_ref()
+                .map(|expr| compiler.compile_typed(expr))
+                .transpose()?;
+            let mut assignments = Vec::with_capacity(event.assignments.len());
+            for assignment in &event.assignments {
+                let output_slot_id = output_scope
+                    .resolve_by_id(assignment.output_column_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "ChangeEventExpand output ColumnId({}) is not in output scope",
+                            assignment.output_column_id.0
+                        )
+                    })?
+                    .slot_id;
+                let expr = assignment
+                    .expr
+                    .as_ref()
+                    .map(|expr| compiler.compile_typed(expr))
+                    .transpose()?;
+                assignments.push(plan_nodes::TChangeEventOutputExpr {
+                    output_slot_id,
+                    expr,
+                });
+            }
+            events.push(plan_nodes::TChangeEventSpec {
+                predicate,
+                branch_kind: change_event_branch_kind_to_thrift(event.branch_kind),
+                assignments,
+            });
+        }
+
+        let output_slot_ids = expand
+            .output_columns
+            .iter()
+            .map(|column| {
+                output_scope
+                    .resolve_by_id(column.column_id)
+                    .map(|binding| binding.slot_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "ChangeEventExpand output ColumnId({}) is not in output scope",
+                            column.column_id.0
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let change_op_slot_id = output_scope
+            .resolve_by_id(expand.change_op_column_id)
+            .ok_or_else(|| {
+                format!(
+                    "ChangeEventExpand change-op ColumnId({}) is not in output scope",
+                    expand.change_op_column_id.0
+                )
+            })?
+            .slot_id;
+        let data_route_slot_id = expand
+            .data_route_column_id
+            .map(|column_id| {
+                output_scope
+                    .resolve_by_id(column_id)
+                    .map(|binding| binding.slot_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "ChangeEventExpand data-route ColumnId({}) is not in output scope",
+                            column_id.0
+                        )
+                    })
+            })
+            .transpose()?;
+
+        let mut plan_node = nodes::default_plan_node();
+        plan_node.node_id = node_id;
+        plan_node.node_type = plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE;
+        plan_node.num_children = 1;
+        plan_node.limit = -1;
+        plan_node.row_tuples = vec![output_tuple_id];
+        plan_node.nullable_tuples = vec![];
+        plan_node.compact_data = true;
+        plan_node.change_event_expand_node = Some(plan_nodes::TChangeEventExpandNode {
+            events,
+            output_slot_ids,
+            change_op_slot_id,
+            data_route_slot_id,
+        });
+
+        Ok((plan_node, output_scope))
+    }
+}
+
+fn change_event_branch_kind_to_thrift(
+    kind: ChangeStreamBranchKind,
+) -> plan_nodes::TChangeEventBranchKind {
+    match kind {
+        ChangeStreamBranchKind::DeleteDv => plan_nodes::TChangeEventBranchKind::DELETE_DV,
+        ChangeStreamBranchKind::ReuseData => plan_nodes::TChangeEventBranchKind::REUSE_DATA,
+        ChangeStreamBranchKind::FreshData => plan_nodes::TChangeEventBranchKind::FRESH_DATA,
     }
 }
 

@@ -17,6 +17,7 @@
 mod aggregate;
 mod analytic;
 mod assert;
+mod change_event_expand;
 mod cross_join;
 mod decode;
 mod empty_set;
@@ -60,6 +61,7 @@ use crate::thrift::{
 pub(crate) use aggregate::lower_aggregate_node;
 pub(crate) use analytic::lower_analytic_node;
 pub(crate) use assert::lower_assert_num_rows_node;
+pub(crate) use change_event_expand::lower_change_event_expand_node;
 pub(crate) use cross_join::lower_cross_join_node;
 pub(crate) use decode::{QueryGlobalDictMap, build_query_global_dict_map, lower_decode_node};
 pub(crate) use empty_set::lower_empty_set_node;
@@ -150,6 +152,7 @@ pub(crate) fn test_plan_node(
         benchmark_scan_node: None,
         cache_stats_scan_node: None,
         iceberg_delta_scan_node: None,
+        change_event_expand_node: None,
     }
 }
 
@@ -404,6 +407,16 @@ fn lower_node_with_children(
             }
             let child = children.into_iter().next().expect("child");
             lower_repeat_node(child, node, out_layout, tuple_slots)?
+        }
+        t if t == plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE => {
+            lower_change_event_expand_node(
+                children,
+                node,
+                out_layout,
+                arena,
+                last_query_id,
+                fe_addr,
+            )?
         }
         t if t == plan_nodes::TPlanNodeType::PROJECT_NODE => {
             if children.len() != 1 {

@@ -96,7 +96,8 @@ enum TPlanNodeType {
   // upstream starrocks additions (which occupy 0..999 by sequential
   // ordering). FE never emits these — they are produced only by
   // NovaRocks-internal compile paths (e.g. IVM incremental refresh).
-  ICEBERG_DELTA_SCAN_NODE = 1000
+  ICEBERG_DELTA_SCAN_NODE = 1000,
+  CHANGE_EVENT_EXPAND_NODE = 1001
 }
 
 // phases of an execution node
@@ -1705,6 +1706,30 @@ struct TIcebergDeltaScanNode {
   6: required TIcebergDeltaScanPlan delta_plan
 }
 
+enum TChangeEventBranchKind {
+  DELETE_DV = 1,
+  REUSE_DATA = 2,
+  FRESH_DATA = 3,
+}
+
+struct TChangeEventOutputExpr {
+  1: required Types.TSlotId output_slot_id
+  2: optional Exprs.TExpr expr
+}
+
+struct TChangeEventSpec {
+  1: optional Exprs.TExpr predicate
+  2: required TChangeEventBranchKind branch_kind
+  3: required list<TChangeEventOutputExpr> assignments
+}
+
+struct TChangeEventExpandNode {
+  1: required list<TChangeEventSpec> events
+  2: required list<Types.TSlotId> output_slot_ids
+  3: required Types.TSlotId change_op_slot_id
+  4: optional Types.TSlotId data_route_slot_id
+}
+
 struct TPlanNode {
   // node id, needed to reassemble tree structure
   1: required Types.TPlanNodeId node_id
@@ -1791,6 +1816,7 @@ struct TPlanNode {
   // NovaRocks-only payloads start at field 1000 to mirror the
   // TPlanNodeType id offset (see enum above).
   1000: optional TIcebergDeltaScanNode iceberg_delta_scan_node;
+  1001: optional TChangeEventExpandNode change_event_expand_node;
 }
 
 // A flattened representation of a tree of PlanNodes, obtained by depth-first

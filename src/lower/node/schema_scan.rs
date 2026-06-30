@@ -301,6 +301,7 @@ mod tests {
             benchmark_scan_node: None,
             cache_stats_scan_node: None,
             iceberg_delta_scan_node: None,
+            change_event_expand_node: None,
         }
     }
 

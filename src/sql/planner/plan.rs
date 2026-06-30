@@ -13,7 +13,7 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 pub(crate) use crate::sql::common::{
-    ApplyKind, DecodeMapping, ScanDictionaryColumn, ScanVariantColumn,
+    ApplyKind, ChangeStreamBranchKind, DecodeMapping, ScanDictionaryColumn, ScanVariantColumn,
 };
 use crate::sql::optimizer::operator::{
     AggMode, AggregateOutputLayout, JoinDistribution, TopNPhase,
@@ -326,6 +326,30 @@ pub(crate) struct PhysicalSetOpNode {
     pub kind: PlanSetOpKind,
     pub output_columns: Vec<OutputColumn>,
     pub child_output_columns: Vec<Vec<OutputColumn>>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedChangeEventExpandNode {
+    pub(crate) events: Vec<DistributedChangeEventSpec>,
+    pub(crate) output_columns: Vec<OutputColumn>,
+    pub(crate) change_op_column_id: ColumnId,
+    pub(crate) data_route_column_id: Option<ColumnId>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedChangeEventSpec {
+    pub(crate) predicate: Option<TypedExpr>,
+    pub(crate) branch_kind: ChangeStreamBranchKind,
+    pub(crate) assignments: Vec<DistributedChangeEventOutputExpr>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedChangeEventOutputExpr {
+    pub(crate) output_column_id: ColumnId,
+    pub(crate) expr: Option<TypedExpr>,
 }
 
 pub(crate) type LogicalDecodeNode = PlanDecodeNode;

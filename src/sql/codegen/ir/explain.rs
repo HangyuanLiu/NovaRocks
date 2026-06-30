@@ -17,8 +17,9 @@ use crate::sql::optimizer::physical_tree::JoinExecutionDistribution;
 use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::plan::{
-    DistributedExchangeNode, ExchangeFlavor, PhysicalHashAggregateNode, PhysicalHashJoinNode,
-    PhysicalNestLoopJoinNode, PhysicalSetOpNode, PhysicalTopNNode,
+    DistributedChangeEventExpandNode, DistributedExchangeNode, ExchangeFlavor,
+    PhysicalHashAggregateNode, PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode,
+    PhysicalTopNNode,
     PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanDecodeNode as DistributedDecodeNode,
     PlanFilterNode as DistributedFilterNode,
     PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
@@ -194,6 +195,18 @@ fn format_distributed_shared_plan_node_header(
             "REPEAT ({} grouping sets)",
             node.grouping_ids.len()
         )),
+        DistributedPlanKind::ChangeEventExpand(node) => {
+            let branches = node
+                .events
+                .iter()
+                .map(|event| format!("{:?}", event.branch_kind))
+                .collect::<Vec<_>>();
+            Some(format!(
+                "CHANGE_EVENT_EXPAND(events={}, branches=[{}])",
+                node.events.len(),
+                branches.join(",")
+            ))
+        }
         DistributedPlanKind::GenerateSeries(node) => Some(format!(
             "GENERATE_SERIES({}, {}, {})",
             node.start, node.end, node.step
@@ -312,6 +325,10 @@ fn format_distributed_node(
         }
         DistributedPlanKind::Repeat(repeat) => {
             format_repeat_node(node, repeat, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, arena, level, indent, actuals, out);
+        }
+        DistributedPlanKind::ChangeEventExpand(expand) => {
+            format_change_event_expand_node(node, expand, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, arena, level, indent, actuals, out);
         }
         DistributedPlanKind::SetOp(set_op) => {
@@ -785,6 +802,23 @@ fn format_repeat_node(
     let body =
         format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
             .expect("Repeat is a shared explain node");
+    out.push(format!(
+        "{pad}{}{body}{costs_suffix}{stats_suffix}",
+        node_prefix(node),
+    ));
+}
+
+fn format_change_event_expand_node(
+    node: &DistributedPlanNode,
+    _expand: &DistributedChangeEventExpandNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let body =
+        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
+            .expect("ChangeEventExpand is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node),

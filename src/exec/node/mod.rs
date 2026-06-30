@@ -17,6 +17,7 @@
 pub mod aggregate;
 pub mod analytic;
 pub mod assert;
+pub mod change_event_expand;
 pub mod exchange_source;
 pub mod fetch;
 pub mod filter;
@@ -45,6 +46,7 @@ use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::aggregate::AggregateNode;
 use crate::exec::node::analytic::AnalyticNode;
 use crate::exec::node::assert::AssertNumRowsNode;
+use crate::exec::node::change_event_expand::ChangeEventExpandNode;
 use crate::exec::node::exchange_source::ExchangeSourceNode;
 use crate::exec::node::fetch::FetchNode;
 use crate::exec::node::filter::FilterNode;
@@ -80,6 +82,7 @@ pub enum ExecNodeKind {
     Project(ProjectNode),
     Filter(FilterNode),
     Repeat(RepeatNode),
+    ChangeEventExpand(ChangeEventExpandNode),
     UnionAll(UnionAllNode),
     Limit(LimitNode),
     ExchangeSource(ExchangeSourceNode),
@@ -280,6 +283,9 @@ fn output_slots_for_node(node: &ExecNode) -> Option<HashSet<SlotId>> {
         }
         ExecNodeKind::Filter(FilterNode { input, .. }) => output_slots_for_node(input),
         ExecNodeKind::Repeat(RepeatNode { input, .. }) => output_slots_for_node(input),
+        ExecNodeKind::ChangeEventExpand(node) => {
+            Some(node.output_slot_ids.iter().copied().collect())
+        }
         ExecNodeKind::Limit(LimitNode { input, .. }) => output_slots_for_node(input),
         ExecNodeKind::Sort(SortNode { input, .. }) => output_slots_for_node(input),
         ExecNodeKind::TableFunction(table_function) => Some(
@@ -386,6 +392,10 @@ fn push_down_local_runtime_filters_inner(
         ExecNodeKind::Repeat(RepeatNode { input, .. }) => {
             let filtered = filter_specs_for_child(arena, inherited, input);
             push_down_local_runtime_filters_inner(input, arena, &filtered);
+        }
+        ExecNodeKind::ChangeEventExpand(node) => {
+            let filtered = filter_specs_for_child(arena, inherited, &node.input);
+            push_down_local_runtime_filters_inner(&mut node.input, arena, &filtered);
         }
         ExecNodeKind::UnionAll(UnionAllNode { inputs, .. }) => {
             for input in inputs {

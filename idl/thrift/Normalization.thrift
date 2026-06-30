@@ -87,6 +87,24 @@ struct TNormalRepeatNode {
   5: optional list<Types.TSlotId> all_slot_ids
 }
 
+struct TNormalChangeEventOutputExpr {
+  1: optional Types.TSlotId output_slot_id
+  2: optional binary expr
+}
+
+struct TNormalChangeEventSpec {
+  1: optional binary predicate
+  2: optional PlanNodes.TChangeEventBranchKind branch_kind
+  3: optional list<TNormalChangeEventOutputExpr> assignments
+}
+
+struct TNormalChangeEventExpandNode {
+  1: optional list<TNormalChangeEventSpec> events
+  2: optional list<Types.TSlotId> output_slot_ids
+  3: optional Types.TSlotId change_op_slot_id
+  4: optional Types.TSlotId data_route_slot_id
+}
+
 struct TNormalAnalyticNode {
   1: optional list<binary> partition_exprs
   2: optional list<binary> order_by_exprs
@@ -182,4 +200,5 @@ struct TNormalPlanNode {
   22: optional TNormalSetOperationNode set_operation_node
   23: optional TNormalSelectNode select_node
   24: optional TNormalRawValuesNode raw_values_node
+  1001: optional TNormalChangeEventExpandNode change_event_expand_node
 }
