@@ -1,22 +1,25 @@
 use std::collections::{HashMap, HashSet};
 
+use arrow::datatypes::DataType;
+
 use crate::common::ids::SlotId;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::change_event_expand::{
-    ChangeEventExecOutputExpr, ChangeEventExecSpec, ChangeEventExpandNode,
+    ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::Layout;
+use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::sql::common::ChangeStreamBranchKind;
-use crate::thrift::{plan_nodes, types};
+use crate::thrift::{descriptors, plan_nodes, types};
 
 pub(crate) fn lower_change_event_expand_node(
     children: Vec<Lowered>,
     node: &plan_nodes::TPlanNode,
     out_layout: Layout,
     arena: &mut ExprArena,
+    desc_tbl: &descriptors::TDescriptorTable,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Lowered, String> {
@@ -54,6 +57,12 @@ pub(crate) fn lower_change_event_expand_node(
         node.node_id,
     )?;
     if let Some(data_route_slot_id) = payload.data_route_slot_id {
+        if data_route_slot_id == payload.change_op_slot_id {
+            return Err(format!(
+                "CHANGE_EVENT_EXPAND_NODE node_id={} change_op_slot_id {} and data_route_slot_id {} must be distinct",
+                node.node_id, payload.change_op_slot_id, data_route_slot_id
+            ));
+        }
         require_route_slot_in_outputs(
             "data_route_slot_id",
             data_route_slot_id,
@@ -102,12 +111,12 @@ pub(crate) fn lower_change_event_expand_node(
                 fe_addr,
                 node.node_id,
             )?;
-            assignments.push(ChangeEventExecOutputExpr {
+            assignments.push(ChangeEventRuntimeOutputExpr {
                 output_slot_id: SlotId::try_from(assignment.output_slot_id)?,
                 expr,
             });
         }
-        events.push(ChangeEventExecSpec {
+        events.push(ChangeEventRuntimeSpec {
             predicate,
             branch_kind,
             assignments,
@@ -121,6 +130,42 @@ pub(crate) fn lower_change_event_expand_node(
         .map(SlotId::try_from)
         .collect::<Result<Vec<_>, _>>()?;
     let layout = output_layout_for_slots(&out_layout, &payload.output_slot_ids)?;
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &layout)?;
+    let change_op_slot_id = SlotId::try_from(payload.change_op_slot_id)?;
+    let change_op_slot = output_chunk_schema.slot(change_op_slot_id).ok_or_else(|| {
+        format!(
+            "CHANGE_EVENT_EXPAND_NODE node_id={} change_op_slot_id {} is missing from output schema",
+            node.node_id, payload.change_op_slot_id
+        )
+    })?;
+    if change_op_slot.data_type() != &DataType::Int8 {
+        return Err(format!(
+            "CHANGE_EVENT_EXPAND_NODE node_id={} change_op_slot_id {} must be TINYINT/Int8, got {:?}",
+            node.node_id,
+            payload.change_op_slot_id,
+            change_op_slot.data_type()
+        ));
+    }
+    let data_route_slot_id = payload
+        .data_route_slot_id
+        .map(SlotId::try_from)
+        .transpose()?;
+    if let Some(data_route_slot_id) = data_route_slot_id {
+        let data_route_slot = output_chunk_schema.slot(data_route_slot_id).ok_or_else(|| {
+            format!(
+                "CHANGE_EVENT_EXPAND_NODE node_id={} data_route_slot_id {} is missing from output schema",
+                node.node_id, data_route_slot_id
+            )
+        })?;
+        if !is_signed_integer_route_type(data_route_slot.data_type()) {
+            return Err(format!(
+                "CHANGE_EVENT_EXPAND_NODE node_id={} data_route_slot_id {} must be a signed integer route type, got {:?}",
+                node.node_id,
+                data_route_slot_id,
+                data_route_slot.data_type()
+            ));
+        }
+    }
 
     Ok(Lowered {
         node: ExecNode {
@@ -129,15 +174,20 @@ pub(crate) fn lower_change_event_expand_node(
                 node_id: node.node_id,
                 events,
                 output_slot_ids,
-                change_op_slot_id: SlotId::try_from(payload.change_op_slot_id)?,
-                data_route_slot_id: payload
-                    .data_route_slot_id
-                    .map(SlotId::try_from)
-                    .transpose()?,
+                output_chunk_schema,
+                change_op_slot_id,
+                data_route_slot_id,
             }),
         },
         layout,
     })
+}
+
+fn is_signed_integer_route_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
 }
 
 fn require_route_slot_in_outputs(
@@ -232,12 +282,22 @@ mod tests {
     use crate::exec::node::{ExecNode, ExecNodeKind};
     use crate::lower::node::Lowered;
     use crate::sql::common::ChangeStreamBranchKind;
+    use crate::thrift::descriptors;
     use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
     use crate::thrift::plan_nodes::{
         TChangeEventBranchKind, TChangeEventExpandNode, TChangeEventOutputExpr, TChangeEventSpec,
         TPlanNodeType,
     };
-    use crate::thrift::types::{TTypeDesc, TTypeNode, TTypeNodeType};
+    use crate::thrift::types::{TPrimitiveType, TScalarType, TTypeDesc, TTypeNode, TTypeNodeType};
+
+    fn scalar_type_desc(ty: TPrimitiveType) -> TTypeDesc {
+        TTypeDesc::new(vec![TTypeNode {
+            type_: TTypeNodeType::SCALAR,
+            scalar_type: Some(TScalarType::new(ty, None, None, None, None)),
+            struct_fields: None,
+            is_named: None,
+        }])
+    }
 
     fn dummy_type() -> TTypeDesc {
         TTypeDesc {
@@ -248,6 +308,55 @@ mod tests {
                 is_named: None,
             }]),
         }
+    }
+
+    fn output_desc_tbl(slot_ids: &[i32]) -> descriptors::TDescriptorTable {
+        output_desc_tbl_with_change_op_type(slot_ids, TPrimitiveType::TINYINT)
+    }
+
+    fn output_desc_tbl_with_change_op_type(
+        slot_ids: &[i32],
+        change_op_type: TPrimitiveType,
+    ) -> descriptors::TDescriptorTable {
+        output_desc_tbl_with_route_types(slot_ids, change_op_type, TPrimitiveType::INT)
+    }
+
+    fn output_desc_tbl_with_route_types(
+        slot_ids: &[i32],
+        change_op_type: TPrimitiveType,
+        data_route_type: TPrimitiveType,
+    ) -> descriptors::TDescriptorTable {
+        descriptors::TDescriptorTable::new(
+            slot_ids
+                .iter()
+                .map(|slot_id| descriptors::TSlotDescriptor {
+                    id: Some(*slot_id),
+                    parent: Some(8),
+                    slot_type: Some(scalar_type_desc(if *slot_id == 30 {
+                        change_op_type
+                    } else if *slot_id == 31 {
+                        data_route_type
+                    } else {
+                        TPrimitiveType::INT
+                    })),
+                    column_pos: None,
+                    byte_offset: None,
+                    null_indicator_byte: None,
+                    null_indicator_bit: None,
+                    col_name: Some(format!("out_{slot_id}")),
+                    slot_idx: None,
+                    is_materialized: None,
+                    is_output_column: None,
+                    is_nullable: Some(true),
+                    col_unique_id: None,
+                    col_physical_name: None,
+                    is_virtual_column: None,
+                })
+                .collect::<Vec<_>>(),
+            vec![],
+            vec![],
+            false,
+        )
     }
 
     fn slot_expr(slot_id: i32, tuple_id: i32) -> TExpr {
@@ -347,12 +456,14 @@ mod tests {
         });
 
         let out_layout = crate::lower::layout::layout_from_slot_ids(8, [20, 21, 22, 30, 31]);
+        let desc_tbl = output_desc_tbl(&[20, 21, 22, 30, 31]);
         let mut arena = ExprArena::default();
         let lowered = lower_change_event_expand_node(
             vec![child_lowered()],
             &node,
             out_layout,
             &mut arena,
+            &desc_tbl,
             None,
             None,
         )
@@ -421,12 +532,14 @@ mod tests {
         });
 
         let out_layout = crate::lower::layout::layout_from_slot_ids(8, [20, 30, 31]);
+        let desc_tbl = output_desc_tbl(&[20, 30, 31]);
         let mut arena = ExprArena::default();
         let err = lower_change_event_expand_node(
             vec![child_lowered()],
             &node,
             out_layout,
             &mut arena,
+            &desc_tbl,
             None,
             None,
         )
@@ -457,12 +570,14 @@ mod tests {
         });
 
         let out_layout = crate::lower::layout::layout_from_slot_ids(8, [20]);
+        let desc_tbl = output_desc_tbl(&[20]);
         let mut arena = ExprArena::default();
         let err = lower_change_event_expand_node(
             vec![child_lowered()],
             &node,
             out_layout,
             &mut arena,
+            &desc_tbl,
             None,
             None,
         )
@@ -493,12 +608,14 @@ mod tests {
         });
 
         let out_layout = crate::lower::layout::layout_from_slot_ids(8, [20, 30]);
+        let desc_tbl = output_desc_tbl(&[20, 30]);
         let mut arena = ExprArena::default();
         let err = lower_change_event_expand_node(
             vec![child_lowered()],
             &node,
             out_layout,
             &mut arena,
+            &desc_tbl,
             None,
             None,
         )
@@ -529,12 +646,14 @@ mod tests {
         });
 
         let out_layout = crate::lower::layout::layout_from_slot_ids(8, [20]);
+        let desc_tbl = output_desc_tbl(&[20]);
         let mut arena = ExprArena::default();
         let err = lower_change_event_expand_node(
             vec![child_lowered()],
             &node,
             out_layout,
             &mut arena,
+            &desc_tbl,
             None,
             None,
         )
@@ -565,12 +684,14 @@ mod tests {
         });
 
         let out_layout = crate::lower::layout::layout_from_slot_ids(8, [20, 30]);
+        let desc_tbl = output_desc_tbl(&[20, 30]);
         let mut arena = ExprArena::default();
         let err = lower_change_event_expand_node(
             vec![child_lowered()],
             &node,
             out_layout,
             &mut arena,
+            &desc_tbl,
             None,
             None,
         )
@@ -601,12 +722,14 @@ mod tests {
         });
 
         let out_layout = crate::lower::layout::layout_from_slot_ids(8, [20, 30]);
+        let desc_tbl = output_desc_tbl(&[20, 30]);
         let mut arena = ExprArena::default();
         let err = lower_change_event_expand_node(
             vec![child_lowered()],
             &node,
             out_layout,
             &mut arena,
+            &desc_tbl,
             None,
             None,
         )
@@ -614,6 +737,126 @@ mod tests {
 
         assert!(
             err.contains("data_route_slot_id") && err.contains("data branch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn lower_change_event_expand_rejects_equal_route_slots() {
+        let mut node =
+            crate::lower::node::test_plan_node(16, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        node.change_event_expand_node = Some(TChangeEventExpandNode {
+            events: vec![TChangeEventSpec {
+                predicate: None,
+                branch_kind: TChangeEventBranchKind::REUSE_DATA,
+                assignments: vec![TChangeEventOutputExpr {
+                    output_slot_id: 20,
+                    expr: Some(slot_expr(10, 7)),
+                }],
+            }],
+            output_slot_ids: vec![20, 30],
+            change_op_slot_id: 30,
+            data_route_slot_id: Some(30),
+        });
+
+        let out_layout = crate::lower::layout::layout_from_slot_ids(8, [20, 30]);
+        let desc_tbl = output_desc_tbl(&[20, 30]);
+        let mut arena = ExprArena::default();
+        let err = lower_change_event_expand_node(
+            vec![child_lowered()],
+            &node,
+            out_layout,
+            &mut arena,
+            &desc_tbl,
+            None,
+            None,
+        )
+        .expect_err("equal route slots must fail");
+
+        assert!(
+            err.contains("change_op_slot_id")
+                && err.contains("data_route_slot_id")
+                && err.contains("distinct"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn lower_change_event_expand_rejects_non_tinyint_change_op_slot() {
+        let mut node =
+            crate::lower::node::test_plan_node(17, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        node.change_event_expand_node = Some(TChangeEventExpandNode {
+            events: vec![TChangeEventSpec {
+                predicate: None,
+                branch_kind: TChangeEventBranchKind::DELETE_DV,
+                assignments: vec![TChangeEventOutputExpr {
+                    output_slot_id: 20,
+                    expr: Some(slot_expr(10, 7)),
+                }],
+            }],
+            output_slot_ids: vec![20, 30],
+            change_op_slot_id: 30,
+            data_route_slot_id: None,
+        });
+
+        let out_layout = crate::lower::layout::layout_from_slot_ids(8, [20, 30]);
+        let desc_tbl = output_desc_tbl_with_change_op_type(&[20, 30], TPrimitiveType::INT);
+        let mut arena = ExprArena::default();
+        let err = lower_change_event_expand_node(
+            vec![child_lowered()],
+            &node,
+            out_layout,
+            &mut arena,
+            &desc_tbl,
+            None,
+            None,
+        )
+        .expect_err("non-TINYINT change-op slot must fail");
+
+        assert!(
+            err.contains("change_op_slot_id") && err.contains("TINYINT"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn lower_change_event_expand_rejects_non_integral_data_route_slot() {
+        let mut node =
+            crate::lower::node::test_plan_node(18, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        node.change_event_expand_node = Some(TChangeEventExpandNode {
+            events: vec![TChangeEventSpec {
+                predicate: None,
+                branch_kind: TChangeEventBranchKind::REUSE_DATA,
+                assignments: vec![TChangeEventOutputExpr {
+                    output_slot_id: 20,
+                    expr: Some(slot_expr(10, 7)),
+                }],
+            }],
+            output_slot_ids: vec![20, 30, 31],
+            change_op_slot_id: 30,
+            data_route_slot_id: Some(31),
+        });
+
+        let out_layout = crate::lower::layout::layout_from_slot_ids(8, [20, 30, 31]);
+        let desc_tbl = output_desc_tbl_with_route_types(
+            &[20, 30, 31],
+            TPrimitiveType::TINYINT,
+            TPrimitiveType::BOOLEAN,
+        );
+        let mut arena = ExprArena::default();
+        let err = lower_change_event_expand_node(
+            vec![child_lowered()],
+            &node,
+            out_layout,
+            &mut arena,
+            &desc_tbl,
+            None,
+            None,
+        )
+        .expect_err("non-integral data-route slot must fail");
+
+        assert!(
+            err.contains("data_route_slot_id") && err.contains("integer"),
             "unexpected error: {err}"
         );
     }

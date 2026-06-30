@@ -63,13 +63,13 @@ use crate::exec::operators::{
     AggregateStateMergeSinkFactory, AggregateStateMergeSourceFactory,
     AggregateStatePhysicalizeProcessorFactory, AggregateStreamingSinkFactory,
     AggregateStreamingSourceFactory, AggregateStreamingState, AnalyticSinkFactory,
-    AnalyticSourceFactory, BroadcastJoinProbeProcessorFactory, ExceptSinkFactory,
-    ExceptSourceFactory, ExchangeSourceFactory, FetchProcessorFactory, FilterProcessorFactory,
-    HashJoinBuildSinkFactory, IntersectSinkFactory, IntersectSourceFactory, LimitProcessorFactory,
-    LocalExchangeSinkFactory, LocalExchangeSourceFactory, LookUpSourceFactory,
-    PartitionedJoinProbeProcessorFactory, ProjectProcessorFactory, RepeatProcessorFactory,
-    ScanSourceFactory, SortProcessorFactory, TableFunctionProcessorFactory, UnionAllSharedState,
-    UnionAllSinkFactory, UnionAllSourceFactory, ValuesSourceFactory,
+    AnalyticSourceFactory, BroadcastJoinProbeProcessorFactory, ChangeEventExpandProcessorFactory,
+    ExceptSinkFactory, ExceptSourceFactory, ExchangeSourceFactory, FetchProcessorFactory,
+    FilterProcessorFactory, HashJoinBuildSinkFactory, IntersectSinkFactory, IntersectSourceFactory,
+    LimitProcessorFactory, LocalExchangeSinkFactory, LocalExchangeSourceFactory,
+    LookUpSourceFactory, PartitionedJoinProbeProcessorFactory, ProjectProcessorFactory,
+    RepeatProcessorFactory, ScanSourceFactory, SortProcessorFactory, TableFunctionProcessorFactory,
+    UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory, ValuesSourceFactory,
 };
 use crate::exec::operators::{ExceptSharedState, IntersectSharedState, SetOpStageController};
 use crate::exec::operators::{
@@ -543,10 +543,21 @@ fn build_pipeline_for_node(
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
-        ExecNodeKind::ChangeEventExpand(node) => Err(format!(
-            "CHANGE_EVENT_EXPAND_NODE node_id={} has no pipeline processor yet",
-            node.node_id
-        )),
+        ExecNodeKind::ChangeEventExpand(node) => {
+            let mut build = build_pipeline_for_node(&node.input, ctx)?;
+            let factory = ChangeEventExpandProcessorFactory::new(
+                node.node_id,
+                Arc::clone(&ctx.arena),
+                node.events.clone(),
+                node.output_chunk_schema.clone(),
+                node.output_slot_ids.clone(),
+                node.change_op_slot_id,
+                node.data_route_slot_id,
+            )?;
+            build.pipeline.factories.push(Box::new(factory));
+            build.stream = StreamDesc::any(build.pipeline.dop);
+            Ok(build)
+        }
         ExecNodeKind::Limit(LimitNode {
             input,
             node_id,

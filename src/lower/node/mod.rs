@@ -409,11 +409,18 @@ fn lower_node_with_children(
             lower_repeat_node(child, node, out_layout, tuple_slots)?
         }
         t if t == plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE => {
+            let desc_tbl = desc_tbl.ok_or_else(|| {
+                format!(
+                    "CHANGE_EVENT_EXPAND_NODE node_id={} requires descriptor table",
+                    node.node_id
+                )
+            })?;
             lower_change_event_expand_node(
                 children,
                 node,
                 out_layout,
                 arena,
+                desc_tbl,
                 last_query_id,
                 fe_addr,
             )?

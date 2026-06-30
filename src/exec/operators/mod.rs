@@ -30,6 +30,7 @@ pub(crate) mod analytic_shared;
 mod analytic_sink;
 mod analytic_source;
 mod assert_num_rows_processor;
+mod change_event_expand_processor;
 mod data_stream_sink;
 mod exchange_source;
 mod fetch_processor;
@@ -70,6 +71,7 @@ pub(crate) use aggregate_state_merge::{
 pub use analytic_sink::AnalyticSinkFactory;
 pub use analytic_source::AnalyticSourceFactory;
 pub use assert_num_rows_processor::AssertNumRowsProcessorFactory;
+pub use change_event_expand_processor::ChangeEventExpandProcessorFactory;
 pub(crate) use data_stream_sink::DataStreamSinkFactory;
 pub use exchange_source::ExchangeSourceFactory;
 pub use fetch_processor::FetchProcessorFactory;
