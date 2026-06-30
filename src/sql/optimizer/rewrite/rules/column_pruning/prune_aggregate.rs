@@ -1,16 +1,11 @@
 //! PruneAggregateColumns — Phase 2 rule for Aggregate nodes.
 //!
-//! **Currently a no-op.**
-//!
-//! `LogicalAggregateOp.output_columns` starts with the group-by output prefix used by
-//! the physical aggregate layout.  The aggregate function outputs themselves
-//! must be identified from the output_column_id in each aggregate spec, not from
-//! SELECT projection order or display names.
-//!
-//! Per-aggregate output pruning remains disabled in this rule until it can
-//! preserve every required aggregate call by ColumnId.  Until then, this rule
-//! returns `Unchanged` unconditionally.
+//! Public `LogicalAggregateOp.output_columns` may be a subset of the internal
+//! `AggregateOutputLayout`.  This rule prunes parent-visible outputs and
+//! aggregate calls by ColumnId while preserving the complete group-key layout
+//! needed by physical property derivation and codegen.
 
+use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -41,13 +36,102 @@ impl LogicalRewriteRule for PruneAggregateColumns {
     }
 
     fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        // No-op: see module-level doc comment.
-        //
-        // Per-aggregate output pruning (Gap 5) remains disabled until upper
-        // projection refs and codegen binding use ScalarAggregateSpec output
-        // column ids.
-        let _ = expr; // suppress unused-variable warning
-        Ok(RewriteResult::Unchanged)
+        let OptExpr {
+            op,
+            children,
+            required_output_columns,
+        } = expr;
+        let Operator::LogicalAggregate(mut node) = op else {
+            unreachable!()
+        };
+
+        let Some(needed) = required_output_columns.clone() else {
+            return Ok(RewriteResult::Unchanged);
+        };
+        let needed = node.effective_required_outputs(&needed);
+
+        node.output_layout
+            .validate_aggregate_calls(&node.aggregates, node.is_merge.len())
+            .map_err(|err| format!("PruneAggregateColumns {err}"))?;
+
+        let original_output_ids = node
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect::<Vec<_>>();
+        let original_aggregate_ids = node
+            .aggregates
+            .iter()
+            .map(|aggregate| aggregate.output_column_id)
+            .collect::<Vec<_>>();
+
+        node.output_columns
+            .retain(|column| needed.contains(&column.column_id));
+
+        let mut retained_aggregates = Vec::new();
+        let mut retained_is_merge = Vec::new();
+        let mut retained_aggregate_columns = Vec::new();
+        for ((aggregate, is_merge), layout_column) in node
+            .aggregates
+            .into_iter()
+            .zip(node.is_merge.into_iter())
+            .zip(node.output_layout.aggregate_columns.into_iter())
+        {
+            if aggregate.output_column_id != layout_column.column_id {
+                return Err(format!(
+                    "aggregate output layout mismatch: spec id {} != layout id {}",
+                    aggregate.output_column_id.0, layout_column.column_id.0
+                ));
+            }
+            if needed.contains(&aggregate.output_column_id) {
+                retained_aggregate_columns.push(layout_column);
+                retained_is_merge.push(is_merge);
+                retained_aggregates.push(aggregate);
+            }
+        }
+
+        node.aggregates = retained_aggregates;
+        node.is_merge = retained_is_merge;
+        node.output_layout.aggregate_columns = retained_aggregate_columns;
+
+        if node.output_columns.is_empty() {
+            let fallback = node
+                .output_layout
+                .group_key_columns
+                .iter()
+                .chain(node.output_layout.aggregate_columns.iter())
+                .find(|column| needed.contains(&column.column_id))
+                .or_else(|| node.output_layout.group_key_columns.first())
+                .or_else(|| node.output_layout.aggregate_columns.first())
+                .ok_or_else(|| {
+                    "AggregateOutputLayout must expose at least one fallback output".to_string()
+                })?
+                .clone();
+            node.output_columns.push(fallback);
+        }
+
+        let pruned_output_ids = node
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect::<Vec<_>>();
+        let pruned_aggregate_ids = node
+            .aggregates
+            .iter()
+            .map(|aggregate| aggregate.output_column_id)
+            .collect::<Vec<_>>();
+
+        if pruned_output_ids == original_output_ids
+            && pruned_aggregate_ids == original_aggregate_ids
+        {
+            return Ok(RewriteResult::Unchanged);
+        }
+
+        Ok(RewriteResult::Changed(OptExpr {
+            op: Operator::LogicalAggregate(node),
+            children,
+            required_output_columns,
+        }))
     }
 }
 
@@ -115,90 +199,160 @@ mod tests {
         }))
     }
 
-    // -----------------------------------------------------------------------
-    // Bug A regression: PruneAggregateColumns must be a no-op.
-    //
-    // Aggregate function outputs are identified by ScalarAggregateSpec output
-    // column ids, not by SELECT projection order or display names. Until this
-    // rule performs that ColumnId-aware pruning, it must always return Unchanged
-    // regardless of what required_output_columns contains.
-    // -----------------------------------------------------------------------
-
-    /// Rule is a no-op even when needed contains only some aggregate output ids.
     #[test]
-    fn prune_aggregate_is_noop_regardless_of_needed_set() {
-        let id_y = ColumnId::new_for_test(1);
-        let id_count_oc = ColumnId::new_for_test(301);
-        let id_sum_oc = ColumnId::new_for_test(302);
+    fn prune_aggregate_keeps_required_calls_and_drops_unused_calls() {
+        let id_group = ColumnId::new_for_test(101);
+        let id_sum = ColumnId::new_for_test(201);
+        let id_count = ColumnId::new_for_test(202);
+        let group = make_output_column(id_group, "g");
+        let sum = make_output_column(id_sum, "sum_a");
+        let count = make_output_column(id_count, "count_b");
+        let layout =
+            AggregateOutputLayout::new(vec![group.clone()], vec![sum.clone(), count.clone()]);
 
         let mut needed = HashSet::new();
-        needed.insert(id_count_oc); // only count needed, not sum
+        needed.insert(id_sum);
 
-        let output_columns = vec![
-            make_output_column(id_y, "y"),
-            make_output_column(id_count_oc, "count"),
-            make_output_column(id_sum_oc, "sum_x"),
-        ];
-        let output_layout = AggregateOutputLayout::new(
-            vec![make_output_column(id_y, "y")],
-            vec![
-                make_output_column(id_count_oc, "count"),
-                make_output_column(id_sum_oc, "sum_x"),
-            ],
-        );
         let mut expr = OptExpr::new(
-            Operator::LogicalAggregate(LogicalAggregateOp {
-                stage: AggStage::Single,
-                group_by: vec![],
-                aggregates: vec![
+            Operator::LogicalAggregate(LogicalAggregateOp::staged(
+                AggStage::Single,
+                vec![],
+                vec![
                     ScalarAggregateSpec {
-                        output_column_id: id_count_oc,
-                        name: "count".to_string(),
-                        args: vec![],
-                        distinct: false,
-                        order_by: vec![],
-                    },
-                    ScalarAggregateSpec {
-                        output_column_id: id_sum_oc,
+                        output_column_id: id_sum,
                         name: "sum".to_string(),
                         args: vec![],
                         distinct: false,
                         order_by: vec![],
                     },
+                    ScalarAggregateSpec {
+                        output_column_id: id_count,
+                        name: "count".to_string(),
+                        args: vec![],
+                        distinct: false,
+                        order_by: vec![],
+                    },
                 ],
-                output_layout,
-                output_columns,
-                is_merge: vec![false, false],
-                is_split: false,
-            }),
+                layout,
+                vec![group.clone(), sum.clone(), count.clone()],
+                vec![false, false],
+                false,
+            )),
             vec![dummy_input()],
         );
         expr.required_output_columns = Some(needed);
 
-        let rule = PruneAggregateColumns;
-        let result = rule.apply(expr, &mut ctx()).unwrap();
+        let result = PruneAggregateColumns.apply(expr, &mut ctx()).unwrap();
 
-        assert!(
-            matches!(result, RewriteResult::Unchanged),
-            "PruneAggregateColumns must be a no-op (Gap 5 not yet implemented); got {result:?}"
+        let RewriteResult::Changed(changed) = result else {
+            panic!("expected prune aggregate to change");
+        };
+        let Operator::LogicalAggregate(node) = changed.op else {
+            panic!("expected LogicalAggregate");
+        };
+        assert_eq!(
+            node.output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![id_sum]
         );
+        assert_eq!(node.aggregates.len(), 1);
+        assert_eq!(node.aggregates[0].output_column_id, id_sum);
+        assert_eq!(node.output_layout.group_key_columns[0].column_id, id_group);
+        assert_eq!(node.output_layout.aggregate_columns.len(), 1);
+        assert_eq!(node.output_layout.aggregate_columns[0].column_id, id_sum);
+        assert_eq!(node.is_merge, vec![false]);
     }
 
-    /// Rule is also a no-op when required_output_columns is None (untagged).
     #[test]
-    fn prune_aggregate_noop_when_required_output_columns_is_none() {
-        let id_k = ColumnId::new_for_test(1);
+    fn prune_aggregate_prunes_public_group_key_output_but_keeps_layout_group_key() {
+        let id_group = ColumnId::new_for_test(101);
         let id_sum = ColumnId::new_for_test(201);
+        let group = make_output_column(id_group, "g");
+        let sum = make_output_column(id_sum, "sum_a");
+        let layout = AggregateOutputLayout::new(vec![group.clone()], vec![sum.clone()]);
+        let mut needed = HashSet::new();
+        needed.insert(id_sum);
 
-        let output_columns = vec![
-            make_output_column(id_k, "k"),
-            make_output_column(id_sum, "sum_a"),
-        ];
-        let output_layout = AggregateOutputLayout::new(
-            vec![make_output_column(id_k, "k")],
-            vec![make_output_column(id_sum, "sum_a")],
+        let mut expr = OptExpr::new(
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![ScalarAggregateSpec {
+                    output_column_id: id_sum,
+                    name: "sum".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    order_by: vec![],
+                }],
+                layout,
+                vec![group.clone(), sum.clone()],
+            )),
+            vec![dummy_input()],
         );
-        let expr = OptExpr::new(
+        expr.required_output_columns = Some(needed);
+
+        let result = PruneAggregateColumns.apply(expr, &mut ctx()).unwrap();
+
+        let RewriteResult::Changed(changed) = result else {
+            panic!("expected changed aggregate");
+        };
+        let Operator::LogicalAggregate(node) = changed.op else {
+            panic!("expected LogicalAggregate");
+        };
+        assert_eq!(node.output_columns.len(), 1);
+        assert_eq!(node.output_columns[0].column_id, id_sum);
+        assert_eq!(node.output_layout.group_key_columns.len(), 1);
+        assert_eq!(node.output_layout.group_key_columns[0].column_id, id_group);
+    }
+
+    #[test]
+    fn prune_aggregate_fallback_public_output_prefers_needed_hidden_aggregate() {
+        let id_group = ColumnId::new_for_test(101);
+        let id_sum = ColumnId::new_for_test(201);
+        let group = make_output_column(id_group, "g");
+        let sum = make_output_column(id_sum, "sum_a");
+        let layout = AggregateOutputLayout::new(vec![group.clone()], vec![sum.clone()]);
+        let mut needed = HashSet::new();
+        needed.insert(id_sum);
+
+        let mut expr = OptExpr::new(
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![ScalarAggregateSpec {
+                    output_column_id: id_sum,
+                    name: "sum".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    order_by: vec![],
+                }],
+                layout,
+                vec![group.clone()],
+            )),
+            vec![dummy_input()],
+        );
+        expr.required_output_columns = Some(needed);
+
+        let result = PruneAggregateColumns.apply(expr, &mut ctx()).unwrap();
+
+        let RewriteResult::Changed(changed) = result else {
+            panic!("expected fallback aggregate output to change the node");
+        };
+        let Operator::LogicalAggregate(node) = changed.op else {
+            panic!("expected LogicalAggregate");
+        };
+        assert_eq!(node.output_columns.len(), 1);
+        assert_eq!(node.output_columns[0].column_id, id_sum);
+    }
+
+    #[test]
+    fn prune_aggregate_rejects_spec_layout_output_mismatch() {
+        let id_sum = ColumnId::new_for_test(201);
+        let id_count = ColumnId::new_for_test(202);
+        let mut needed = HashSet::new();
+        needed.insert(id_sum);
+
+        let mut expr = OptExpr::new(
             Operator::LogicalAggregate(LogicalAggregateOp {
                 stage: AggStage::Single,
                 group_by: vec![],
@@ -209,21 +363,44 @@ mod tests {
                     distinct: false,
                     order_by: vec![],
                 }],
-                output_layout,
-                output_columns,
+                output_layout: AggregateOutputLayout::new(
+                    vec![],
+                    vec![make_output_column(id_count, "count_b")],
+                ),
+                output_columns: vec![make_output_column(id_sum, "sum_a")],
                 is_merge: vec![false],
                 is_split: false,
             }),
             vec![dummy_input()],
         );
-        // required_output_columns = None (default)
+        expr.required_output_columns = Some(needed);
 
-        let rule = PruneAggregateColumns;
-        let result = rule.apply(expr, &mut ctx()).unwrap();
+        let err = PruneAggregateColumns.apply(expr, &mut ctx()).unwrap_err();
+        assert!(err.contains("aggregate output layout mismatch"));
+    }
 
-        assert!(
-            matches!(result, RewriteResult::Unchanged),
-            "must be no-op when required_output_columns is None"
+    #[test]
+    fn prune_aggregate_noop_when_required_output_columns_is_none() {
+        let id_sum = ColumnId::new_for_test(201);
+        let sum = make_output_column(id_sum, "sum_a");
+        let expr = OptExpr::new(
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![ScalarAggregateSpec {
+                    output_column_id: id_sum,
+                    name: "sum".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    order_by: vec![],
+                }],
+                AggregateOutputLayout::new(vec![], vec![sum.clone()]),
+                vec![sum],
+            )),
+            vec![dummy_input()],
         );
+
+        let result = PruneAggregateColumns.apply(expr, &mut ctx()).unwrap();
+
+        assert!(matches!(result, RewriteResult::Unchanged));
     }
 }

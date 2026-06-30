@@ -303,6 +303,26 @@ impl LogicalAggregateOp {
             is_split,
         }
     }
+
+    pub(crate) fn effective_required_outputs(
+        &self,
+        parent_needed: &HashSet<ColumnId>,
+    ) -> HashSet<ColumnId> {
+        if !parent_needed.is_empty() {
+            return parent_needed.clone();
+        }
+        let fallback = self
+            .output_layout
+            .group_key_columns
+            .first()
+            .or_else(|| self.output_layout.aggregate_columns.first())
+            .unwrap_or_else(|| {
+                panic!("AggregateOutputLayout must expose at least one fallback output")
+            });
+        let mut effective = HashSet::new();
+        effective.insert(fallback.column_id);
+        effective
+    }
 }
 
 #[derive(Clone, Debug)]
