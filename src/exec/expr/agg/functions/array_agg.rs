@@ -32,7 +32,7 @@ use crate::exec::node::aggregate::AggFunction;
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::compare_scalar_values;
+use super::common::{compare_scalar_values, key_fingerprint};
 
 pub(super) struct ArrayAggAgg;
 
@@ -55,75 +55,12 @@ struct ArrayAggState {
     distinct_seen: HashSet<Vec<u8>>,
 }
 
-fn encode_scalar_key(value: &Option<ArrayAggValue>) -> Vec<u8> {
-    fn encode_value(out: &mut Vec<u8>, value: &ArrayAggValue) {
-        match value {
-            ArrayAggValue::Bool(v) => {
-                out.push(1);
-                out.push(*v as u8);
-            }
-            ArrayAggValue::Int64(v) => {
-                out.push(2);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            ArrayAggValue::Float64(v) => {
-                out.push(3);
-                out.extend_from_slice(&v.to_bits().to_le_bytes());
-            }
-            ArrayAggValue::Utf8(v) => {
-                out.push(4);
-                let len = v.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                out.extend_from_slice(v.as_bytes());
-            }
-            ArrayAggValue::Date32(v) => {
-                out.push(5);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            ArrayAggValue::Timestamp(v) => {
-                out.push(6);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            ArrayAggValue::Decimal128(v) => {
-                out.push(7);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            ArrayAggValue::Struct(items) => {
-                out.push(8);
-                let len = items.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                for item in items {
-                    match item {
-                        None => out.push(0),
-                        Some(v) => {
-                            out.push(1);
-                            encode_value(out, v);
-                        }
-                    }
-                }
-            }
-            ArrayAggValue::List(items) => {
-                out.push(9);
-                let len = items.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                for item in items {
-                    match item {
-                        None => out.push(0),
-                        Some(v) => {
-                            out.push(1);
-                            encode_value(out, v);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+fn distinct_key(value: &Option<ArrayAggValue>) -> Vec<u8> {
     match value {
         None => vec![0],
         Some(v) => {
             let mut out = vec![1];
-            encode_value(&mut out, v);
+            out.extend(key_fingerprint(&to_common_scalar(v)));
             out
         }
     }
@@ -253,7 +190,7 @@ fn extract_final_values(
     for row in rows {
         let value = row.first().cloned().unwrap_or(None);
         if distinct {
-            let key = encode_scalar_key(&value);
+            let key = distinct_key(&value);
             if seen.insert(key) {
                 out.push(value);
             }
@@ -453,7 +390,7 @@ fn reconcile_fields_for_columns(
 
 fn append_value(state: &mut ArrayAggState, value: Option<ArrayAggValue>, distinct: bool) {
     if distinct {
-        let key = encode_scalar_key(&value);
+        let key = distinct_key(&value);
         if state.distinct_seen.insert(key) {
             state.rows.push(vec![value]);
         }
@@ -1560,6 +1497,22 @@ mod tests {
             Some(arrow_buffer::NullBuffer::from(vec![true, true, false])),
             false,
         )) as ArrayRef
+    }
+
+    #[test]
+    fn array_agg_distinct_key_uses_common_fingerprint() {
+        let value = Some(ArrayAggValue::Struct(vec![
+            Some(ArrayAggValue::Int64(7)),
+            None,
+            Some(ArrayAggValue::Utf8("x".to_string())),
+        ]));
+        let mut expected = vec![1];
+        expected.extend(super::super::common::key_fingerprint(&to_common_scalar(
+            value.as_ref().unwrap(),
+        )));
+
+        assert_eq!(distinct_key(&value), expected);
+        assert_eq!(distinct_key(&None), vec![0]);
     }
 
     #[test]
