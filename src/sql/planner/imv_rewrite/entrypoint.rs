@@ -1182,6 +1182,8 @@ mod tests {
             )
             .expect("create base table");
         }
+        let left_lineage = seed_join_projection_base_table(&base_entry, "l", 10, 11);
+        let right_lineage = seed_join_projection_base_table(&base_entry, "r", 20, 21);
         crate::connector::iceberg::catalog::registry::create_table(
             &target_entry,
             "db",
@@ -1238,20 +1240,54 @@ mod tests {
                 .expect("build target iceberg catalog");
 
         let base = join_projection_mv_ctx();
+        let mut mv_definition = (*base.mv_definition).clone();
+        mv_definition.last_refresh_snapshots = [
+            ("ice.db.l".to_string(), left_lineage.previous_snapshot_id),
+            ("ice.db.r".to_string(), right_lineage.previous_snapshot_id),
+        ]
+        .into_iter()
+        .collect();
+        mv_definition.last_refresh_table_uuids = [
+            ("ice.db.l".to_string(), left_lineage.table_uuid.clone()),
+            ("ice.db.r".to_string(), right_lineage.table_uuid.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let mut schema_contract = (*base.schema_contract).clone();
+        for base_contract in &mut schema_contract.bases {
+            if base_contract.table_fqn.eq_ignore_ascii_case("ice.db.l") {
+                base_contract.table_uuid = left_lineage.table_uuid.clone();
+            } else if base_contract.table_fqn.eq_ignore_ascii_case("ice.db.r") {
+                base_contract.table_uuid = right_lineage.table_uuid.clone();
+            }
+        }
+        mv_definition.schema_contract = Some(schema_contract.clone());
+        let pin = make_pin(&[
+            (
+                "ice.db.l",
+                left_lineage.current_snapshot_id,
+                left_lineage.table_uuid.as_str(),
+            ),
+            (
+                "ice.db.r",
+                right_lineage.current_snapshot_id,
+                right_lineage.table_uuid.as_str(),
+            ),
+        ]);
         let rewrite = Arc::new(
             IcebergMvRewriteContext::from_parts(
                 base.target.clone(),
                 base.mv_id,
                 base.current_catalog.clone(),
                 base.current_database.clone(),
-                Arc::clone(&base.mv_definition),
+                Arc::new(mv_definition),
                 Arc::clone(&base.canonical_select_query),
                 Arc::clone(&base.base_refs),
-                Arc::clone(&base.pin),
+                Arc::new(pin),
                 Some(target_snapshot_id),
-                base.target_table_uuid.clone(),
+                loaded.table.metadata().uuid().to_string(),
                 Arc::clone(&base.target_schema),
-                Some(Arc::clone(&base.schema_contract)),
+                Some(Arc::new(schema_contract)),
             )
             .expect("join projection refresh rewrite context"),
         );
@@ -1275,6 +1311,62 @@ mod tests {
                 ),
             },
         )
+    }
+
+    #[derive(Debug)]
+    struct JoinProjectionBaseLineage {
+        previous_snapshot_id: i64,
+        current_snapshot_id: i64,
+        table_uuid: String,
+    }
+
+    fn seed_join_projection_base_table(
+        entry: &crate::connector::iceberg::catalog::registry::IcebergCatalogEntry,
+        table: &str,
+        previous_value: i64,
+        current_value: i64,
+    ) -> JoinProjectionBaseLineage {
+        crate::connector::iceberg::catalog::registry::insert_rows(
+            entry,
+            "db",
+            table,
+            &[vec![
+                crate::sql::Literal::Int(1),
+                crate::sql::Literal::Int(previous_value),
+            ]],
+        )
+        .expect("insert previous base row");
+        let previous = crate::connector::iceberg::catalog::registry::load_table(entry, "db", table)
+            .expect("load previous base table");
+        let previous_snapshot_id = previous
+            .table
+            .metadata()
+            .current_snapshot_id()
+            .expect("previous base snapshot");
+
+        crate::connector::iceberg::catalog::registry::insert_rows(
+            entry,
+            "db",
+            table,
+            &[vec![
+                crate::sql::Literal::Int(2),
+                crate::sql::Literal::Int(current_value),
+            ]],
+        )
+        .expect("insert current base row");
+        let current = crate::connector::iceberg::catalog::registry::load_table(entry, "db", table)
+            .expect("load current base table");
+        let current_snapshot_id = current
+            .table
+            .metadata()
+            .current_snapshot_id()
+            .expect("current base snapshot");
+
+        JoinProjectionBaseLineage {
+            previous_snapshot_id,
+            current_snapshot_id,
+            table_uuid: current.table.metadata().uuid().to_string(),
+        }
     }
 
     // ── Task-3 helpers ──────────────────────────────────────────────────────
@@ -2525,8 +2617,12 @@ mod tests {
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 let (_warehouse, refresh_ctx) = join_projection_refresh_context_for_test();
+                let plan = bind_iceberg_scan_metadata_to_refresh_pin(
+                    join_projection_plan(),
+                    &refresh_ctx.rewrite,
+                );
                 let outcome = run_imv_rewrite(ImvRewriteInput {
-                    plan: join_projection_plan(),
+                    plan,
                     mv_ctx: Arc::clone(&refresh_ctx.rewrite),
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                     deadline: None,
@@ -2567,6 +2663,44 @@ mod tests {
             .expect("spawn fragment lowering test")
             .join()
             .expect("fragment lowering test");
+    }
+
+    fn bind_iceberg_scan_metadata_to_refresh_pin(
+        mut plan: LogicalPlanNode,
+        refresh_ctx: &IcebergMvRewriteContext,
+    ) -> LogicalPlanNode {
+        fn visit(plan: &mut LogicalPlanNode, refresh_ctx: &IcebergMvRewriteContext) {
+            if let PlanNodeKind::Scan(scan) = &mut plan.kind
+                && let ScanSource::IcebergDataFiles { table, .. } = &mut scan.table.source
+            {
+                let fqn = format!("{}.{}.{}", table.catalog, table.namespace, table.table);
+                if let Some(base_ref) = refresh_ctx
+                    .base_refs
+                    .iter()
+                    .find(|base_ref| base_ref.fqn().eq_ignore_ascii_case(&fqn))
+                {
+                    table.current_snapshot_id = Some(
+                        refresh_ctx
+                            .pin
+                            .get(base_ref)
+                            .expect("test refresh pin covers base"),
+                    );
+                    table.table_uuid = Some(
+                        refresh_ctx
+                            .pin
+                            .uuid(base_ref)
+                            .expect("test refresh pin carries base uuid")
+                            .to_string(),
+                    );
+                }
+            }
+            for child in &mut plan.children {
+                visit(child, refresh_ctx);
+            }
+        }
+
+        visit(&mut plan, refresh_ctx);
+        plan
     }
 
     #[test]

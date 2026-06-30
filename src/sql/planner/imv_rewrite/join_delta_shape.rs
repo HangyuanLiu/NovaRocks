@@ -181,8 +181,10 @@ fn join_delta_delta_action_column_id(plan: &LogicalPlanNode) -> Option<ColumnId>
 fn is_join_delta_version_like(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
         PlanNodeKind::Scan(scan) => {
-            matches!(scan.table.source, ScanSource::IcebergVersionTable { .. })
-                && !scan.columns.iter().any(has_reserved_action_output_name)
+            matches!(
+                scan.table.source,
+                ScanSource::IcebergVersionTable { .. } | ScanSource::IcebergDataFiles { .. }
+            ) && !scan.columns.iter().any(has_reserved_action_output_name)
         }
         PlanNodeKind::Filter(_) => is_join_delta_version_like(plan.unary_input()),
         PlanNodeKind::Project(node) => {
@@ -272,7 +274,9 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, TableDef};
+    use crate::sql::catalog::{
+        ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, TableDef,
+    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{LogicalProjectNode, LogicalScanNode, PlanNodeKind};
 
@@ -358,6 +362,19 @@ mod tests {
             ScanSource::IcebergVersionTable {
                 table: table_info(table),
                 snapshot_id: 22,
+            },
+        )
+    }
+
+    fn snapshot_data_files_scan(table: &str, column_id: ColumnId) -> LogicalPlanNode {
+        scan(
+            table,
+            column_id,
+            ScanSource::IcebergDataFiles {
+                table: table_info(table),
+                files: Vec::new(),
+                cloud_properties: Default::default(),
+                binding: IcebergDataFileBinding::ExplicitFiles,
             },
         )
     }
@@ -451,6 +468,20 @@ mod tests {
             version_scan("b", ColumnId(10)),
             column_ref_item(action_id, ImvActionColumn::NAME, DataType::Int8),
         )
+    }
+
+    #[test]
+    fn join_delta_branch_accepts_snapshot_data_files_side() {
+        let action_id = ColumnId(100);
+        let branch = join_plan(
+            delta_scan_with_action("a", ColumnId(1), action_id),
+            snapshot_data_files_scan("b", ColumnId(10)),
+        );
+
+        assert!(
+            is_supported_join_delta_branch(&branch),
+            "join delta coalesce branches use IcebergDataFiles for snapshot sides"
+        );
     }
 
     fn right_delta_branch(action_id: ColumnId) -> LogicalPlanNode {

@@ -696,6 +696,10 @@ fn aggregate_delete_expr_for_output(
         }
     }
 
+    if is_locator_metadata_column(&output.name) {
+        return source_expr_by_name(input_outputs, old_outputs, &output.name);
+    }
+
     Err(format!(
         "Iceberg IMV aggregate rewrite cannot project delete-side change-stream output column {}",
         output.name
@@ -728,10 +732,11 @@ fn aggregate_insert_expr_for_output(
         let state_column = single_state_column_for_visible(layout, visible_index)?;
         let merged_state =
             merged_state_expr(state_column, input_outputs, delta_outputs, old_outputs)?;
+        let args = visible_state_args(state_column, merged_state, layout)?;
         return Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
                 name: visible_state_function(state_column.function)?.to_string(),
-                args: vec![merged_state],
+                args,
                 distinct: false,
             },
             data_type: visible.data_type.clone(),
@@ -743,6 +748,10 @@ fn aggregate_insert_expr_for_output(
         if output.name.eq_ignore_ascii_case(&state_column.name) {
             return merged_state_expr(state_column, input_outputs, delta_outputs, old_outputs);
         }
+    }
+
+    if is_locator_metadata_column(&output.name) {
+        return Ok(typed_null(output.data_type.clone()));
     }
 
     Err(format!(
@@ -820,6 +829,7 @@ fn aggregate_change_stream_output_columns(
         1 + layout.visible_columns.len()
             + layout.state_columns.len()
             + usize::from(branch_scope.is_some())
+            + 2
             + 1,
     );
     columns.push(allocate_imv_output_column(
@@ -858,12 +868,31 @@ fn aggregate_change_stream_output_columns(
     }
     columns.push(allocate_imv_output_column(
         ctx,
+        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        DataType::Utf8,
+        true,
+        true,
+    )?);
+    columns.push(allocate_imv_output_column(
+        ctx,
+        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        DataType::Int64,
+        true,
+        true,
+    )?);
+    columns.push(allocate_imv_output_column(
+        ctx,
         ImvActionColumn::NAME,
         DataType::Int8,
         false,
         true,
     )?);
     Ok(columns)
+}
+
+fn is_locator_metadata_column(name: &str) -> bool {
+    name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
+        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
 }
 
 fn column_ref(column: &OutputColumn) -> TypedExpr {
@@ -977,6 +1006,48 @@ fn visible_state_function(
         other => Err(format!(
             "Iceberg IMV aggregate rewrite does not support visible state for {other:?}"
         )),
+    }
+}
+
+fn visible_state_args(
+    state_column: &crate::connector::starrocks::table::mv_agg_state::AggregateStateColumn,
+    merged_state: TypedExpr,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+) -> Result<Vec<TypedExpr>, String> {
+    use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
+
+    let visible = layout
+        .visible_columns
+        .get(state_column.visible_source_index)
+        .ok_or_else(|| {
+            format!(
+                "Iceberg IMV aggregate rewrite visible source index {} out of range",
+                state_column.visible_source_index
+            )
+        })?;
+    if state_column.function != AggregateFunctionKind::Avg
+        || !matches!(visible.data_type, DataType::Decimal128(_, _))
+    {
+        return Ok(vec![merged_state]);
+    }
+    let Some(DataType::Decimal128(_, input_scale)) = layout
+        .aggregate_input_types
+        .get(state_column.aggregate_index)
+        .and_then(Option::as_ref)
+    else {
+        return Err(format!(
+            "Iceberg IMV aggregate rewrite requires Decimal128 AVG input scale metadata for visible column {}",
+            visible.name
+        ));
+    };
+    Ok(vec![merged_state, int64_literal(i64::from(*input_scale))])
+}
+
+fn int64_literal(value: i64) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::Int(value)),
+        data_type: DataType::Int64,
+        nullable: false,
     }
 }
 
@@ -2236,6 +2307,73 @@ mod tests {
         assert_eq!(ext.annotation.partition, None);
     }
 
+    #[test]
+    fn visible_state_args_threads_avg_decimal_input_scale() {
+        let shape = crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(
+            &parse_query("select k, avg(d) as a from ice.db.b group by k"),
+        )
+        .expect("classify aggregate");
+        let crate::connector::starrocks::table::mv_shape::IncrementalMvShape::Aggregate(shape) =
+            shape
+        else {
+            panic!("expected aggregate shape");
+        };
+        let calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(
+                &shape,
+            );
+        let layout =
+            crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+                &calls,
+                &[
+                    OutputColumn {
+                        column_id: ColumnId::new_for_test(1),
+                        name: "k".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: ColumnId::new_for_test(2),
+                        name: "a".to_string(),
+                        data_type: DataType::Decimal128(38, 10),
+                        nullable: true,
+                        is_internal: false,
+                    },
+                ],
+                &[Some(DataType::Decimal128(20, 4))],
+            )
+            .expect("AVG decimal layout");
+        let state_column = layout
+            .state_columns
+            .iter()
+            .find(|column| {
+                column.state_role
+                    == crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::Single
+            })
+            .expect("single AVG state column");
+        let merged_state = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(10),
+                qualifier: None,
+                column: state_column.name.clone(),
+            },
+            data_type: DataType::Binary,
+            nullable: false,
+        };
+
+        let args = visible_state_args(state_column, merged_state, &layout)
+            .expect("AVG decimal visible args");
+
+        assert_eq!(args.len(), 2);
+        assert!(matches!(
+            &args[1].kind,
+            ExprKind::Literal(LiteralValue::Int(4))
+        ));
+        assert_eq!(args[1].data_type, DataType::Int64);
+        assert!(!args[1].nullable);
+    }
+
     fn col_expr(id: u32, name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -2896,6 +3034,8 @@ mod tests {
                 "v",
                 "__agg_state_s",
                 "__agg_state___ivm_row_count",
+                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                crate::exec::row_position::ICEBERG_ROW_POS_COL,
                 "__change_op"
             ]
         );
@@ -2904,6 +3044,84 @@ mod tests {
                 assert_branch_case_arms_cast_to_output_type(item);
             }
         }
+    }
+
+    #[test]
+    fn rewrite_aggregate_state_locator_case_arms_keep_old_positions_and_null_inserts() {
+        let rule = RewriteAggregateStateRule;
+        let mut ctx = build_ctx();
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(
+            &delta(aggregate_over(leaf_scan())),
+            &mut arena_rc.borrow_mut(),
+        );
+        let result = rule
+            .apply(expr, &mut ctx)
+            .expect("aggregate rewrite must succeed");
+        let changed = expect_changed_plan(result, &arena_rc.borrow());
+
+        let project = aggregate_change_stream_project(&changed);
+        let filter_plan = changed.unary_input();
+        let expanded_plan = filter_plan.unary_input();
+        let left_join_plan = expanded_plan.left();
+        let old_outputs = plan_output_columns(left_join_plan.right()).expect("old outputs");
+        let old_file = find_output_column_by_name(
+            &old_outputs,
+            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        )
+        .expect("old file locator")
+        .column_id;
+        let old_pos = find_output_column_by_name(
+            &old_outputs,
+            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        )
+        .expect("old row position locator")
+        .column_id;
+
+        let file_item = project
+            .items
+            .iter()
+            .find(|item| {
+                item.output_name
+                    .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
+            })
+            .expect("expected file locator output");
+        let pos_item = project
+            .items
+            .iter()
+            .find(|item| {
+                item.output_name
+                    .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
+            })
+            .expect("expected row position locator output");
+
+        let (delete_file, insert_file) = case_arm_exprs(&file_item.expr);
+        let ExprKind::ColumnRef { column_id, .. } = uncast_expr(delete_file).kind else {
+            panic!("DELETE file locator must read old target-state _file");
+        };
+        assert_eq!(column_id, old_file);
+        assert!(
+            matches!(
+                uncast_expr(insert_file).kind,
+                ExprKind::Literal(LiteralValue::Null)
+            ),
+            "INSERT file locator must be NULL"
+        );
+        assert!(file_item.expr.nullable);
+
+        let (delete_pos, insert_pos) = case_arm_exprs(&pos_item.expr);
+        let ExprKind::ColumnRef { column_id, .. } = uncast_expr(delete_pos).kind else {
+            panic!("DELETE row position locator must read old target-state _pos");
+        };
+        assert_eq!(column_id, old_pos);
+        assert!(
+            matches!(
+                uncast_expr(insert_pos).kind,
+                ExprKind::Literal(LiteralValue::Null)
+            ),
+            "INSERT row position locator must be NULL"
+        );
+        assert!(pos_item.expr.nullable);
     }
 
     #[test]
@@ -2980,6 +3198,14 @@ mod tests {
     }
 
     fn case_arm_column_ids(expr: &TypedExpr) -> (ColumnId, ColumnId) {
+        let (delete_expr, insert_expr) = case_arm_exprs(expr);
+        (
+            column_id_through_cast(delete_expr),
+            column_id_through_cast(insert_expr),
+        )
+    }
+
+    fn case_arm_exprs(expr: &TypedExpr) -> (&TypedExpr, &TypedExpr) {
         let ExprKind::Case {
             when_then,
             else_expr,
@@ -2995,21 +3221,22 @@ mod tests {
         let insert_expr = else_expr
             .as_deref()
             .expect("expected insert branch in CASE ELSE");
-        (
-            column_id_through_cast(delete_expr),
-            column_id_through_cast(insert_expr),
-        )
+        (delete_expr, insert_expr)
     }
 
     fn column_id_through_cast(expr: &TypedExpr) -> ColumnId {
-        let expr = match &expr.kind {
-            ExprKind::Cast { expr, .. } => expr.as_ref(),
-            _ => expr,
-        };
+        let expr = uncast_expr(expr);
         let ExprKind::ColumnRef { column_id, .. } = &expr.kind else {
             panic!("expected CASE arm to read a ColumnRef through optional Cast");
         };
         *column_id
+    }
+
+    fn uncast_expr(expr: &TypedExpr) -> &TypedExpr {
+        match &expr.kind {
+            ExprKind::Cast { expr, .. } => expr.as_ref(),
+            _ => expr,
+        }
     }
 
     fn assert_branch_case_arms_cast_to_output_type(item: &ProjectItem) {

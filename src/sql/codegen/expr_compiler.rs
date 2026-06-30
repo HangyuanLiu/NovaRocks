@@ -2358,6 +2358,26 @@ fn infer_scalar_function_return_type(
             crate::common::largeint::LARGEINT_BYTE_WIDTH,
         )),
         "to_binary" | "encode_row_id" => Ok(DataType::Binary),
+        "count_state_union"
+        | "count_distinct_state_union"
+        | "approx_count_distinct_state_union"
+        | "avg_state_union"
+        | "sum_state_union"
+        | "min_state_union"
+        | "max_state_union"
+        | "bool_or_state_union"
+        | "bool_and_state_union" => Ok(DataType::Binary),
+        "count_state_visible"
+        | "count_distinct_state_visible"
+        | "approx_count_distinct_state_visible"
+        | "sum_state_visible"
+        | "min_state_visible"
+        | "max_state_visible" => Ok(DataType::Int64),
+        "avg_state_visible" => Ok(DataType::Float64),
+        "bool_or_state_visible" | "bool_and_state_visible" | "state_all_zero" => {
+            Ok(DataType::Boolean)
+        }
+        "mv_group_row_id" => Ok(DataType::Utf8),
         "aes_encrypt" | "aes_decrypt" | "encode_sort_key" => Ok(DataType::Utf8),
         "encode_fingerprint_sha256" => Ok(DataType::Binary),
         "__iceberg_transform_identity" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
@@ -4060,6 +4080,38 @@ mod tests {
         probes.push(("encode_fingerprint_sha256", vec![DataType::Utf8]));
         probes.push(("to_binary", vec![DataType::Utf8]));
         probes.push(("encode_row_id", vec![DataType::Int64]));
+
+        // ---------------- MV state scalar helpers ---------------------
+        for name in [
+            "count_state_union",
+            "count_distinct_state_union",
+            "approx_count_distinct_state_union",
+            "avg_state_union",
+            "sum_state_union",
+            "min_state_union",
+            "max_state_union",
+            "bool_or_state_union",
+            "bool_and_state_union",
+        ] {
+            probes.push((name, vec![DataType::Binary, DataType::Binary]));
+        }
+        for name in [
+            "count_state_visible",
+            "count_distinct_state_visible",
+            "approx_count_distinct_state_visible",
+            "avg_state_visible",
+            "sum_state_visible",
+            "min_state_visible",
+            "max_state_visible",
+            "bool_or_state_visible",
+            "bool_and_state_visible",
+        ] {
+            probes.push((name, vec![DataType::Binary]));
+        }
+        probes.push(("avg_state_visible", vec![DataType::Binary, DataType::Int64]));
+        probes.push(("state_all_zero", vec![DataType::Binary]));
+        probes.push(("state_all_zero", vec![DataType::Int64]));
+        probes.push(("mv_group_row_id", vec![DataType::Utf8]));
 
         // ---------------- aggregates in expr context -------------------
         for name in ["max_by", "min_by", "any_value"] {

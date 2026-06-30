@@ -34,7 +34,7 @@ use crate::connector::starrocks::table::mv_ddl::{
 };
 use crate::connector::starrocks::table::mv_refresh::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
-    run_mv_full_select_chunks, single_snapshot_map, single_table_uuid_map,
+    query_result_to_chunks, run_mv_full_select_chunks, single_snapshot_map, single_table_uuid_map,
 };
 use crate::connector::starrocks::table::mv_shape::UnionBranchKind;
 use crate::engine::mv::iceberg_target_apply::{
@@ -2698,10 +2698,7 @@ fn validate_repartition_support(caps: &RefreshCapabilities) -> Result<Repartitio
             Ok(RepartitionSupport::AggregateSingleBase)
         }
         (BaseSnapshotPolicy::JoinPairPartialInitialSkip, false, RefreshIdentity::JoinRowKey) => {
-            Err(format!(
-                "UnsupportedRepartitionShape: ALTER MATERIALIZED VIEW ... REPARTITION does not support identity={:?}, snapshot_policy={:?}, aggregate_state={}; join projection/filter repartition requires a merge-sink rebuild path that is not wired",
-                caps.identity, caps.snapshot_policy, caps.has_agg_state
-            ))
+            Ok(RepartitionSupport::JoinProjectionFilter)
         }
         (BaseSnapshotPolicy::JoinPairPartialInitialSkip, true, RefreshIdentity::GroupRowId) => {
             Ok(RepartitionSupport::JoinAggregate)
@@ -3160,10 +3157,19 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
                     &canonical_select_query,
                 )?;
+            let is_composed_join_aggregate =
+                matches!(
+                    (&caps.snapshot_policy, &caps.identity),
+                    (
+                        BaseSnapshotPolicy::AllBasesRequired,
+                        RefreshIdentity::GroupRowId
+                    )
+                ) && !from_clause_is_fan_in_union(&canonical_select_query);
             let join_aliases = if matches!(
                 caps.snapshot_policy,
                 BaseSnapshotPolicy::JoinPairPartialInitialSkip
-            ) {
+            ) || is_composed_join_aggregate
+            {
                 Some(
                     crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
                         &canonical_select_query,
@@ -3849,10 +3855,12 @@ fn refresh_iceberg_aggregate_mv(
     // additionally consumes the join aliases for base-ref matching.
     match &caps.snapshot_policy {
         BaseSnapshotPolicy::AllBasesRequired => {
-            let refresh = if apply_key.rewrite_evidence == RewriteEvidence::JoinAggregate {
+            let refresh = if let Some(join_aliases) = join_aliases {
+                validate_join_aliases_base_refs(join_aliases, base_refs)?;
                 AllBasesAggregateRefresh::ComposedJoinAggregate {
                     schema_contract,
                     aggregate_calls,
+                    join_aliases,
                 }
             } else {
                 AllBasesAggregateRefresh::FanIn {
@@ -4214,6 +4222,7 @@ enum AllBasesAggregateRefresh<'a> {
         schema_contract: &'a crate::meta::repository::mv_contract::MvSchemaContract,
         aggregate_calls:
             &'a crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
+        join_aliases: &'a crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     },
     /// UNION ALL of aggregate branches (`BranchScoped` identity): the union sits
     /// above per-branch aggregates and the first refresh injects `__branch_id__`.
@@ -4266,6 +4275,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
         AllBasesAggregateRefresh::ComposedJoinAggregate {
             schema_contract,
             aggregate_calls: _,
+            join_aliases: _,
         } => *schema_contract,
         AllBasesAggregateRefresh::BranchUnion {
             branch_count,
@@ -4518,6 +4528,14 @@ fn refresh_fan_in_aggregate_iceberg_mv(
             )
         },
         || {
+            if let AllBasesAggregateRefresh::ComposedJoinAggregate { join_aliases, .. } = &refresh {
+                let (left_ref, right_ref) = join_base_refs_for_aliases(join_aliases, base_refs)?;
+                return incremental_refresh_iceberg_join_mv(
+                    state,
+                    &ctx,
+                    &[left_ref.clone(), right_ref.clone()],
+                );
+            }
             let changes = loaded_bases
                 .iter()
                 .map(|(base_ref, loaded, current_snapshot_id, current_table_uuid)| {
@@ -4567,7 +4585,7 @@ fn refresh_join_aggregate_iceberg_mv(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     join_aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     aggregate_calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
-    apply_key: ApplyKeyContract,
+    _apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     if base_refs.len() != 2 {
@@ -4759,53 +4777,7 @@ fn refresh_join_aggregate_iceberg_mv(
                 )?,
             )
         },
-        || {
-            let (Some(left_prev), Some(right_prev)) = (left_previous, right_previous) else {
-                return Err("invalid join aggregate MV incremental decision"
-                    .to_string()
-                    .into());
-            };
-            let left_table_uuid = pin
-                .uuid(left_ref)
-                .ok_or_else(|| {
-                    format!(
-                        "refresh pin missing uuid for base {} (this should not happen)",
-                        left_ref.fqn()
-                    )
-                })?
-                .to_string();
-            let right_table_uuid = pin
-                .uuid(right_ref)
-                .ok_or_else(|| {
-                    format!(
-                        "refresh pin missing uuid for base {} (this should not happen)",
-                        right_ref.fqn()
-                    )
-                })?
-                .to_string();
-            incremental_refresh_iceberg_mv_with_changes(
-                state,
-                &ctx,
-                &[
-                    RewriteMergeBaseChange {
-                        base_ref: left_ref,
-                        previous_snapshot_id: left_prev,
-                        current_snapshot_id: left_current,
-                        base_table: &left_loaded.table,
-                        current_table_uuid: &left_table_uuid,
-                    },
-                    RewriteMergeBaseChange {
-                        base_ref: right_ref,
-                        previous_snapshot_id: right_prev,
-                        current_snapshot_id: right_current,
-                        base_table: &right_loaded.table,
-                        current_table_uuid: &right_table_uuid,
-                    },
-                ],
-                None,
-                RewriteMergeRefreshOptions { apply_key },
-            )
-        },
+        || incremental_refresh_iceberg_join_mv(state, &ctx, &[left_ref.clone(), right_ref.clone()]),
     )
 }
 
@@ -8268,6 +8240,113 @@ fn build_aggregate_repartition_payload(
     Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
 }
 
+fn build_join_projection_repartition_payload(
+    state: &Arc<StandaloneState>,
+    current_database: &str,
+    mv_definition: &StoredMvDefinition,
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
+    left_ref: &IcebergTableRef,
+    right_ref: &IcebergTableRef,
+) -> Result<RepartitionRebuildPayload, String> {
+    let left_snapshot = pin
+        .get(left_ref)
+        .ok_or_else(|| format!("missing refresh pin for {}", left_ref.fqn()))?;
+    let right_snapshot = pin
+        .get(right_ref)
+        .ok_or_else(|| format!("missing refresh pin for {}", right_ref.fqn()))?;
+    let base_query = parse_mv_select_query(&mv_definition.select_sql)?;
+    let mut full_refresh_query = base_query.clone();
+    rewrite_join_full_refresh_query(
+        &mut full_refresh_query,
+        left_ref,
+        left_snapshot,
+        right_ref,
+        right_snapshot,
+        &aliases.left_alias,
+        &aliases.right_alias,
+    )?;
+    let left_uuid = pin
+        .uuid(left_ref)
+        .ok_or_else(|| format!("missing uuid for {}", left_ref.fqn()))?;
+    let right_uuid = pin
+        .uuid(right_ref)
+        .ok_or_else(|| format!("missing uuid for {}", right_ref.fqn()))?;
+    let query = crate::engine::mv::iceberg_join_branch::rewrite_join_full_refresh_apply_query(
+        &base_query,
+        full_refresh_query,
+        left_uuid,
+        right_uuid,
+    )?;
+    let branch_catalog = build_join_snapshot_catalog(
+        state,
+        &[(left_ref, left_snapshot), (right_ref, right_snapshot)],
+    )?;
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let catalogs_guard = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+    let result = crate::engine::execute_query_with_options(
+        &query,
+        &branch_catalog,
+        &connectors_snapshot,
+        current_database,
+        state.exchange_port,
+        None,
+        None,
+        Some(&*catalogs_guard),
+        None,
+    )?;
+    let chunks = query_result_to_chunks(result)?;
+    let chunks = strip_change_op_from_repartition_chunks(chunks)?;
+    Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
+}
+
+fn strip_change_op_from_repartition_chunks(
+    chunks: Vec<crate::exec::chunk::Chunk>,
+) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            let batch = strip_column_from_batch(
+                chunk.batch,
+                crate::exec::change_op::CHANGE_OP_COLUMN,
+                "join projection/filter repartition rebuild",
+            )?;
+            crate::engine::record_batch_to_chunk(batch)
+        })
+        .collect()
+}
+
+fn strip_column_from_batch(
+    batch: arrow::record_batch::RecordBatch,
+    column_name: &str,
+    context: &str,
+) -> Result<arrow::record_batch::RecordBatch, String> {
+    let schema = batch.schema();
+    let Ok(drop_index) = schema.index_of(column_name) else {
+        return Ok(batch);
+    };
+    let mut fields = schema
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let mut columns = batch.columns().to_vec();
+    fields.remove(drop_index);
+    columns.remove(drop_index);
+    arrow::record_batch::RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
+        columns,
+    )
+    .map_err(|e| format!("{context}: strip column {column_name}: {e}"))
+}
+
 fn build_union_projection_repartition_payload(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -10348,19 +10427,58 @@ fn build_join_projection_repartition_context(
 
 #[allow(clippy::too_many_arguments)]
 fn repartition_iceberg_join_mv_overwrite(
-    _state: &Arc<StandaloneState>,
-    _ctx: &IcebergMvRefreshContext,
-    _staging_branch: &str,
-    _refresh_id: i64,
-    _aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
-    _left_ref: &IcebergTableRef,
-    _right_ref: &IcebergTableRef,
-    _partition_contract: &crate::meta::repository::mv_contract::MvPartitionContract,
-    _repartition_restore: RepartitionDefaultSpecRestore,
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+    staging_branch: &str,
+    refresh_id: i64,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
+    left_ref: &IcebergTableRef,
+    right_ref: &IcebergTableRef,
+    partition_contract: &crate::meta::repository::mv_contract::MvPartitionContract,
+    repartition_restore: RepartitionDefaultSpecRestore,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    Err(IcebergMvRefreshExecutionError::pre_commit(
-        "UnsupportedRepartitionShape: ALTER MATERIALIZED VIEW ... REPARTITION for join projection/filter Iceberg MVs is disabled until the merge-sink rebuild path is wired",
-    ))
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
+    let payload = match build_join_projection_repartition_payload(
+        state,
+        current_database,
+        mv_definition,
+        &ctx.rewrite.pin,
+        aliases,
+        left_ref,
+        right_ref,
+    ) {
+        Ok(payload) => payload,
+        Err(err) => {
+            return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
+                state,
+                refresh_id,
+                target_entry,
+                target,
+                repartition_restore.new_default_spec_id,
+                repartition_restore.old_default_spec_id,
+                err,
+            )
+            .into());
+        }
+    };
+    commit_repartition_rebuild_payload(
+        state,
+        target,
+        target_entry,
+        iceberg_catalog,
+        expected_main_snapshot_id,
+        staging_branch,
+        refresh_id,
+        mv_definition,
+        payload,
+        partition_contract,
+        Some(repartition_restore),
+    )
 }
 
 fn first_refresh_iceberg_join_mv(
@@ -11774,7 +11892,12 @@ fn incremental_refresh_iceberg_join_mv(
             )?,
         );
     }
-    match select_join_incremental_refresh_route(left_has_delete_changes, right_has_delete_changes) {
+    let route = if ctx.rewrite.schema_contract.aggregate.is_some() {
+        JoinIncrementalRefreshRoute::LogicalCoalesce
+    } else {
+        select_join_incremental_refresh_route(left_has_delete_changes, right_has_delete_changes)
+    };
+    match route {
         JoinIncrementalRefreshRoute::LogicalAppendOnly => {
             execute_append_only_join_delta_branches_logical(state, ctx, branches)
         }
@@ -12349,40 +12472,42 @@ fn build_join_incremental_refresh_logical_plan(
     route: JoinIncrementalRefreshRoute,
 ) -> Result<JoinRefreshLogicalPlan, String> {
     let (plan, factory) = plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
+    let is_aggregate_refresh = ctx.rewrite.schema_contract.aggregate.is_some();
     let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
         crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
             plan,
             mv_ctx: Arc::clone(&ctx.rewrite),
-            disabled_rules: join_refresh_logical_execution_disabled_rules(),
+            disabled_rules: join_refresh_logical_execution_disabled_rules(is_aggregate_refresh),
             deadline: None,
             column_ref_factory: std::rc::Rc::clone(&factory_cell),
         },
     )
     .map_err(|e| format!("join refresh logical rewrite: {e}"))?;
-    let descriptor = outcome
-        .annotation
-        .change_stream
-        .join_refresh
-        .clone()
-        .ok_or_else(|| {
-            format!(
-                "iceberg join MV {} incremental refresh rewrite did not produce join refresh descriptor",
-                target_fqn_string(&ctx.rewrite.target)
-            )
-        })?;
-    descriptor.validate().map_err(|e| {
-        format!(
-            "iceberg join MV {} incremental refresh descriptor is invalid: {e}",
-            target_fqn_string(&ctx.rewrite.target)
-        )
-    })?;
     let mut factory = std::rc::Rc::try_unwrap(factory_cell)
         .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
         .into_inner();
     let plan = match route {
         JoinIncrementalRefreshRoute::LogicalAppendOnly => outcome.plan,
+        JoinIncrementalRefreshRoute::LogicalCoalesce if is_aggregate_refresh => outcome.plan,
         JoinIncrementalRefreshRoute::LogicalCoalesce => {
+            let descriptor = outcome
+                .annotation
+                .change_stream
+                .join_refresh
+                .clone()
+                .ok_or_else(|| {
+                    format!(
+                        "iceberg join MV {} incremental refresh rewrite did not produce join refresh descriptor",
+                        target_fqn_string(&ctx.rewrite.target)
+                    )
+                })?;
+            descriptor.validate().map_err(|e| {
+                format!(
+                    "iceberg join MV {} incremental refresh descriptor is invalid: {e}",
+                    target_fqn_string(&ctx.rewrite.target)
+                )
+            })?;
             let net_column_id = factory
                 .create(
                     None,
@@ -12422,7 +12547,7 @@ fn build_join_incremental_refresh_logical_plan(
     Ok(JoinRefreshLogicalPlan { plan, factory })
 }
 
-fn join_refresh_logical_execution_disabled_rules() -> Vec<String> {
+fn join_refresh_logical_execution_disabled_rules(is_aggregate_refresh: bool) -> Vec<String> {
     let mut disabled_rules = crate::sql::optimizer::options::current_session_optimizer_settings()
         .disabled_rules
         .clone();
@@ -12431,6 +12556,13 @@ fn join_refresh_logical_execution_disabled_rules() -> Vec<String> {
         .any(|rule| rule == "InjectTargetLocatorJoin")
     {
         disabled_rules.push("InjectTargetLocatorJoin".to_string());
+    }
+    if is_aggregate_refresh
+        && !disabled_rules
+            .iter()
+            .any(|rule| rule == "RecordJoinRefreshDescriptor")
+    {
+        disabled_rules.push("RecordJoinRefreshDescriptor".to_string());
     }
     disabled_rules
 }
@@ -12897,7 +13029,7 @@ fn execute_append_only_join_delta_branches(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        if let Err(err) = crate::engine::execute_query_with_options(
+        let execute_result = crate::engine::execute_preexpanded_mv_refresh_query_with_options(
             &query,
             &branch_catalog,
             &connectors_snapshot,
@@ -12906,8 +13038,9 @@ fn execute_append_only_join_delta_branches(
             None,
             Some(Box::new(merge_sink)),
             Some(&*catalogs_guard),
-            None,
-        ) {
+            Some(ctx),
+        );
+        if let Err(err) = execute_result {
             drop(catalogs_guard);
             return Err(handle_iceberg_mv_commit_error(
                 state,
@@ -13039,6 +13172,7 @@ fn execute_join_delta_branches(
     mv_definition: &StoredMvDefinition,
     aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    ctx: &IcebergMvRefreshContext,
     affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
@@ -13203,7 +13337,7 @@ fn execute_join_delta_branches(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        if let Err(err) = crate::engine::execute_query_with_options(
+        let execute_result = crate::engine::execute_preexpanded_mv_refresh_query_with_options(
             &query,
             &branch_catalog,
             &connectors_snapshot,
@@ -13212,8 +13346,9 @@ fn execute_join_delta_branches(
             None,
             Some(Box::new(merge_sink)),
             Some(&*catalogs_guard),
-            None,
-        ) {
+            Some(ctx),
+        );
+        if let Err(err) = execute_result {
             drop(catalogs_guard);
             return Err(handle_iceberg_mv_commit_error(
                 state,
@@ -14567,7 +14702,7 @@ mod tests {
     }
 
     #[test]
-    fn repartition_support_rejects_join_projection_until_rebuild_path_is_wired() {
+    fn repartition_support_accepts_join_projection_filter() {
         let join = RefreshCapabilities {
             snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
             has_agg_state: false,
@@ -14576,11 +14711,10 @@ mod tests {
             apply_key_value_type: ApplyKeyValueType::Utf8,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
-        let err = validate_repartition_support(&join)
-            .expect_err("join projection repartition should fail fast until rebuild is wired");
-        assert!(err.contains("UnsupportedRepartitionShape"), "err={err}");
-        assert!(err.contains("JoinPairPartialInitialSkip"), "err={err}");
-        assert!(err.contains("merge-sink rebuild path"), "err={err}");
+        assert_eq!(
+            validate_repartition_support(&join).expect("join projection/filter support"),
+            RepartitionSupport::JoinProjectionFilter
+        );
     }
 
     #[test]
@@ -14636,6 +14770,7 @@ mod tests {
         for support in [
             RepartitionSupport::ProjectionFilterSingleBase,
             RepartitionSupport::AggregateSingleBase,
+            RepartitionSupport::JoinProjectionFilter,
             RepartitionSupport::JoinAggregate,
             RepartitionSupport::FanInAggregate,
             RepartitionSupport::UnionProjectionFilter,

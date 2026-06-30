@@ -643,6 +643,10 @@ run_spark_loader() {
   log "Writing $suite data to Iceberg with Spark..."
   local loader_tmp_dir="/tmp/novarocks-benchmark-bootstrap-${NOVA_ENV_ID:-env}-$$"
   local schema_arg=""
+  local spark_master="${NOVAROCKS_BENCHMARK_SPARK_MASTER:-local[2]}"
+  local spark_memory="${NOVAROCKS_BENCHMARK_SPARK_MEMORY:-2g}"
+  local spark_shuffle_partitions="${NOVAROCKS_BENCHMARK_SPARK_SHUFFLE_PARTITIONS:-8}"
+  local spark_default_parallelism="${NOVAROCKS_BENCHMARK_SPARK_DEFAULT_PARALLELISM:-8}"
   "${compose_args[@]}" exec -T spark /bin/bash -lc "rm -rf '$loader_tmp_dir' && mkdir -p '$loader_tmp_dir'"
   "${compose_args[@]}" cp "$spark_loader" "spark:$loader_tmp_dir/write_standard_benchmark.py"
   if [[ -n "$schema_ddl_file" ]]; then
@@ -664,7 +668,13 @@ run_spark_loader() {
       echo 'spark-submit binary not found' >&2
       exit 127
     fi
-    \"\$spark_submit_bin\" '$loader_tmp_dir/write_standard_benchmark.py' \
+    \"\$spark_submit_bin\" \
+      --master '$spark_master' \
+      --driver-memory '$spark_memory' \
+      --conf 'spark.executor.memory=$spark_memory' \
+      --conf 'spark.sql.shuffle.partitions=$spark_shuffle_partitions' \
+      --conf 'spark.default.parallelism=$spark_default_parallelism' \
+      '$loader_tmp_dir/write_standard_benchmark.py' \
       --suite '$suite' \
       --scale '$scale' \
       --raw-base-uri '$raw_uri' \
