@@ -158,6 +158,26 @@ mod tests {
         assert_eq!(cfg.timeout_ms, Some(1234));
         assert_eq!(cfg.io_timeout_ms, Some(5678));
     }
+
+    #[test]
+    fn build_s3_config_leaves_retry_and_timeout_to_runtime_defaults_when_omitted() {
+        let props = vec![
+            (
+                "aws.s3.endpoint_url".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+        ];
+
+        let cfg = build_s3_config_from_properties(&props).expect("build S3 config");
+
+        assert_eq!(cfg.retry_max_times, None);
+        assert_eq!(cfg.retry_min_delay_ms, None);
+        assert_eq!(cfg.retry_max_delay_ms, None);
+        assert_eq!(cfg.timeout_ms, None);
+        assert_eq!(cfg.io_timeout_ms, None);
+    }
 }
 
 pub(crate) fn parse_s3_path(path: &str) -> Result<(String, String), String> {

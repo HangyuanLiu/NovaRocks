@@ -1457,6 +1457,7 @@ pub(crate) fn build_staged_file_io(
             endpoint: s3.endpoint.clone(),
             access_key_id: s3.access_key_id.clone(),
             access_key_secret: s3.access_key_secret.clone(),
+            session_token: None,
             region: s3.region.clone().unwrap_or_else(|| "us-east-1".to_string()),
             enable_path_style: s3.enable_path_style_access.unwrap_or(false),
         };

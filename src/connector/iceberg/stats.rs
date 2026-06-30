@@ -329,6 +329,7 @@ fn build_stats_file_io(
         endpoint: credentials.endpoint,
         access_key_id: credentials.access_key_id,
         access_key_secret: credentials.access_key_secret,
+        session_token: credentials.session_token,
         region: credentials
             .region
             .unwrap_or_else(|| "us-east-1".to_string()),

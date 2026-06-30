@@ -1974,6 +1974,7 @@ pub(crate) fn file_io_for_table_location(
             endpoint: cfg.endpoint.clone(),
             access_key_id: cfg.access_key_id.clone(),
             access_key_secret: cfg.access_key_secret.clone(),
+            session_token: cfg.session_token.clone(),
             region: cfg
                 .region
                 .clone()

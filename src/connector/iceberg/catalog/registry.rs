@@ -1608,11 +1608,22 @@ fn normalize_catalog_property_key(key: &str) -> String {
 /// bucket from an `s3://` / `s3a://` / `oss://` warehouse URI. Shared by the
 /// REST and Hive entry builders (both point at object-store warehouses and
 /// inject a `StorageFactory` rather than touching a local warehouse path).
-fn object_store_config_from_props(
+fn optional_object_store_config_from_props(
     props: &HashMap<String, String>,
     warehouse: &str,
-) -> Option<crate::fs::object_store::ObjectStoreConfig> {
-    let credentials = object_store_credentials_from_props(props).ok()?;
+) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String> {
+    let props_map: BTreeMap<String, String> = props
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let Some(credentials) =
+        crate::fs::object_store_credentials::ObjectStoreCredentials::optional_from_aws_s3_properties(
+            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
+            &props_map,
+        )?
+    else {
+        return Ok(None);
+    };
     let bucket = warehouse
         .strip_prefix("s3://")
         .or_else(|| warehouse.strip_prefix("s3a://"))
@@ -1620,7 +1631,10 @@ fn object_store_config_from_props(
         .and_then(|rest| rest.split('/').next())
         .unwrap_or_default()
         .to_string();
-    Some(object_store_config_from_credentials(credentials, &bucket))
+    Ok(Some(object_store_config_from_credentials(
+        credentials,
+        &bucket,
+    )))
 }
 
 fn object_store_credentials_from_props(
@@ -1682,7 +1696,7 @@ fn build_rest_catalog_entry(
     // Optional S3 storage props — populated only when the user provided them.
     // The REST server may also vend storage credentials; that codepath is a
     // follow-up (Issue: REST credential vending).
-    let s3_config = object_store_config_from_props(props, &warehouse);
+    let s3_config = optional_object_store_config_from_props(props, &warehouse)?;
 
     // No local warehouse_path for REST; allocate an empty placeholder so any
     // legacy hadoop-only code path that touches `entry.warehouse_path` fails
@@ -1763,7 +1777,7 @@ fn build_hms_catalog_entry(
         .cloned()
         .unwrap_or_default();
 
-    let s3_config = object_store_config_from_props(props, &warehouse);
+    let s3_config = optional_object_store_config_from_props(props, &warehouse)?;
 
     // No local warehouse_path for HMS; placeholder so any legacy hadoop-only
     // path that touches warehouse_path fails loudly instead of corrupting a dir.
@@ -3815,6 +3829,87 @@ mod rest_catalog_tests {
         assert_eq!(cfg.access_key_secret, "sk");
         assert_eq!(cfg.enable_path_style_access, Some(true));
         assert_eq!(cfg.retry_max_times, Some(4));
+    }
+
+    #[test]
+    fn rest_entry_with_incomplete_s3_credentials_has_no_object_store_config() {
+        let entry = build_catalog_entry(
+            "ice_rest",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), "http://localhost:8181".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    "s3://bucket-b/rest".to_string(),
+                ),
+                (
+                    "aws.s3.endpoint_url".to_string(),
+                    "http://localhost:9000".to_string(),
+                ),
+            ],
+        )
+        .expect("incomplete REST S3 credentials remain optional");
+
+        assert!(entry.object_store_config().is_none());
+    }
+
+    #[test]
+    fn rest_entry_rejects_invalid_present_s3_bool() {
+        let err = build_catalog_entry(
+            "ice_rest",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), "http://localhost:8181".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    "s3://bucket-b/rest".to_string(),
+                ),
+                (
+                    "aws.s3.endpoint_url".to_string(),
+                    "http://localhost:9000".to_string(),
+                ),
+                ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+                ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+                (
+                    "aws.s3.enable_path_style_access".to_string(),
+                    "maybe".to_string(),
+                ),
+            ],
+        )
+        .map(|_| ())
+        .expect_err("invalid present bool should be rejected");
+
+        assert!(err.contains("invalid boolean value: maybe"), "{err}");
+    }
+
+    #[test]
+    fn s3_catalog_entry_leaves_retry_and_timeout_to_runtime_defaults_when_omitted() {
+        let entry = build_catalog_entry(
+            "ice_s3",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    "s3://bucket-a/warehouse".to_string(),
+                ),
+                (
+                    "aws.s3.endpoint_url".to_string(),
+                    "http://localhost:9000".to_string(),
+                ),
+                ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+                ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+            ],
+        )
+        .expect("S3 entry");
+
+        let cfg = entry.object_store_config().expect("object-store config");
+        assert_eq!(cfg.retry_max_times, None);
+        assert_eq!(cfg.retry_min_delay_ms, None);
+        assert_eq!(cfg.retry_max_delay_ms, None);
+        assert_eq!(cfg.timeout_ms, None);
+        assert_eq!(cfg.io_timeout_ms, None);
     }
 
     #[test]

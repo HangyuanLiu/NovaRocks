@@ -29,6 +29,8 @@ pub(crate) struct S3Storage {
     endpoint: String,
     access_key_id: String,
     access_key_secret: String,
+    #[serde(default)]
+    session_token: Option<String>,
     region: String,
     enable_path_style: bool,
     #[serde(skip)]
@@ -40,6 +42,7 @@ impl S3Storage {
         endpoint: &str,
         access_key_id: &str,
         access_key_secret: &str,
+        session_token: Option<&str>,
         region: &str,
         enable_path_style: bool,
     ) -> Self {
@@ -47,6 +50,7 @@ impl S3Storage {
             endpoint: endpoint.to_string(),
             access_key_id: access_key_id.to_string(),
             access_key_secret: access_key_secret.to_string(),
+            session_token: session_token.map(str::to_string),
             region: region.to_string(),
             enable_path_style,
             operators: std::sync::Mutex::new(HashMap::new()),
@@ -91,7 +95,7 @@ impl S3Storage {
             root: String::new(),
             access_key_id: self.access_key_id.clone(),
             access_key_secret: self.access_key_secret.clone(),
-            session_token: None,
+            session_token: self.session_token.clone(),
             enable_path_style_access: Some(self.enable_path_style),
             region: Some(self.region.clone()),
             retry_max_times: Some(3),
@@ -196,6 +200,7 @@ impl Storage for S3Storage {
             &self.endpoint,
             &self.access_key_id,
             &self.access_key_secret,
+            self.session_token.as_deref(),
             &self.region,
             self.enable_path_style,
         ));
@@ -207,6 +212,7 @@ impl Storage for S3Storage {
             &self.endpoint,
             &self.access_key_id,
             &self.access_key_secret,
+            self.session_token.as_deref(),
             &self.region,
             self.enable_path_style,
         ));
@@ -288,6 +294,8 @@ pub(crate) struct S3StorageFactory {
     pub endpoint: String,
     pub access_key_id: String,
     pub access_key_secret: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
     pub region: String,
     pub enable_path_style: bool,
 }
@@ -310,6 +318,7 @@ impl S3StorageFactory {
             endpoint: credentials.endpoint,
             access_key_id: credentials.access_key_id,
             access_key_secret: credentials.access_key_secret,
+            session_token: credentials.session_token,
             region: credentials
                 .region
                 .unwrap_or_else(|| "us-east-1".to_string()),
@@ -325,6 +334,7 @@ impl StorageFactory for S3StorageFactory {
             &self.endpoint,
             &self.access_key_id,
             &self.access_key_secret,
+            self.session_token.as_deref(),
             &self.region,
             self.enable_path_style,
         )))
@@ -357,5 +367,22 @@ mod tests {
         assert_eq!(factory.access_key_secret, "sk");
         assert_eq!(factory.region, "us-east-1");
         assert!(factory.enable_path_style);
+    }
+
+    #[test]
+    fn s3_storage_factory_preserves_session_token() {
+        let props = vec![
+            (
+                "aws.s3.endpoint_url".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+            ("aws.s3.sessionToken".to_string(), "token".to_string()),
+        ];
+
+        let factory = S3StorageFactory::from_catalog_properties(&props).expect("parse factory");
+
+        assert_eq!(factory.session_token.as_deref(), Some("token"));
     }
 }
