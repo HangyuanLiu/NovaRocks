@@ -1800,6 +1800,7 @@ mod tests {
                 cte_id,
                 alias: "cte_t".to_string(),
                 output_columns: output_columns.clone(),
+                producer_column_ids: output_columns.iter().map(|c| c.column_id).collect(),
             }),
             vec![],
             output_columns,
