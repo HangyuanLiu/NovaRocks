@@ -11,12 +11,24 @@
 //! `RowDeltaDvFromFiles` already understands.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use iceberg::spec::TableMetadata;
 
-use crate::connector::iceberg::commit::{IcebergCommitCollector, WrittenFile};
+use crate::connector::iceberg::commit::{
+    CleanupAttempt, CommitOutcome, CommitServiceError, IcebergCommitCollector, WrittenFile,
+};
+use crate::engine::StandaloneState;
+use crate::engine::write_transaction::{
+    IcebergWriteCommitExecutor, IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec,
+};
+use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
-use crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind;
+use crate::sql::codegen::iceberg_change_stream_write::{
+    ChangeStreamWriteBranchKind, IcebergChangeStreamWriteDagSpec,
+};
+use crate::sql::optimizer::PhysicalPlanNode;
+use crate::thrift::internal_service::TQueryOptions;
 use crate::thrift::types;
 
 pub(crate) fn writer_fragment_id_from_finst_id(finst: &types::TUniqueId) -> i32 {
@@ -39,6 +51,34 @@ impl ChangeStreamWriterCommitPlan {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.branch_by_writer_fragment.is_empty()
+    }
+
+    pub(crate) fn from_dag(dag: &IcebergChangeStreamWriteDagSpec) -> Result<Self, String> {
+        let mut branch_by_writer_fragment = BTreeMap::new();
+        for branch in &dag.branches {
+            let writer_fragment_id = branch.writer_fragment_id.ok_or_else(|| {
+                format!(
+                    "change-stream branch {} ({:?}) has no planned writer fragment id",
+                    branch.branch_id, branch.branch_kind
+                )
+            })?;
+            let writer_fragment_id = i32::try_from(writer_fragment_id).map_err(|_| {
+                format!(
+                    "writer fragment id {writer_fragment_id} for change-stream branch {} \
+                     does not fit in commit-plan fragment id field",
+                    branch.branch_id
+                )
+            })?;
+            if branch_by_writer_fragment
+                .insert(writer_fragment_id, branch.branch_kind)
+                .is_some()
+            {
+                return Err(format!(
+                    "duplicate writer fragment id {writer_fragment_id} in change-stream commit plan"
+                ));
+            }
+        }
+        Ok(Self::new(branch_by_writer_fragment))
     }
 
     fn branch_for_finst(
@@ -149,6 +189,94 @@ pub(crate) fn route_change_stream_writer_reports(
     }
 
     Ok(routed)
+}
+
+pub(crate) struct ChangeStreamPhysicalBuildInput {
+    pub(crate) state: Arc<StandaloneState>,
+    pub(crate) current_catalog: Option<String>,
+    pub(crate) current_database: String,
+    pub(crate) physical_plan: PhysicalPlanNode,
+    pub(crate) dag: IcebergChangeStreamWriteDagSpec,
+    pub(crate) query_opts: Option<TQueryOptions>,
+    pub(crate) mv_refresh_ctx:
+        Option<Arc<crate::engine::mv::refresh_context::IcebergMvRefreshContext>>,
+}
+
+pub(crate) struct ChangeStreamWriteTransactionExecutor {
+    build_input: Mutex<Option<ChangeStreamPhysicalBuildInput>>,
+    commit_executor: IcebergWriteCommitExecutor,
+    commit_plan: Mutex<Option<ChangeStreamWriterCommitPlan>>,
+}
+
+impl ChangeStreamWriteTransactionExecutor {
+    pub(crate) fn new(
+        build_input: ChangeStreamPhysicalBuildInput,
+        commit_executor: IcebergWriteCommitExecutor,
+    ) -> Self {
+        Self {
+            build_input: Mutex::new(Some(build_input)),
+            commit_executor,
+            commit_plan: Mutex::new(None),
+        }
+    }
+}
+
+impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
+    fn run_coordinated_write(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+    ) -> Result<CoordinatedQueryResult, String> {
+        let mut build_input = self
+            .build_input
+            .lock()
+            .expect("change-stream build input lock poisoned")
+            .take()
+            .ok_or_else(|| "change-stream write build input was already consumed".to_string())?;
+        let planned = crate::engine::build_physical_plan_as_iceberg_change_stream_write(
+            &build_input.state,
+            build_input.current_catalog.as_deref(),
+            &build_input.current_database,
+            &build_input.physical_plan,
+            &mut build_input.dag,
+            build_input.mv_refresh_ctx.as_deref(),
+        )?;
+        let crate::engine::PlannedIcebergChangeStreamWrite {
+            build_result,
+            commit_plan,
+        } = planned;
+        *self
+            .commit_plan
+            .lock()
+            .expect("change-stream commit plan lock poisoned") = Some(commit_plan);
+        crate::engine::execute_planned_iceberg_change_stream_write(
+            build_result,
+            build_input.query_opts.clone(),
+        )
+    }
+
+    fn commit(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+        write_commit: &WriteCommitInput,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        let guard = self
+            .commit_plan
+            .lock()
+            .expect("change-stream commit plan lock poisoned");
+        let plan = guard.as_ref().ok_or_else(|| {
+            CommitServiceError::known_uncommitted(
+                "change-stream commit plan is missing; coordinated write did not complete"
+                    .to_string(),
+                CleanupAttempt::not_attempted(),
+            )
+        })?;
+        self.commit_executor
+            .commit_change_stream_write_input(write_commit, plan)
+    }
+
+    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
+        self.commit_executor.finalize()
+    }
 }
 
 #[cfg(test)]
@@ -351,5 +479,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["unknown.parquet"]
         );
+    }
+
+    #[test]
+    fn change_stream_commit_plan_requires_planned_writer_fragments() {
+        let dag = IcebergChangeStreamWriteDagSpec::for_test(
+            1,
+            Some(2),
+            vec![
+                crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![3]),
+            ],
+        );
+
+        let err = ChangeStreamWriterCommitPlan::from_dag(&dag)
+            .expect_err("writer fragments are assigned by the fragment builder");
+
+        assert!(err.contains("has no planned writer fragment id"), "{err}");
     }
 }

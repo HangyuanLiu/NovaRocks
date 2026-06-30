@@ -3528,6 +3528,198 @@ pub(crate) fn execute_query_as_iceberg_write(
     .execute_with_write_outcome()
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChangeStreamWriteEntrypoint {
+    PhysicalPlan,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChangeStreamWriteBuildObservation {
+    entrypoint: ChangeStreamWriteEntrypoint,
+    branch_kinds:
+        Vec<crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind>,
+    writer_fragment_ids: Vec<Option<crate::sql::codegen::FragmentId>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ChangeStreamWriteTestObserverState {
+    short_circuit_after_build: bool,
+    observations: Vec<ChangeStreamWriteBuildObservation>,
+}
+
+#[cfg(test)]
+fn change_stream_write_test_observer()
+-> &'static std::sync::Mutex<Option<ChangeStreamWriteTestObserverState>> {
+    static OBSERVER: std::sync::OnceLock<
+        std::sync::Mutex<Option<ChangeStreamWriteTestObserverState>>,
+    > = std::sync::OnceLock::new();
+    OBSERVER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+struct ChangeStreamWriteTestObserverGuard;
+
+#[cfg(test)]
+impl ChangeStreamWriteTestObserverGuard {
+    fn take_observations(&self) -> Vec<ChangeStreamWriteBuildObservation> {
+        change_stream_write_test_observer()
+            .lock()
+            .expect("change-stream write test observer lock")
+            .as_mut()
+            .expect("change-stream write test observer installed")
+            .observations
+            .drain(..)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl Drop for ChangeStreamWriteTestObserverGuard {
+    fn drop(&mut self) {
+        *change_stream_write_test_observer()
+            .lock()
+            .expect("change-stream write test observer lock") = None;
+    }
+}
+
+#[cfg(test)]
+fn install_change_stream_write_test_observer(
+    short_circuit_after_build: bool,
+) -> ChangeStreamWriteTestObserverGuard {
+    let mut observer = change_stream_write_test_observer()
+        .lock()
+        .expect("change-stream write test observer lock");
+    assert!(
+        observer.is_none(),
+        "change-stream write test observer already installed"
+    );
+    *observer = Some(ChangeStreamWriteTestObserverState {
+        short_circuit_after_build,
+        observations: Vec::new(),
+    });
+    ChangeStreamWriteTestObserverGuard
+}
+
+#[cfg(test)]
+fn observe_change_stream_write_build_for_test(
+    dag: &crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec,
+) -> Option<crate::runtime::coordinator::CoordinatedQueryResult> {
+    let mut observer = change_stream_write_test_observer()
+        .lock()
+        .expect("change-stream write test observer lock");
+    let observer = observer.as_mut()?;
+    observer
+        .observations
+        .push(ChangeStreamWriteBuildObservation {
+            entrypoint: ChangeStreamWriteEntrypoint::PhysicalPlan,
+            branch_kinds: dag
+                .branches
+                .iter()
+                .map(|branch| branch.branch_kind)
+                .collect(),
+            writer_fragment_ids: dag
+                .branches
+                .iter()
+                .map(|branch| branch.writer_fragment_id)
+                .collect(),
+        });
+    if observer.short_circuit_after_build {
+        Some(crate::runtime::coordinator::CoordinatedQueryResult {
+            query_result: crate::runtime::query_result::QueryResult::empty(),
+            write_commit: None,
+            write_abort: None,
+            fragment_profiles: Vec::new(),
+        })
+    } else {
+        None
+    }
+}
+
+pub(crate) struct PlannedIcebergChangeStreamWrite {
+    pub(crate) build_result: crate::sql::codegen::MultiFragmentBuildResult,
+    pub(crate) commit_plan:
+        crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
+    state: &Arc<StandaloneState>,
+    _current_catalog: Option<&str>,
+    current_database: &str,
+    physical_plan: &crate::sql::optimizer::PhysicalPlanNode,
+    dag: &mut crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<PlannedIcebergChangeStreamWrite, String> {
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    snapshot_effective_backend_count_into_session();
+    let build_result =
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_change_stream_write(
+            physical_plan,
+            &catalog_snapshot,
+            &connectors_snapshot,
+            current_database,
+            mv_refresh_ctx,
+            dag,
+        )?;
+    let commit_plan =
+        crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_dag(dag)?;
+    Ok(PlannedIcebergChangeStreamWrite {
+        build_result,
+        commit_plan,
+    })
+}
+
+pub(crate) fn execute_planned_iceberg_change_stream_write(
+    build_result: crate::sql::codegen::MultiFragmentBuildResult,
+    query_opts: Option<TQueryOptions>,
+) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    crate::runtime::coordinator::ExecutionCoordinator::new(
+        build_result,
+        dispatcher,
+        scheduler,
+        query_opts,
+    )
+    .execute_with_write_outcome()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    physical_plan: &crate::sql::optimizer::PhysicalPlanNode,
+    dag: &mut crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec,
+    query_opts: Option<TQueryOptions>,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+    let planned = build_physical_plan_as_iceberg_change_stream_write(
+        state,
+        current_catalog,
+        current_database,
+        physical_plan,
+        dag,
+        mv_refresh_ctx,
+    )?;
+    #[cfg(test)]
+    if let Some(result) = observe_change_stream_write_build_for_test(dag) {
+        return Ok(result);
+    }
+    execute_planned_iceberg_change_stream_write(planned.build_result, query_opts)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_query_with_catalog_provider(
     query: &sqlparser::ast::Query,
@@ -9990,6 +10182,87 @@ path = "meta/operations.sqlite"
         assert!(
             err.contains("resolver saw planned _file output"),
             "expected resolver error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn planned_change_stream_write_uses_physical_plan_entrypoint() {
+        use crate::sql::codegen::iceberg_change_stream_write::{
+            ChangeStreamWriteBranchKind, ChangeStreamWriteBranchSpec,
+            IcebergChangeStreamWriteDagSpec,
+        };
+        use crate::sql::column_id::ColumnId;
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
+        use crate::sql::optimizer::physical_plan::{
+            PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
+        };
+        use crate::sql::optimizer::scalar::ScalarArena;
+        use crate::sql::optimizer::statistics::Statistics;
+
+        let _test_guard = super::acquire_standalone_test_guard();
+        let observer = super::install_change_stream_write_test_observer(true);
+        let output_column = crate::sql::analysis::OutputColumn {
+            column_id: ColumnId::new_for_test(3),
+            name: "id".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            is_internal: false,
+        };
+        let mut physical_plan = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: Vec::new(),
+                columns: vec![output_column.clone()],
+            }),
+            children: Vec::new(),
+            stats: Statistics {
+                output_row_count: 0.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![output_column],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        attach_scalar_arena(&mut physical_plan, Arc::new(ScalarArena::new()));
+        let state = Arc::new(StandaloneState::default());
+        let mut dag = IcebergChangeStreamWriteDagSpec::for_test(
+            1,
+            Some(2),
+            vec![ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![3])],
+        );
+
+        let result = super::execute_physical_plan_as_iceberg_change_stream_write(
+            &state,
+            None,
+            "default",
+            &physical_plan,
+            &mut dag,
+            None,
+            None,
+        )
+        .expect("planned physical change-stream write build");
+
+        assert!(result.write_commit.is_none());
+        let observations = observer.take_observations();
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        assert_eq!(
+            observation.entrypoint,
+            super::ChangeStreamWriteEntrypoint::PhysicalPlan
+        );
+        assert_eq!(
+            observation.branch_kinds,
+            vec![ChangeStreamWriteBranchKind::ReuseData]
+        );
+        assert_eq!(observation.writer_fragment_ids.len(), 1);
+        assert!(
+            observation.writer_fragment_ids[0].is_some(),
+            "fragment builder must assign the writer fragment before execution"
+        );
+        assert_eq!(
+            observation.writer_fragment_ids[0],
+            dag.branches[0].writer_fragment_id
         );
     }
 
