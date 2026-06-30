@@ -186,11 +186,10 @@ pub struct ObjectStoreConfig {
     pub io_timeout_ms: Option<u64>,
 }
 
-#[derive(Clone, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct OssOperatorCacheKey {
     endpoint: String,
     bucket: String,
-    root: String,
     access_key_id: String,
     access_key_secret: String,
     session_token: Option<String>,
@@ -204,11 +203,10 @@ struct OssOperatorCacheKey {
 }
 
 impl OssOperatorCacheKey {
-    fn from_config(cfg: &ObjectStoreConfig) -> Self {
+    fn from_bucket_and_config(bucket: &str, cfg: &ObjectStoreConfig) -> Self {
         Self {
             endpoint: cfg.endpoint.clone(),
-            bucket: cfg.bucket.clone(),
-            root: cfg.root.clone(),
+            bucket: bucket.to_string(),
             access_key_id: cfg.access_key_id.clone(),
             access_key_secret: cfg.access_key_secret.clone(),
             session_token: cfg.session_token.clone(),
@@ -514,14 +512,14 @@ pub(crate) fn effective_s3_region(region: Option<&str>) -> &str {
     region.filter(|r| !r.is_empty()).unwrap_or("us-east-1")
 }
 
-fn build_raw_object_store_operator(cfg: &ObjectStoreConfig) -> Result<Operator> {
+fn build_raw_object_store_operator(bucket: &str, cfg: &ObjectStoreConfig) -> Result<Operator> {
     let endpoint = normalize_s3_endpoint(&cfg.endpoint)?;
     let local_endpoint = is_local_endpoint(&endpoint);
     let use_path_style = should_use_path_style(cfg);
 
     let mut builder = opendal::services::S3::default()
         .endpoint(&endpoint)
-        .bucket(&cfg.bucket)
+        .bucket(bucket)
         .region(effective_s3_region(cfg.region.as_deref()))
         .access_key_id(&cfg.access_key_id)
         .secret_access_key(&cfg.access_key_secret);
@@ -530,9 +528,6 @@ fn build_raw_object_store_operator(cfg: &ObjectStoreConfig) -> Result<Operator> 
     }
     if let Some(token) = cfg.session_token.as_deref() {
         builder = builder.session_token(token);
-    }
-    if !cfg.root.is_empty() {
-        builder = builder.root(&cfg.root);
     }
     let init_context = if use_path_style {
         "init opendal s3 operator for path-style endpoint"
@@ -618,9 +613,18 @@ fn normalize_s3_endpoint(raw_endpoint: &str) -> Result<String> {
 }
 
 pub fn build_oss_operator(cfg: &ObjectStoreConfig) -> Result<Operator> {
+    build_object_store_operator(&cfg.bucket, cfg)
+}
+
+pub fn build_object_store_operator(bucket: &str, cfg: &ObjectStoreConfig) -> Result<Operator> {
+    let bucket = bucket.trim();
+    if bucket.is_empty() {
+        return Err(anyhow!("empty object-store bucket"));
+    }
     let mut effective_cfg = cfg.clone();
     apply_object_store_runtime_defaults(&mut effective_cfg);
-    let key = OssOperatorCacheKey::from_config(&effective_cfg);
+    effective_cfg.bucket = bucket.to_string();
+    let key = OssOperatorCacheKey::from_bucket_and_config(bucket, &effective_cfg);
     let mut guard = oss_operator_cache()
         .lock()
         .map_err(|_| anyhow!("lock oss operator cache failed"))?;
@@ -631,14 +635,14 @@ pub fn build_oss_operator(cfg: &ObjectStoreConfig) -> Result<Operator> {
     debug!(
         "init object store operator: endpoint={} bucket={} retry_max_times={:?} retry_min_delay_ms={:?} retry_max_delay_ms={:?} timeout_ms={:?} io_timeout_ms={:?}",
         effective_cfg.endpoint,
-        effective_cfg.bucket,
+        bucket,
         effective_cfg.retry_max_times,
         effective_cfg.retry_min_delay_ms,
         effective_cfg.retry_max_delay_ms,
         effective_timeout_ms(&effective_cfg),
         effective_io_timeout_ms(&effective_cfg)
     );
-    let op = build_raw_object_store_operator(&effective_cfg)?;
+    let op = build_raw_object_store_operator(bucket, &effective_cfg)?;
     guard.insert(key, op.clone());
     Ok(op)
 }
@@ -666,12 +670,12 @@ pub fn resolve_oss_operator_and_path_with_config(
     Ok((op, rel))
 }
 
-pub fn normalize_oss_path(full: &str, bucket: &str, root: &str) -> Result<String, String> {
+pub fn normalize_oss_path(full: &str, bucket: &str, _root: &str) -> Result<String, String> {
     // Expected full path formats:
     // - oss://<bucket>/<key>
     // - s3://<bucket>/<key> / s3a://<bucket>/<key>
     // - <key> (already relative to bucket)
-    // Return value must be path relative to configured OpenDAL root.
+    // Return value must be relative to the bucket-root OpenDAL operator.
     let mut s = full.trim().to_string();
 
     for scheme in ["oss://", "s3://", "s3a://"] {
@@ -691,16 +695,6 @@ pub fn normalize_oss_path(full: &str, bucket: &str, root: &str) -> Result<String
 
     s = s.trim_start_matches('/').to_string();
 
-    let root_trim = root.trim_matches('/');
-    if !root_trim.is_empty() {
-        let prefix = format!("{root_trim}/");
-        if let Some(rest) = s.strip_prefix(&prefix) {
-            s = rest.to_string();
-        } else if s == root_trim {
-            s.clear();
-        }
-    }
-
     Ok(s)
 }
 
@@ -708,22 +702,18 @@ pub fn normalize_oss_path(full: &str, bucket: &str, root: &str) -> Result<String
 mod tests {
     use super::{
         DEFAULT_OSS_IO_TIMEOUT_MS, DEFAULT_OSS_TIMEOUT_MS, ObjectStoreRetrySettings,
-        build_timeout_layer, effective_io_timeout_ms, effective_s3_region, effective_timeout_ms,
-        normalize_oss_path, normalize_s3_endpoint, prefer_virtual_host_style,
+        OssOperatorCacheKey, build_timeout_layer, effective_io_timeout_ms, effective_s3_region,
+        effective_timeout_ms, normalize_oss_path, normalize_s3_endpoint, prefer_virtual_host_style,
         should_use_path_style,
     };
     use crate::fs::object_store::ObjectStoreConfig;
     use std::collections::BTreeMap;
 
     #[test]
-    fn normalize_oss_path_strips_bucket_and_root_prefix() {
-        let got = normalize_oss_path(
-            "oss://my-bucket/my-prefix/a/b.parquet",
-            "my-bucket",
-            "/my-prefix",
-        )
-        .expect("normalize oss path");
-        assert_eq!(got, "a/b.parquet");
+    fn normalize_oss_path_returns_bucket_relative_key() {
+        let got = normalize_oss_path("s3://bucket/warehouse/a.parquet", "bucket", "warehouse")
+            .expect("normalize oss path");
+        assert_eq!(got, "warehouse/a.parquet");
     }
 
     #[test]
@@ -734,7 +724,7 @@ mod tests {
             "my-prefix",
         )
         .expect("normalize s3a path");
-        assert_eq!(got, "a/b.parquet");
+        assert_eq!(got, "my-prefix/a/b.parquet");
     }
 
     #[test]
@@ -742,6 +732,36 @@ mod tests {
         let err = normalize_oss_path("oss://bucket-a/a/b.parquet", "bucket-b", "")
             .expect_err("bucket mismatch should fail");
         assert!(err.contains("bucket mismatch"));
+    }
+
+    #[test]
+    fn object_store_cache_key_ignores_table_root() {
+        let cfg_a = ObjectStoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            bucket: "legacy-bucket".to_string(),
+            root: "warehouse/table-a".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            session_token: None,
+            enable_path_style_access: Some(true),
+            region: Some("us-east-1".to_string()),
+            retry_max_times: Some(3),
+            retry_min_delay_ms: Some(10),
+            retry_max_delay_ms: Some(20),
+            timeout_ms: Some(1000),
+            io_timeout_ms: Some(2000),
+        };
+        let cfg_b = ObjectStoreConfig {
+            root: "warehouse/table-b".to_string(),
+            ..cfg_a.clone()
+        };
+
+        let key_a = OssOperatorCacheKey::from_bucket_and_config("bucket-a", &cfg_a);
+        let key_b = OssOperatorCacheKey::from_bucket_and_config("bucket-a", &cfg_b);
+        let key_c = OssOperatorCacheKey::from_bucket_and_config("bucket-b", &cfg_a);
+
+        assert_eq!(key_a, key_b);
+        assert_ne!(key_a, key_c);
     }
 
     #[test]
