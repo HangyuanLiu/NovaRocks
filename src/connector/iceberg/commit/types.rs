@@ -111,6 +111,7 @@ pub struct WrittenFile {
     pub column_sizes: HashMap<i32, u64>,
     pub value_counts: HashMap<i32, u64>,
     pub null_value_counts: HashMap<i32, u64>,
+    pub nan_value_counts: HashMap<i32, u64>,
     /// Per-column lower bounds (Iceberg spec §3.4), keyed by field id. Carried
     /// from the writer's `DataFile` so the committed manifest entry preserves
     /// min bounds for range-predicate selectivity. Empty when the writer did
@@ -165,6 +166,7 @@ mod tests {
             column_sizes: Default::default(),
             value_counts: Default::default(),
             null_value_counts: Default::default(),
+            nan_value_counts: Default::default(),
             lower_bounds: Default::default(),
             upper_bounds: Default::default(),
             key_metadata: None,

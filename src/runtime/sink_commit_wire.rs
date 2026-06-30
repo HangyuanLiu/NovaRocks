@@ -101,7 +101,7 @@ fn column_stats_to_thrift(stats: IcebergColumnStats) -> Option<types::TIcebergCo
         column_sizes: non_empty(stats.column_sizes),
         value_counts: non_empty(stats.value_counts),
         null_value_counts: non_empty(stats.null_value_counts),
-        nan_value_counts: None,
+        nan_value_counts: non_empty(stats.nan_value_counts),
         lower_bounds: non_empty(stats.lower_bounds),
         upper_bounds: non_empty(stats.upper_bounds),
     })
@@ -250,6 +250,25 @@ mod tests {
             thrift.column_sizes.expect("column sizes").get(&1),
             Some(&10)
         );
+        assert!(thrift.value_counts.is_none());
+        assert!(thrift.null_value_counts.is_none());
+        assert!(thrift.nan_value_counts.is_none());
+        assert!(thrift.lower_bounds.is_none());
+        assert!(thrift.upper_bounds.is_none());
+    }
+
+    #[test]
+    fn column_stats_to_thrift_preserves_nan_value_counts() {
+        let mut stats = IcebergColumnStats::default();
+        stats.nan_value_counts.insert(1, 2);
+
+        let thrift = column_stats_to_thrift(stats).expect("thrift stats");
+
+        assert_eq!(
+            thrift.nan_value_counts.expect("nan value counts").get(&1),
+            Some(&2)
+        );
+        assert!(thrift.column_sizes.is_none());
         assert!(thrift.value_counts.is_none());
         assert!(thrift.null_value_counts.is_none());
         assert!(thrift.lower_bounds.is_none());

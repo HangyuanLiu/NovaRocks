@@ -22,7 +22,7 @@
 //! `DataFile` fields are `pub(crate)` in iceberg-rust 0.9, so construction
 //! goes through `DataFileBuilder`. Column statistics carried by the
 //! `WrittenFile` (`column_sizes`, `value_counts`, `null_value_counts`,
-//! `lower_bounds`, `upper_bounds`, per spec §3.4) are forwarded onto the
+//! `nan_value_counts`, `lower_bounds`, `upper_bounds`, per spec §3.4) are forwarded onto the
 //! committed manifest entry. Bounds are passed through as `Datum`s; the
 //! iceberg-rust manifest serializer applies the spec's binary single-value
 //! encoding. Empty maps remain at the builder defaults.
@@ -66,6 +66,9 @@ pub fn written_file_to_iceberg_data_file(
     }
     if !f.null_value_counts.is_empty() {
         builder.null_value_counts(f.null_value_counts.clone());
+    }
+    if !f.nan_value_counts.is_empty() {
+        builder.nan_value_counts(f.nan_value_counts.clone());
     }
     if !f.lower_bounds.is_empty() {
         builder.lower_bounds(f.lower_bounds.clone());

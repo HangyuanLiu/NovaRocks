@@ -1671,6 +1671,7 @@ fn collect_iceberg_column_stats(metadata: &ParquetMetaData) -> Option<IcebergCol
         column_sizes,
         value_counts,
         null_value_counts,
+        nan_value_counts: BTreeMap::new(),
         lower_bounds,
         upper_bounds,
     })

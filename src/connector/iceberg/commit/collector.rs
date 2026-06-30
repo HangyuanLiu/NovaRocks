@@ -436,6 +436,7 @@ impl IcebergCommitCollector {
         let column_sizes = i64_map_to_u64(stats.column_sizes, "column_sizes")?;
         let value_counts = i64_map_to_u64(stats.value_counts, "value_counts")?;
         let null_value_counts = i64_map_to_u64(stats.null_value_counts, "null_value_counts")?;
+        let nan_value_counts = i64_map_to_u64(stats.nan_value_counts, "nan_value_counts")?;
         let lower_bounds = self.decode_bounds(stats.lower_bounds, "lower_bounds")?;
         let upper_bounds = self.decode_bounds(stats.upper_bounds, "upper_bounds")?;
 
@@ -451,6 +452,7 @@ impl IcebergCommitCollector {
             column_sizes,
             value_counts,
             null_value_counts,
+            nan_value_counts,
             lower_bounds,
             upper_bounds,
             key_metadata: df.key_metadata,
@@ -1549,7 +1551,7 @@ mod parity_tests {
                 column_sizes: Some(BTreeMap::from([(2, 8)])),
                 value_counts: Some(BTreeMap::from([(2, 1)])),
                 null_value_counts: Some(BTreeMap::from([(2, 0)])),
-                nan_value_counts: None,
+                nan_value_counts: Some(BTreeMap::from([(2, 3)])),
                 lower_bounds: Some(BTreeMap::from([(2, vec![1, 2, 3])])),
                 upper_bounds: Some(BTreeMap::from([(2, vec![4, 5, 6])])),
             }),
@@ -1577,6 +1579,7 @@ mod parity_tests {
         assert_eq!(actual.column_sizes.get(&2), Some(&8));
         assert_eq!(actual.value_counts.get(&2), Some(&1));
         assert_eq!(actual.null_value_counts.get(&2), Some(&0));
+        assert_eq!(actual.nan_value_counts.get(&2), Some(&3));
     }
 }
 

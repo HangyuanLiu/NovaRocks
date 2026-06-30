@@ -1218,6 +1218,7 @@ pub(crate) fn data_file_to_written_file(
         column_sizes: df.column_sizes().clone(),
         value_counts: df.value_counts().clone(),
         null_value_counts: df.null_value_counts().clone(),
+        nan_value_counts: df.nan_value_counts().clone(),
         lower_bounds: df.lower_bounds().clone(),
         upper_bounds: df.upper_bounds().clone(),
         key_metadata: df.key_metadata().map(|s| s.to_vec()),

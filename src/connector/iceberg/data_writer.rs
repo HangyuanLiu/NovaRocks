@@ -565,12 +565,14 @@ fn written_file_column_stats(
     let column_sizes = u64_stats_to_i64(&file.column_sizes, "column_sizes")?;
     let value_counts = u64_stats_to_i64(&file.value_counts, "value_counts")?;
     let null_value_counts = u64_stats_to_i64(&file.null_value_counts, "null_value_counts")?;
+    let nan_value_counts = u64_stats_to_i64(&file.nan_value_counts, "nan_value_counts")?;
     let lower_bounds = datum_bounds_to_bytes(&file.lower_bounds, "lower_bounds")?;
     let upper_bounds = datum_bounds_to_bytes(&file.upper_bounds, "upper_bounds")?;
 
     if column_sizes.is_empty()
         && value_counts.is_empty()
         && null_value_counts.is_empty()
+        && nan_value_counts.is_empty()
         && lower_bounds.is_empty()
         && upper_bounds.is_empty()
     {
@@ -581,7 +583,7 @@ fn written_file_column_stats(
         column_sizes: (!column_sizes.is_empty()).then_some(column_sizes),
         value_counts: (!value_counts.is_empty()).then_some(value_counts),
         null_value_counts: (!null_value_counts.is_empty()).then_some(null_value_counts),
-        nan_value_counts: None,
+        nan_value_counts: (!nan_value_counts.is_empty()).then_some(nan_value_counts),
         lower_bounds: (!lower_bounds.is_empty()).then_some(lower_bounds),
         upper_bounds: (!upper_bounds.is_empty()).then_some(upper_bounds),
     }))
@@ -694,12 +696,14 @@ fn iceberg_data_file_to_report_column_stats(
     let column_sizes = u64_stats_to_i64(df.column_sizes(), "column_sizes")?;
     let value_counts = u64_stats_to_i64(df.value_counts(), "value_counts")?;
     let null_value_counts = u64_stats_to_i64(df.null_value_counts(), "null_value_counts")?;
+    let nan_value_counts = u64_stats_to_i64(df.nan_value_counts(), "nan_value_counts")?;
     let lower_bounds = datum_bounds_to_bytes(df.lower_bounds(), "lower_bounds")?;
     let upper_bounds = datum_bounds_to_bytes(df.upper_bounds(), "upper_bounds")?;
 
     if column_sizes.is_empty()
         && value_counts.is_empty()
         && null_value_counts.is_empty()
+        && nan_value_counts.is_empty()
         && lower_bounds.is_empty()
         && upper_bounds.is_empty()
     {
@@ -711,6 +715,7 @@ fn iceberg_data_file_to_report_column_stats(
             column_sizes,
             value_counts,
             null_value_counts,
+            nan_value_counts,
             lower_bounds,
             upper_bounds,
         },
@@ -1527,6 +1532,7 @@ mod tests {
             column_sizes: Default::default(),
             value_counts: Default::default(),
             null_value_counts: Default::default(),
+            nan_value_counts: Default::default(),
             lower_bounds: Default::default(),
             upper_bounds: Default::default(),
             key_metadata: None,
@@ -1568,6 +1574,7 @@ mod tests {
             column_sizes: Default::default(),
             value_counts: Default::default(),
             null_value_counts: Default::default(),
+            nan_value_counts: Default::default(),
             lower_bounds: Default::default(),
             upper_bounds: Default::default(),
             key_metadata: None,
@@ -1613,6 +1620,7 @@ mod tests {
             column_sizes: HashMap::new(),
             value_counts: HashMap::new(),
             null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
             lower_bounds: HashMap::new(),
             upper_bounds: HashMap::new(),
             key_metadata: None,
@@ -1655,6 +1663,51 @@ mod tests {
     }
 
     #[test]
+    fn written_file_to_sink_commit_info_preserves_nan_value_counts() {
+        use iceberg::spec::DataFileFormat;
+
+        let metadata = test_unpartitioned_metadata();
+        let file = super::super::commit::WrittenFile {
+            path: "file:///t/data-1.parquet".to_string(),
+            format: DataFileFormat::Parquet,
+            content: DataContentType::Data,
+            partition_values: Struct::empty(),
+            partition_spec_id: metadata.default_partition_spec_id(),
+            record_count: 2,
+            file_size_in_bytes: 128,
+            split_offsets: Vec::new(),
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::from([(1, 1)]),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
+        };
+
+        let info = written_file_to_sink_commit_info(&file, &metadata).expect("sink commit info");
+        let column_stats = info
+            .iceberg_data_file
+            .expect("iceberg data file")
+            .column_stats
+            .expect("column stats");
+
+        assert_eq!(
+            column_stats
+                .nan_value_counts
+                .expect("nan value counts")
+                .get(&1),
+            Some(&1)
+        );
+    }
+
+    #[test]
     fn written_file_to_sink_commit_info_preserves_puffin_dv_descriptor() {
         use iceberg::spec::DataFileFormat;
 
@@ -1671,6 +1724,7 @@ mod tests {
             column_sizes: HashMap::new(),
             value_counts: HashMap::new(),
             null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
             lower_bounds: HashMap::new(),
             upper_bounds: HashMap::new(),
             key_metadata: None,
@@ -1712,6 +1766,7 @@ mod tests {
             column_sizes: HashMap::new(),
             value_counts: HashMap::new(),
             null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
             lower_bounds: HashMap::new(),
             upper_bounds: HashMap::new(),
             key_metadata: None,
@@ -2028,11 +2083,65 @@ mod tests {
             ctx.partition_spec_id()
         );
         assert_eq!(report.file.content, IcebergFileContent::Data);
-        assert!(report.file.column_stats.is_some());
+        let column_stats = report.file.column_stats.as_ref().expect("column stats");
+        assert_eq!(
+            column_stats.column_sizes,
+            u64_stats_to_i64(s.data_file.column_sizes(), "column_sizes").expect("column sizes")
+        );
+        assert_eq!(
+            column_stats.value_counts,
+            u64_stats_to_i64(s.data_file.value_counts(), "value_counts").expect("value counts")
+        );
+        assert_eq!(
+            column_stats.null_value_counts,
+            u64_stats_to_i64(s.data_file.null_value_counts(), "null_value_counts")
+                .expect("null value counts")
+        );
+        assert_eq!(
+            column_stats.nan_value_counts,
+            u64_stats_to_i64(s.data_file.nan_value_counts(), "nan_value_counts")
+                .expect("nan value counts")
+        );
+        assert_eq!(
+            column_stats.lower_bounds,
+            datum_bounds_to_bytes(s.data_file.lower_bounds(), "lower_bounds")
+                .expect("lower bounds")
+        );
+        assert_eq!(
+            column_stats.upper_bounds,
+            datum_bounds_to_bytes(s.data_file.upper_bounds(), "upper_bounds")
+                .expect("upper bounds")
+        );
 
         let sketch_set = sketch_set.expect("sketch set");
         assert_eq!(sketch_set.file_path, report.file.path);
         assert!(sketch_set.sketches.contains_key(&1));
+    }
+
+    #[test]
+    fn iceberg_data_file_to_report_column_stats_preserves_nan_value_counts() {
+        let mut builder = DataFileBuilder::default();
+        builder
+            .content(DataContentType::Data)
+            .file_path("file:///tmp/nan.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(1)
+            .file_size_in_bytes(128)
+            .nan_value_counts(HashMap::from([(1, 1)]));
+        let df = builder.build().expect("data file");
+
+        let stats = iceberg_data_file_to_report_column_stats(&df)
+            .expect("report column stats")
+            .expect("nan-only stats should be preserved");
+
+        assert_eq!(stats.nan_value_counts.get(&1), Some(&1));
+        assert!(stats.column_sizes.is_empty());
+        assert!(stats.value_counts.is_empty());
+        assert!(stats.null_value_counts.is_empty());
+        assert!(stats.lower_bounds.is_empty());
+        assert!(stats.upper_bounds.is_empty());
     }
 
     #[test]
