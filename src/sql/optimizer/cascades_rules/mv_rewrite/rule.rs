@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
+use crate::sql::column_id::ColumnId;
 use crate::sql::common::{LiteralValue, OutputColumn};
 use crate::sql::optimizer::memo::{MExpr, MExprId, Memo};
 use crate::sql::optimizer::operator::{
@@ -83,6 +84,54 @@ impl Rule for MvRewriteRule {
         }
         out
     }
+}
+
+enum AggregateOutputPosition {
+    GroupKey(usize),
+    Aggregate(usize),
+}
+
+fn aggregate_output_position(
+    layout: &AggregateOutputLayout,
+    column_id: ColumnId,
+) -> Option<AggregateOutputPosition> {
+    if let Some((idx, _)) = layout
+        .group_key_columns
+        .iter()
+        .enumerate()
+        .find(|(_, column)| column.column_id == column_id)
+    {
+        return Some(AggregateOutputPosition::GroupKey(idx));
+    }
+    layout
+        .aggregate_columns
+        .iter()
+        .enumerate()
+        .find(|(_, column)| column.column_id == column_id)
+        .map(|(idx, _)| AggregateOutputPosition::Aggregate(idx))
+}
+
+fn remap_visible_outputs_to_layout(
+    visible_outputs: &[OutputColumn],
+    original_layout: &AggregateOutputLayout,
+    rewritten_layout: &AggregateOutputLayout,
+) -> Option<Vec<OutputColumn>> {
+    visible_outputs
+        .iter()
+        .map(|visible| {
+            let mut output = visible.clone();
+            output.column_id = match aggregate_output_position(original_layout, visible.column_id)?
+            {
+                AggregateOutputPosition::GroupKey(idx) => {
+                    rewritten_layout.group_key_columns[idx].column_id
+                }
+                AggregateOutputPosition::Aggregate(idx) => {
+                    rewritten_layout.aggregate_columns[idx].column_id
+                }
+            };
+            Some(output)
+        })
+        .collect()
 }
 
 fn try_rewrite(
@@ -250,23 +299,26 @@ fn try_rewrite(
                 &cand.mv_scalars,
                 &m_names,
             )?;
-            let n_keys = original_agg.group_by.len();
             match plan.kind {
                 RollupKind::Direct => {
                     // One row per group already: Project binding the original
-                    // output ids (group keys then agg results).
+                    // visible output ids.
                     let mut items: Vec<ScalarProjectItem> = Vec::new();
-                    for (i, oc) in original_agg.output_columns.iter().enumerate() {
-                        let expr = if i < n_keys {
-                            col_map.rewrite(
+                    for oc in &original_agg.output_columns {
+                        let expr = match aggregate_output_position(
+                            &original_agg.output_layout,
+                            oc.column_id,
+                        )? {
+                            AggregateOutputPosition::GroupKey(idx) => col_map.rewrite(
                                 &mut memo.scalars,
-                                original_agg.group_by[i],
+                                original_agg.group_by[idx],
                                 &q_names,
-                            )?
-                        } else {
-                            let item = &plan.items[i - n_keys];
-                            let mv_col = agg_cols[item.mv_output_index].clone()?;
-                            column_ref(&mut memo.scalars, &mv_col)
+                            )?,
+                            AggregateOutputPosition::Aggregate(idx) => {
+                                let item = &plan.items[idx];
+                                let mv_col = agg_cols[item.mv_output_index].clone()?;
+                                column_ref(&mut memo.scalars, &mv_col)
+                            }
                         };
                         items.push(project_item(
                             &mut memo.scalars,
@@ -293,9 +345,10 @@ fn try_rewrite(
                     // Aggregate outputs: reuse original ids directly unless a
                     // COALESCE wrapper project is needed (then mint fresh ids
                     // for the aggregate and bind originals in the project).
-                    let mut agg_outputs = original_agg.output_columns.clone();
+                    let mut aggregate_columns =
+                        original_agg.output_layout.aggregate_columns.clone();
                     if needs_coalesce {
-                        for oc in agg_outputs.iter_mut().skip(n_keys) {
+                        for oc in &mut aggregate_columns {
                             oc.column_id = memo.factory.create(
                                 None,
                                 oc.name.clone(),
@@ -304,6 +357,10 @@ fn try_rewrite(
                             );
                         }
                     }
+                    let output_layout = AggregateOutputLayout::new(
+                        original_agg.output_layout.group_key_columns.clone(),
+                        aggregate_columns,
+                    );
                     let aggregates = plan
                         .items
                         .iter()
@@ -311,7 +368,7 @@ fn try_rewrite(
                         .map(|(idx, item)| {
                             let mv_col = agg_cols[item.mv_output_index].clone()?;
                             Some(ScalarAggregateSpec {
-                                output_column_id: agg_outputs[n_keys + idx].column_id,
+                                output_column_id: output_layout.aggregate_columns[idx].column_id,
                                 name: item.rollup_fn.to_string(),
                                 args: vec![column_ref(&mut memo.scalars, &mv_col)],
                                 distinct: false,
@@ -319,15 +376,16 @@ fn try_rewrite(
                             })
                         })
                         .collect::<Option<Vec<_>>>()?;
-                    let output_layout = AggregateOutputLayout::new(
-                        agg_outputs.iter().take(group_by.len()).cloned().collect(),
-                        agg_outputs.iter().skip(group_by.len()).cloned().collect(),
-                    );
+                    let aggregate_visible_outputs = remap_visible_outputs_to_layout(
+                        &original_agg.output_columns,
+                        &original_agg.output_layout,
+                        &output_layout,
+                    )?;
                     let agg_op = Operator::LogicalAggregate(LogicalAggregateOp::single(
                         group_by,
                         aggregates,
-                        output_layout,
-                        agg_outputs.clone(),
+                        output_layout.clone(),
+                        aggregate_visible_outputs,
                     ));
                     if !needs_coalesce {
                         return Some(NewExpr {
@@ -344,17 +402,35 @@ fn try_rewrite(
                     let items: Vec<ScalarProjectItem> = original_agg
                         .output_columns
                         .iter()
-                        .enumerate()
-                        .map(|(i, oc)| {
-                            let inner = column_ref(&mut memo.scalars, &agg_outputs[i]);
-                            let expr = if i >= n_keys && plan.items[i - n_keys].needs_coalesce {
-                                coalesce_zero(&mut memo.scalars, inner, oc)
-                            } else {
-                                inner
+                        .map(|oc| {
+                            let expr = match aggregate_output_position(
+                                &original_agg.output_layout,
+                                oc.column_id,
+                            )? {
+                                AggregateOutputPosition::GroupKey(idx) => column_ref(
+                                    &mut memo.scalars,
+                                    &output_layout.group_key_columns[idx],
+                                ),
+                                AggregateOutputPosition::Aggregate(idx) => {
+                                    let inner = column_ref(
+                                        &mut memo.scalars,
+                                        &output_layout.aggregate_columns[idx],
+                                    );
+                                    if plan.items[idx].needs_coalesce {
+                                        coalesce_zero(&mut memo.scalars, inner, oc)
+                                    } else {
+                                        inner
+                                    }
+                                }
                             };
-                            project_item(&mut memo.scalars, expr, oc.name.clone(), oc.column_id)
+                            Some(project_item(
+                                &mut memo.scalars,
+                                expr,
+                                oc.name.clone(),
+                                oc.column_id,
+                            ))
                         })
-                        .collect();
+                        .collect::<Option<Vec<_>>>()?;
                     Some(NewExpr {
                         op: Operator::LogicalProject(ProjectOp {
                             items,
@@ -723,8 +799,51 @@ mod tests {
         }
     }
 
+    fn direct_agg_candidate(mv_low: i64) -> MvRewriteCandidate {
+        let a = col(100, "a");
+        let v = col(102, "v");
+        let s = col(110, "s");
+        let plan = LogicalPlanNode::new(
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                PlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: ge(col_ref(&a), mv_low),
+                }),
+                vec![base_scan(&[a.clone(), v.clone()])],
+                None,
+            )],
+            None,
+        );
+        let (mv, mv_scalars) = spjg_descriptor_for_test(&plan);
+        MvRewriteCandidate {
+            mv_name: "direct_agg_mv".to_string(),
+            mv,
+            mv_scalars,
+            target_database: "ns".to_string(),
+            target_table: iceberg_table("cat", "ns", "direct_agg_mv", &["a", "s"]),
+            target_stats_ref: stats_ref_for_test(703),
+        }
+    }
+
     fn stats_ref_for_test(value: u32) -> crate::sql::optimizer::stats_input::StatsRef {
         crate::sql::optimizer::stats_input::StatsRef::new(value)
+    }
+
+    fn prune_root_aggregate_outputs(
+        memo: &mut Memo,
+        root: GroupId,
+        output_columns: Vec<OutputColumn>,
+    ) {
+        let Operator::LogicalAggregate(aggregate) = &mut memo.groups[root].logical_exprs[0].op
+        else {
+            panic!("expected root aggregate");
+        };
+        aggregate.output_columns = output_columns;
     }
 
     /// Walk a child-group chain from `gid`, following first logical expr, and
@@ -809,6 +928,114 @@ mod tests {
             rule.apply(&root_expr, &mut memo).is_empty(),
             "second apply must be a no-op"
         );
+    }
+
+    #[test]
+    fn direct_rewrite_uses_layout_when_group_key_output_pruned() {
+        // Query: SELECT sum(v) FROM t WHERE a >= 0 GROUP BY a.
+        // The optimizer has pruned public aggregate outputs down to [sum],
+        // but the internal aggregate layout still contains group key [a].
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let s = col(3, "s");
+        let query_plan = LogicalPlanNode::new(
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                PlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: ge(col_ref(&a), 0),
+                }),
+                vec![base_scan(&[a.clone(), v.clone()])],
+                None,
+            )],
+            None,
+        );
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        prune_root_aggregate_outputs(&mut memo, root, vec![s.clone()]);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        let rule = MvRewriteRule::new(vec![direct_agg_candidate(0)]);
+        let alts = rule.apply(&root_expr, &mut memo);
+        assert_eq!(alts.len(), 1);
+
+        let Operator::LogicalProject(project) = &alts[0].op else {
+            panic!("expected direct rewrite project, got {:?}", alts[0].op);
+        };
+        assert_eq!(project.items.len(), 1);
+        assert_eq!(project.items[0].output_column_id, s.column_id);
+        let expr = materialize(&memo.scalars, project.items[0].expr);
+        let ExprKind::ColumnRef { column, .. } = &expr.kind else {
+            panic!("expected aggregate output column ref, got {:?}", expr.kind);
+        };
+        assert_eq!(
+            column, "s",
+            "direct rewrite must bind visible aggregate output to MV aggregate column"
+        );
+    }
+
+    #[test]
+    fn rollup_rewrite_uses_layout_when_group_key_output_pruned() {
+        // Query: SELECT sum(v) FROM t WHERE a >= 10 GROUP BY a.
+        // MV:    SELECT a, b, sum(v) s FROM t WHERE a >= 0 GROUP BY a, b.
+        // The query's public aggregate outputs have been pruned to [sum].
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let s = col(3, "s");
+        let query_plan = LogicalPlanNode::new(
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                PlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: ge(col_ref(&a), 10),
+                }),
+                vec![base_scan(&[a.clone(), v.clone()])],
+                None,
+            )],
+            None,
+        );
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        prune_root_aggregate_outputs(&mut memo, root, vec![s.clone()]);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        let rule = MvRewriteRule::new(vec![agg_candidate(0)]);
+        let alts = rule.apply(&root_expr, &mut memo);
+        assert_eq!(alts.len(), 1);
+
+        let Operator::LogicalAggregate(aggregate) = &alts[0].op else {
+            panic!("expected rollup aggregate, got {:?}", alts[0].op);
+        };
+        assert_eq!(
+            aggregate
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![s.column_id],
+            "rollup visible outputs should preserve the pruned public contract"
+        );
+        assert_eq!(
+            aggregate.output_layout.group_key_columns[0].column_id,
+            a.column_id
+        );
+        assert_eq!(
+            aggregate.output_layout.aggregate_columns[0].column_id,
+            s.column_id
+        );
+        assert_eq!(aggregate.aggregates[0].output_column_id, s.column_id);
     }
 
     #[test]
