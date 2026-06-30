@@ -61,7 +61,6 @@ use crate::connector::iceberg::report::{
     IcebergColumnStats, IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     partition_path_from_struct,
 };
-use crate::connector::iceberg::report_wire::emit_iceberg_writer_report;
 use crate::connector::iceberg::sink_plan::{
     IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkPlan,
 };
@@ -648,7 +647,7 @@ impl IcebergTableSinkBackend {
                 is_overwrite: None,
                 is_rewrite: None,
             };
-            emit_iceberg_writer_report(state, report, &descriptor_metadata)?;
+            state.add_iceberg_writer_report(report, &descriptor_metadata)?;
         }
 
         Ok(())
@@ -759,7 +758,7 @@ impl IcebergTableSinkBackend {
                 is_overwrite: None,
                 is_rewrite: None,
             };
-            emit_iceberg_writer_report(&state, report, &metadata)?;
+            state.add_iceberg_writer_report(report, &metadata)?;
         }
 
         self.pending_deletion_vectors.clear();
@@ -810,7 +809,7 @@ impl IcebergTableSinkBackend {
         let report = crate::connector::iceberg::report::writer_report_from_written_file(
             &written, &metadata,
         )?;
-        emit_iceberg_writer_report(state, report, &metadata)?;
+        state.add_iceberg_writer_report(report, &metadata)?;
         Ok(())
     }
 
@@ -2620,10 +2619,9 @@ mod tests {
             .expect("iceberg equality-delete data file");
         assert_eq!(data_file.format.as_deref(), Some("parquet"));
         assert_eq!(data_file.record_count, Some(2));
-        let expected_content =
-            crate::connector::iceberg::report_wire::expected_file_content_for_test(
-                IcebergFileContent::EqualityDeletes,
-            );
+        let expected_content = crate::runtime::sink_commit_wire::expected_file_content_for_test(
+            IcebergFileContent::EqualityDeletes,
+        );
         assert_eq!(data_file.file_content.as_ref(), Some(&expected_content));
         assert_eq!(data_file.equality_ids, Some(vec![11, 12]));
         assert_eq!(data_file.partition_path.as_deref(), Some(""));
@@ -2983,10 +2981,9 @@ mod tests {
             "writer report must carry the target default partition spec id"
         );
         assert_eq!(data_file.record_count, Some(2));
-        let expected_content =
-            crate::connector::iceberg::report_wire::expected_file_content_for_test(
-                IcebergFileContent::Data,
-            );
+        let expected_content = crate::runtime::sink_commit_wire::expected_file_content_for_test(
+            IcebergFileContent::Data,
+        );
         assert_eq!(data_file.file_content.as_ref(), Some(&expected_content));
     }
 
@@ -3201,10 +3198,9 @@ mod tests {
             path.starts_with(&format!("{data_location}/id_part=7/delete-")),
             "position delete sink should keep manual delete file naming, got {path}"
         );
-        let expected_content =
-            crate::connector::iceberg::report_wire::expected_file_content_for_test(
-                IcebergFileContent::PositionDeletes,
-            );
+        let expected_content = crate::runtime::sink_commit_wire::expected_file_content_for_test(
+            IcebergFileContent::PositionDeletes,
+        );
         assert_eq!(data_file.file_content.as_ref(), Some(&expected_content));
         assert_eq!(data_file.partition_spec_id, Some(7));
         assert!(
@@ -3556,10 +3552,9 @@ mod tests {
             .as_ref()
             .expect("iceberg dv data file");
         assert_eq!(data_file.format.as_deref(), Some("puffin"));
-        let expected_content =
-            crate::connector::iceberg::report_wire::expected_file_content_for_test(
-                IcebergFileContent::PositionDeletes,
-            );
+        let expected_content = crate::runtime::sink_commit_wire::expected_file_content_for_test(
+            IcebergFileContent::PositionDeletes,
+        );
         assert_eq!(data_file.file_content.as_ref(), Some(&expected_content));
         assert_eq!(data_file.referenced_data_file.as_deref(), Some(referenced));
         assert_eq!(data_file.cardinality, Some(2));
