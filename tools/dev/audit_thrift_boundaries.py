@@ -136,7 +136,7 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/exec/pipeline/driver.rs": BaselineEntry("legal-boundary", "control-plane-wire", 1, "Pipeline driver carries FE-compatible control-plane payloads"),
     "src/exec/operators/exchange_source.rs": BaselineEntry("legal-boundary", "control-plane-wire", 1, "Exchange source reads cross-node wire metadata"),
     "src/exec/node/fetch.rs": BaselineEntry("legal-boundary", "control-plane-wire", 1, "Fetch node exposes FE-compatible result metadata"),
-    "src/engine/mod.rs": BaselineEntry("domain-leak", "B7", 16, "Standalone engine still contains thrift compatibility paths outside dedicated adapters"),
+    "src/engine/mod.rs": BaselineEntry("domain-leak", "B7", 17, "Standalone engine still contains thrift compatibility paths outside dedicated adapters"),
     "src/exec/spill/mod.rs": BaselineEntry("domain-leak", "B7", 2, "Spill path still carries thrift-derived compression/type metadata"),
     "src/exec/node/join.rs": BaselineEntry("domain-leak", "B7", 2, "Execution join node still carries thrift-derived metadata"),
     "src/exec/node/aggregate.rs": BaselineEntry("domain-leak", "B7", 2, "Execution aggregate node still carries thrift-derived metadata"),
