@@ -81,6 +81,9 @@ impl LogicalRewriteRule for BindIcebergScanRule {
                         bound
                             .columns
                             .push(ImvActionColumn::output_column(column_id));
+                        ImvActionColumn::ensure_metadata_column(
+                            &mut bound.table.iceberg_row_lineage_metadata_columns,
+                        );
                     }
                     Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
                         PlanNodeKind::Scan(bound),
@@ -371,6 +374,18 @@ mod tests {
             .find(|column| ImvActionColumn::matches(column))
             .expect("bound delta scan must carry marker action column");
         assert_eq!(action.column_id, ColumnId::new_for_test(77));
+        assert!(
+            bound
+                .table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(
+                    |column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)
+                        && column.data_type == DataType::Int8
+                        && !column.nullable
+                ),
+            "bound delta scan table metadata must expose the action pseudo-column for codegen"
+        );
 
         let inject = InjectActionColumnRule;
         assert!(
@@ -428,6 +443,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].column_id, ColumnId::new_for_test(77));
+        let metadata_actions = bound
+            .table
+            .iceberg_row_lineage_metadata_columns
+            .iter()
+            .filter(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+            .collect::<Vec<_>>();
+        assert_eq!(metadata_actions.len(), 1);
+        assert_eq!(metadata_actions[0].data_type, DataType::Int8);
+        assert!(!metadata_actions[0].nullable);
     }
 
     #[test]

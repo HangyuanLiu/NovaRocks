@@ -6,10 +6,11 @@
 use std::collections::HashMap;
 
 use super::memo::{GroupId, Memo};
-use super::operator::{JoinDistribution, Operator, PhysicalDistributionOp, SortOp};
+use super::operator::{JoinDistribution, Operator, PhysicalDistributionOp, ProjectOp, SortOp};
 use super::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps};
 use super::property::{OrderingSpec, PhysicalPropertySet};
 use super::search::{EnforcerKind, Winner};
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarNode, SortKey};
 use crate::sql::optimizer::statistics::Statistics;
 use arrow::datatypes::DataType;
@@ -107,6 +108,8 @@ pub(crate) fn extract_best(
             JoinExecutionDistribution::Colocate => JoinDistribution::Colocate,
         };
     }
+    let output_columns =
+        output_columns_for_physical_expr(&op, &memo.scalars, output_columns, &children);
     let inner_output_property = winner
         .enforcer
         .as_ref()
@@ -185,6 +188,78 @@ fn group_statistics(group: &super::memo::Group) -> Statistics {
     }
 }
 
+fn output_columns_for_physical_expr(
+    op: &Operator,
+    scalars: &ScalarArena,
+    group_output_columns: Vec<OutputColumn>,
+    children: &[PhysicalPlanNode],
+) -> Vec<OutputColumn> {
+    match op {
+        Operator::PhysicalProject(project) => {
+            project_output_columns(project, scalars, &group_output_columns)
+        }
+        Operator::PhysicalHashJoin(join) => {
+            join_output_columns(join.join_type, children).unwrap_or(group_output_columns)
+        }
+        Operator::PhysicalNestLoopJoin(join) => {
+            join_output_columns(join.join_type, children).unwrap_or(group_output_columns)
+        }
+        _ => group_output_columns,
+    }
+}
+
+fn join_output_columns(
+    join_type: crate::sql::analysis::JoinKind,
+    children: &[PhysicalPlanNode],
+) -> Option<Vec<OutputColumn>> {
+    if children.len() != 2 {
+        return None;
+    }
+    let mut output = match join_type {
+        crate::sql::analysis::JoinKind::LeftSemi
+        | crate::sql::analysis::JoinKind::LeftAnti
+        | crate::sql::analysis::JoinKind::NullAwareLeftAnti => children[0].output_columns.clone(),
+        crate::sql::analysis::JoinKind::RightSemi | crate::sql::analysis::JoinKind::RightAnti => {
+            children[1].output_columns.clone()
+        }
+        _ => {
+            let mut columns = children[0].output_columns.clone();
+            columns.extend(children[1].output_columns.clone());
+            columns
+        }
+    };
+    output.dedup_by_key(|column| column.column_id);
+    Some(output)
+}
+
+fn project_output_columns(
+    project: &ProjectOp,
+    scalars: &ScalarArena,
+    group_output_columns: &[OutputColumn],
+) -> Vec<OutputColumn> {
+    project
+        .items
+        .iter()
+        .map(|item| {
+            let inherited = group_output_columns
+                .iter()
+                .find(|column| column.column_id == item.output_column_id)
+                .or_else(|| {
+                    group_output_columns
+                        .iter()
+                        .find(|column| column.name.eq_ignore_ascii_case(&item.output_name))
+                });
+            OutputColumn {
+                column_id: item.output_column_id,
+                name: item.output_name.clone(),
+                data_type: scalars.data_type(item.expr).clone(),
+                nullable: scalars.nullable(item.expr),
+                is_internal: inherited.map(|column| column.is_internal).unwrap_or(false),
+            }
+        })
+        .collect()
+}
+
 /// Convert an `OrderingSpec` to scalar sort keys for the enforcer PhysicalSort node.
 fn ordering_spec_to_sort_keys(arena: &mut ScalarArena, ordering: &OrderingSpec) -> Vec<SortKey> {
     match ordering {
@@ -211,7 +286,7 @@ mod tests {
     use crate::sql::optimizer::memo::{MExpr, Memo};
     use crate::sql::optimizer::operator::{
         JoinDistribution, LimitOp, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
-        ScanOp, ValuesOp,
+        ProjectOp, ScalarProjectItem, ScanOp, ValuesOp,
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::search::{EnforcerInfo, Winner};
@@ -296,6 +371,239 @@ mod tests {
             "test fixture winner total {} should preserve argument {}",
             winner.total_cost,
             total_cost
+        );
+    }
+
+    #[test]
+    fn extract_project_output_columns_follow_project_items_not_stale_group_props() {
+        let mut memo = Memo::new();
+        let source_col = OutputColumn {
+            column_id: ColumnId(1),
+            name: "__change_op_source".to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal: true,
+        };
+        let child = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![source_col.clone()],
+            }),
+            children: vec![],
+        });
+        memo.groups[child].logical_props = Some(
+            crate::sql::optimizer::memo::LogicalProperties::new(vec![source_col.clone()], 0.0),
+        );
+
+        let output_id = ColumnId(14);
+        let stale_id = ColumnId(13);
+        let project_expr = memo.scalars.intern(
+            ScalarNode::ColumnRef(source_col.column_id),
+            DataType::Int8,
+            false,
+        );
+        let root = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalProject(ProjectOp {
+                items: vec![ScalarProjectItem {
+                    expr: project_expr,
+                    output_name: "__change_op".to_string(),
+                    output_column_id: output_id,
+                    expr_display: None,
+                }],
+                output_qualifier: None,
+            }),
+            children: vec![child],
+        });
+        memo.groups[root].logical_props =
+            Some(crate::sql::optimizer::memo::LogicalProperties::new(
+                vec![OutputColumn {
+                    column_id: stale_id,
+                    name: "__change_op".to_string(),
+                    data_type: DataType::Int8,
+                    nullable: false,
+                    is_internal: true,
+                }],
+                0.0,
+            ));
+
+        let required = PhysicalPropertySet::any();
+        let mut winners = HashMap::new();
+        winners.insert(
+            (child, required.clone()),
+            winner_for_test(
+                child,
+                0,
+                1.0,
+                None,
+                PhysicalPropertySet::any(),
+                PropertyAlternativeKind::Default,
+                vec![],
+                vec![],
+            ),
+        );
+        winners.insert(
+            (root, required.clone()),
+            winner_for_test(
+                root,
+                0,
+                2.0,
+                None,
+                PhysicalPropertySet::any(),
+                PropertyAlternativeKind::Default,
+                vec![PhysicalPropertySet::any()],
+                vec![PhysicalPropertySet::any()],
+            ),
+        );
+
+        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+
+        assert_eq!(plan.output_columns.len(), 1);
+        assert_eq!(plan.output_columns[0].column_id, output_id);
+        assert_eq!(plan.output_columns[0].name, "__change_op");
+        assert_eq!(plan.output_columns[0].data_type, DataType::Int8);
+        assert!(!plan.output_columns[0].nullable);
+        assert!(plan.output_columns[0].is_internal);
+    }
+
+    #[test]
+    fn extract_join_output_columns_follow_children_not_stale_group_props() {
+        let mut memo = Memo::new();
+        let left_key_col = OutputColumn {
+            column_id: ColumnId(1),
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        };
+        let action_col = OutputColumn {
+            column_id: ColumnId(14),
+            name: "__change_op".to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal: true,
+        };
+        let right_key_col = OutputColumn {
+            column_id: ColumnId(2),
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        };
+        let left_columns = vec![left_key_col.clone(), action_col.clone()];
+        let right_columns = vec![right_key_col.clone()];
+        let left = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: left_columns.clone(),
+            }),
+            children: vec![],
+        });
+        memo.groups[left].logical_props = Some(
+            crate::sql::optimizer::memo::LogicalProperties::new(left_columns.clone(), 0.0),
+        );
+        let right = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: right_columns.clone(),
+            }),
+            children: vec![],
+        });
+        memo.groups[right].logical_props = Some(
+            crate::sql::optimizer::memo::LogicalProperties::new(right_columns.clone(), 0.0),
+        );
+
+        let left_key = intern_typed(&mut memo.scalars, &test_col(1));
+        let right_key = intern_typed(&mut memo.scalars, &test_col(2));
+        let root = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: left_key,
+                    right: right_key,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Unknown,
+            }),
+            children: vec![left, right],
+        });
+        memo.groups[root].logical_props =
+            Some(crate::sql::optimizer::memo::LogicalProperties::new(
+                vec![
+                    left_key_col.clone(),
+                    right_key_col.clone(),
+                    OutputColumn {
+                        column_id: ColumnId(15),
+                        name: "__change_op".to_string(),
+                        data_type: DataType::Int8,
+                        nullable: false,
+                        is_internal: true,
+                    },
+                ],
+                0.0,
+            ));
+
+        let required = PhysicalPropertySet::any();
+        let mut winners = HashMap::new();
+        winners.insert(
+            (left, required.clone()),
+            winner_for_test(
+                left,
+                0,
+                1.0,
+                None,
+                required.clone(),
+                PropertyAlternativeKind::Default,
+                vec![],
+                vec![],
+            ),
+        );
+        winners.insert(
+            (right, required.clone()),
+            winner_for_test(
+                right,
+                0,
+                1.0,
+                None,
+                required.clone(),
+                PropertyAlternativeKind::Default,
+                vec![],
+                vec![],
+            ),
+        );
+        winners.insert(
+            (root, required.clone()),
+            winner_for_test(
+                root,
+                0,
+                2.0,
+                None,
+                required.clone(),
+                PropertyAlternativeKind::Default,
+                vec![required.clone(), required.clone()],
+                vec![required.clone(), required.clone()],
+            ),
+        );
+
+        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let ids: Vec<_> = plan
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect();
+
+        assert_eq!(ids, vec![ColumnId(1), ColumnId(14), ColumnId(2)]);
+        assert_eq!(
+            plan.output_columns
+                .iter()
+                .find(|column| column.name == "__change_op")
+                .map(|column| column.column_id),
+            Some(ColumnId(14))
         );
     }
 

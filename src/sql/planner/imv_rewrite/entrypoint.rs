@@ -87,14 +87,16 @@ mod tests {
     use std::rc::Rc;
 
     use crate::engine::mv::iceberg_target_apply::{
-        ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN,
+        ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
     };
     use crate::engine::mv::refresh_context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource,
+        ApplyKeySource, BRANCH_ID_COLUMN_NAME, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
+        BranchIdColumnContract, BranchUnionContract, JoinContract, JoinContractKind,
+        JoinPredicateLineage, MvSchemaContract, QualifiedFieldLineage,
     };
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
@@ -113,6 +115,9 @@ mod tests {
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::imv_rewrite::annotation::ImvPartitionAnnotation;
     use crate::sql::planner::imv_rewrite::change_stream::AggregateChangeStreamShape;
+    use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
+        JoinRefreshBranchSide, JoinRefreshMode, JoinRefreshOutputSource,
+    };
     use crate::sql::planner::imv_rewrite::marker::{ImvVersionRef, plan_contains_imv_marker};
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
@@ -133,7 +138,7 @@ mod tests {
             &mut arena.borrow_mut(),
         )
     }
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn dummy_mv_ctx() -> Arc<IcebergMvRewriteContext> {
@@ -148,6 +153,25 @@ mod tests {
         let factory = test_column_ref_factory();
         factory.borrow_mut().reserve_until(next_id);
         factory
+    }
+
+    fn optimize_logical_for_test(plan: LogicalPlanNode) -> crate::sql::optimizer::PhysicalPlanNode {
+        let mut scalar_arena = ScalarArena::new();
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr(
+            &plan,
+            &mut scalar_arena,
+        );
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        factory.reserve_until(300);
+        crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+            opt_expr,
+            scalar_arena,
+            &HashMap::new(),
+            factory,
+            None,
+            Vec::new(),
+        )
+        .expect("physical optimization")
     }
 
     fn empty_values_plan() -> LogicalPlanNode {
@@ -544,6 +568,105 @@ mod tests {
     }
 
     fn join_aggregate_mv_ctx() -> Arc<IcebergMvRewriteContext> {
+        join_aggregate_mv_ctx_customized(|_| {})
+    }
+
+    fn join_projection_mv_ctx() -> Arc<IcebergMvRewriteContext> {
+        let mut mv_def = make_mv_definition();
+        mv_def.base_table_refs = vec!["ice.db.l".to_string(), "ice.db.r".to_string()];
+        mv_def.last_refresh_snapshots = [
+            ("ice.db.l".to_string(), 11i64),
+            ("ice.db.r".to_string(), 33i64),
+        ]
+        .into_iter()
+        .collect();
+        mv_def.last_refresh_table_uuids = [
+            ("ice.db.l".to_string(), "uuid-l".to_string()),
+            ("ice.db.r".to_string(), "uuid-r".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let mut contract = make_schema_contract();
+        contract.target.visible_columns[0].output_name = "k".to_string();
+        contract.target.visible_columns[1].output_name = "v".to_string();
+        contract.target.hidden_apply_key.column_name = ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string();
+        contract.target.hidden_apply_key.target_field_id = 999;
+        contract.target.hidden_apply_key.source = ApplyKeySource::JoinRowKey;
+        contract.bases = vec![
+            join_base_contract("ice.db.l", "uuid-l", "l"),
+            join_base_contract("ice.db.r", "uuid-r", "r"),
+        ];
+        contract.output.columns[0]
+            .expression
+            .referenced_base_field_ids
+            .clear();
+        contract.output.columns[0].expression.referenced_base_fields =
+            vec![qualified_field("ice.db.l", "l", 1)];
+        contract.output.columns[1]
+            .expression
+            .referenced_base_field_ids
+            .clear();
+        contract.output.columns[1].expression.referenced_base_fields =
+            vec![qualified_field("ice.db.r", "r", 2)];
+        contract.join = Some(JoinContract {
+            kind: JoinContractKind::InnerEquiJoin,
+            predicates: vec![JoinPredicateLineage {
+                left: qualified_field("ice.db.l", "l", 1),
+                right: qualified_field("ice.db.r", "r", 1),
+            }],
+        });
+        contract.aggregate = None;
+        mv_def.schema_contract = Some(contract.clone());
+        let target_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(7)
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        100,
+                        "k",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        101,
+                        "v",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::required(
+                        999,
+                        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])
+                .build()
+                .expect("build join projection target schema"),
+        );
+        Arc::new(
+            IcebergMvRewriteContext::from_parts(
+                make_target(),
+                42,
+                Some("sess_cat".to_string()),
+                "sess_db".to_string(),
+                Arc::new(mv_def),
+                Arc::new(parse_query(
+                    "SELECT l.k, r.v FROM ice.db.l JOIN ice.db.r ON l.k = r.k",
+                )),
+                Arc::from(vec![make_ref("ice", "db", "l"), make_ref("ice", "db", "r")]),
+                Arc::new(make_pin(&[
+                    ("ice.db.l", 22, "uuid-l"),
+                    ("ice.db.r", 44, "uuid-r"),
+                ])),
+                Some(99),
+                "uuid-tgt".to_string(),
+                target_schema,
+                Some(Arc::new(contract)),
+            )
+            .expect("join projection mv context must build"),
+        )
+    }
+
+    fn join_aggregate_mv_ctx_customized(
+        mutate: impl FnOnce(&mut MvSchemaContract),
+    ) -> Arc<IcebergMvRewriteContext> {
         let mut mv_def = make_mv_definition();
         mv_def.base_table_refs = vec!["ice.db.l".to_string(), "ice.db.r".to_string()];
         mv_def.last_refresh_snapshots = [
@@ -564,6 +687,29 @@ mod tests {
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
         contract.target.hidden_apply_key.target_field_id = 999;
         contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
+        contract.bases = vec![
+            join_base_contract("ice.db.l", "uuid-l", "l"),
+            join_base_contract("ice.db.r", "uuid-r", "r"),
+        ];
+        contract.output.columns[0]
+            .expression
+            .referenced_base_field_ids
+            .clear();
+        contract.output.columns[0].expression.referenced_base_fields =
+            vec![qualified_field("ice.db.l", "l", 1)];
+        contract.output.columns[1]
+            .expression
+            .referenced_base_field_ids
+            .clear();
+        contract.output.columns[1].expression.referenced_base_fields =
+            vec![qualified_field("ice.db.r", "r", 2)];
+        contract.join = Some(JoinContract {
+            kind: JoinContractKind::InnerEquiJoin,
+            predicates: vec![JoinPredicateLineage {
+                left: qualified_field("ice.db.l", "l", 1),
+                right: qualified_field("ice.db.r", "r", 1),
+            }],
+        });
         contract.aggregate = Some(AggregateStateContract {
             state_layout_version: 1,
             row_id_column_name: "__row_id__".to_string(),
@@ -584,37 +730,46 @@ mod tests {
                 },
             ],
         });
+        mutate(&mut contract);
         mv_def.schema_contract = Some(contract.clone());
+        let mut target_fields = vec![
+            Arc::new(NestedField::required(
+                100,
+                "k",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                101,
+                "s",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::required(
+                999,
+                "__row_id__",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                200,
+                "__agg_state_s",
+                Type::Primitive(PrimitiveType::Binary),
+            )),
+            Arc::new(NestedField::required(
+                201,
+                "__agg_state___ivm_row_count",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+        ];
+        if let Some(branch) = &contract.branch {
+            target_fields.push(Arc::new(NestedField::required(
+                branch.branch_id_column.target_field_id,
+                branch.branch_id_column.column_name.clone(),
+                Type::Primitive(PrimitiveType::Int),
+            )));
+        }
         let target_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "k",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "s",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        999,
-                        "__row_id__",
-                        Type::Primitive(PrimitiveType::String),
-                    )),
-                    Arc::new(NestedField::optional(
-                        200,
-                        "__agg_state_s",
-                        Type::Primitive(PrimitiveType::Binary),
-                    )),
-                    Arc::new(NestedField::required(
-                        201,
-                        "__agg_state___ivm_row_count",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                ])
+                .with_fields(target_fields)
                 .build()
                 .expect("build target schema"),
         );
@@ -640,6 +795,39 @@ mod tests {
             )
             .expect("join aggregate mv context must build"),
         )
+    }
+
+    fn join_base_contract(table_fqn: &str, table_uuid: &str, alias: &str) -> BaseContract {
+        BaseContract {
+            table_fqn: table_fqn.to_string(),
+            table_uuid: table_uuid.to_string(),
+            alias_at_create: Some(alias.to_string()),
+            schema_id_at_create: 7,
+            schema_at_create: BaseSchemaSnapshot {
+                fields: vec![
+                    BaseFieldRecord {
+                        field_id: 1,
+                        name_at_create: "k".to_string(),
+                        type_signature: "long".to_string(),
+                        required: true,
+                    },
+                    BaseFieldRecord {
+                        field_id: 2,
+                        name_at_create: "v".to_string(),
+                        type_signature: "long".to_string(),
+                        required: false,
+                    },
+                ],
+            },
+        }
+    }
+
+    fn qualified_field(table_fqn: &str, qualifier: &str, field_id: i32) -> QualifiedFieldLineage {
+        QualifiedFieldLineage {
+            table_fqn: table_fqn.to_string(),
+            qualifier_at_create: qualifier.to_string(),
+            field_id,
+        }
     }
 
     fn join_base_scan(table: &str, first_id: u32, current_snapshot_id: i64) -> LogicalPlanNode {
@@ -795,6 +983,297 @@ mod tests {
                 None,
             )],
             None,
+        )
+    }
+
+    fn join_projection_plan() -> LogicalPlanNode {
+        let left = project_all(join_base_scan("l", 1, 22), 1);
+        let right = project_all(join_base_scan("r", 10, 44), 10);
+        let join = LogicalPlanNode::new(
+            PlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(column_expr(1, "k", false)),
+                        op: BinOp::Eq,
+                        right: Box::new(column_expr(10, "k", false)),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                }),
+            }),
+            vec![left, right],
+            None,
+        );
+        LogicalPlanNode::new(
+            PlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: column_expr(1, "k", false),
+                        output_name: "k".to_string(),
+                        output_column_id: ColumnId(1),
+                    },
+                    ProjectItem {
+                        expr: column_expr(11, "v", true),
+                        output_name: "v".to_string(),
+                        output_column_id: ColumnId(11),
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![join],
+            None,
+        )
+    }
+
+    fn join_projection_filter_plan() -> LogicalPlanNode {
+        let PlanNodeKind::Project(project) = join_projection_plan().kind else {
+            unreachable!("join projection helper must return Project");
+        };
+        let left = project_all(join_base_scan("l", 1, 22), 1);
+        let right = project_all(join_base_scan("r", 10, 44), 10);
+        let join = LogicalPlanNode::new(
+            PlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(column_expr(1, "k", false)),
+                        op: BinOp::Eq,
+                        right: Box::new(column_expr(10, "k", false)),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                }),
+            }),
+            vec![left, right],
+            None,
+        );
+        let filter = LogicalPlanNode::new(
+            PlanNodeKind::Filter(LogicalFilterNode {
+                predicate: TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(column_expr(1, "k", false)),
+                        op: BinOp::Gt,
+                        right: Box::new(TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Int(0)),
+                            data_type: DataType::Int64,
+                            nullable: false,
+                        }),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                },
+            }),
+            vec![join],
+            None,
+        );
+        LogicalPlanNode::new(PlanNodeKind::Project(project), vec![filter], None)
+    }
+
+    fn join_projection_left_filter_plan() -> LogicalPlanNode {
+        let PlanNodeKind::Project(project) = join_projection_plan().kind else {
+            unreachable!("join projection helper must return Project");
+        };
+        let left_scan = join_base_scan("l", 1, 22);
+        let left_filter = LogicalPlanNode::new(
+            PlanNodeKind::Filter(LogicalFilterNode {
+                predicate: TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(column_expr(1, "k", false)),
+                        op: BinOp::Gt,
+                        right: Box::new(TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Int(0)),
+                            data_type: DataType::Int64,
+                            nullable: false,
+                        }),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                },
+            }),
+            vec![left_scan],
+            None,
+        );
+        let left = project_all(left_filter, 1);
+        let right = project_all(join_base_scan("r", 10, 44), 10);
+        let join = LogicalPlanNode::new(
+            PlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(column_expr(1, "k", false)),
+                        op: BinOp::Eq,
+                        right: Box::new(column_expr(10, "k", false)),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                }),
+            }),
+            vec![left, right],
+            None,
+        );
+        LogicalPlanNode::new(PlanNodeKind::Project(project), vec![join], None)
+    }
+
+    fn join_projection_refresh_context_for_test() -> (
+        tempfile::TempDir,
+        crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) {
+        let warehouse = tempfile::Builder::new()
+            .prefix("novarocks_join_projection_target_")
+            .tempdir()
+            .expect("target warehouse tempdir");
+        let target_warehouse_uri = format!("file://{}", warehouse.path().join("target").display());
+        let base_warehouse_uri = format!("file://{}", warehouse.path().join("base").display());
+        let target_entry = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "tgt",
+                &[
+                    ("type".to_string(), "iceberg".to_string()),
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    (
+                        "iceberg.catalog.warehouse".to_string(),
+                        target_warehouse_uri,
+                    ),
+                ],
+            )
+            .expect("target catalog entry"),
+        );
+        let base_entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "ice",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                ("iceberg.catalog.warehouse".to_string(), base_warehouse_uri),
+            ],
+        )
+        .expect("base catalog entry");
+        crate::connector::iceberg::catalog::registry::create_namespace(&target_entry, "db")
+            .expect("create target namespace");
+        crate::connector::iceberg::catalog::registry::create_namespace(&base_entry, "db")
+            .expect("create base namespace");
+        for table in ["l", "r"] {
+            crate::connector::iceberg::catalog::registry::create_table(
+                &base_entry,
+                "db",
+                table,
+                &[
+                    crate::sql::TableColumnDef {
+                        name: "k".to_string(),
+                        data_type: crate::sql::SqlType::BigInt,
+                        nullable: false,
+                        aggregation: None,
+                        default: None,
+                    },
+                    crate::sql::TableColumnDef {
+                        name: "v".to_string(),
+                        data_type: crate::sql::SqlType::BigInt,
+                        nullable: true,
+                        aggregation: None,
+                        default: None,
+                    },
+                ],
+                None,
+                &[],
+                &[
+                    ("format-version".to_string(), "3".to_string()),
+                    ("write.row-lineage".to_string(), "true".to_string()),
+                ],
+            )
+            .expect("create base table");
+        }
+        crate::connector::iceberg::catalog::registry::create_table(
+            &target_entry,
+            "db",
+            "mv",
+            &[
+                crate::sql::TableColumnDef {
+                    name: "k".to_string(),
+                    data_type: crate::sql::SqlType::BigInt,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                },
+                crate::sql::TableColumnDef {
+                    name: "v".to_string(),
+                    data_type: crate::sql::SqlType::BigInt,
+                    nullable: true,
+                    aggregation: None,
+                    default: None,
+                },
+                crate::sql::TableColumnDef {
+                    name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                    data_type: crate::sql::SqlType::String,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                },
+            ],
+            None,
+            &[],
+            &[],
+        )
+        .expect("create target table");
+        crate::connector::iceberg::catalog::registry::insert_rows(
+            &target_entry,
+            "db",
+            "mv",
+            &[vec![
+                crate::sql::Literal::Int(1),
+                crate::sql::Literal::Int(10),
+                crate::sql::Literal::String("join-key-1".to_string()),
+            ]],
+        )
+        .expect("insert target row");
+        let loaded =
+            crate::connector::iceberg::catalog::registry::load_table(&target_entry, "db", "mv")
+                .expect("load target table");
+        let target_snapshot_id = loaded
+            .table
+            .metadata()
+            .current_snapshot_id()
+            .expect("target snapshot");
+        let iceberg_catalog =
+            crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&target_entry)
+                .expect("build target iceberg catalog");
+
+        let base = join_projection_mv_ctx();
+        let rewrite = Arc::new(
+            IcebergMvRewriteContext::from_parts(
+                base.target.clone(),
+                base.mv_id,
+                base.current_catalog.clone(),
+                base.current_database.clone(),
+                Arc::clone(&base.mv_definition),
+                Arc::clone(&base.canonical_select_query),
+                Arc::clone(&base.base_refs),
+                Arc::clone(&base.pin),
+                Some(target_snapshot_id),
+                base.target_table_uuid.clone(),
+                Arc::clone(&base.target_schema),
+                Some(Arc::clone(&base.schema_contract)),
+            )
+            .expect("join projection refresh rewrite context"),
+        );
+
+        let mut base_catalog_entries = BTreeMap::new();
+        base_catalog_entries.insert("ice".to_string(), base_entry);
+
+        (
+            warehouse,
+            crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+                rewrite,
+                target_entry,
+                base_catalog_entries,
+                iceberg_catalog,
+                target_table: loaded.table,
+                affected_partitions:
+                    crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                        "test context",
+                    ),
+                pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(
+                ),
+            },
         )
     }
 
@@ -1747,6 +2226,376 @@ mod tests {
             panic!("expected join delta UnionAll under signed aggregate");
         };
         assert_join_delta_union_shape(union_plan, signed_action_id);
+        let union_columns = match &union_plan.kind {
+            PlanNodeKind::Union(union) => &union.output_columns,
+            _ => unreachable!(),
+        };
+        let join_apply_key_from_plan = union_columns
+            .iter()
+            .find(|column| {
+                column
+                    .name
+                    .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+            })
+            .expect("join delta UnionAll must produce join apply-key before descriptor recording");
+
+        let descriptor = outcome
+            .annotation
+            .change_stream
+            .join_refresh
+            .as_ref()
+            .expect("join delta rewrite must record join refresh descriptor");
+        assert_eq!(descriptor.mode, JoinRefreshMode::Coalesce);
+        assert_eq!(descriptor.mv_identity.catalog, "tgt");
+        assert_eq!(descriptor.mv_identity.database, "db");
+        assert_eq!(descriptor.mv_identity.name, "mv");
+        assert_eq!(descriptor.left_base_fqn, "ice.db.l");
+        assert_eq!(descriptor.right_base_fqn, "ice.db.r");
+        assert_eq!(descriptor.join_key_pairs.len(), 1);
+        assert_eq!(descriptor.join_key_pairs[0].left_column.name, "k");
+        assert_eq!(descriptor.join_key_pairs[0].right_column.name, "k");
+        assert_eq!(
+            descriptor.join_apply_key_column.column_id, join_apply_key_from_plan.column_id,
+            "descriptor join apply-key source must be produced by the plan"
+        );
+        assert_eq!(descriptor.branches.len(), 2);
+        assert!(descriptor.branches.iter().any(|branch| {
+            branch.side == JoinRefreshBranchSide::LeftDeltaRightSnapshot
+                && branch.action_column_id == descriptor.action_column.column_id
+        }));
+        assert!(descriptor.branches.iter().any(|branch| {
+            branch.side == JoinRefreshBranchSide::LeftSnapshotRightDelta
+                && branch.action_column_id == descriptor.action_column.column_id
+        }));
+        assert!(descriptor.output_mappings.iter().any(|mapping| {
+            matches!(
+                mapping.source,
+                JoinRefreshOutputSource::Action(column_id)
+                    if column_id == descriptor.action_column.column_id
+            )
+        }));
+        assert!(descriptor.output_mappings.iter().any(|mapping| {
+            matches!(
+                mapping.source,
+                JoinRefreshOutputSource::JoinApplyKey(column_id)
+                    if column_id == descriptor.join_apply_key_column.column_id
+            )
+        }));
+        for payload in &descriptor.payload_columns {
+            assert!(descriptor.output_mappings.iter().any(|mapping| {
+                matches!(
+                    mapping.source,
+                    JoinRefreshOutputSource::Payload(column_id)
+                        if column_id == payload.column_id
+                )
+            }));
+        }
+        descriptor
+            .validate()
+            .expect("recorded join refresh descriptor must validate");
+    }
+
+    #[test]
+    fn join_refresh_descriptor_uses_visible_lineage_payload_columns() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: join_aggregate_plan(),
+            mv_ctx: join_aggregate_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            column_ref_factory: test_column_ref_factory(),
+        })
+        .expect("join aggregate IMV pipeline must rewrite and validate");
+
+        let descriptor = outcome
+            .annotation
+            .change_stream
+            .join_refresh
+            .as_ref()
+            .expect("join delta rewrite must record join refresh descriptor");
+        let payload_ids = descriptor
+            .payload_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            payload_ids,
+            vec![ColumnId(1), ColumnId(11)],
+            "descriptor payload must follow target-visible output lineage, not the full join union output"
+        );
+    }
+
+    #[test]
+    fn pure_join_refresh_pipeline_keeps_internal_outputs_above_projection() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: join_projection_plan(),
+            mv_ctx: join_projection_mv_ctx(),
+            disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
+            deadline: None,
+            column_ref_factory: test_column_ref_factory_reserved_until(30),
+        })
+        .expect("join projection IMV pipeline must rewrite and validate");
+        let descriptor = outcome
+            .annotation
+            .change_stream
+            .join_refresh
+            .as_ref()
+            .expect("join projection rewrite must record join refresh descriptor");
+        let output_columns = crate::sql::planner::plan_output_columns(&outcome.plan)
+            .expect("pipeline output columns");
+
+        assert!(
+            output_columns.iter().any(|column| column.column_id
+                == descriptor.action_column.column_id
+                && column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
+            "coalesce input must expose the recorded action column"
+        );
+        assert!(
+            output_columns.iter().any(|column| {
+                column.column_id == descriptor.join_apply_key_column.column_id
+                    && column
+                        .name
+                        .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+            }),
+            "coalesce input must expose the recorded join apply-key column"
+        );
+    }
+
+    #[test]
+    fn pure_join_refresh_coalesce_plan_keeps_project_refs_in_child_scope() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: join_projection_plan(),
+            mv_ctx: join_projection_mv_ctx(),
+            disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
+            deadline: None,
+            column_ref_factory: test_column_ref_factory_reserved_until(30),
+        })
+        .expect("join projection IMV pipeline must rewrite and validate");
+        let descriptor = outcome
+            .annotation
+            .change_stream
+            .join_refresh
+            .as_ref()
+            .expect("join projection rewrite must record join refresh descriptor");
+        let coalesce = crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+            outcome.plan,
+            descriptor,
+            &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                target_table_uuid: "uuid-tgt".to_string(),
+                target_snapshot_id: Some(99),
+            },
+            200,
+            201,
+            202,
+        )
+        .expect("join projection coalesce plan");
+
+        assert_project_refs_resolve_to_child_outputs(&coalesce);
+    }
+
+    #[test]
+    fn pure_join_refresh_physical_plan_keeps_project_refs_in_child_scope() {
+        std::thread::Builder::new()
+            .name("imv-join-physical-scope-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let outcome = run_imv_rewrite(ImvRewriteInput {
+                    plan: join_projection_plan(),
+                    mv_ctx: join_projection_mv_ctx(),
+                    disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
+                    deadline: None,
+                    column_ref_factory: test_column_ref_factory_reserved_until(30),
+                })
+                .expect("join projection IMV pipeline must rewrite and validate");
+                let descriptor = outcome
+                    .annotation
+                    .change_stream
+                    .join_refresh
+                    .as_ref()
+                    .expect("join projection rewrite must record join refresh descriptor");
+                let coalesce = crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+                    outcome.plan,
+                    descriptor,
+                    &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                        target_table_uuid: "uuid-tgt".to_string(),
+                        target_snapshot_id: Some(99),
+                    },
+                    200,
+                    201,
+                    202,
+                )
+                .expect("join projection coalesce plan");
+                let physical = optimize_logical_for_test(coalesce);
+
+                assert_physical_project_refs_resolve_to_child_outputs(&physical);
+            })
+            .expect("spawn physical scope test")
+            .join()
+            .expect("physical scope test");
+    }
+
+    #[test]
+    fn pure_join_refresh_filter_physical_plan_keeps_action_refs_in_child_scope() {
+        std::thread::Builder::new()
+            .name("imv-join-filter-physical-scope-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let outcome = run_imv_rewrite(ImvRewriteInput {
+                    plan: join_projection_filter_plan(),
+                    mv_ctx: join_projection_mv_ctx(),
+                    disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
+                    deadline: None,
+                    column_ref_factory: test_column_ref_factory_reserved_until(30),
+                })
+                .expect("join projection/filter IMV pipeline must rewrite and validate");
+                let descriptor = outcome
+                    .annotation
+                    .change_stream
+                    .join_refresh
+                    .as_ref()
+                    .expect("join projection/filter rewrite must record join refresh descriptor");
+                let coalesce = crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+                    outcome.plan,
+                    descriptor,
+                    &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                        target_table_uuid: "uuid-tgt".to_string(),
+                        target_snapshot_id: Some(99),
+                    },
+                    200,
+                    201,
+                    202,
+                )
+                .expect("join projection/filter coalesce plan");
+                let physical = optimize_logical_for_test(coalesce);
+
+                crate::sql::codegen::id_binding_verifier::verify_id_binding(&physical)
+                    .expect("join projection/filter physical coalesce plan must bind ids");
+                assert_physical_project_refs_resolve_to_child_outputs(&physical);
+            })
+            .expect("spawn join filter physical scope test")
+            .join()
+            .expect("join filter physical scope test");
+    }
+
+    #[test]
+    fn pure_join_refresh_side_filter_physical_plan_keeps_action_refs_in_child_scope() {
+        std::thread::Builder::new()
+            .name("imv-join-side-filter-physical-scope-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let outcome = run_imv_rewrite(ImvRewriteInput {
+                    plan: join_projection_left_filter_plan(),
+                    mv_ctx: join_projection_mv_ctx(),
+                    disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
+                    deadline: None,
+                    column_ref_factory: test_column_ref_factory_reserved_until(30),
+                })
+                .expect("join projection side-filter IMV pipeline must rewrite and validate");
+                let descriptor = outcome
+                    .annotation
+                    .change_stream
+                    .join_refresh
+                    .as_ref()
+                    .expect("join side-filter rewrite must record join refresh descriptor");
+                let coalesce = crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+                    outcome.plan,
+                    descriptor,
+                    &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                        target_table_uuid: "uuid-tgt".to_string(),
+                        target_snapshot_id: Some(99),
+                    },
+                    200,
+                    201,
+                    202,
+                )
+                .expect("join side-filter coalesce plan");
+                let physical = optimize_logical_for_test(coalesce);
+
+                assert_physical_project_refs_resolve_to_child_outputs(&physical);
+            })
+            .expect("spawn join side-filter physical scope test")
+            .join()
+            .expect("join side-filter physical scope test");
+    }
+
+    #[test]
+    fn pure_join_refresh_fragment_builder_lowers_coalesce_plan() {
+        std::thread::Builder::new()
+            .name("imv-join-fragment-lowering-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let (_warehouse, refresh_ctx) = join_projection_refresh_context_for_test();
+                let outcome = run_imv_rewrite(ImvRewriteInput {
+                    plan: join_projection_plan(),
+                    mv_ctx: Arc::clone(&refresh_ctx.rewrite),
+                    disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
+                    deadline: None,
+                    column_ref_factory: test_column_ref_factory_reserved_until(30),
+                })
+                .expect("join projection IMV pipeline must rewrite and validate");
+                let descriptor = outcome
+                    .annotation
+                    .change_stream
+                    .join_refresh
+                    .as_ref()
+                    .expect("join projection rewrite must record join refresh descriptor");
+                let coalesce = crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+                    outcome.plan,
+                    descriptor,
+                    &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_rewrite_context(&refresh_ctx.rewrite),
+                    200,
+                    201,
+                    202,
+                )
+                .expect("join projection coalesce plan");
+                let physical = optimize_logical_for_test(coalesce);
+                let catalog = crate::engine::catalog::InMemoryCatalog::default();
+                let mut connectors = crate::connector::ConnectorRegistry::default();
+                connectors.register_scan_planner(Arc::new(
+                    crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+                ));
+
+                crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
+                    &physical,
+                    &catalog,
+                    &connectors,
+                    "default",
+                    Some(&refresh_ctx),
+                )
+                .expect("join projection coalesce plan must lower");
+            })
+            .expect("spawn fragment lowering test")
+            .join()
+            .expect("fragment lowering test");
+    }
+
+    #[test]
+    fn imv_pipeline_rejects_join_descriptor_recording_without_join_contract() {
+        let ctx = join_aggregate_mv_ctx_customized(|contract| {
+            contract.join = None;
+            contract.branch = Some(BranchUnionContract {
+                branch_id_column: BranchIdColumnContract {
+                    column_name: BRANCH_ID_COLUMN_NAME.to_string(),
+                    target_field_id: 4242,
+                },
+                branch_count: 2,
+                inner_apply_key_source: ApplyKeySource::GroupRowId,
+            });
+        });
+
+        let err = run_imv_rewrite(ImvRewriteInput {
+            plan: join_aggregate_plan(),
+            mv_ctx: ctx,
+            disabled_rules: Vec::new(),
+            deadline: None,
+            column_ref_factory: test_column_ref_factory(),
+        })
+        .expect_err("join delta descriptor recording must fail closed without join contract");
+
+        assert!(
+            err.contains("schema_contract.join"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1835,6 +2684,191 @@ mod tests {
             !plan_contains_imv_marker(plan),
             "final aggregate change-stream plan must not contain IMV markers"
         );
+    }
+
+    fn assert_project_refs_resolve_to_child_outputs(plan: &LogicalPlanNode) {
+        if let PlanNodeKind::Project(project) = &plan.kind {
+            let child_output_ids = crate::sql::planner::plan_output_columns(plan.unary_input())
+                .expect("project child output columns")
+                .into_iter()
+                .map(|column| column.column_id)
+                .collect::<HashSet<_>>();
+            for item in &project.items {
+                let mut refs = HashSet::new();
+                collect_column_refs(&item.expr, &mut refs);
+                for column_id in refs {
+                    assert!(
+                        child_output_ids.contains(&column_id),
+                        "Project item `{}` references {column_id}, but child outputs are {:?}",
+                        item.output_name,
+                        child_output_ids
+                    );
+                }
+            }
+        }
+        for child in &plan.children {
+            assert_project_refs_resolve_to_child_outputs(child);
+        }
+    }
+
+    fn assert_physical_project_refs_resolve_to_child_outputs(
+        plan: &crate::sql::optimizer::PhysicalPlanNode,
+    ) {
+        if matches!(
+            &plan.op,
+            crate::sql::optimizer::Operator::PhysicalHashJoin(_)
+                | crate::sql::optimizer::Operator::PhysicalNestLoopJoin(_)
+        ) {
+            let child_output_ids = plan
+                .children
+                .iter()
+                .flat_map(|child| child.output_columns.iter().map(|column| column.column_id))
+                .collect::<HashSet<_>>();
+            for column in &plan.output_columns {
+                assert!(
+                    child_output_ids.contains(&column.column_id),
+                    "Physical join declares output `{}` {}, but children output {:?}",
+                    column.name,
+                    column.column_id,
+                    child_output_ids
+                );
+            }
+        }
+        if let crate::sql::optimizer::Operator::PhysicalProject(project) = &plan.op {
+            let child = plan
+                .children
+                .first()
+                .expect("PhysicalProject must have one child");
+            let child_output_ids = child
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<HashSet<_>>();
+            let arena = plan
+                .execution_props
+                .scalar_arena
+                .as_ref()
+                .expect("physical plan must carry scalar arena");
+            for item in &project.items {
+                let refs =
+                    crate::sql::optimizer::scalar_expr::collect_column_ids_strict(arena, item.expr)
+                        .expect("project scalar must have resolved column ids");
+                for column_id in refs {
+                    assert!(
+                        child_output_ids.contains(&column_id),
+                        "PhysicalProject item `{}` references {column_id}, but child outputs are {:?}",
+                        item.output_name,
+                        child_output_ids
+                    );
+                }
+            }
+        }
+        if let crate::sql::optimizer::Operator::PhysicalUnion(union) = &plan.op {
+            for (idx, child) in plan.children.iter().enumerate() {
+                assert_eq!(
+                    child.output_columns.len(),
+                    union.output_columns.len(),
+                    "PhysicalUnion child {idx} output length must match union output length; child={:?}, union={:?}",
+                    child
+                        .output_columns
+                        .iter()
+                        .map(|column| format!("{}:{}", column.column_id, column.name))
+                        .collect::<Vec<_>>(),
+                    union
+                        .output_columns
+                        .iter()
+                        .map(|column| format!("{}:{}", column.column_id, column.name))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        for child in &plan.children {
+            assert_physical_project_refs_resolve_to_child_outputs(child);
+        }
+    }
+
+    fn collect_column_refs(expr: &TypedExpr, refs: &mut HashSet<ColumnId>) {
+        match &expr.kind {
+            ExprKind::ColumnRef { column_id, .. } => {
+                if *column_id != ColumnId::UNSET {
+                    refs.insert(*column_id);
+                }
+            }
+            ExprKind::BinaryOp { left, right, .. } => {
+                collect_column_refs(left, refs);
+                collect_column_refs(right, refs);
+            }
+            ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+                for arg in args {
+                    collect_column_refs(arg, refs);
+                }
+                if let ExprKind::AggregateCall { order_by, .. } = &expr.kind {
+                    for item in order_by {
+                        collect_column_refs(&item.expr, refs);
+                    }
+                }
+            }
+            ExprKind::Cast { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::UnaryOp { expr, .. }
+            | ExprKind::Nested(expr)
+            | ExprKind::IsTruthValue { expr, .. } => collect_column_refs(expr, refs),
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                if let Some(operand) = operand {
+                    collect_column_refs(operand, refs);
+                }
+                for (when, then) in when_then {
+                    collect_column_refs(when, refs);
+                    collect_column_refs(then, refs);
+                }
+                if let Some(else_expr) = else_expr {
+                    collect_column_refs(else_expr, refs);
+                }
+            }
+            ExprKind::InList { expr, list, .. } => {
+                collect_column_refs(expr, refs);
+                for item in list {
+                    collect_column_refs(item, refs);
+                }
+            }
+            ExprKind::Between {
+                expr, low, high, ..
+            } => {
+                collect_column_refs(expr, refs);
+                collect_column_refs(low, refs);
+                collect_column_refs(high, refs);
+            }
+            ExprKind::Like { expr, pattern, .. } => {
+                collect_column_refs(expr, refs);
+                collect_column_refs(pattern, refs);
+            }
+            ExprKind::WindowCall {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for arg in args {
+                    collect_column_refs(arg, refs);
+                }
+                for expr in partition_by {
+                    collect_column_refs(expr, refs);
+                }
+                for item in order_by {
+                    collect_column_refs(&item.expr, refs);
+                }
+            }
+            ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+                collect_column_refs(body, refs);
+            }
+            ExprKind::LambdaParamRef { .. }
+            | ExprKind::Literal(_)
+            | ExprKind::SubqueryPlaceholder { .. } => {}
+        }
     }
 
     fn find_signed_delta_project(plan: &LogicalPlanNode) -> &LogicalPlanNode {

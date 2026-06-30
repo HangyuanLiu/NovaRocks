@@ -266,7 +266,17 @@ pub(crate) fn collect_output_ids_ordered_opt(expr: &OptExpr) -> Vec<ColumnId> {
         Operator::LogicalFilter(_)
         | Operator::LogicalSort(_)
         | Operator::LogicalLimit(_)
-        | Operator::LogicalRepeat(_) => collect_output_ids_ordered_opt(expr.unary_input()),
+        | Operator::LogicalRepeat(_)
+        | Operator::LogicalImvVersion(_) => collect_output_ids_ordered_opt(expr.unary_input()),
+        Operator::LogicalImvDelta(delta) => {
+            let mut ids = collect_output_ids_ordered_opt(expr.unary_input());
+            if let Some(action_column) = delta.action_column
+                && !ids.contains(&action_column)
+            {
+                ids.push(action_column);
+            }
+            ids
+        }
         Operator::LogicalTableFunction(t) => {
             let mut ids = collect_output_ids_ordered_opt(expr.unary_input());
             ids.extend(t.output_columns.iter().map(|c| c.column_id));

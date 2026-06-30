@@ -2,8 +2,9 @@
 //!
 //! `_row_id` is the Iceberg v3 row-lineage identity. The IMV apply key
 //! (`__nova_base_row_id`) is derived from it. Phase 3 injects it (internal,
-//! Int64, non-null) on Delta-bound scans so the root apply-key project can
-//! reference it. It is never exposed to user-visible output.
+//! Int64, non-null) on Delta-bound scans and version snapshot scans so refresh
+//! rewrite rules can build row-identity apply keys from real plan outputs. It
+//! is never exposed to user-visible output.
 
 use arrow::datatypes::DataType;
 
@@ -38,7 +39,8 @@ impl ImvRowIdColumn {
     }
 }
 
-/// Rule to add the `_row_id` internal column to Delta-bound scans (idempotent).
+/// Rule to add the `_row_id` internal column to row-lineage Iceberg scans
+/// (idempotent).
 /// Will be registered into the `imv-action-propagation` stage alongside
 /// `InjectActionColumnRule` by the pipeline wiring task.
 pub(crate) struct InjectRowIdRule;
@@ -60,8 +62,10 @@ impl LogicalRewriteRule for InjectRowIdRule {
         let plan = opt_expr_to_plan(expr.clone(), ctx);
         match &plan.kind {
             PlanNodeKind::Scan(scan) => {
-                matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. })
-                    && !scan.columns.iter().any(ImvRowIdColumn::matches)
+                matches!(
+                    scan.table.source,
+                    ScanSource::IcebergDeltaTable { .. } | ScanSource::IcebergVersionTable { .. }
+                ) && !scan.columns.iter().any(ImvRowIdColumn::matches)
             }
             _ => false,
         }
@@ -178,6 +182,18 @@ mod tests {
         }
     }
 
+    fn version_scan() -> LogicalScanNode {
+        let mut scan = delta_scan();
+        let ScanSource::IcebergDeltaTable { table, .. } = scan.table.source else {
+            unreachable!("delta_scan must use IcebergDeltaTable")
+        };
+        scan.table.source = ScanSource::IcebergVersionTable {
+            table,
+            snapshot_id: 22,
+        };
+        scan
+    }
+
     fn scan_plan(scan: LogicalScanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(PlanNodeKind::Scan(scan), vec![], None)
     }
@@ -196,6 +212,29 @@ mod tests {
         let rule = InjectRowIdRule;
         let mut ctx = build_ctx();
         let plan = scan_plan(delta_scan());
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(rule.matches(&expr, &ctx));
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
+        else {
+            panic!("expected Changed(Scan)");
+        };
+        let arena = ctx.scalar_arena();
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            changed_expr,
+            &arena.borrow(),
+        );
+        let PlanNodeKind::Scan(scan) = changed.kind else {
+            panic!("expected Changed(Scan)");
+        };
+        assert!(scan.columns.iter().any(ImvRowIdColumn::matches));
+    }
+
+    #[test]
+    fn inject_row_id_on_version_scan() {
+        let rule = InjectRowIdRule;
+        let mut ctx = build_ctx();
+        let plan = scan_plan(version_scan());
         let mut arena = ScalarArena::new();
         let expr = logical_plan_to_opt_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));

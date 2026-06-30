@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
+use arrow::datatypes::DataType;
 use iceberg::Catalog;
 use iceberg::TableIdent;
 use iceberg::spec::DataFile;
@@ -77,8 +78,8 @@ use crate::meta::repository::mv::{
 };
 use crate::meta::repository::mv_contract::MvPartitionContract;
 use crate::runtime::global_async_runtime::data_block_on;
-#[cfg(test)]
-use crate::sql::analysis::OutputColumn;
+use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
+use crate::sql::column_id::ColumnId;
 use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
     DropMaterializedViewStmt, ObjectName, RefreshMaterializedViewStmt,
@@ -3219,14 +3220,10 @@ fn refresh_iceberg_mv_with_planned_partitions(
             );
         }
         // Two-table inner equi-join projection/filter. The left/right table
-        // aliases (the single execution-load-bearing join field, consumed by the
-        // join-refresh SQL rewriters) are sourced from the focused join-alias
-        // extractor rather than the legacy classifier.
+        // order is sourced from the persisted schema contract, not the SQL
+        // surface shape. First/full refresh still extracts aliases inside the
+        // first-refresh closure until Task 6 cuts that SQL wrapper over.
         (false, BaseSnapshotPolicy::JoinPairPartialInitialSkip, _) => {
-            let join_aliases =
-                crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
-                    &canonical_select_query,
-                )?;
             return refresh_iceberg_join_mv(
                 state,
                 &target,
@@ -3238,7 +3235,6 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 current_database,
                 &mv_definition,
                 &base_refs,
-                &join_aliases,
                 refresh_contract.apply_key,
             );
         }
@@ -9772,7 +9768,6 @@ fn refresh_iceberg_join_mv(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
-    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     apply_key: ApplyKeyContract,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     if base_refs.len() != 2 {
@@ -9787,7 +9782,6 @@ fn refresh_iceberg_join_mv(
                 .into(),
         );
     }
-    validate_join_aliases_base_refs(aliases, base_refs)?;
     let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
         format!(
             "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
@@ -9801,7 +9795,7 @@ fn refresh_iceberg_join_mv(
         )
         .into());
     }
-    let (left_ref, right_ref) = join_base_refs_for_aliases(aliases, base_refs)?;
+    let (left_ref, right_ref) = join_base_refs_for_schema_contract(schema_contract, base_refs)?;
     let left_loaded_before_pin = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded_before_pin = load_current_iceberg_base_table(state, right_ref)?;
     let left_current_before_pin =
@@ -9947,7 +9941,6 @@ fn refresh_iceberg_join_mv(
                 &ctx,
                 &staging_branch,
                 refresh_id,
-                aliases,
                 left_ref,
                 right_ref,
             )
@@ -9970,14 +9963,7 @@ fn refresh_iceberg_join_mv(
                 )?,
             )
         },
-        || {
-            incremental_refresh_iceberg_join_mv(
-                state,
-                &ctx,
-                &[left_ref.clone(), right_ref.clone()],
-                aliases,
-            )
-        },
+        || incremental_refresh_iceberg_join_mv(state, &ctx, &[left_ref.clone(), right_ref.clone()]),
     )
 }
 
@@ -10010,6 +9996,36 @@ fn join_base_refs_for_aliases<'a>(
 ) -> Result<(&'a IcebergTableRef, &'a IcebergTableRef), String> {
     let left_name = aliases.left_table.as_str();
     let right_name = aliases.right_table.as_str();
+    let left = base_refs
+        .iter()
+        .find(|base| base.fqn().eq_ignore_ascii_case(left_name))
+        .ok_or_else(|| format!("join MV left base {left_name} was not resolved"))?;
+    let right = base_refs
+        .iter()
+        .find(|base| base.fqn().eq_ignore_ascii_case(right_name))
+        .ok_or_else(|| format!("join MV right base {right_name} was not resolved"))?;
+    Ok((left, right))
+}
+
+fn join_base_refs_for_schema_contract<'a>(
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    base_refs: &'a [IcebergTableRef],
+) -> Result<(&'a IcebergTableRef, &'a IcebergTableRef), String> {
+    let join = schema_contract
+        .join
+        .as_ref()
+        .ok_or_else(|| "join MV schema contract missing join lineage".to_string())?;
+    let predicate = join
+        .predicates
+        .first()
+        .ok_or_else(|| "join MV schema contract has no join predicates".to_string())?;
+    let left_name = predicate.left.table_fqn.as_str();
+    let right_name = predicate.right.table_fqn.as_str();
+    if left_name.eq_ignore_ascii_case(right_name) {
+        return Err(format!(
+            "join MV schema contract has identical left/right bases: {left_name}"
+        ));
+    }
     let left = base_refs
         .iter()
         .find(|base| base.fqn().eq_ignore_ascii_case(left_name))
@@ -10357,7 +10373,6 @@ fn first_refresh_iceberg_join_mv(
     ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     left_ref: &IcebergTableRef,
     right_ref: &IcebergTableRef,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
@@ -10366,8 +10381,6 @@ fn first_refresh_iceberg_join_mv(
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let current_database = ctx.rewrite.current_database.as_str();
-    let mv_definition = &*ctx.rewrite.mv_definition;
-    let pin = &*ctx.rewrite.pin;
     if let Err(err) = ensure_iceberg_mv_staging_branch(
         iceberg_catalog,
         target,
@@ -10390,93 +10403,15 @@ fn first_refresh_iceberg_join_mv(
             ));
         }
     };
-    let left_snapshot = pin
-        .get(left_ref)
-        .ok_or_else(|| format!("missing refresh pin for {}", left_ref.fqn()))
-        .map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-            )
-        })?;
-    let right_snapshot = pin
-        .get(right_ref)
-        .ok_or_else(|| format!("missing refresh pin for {}", right_ref.fqn()))
-        .map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-            )
-        })?;
-    let base_query = parse_mv_select_query(&mv_definition.select_sql).map_err(|err| {
-        handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
-    })?;
-    let mut full_refresh_query = base_query.clone();
-    rewrite_join_full_refresh_query(
-        &mut full_refresh_query,
-        left_ref,
-        left_snapshot,
-        right_ref,
-        right_snapshot,
-        &aliases.left_alias,
-        &aliases.right_alias,
-    )
+    let logical_plan = match select_join_full_refresh_route() {
+        JoinFullRefreshRoute::LogicalApplyKeyProject => {
+            build_join_full_refresh_logical_plan(state, ctx, left_ref, right_ref)
+        }
+    }
     .map_err(|err| {
         handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
     })?;
-    let left_uuid = pin
-        .uuid(left_ref)
-        .ok_or_else(|| format!("missing uuid for {}", left_ref.fqn()))
-        .map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-            )
-        })?
-        .to_string();
-    let right_uuid = pin
-        .uuid(right_ref)
-        .ok_or_else(|| format!("missing uuid for {}", right_ref.fqn()))
-        .map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-            )
-        })?
-        .to_string();
-    let query = crate::engine::mv::iceberg_join_branch::rewrite_join_full_refresh_apply_query(
-        &base_query,
-        full_refresh_query,
-        &left_uuid,
-        &right_uuid,
-    )
-    .map_err(|err| {
-        handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
-    })?;
-    let branch_catalog = build_join_snapshot_catalog(
-        state,
-        &[(left_ref, left_snapshot), (right_ref, right_snapshot)],
-    )
-    .map_err(|err| {
-        handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
-    })?;
-    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)
+    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, ctx.rewrite.mv_definition.mv_id)
         .map_err(|err| {
             handle_iceberg_mv_commit_error(
                 state,
@@ -10513,15 +10448,18 @@ fn first_refresh_iceberg_join_mv(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        if let Err(err) = crate::engine::execute_query_with_options(
-            &query,
-            &branch_catalog,
+        let codegen_catalog = crate::engine::catalog::InMemoryCatalog::default();
+        if let Err(err) = crate::engine::execute_logical_plan_with_options(
+            logical_plan.plan,
+            logical_plan.factory,
+            &codegen_catalog,
             &connectors_snapshot,
             current_database,
             state.exchange_port,
             None,
             Some(Box::new(merge_sink)),
             Some(&*catalogs_guard),
+            Some(ctx),
             None,
         ) {
             drop(catalogs_guard);
@@ -10574,8 +10512,8 @@ fn first_refresh_iceberg_join_mv(
         }
     };
 
-    let snapshots = pin.to_snapshot_map();
-    let table_uuids = pin.to_table_uuid_map();
+    let snapshots = ctx.rewrite.pin.to_snapshot_map();
+    let table_uuids = ctx.rewrite.pin.to_table_uuid_map();
     record_iceberg_mv_staging_commit(
         state,
         refresh_id,
@@ -10591,7 +10529,7 @@ fn first_refresh_iceberg_join_mv(
         expected_main_snapshot_id,
         new_snapshot_id,
         refresh_id,
-        mv_definition.mv_id,
+        ctx.rewrite.mv_definition.mv_id,
     )?;
     record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
     drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
@@ -10606,6 +10544,15 @@ fn first_refresh_iceberg_join_mv(
     Ok(StatementResult::Ok)
 }
 
+#[cfg(test)]
+fn join_full_refresh_uses_logical_plan() -> bool {
+    matches!(
+        select_join_full_refresh_route(),
+        JoinFullRefreshRoute::LogicalApplyKeyProject
+    )
+}
+
+#[cfg(test)]
 fn rewrite_join_full_refresh_query(
     query: &mut sqlparser::ast::Query,
     left_ref: &IcebergTableRef,
@@ -10639,6 +10586,7 @@ fn rewrite_join_full_refresh_query(
     append_join_apply_hidden_projection(select, left_alias, right_alias, true)
 }
 
+#[cfg(test)]
 fn append_join_apply_hidden_projection(
     select: &mut sqlparser::ast::Select,
     left_alias: &str,
@@ -10679,6 +10627,7 @@ fn append_join_apply_hidden_projection(
     Ok(())
 }
 
+#[cfg(test)]
 fn join_row_id_select_item(alias: &str, output: &str) -> sqlparser::ast::SelectItem {
     sqlparser::ast::SelectItem::ExprWithAlias {
         expr: sqlparser::ast::Expr::CompoundIdentifier(vec![
@@ -11295,6 +11244,7 @@ mod aggregate_refresh_rewrite_validation_tests {
                 target_state: TargetStateProof { present: true },
                 signed_state_aggregate: SignedStateAggregateProof { present: true },
             }),
+            ..Default::default()
         }
     }
 
@@ -11473,6 +11423,53 @@ mod aggregate_refresh_rewrite_validation_tests {
 #[cfg(test)]
 mod join_delta_append_only_fast_path_tests {
     use super::*;
+
+    #[test]
+    fn join_incremental_refresh_plan_kind_uses_logical_cutover() {
+        let route = select_join_incremental_refresh_route(false, false);
+        assert_eq!(route, JoinIncrementalRefreshRoute::LogicalAppendOnly);
+        let route = select_join_incremental_refresh_route(true, false);
+        assert_eq!(route, JoinIncrementalRefreshRoute::LogicalCoalesce);
+        let route = select_join_incremental_refresh_route(false, true);
+        assert_eq!(route, JoinIncrementalRefreshRoute::LogicalCoalesce);
+    }
+
+    #[test]
+    fn join_incremental_refresh_production_route_uses_logical_executors() {
+        let source = std::fs::read_to_string(file!()).expect("read source");
+        let route_body = source_between(
+            &source,
+            "\nfn incremental_refresh_iceberg_join_mv(\n",
+            "\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum JoinIncrementalRefreshRoute",
+        );
+
+        assert!(route_body.contains("execute_append_only_join_delta_branches_logical("));
+        assert!(route_body.contains("execute_coalescing_join_delta_branches_logical("));
+
+        let forbidden = [
+            "parse_mv_select_query(",
+            "should_use_join_delta_append_only_fast_path(",
+            "execute_append_only_join_delta_branches(",
+            "execute_join_delta_branches(",
+            "rewrite_join_branch_query(",
+            "rewrite_join_delta_append_only_query(",
+            "rewrite_join_delta_coalesce_query",
+            "extract_join_aliases(",
+        ];
+        for token in forbidden {
+            assert!(
+                !route_body.contains(token),
+                "incremental join refresh production route still references legacy SQL path: {token}"
+            );
+        }
+    }
+
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_idx = source.find(start).expect("source start marker");
+        let rest = &source[start_idx..];
+        let end_idx = rest.find(end).expect("source end marker");
+        &rest[..end_idx]
+    }
 
     #[test]
     fn join_delta_append_only_fast_path_requires_append_only_inner_or_cross_join() {
@@ -11693,13 +11690,8 @@ fn incremental_refresh_iceberg_join_mv(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
     base_refs: &[IcebergTableRef],
-    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.rewrite.target;
-    let target_entry = &*ctx.target_entry;
-    let iceberg_catalog = &ctx.iceberg_catalog;
-    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
-    let current_database = ctx.rewrite.current_database.as_str();
     let mv_definition = &*ctx.rewrite.mv_definition;
     let pin = &*ctx.rewrite.pin;
     if base_refs.len() != 2 {
@@ -11787,29 +11779,978 @@ fn incremental_refresh_iceberg_join_mv(
             )?,
         );
     }
-    let base_query = parse_mv_select_query(&mv_definition.select_sql)?;
-    if should_use_join_delta_append_only_fast_path(
-        &base_query,
-        left_has_delete_changes,
-        right_has_delete_changes,
-    ) {
-        return execute_append_only_join_delta_branches(state, ctx, aliases, &base_query, branches);
+    match select_join_incremental_refresh_route(left_has_delete_changes, right_has_delete_changes) {
+        JoinIncrementalRefreshRoute::LogicalAppendOnly => {
+            execute_append_only_join_delta_branches_logical(state, ctx, branches)
+        }
+        JoinIncrementalRefreshRoute::LogicalCoalesce => {
+            execute_coalescing_join_delta_branches_logical(state, ctx, branches)
+        }
     }
-    execute_join_delta_branches(
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinIncrementalRefreshRoute {
+    LogicalAppendOnly,
+    LogicalCoalesce,
+}
+
+fn select_join_incremental_refresh_route(
+    left_has_delete_changes: bool,
+    right_has_delete_changes: bool,
+) -> JoinIncrementalRefreshRoute {
+    if left_has_delete_changes || right_has_delete_changes {
+        JoinIncrementalRefreshRoute::LogicalCoalesce
+    } else {
+        JoinIncrementalRefreshRoute::LogicalAppendOnly
+    }
+}
+
+struct JoinRefreshLogicalPlan {
+    plan: crate::sql::planner::plan::LogicalPlanNode,
+    factory: crate::sql::column_id::ColumnRefFactory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinFullRefreshRoute {
+    LogicalApplyKeyProject,
+}
+
+fn select_join_full_refresh_route() -> JoinFullRefreshRoute {
+    JoinFullRefreshRoute::LogicalApplyKeyProject
+}
+
+fn build_join_full_refresh_logical_plan(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+    left_ref: &IcebergTableRef,
+    right_ref: &IcebergTableRef,
+) -> Result<JoinRefreshLogicalPlan, String> {
+    let (plan, mut factory) = plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
+    let input = build_join_full_refresh_apply_input(
+        plan,
+        ctx.rewrite.schema_contract.as_ref(),
+        left_ref,
+        right_ref,
+    )?;
+    reserve_factory_for_logical_plan(&mut factory, &input.plan)?;
+    let join_apply_key_column_id = factory.create(
+        None,
+        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+        DataType::Utf8,
+        false,
+    );
+    let action_column_id = factory.create(
+        None,
+        crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+        DataType::Int8,
+        false,
+    );
+    let join_apply_key_column = join_full_refresh_output_column(
+        join_apply_key_column_id,
+        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        DataType::Utf8,
+        false,
+        true,
+    );
+    let action_column = join_full_refresh_output_column(
+        action_column_id,
+        crate::exec::change_op::CHANGE_OP_COLUMN,
+        DataType::Int8,
+        false,
+        true,
+    );
+    let descriptor = build_join_full_refresh_descriptor(
+        ctx,
+        left_ref,
+        right_ref,
+        input.payload_columns,
+        input.left_row_id_column,
+        input.right_row_id_column,
+        action_column.clone(),
+        join_apply_key_column.clone(),
+        input.join_key_pairs,
+    )?;
+    descriptor.validate().map_err(|e| {
+        format!(
+            "iceberg join MV {} full refresh descriptor is invalid: {e}",
+            target_fqn_string(&ctx.rewrite.target)
+        )
+    })?;
+    let left_uuid = ctx
+        .rewrite
+        .pin
+        .uuid(left_ref)
+        .ok_or_else(|| format!("missing uuid for {}", left_ref.fqn()))?
+        .to_string();
+    let right_uuid = ctx
+        .rewrite
+        .pin
+        .uuid(right_ref)
+        .ok_or_else(|| format!("missing uuid for {}", right_ref.fqn()))?
+        .to_string();
+    let plan =
+        crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_apply_key_project_with_constant_insert_action(
+            input.plan,
+            &descriptor,
+            &left_uuid,
+            &right_uuid,
+            join_apply_key_column_id.0,
+            action_column_id.0,
+        )
+        .map_err(|e| format!("build join full refresh apply-key logical plan: {e}"))?;
+    reserve_factory_for_logical_plan(&mut factory, &plan)?;
+    Ok(JoinRefreshLogicalPlan { plan, factory })
+}
+
+struct JoinFullRefreshApplyInput {
+    plan: crate::sql::planner::plan::LogicalPlanNode,
+    payload_columns: Vec<OutputColumn>,
+    left_row_id_column: OutputColumn,
+    right_row_id_column: OutputColumn,
+    join_key_pairs:
+        Vec<crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair>,
+}
+
+fn build_join_full_refresh_apply_input(
+    plan: crate::sql::planner::plan::LogicalPlanNode,
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    left_ref: &IcebergTableRef,
+    right_ref: &IcebergTableRef,
+) -> Result<JoinFullRefreshApplyInput, String> {
+    let crate::sql::planner::plan::LogicalPlanNode {
+        kind,
+        mut children,
+        required_output_columns: _,
+    } = plan;
+    let crate::sql::planner::plan::PlanNodeKind::Project(mut project) = kind else {
+        return Err("join full refresh logical route requires a root Project".to_string());
+    };
+    if children.len() != 1 {
+        return Err(format!(
+            "join full refresh root Project expected one input, got {}",
+            children.len()
+        ));
+    }
+    let input = children.remove(0);
+    let payload_columns = project
+        .items
+        .iter()
+        .map(|item| OutputColumn {
+            column_id: item.output_column_id,
+            name: item.output_name.clone(),
+            data_type: item.expr.data_type.clone(),
+            nullable: item.expr.nullable,
+            is_internal: false,
+        })
+        .collect::<Vec<_>>();
+    validate_join_full_refresh_payload_columns(schema_contract, &payload_columns)?;
+    let left_scan = find_join_full_refresh_base_scan(&input, left_ref, "left")?;
+    let right_scan = find_join_full_refresh_base_scan(&input, right_ref, "right")?;
+    let left_row_id_column = join_full_refresh_row_id_column(&left_scan, "left")?;
+    let right_row_id_column = join_full_refresh_row_id_column(&right_scan, "right")?;
+    let join_key_pairs = build_join_full_refresh_key_pairs(
+        schema_contract,
+        left_ref,
+        right_ref,
+        &left_scan,
+        &right_scan,
+    )?;
+    project
+        .items
+        .push(project_item_for_column(&left_row_id_column));
+    project
+        .items
+        .push(project_item_for_column(&right_row_id_column));
+    let plan = crate::sql::planner::plan::LogicalPlanNode::new(
+        crate::sql::planner::plan::PlanNodeKind::Project(project),
+        vec![input],
+        None,
+    );
+    Ok(JoinFullRefreshApplyInput {
+        plan,
+        payload_columns,
+        left_row_id_column,
+        right_row_id_column,
+        join_key_pairs,
+    })
+}
+
+fn validate_join_full_refresh_payload_columns(
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    payload_columns: &[OutputColumn],
+) -> Result<(), String> {
+    if payload_columns.len() != schema_contract.target.visible_columns.len() {
+        return Err(format!(
+            "join full refresh payload column count mismatch: plan has {}, target contract has {}",
+            payload_columns.len(),
+            schema_contract.target.visible_columns.len()
+        ));
+    }
+    for (idx, (actual, expected)) in payload_columns
+        .iter()
+        .zip(schema_contract.target.visible_columns.iter())
+        .enumerate()
+    {
+        if !actual.name.eq_ignore_ascii_case(&expected.output_name) {
+            return Err(format!(
+                "join full refresh payload column {idx} name mismatch: plan has `{}`, target contract has `{}`",
+                actual.name, expected.output_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct JoinFullRefreshBaseScan {
+    output_columns: Vec<OutputColumn>,
+    schema_fields: Vec<crate::sql::catalog::IcebergSchemaFieldDef>,
+}
+
+fn find_join_full_refresh_base_scan(
+    plan: &crate::sql::planner::plan::LogicalPlanNode,
+    base_ref: &IcebergTableRef,
+    role: &str,
+) -> Result<JoinFullRefreshBaseScan, String> {
+    let mut scans = Vec::new();
+    collect_join_full_refresh_base_scans(plan, base_ref, &mut scans);
+    match scans.as_slice() {
+        [scan] => Ok((*scan).clone()),
+        [] => Err(format!(
+            "join full refresh cannot find {role} base scan {} in logical plan",
+            base_ref.fqn()
+        )),
+        _ => Err(format!(
+            "join full refresh found multiple {role} base scans {} in logical plan",
+            base_ref.fqn()
+        )),
+    }
+}
+
+fn collect_join_full_refresh_base_scans(
+    plan: &crate::sql::planner::plan::LogicalPlanNode,
+    base_ref: &IcebergTableRef,
+    scans: &mut Vec<JoinFullRefreshBaseScan>,
+) {
+    if let crate::sql::planner::plan::PlanNodeKind::Scan(scan) = &plan.kind
+        && let Some(table) = iceberg_scan_table_info(&scan.table.source)
+        && table.catalog.eq_ignore_ascii_case(&base_ref.catalog)
+        && table.namespace.eq_ignore_ascii_case(&base_ref.namespace)
+        && table.table.eq_ignore_ascii_case(&base_ref.table)
+    {
+        scans.push(JoinFullRefreshBaseScan {
+            output_columns: scan.columns.clone(),
+            schema_fields: table.schema.fields.clone(),
+        });
+    }
+    for child in &plan.children {
+        collect_join_full_refresh_base_scans(child, base_ref, scans);
+    }
+}
+
+fn iceberg_scan_table_info(
+    source: &crate::sql::catalog::ScanSource,
+) -> Option<&crate::sql::catalog::IcebergTableInfo> {
+    match source {
+        crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergVersionTable { table, .. } => Some(table),
+        crate::sql::catalog::ScanSource::StarRocks { .. }
+        | crate::sql::catalog::ScanSource::IcebergMvTargetState(_)
+        | crate::sql::catalog::ScanSource::IcebergMvTargetLocator(_) => None,
+    }
+}
+
+fn join_full_refresh_row_id_column(
+    scan: &JoinFullRefreshBaseScan,
+    role: &str,
+) -> Result<OutputColumn, String> {
+    let column = find_unique_scan_output_column(
+        &scan.output_columns,
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        &format!("{role} row-id"),
+    )?;
+    if column.data_type != DataType::Int64 || column.nullable {
+        return Err(format!(
+            "join full refresh {role} row-id column has invalid shape: type={:?}, nullable={}",
+            column.data_type, column.nullable
+        ));
+    }
+    Ok(join_full_refresh_output_column(
+        column.column_id,
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        DataType::Int64,
+        false,
+        true,
+    ))
+}
+
+fn build_join_full_refresh_key_pairs(
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    left_ref: &IcebergTableRef,
+    right_ref: &IcebergTableRef,
+    left_scan: &JoinFullRefreshBaseScan,
+    right_scan: &JoinFullRefreshBaseScan,
+) -> Result<
+    Vec<crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair>,
+    String,
+> {
+    let join_contract = schema_contract
+        .join
+        .as_ref()
+        .ok_or_else(|| "join full refresh schema contract missing join lineage".to_string())?;
+    let left_base_contract = schema_base_contract_for_fqn(&schema_contract.bases, &left_ref.fqn())?;
+    let right_base_contract =
+        schema_base_contract_for_fqn(&schema_contract.bases, &right_ref.fqn())?;
+    join_contract
+        .predicates
+        .iter()
+        .map(|predicate| {
+            let (left_lineage, right_lineage) =
+                join_predicate_lineage_for_sides(predicate, &left_ref.fqn(), &right_ref.fqn())?;
+            let left_name =
+                current_scan_field_name(left_base_contract, left_scan, left_lineage, "left")?;
+            let right_name =
+                current_scan_field_name(right_base_contract, right_scan, right_lineage, "right")?;
+            Ok(
+                crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair {
+                    left_column: find_unique_scan_output_column(
+                        &left_scan.output_columns,
+                        &left_name,
+                        "left join key",
+                    )?,
+                    right_column: find_unique_scan_output_column(
+                        &right_scan.output_columns,
+                        &right_name,
+                        "right join key",
+                    )?,
+                },
+            )
+        })
+        .collect()
+}
+
+fn schema_base_contract_for_fqn<'a>(
+    bases: &'a [crate::meta::repository::mv_contract::BaseContract],
+    table_fqn: &str,
+) -> Result<&'a crate::meta::repository::mv_contract::BaseContract, String> {
+    let matches = bases
+        .iter()
+        .filter(|base| base.table_fqn.eq_ignore_ascii_case(table_fqn))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [base] => Ok(*base),
+        [] => Err(format!(
+            "join full refresh schema contract missing base {table_fqn}"
+        )),
+        _ => Err(format!(
+            "join full refresh schema contract has duplicate base {table_fqn}"
+        )),
+    }
+}
+
+fn join_predicate_lineage_for_sides<'a>(
+    predicate: &'a crate::meta::repository::mv_contract::JoinPredicateLineage,
+    left_base_fqn: &str,
+    right_base_fqn: &str,
+) -> Result<
+    (
+        &'a crate::meta::repository::mv_contract::QualifiedFieldLineage,
+        &'a crate::meta::repository::mv_contract::QualifiedFieldLineage,
+    ),
+    String,
+> {
+    if predicate.left.table_fqn.eq_ignore_ascii_case(left_base_fqn)
+        && predicate
+            .right
+            .table_fqn
+            .eq_ignore_ascii_case(right_base_fqn)
+    {
+        return Ok((&predicate.left, &predicate.right));
+    }
+    if predicate
+        .left
+        .table_fqn
+        .eq_ignore_ascii_case(right_base_fqn)
+        && predicate
+            .right
+            .table_fqn
+            .eq_ignore_ascii_case(left_base_fqn)
+    {
+        return Ok((&predicate.right, &predicate.left));
+    }
+    Err(format!(
+        "join full refresh predicate lineage does not align with logical plan bases: predicate left={}, right={}, actual left={}, right={}",
+        predicate.left.table_fqn, predicate.right.table_fqn, left_base_fqn, right_base_fqn
+    ))
+}
+
+fn current_scan_field_name(
+    base_contract: &crate::meta::repository::mv_contract::BaseContract,
+    scan: &JoinFullRefreshBaseScan,
+    lineage: &crate::meta::repository::mv_contract::QualifiedFieldLineage,
+    role: &str,
+) -> Result<String, String> {
+    if !lineage
+        .table_fqn
+        .eq_ignore_ascii_case(&base_contract.table_fqn)
+    {
+        return Err(format!(
+            "join full refresh {role} lineage table {} does not match base {}",
+            lineage.table_fqn, base_contract.table_fqn
+        ));
+    }
+    scan.schema_fields
+        .iter()
+        .find(|field| field.field_id == lineage.field_id)
+        .map(|field| field.name.clone())
+        .or_else(|| {
+            base_contract
+                .schema_at_create
+                .fields
+                .iter()
+                .find(|field| field.field_id == lineage.field_id)
+                .map(|field| field.name_at_create.clone())
+        })
+        .ok_or_else(|| {
+            format!(
+                "join full refresh {role} lineage references unknown field {} on base {}",
+                lineage.field_id, base_contract.table_fqn
+            )
+        })
+}
+
+fn find_unique_scan_output_column(
+    columns: &[OutputColumn],
+    name: &str,
+    role: &str,
+) -> Result<OutputColumn, String> {
+    let matches = columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(name))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [column] => Ok((*column).clone()),
+        [] => Err(format!(
+            "join full refresh cannot find {role} column {name}"
+        )),
+        _ => Err(format!(
+            "join full refresh found multiple {role} columns named {name}"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_join_full_refresh_descriptor(
+    ctx: &IcebergMvRefreshContext,
+    left_ref: &IcebergTableRef,
+    right_ref: &IcebergTableRef,
+    payload_columns: Vec<OutputColumn>,
+    left_row_id_column: OutputColumn,
+    right_row_id_column: OutputColumn,
+    action_column: OutputColumn,
+    join_apply_key_column: OutputColumn,
+    join_key_pairs: Vec<
+        crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair,
+    >,
+) -> Result<crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor, String>
+{
+    let mut output_mappings = payload_columns
+        .iter()
+        .map(|column| {
+            crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputMapping {
+                mv_output_column: column.clone(),
+                source:
+                    crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputSource::Payload(
+                        column.column_id,
+                    ),
+            }
+        })
+        .collect::<Vec<_>>();
+    output_mappings.push(
+        crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputMapping {
+            mv_output_column: join_apply_key_column.clone(),
+            source:
+                crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputSource::JoinApplyKey(
+                    join_apply_key_column.column_id,
+                ),
+        },
+    );
+    output_mappings.push(
+        crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputMapping {
+            mv_output_column: action_column.clone(),
+            source:
+                crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputSource::Action(
+                    action_column.column_id,
+                ),
+        },
+    );
+
+    Ok(
+        crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor {
+            mode: crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshMode::Full,
+            mv_identity:
+                crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshMvIdentity {
+                    catalog: ctx.rewrite.target.catalog.clone(),
+                    database: ctx.rewrite.target.namespace.clone(),
+                    name: ctx.rewrite.target.table.clone(),
+                },
+            left_base_fqn: left_ref.fqn(),
+            right_base_fqn: right_ref.fqn(),
+            left_row_id_column,
+            right_row_id_column,
+            action_column,
+            join_apply_key_column,
+            payload_columns,
+            join_key_pairs,
+            output_mappings,
+            branches: Vec::new(),
+            needs_target_locator: false,
+        },
+    )
+}
+
+fn project_item_for_column(column: &OutputColumn) -> ProjectItem {
+    ProjectItem {
+        expr: column_ref_expr(column),
+        output_name: column.name.clone(),
+        output_column_id: column.column_id,
+    }
+}
+
+fn column_ref_expr(column: &OutputColumn) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id: column.column_id,
+            qualifier: None,
+            column: column.name.clone(),
+        },
+        data_type: column.data_type.clone(),
+        nullable: column.nullable,
+    }
+}
+
+fn join_full_refresh_output_column(
+    column_id: ColumnId,
+    name: &str,
+    data_type: DataType,
+    nullable: bool,
+    is_internal: bool,
+) -> OutputColumn {
+    OutputColumn {
+        column_id,
+        name: name.to_string(),
+        data_type,
+        nullable,
+        is_internal,
+    }
+}
+
+fn build_join_incremental_refresh_logical_plan(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+    route: JoinIncrementalRefreshRoute,
+) -> Result<JoinRefreshLogicalPlan, String> {
+    let (plan, factory) = plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
+    let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
+    let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
+        crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
+            plan,
+            mv_ctx: Arc::clone(&ctx.rewrite),
+            disabled_rules: join_refresh_logical_execution_disabled_rules(),
+            deadline: None,
+            column_ref_factory: std::rc::Rc::clone(&factory_cell),
+        },
+    )
+    .map_err(|e| format!("join refresh logical rewrite: {e}"))?;
+    let descriptor = outcome
+        .annotation
+        .change_stream
+        .join_refresh
+        .clone()
+        .ok_or_else(|| {
+            format!(
+                "iceberg join MV {} incremental refresh rewrite did not produce join refresh descriptor",
+                target_fqn_string(&ctx.rewrite.target)
+            )
+        })?;
+    descriptor.validate().map_err(|e| {
+        format!(
+            "iceberg join MV {} incremental refresh descriptor is invalid: {e}",
+            target_fqn_string(&ctx.rewrite.target)
+        )
+    })?;
+    let mut factory = std::rc::Rc::try_unwrap(factory_cell)
+        .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
+        .into_inner();
+    let plan = match route {
+        JoinIncrementalRefreshRoute::LogicalAppendOnly => outcome.plan,
+        JoinIncrementalRefreshRoute::LogicalCoalesce => {
+            let net_column_id = factory
+                .create(
+                    None,
+                    "net".to_string(),
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                )
+                .0;
+            let locator_file_column_id = factory
+                .create(
+                    None,
+                    crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+                    arrow::datatypes::DataType::Utf8,
+                    true,
+                )
+                .0;
+            let locator_pos_column_id = factory
+                .create(
+                    None,
+                    crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                )
+                .0;
+            crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+                outcome.plan,
+                &descriptor,
+                &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_rewrite_context(&ctx.rewrite),
+                net_column_id,
+                locator_file_column_id,
+                locator_pos_column_id,
+            )
+            .map_err(|e| format!("build join refresh coalesce logical plan: {e}"))?
+        }
+    };
+    reserve_factory_for_logical_plan(&mut factory, &plan)?;
+    Ok(JoinRefreshLogicalPlan { plan, factory })
+}
+
+fn join_refresh_logical_execution_disabled_rules() -> Vec<String> {
+    let mut disabled_rules = crate::sql::optimizer::options::current_session_optimizer_settings()
+        .disabled_rules
+        .clone();
+    if !disabled_rules
+        .iter()
+        .any(|rule| rule == "InjectTargetLocatorJoin")
+    {
+        disabled_rules.push("InjectTargetLocatorJoin".to_string());
+    }
+    disabled_rules
+}
+
+fn reserve_factory_for_logical_plan(
+    factory: &mut crate::sql::column_id::ColumnRefFactory,
+    plan: &crate::sql::planner::plan::LogicalPlanNode,
+) -> Result<(), String> {
+    let max_id = max_logical_plan_output_column_id(plan)?;
+    factory.reserve_until(max_id.saturating_add(1));
+    Ok(())
+}
+
+fn max_logical_plan_output_column_id(
+    plan: &crate::sql::planner::plan::LogicalPlanNode,
+) -> Result<u32, String> {
+    let mut max_id = crate::sql::planner::plan_output_columns(plan)?
+        .iter()
+        .map(|column| column.column_id.0)
+        .max()
+        .unwrap_or(0);
+    for child in &plan.children {
+        max_id = max_id.max(max_logical_plan_output_column_id(child)?);
+    }
+    Ok(max_id)
+}
+
+fn execute_append_only_join_delta_branches_logical(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+    branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
+    execute_join_delta_branches_logical(
         state,
-        target,
-        target_entry,
-        iceberg_catalog,
-        expected_main_snapshot_id,
-        current_database,
-        mv_definition,
-        aliases,
-        pin,
-        &ctx.affected_partitions,
+        ctx,
+        JoinIncrementalRefreshRoute::LogicalAppendOnly,
         branches,
     )
 }
 
+fn execute_coalescing_join_delta_branches_logical(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+    branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
+    execute_join_delta_branches_logical(
+        state,
+        ctx,
+        JoinIncrementalRefreshRoute::LogicalCoalesce,
+        branches,
+    )
+}
+
+fn execute_join_delta_branches_logical(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+    route: JoinIncrementalRefreshRoute,
+    branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
+    if branches.is_empty() {
+        return Err("join delta logical execution requires at least one branch"
+            .to_string()
+            .into());
+    }
+    let logical_plan = build_join_incremental_refresh_logical_plan(state, ctx, route)?;
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
+    let pin = &*ctx.rewrite.pin;
+    let snapshots = pin.to_snapshot_map();
+    let table_uuids = pin.to_table_uuid_map();
+    let ident = iceberg_mv_table_ident(target)?;
+    let staging_branch = format!(
+        "__nova_mv_refresh_{}_{}",
+        mv_definition.mv_id,
+        uuid::Uuid::new_v4().simple()
+    );
+    let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+        state,
+        target,
+        mv_definition.mv_id,
+        expected_main_snapshot_id,
+        snapshots.clone(),
+        &staging_branch,
+    )?;
+    let marker = match load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id) {
+        Ok(marker) => marker.to_summary_properties(),
+        Err(err) => {
+            return Err(handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+    };
+    if let Err(err) = ensure_iceberg_mv_staging_branch(
+        iceberg_catalog,
+        target,
+        &staging_branch,
+        expected_main_snapshot_id,
+    ) {
+        abort_iceberg_mv_refresh(state, refresh_id)?;
+        return Err(err.into());
+    }
+    let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
+        Ok(table) => table,
+        Err(err) => {
+            return Err(handle_iceberg_mv_definite_pre_publish_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+    };
+    let op_kind = match route {
+        JoinIncrementalRefreshRoute::LogicalAppendOnly => CommitOpKind::FastAppend,
+        JoinIncrementalRefreshRoute::LogicalCoalesce => CommitOpKind::RowDeltaDv,
+    };
+    let collector =
+        new_iceberg_mv_commit_collector(&target_table, &ident, &staging_branch, op_kind);
+    let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
+        target_table: target_table.clone(),
+        collector: Arc::clone(&collector),
+    };
+    let merge_sink =
+        crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
+    {
+        let connectors_snapshot = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
+        let catalogs_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        let codegen_catalog = crate::engine::catalog::InMemoryCatalog::default();
+        if let Err(err) = crate::engine::execute_logical_plan_with_options(
+            logical_plan.plan,
+            logical_plan.factory,
+            &codegen_catalog,
+            &connectors_snapshot,
+            current_database,
+            state.exchange_port,
+            None,
+            Some(Box::new(merge_sink)),
+            Some(&*catalogs_guard),
+            Some(ctx),
+            None,
+        ) {
+            drop(catalogs_guard);
+            return Err(handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+        drop(catalogs_guard);
+    }
+
+    let added_rows = collector.injected_data_record_count();
+    let deleted_rows = collector.injected_delete_record_count();
+    let new_total_rows = match route {
+        JoinIncrementalRefreshRoute::LogicalAppendOnly if added_rows == 0 => {
+            tracing::info!(
+                snapshots = ?snapshots,
+                "iceberg join mv {}.{}.{}: append-only logical refresh produced 0 effective rows; \
+                 advancing lineage without new iceberg snapshot",
+                target.catalog,
+                target.namespace,
+                target.table
+            );
+            drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
+            abort_iceberg_mv_refresh(state, refresh_id)?;
+            let target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
+            let metadata_refresh_id =
+                begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
+            finalize_iceberg_mv_refresh_with_partition_state(
+                state,
+                metadata_refresh_id,
+                mv_definition.last_refresh_rows.unwrap_or(0),
+                snapshots,
+                table_uuids,
+                target_snapshot_id,
+                IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+            )?;
+            return Ok(StatementResult::Ok);
+        }
+        JoinIncrementalRefreshRoute::LogicalAppendOnly => mv_definition
+            .last_refresh_rows
+            .unwrap_or(0)
+            .checked_add(added_rows)
+            .ok_or_else(|| {
+                handle_iceberg_mv_commit_error(
+                    state,
+                    target,
+                    target_entry,
+                    &staging_branch,
+                    refresh_id,
+                    format!(
+                        "iceberg join MV append-only row-count overflow: current={:?}, inserts={added_rows}",
+                        mv_definition.last_refresh_rows
+                    ),
+                )
+            })?,
+        JoinIncrementalRefreshRoute::LogicalCoalesce if added_rows == 0 && deleted_rows == 0 => {
+            drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
+            abort_iceberg_mv_refresh(state, refresh_id)?;
+            return Ok(
+                finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
+                    state,
+                    target,
+                    mv_definition,
+                    snapshots,
+                    table_uuids,
+                    IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+                )?,
+            );
+        }
+        JoinIncrementalRefreshRoute::LogicalCoalesce => mv_definition
+            .last_refresh_rows
+            .unwrap_or(0)
+            .checked_add(added_rows)
+            .and_then(|rows| rows.checked_sub(deleted_rows))
+            .ok_or_else(|| {
+                handle_iceberg_mv_commit_error(
+                    state,
+                    target,
+                    target_entry,
+                    &staging_branch,
+                    refresh_id,
+                    format!(
+                        "iceberg join MV row-count delta overflow: current={:?}, inserts={}, deletes={}",
+                        mv_definition.last_refresh_rows, added_rows, deleted_rows
+                    ),
+                )
+            })?,
+    };
+
+    let commit_outcome = match data_block_on(commit_iceberg_mv_with_populated_collector(
+        &target_table,
+        iceberg_catalog,
+        target_entry,
+        &ident,
+        Arc::clone(&collector),
+        &staging_branch,
+        marker,
+    )) {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(err)) => {
+            return Err(handle_iceberg_mv_commit_service_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+        Err(err) => {
+            return Err(handle_iceberg_mv_definite_pre_publish_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+    };
+
+    record_iceberg_mv_staging_commit(
+        state,
+        refresh_id,
+        commit_outcome.new_snapshot_id,
+        new_total_rows,
+        table_uuids.clone(),
+    )?;
+    let published_snapshot_id = publish_iceberg_mv_refresh(
+        state,
+        target,
+        target_entry,
+        &staging_branch,
+        expected_main_snapshot_id,
+        commit_outcome.new_snapshot_id,
+        refresh_id,
+        mv_definition.mv_id,
+    )?;
+    record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
+    drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
+    finalize_iceberg_mv_refresh_with_partition_state(
+        state,
+        refresh_id,
+        new_total_rows,
+        snapshots,
+        table_uuids,
+        published_snapshot_id,
+        IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+    )?;
+    Ok(StatementResult::Ok)
+}
+
+#[cfg(test)]
 fn should_use_join_delta_append_only_fast_path(
     query: &sqlparser::ast::Query,
     left_has_delete_changes: bool,
@@ -11820,6 +12761,7 @@ fn should_use_join_delta_append_only_fast_path(
         && crate::engine::mv::iceberg_join_branch::is_append_only_join_delta_eligible(query)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn execute_append_only_join_delta_branches(
     state: &Arc<StandaloneState>,
@@ -12090,6 +13032,7 @@ fn execute_append_only_join_delta_branches(
     Ok(StatementResult::Ok)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn execute_join_delta_branches(
     state: &Arc<StandaloneState>,
@@ -13472,6 +14415,90 @@ mod tests {
         assert_eq!(rebound[0].base_table_fqn, "ice.db.fact");
         assert_eq!(rebound[0].name_at_create, "dim_id");
         assert_eq!(rebound[0].current_name, "new_dim_id");
+    }
+
+    #[test]
+    fn join_base_refs_for_schema_contract_uses_join_lineage_order() {
+        let left = IcebergTableRef {
+            catalog: "ice".to_string(),
+            namespace: "sales".to_string(),
+            table: "fact".to_string(),
+        };
+        let right = IcebergTableRef {
+            catalog: "ice".to_string(),
+            namespace: "sales".to_string(),
+            table: "dim".to_string(),
+        };
+        let base_refs = vec![right.clone(), left.clone()];
+        let contract = test_join_projection_schema_contract(&left.fqn(), &right.fqn());
+
+        let (actual_left, actual_right) = join_base_refs_for_schema_contract(&contract, &base_refs)
+            .expect("schema-contract join base refs");
+
+        assert_eq!(actual_left.fqn(), left.fqn());
+        assert_eq!(actual_right.fqn(), right.fqn());
+    }
+
+    fn test_join_projection_schema_contract(
+        left_fqn: &str,
+        right_fqn: &str,
+    ) -> crate::meta::repository::mv_contract::MvSchemaContract {
+        use crate::meta::repository::mv_contract::{
+            ApplyKeySource, HiddenApplyKeyContract, JoinContract, JoinContractKind,
+            JoinPredicateLineage, MvSchemaContract, OutputContract, QualifiedFieldLineage,
+            TargetContract,
+        };
+
+        MvSchemaContract {
+            contract_version: 2,
+            base: test_base_contract(left_fqn),
+            bases: vec![test_base_contract(left_fqn), test_base_contract(right_fqn)],
+            output: OutputContract {
+                columns: Vec::new(),
+                filter: None,
+            },
+            join: Some(JoinContract {
+                kind: JoinContractKind::InnerEquiJoin,
+                predicates: vec![JoinPredicateLineage {
+                    left: QualifiedFieldLineage {
+                        table_fqn: left_fqn.to_string(),
+                        qualifier_at_create: "l".to_string(),
+                        field_id: 1,
+                    },
+                    right: QualifiedFieldLineage {
+                        table_fqn: right_fqn.to_string(),
+                        qualifier_at_create: "r".to_string(),
+                        field_id: 1,
+                    },
+                }],
+            }),
+            aggregate: None,
+            branch: None,
+            target: TargetContract {
+                table_fqn: "ice.sales.mv".to_string(),
+                table_uuid: "target-uuid".to_string(),
+                schema_id_at_create: 1,
+                visible_columns: Vec::new(),
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                    target_field_id: 1,
+                    source: ApplyKeySource::JoinRowKey,
+                },
+                partition: None,
+            },
+        }
+    }
+
+    fn test_base_contract(table_fqn: &str) -> crate::meta::repository::mv_contract::BaseContract {
+        crate::meta::repository::mv_contract::BaseContract {
+            table_fqn: table_fqn.to_string(),
+            table_uuid: format!("{table_fqn}-uuid"),
+            alias_at_create: None,
+            schema_id_at_create: 1,
+            schema_at_create: crate::meta::repository::mv_contract::BaseSchemaSnapshot {
+                fields: Vec::new(),
+            },
+        }
     }
 
     fn parse_select_query(sql: &str) -> sqlparser::ast::Query {
@@ -18714,6 +19741,11 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn join_full_refresh_uses_logical_apply_key_project_route() {
+        assert!(join_full_refresh_uses_logical_plan());
     }
 
     #[test]

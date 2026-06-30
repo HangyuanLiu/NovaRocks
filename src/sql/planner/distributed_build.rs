@@ -183,10 +183,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                 let child = self.visit(child_plan)?;
                 let node_id = self.alloc_node();
                 let tuple_id = self.alloc_tuple();
-                let mut items = materialize_project_items(self.scalars, &op.items);
-                for (item, output_column) in items.iter_mut().zip(node.output_columns.iter()) {
-                    item.output_column_id = output_column.column_id;
-                }
+                let items = materialize_project_items(self.scalars, &op.items);
                 Ok(DistributedPlanNode {
                     node_id,
                     fragment_id,

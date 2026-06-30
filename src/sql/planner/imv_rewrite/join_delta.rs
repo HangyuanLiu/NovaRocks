@@ -1,6 +1,15 @@
+use std::collections::HashMap;
+
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem};
+use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN;
+use crate::meta::repository::mv_contract::{
+    BaseContract, ExpressionKind, JoinContractKind, MvSchemaContract, QualifiedFieldLineage,
+};
+use crate::sql::analysis::{
+    ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+};
+use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -10,10 +19,20 @@ use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal}
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
-use crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column;
+use crate::sql::planner::imv_rewrite::column_alloc::{
+    allocate_imv_column, allocate_imv_output_column,
+};
+use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
+    JoinRefreshBranchDescriptor, JoinRefreshBranchSide, JoinRefreshDescriptor,
+    JoinRefreshJoinKeyPair, JoinRefreshMode, JoinRefreshMvIdentity, JoinRefreshOutputMapping,
+    JoinRefreshOutputSource,
+};
 use crate::sql::planner::imv_rewrite::marker::ImvVersionRef;
+use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::sql::planner::imv_rewrite::target_locator::is_target_locator_join;
-use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
+use crate::sql::planner::imv_rewrite::{
+    PlanRewriteResult, bridge_apply_result_mut, opt_expr_to_plan,
+};
 use crate::sql::planner::plan::{
     LogicalImvDeltaNode, LogicalImvVersionNode, LogicalJoinNode, LogicalPlanNode,
     LogicalProjectNode, LogicalUnionNode, PlanNodeKind,
@@ -50,7 +69,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        bridge_apply_result(expr, ctx, |plan, ctx| {
+        bridge_apply_result_mut(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
             } = plan;
@@ -129,6 +148,876 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
     }
 }
 
+pub(crate) struct InjectJoinApplyKeyRule;
+
+impl LogicalRewriteRule for InjectJoinApplyKeyRule {
+    fn name(&self) -> &'static str {
+        "InjectJoinApplyKey"
+    }
+
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::SemanticRewrite
+    }
+
+    fn traversal(&self) -> RewriteTraversal {
+        RewriteTraversal::BottomUp
+    }
+
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
+        is_join_refresh_union_without_apply_key(&plan)
+            || project_needs_join_refresh_internal_outputs(&plan)
+    }
+
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        bridge_apply_result_mut(expr, ctx, |plan, ctx| {
+            if project_needs_join_refresh_internal_outputs(&plan) {
+                return Ok(PlanRewriteResult::Changed(
+                    propagate_join_refresh_internal_outputs_through_project(plan)?,
+                ));
+            }
+            Ok(PlanRewriteResult::Changed(inject_join_apply_key(
+                plan, ctx,
+            )?))
+        })
+    }
+}
+
+pub(crate) struct RecordJoinRefreshDescriptorRule;
+
+impl LogicalRewriteRule for RecordJoinRefreshDescriptorRule {
+    fn name(&self) -> &'static str {
+        "RecordJoinRefreshDescriptor"
+    }
+
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::SemanticRewrite
+    }
+
+    fn traversal(&self) -> RewriteTraversal {
+        RewriteTraversal::BottomUp
+    }
+
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        if ctx
+            .extension::<ImvExtension>()
+            .is_some_and(|ext| ext.annotation.change_stream.join_refresh.is_some())
+        {
+            return false;
+        }
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
+        is_join_refresh_union_with_apply_key(&plan)
+    }
+
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        bridge_apply_result_mut(expr, ctx, |plan, ctx| {
+            record_join_refresh_descriptor(ctx, &plan)?;
+            Ok(PlanRewriteResult::Unchanged)
+        })
+    }
+}
+
+#[derive(Clone)]
+struct PlanBaseIdentity {
+    fqn: String,
+    table_uuid: String,
+    source_kind: BranchSourceKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BranchSourceKind {
+    Delta,
+    Version,
+}
+
+#[derive(Clone)]
+struct JoinDeltaBranchEvidence {
+    side: JoinRefreshBranchSide,
+    left_base: PlanBaseIdentity,
+    right_base: PlanBaseIdentity,
+    left_output_columns: Vec<OutputColumn>,
+    right_output_columns: Vec<OutputColumn>,
+    left_row_id_column: OutputColumn,
+    right_row_id_column: OutputColumn,
+}
+
+#[derive(Clone)]
+struct JoinDeltaUnionEvidence {
+    left_base_fqn: String,
+    right_base_fqn: String,
+    left_output_columns: Vec<OutputColumn>,
+    right_output_columns: Vec<OutputColumn>,
+    left_row_id_column: OutputColumn,
+    right_row_id_column: OutputColumn,
+    action_column: OutputColumn,
+    join_apply_key_column: OutputColumn,
+    branches: Vec<JoinRefreshBranchDescriptor>,
+}
+
+fn is_join_refresh_union_without_apply_key(plan: &LogicalPlanNode) -> bool {
+    crate::sql::planner::imv_rewrite::join_delta_shape::is_supported_join_delta_union(plan)
+        && matches!(
+            &plan.kind,
+            PlanNodeKind::Union(union)
+                if !union
+                    .output_columns
+                    .iter()
+                    .any(|column| column.name.eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN))
+        )
+}
+
+fn is_join_refresh_union_with_apply_key(plan: &LogicalPlanNode) -> bool {
+    crate::sql::planner::imv_rewrite::join_delta_shape::is_supported_join_delta_union(plan)
+        && matches!(
+            &plan.kind,
+            PlanNodeKind::Union(union)
+                if union
+                    .output_columns
+                    .iter()
+                    .any(|column| column.name.eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN))
+        )
+}
+
+fn inject_join_apply_key(
+    mut plan: LogicalPlanNode,
+    ctx: &mut RewriteContext,
+) -> Result<LogicalPlanNode, String> {
+    let ext = ctx
+        .extension::<ImvExtension>()
+        .ok_or_else(|| "InjectJoinApplyKey requires ImvExtension".to_string())?;
+    let branch_evidence = collect_join_delta_branch_evidence(&plan)?;
+    validate_join_descriptor_contract(ext, &branch_evidence)?;
+    let join_apply_key_column = allocate_imv_output_column(
+        ctx,
+        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        DataType::Utf8,
+        false,
+        true,
+    )?;
+
+    let PlanNodeKind::Union(union) = &mut plan.kind else {
+        return Ok(plan);
+    };
+    for (branch, evidence) in plan.children.iter_mut().zip(branch_evidence.iter()) {
+        inject_join_apply_key_into_branch(branch, evidence, &join_apply_key_column)?;
+    }
+    union.output_columns.push(join_apply_key_column);
+    Ok(plan)
+}
+
+fn project_needs_join_refresh_internal_outputs(plan: &LogicalPlanNode) -> bool {
+    let PlanNodeKind::Project(project) = &plan.kind else {
+        return false;
+    };
+    let required = join_refresh_internal_output_columns(plan.unary_input());
+    !required.is_empty()
+        && required.iter().any(|required| {
+            !project
+                .items
+                .iter()
+                .any(|item| item.output_column_id == required.column_id)
+        })
+}
+
+fn propagate_join_refresh_internal_outputs_through_project(
+    mut plan: LogicalPlanNode,
+) -> Result<LogicalPlanNode, String> {
+    let required = join_refresh_internal_output_columns(plan.unary_input());
+    if required.is_empty() {
+        return Err(
+            "join refresh internal output propagation expected child output columns".to_string(),
+        );
+    }
+    let PlanNodeKind::Project(project) = &mut plan.kind else {
+        return Ok(plan);
+    };
+    for column in required {
+        if project
+            .items
+            .iter()
+            .any(|item| item.output_column_id == column.column_id)
+        {
+            continue;
+        }
+        project.items.push(ProjectItem {
+            expr: column_ref_expr(&column),
+            output_name: column.name.clone(),
+            output_column_id: column.column_id,
+        });
+    }
+    Ok(plan)
+}
+
+fn join_refresh_internal_output_columns(plan: &LogicalPlanNode) -> Vec<OutputColumn> {
+    let columns = plan_output_columns(plan).unwrap_or_default();
+    let join_apply_key = columns.iter().find(|column| {
+        column
+            .name
+            .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+    });
+    let action = columns
+        .iter()
+        .find(|column| ImvActionColumn::matches(column));
+    match (join_apply_key, action) {
+        (Some(join_apply_key), Some(action)) => vec![join_apply_key.clone(), action.clone()],
+        (Some(join_apply_key), None) => vec![join_apply_key.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn inject_join_apply_key_into_branch(
+    branch: &mut LogicalPlanNode,
+    evidence: &JoinDeltaBranchEvidence,
+    join_apply_key_column: &OutputColumn,
+) -> Result<(), String> {
+    let PlanNodeKind::Project(project) = &mut branch.kind else {
+        return Err("join apply-key injection expected normalized Project branch".to_string());
+    };
+    if project.items.iter().any(|item| {
+        item.output_name
+            .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+    }) {
+        return Ok(());
+    }
+    project.items.push(ProjectItem {
+        expr: join_row_key_expr(evidence),
+        output_name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+        output_column_id: join_apply_key_column.column_id,
+    });
+    Ok(())
+}
+
+fn join_row_key_expr(evidence: &JoinDeltaBranchEvidence) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::FunctionCall {
+            name: "join_row_key".to_string(),
+            args: vec![
+                string_literal(&evidence.left_base.table_uuid),
+                column_ref_expr(&evidence.left_row_id_column),
+                string_literal(&evidence.right_base.table_uuid),
+                column_ref_expr(&evidence.right_row_id_column),
+            ],
+            distinct: false,
+        },
+        data_type: DataType::Utf8,
+        nullable: false,
+    }
+}
+
+fn string_literal(value: &str) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
+        data_type: DataType::Utf8,
+        nullable: false,
+    }
+}
+
+fn column_ref_expr(column: &OutputColumn) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id: column.column_id,
+            qualifier: None,
+            column: column.name.clone(),
+        },
+        data_type: column.data_type.clone(),
+        nullable: column.nullable,
+    }
+}
+
+fn record_join_refresh_descriptor(
+    ctx: &mut RewriteContext,
+    union_plan: &LogicalPlanNode,
+) -> Result<(), String> {
+    let Some(ext) = ctx.extension::<ImvExtension>().cloned() else {
+        return Ok(());
+    };
+    if ext.annotation.change_stream.join_refresh.is_some() {
+        return Ok(());
+    }
+
+    let evidence = collect_join_delta_union_evidence(union_plan)?;
+    let descriptor = build_join_refresh_descriptor(&ext, evidence)?;
+    descriptor.validate()?;
+
+    let mut annotation = ext.annotation.clone();
+    annotation.change_stream.join_refresh = Some(descriptor);
+    ctx.set_extension::<ImvExtension>(ImvExtension { annotation, ..ext });
+    Ok(())
+}
+
+fn collect_join_delta_union_evidence(
+    union_plan: &LogicalPlanNode,
+) -> Result<JoinDeltaUnionEvidence, String> {
+    let PlanNodeKind::Union(union) = &union_plan.kind else {
+        return Err("join refresh descriptor expected join delta UnionAll".to_string());
+    };
+    let branch_evidence = collect_join_delta_branch_evidence(union_plan)?;
+    let left_delta_branch = branch_evidence
+        .iter()
+        .find(|branch| branch.side == JoinRefreshBranchSide::LeftDeltaRightSnapshot)
+        .ok_or_else(|| {
+            "join refresh descriptor requires left-delta/right-snapshot branch".to_string()
+        })?;
+    let action_column =
+        find_unique_internal_column(&union.output_columns, ImvActionColumn::NAME, "action")?;
+    let join_apply_key_column = find_unique_internal_column(
+        &union.output_columns,
+        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        "join apply-key",
+    )?;
+    let branches = branch_evidence
+        .iter()
+        .map(|branch| JoinRefreshBranchDescriptor {
+            side: branch.side,
+            action_column_id: action_column.column_id,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(JoinDeltaUnionEvidence {
+        left_base_fqn: left_delta_branch.left_base.fqn.clone(),
+        right_base_fqn: left_delta_branch.right_base.fqn.clone(),
+        left_output_columns: left_delta_branch.left_output_columns.clone(),
+        right_output_columns: left_delta_branch.right_output_columns.clone(),
+        left_row_id_column: left_delta_branch.left_row_id_column.clone(),
+        right_row_id_column: left_delta_branch.right_row_id_column.clone(),
+        action_column,
+        join_apply_key_column,
+        branches,
+    })
+}
+
+fn collect_join_delta_branch_evidence(
+    union_plan: &LogicalPlanNode,
+) -> Result<Vec<JoinDeltaBranchEvidence>, String> {
+    let PlanNodeKind::Union(union) = &union_plan.kind else {
+        return Err("join refresh descriptor expected join delta UnionAll".to_string());
+    };
+    if !union.all || union_plan.children.len() != 2 {
+        return Err(
+            "join refresh descriptor requires two UNION ALL join delta branches".to_string(),
+        );
+    }
+    let branches = union_plan
+        .children
+        .iter()
+        .map(join_delta_branch_evidence)
+        .collect::<Result<Vec<_>, String>>()?;
+    validate_branch_pair(&branches)?;
+    Ok(branches)
+}
+
+fn join_delta_branch_evidence(branch: &LogicalPlanNode) -> Result<JoinDeltaBranchEvidence, String> {
+    let PlanNodeKind::Project(_) = &branch.kind else {
+        return Err("join refresh descriptor expected normalized Project branch".to_string());
+    };
+    let join_plan = branch.unary_input();
+    let PlanNodeKind::Join(join) = &join_plan.kind else {
+        return Err("join refresh descriptor expected Project(Join) branch".to_string());
+    };
+    if !join_delta_kind_supported(join.join_type) {
+        return Err(format!(
+            "join refresh descriptor supports inner/cross join delta branches only, got {:?}",
+            join.join_type
+        ));
+    }
+
+    let left_base = unique_branch_base_identity(join_plan.left(), "left")?;
+    let right_base = unique_branch_base_identity(join_plan.right(), "right")?;
+    let side = match (left_base.source_kind, right_base.source_kind) {
+        (BranchSourceKind::Delta, BranchSourceKind::Version) => {
+            JoinRefreshBranchSide::LeftDeltaRightSnapshot
+        }
+        (BranchSourceKind::Version, BranchSourceKind::Delta) => {
+            JoinRefreshBranchSide::LeftSnapshotRightDelta
+        }
+        _ => {
+            return Err(
+                "join refresh descriptor requires each branch to contain one delta side and one snapshot side"
+                    .to_string(),
+            );
+        }
+    };
+    let left_output_columns = plan_output_columns(join_plan.left())?;
+    let right_output_columns = plan_output_columns(join_plan.right())?;
+    let left_row_id_column =
+        find_unique_internal_column(&left_output_columns, ImvRowIdColumn::NAME, "left row-id")?;
+    let right_row_id_column =
+        find_unique_internal_column(&right_output_columns, ImvRowIdColumn::NAME, "right row-id")?;
+
+    Ok(JoinDeltaBranchEvidence {
+        side,
+        left_base,
+        right_base,
+        left_output_columns,
+        right_output_columns,
+        left_row_id_column,
+        right_row_id_column,
+    })
+}
+
+fn validate_branch_pair(branches: &[JoinDeltaBranchEvidence]) -> Result<(), String> {
+    let [first, second] = branches else {
+        return Err("join refresh descriptor requires exactly two join delta branches".to_string());
+    };
+    if !first
+        .left_base
+        .fqn
+        .eq_ignore_ascii_case(&second.left_base.fqn)
+        || !first
+            .right_base
+            .fqn
+            .eq_ignore_ascii_case(&second.right_base.fqn)
+    {
+        return Err(format!(
+            "join refresh descriptor branch bases do not align: first left={}, right={}; second left={}, right={}",
+            first.left_base.fqn, first.right_base.fqn, second.left_base.fqn, second.right_base.fqn
+        ));
+    }
+    if first.side == second.side {
+        return Err(
+            "join refresh descriptor requires one left-delta branch and one right-delta branch"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn unique_branch_base_identity(
+    plan: &LogicalPlanNode,
+    role: &str,
+) -> Result<PlanBaseIdentity, String> {
+    let mut bases = Vec::new();
+    collect_branch_base_identities(plan, &mut bases)?;
+    match bases.as_slice() {
+        [base] => Ok(base.clone()),
+        [] => Err(format!(
+            "join refresh descriptor cannot derive {role} branch base from plan"
+        )),
+        _ => Err(format!(
+            "join refresh descriptor requires one {role} branch base, found {}",
+            bases.len()
+        )),
+    }
+}
+
+fn collect_branch_base_identities(
+    plan: &LogicalPlanNode,
+    bases: &mut Vec<PlanBaseIdentity>,
+) -> Result<(), String> {
+    match &plan.kind {
+        PlanNodeKind::Scan(scan) => match &scan.table.source {
+            ScanSource::IcebergDeltaTable { table, .. } => {
+                bases.push(plan_base_identity(table, BranchSourceKind::Delta)?);
+            }
+            ScanSource::IcebergVersionTable { table, .. } => {
+                bases.push(plan_base_identity(table, BranchSourceKind::Version)?);
+            }
+            _ => {}
+        },
+        _ => {
+            for child in &plan.children {
+                collect_branch_base_identities(child, bases)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_base_identity(
+    table: &crate::sql::catalog::IcebergTableInfo,
+    source_kind: BranchSourceKind,
+) -> Result<PlanBaseIdentity, String> {
+    let table_uuid = table.table_uuid.clone().ok_or_else(|| {
+        format!(
+            "join refresh descriptor requires table uuid for {}.{}.{}",
+            table.catalog, table.namespace, table.table
+        )
+    })?;
+    Ok(PlanBaseIdentity {
+        fqn: format!("{}.{}.{}", table.catalog, table.namespace, table.table),
+        table_uuid,
+        source_kind,
+    })
+}
+
+fn validate_join_descriptor_contract(
+    ext: &ImvExtension,
+    branch_evidence: &[JoinDeltaBranchEvidence],
+) -> Result<(), String> {
+    let mv_ctx = ext.mv_ctx.as_ref();
+    let Some(first) = branch_evidence.first() else {
+        return Err("join refresh descriptor requires join delta branch evidence".to_string());
+    };
+    let join_contract = mv_ctx.schema_contract.join.as_ref().ok_or_else(|| {
+        "join refresh descriptor requires schema_contract.join lineage".to_string()
+    })?;
+    if join_contract.kind != JoinContractKind::InnerEquiJoin {
+        return Err(format!(
+            "join refresh descriptor supports inner equi-join contract only, got {:?}",
+            join_contract.kind
+        ));
+    }
+    if join_contract.predicates.is_empty() {
+        return Err(
+            "join refresh descriptor requires at least one join predicate lineage".to_string(),
+        );
+    }
+    validate_actual_bases_in_context(ext, &first.left_base.fqn, &first.right_base.fqn)?;
+    let left_base_contract =
+        base_contract_for_fqn(&mv_ctx.schema_contract.bases, &first.left_base.fqn)?;
+    let right_base_contract =
+        base_contract_for_fqn(&mv_ctx.schema_contract.bases, &first.right_base.fqn)?;
+    build_join_key_pairs(
+        join_contract,
+        left_base_contract,
+        right_base_contract,
+        &first.left_base.fqn,
+        &first.right_base.fqn,
+        &first.left_output_columns,
+        &first.right_output_columns,
+    )?;
+    Ok(())
+}
+
+fn validate_actual_bases_in_context(
+    ext: &ImvExtension,
+    left_base_fqn: &str,
+    right_base_fqn: &str,
+) -> Result<(), String> {
+    let base_refs = &ext.mv_ctx.base_refs;
+    if base_refs.len() != 2 {
+        return Err(format!(
+            "join refresh descriptor requires exactly two base refs, got {}",
+            base_refs.len()
+        ));
+    }
+    for fqn in [left_base_fqn, right_base_fqn] {
+        if !base_refs
+            .iter()
+            .any(|base| base.fqn().eq_ignore_ascii_case(fqn))
+        {
+            return Err(format!(
+                "join refresh descriptor actual plan base {fqn} is not in refresh context"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_join_refresh_descriptor(
+    ext: &ImvExtension,
+    evidence: JoinDeltaUnionEvidence,
+) -> Result<JoinRefreshDescriptor, String> {
+    let mv_ctx = ext.mv_ctx.as_ref();
+    let join_contract = mv_ctx.schema_contract.join.as_ref().ok_or_else(|| {
+        "join refresh descriptor requires schema_contract.join lineage".to_string()
+    })?;
+    if join_contract.kind != JoinContractKind::InnerEquiJoin {
+        return Err(format!(
+            "join refresh descriptor supports inner equi-join contract only, got {:?}",
+            join_contract.kind
+        ));
+    }
+    if join_contract.predicates.is_empty() {
+        return Err(
+            "join refresh descriptor requires at least one join predicate lineage".to_string(),
+        );
+    }
+    validate_actual_bases_in_context(ext, &evidence.left_base_fqn, &evidence.right_base_fqn)?;
+    let left_base_contract =
+        base_contract_for_fqn(&mv_ctx.schema_contract.bases, &evidence.left_base_fqn)?;
+    let right_base_contract =
+        base_contract_for_fqn(&mv_ctx.schema_contract.bases, &evidence.right_base_fqn)?;
+    let join_key_pairs = build_join_key_pairs(
+        join_contract,
+        left_base_contract,
+        right_base_contract,
+        &evidence.left_base_fqn,
+        &evidence.right_base_fqn,
+        &evidence.left_output_columns,
+        &evidence.right_output_columns,
+    )?;
+    let payload_columns = build_join_payload_columns(
+        &mv_ctx.schema_contract,
+        left_base_contract,
+        right_base_contract,
+        &evidence.left_base_fqn,
+        &evidence.right_base_fqn,
+        &evidence.left_output_columns,
+        &evidence.right_output_columns,
+    )?;
+    let output_mappings = join_refresh_output_mappings(
+        &payload_columns,
+        &evidence.action_column,
+        &evidence.join_apply_key_column,
+    );
+
+    Ok(JoinRefreshDescriptor {
+        mode: JoinRefreshMode::Coalesce,
+        mv_identity: JoinRefreshMvIdentity {
+            catalog: mv_ctx.target.catalog.clone(),
+            database: mv_ctx.target.namespace.clone(),
+            name: mv_ctx.target.table.clone(),
+        },
+        left_base_fqn: evidence.left_base_fqn,
+        right_base_fqn: evidence.right_base_fqn,
+        left_row_id_column: evidence.left_row_id_column,
+        right_row_id_column: evidence.right_row_id_column,
+        action_column: evidence.action_column,
+        join_apply_key_column: evidence.join_apply_key_column,
+        payload_columns,
+        join_key_pairs,
+        output_mappings,
+        branches: evidence.branches,
+        needs_target_locator: true,
+    })
+}
+
+fn build_join_payload_columns(
+    schema_contract: &MvSchemaContract,
+    left_base_contract: &BaseContract,
+    right_base_contract: &BaseContract,
+    left_base_fqn: &str,
+    right_base_fqn: &str,
+    left_output_columns: &[OutputColumn],
+    right_output_columns: &[OutputColumn],
+) -> Result<Vec<OutputColumn>, String> {
+    if schema_contract.output.columns.len() != schema_contract.target.visible_columns.len() {
+        return Err(format!(
+            "join refresh descriptor output/target column count mismatch: output has {}, target has {}",
+            schema_contract.output.columns.len(),
+            schema_contract.target.visible_columns.len()
+        ));
+    }
+
+    schema_contract
+        .output
+        .columns
+        .iter()
+        .zip(schema_contract.target.visible_columns.iter())
+        .enumerate()
+        .map(|(idx, (lineage, target))| {
+            if lineage.expression.kind != ExpressionKind::Column {
+                return Err(format!(
+                    "join refresh descriptor payload column {idx} `{}` must be a direct column reference, got {:?}",
+                    target.output_name, lineage.expression.kind
+                ));
+            }
+            let [field] = lineage.expression.referenced_base_fields.as_slice() else {
+                return Err(format!(
+                    "join refresh descriptor payload column {idx} `{}` must reference exactly one base field, got {}",
+                    target.output_name,
+                    lineage.expression.referenced_base_fields.len()
+                ));
+            };
+            let (base_contract, output_columns, role) =
+                if field.table_fqn.eq_ignore_ascii_case(left_base_fqn) {
+                    (left_base_contract, left_output_columns, "left payload")
+                } else if field.table_fqn.eq_ignore_ascii_case(right_base_fqn) {
+                    (right_base_contract, right_output_columns, "right payload")
+                } else {
+                    return Err(format!(
+                        "join refresh descriptor payload column {idx} `{}` references base {} outside actual join bases {}, {}",
+                        target.output_name, field.table_fqn, left_base_fqn, right_base_fqn
+                    ));
+                };
+            let field_name = field_name_for_lineage(base_contract, field)?;
+            find_unique_output_column(output_columns, field_name, role)
+        })
+        .collect()
+}
+
+fn build_join_key_pairs(
+    join_contract: &crate::meta::repository::mv_contract::JoinContract,
+    left_base_contract: &BaseContract,
+    right_base_contract: &BaseContract,
+    left_base_fqn: &str,
+    right_base_fqn: &str,
+    left_output_columns: &[OutputColumn],
+    right_output_columns: &[OutputColumn],
+) -> Result<Vec<JoinRefreshJoinKeyPair>, String> {
+    join_contract
+        .predicates
+        .iter()
+        .map(|predicate| {
+            let (left_lineage, right_lineage) =
+                predicate_lineage_for_actual_sides(predicate, left_base_fqn, right_base_fqn)?;
+            let left_name = field_name_for_lineage(left_base_contract, left_lineage)?;
+            let right_name = field_name_for_lineage(right_base_contract, right_lineage)?;
+            Ok(JoinRefreshJoinKeyPair {
+                left_column: find_unique_output_column(
+                    left_output_columns,
+                    left_name,
+                    "left join key",
+                )?,
+                right_column: find_unique_output_column(
+                    right_output_columns,
+                    right_name,
+                    "right join key",
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn predicate_lineage_for_actual_sides<'a>(
+    predicate: &'a crate::meta::repository::mv_contract::JoinPredicateLineage,
+    left_base_fqn: &str,
+    right_base_fqn: &str,
+) -> Result<(&'a QualifiedFieldLineage, &'a QualifiedFieldLineage), String> {
+    if predicate.left.table_fqn.eq_ignore_ascii_case(left_base_fqn)
+        && predicate
+            .right
+            .table_fqn
+            .eq_ignore_ascii_case(right_base_fqn)
+    {
+        return Ok((&predicate.left, &predicate.right));
+    }
+    if predicate
+        .left
+        .table_fqn
+        .eq_ignore_ascii_case(right_base_fqn)
+        && predicate
+            .right
+            .table_fqn
+            .eq_ignore_ascii_case(left_base_fqn)
+    {
+        return Ok((&predicate.right, &predicate.left));
+    }
+    Err(format!(
+        "join refresh descriptor predicate lineage does not align with actual plan bases: predicate left={}, right={}, actual left={}, right={}",
+        predicate.left.table_fqn, predicate.right.table_fqn, left_base_fqn, right_base_fqn
+    ))
+}
+
+fn base_contract_for_fqn<'a>(
+    bases: &'a [BaseContract],
+    table_fqn: &str,
+) -> Result<&'a BaseContract, String> {
+    let matches = bases
+        .iter()
+        .filter(|base| base.table_fqn.eq_ignore_ascii_case(table_fqn))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [base] => Ok(*base),
+        [] => Err(format!(
+            "join refresh descriptor schema contract missing base {table_fqn}"
+        )),
+        _ => Err(format!(
+            "join refresh descriptor schema contract has duplicate base {table_fqn}"
+        )),
+    }
+}
+
+fn field_name_for_lineage<'a>(
+    base: &'a BaseContract,
+    field: &QualifiedFieldLineage,
+) -> Result<&'a str, String> {
+    if !field.table_fqn.eq_ignore_ascii_case(&base.table_fqn) {
+        return Err(format!(
+            "join refresh descriptor lineage table {} does not match base {}",
+            field.table_fqn, base.table_fqn
+        ));
+    }
+    if let Some(alias) = &base.alias_at_create {
+        if !field.qualifier_at_create.eq_ignore_ascii_case(alias) {
+            return Err(format!(
+                "join refresh descriptor lineage qualifier {} does not match base alias {}",
+                field.qualifier_at_create, alias
+            ));
+        }
+    }
+    base.schema_at_create
+        .fields
+        .iter()
+        .find(|base_field| base_field.field_id == field.field_id)
+        .map(|base_field| base_field.name_at_create.as_str())
+        .ok_or_else(|| {
+            format!(
+                "join refresh descriptor lineage references unknown field {} on base {}",
+                field.field_id, base.table_fqn
+            )
+        })
+}
+
+fn find_unique_output_column(
+    columns: &[OutputColumn],
+    name: &str,
+    role: &str,
+) -> Result<OutputColumn, String> {
+    let matches = columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(name) && !column.is_internal)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [column] => Ok((*column).clone()),
+        [] => Err(format!(
+            "join refresh descriptor cannot find {role} column {name}"
+        )),
+        _ => Err(format!(
+            "join refresh descriptor found multiple {role} columns named {name}"
+        )),
+    }
+}
+
+fn find_unique_internal_column(
+    columns: &[OutputColumn],
+    name: &str,
+    role: &str,
+) -> Result<OutputColumn, String> {
+    let matches = columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(name) && column.is_internal)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [column] => Ok((*column).clone()),
+        [] => Err(format!(
+            "join refresh descriptor cannot find {role} internal column {name}"
+        )),
+        _ => Err(format!(
+            "join refresh descriptor found multiple {role} internal columns named {name}"
+        )),
+    }
+}
+
+fn join_refresh_output_mappings(
+    payload_columns: &[OutputColumn],
+    action_column: &OutputColumn,
+    join_apply_key_column: &OutputColumn,
+) -> Vec<JoinRefreshOutputMapping> {
+    let mut seen_names = HashMap::new();
+    let mut mappings = payload_columns
+        .iter()
+        .map(|payload| JoinRefreshOutputMapping {
+            mv_output_column: unique_mapping_output_column(payload, &mut seen_names),
+            source: JoinRefreshOutputSource::Payload(payload.column_id),
+        })
+        .collect::<Vec<_>>();
+    mappings.push(JoinRefreshOutputMapping {
+        mv_output_column: unique_mapping_output_column(action_column, &mut seen_names),
+        source: JoinRefreshOutputSource::Action(action_column.column_id),
+    });
+    mappings.push(JoinRefreshOutputMapping {
+        mv_output_column: unique_mapping_output_column(join_apply_key_column, &mut seen_names),
+        source: JoinRefreshOutputSource::JoinApplyKey(join_apply_key_column.column_id),
+    });
+    mappings
+}
+
+fn unique_mapping_output_column(
+    source: &OutputColumn,
+    seen_names: &mut HashMap<String, usize>,
+) -> OutputColumn {
+    let mut output = source.clone();
+    let normalized = output.name.to_ascii_lowercase();
+    let count = seen_names.entry(normalized).or_insert(0);
+    if *count > 0 {
+        output.name = format!("{}__{}", output.name, output.column_id.0);
+    }
+    *count += 1;
+    output
+}
+
 fn join_output_columns(
     join_type: JoinKind,
     left: &LogicalPlanNode,
@@ -142,12 +1031,27 @@ fn join_output_columns(
     }
     let left_cols = plan_output_columns(left)?;
     let right_cols = plan_output_columns(right)?;
-    let mut out = left_cols
-        .into_iter()
-        .filter(|column| !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
-        .collect::<Vec<_>>();
-    out.extend(right_cols);
-    out.retain(|column| !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME));
+    let mut out = Vec::new();
+    let mut action_output: Option<OutputColumn> = None;
+    for column in left_cols.into_iter().chain(right_cols) {
+        if ImvActionColumn::matches(&column) {
+            match &action_output {
+                Some(existing) if existing.column_id != column.column_id => {
+                    return Err(format!(
+                        "Iceberg IMV join delta rewrite found multiple action columns in join inputs: {:?} and {:?}",
+                        existing.column_id, column.column_id
+                    ));
+                }
+                Some(_) => {}
+                None => action_output = Some(column),
+            }
+        } else {
+            out.push(column);
+        }
+    }
+    if let Some(action_output) = action_output {
+        out.push(action_output);
+    }
     Ok(out)
 }
 
@@ -181,7 +1085,25 @@ fn mark_scan(plan: LogicalPlanNode, marker: MarkerKind) -> Result<LogicalPlanNod
             LogicalPlanNode::new(kind, children, required_output_columns),
             marker,
         ),
-        PlanNodeKind::Project(_) | PlanNodeKind::Filter(_) => {
+        PlanNodeKind::Project(mut project) => {
+            if let MarkerKind::Delta(action_column) = &marker {
+                let action_output = ImvActionColumn::output_column(*action_column);
+                if !project
+                    .items
+                    .iter()
+                    .any(|item| item.output_column_id == action_output.column_id)
+                {
+                    project.items.push(action_project_item(&action_output));
+                }
+            }
+            let input = take_unary_child(&mut children);
+            LogicalPlanNode::new(
+                PlanNodeKind::Project(project),
+                vec![mark_scan(input, marker)?],
+                required_output_columns,
+            )
+        }
+        PlanNodeKind::Filter(_) => {
             let input = take_unary_child(&mut children);
             LogicalPlanNode::new(
                 kind,
@@ -218,6 +1140,22 @@ fn mark_scan(plan: LogicalPlanNode, marker: MarkerKind) -> Result<LogicalPlanNod
     })
 }
 
+fn action_project_item(action_output: &OutputColumn) -> ProjectItem {
+    ProjectItem {
+        expr: TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: action_output.column_id,
+                qualifier: None,
+                column: action_output.name.clone(),
+            },
+            data_type: action_output.data_type.clone(),
+            nullable: action_output.nullable,
+        },
+        output_name: action_output.name.clone(),
+        output_column_id: action_output.column_id,
+    }
+}
+
 fn wrap_scan_marker(scan: LogicalPlanNode, marker: MarkerKind) -> LogicalPlanNode {
     match marker {
         MarkerKind::Delta(action_column) => LogicalPlanNode::new(
@@ -235,10 +1173,6 @@ fn wrap_scan_marker(scan: LogicalPlanNode, marker: MarkerKind) -> LogicalPlanNod
             None,
         ),
     }
-}
-
-fn plan_kind(plan: &LogicalPlanNode) -> &'static str {
-    plan_kind_from_kind(&plan.kind)
 }
 
 fn plan_kind_from_kind(kind: &PlanNodeKind) -> &'static str {
@@ -317,7 +1251,15 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
             out
         }
         PlanNodeKind::AssertOneRow(_) => plan_output_columns(plan.unary_input())?,
-        PlanNodeKind::ImvDelta(_) => plan_output_columns(plan.unary_input())?,
+        PlanNodeKind::ImvDelta(delta) => {
+            let mut out = plan_output_columns(plan.unary_input())?;
+            if let Some(action_column) = delta.action_column
+                && !out.iter().any(|column| column.column_id == action_column)
+            {
+                out.push(ImvActionColumn::output_column(action_column));
+            }
+            out
+        }
         PlanNodeKind::ImvVersion(_) => plan_output_columns(plan.unary_input())?,
         PlanNodeKind::TopN(_)
         | PlanNodeKind::Exchange(_)
@@ -351,7 +1293,11 @@ fn project_item_output_column(item: &ProjectItem) -> OutputColumn {
         name: item.output_name.clone(),
         data_type: item.expr.data_type.clone(),
         nullable: item.expr.nullable,
-        is_internal: false,
+        is_internal: item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)
+            || item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
+            || item
+                .output_name
+                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN),
     }
 }
 
@@ -641,6 +1587,106 @@ mod tests {
     }
 
     #[test]
+    fn pure_join_delta_does_not_record_descriptor_before_key_injection() {
+        let rule = RewriteJoinDeltaRule;
+        let mut ctx = build_ctx();
+        ctx.set_extension::<ImvExtension>(ImvExtension {
+            mv_ctx: dummy_rewrite_context(),
+            annotation: ImvPlanAnnotation::default(),
+        });
+        let plan = LogicalPlanNode::new(
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                is_root: false,
+                action_column: Some(ColumnId(100)),
+                branch_scope: None,
+            }),
+            vec![join_over(JoinKind::Inner)],
+            None,
+        );
+
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let result = rule
+            .apply(expr, &mut ctx)
+            .expect("early join-delta rewrite must not require descriptor lineage");
+
+        assert!(
+            matches!(result, RewriteResult::Changed(_)),
+            "expected join-delta union rewrite"
+        );
+        let ext = ctx
+            .extension::<ImvExtension>()
+            .expect("extension must stay installed");
+        assert!(
+            ext.annotation.change_stream.join_refresh.is_none(),
+            "descriptor must be recorded only after row-id/apply-key injection"
+        );
+    }
+
+    #[test]
+    fn join_apply_key_rule_propagates_key_through_project() {
+        let rule = InjectJoinApplyKeyRule;
+        let mut ctx = build_ctx();
+        let plan = project_payload_only(join_apply_key_union());
+
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(
+            rule.matches(&expr, &ctx),
+            "Project above a join apply-key union must expose the key for coalescing"
+        );
+
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("propagate")
+        else {
+            panic!("join apply-key propagation must change the Project");
+        };
+        let arena = ctx.scalar_arena();
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            changed_expr,
+            &arena.borrow(),
+        );
+        let PlanNodeKind::Project(project) = &changed.kind else {
+            panic!("expected Project");
+        };
+        assert!(project.items.iter().any(|item| {
+            item.output_name
+                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+                && item.output_column_id == ColumnId(21)
+        }));
+    }
+
+    #[test]
+    fn join_apply_key_rule_propagates_action_through_project() {
+        let rule = InjectJoinApplyKeyRule;
+        let mut ctx = build_ctx();
+        let plan = project_payload_only(join_apply_key_union());
+
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(
+            rule.matches(&expr, &ctx),
+            "Project above a join apply-key union must expose action for coalescing"
+        );
+
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("propagate")
+        else {
+            panic!("join action propagation must change the Project");
+        };
+        let arena = ctx.scalar_arena();
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            changed_expr,
+            &arena.borrow(),
+        );
+        let PlanNodeKind::Project(project) = &changed.kind else {
+            panic!("expected Project");
+        };
+        assert!(project.items.iter().any(|item| {
+            item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)
+                && item.output_column_id == ColumnId(20)
+        }));
+    }
+
+    #[test]
     fn mark_delta_scan_wraps_nested_join_whole() {
         // Delta marker over a Join must wrap the entire join (pending recursive join-delta expansion),
         // NOT push into the two sides.
@@ -655,13 +1701,58 @@ mod tests {
     }
 
     #[test]
+    fn mark_delta_scan_propagates_action_through_project_side() {
+        let marked =
+            mark_delta_scan(project_over(scan("a", 1)), ColumnId(100)).expect("mark delta");
+
+        let PlanNodeKind::Project(project) = &marked.kind else {
+            panic!("expected Project, got {marked:?}");
+        };
+        let Some(action_item) = project
+            .items
+            .iter()
+            .find(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+        else {
+            panic!("delta-marked Project must expose the action column");
+        };
+        assert_eq!(action_item.output_column_id, ColumnId(100));
+        assert!(matches!(
+            &action_item.expr.kind,
+            ExprKind::ColumnRef {
+                column_id,
+                column,
+                ..
+            } if *column_id == ColumnId(100) && column.eq_ignore_ascii_case(ImvActionColumn::NAME)
+        ));
+    }
+
+    #[test]
+    fn join_output_columns_keep_delta_side_action_for_normalized_branch() {
+        let left =
+            mark_delta_scan(project_over(scan("a", 1)), ColumnId(100)).expect("mark left delta");
+        let right = mark_version_scan(project_over(scan("b", 10)), ImvVersionRef::from_snapshot())
+            .expect("mark right version");
+        let join = join_of(left, right);
+
+        let columns = plan_output_columns(&join).expect("join output columns");
+
+        assert!(
+            columns
+                .iter()
+                .any(|column| ImvActionColumn::matches(column)
+                    && column.column_id == ColumnId(100)),
+            "normalized join-delta branch Join must expose the shared action column"
+        );
+    }
+
+    #[test]
     fn mark_version_scan_pushes_same_role_down_both_join_sides() {
         // Version marker over a Join distributes over the join:
         // Version(Join(a,b), from) == Join(Version(a, from), Version(b, from)).
         let join = join_of(scan("a", 1), scan("b", 10));
         let marked = mark_version_scan(join, ImvVersionRef::from_snapshot())
             .expect("mark version over join");
-        let PlanNodeKind::Join(j) = &marked.kind else {
+        let PlanNodeKind::Join(_) = &marked.kind else {
             panic!("expected Join with both sides version-marked, got {marked:?}");
         };
         let left_v = assert_version_side(marked.left());
@@ -730,10 +1821,6 @@ mod tests {
         let factory = std::rc::Rc::new(std::cell::RefCell::new(ColumnRefFactory::new()));
         factory.borrow_mut().reserve_until(100);
         ctx.set_column_ref_factory(std::rc::Rc::clone(&factory));
-        ctx.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx: dummy_rewrite_context(),
-            annotation: ImvPlanAnnotation::default(),
-        });
         ctx
     }
 
@@ -801,6 +1888,58 @@ mod tests {
 
     fn join_of_with_left(left: LogicalPlanNode, right: LogicalPlanNode) -> LogicalPlanNode {
         join_of(left, right)
+    }
+
+    fn project_payload_only(input: LogicalPlanNode) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            PlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: col_expr(1, "payload"),
+                    output_name: "payload".to_string(),
+                    output_column_id: ColumnId(1),
+                }],
+                output_qualifier: None,
+            }),
+            vec![input],
+            None,
+        )
+    }
+
+    fn join_apply_key_union() -> LogicalPlanNode {
+        let payload = output_column(1, "payload");
+        let action = ImvActionColumn::output_column(ColumnId(20));
+        let join_apply_key = OutputColumn {
+            column_id: ColumnId(21),
+            name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+            data_type: DataType::Utf8,
+            nullable: false,
+            is_internal: true,
+        };
+        LogicalPlanNode::new(
+            PlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![payload.clone(), action.clone(), join_apply_key.clone()],
+            }),
+            vec![
+                LogicalPlanNode::new(
+                    PlanNodeKind::Values(LogicalValuesNode {
+                        rows: Vec::new(),
+                        columns: vec![payload.clone(), action.clone(), join_apply_key.clone()],
+                    }),
+                    Vec::new(),
+                    None,
+                ),
+                LogicalPlanNode::new(
+                    PlanNodeKind::Values(LogicalValuesNode {
+                        rows: Vec::new(),
+                        columns: vec![payload, action, join_apply_key],
+                    }),
+                    Vec::new(),
+                    None,
+                ),
+            ],
+            None,
+        )
     }
 
     fn project_over(input: LogicalPlanNode) -> LogicalPlanNode {
@@ -962,7 +2101,7 @@ mod tests {
     }
 
     fn assert_delta(plan: &LogicalPlanNode, expected_scan: &str, action_column: ColumnId) {
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let PlanNodeKind::Project(_) = &plan.kind else {
             panic!("expected Project");
         };
         let delta_plan = plan.unary_input();
@@ -975,7 +2114,7 @@ mod tests {
     }
 
     fn assert_version(plan: &LogicalPlanNode, expected_scan: &str, role: ImvVersionRole) {
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let PlanNodeKind::Project(_) = &plan.kind else {
             panic!("expected Project");
         };
         let version_plan = plan.unary_input();
@@ -1053,6 +2192,7 @@ mod tests {
                 target_state: TargetStateProof { present: true },
                 signed_state_aggregate: SignedStateAggregateProof { present: true },
             }),
+            ..Default::default()
         };
         ctx.set_extension::<ImvExtension>(ext);
         let arena_rc = ctx.scalar_arena();
