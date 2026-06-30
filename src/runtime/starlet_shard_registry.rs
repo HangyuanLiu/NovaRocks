@@ -38,25 +38,16 @@ pub(crate) struct S3StoreConfig {
 
 impl S3StoreConfig {
     pub(crate) fn to_object_store_config(&self) -> crate::fs::object_store::ObjectStoreConfig {
-        let mut cfg = crate::fs::object_store::ObjectStoreConfig {
-            endpoint: self.endpoint.clone(),
-            bucket: self.bucket.clone(),
-            // OpenDAL builder.root is intentionally empty: keys are
-            // computed as bucket-relative from the full_path being
-            // accessed, so the operator can be safely shared across all
-            // tablets in the same bucket.
-            root: String::new(),
-            access_key_id: self.access_key_id.clone(),
-            access_key_secret: self.access_key_secret.clone(),
-            session_token: None,
-            enable_path_style_access: self.enable_path_style_access,
-            region: self.region.clone(),
-            retry_max_times: None,
-            retry_min_delay_ms: None,
-            retry_max_delay_ms: None,
-            timeout_ms: None,
-            io_timeout_ms: None,
-        };
+        let credentials = crate::fs::object_store_credentials::ObjectStoreCredentials::from_parts(
+            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::StarletProfile,
+            &self.endpoint,
+            &self.access_key_id,
+            &self.access_key_secret,
+            self.region.as_deref(),
+            self.enable_path_style_access,
+        )
+        .expect("validated Starlet S3 profile");
+        let mut cfg = credentials.to_object_store_config(&self.bucket, "");
         crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
         cfg
     }
@@ -500,6 +491,27 @@ mod tests {
             "S3StoreConfig is cluster-level only; root must always be empty"
         );
         assert_eq!(object_cfg.bucket, "bucket");
+    }
+
+    #[test]
+    fn s3_store_config_uses_shared_credentials_for_legacy_config() {
+        let cfg = S3StoreConfig {
+            endpoint: " http://localhost:9000 ".to_string(),
+            bucket: "bucket-a".to_string(),
+            access_key_id: " ak ".to_string(),
+            access_key_secret: " sk ".to_string(),
+            region: Some(" us-east-1 ".to_string()),
+            enable_path_style_access: Some(true),
+        };
+
+        let legacy = cfg.to_object_store_config();
+
+        assert_eq!(legacy.endpoint, "http://localhost:9000");
+        assert_eq!(legacy.bucket, "bucket-a");
+        assert_eq!(legacy.root, "");
+        assert_eq!(legacy.access_key_id, "ak");
+        assert_eq!(legacy.access_key_secret, "sk");
+        assert_eq!(legacy.region.as_deref(), Some("us-east-1"));
     }
 
     #[test]

@@ -33,21 +33,20 @@ use crate::connector::iceberg::schema::{
     IcebergPartitionInfo, IcebergSchemaDescriptor, IcebergSchemaFieldDescriptor,
     IcebergTableColumn, IcebergTableDescriptor, apply_field_id_recursive, build_full_output_schema,
 };
-use crate::connector::iceberg::sink::{
-    build_staged_file_io, parse_object_store_bucket_and_root, parse_true_false,
-};
+use crate::connector::iceberg::sink::{build_staged_file_io, parse_object_store_bucket_and_root};
 use crate::connector::iceberg::sink_plan::{
-    IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkPlan, PositionDeleteDataFilePartition,
+    IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan,
+    PositionDeleteDataFilePartition,
 };
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::row_position::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
 };
+use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::Layout;
 use crate::runtime::global_async_runtime::data_block_on;
-use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::thrift::{data_sinks, descriptors, exprs, types};
 
 type PartitionExprs = (Vec<String>, Vec<String>, Vec<String>, Vec<exprs::TExpr>);
@@ -700,7 +699,7 @@ fn resolve_data_location(sink: &data_sinks::TIcebergTableSink) -> Result<String,
 fn resolve_sink_s3_config(
     sink: &data_sinks::TIcebergTableSink,
     data_location: &str,
-) -> Result<Option<S3StoreConfig>, String> {
+) -> Result<Option<IcebergSinkObjectStoreConfig>, String> {
     let Some((bucket, _data_root)) = parse_object_store_bucket_and_root(data_location) else {
         return Ok(None);
     };
@@ -714,56 +713,22 @@ fn resolve_sink_s3_config(
         .as_ref()
         .ok_or_else(|| "iceberg sink cloud_configuration.cloud_properties is empty".to_string())?;
 
-    let endpoint = props
-        .get("aws.s3.endpoint")
-        .or_else(|| props.get("aws.s3.endpoint_url"))
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| "iceberg sink cloud_properties missing aws.s3.endpoint".to_string())?
-        .to_string();
-    let access_key_id = props
-        .get("aws.s3.accessKeyId")
-        .or_else(|| props.get("aws.s3.access_key"))
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            "iceberg sink cloud_properties missing aws.s3.accessKeyId/aws.s3.access_key".to_string()
-        })?
-        .to_string();
-    let access_key_secret = props
-        .get("aws.s3.accessKeySecret")
-        .or_else(|| props.get("aws.s3.secret_key"))
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            "iceberg sink cloud_properties missing aws.s3.accessKeySecret/aws.s3.secret_key"
-                .to_string()
-        })?
-        .to_string();
-    let region = props
-        .get("aws.s3.region")
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string());
-    let enable_path_style_access = props
-        .get("aws.s3.enable_path_style_access")
-        .and_then(|v| parse_true_false(v));
+    let credentials = ObjectStoreCredentials::from_aws_s3_properties(
+        ObjectStoreCredentialsSource::IcebergSinkCloudProperties,
+        props,
+    )?;
 
-    Ok(Some(S3StoreConfig {
-        endpoint,
+    Ok(Some(IcebergSinkObjectStoreConfig::from_credentials(
         bucket,
-        access_key_id,
-        access_key_secret,
-        region,
-        enable_path_style_access,
-    }))
+        credentials,
+    )))
 }
 
 fn build_position_delete_data_file_partition_index(
     metadata: &TableMetadata,
     target_snapshot_id: Option<i64>,
     table_location: &str,
-    s3_config: Option<&S3StoreConfig>,
+    s3_config: Option<&IcebergSinkObjectStoreConfig>,
 ) -> Result<HashMap<String, PositionDeleteDataFilePartition>, String> {
     use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
 
@@ -991,6 +956,7 @@ mod tests {
         ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
         ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
     };
+    use std::collections::BTreeMap;
 
     fn thrift_type_desc(primitive: types::TPrimitiveType) -> types::TTypeDesc {
         crate::types::arrow_thrift::thrift_type_desc_from_primitive(primitive)
@@ -1341,6 +1307,21 @@ mod tests {
         )
     }
 
+    fn s3_cloud_configuration(
+        entries: &[(&str, &str)],
+    ) -> crate::thrift::cloud_configuration::TCloudConfiguration {
+        let cloud_properties = entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<BTreeMap<_, _>>();
+        crate::thrift::cloud_configuration::TCloudConfiguration::new(
+            None::<crate::thrift::cloud_configuration::TCloudType>,
+            None::<Vec<crate::thrift::cloud_configuration::TCloudProperty>>,
+            Some(cloud_properties),
+            None::<bool>,
+        )
+    }
+
     fn test_position_delete_descriptor(
         target_partition_spec_id: i32,
         include_partition_source: bool,
@@ -1453,6 +1434,90 @@ mod tests {
         assert_eq!(
             iceberg_sink_mode_for_type(data_sinks::TDataSinkType::ICEBERG_TABLE_SINK),
             IcebergSinkMode::Data
+        );
+    }
+
+    #[test]
+    fn sink_s3_config_uses_shared_credentials_aliases_and_policy() {
+        let table_location = "s3://bucket-a/warehouse/table-a";
+        let mut sink = test_iceberg_table_sink(1, table_location);
+        sink.cloud_configuration = Some(s3_cloud_configuration(&[
+            ("aws.s3.endpoint_url", " http://localhost:9000 "),
+            ("aws.s3.accessKeyId", " ak "),
+            ("aws.s3.accessKeySecret", " sk "),
+            ("aws.s3.sessionToken", " token "),
+            ("aws.s3.region", " us-east-1 "),
+            ("aws.s3.enable_path_style_access", "yes"),
+            ("aws.s3.max_retries", "7"),
+            ("aws.s3.retry_min_delay_ms", "11"),
+            ("aws.s3.retry_max_delay_ms", "99"),
+            ("aws.s3.request_timeout_ms", "1234"),
+            ("aws.s3.io_timeout_ms", "5678"),
+        ]));
+
+        let s3 = resolve_sink_s3_config(
+            &sink,
+            sink.data_location
+                .as_deref()
+                .expect("test sink has data location"),
+        )
+        .expect("resolve s3 config")
+        .expect("s3 config");
+
+        assert_eq!(s3.bucket, "bucket-a");
+        assert_eq!(s3.endpoint, "http://localhost:9000");
+        assert_eq!(s3.access_key_id, "ak");
+        assert_eq!(s3.access_key_secret, "sk");
+        assert_eq!(s3.session_token.as_deref(), Some("token"));
+        assert_eq!(s3.region.as_deref(), Some("us-east-1"));
+        assert_eq!(s3.enable_path_style_access, Some(true));
+        assert_eq!(s3.retry_max_times, Some(7));
+        assert_eq!(s3.retry_min_delay_ms, Some(11));
+        assert_eq!(s3.retry_max_delay_ms, Some(99));
+        assert_eq!(s3.timeout_ms, Some(1234));
+        assert_eq!(s3.io_timeout_ms, Some(5678));
+
+        let factory = s3.to_s3_storage_factory();
+        assert_eq!(factory.session_token.as_deref(), Some("token"));
+        assert_eq!(factory.retry_max_times, Some(7));
+        assert_eq!(factory.retry_min_delay_ms, Some(11));
+        assert_eq!(factory.retry_max_delay_ms, Some(99));
+        assert_eq!(factory.timeout_ms, Some(1234));
+        assert_eq!(factory.io_timeout_ms, Some(5678));
+
+        let legacy = s3.to_object_store_config();
+        assert_eq!(legacy.session_token.as_deref(), Some("token"));
+        assert_eq!(legacy.retry_max_times, Some(7));
+        assert_eq!(legacy.retry_min_delay_ms, Some(11));
+        assert_eq!(legacy.retry_max_delay_ms, Some(99));
+        assert_eq!(legacy.timeout_ms, Some(1234));
+        assert_eq!(legacy.io_timeout_ms, Some(5678));
+    }
+
+    #[test]
+    fn sink_s3_config_rejects_invalid_path_style_property() {
+        let table_location = "s3://bucket-a/warehouse/table-a";
+        let mut sink = test_iceberg_table_sink(1, table_location);
+        sink.cloud_configuration = Some(s3_cloud_configuration(&[
+            ("aws.s3.endpoint", "http://localhost:9000"),
+            ("aws.s3.access_key", "ak"),
+            ("aws.s3.secret_key", "sk"),
+            ("aws.s3.enable_path_style_access", "maybe"),
+        ]));
+
+        let err = resolve_sink_s3_config(
+            &sink,
+            sink.data_location
+                .as_deref()
+                .expect("test sink has data location"),
+        )
+        .expect_err("invalid path style should fail");
+
+        assert!(
+            err.contains(
+                "iceberg_sink_cloud_properties object-store property aws.s3.enable_path_style_access has invalid boolean value: maybe"
+            ),
+            "{err}"
         );
     }
 

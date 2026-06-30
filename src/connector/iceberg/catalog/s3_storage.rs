@@ -4,7 +4,7 @@
 //! OpenDAL S3 operator, allowing Iceberg metadata and data files to be stored
 //! on S3-compatible object storage (MinIO, AWS S3, Aliyun OSS).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -29,8 +29,20 @@ pub(crate) struct S3Storage {
     endpoint: String,
     access_key_id: String,
     access_key_secret: String,
+    #[serde(default)]
+    session_token: Option<String>,
     region: String,
     enable_path_style: bool,
+    #[serde(default)]
+    retry_max_times: Option<usize>,
+    #[serde(default)]
+    retry_min_delay_ms: Option<u64>,
+    #[serde(default)]
+    retry_max_delay_ms: Option<u64>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    io_timeout_ms: Option<u64>,
     #[serde(skip)]
     operators: std::sync::Mutex<HashMap<String, Operator>>,
 }
@@ -40,15 +52,27 @@ impl S3Storage {
         endpoint: &str,
         access_key_id: &str,
         access_key_secret: &str,
+        session_token: Option<&str>,
         region: &str,
         enable_path_style: bool,
+        retry_max_times: Option<usize>,
+        retry_min_delay_ms: Option<u64>,
+        retry_max_delay_ms: Option<u64>,
+        timeout_ms: Option<u64>,
+        io_timeout_ms: Option<u64>,
     ) -> Self {
         Self {
             endpoint: endpoint.to_string(),
             access_key_id: access_key_id.to_string(),
             access_key_secret: access_key_secret.to_string(),
+            session_token: session_token.map(str::to_string),
             region: region.to_string(),
             enable_path_style,
+            retry_max_times,
+            retry_min_delay_ms,
+            retry_max_delay_ms,
+            timeout_ms,
+            io_timeout_ms,
             operators: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -91,14 +115,14 @@ impl S3Storage {
             root: String::new(),
             access_key_id: self.access_key_id.clone(),
             access_key_secret: self.access_key_secret.clone(),
-            session_token: None,
+            session_token: self.session_token.clone(),
             enable_path_style_access: Some(self.enable_path_style),
             region: Some(self.region.clone()),
-            retry_max_times: Some(3),
-            retry_min_delay_ms: Some(100),
-            retry_max_delay_ms: Some(2000),
-            timeout_ms: Some(30000),
-            io_timeout_ms: Some(30000),
+            retry_max_times: self.retry_max_times,
+            retry_min_delay_ms: self.retry_min_delay_ms,
+            retry_max_delay_ms: self.retry_max_delay_ms,
+            timeout_ms: self.timeout_ms,
+            io_timeout_ms: self.io_timeout_ms,
         };
         let op = crate::fs::object_store::build_oss_operator(&cfg)
             .map_err(|e| Error::new(ErrorKind::Unexpected, format!("build S3 operator: {e}")))?;
@@ -196,8 +220,14 @@ impl Storage for S3Storage {
             &self.endpoint,
             &self.access_key_id,
             &self.access_key_secret,
+            self.session_token.as_deref(),
             &self.region,
             self.enable_path_style,
+            self.retry_max_times,
+            self.retry_min_delay_ms,
+            self.retry_max_delay_ms,
+            self.timeout_ms,
+            self.io_timeout_ms,
         ));
         Ok(InputFile::new(storage, path.to_string()))
     }
@@ -207,8 +237,14 @@ impl Storage for S3Storage {
             &self.endpoint,
             &self.access_key_id,
             &self.access_key_secret,
+            self.session_token.as_deref(),
             &self.region,
             self.enable_path_style,
+            self.retry_max_times,
+            self.retry_min_delay_ms,
+            self.retry_max_delay_ms,
+            self.timeout_ms,
+            self.io_timeout_ms,
         ));
         Ok(OutputFile::new(storage, path.to_string()))
     }
@@ -288,34 +324,55 @@ pub(crate) struct S3StorageFactory {
     pub endpoint: String,
     pub access_key_id: String,
     pub access_key_secret: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
     pub region: String,
     pub enable_path_style: bool,
+    #[serde(default)]
+    pub retry_max_times: Option<usize>,
+    #[serde(default)]
+    pub retry_min_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub retry_max_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub io_timeout_ms: Option<u64>,
 }
 
 impl S3StorageFactory {
     /// Build from catalog properties (aws.s3.access_key, aws.s3.secret_key, etc.).
-    pub fn from_catalog_properties(props: &[(String, String)]) -> Option<Self> {
-        let map: HashMap<&str, &str> = props
+    pub fn from_catalog_properties(
+        props: &[(String, String)],
+    ) -> std::result::Result<Option<Self>, String> {
+        let props_map: BTreeMap<String, String> = props
             .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
+        let credentials =
+            crate::fs::object_store_credentials::ObjectStoreCredentials::optional_from_aws_s3_properties(
+                crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
+                &props_map,
+            )?;
+        let Some(credentials) = credentials else {
+            return Ok(None);
+        };
 
-        let endpoint = map.get("aws.s3.endpoint").copied()?;
-        let ak = map.get("aws.s3.access_key").copied()?;
-        let sk = map.get("aws.s3.secret_key").copied()?;
-        let region = map.get("aws.s3.region").copied().unwrap_or("us-east-1");
-        let path_style = map
-            .get("aws.s3.enable_path_style_access")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-
-        Some(Self {
-            endpoint: endpoint.to_string(),
-            access_key_id: ak.to_string(),
-            access_key_secret: sk.to_string(),
-            region: region.to_string(),
-            enable_path_style: path_style,
-        })
+        Ok(Some(Self {
+            endpoint: credentials.endpoint,
+            access_key_id: credentials.access_key_id,
+            access_key_secret: credentials.access_key_secret,
+            session_token: credentials.session_token,
+            region: credentials
+                .region
+                .unwrap_or_else(|| "us-east-1".to_string()),
+            enable_path_style: credentials.enable_path_style_access.unwrap_or(false),
+            retry_max_times: credentials.retry_max_times,
+            retry_min_delay_ms: credentials.retry_min_delay_ms,
+            retry_max_delay_ms: credentials.retry_max_delay_ms,
+            timeout_ms: credentials.timeout_ms,
+            io_timeout_ms: credentials.io_timeout_ms,
+        }))
     }
 }
 
@@ -326,8 +383,117 @@ impl StorageFactory for S3StorageFactory {
             &self.endpoint,
             &self.access_key_id,
             &self.access_key_secret,
+            self.session_token.as_deref(),
             &self.region,
             self.enable_path_style,
+            self.retry_max_times,
+            self.retry_min_delay_ms,
+            self.retry_max_delay_ms,
+            self.timeout_ms,
+            self.io_timeout_ms,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::S3StorageFactory;
+
+    #[test]
+    fn s3_storage_factory_uses_shared_credentials_aliases() {
+        let props = vec![
+            (
+                "aws.s3.endpoint_url".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "1".to_string(),
+            ),
+        ];
+
+        let factory = S3StorageFactory::from_catalog_properties(&props)
+            .expect("parse factory")
+            .expect("factory");
+
+        assert_eq!(factory.endpoint, "http://localhost:9000");
+        assert_eq!(factory.access_key_id, "ak");
+        assert_eq!(factory.access_key_secret, "sk");
+        assert_eq!(factory.region, "us-east-1");
+        assert!(factory.enable_path_style);
+    }
+
+    #[test]
+    fn s3_storage_factory_preserves_session_token() {
+        let props = vec![
+            (
+                "aws.s3.endpoint_url".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+            ("aws.s3.sessionToken".to_string(), "token".to_string()),
+        ];
+
+        let factory = S3StorageFactory::from_catalog_properties(&props)
+            .expect("parse factory")
+            .expect("factory");
+
+        assert_eq!(factory.session_token.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn s3_storage_factory_preserves_retry_and_timeout_policy() {
+        let props = vec![
+            (
+                "aws.s3.endpoint_url".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+            ("aws.s3.max_retries".to_string(), "7".to_string()),
+            ("aws.s3.retry_min_delay_ms".to_string(), "11".to_string()),
+            ("aws.s3.retry_max_delay_ms".to_string(), "99".to_string()),
+            ("aws.s3.request_timeout_ms".to_string(), "1234".to_string()),
+            ("aws.s3.io_timeout_ms".to_string(), "5678".to_string()),
+        ];
+
+        let factory = S3StorageFactory::from_catalog_properties(&props)
+            .expect("parse factory")
+            .expect("factory");
+
+        assert_eq!(factory.retry_max_times, Some(7));
+        assert_eq!(factory.retry_min_delay_ms, Some(11));
+        assert_eq!(factory.retry_max_delay_ms, Some(99));
+        assert_eq!(factory.timeout_ms, Some(1234));
+        assert_eq!(factory.io_timeout_ms, Some(5678));
+    }
+
+    #[test]
+    fn s3_storage_factory_rejects_invalid_path_style_property() {
+        let props = vec![
+            (
+                "aws.s3.endpoint_url".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "maybe".to_string(),
+            ),
+        ];
+
+        let err = S3StorageFactory::from_catalog_properties(&props)
+            .expect_err("invalid path style should fail");
+
+        assert!(
+            err.contains(
+                "aws_s3_properties object-store property aws.s3.enable_path_style_access has invalid boolean value: maybe"
+            ),
+            "{err}"
+        );
     }
 }

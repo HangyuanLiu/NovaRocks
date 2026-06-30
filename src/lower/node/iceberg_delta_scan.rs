@@ -81,7 +81,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     let object_store_config = object_store_config_from_cloud_configuration(
         plan.cloud_configuration.as_ref(),
         &table_payload.table_location,
-    );
+    )?;
     let object_store_factory = Arc::new(
         crate::connector::iceberg::changes::build_factory_for_table_location(
             &table_payload.table_location,
@@ -434,54 +434,26 @@ fn lower_delete_visibility_content(
 fn object_store_config_from_cloud_configuration(
     cloud: Option<&crate::thrift::cloud_configuration::TCloudConfiguration>,
     table_location: &str,
-) -> Option<crate::fs::object_store::ObjectStoreConfig> {
-    let props = cloud?.cloud_properties.as_ref()?;
-    let retry_settings =
-        crate::fs::object_store::ObjectStoreRetrySettings::from_aws_s3_props(Some(props));
-    let get = |key: &str| {
-        props
-            .get(key)
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
+) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String> {
+    let Some(cloud) = cloud else {
+        return Ok(None);
     };
-    let endpoint = get("aws.s3.endpoint")
-        .or_else(|| get("aws.s3.endpoint_url"))?
-        .to_string();
-    let access_key_id = get("aws.s3.accessKeyId")
-        .or_else(|| get("aws.s3.access_key"))?
-        .to_string();
-    let access_key_secret = get("aws.s3.accessKeySecret")
-        .or_else(|| get("aws.s3.secret_key"))?
-        .to_string();
-    let region = get("aws.s3.region").map(|value| value.to_string());
-    let enable_path_style_access =
-        get("aws.s3.enable_path_style_access").and_then(parse_true_false);
-    let bucket = bucket_from_table_location(table_location).unwrap_or_default();
-    let mut config = crate::fs::object_store::ObjectStoreConfig {
-        endpoint,
-        bucket,
-        root: String::new(),
-        access_key_id,
-        access_key_secret,
-        session_token: None,
-        enable_path_style_access,
-        region,
-        retry_max_times: retry_settings.retry_max_times,
-        retry_min_delay_ms: retry_settings.retry_min_delay_ms,
-        retry_max_delay_ms: retry_settings.retry_max_delay_ms,
-        timeout_ms: retry_settings.timeout_ms,
-        io_timeout_ms: retry_settings.io_timeout_ms,
+    let Some(props) = cloud.cloud_properties.as_ref() else {
+        return Ok(None);
     };
-    crate::fs::object_store::apply_object_store_runtime_defaults(&mut config);
-    Some(config)
-}
+    let credentials =
+        crate::fs::object_store_credentials::ObjectStoreCredentials::optional_from_aws_s3_properties(
+            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
+            props,
+        )?;
+    let Some(credentials) = credentials else {
+        return Ok(None);
+    };
 
-fn parse_true_false(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => Some(true),
-        "false" | "0" | "no" => Some(false),
-        _ => None,
-    }
+    let bucket = bucket_from_table_location(table_location).unwrap_or_default();
+    let mut config = credentials.to_object_store_config(&bucket, "");
+    crate::fs::object_store::apply_object_store_runtime_defaults(&mut config);
+    Ok(Some(config))
 }
 
 fn bucket_from_table_location(location: &str) -> Option<String> {
@@ -572,6 +544,70 @@ mod tests {
             Some(cloud_properties),
             None::<bool>,
         )
+    }
+
+    #[test]
+    fn delta_cloud_object_store_config_uses_shared_credentials_aliases() {
+        let cloud_properties = BTreeMap::from([
+            (
+                "aws.s3.endpoint_url".to_string(),
+                " http://localhost:9000 ".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), " ak ".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), " sk ".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "yes".to_string(),
+            ),
+        ]);
+        let cloud_configuration = crate::thrift::cloud_configuration::TCloudConfiguration::new(
+            None::<crate::thrift::cloud_configuration::TCloudType>,
+            None::<Vec<crate::thrift::cloud_configuration::TCloudProperty>>,
+            Some(cloud_properties),
+            None::<bool>,
+        );
+
+        let cfg = object_store_config_from_cloud_configuration(
+            Some(&cloud_configuration),
+            "s3://bucket-a/table/root",
+        )
+        .expect("parse cloud config")
+        .expect("credentials present");
+
+        assert_eq!(cfg.endpoint, "http://localhost:9000");
+        assert_eq!(cfg.bucket, "bucket-a");
+        assert_eq!(cfg.access_key_id, "ak");
+        assert_eq!(cfg.access_key_secret, "sk");
+        assert_eq!(cfg.enable_path_style_access, Some(true));
+    }
+
+    #[test]
+    fn delta_cloud_object_store_config_errors_on_invalid_bool() {
+        let cloud_properties = BTreeMap::from([
+            (
+                "aws.s3.endpoint".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.access_key".to_string(), "ak".to_string()),
+            ("aws.s3.secret_key".to_string(), "sk".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "maybe".to_string(),
+            ),
+        ]);
+        let cloud_configuration = crate::thrift::cloud_configuration::TCloudConfiguration::new(
+            None::<crate::thrift::cloud_configuration::TCloudType>,
+            None::<Vec<crate::thrift::cloud_configuration::TCloudProperty>>,
+            Some(cloud_properties),
+            None::<bool>,
+        );
+
+        let err = object_store_config_from_cloud_configuration(
+            Some(&cloud_configuration),
+            "s3://bucket-a/table/root",
+        )
+        .expect_err("invalid bool should fail");
+        assert!(err.contains("invalid boolean value: maybe"), "{err}");
     }
 
     #[test]
