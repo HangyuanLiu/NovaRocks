@@ -460,6 +460,9 @@ fn validate_edge_target_node(
             "lower_distributed_plan CTE multicast edge target_exchange_node_id={} in target fragment id={} must target Exchange(CteMulticast)",
             edge.target_exchange_node_id, target_fragment.fragment_id
         )),
+        (crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. }, _) => {
+            Err("Iceberg change-stream router edges are not wired yet".to_string())
+        }
     }
 }
 
@@ -611,6 +614,9 @@ fn edge_boundary_schemas(
                 }
             }
             crate::sql::codegen::FragmentEdgeKind::Stream => &source.output_columns,
+            crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
+                return Err("Iceberg change-stream router edges are not wired yet".to_string());
+            }
         };
         let output_columns = output_columns_for_boundary(edge_output_columns);
         let columns = output_columns_to_boundary_columns(&output_columns);
@@ -680,6 +686,9 @@ fn target_exchange_for_edge<'a>(
             "lower_distributed_plan CTE multicast edge target_exchange_node_id={} in target fragment id={} must target Exchange(CteMulticast)",
             edge.target_exchange_node_id, target_fragment.fragment_id
         )),
+        (crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. }, _) => {
+            Err("Iceberg change-stream router edges are not wired yet".to_string())
+        }
     }
 }
 

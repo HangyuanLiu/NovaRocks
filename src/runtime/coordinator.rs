@@ -137,6 +137,9 @@ impl ExecutionCoordinator {
                 match &e.edge_kind {
                     FragmentEdgeKind::Stream => "Stream",
                     FragmentEdgeKind::CteMulticast { .. } => "CteMulticast",
+                    FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
+                        "IcebergChangeStreamRouter"
+                    }
                 },
                 e.output_partition.type_,
             );
@@ -180,6 +183,9 @@ impl ExecutionCoordinator {
                         e.target_exchange_node_id,
                         e.output_partition.clone(),
                     ));
+                }
+                FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
+                    return Err("Iceberg change-stream router edges are not wired yet".to_string());
                 }
             }
         }

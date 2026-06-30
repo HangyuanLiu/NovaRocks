@@ -161,6 +161,8 @@ impl FragmentScheduler {
         query_id: TUniqueId,
         live: &[LiveBackend],
     ) -> Result<SchedulingPlan, String> {
+        reject_unsupported_router_edges(edges)?;
+
         let n = live.len();
         if n == 0 {
             return Err("no live backend available".into());
@@ -186,6 +188,9 @@ impl FragmentScheduler {
             let stream_kind = match e.edge_kind {
                 FragmentEdgeKind::Stream => e.stream_kind,
                 FragmentEdgeKind::CteMulticast { .. } => FragmentStreamKind::Broadcast,
+                FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
+                    unreachable!("router edges are rejected before ordinary fragment scheduling")
+                }
             };
             incoming.entry(e.target_fragment_id).or_default().push((
                 e.source_fragment_id,
@@ -327,6 +332,8 @@ impl FragmentScheduler {
         edges: &[FragmentEdge],
         live: &[LiveBackend],
     ) -> Result<(), String> {
+        reject_unsupported_router_edges(edges)?;
+
         for e in edges {
             // Snapshot target placements to avoid borrow conflict.
             let target_placements: Vec<(TUniqueId, usize)> = plan
@@ -464,6 +471,18 @@ impl FragmentScheduler {
     fn full_live_snapshot(&self) -> Vec<LiveBackend> {
         self.live_backends.clone()
     }
+}
+
+fn reject_unsupported_router_edges(edges: &[FragmentEdge]) -> Result<(), String> {
+    if edges.iter().any(|edge| {
+        matches!(
+            edge.edge_kind,
+            FragmentEdgeKind::IcebergChangeStreamRouter { .. }
+        )
+    }) {
+        return Err("Iceberg change-stream router edges are not wired yet".to_string());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -786,6 +805,23 @@ mod tests {
         }
     }
 
+    fn fake_router_edge(src: FragmentId, tgt: FragmentId, exch_node_id: i32) -> FragmentEdge {
+        let mut edge = fake_stream_edge(
+            src,
+            tgt,
+            partitions::TPartitionType::UNPARTITIONED,
+            exch_node_id,
+            FragmentStreamKind::Gather,
+        );
+        edge.edge_kind = FragmentEdgeKind::IcebergChangeStreamRouter {
+            router_group_id: 42,
+            branch_id: 1,
+            branch_kind:
+                crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind::DeleteDv,
+        };
+        edge
+    }
+
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
@@ -878,6 +914,19 @@ mod tests {
             "scan producer gets 3 instances"
         );
         assert_eq!(plan.by_fragment[&1].len(), 1, "root gets 1 instance");
+    }
+
+    #[test]
+    fn change_stream_router_edges_are_not_scheduled_as_stream_edges() {
+        let scheduler = FragmentScheduler::new(two_backends());
+        let fragments = vec![fake_fragment(0, Some(1), 3), fake_fragment(1, None, 0)];
+        let edges = vec![fake_router_edge(0, 1, 10)];
+
+        let err = scheduler
+            .assign(&fragments, &edges, make_query_id(1, 1))
+            .expect_err("router edges are graph-model-only in Task 2");
+
+        assert!(err.contains("Iceberg change-stream router edges are not wired yet"));
     }
 
     #[test]
