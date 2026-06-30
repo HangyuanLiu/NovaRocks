@@ -11009,19 +11009,16 @@ pub(crate) fn normalize_imv_rewrite_root_project(
             required_output_columns,
         );
     }
-    let aggregate_output_ids = aggregate
-        .output_columns
-        .iter()
-        .map(|column| column.column_id)
-        .collect::<HashSet<_>>();
     let Some(output_columns) = project
         .items
         .iter()
+        .zip(aggregate.output_columns.iter())
         .map(|item| {
+            let (item, aggregate_output) = item;
             let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind else {
                 return None;
             };
-            if !aggregate_output_ids.contains(column_id) {
+            if *column_id != aggregate_output.column_id {
                 return None;
             }
             Some(crate::sql::analysis::OutputColumn {
@@ -15317,6 +15314,128 @@ mod tests {
         let mut arena = ScalarArena::new();
         try_logical_plan_to_opt_expr(&normalized, &mut arena)
             .expect("normalized aggregate must satisfy optimizer bridge contract");
+    }
+
+    #[test]
+    fn normalize_imv_rewrite_root_project_keeps_reordered_passthrough_project() {
+        let (g1, g2, sum_output) = normalization_aggregate_outputs();
+        let root = normalization_project_over_aggregate(vec![
+            normalization_project_item(&g2, 21, "g2"),
+            normalization_project_item(&g1, 22, "g1"),
+            normalization_project_item(&sum_output, 23, "s"),
+        ]);
+
+        let normalized = normalize_imv_rewrite_root_project(root);
+
+        assert!(matches!(&normalized.kind, PlanNodeKind::Project(_)));
+        let PlanNodeKind::Aggregate(aggregate) = &normalized.unary_input().kind else {
+            panic!("expected preserved Project over Aggregate");
+        };
+        assert_eq!(
+            aggregate
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![g1.column_id, g2.column_id, sum_output.column_id]
+        );
+    }
+
+    #[test]
+    fn normalize_imv_rewrite_root_project_keeps_duplicate_passthrough_project() {
+        let (g1, g2, sum_output) = normalization_aggregate_outputs();
+        let root = normalization_project_over_aggregate(vec![
+            normalization_project_item(&g1, 21, "g1"),
+            normalization_project_item(&g1, 22, "g1_again"),
+            normalization_project_item(&sum_output, 23, "s"),
+        ]);
+
+        let normalized = normalize_imv_rewrite_root_project(root);
+
+        assert!(matches!(&normalized.kind, PlanNodeKind::Project(_)));
+        let PlanNodeKind::Aggregate(aggregate) = &normalized.unary_input().kind else {
+            panic!("expected preserved Project over Aggregate");
+        };
+        assert_eq!(
+            aggregate
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![g1.column_id, g2.column_id, sum_output.column_id]
+        );
+    }
+
+    fn normalization_aggregate_outputs() -> (OutputColumn, OutputColumn, OutputColumn) {
+        (
+            normalization_output_column(1, "g1", DataType::Utf8, false),
+            normalization_output_column(2, "g2", DataType::Utf8, false),
+            normalization_output_column(11, "sum(amount)", DataType::Int64, true),
+        )
+    }
+
+    fn normalization_project_over_aggregate(project_items: Vec<ProjectItem>) -> LogicalPlanNode {
+        let (g1, g2, sum_output) = normalization_aggregate_outputs();
+        let child = LogicalPlanNode::new(
+            PlanNodeKind::Values(LogicalValuesNode {
+                rows: Vec::new(),
+                columns: vec![g1.clone(), g2.clone()],
+            }),
+            vec![],
+            None,
+        );
+        let aggregate = LogicalPlanNode::new(
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![column_ref_expr(&g1), column_ref_expr(&g2)],
+                aggregates: vec![AggregateCall {
+                    name: "sum".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: Vec::new(),
+                    output_column_id: sum_output.column_id,
+                }],
+                output_columns: vec![g1, g2, sum_output],
+                already_pushed: false,
+            }),
+            vec![child],
+            None,
+        );
+        LogicalPlanNode::new(
+            PlanNodeKind::Project(LogicalProjectNode {
+                items: project_items,
+                output_qualifier: None,
+            }),
+            vec![aggregate],
+            None,
+        )
+    }
+
+    fn normalization_project_item(
+        source: &OutputColumn,
+        output_id: u32,
+        name: &str,
+    ) -> ProjectItem {
+        ProjectItem {
+            expr: column_ref_expr(source),
+            output_name: name.to_string(),
+            output_column_id: ColumnId::new_for_test(output_id),
+        }
+    }
+
+    fn normalization_output_column(
+        id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal: false,
+        }
     }
 
     #[test]
