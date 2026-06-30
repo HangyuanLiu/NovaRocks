@@ -65,6 +65,9 @@ pub(crate) fn tag_required_columns(
         Operator::LogicalCTEProduce(_) => tag_cte_produce(expr, arena, parent_needed),
         Operator::LogicalWindow(_) => tag_window(expr, arena, parent_needed),
         Operator::LogicalRepeat(_) => tag_repeat(expr, arena, parent_needed),
+        Operator::LogicalChangeEventExpand(_) => {
+            tag_change_event_expand(expr, arena, parent_needed)
+        }
         Operator::LogicalDecode(_) => tag_decode(expr, arena, parent_needed),
         Operator::LogicalAggregateStateMerge(_) => {
             tag_aggregate_state_merge(expr, arena, parent_needed)
@@ -488,6 +491,35 @@ fn tag_repeat(
     OptExpr {
         op: expr.op,
         children: vec![tag_required_columns(input, arena, child_needed)],
+        required_output_columns: parent_needed,
+    }
+}
+
+fn tag_change_event_expand(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    let Operator::LogicalChangeEventExpand(node) = &expr.op else {
+        unreachable!()
+    };
+    expr.required_output_columns = parent_needed.clone();
+    let mut child_needed = HashSet::new();
+    for event in &node.events {
+        if let Some(predicate) = event.predicate {
+            child_needed.extend(collect_scalar_column_id_refs(arena, predicate));
+        }
+        for assignment in &event.assignments {
+            if let Some(expr) = assignment.expr {
+                child_needed.extend(collect_scalar_column_id_refs(arena, expr));
+            }
+        }
+    }
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, Some(child_needed))],
         required_output_columns: parent_needed,
     }
 }
@@ -2369,6 +2401,62 @@ mod tests {
         assert!(req.contains(&ColumnId::new_for_test(1)));
         assert!(req.contains(&ColumnId::new_for_test(2)));
         assert!(req.contains(&ColumnId::new_for_test(3)));
+    }
+
+    #[test]
+    fn change_event_expand_required_columns_include_predicates_and_assignments() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::{
+            ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec,
+        };
+
+        let arena_rc = make_arena();
+        let predicate;
+        let assignment_expr;
+        {
+            let mut arena = arena_rc.borrow_mut();
+            let c1 = col_ref_scalar(&mut arena, ColumnId::new_for_test(1));
+            let one = int_literal_scalar(&mut arena, 1);
+            predicate = binop_scalar(&mut arena, c1, BinOp::Eq, one);
+            assignment_expr = col_ref_scalar(&mut arena, ColumnId::new_for_test(2));
+        }
+
+        let output_columns = vec![
+            make_output_column(ColumnId::new_for_test(101), "_file"),
+            make_output_column(ColumnId::new_for_test(102), "_pos"),
+            make_output_column(ColumnId::new_for_test(103), "__change_op"),
+        ];
+        let expand = OptExpr::new(
+            Operator::LogicalChangeEventExpand(ChangeEventExpandOp {
+                events: vec![ChangeEventSpec {
+                    predicate: Some(predicate),
+                    branch_kind: ChangeStreamBranchKind::DeleteDv,
+                    assignments: vec![
+                        ChangeEventOutputExpr {
+                            output_column_id: ColumnId::new_for_test(101),
+                            expr: Some(assignment_expr),
+                        },
+                        ChangeEventOutputExpr {
+                            output_column_id: ColumnId::new_for_test(103),
+                            expr: None,
+                        },
+                    ],
+                }],
+                output_columns,
+                change_op_column_id: ColumnId::new_for_test(103),
+                data_route_column_id: None,
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(expand, &arena, Some(needed_set(&[103])));
+        assert!(matches!(&tagged.op, Operator::LogicalChangeEventExpand(_)));
+        assert_eq!(required_columns(&tagged), &needed_set(&[103]));
+        assert_eq!(
+            scan_required_columns(tagged.unary_input()),
+            &needed_set(&[1, 2])
+        );
     }
 
     #[test]

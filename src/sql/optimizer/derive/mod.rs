@@ -169,6 +169,7 @@ pub(crate) fn derive_output(
         Operator::PhysicalAssertOneRow(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalCTEProduce(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalRepeat(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalChangeEventExpand(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalTableFunction(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalWindow(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalNestLoopJoin(o) => o.derive_output(scalars, children_outputs),
@@ -237,6 +238,9 @@ pub(crate) fn derive_required(
             o.derive_required(scalars, parent_required, num_children)
         }
         Operator::PhysicalRepeat(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalChangeEventExpand(o) => {
+            o.derive_required(scalars, parent_required, num_children)
+        }
         Operator::PhysicalTableFunction(o) => {
             o.derive_required(scalars, parent_required, num_children)
         }

@@ -246,6 +246,10 @@ pub(crate) fn derive_statistics(
             }
         }
 
+        Operator::LogicalChangeEventExpand(expand) => {
+            derive_change_event_expand_statistics(expand, expr, memo)
+        }
+
         Operator::LogicalCTEProduce(_) => {
             // Passthrough child stats.
             child_statistics(memo, &expr.children, 0)
@@ -591,6 +595,10 @@ pub(crate) fn derive_statistics(
             }
         }
 
+        Operator::PhysicalChangeEventExpand(expand) => {
+            derive_change_event_expand_statistics(expand, expr, memo)
+        }
+
         Operator::PhysicalUnion(union_op) => derive_set_op_statistics(
             memo,
             &expr.children,
@@ -745,6 +753,35 @@ fn extract_column_id_scalar(arena: &ScalarArena, expr: ScalarId) -> Option<Colum
             extract_column_id_scalar(arena, *child)
         }
         _ => None,
+    }
+}
+
+fn derive_change_event_expand_statistics(
+    expand: &super::operator::ChangeEventExpandOp,
+    expr: &MExpr,
+    memo: &Memo,
+) -> Statistics {
+    let child_stats = child_statistics(memo, &expr.children, 0);
+    let event_count = expand.events.len() as f64;
+    let output_rows = child_stats.output_row_count * event_count;
+    let mut column_statistics = HashMap::new();
+    for event in &expand.events {
+        for assignment in &event.assignments {
+            let Some(expr) = assignment.expr else {
+                continue;
+            };
+            let Some(input_id) = extract_column_id_scalar(&memo.scalars, expr) else {
+                continue;
+            };
+            if let Some(stat) = child_stats.column_statistics.get(&input_id) {
+                column_statistics.insert(assignment.output_column_id, stat.clone());
+            }
+        }
+    }
+    Statistics {
+        output_row_count: output_rows,
+        row_count_confidence: Confidence::Estimated,
+        column_statistics,
     }
 }
 
@@ -2242,6 +2279,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::commo
             .collect(),
         Operator::LogicalAggregate(a) => a.output_columns.clone(),
         Operator::LogicalAggregateStateMerge(a) => a.output_columns.clone(),
+        Operator::LogicalChangeEventExpand(e) => e.output_columns.clone(),
         Operator::LogicalWindow(w) => w.output_columns.clone(),
         Operator::LogicalValues(v) => v.columns.clone(),
         // Decode renames dict->string and therefore breaks the
@@ -2322,6 +2360,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::commo
             .collect(),
         Operator::PhysicalHashAggregate(a) => a.output_columns.clone(),
         Operator::PhysicalAggregateStateMerge(a) => a.output_columns.clone(),
+        Operator::PhysicalChangeEventExpand(e) => e.output_columns.clone(),
         Operator::PhysicalWindow(w) => w.output_columns.clone(),
         Operator::PhysicalValues(v) => v.columns.clone(),
         // Decode renames dict->string; see the LogicalDecode arm above.
@@ -2949,6 +2988,72 @@ mod tests {
         let stats = child_statistics(&memo, &[child], 0);
         assert_eq!(stats.output_row_count, 42.0);
         assert_eq!(stats.row_count_confidence, Confidence::Fallback);
+    }
+
+    #[test]
+    fn change_event_expand_output_columns_are_declared_schema() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{
+            ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec, Operator, ValuesOp,
+        };
+
+        fn output_column(id: u32, name: &str) -> OutputColumn {
+            OutputColumn {
+                column_id: ColumnId::new_for_test(id),
+                name: name.to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: name.starts_with('_'),
+            }
+        }
+
+        let mut memo = Memo::new();
+        let child_columns = vec![output_column(1, "payload")];
+        let child = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: child_columns.clone(),
+            }),
+            children: vec![],
+        });
+        memo.groups[child].logical_props = Some(LogicalProperties::new(child_columns, 10.0));
+
+        let output_columns = vec![
+            output_column(101, "_file"),
+            output_column(102, "_pos"),
+            output_column(103, "__change_op"),
+        ];
+        let expand_group = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
+                events: vec![ChangeEventSpec {
+                    predicate: None,
+                    branch_kind: ChangeStreamBranchKind::DeleteDv,
+                    assignments: vec![ChangeEventOutputExpr {
+                        output_column_id: ColumnId::new_for_test(101),
+                        expr: None,
+                    }],
+                }],
+                output_columns: output_columns.clone(),
+                change_op_column_id: ColumnId::new_for_test(103),
+                data_route_column_id: None,
+            }),
+            children: vec![child],
+        });
+
+        let derived = derive_output_columns(&memo, expand_group);
+        assert_eq!(
+            derived
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

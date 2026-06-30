@@ -7,9 +7,9 @@ use crate::sql::codegen::scalar_materialize::{
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
-    AggregateStateMergeOp, DecodeOp, GenerateSeriesOp, Operator, PhysicalDistributionOp,
-    PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp,
-    TableFunctionOp, WindowOp,
+    AggregateStateMergeOp, ChangeEventExpandOp, DecodeOp, GenerateSeriesOp, Operator,
+    PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp,
+    ProjectOp, RepeatOp, TableFunctionOp, WindowOp,
 };
 use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
 use crate::sql::optimizer::property::DistributionSpec;
@@ -96,6 +96,9 @@ fn verify_node(
         Operator::PhysicalNestLoopJoin(op) => verify_nested_loop_join(op, &child_outputs, scalars),
         Operator::PhysicalTableFunction(op) => verify_table_function(op, &child_outputs, scalars),
         Operator::PhysicalRepeat(op) => verify_repeat(op, &child_outputs),
+        Operator::PhysicalChangeEventExpand(op) => {
+            verify_change_event_expand(op, &child_outputs, scalars)
+        }
         Operator::PhysicalDecode(op) => verify_decode(op, &child_outputs),
 
         Operator::PhysicalUnion(op) => {
@@ -348,6 +351,46 @@ fn verify_repeat(
     Ok(out)
 }
 
+fn verify_change_event_expand(
+    op: &ChangeEventExpandOp,
+    child_outputs: &[HashSet<ColumnId>],
+    scalars: &ScalarArena,
+) -> Result<HashSet<ColumnId>, String> {
+    let input = only_child(child_outputs, "PhysicalChangeEventExpand")?;
+    let outputs = output_ids(op.output_columns.iter().map(|c| c.column_id));
+    verify_declared_output_id(
+        op.change_op_column_id,
+        &outputs,
+        "PhysicalChangeEventExpand change-op column",
+    )?;
+    if let Some(column_id) = op.data_route_column_id {
+        verify_declared_output_id(
+            column_id,
+            &outputs,
+            "PhysicalChangeEventExpand data-route column",
+        )?;
+    }
+    for event in &op.events {
+        let _route_key = event.branch_kind.route_key();
+        if let Some(predicate) = event.predicate {
+            let predicate = materialize(scalars, predicate);
+            verify_expr(&predicate, input, "PhysicalChangeEventExpand predicate")?;
+        }
+        for assignment in &event.assignments {
+            verify_declared_output_id(
+                assignment.output_column_id,
+                &outputs,
+                "PhysicalChangeEventExpand assignment output",
+            )?;
+            if let Some(expr) = assignment.expr {
+                let expr = materialize(scalars, expr);
+                verify_expr(&expr, input, "PhysicalChangeEventExpand assignment")?;
+            }
+        }
+    }
+    Ok(outputs)
+}
+
 fn verify_decode(
     op: &DecodeOp,
     child_outputs: &[HashSet<ColumnId>],
@@ -587,6 +630,23 @@ fn verify_input_id(
         available.sort_unstable();
         return Err(format!(
             "{context}: ColumnId({}) is not produced by child scope; available={:?}",
+            column_id.0, available
+        ));
+    }
+    Ok(())
+}
+
+fn verify_declared_output_id(
+    column_id: ColumnId,
+    outputs: &HashSet<ColumnId>,
+    context: &str,
+) -> Result<(), String> {
+    verify_output_id(column_id, context)?;
+    if !outputs.contains(&column_id) {
+        let mut available = outputs.iter().map(|id| id.0).collect::<Vec<_>>();
+        available.sort_unstable();
+        return Err(format!(
+            "{context}: ColumnId({}) is not declared by operator output columns; available={:?}",
             column_id.0, available
         ));
     }

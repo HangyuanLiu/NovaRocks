@@ -45,7 +45,7 @@
 //!   decoded before the union. UNION DISTINCT / INTERSECT / EXCEPT
 //!   always decode (set-distinct semantics hash on the user-facing
 //!   string value, so dict ids would diverge across snapshots).
-//! * `Window` / `TableFunction` / `Repeat` /
+//! * `Window` / `TableFunction` / `Repeat` / `ChangeEventExpand` /
 //!   `CTEAnchor` / `CTEProduce`: conservative decode boundary — every
 //!   dict column flowing through is decoded back to its string before
 //!   the node. For multi-consumer CTEs, see the `TODO(task-8-cte)`
@@ -65,8 +65,8 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::common::{BinOp, DictionarySnapshot, OutputColumn};
 use crate::sql::common::{DecodeMapping, ScanDictionaryColumn};
 use crate::sql::optimizer::operator::{
-    AggregateOutputLayout, DecodeOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp,
-    ScalarAggregateSpec, ScalarProjectItem, ScanOp, SortOp, TopNOp, UnionOp,
+    AggregateOutputLayout, ChangeEventExpandOp, DecodeOp, LogicalAggregateOp, LogicalJoinOp,
+    Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem, ScanOp, SortOp, TopNOp, UnionOp,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarArena, ScalarId, ScalarNode};
@@ -119,6 +119,9 @@ fn rewrite_node(
         }
         Operator::LogicalProject(node) => {
             rewrite_project(node, children, required_output_columns, ctx, arena)
+        }
+        Operator::LogicalChangeEventExpand(node) => {
+            rewrite_change_event_expand(node, children, required_output_columns, ctx, arena)
         }
         Operator::LogicalAggregate(node) => {
             rewrite_aggregate(node, children, required_output_columns, ctx, arena)
@@ -582,6 +585,31 @@ fn rewrite_project(
             required_output_columns,
         ),
         output_scope,
+    ))
+}
+
+fn rewrite_change_event_expand(
+    node: ChangeEventExpandOp,
+    mut children: Vec<OptExpr>,
+    required_output_columns: Option<std::collections::HashSet<ColumnId>>,
+    ctx: &mut DictionaryRewriteContext,
+    arena: &mut ScalarArena,
+) -> Result<(OptExpr, DictScope), String> {
+    let input = take_unary_child(&mut children);
+    let (input, input_scope) = rewrite_node(input, ctx, arena)?;
+    let input = wrap_with_decode(input, &input_scope, ctx, arena);
+    Ok((
+        opt_expr(
+            Operator::LogicalChangeEventExpand(ChangeEventExpandOp {
+                events: node.events,
+                output_columns: node.output_columns,
+                change_op_column_id: node.change_op_column_id,
+                data_route_column_id: node.data_route_column_id,
+            }),
+            vec![input],
+            required_output_columns,
+        ),
+        DictScope::new(),
     ))
 }
 
@@ -1571,6 +1599,7 @@ fn plan_output_columns(plan: &OptExpr, arena: &ScalarArena) -> Vec<OutputColumn>
     match &plan.op {
         Operator::LogicalScan(scan) => scan.columns.clone(),
         Operator::LogicalAggregate(node) => node.output_columns.clone(),
+        Operator::LogicalChangeEventExpand(node) => node.output_columns.clone(),
         Operator::LogicalWindow(node) => node.output_columns.clone(),
         Operator::LogicalTableFunction(node) => node.output_columns.clone(),
         Operator::LogicalCTEProduce(node) => node.output_columns.clone(),
@@ -1630,6 +1659,14 @@ fn plan_output_columns(plan: &OptExpr, arena: &ScalarArena) -> Vec<OutputColumn>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::dictionary::model::{
+        DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue, DictionaryWatermark,
+    };
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::common::change_stream::ChangeStreamBranchKind;
+    use crate::sql::optimizer::operator::{
+        ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec, ScanOp,
+    };
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::*;
@@ -1657,6 +1694,63 @@ mod tests {
             vec![],
             None,
         )
+    }
+
+    fn sample_snapshot(column_name: &str) -> DictionarySnapshot {
+        DictionarySnapshot {
+            dictionary_id: 1,
+            owner: DictionaryOwner::StarRocksTable {
+                database: "db".to_string(),
+                table: "t".to_string(),
+                db_id: 1,
+                table_id: 2,
+            },
+            column_id: Some(10),
+            column_name: column_name.to_string(),
+            data_type: DataType::Utf8,
+            version: 1,
+            watermark: DictionaryWatermark::Iceberg {
+                snapshot_id: None,
+                schema_id: 0,
+            },
+            values: vec![DictionaryValue {
+                id: 1,
+                bytes: b"a".to_vec(),
+            }],
+            null_id: 0,
+            state: DictionaryState::Active,
+            order_preserving: true,
+        }
+    }
+
+    fn scan_expr_for_dict_test() -> OptExpr {
+        let source_column = output_col(1, "s");
+        OptExpr::leaf(Operator::LogicalScan(ScanOp {
+            database: "db".to_string(),
+            table: TableDef {
+                name: "t".to_string(),
+                columns: vec![ColumnDef {
+                    name: "s".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                }],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::StarRocks {
+                    db_id: 1,
+                    table_id: 2,
+                },
+            },
+            alias: None,
+            stats_ref: None,
+            columns: vec![source_column],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }))
     }
 
     #[test]
@@ -1700,5 +1794,66 @@ mod tests {
             assert_eq!(actual[0].data_type, output_columns[0].data_type);
             assert_eq!(actual[0].nullable, output_columns[0].nullable);
         }
+    }
+
+    #[test]
+    fn change_event_expand_decodes_child_dict_scope_and_declares_outputs() {
+        let mut arena = ScalarArena::new();
+        let source = arena.intern(
+            ScalarNode::ColumnRef(ColumnId::new_for_test(1)),
+            DataType::Utf8,
+            true,
+        );
+        let assignment = source;
+        let output_columns = vec![
+            output_col(101, "_file"),
+            output_col(102, "_pos"),
+            output_col(103, "__change_op"),
+        ];
+        let expand = OptExpr::new(
+            Operator::LogicalChangeEventExpand(ChangeEventExpandOp {
+                events: vec![ChangeEventSpec {
+                    predicate: Some(source),
+                    branch_kind: ChangeStreamBranchKind::DeleteDv,
+                    assignments: vec![ChangeEventOutputExpr {
+                        output_column_id: ColumnId::new_for_test(101),
+                        expr: Some(assignment),
+                    }],
+                }],
+                output_columns: output_columns.clone(),
+                change_op_column_id: ColumnId::new_for_test(103),
+                data_route_column_id: None,
+            }),
+            vec![scan_expr_for_dict_test()],
+        );
+        let mut ctx = DictionaryRewriteContext::default();
+        ctx.register_scan_column(
+            super::super::context::ScanColumnKey::new("db", "t", "s"),
+            sample_snapshot("s"),
+        );
+
+        let (rewritten, _scope) =
+            rewrite_node(expand, &mut ctx, &mut arena).expect("rewrite should not fail");
+
+        let declared = plan_output_columns(&rewritten, &arena);
+        assert_eq!(
+            declared
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>()
+        );
+        let Operator::LogicalChangeEventExpand(op) = &rewritten.op else {
+            panic!("expected LogicalChangeEventExpand");
+        };
+        assert_eq!(op.events[0].predicate, Some(source));
+        assert_eq!(op.events[0].assignments[0].expr, Some(assignment));
+        assert!(matches!(
+            &rewritten.unary_input().op,
+            Operator::LogicalDecode(_)
+        ));
     }
 }

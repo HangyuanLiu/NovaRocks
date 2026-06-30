@@ -83,6 +83,7 @@ pub(crate) fn compute_cost(
         | Operator::LogicalGenerateSeries(_)
         | Operator::LogicalTableFunction(_)
         | Operator::LogicalRepeat(_)
+        | Operator::LogicalChangeEventExpand(_)
         | Operator::LogicalCTEAnchor(_)
         | Operator::LogicalCTEProduce(_)
         | Operator::LogicalCTEConsume(_)
@@ -197,6 +198,7 @@ pub(crate) fn compute_cost(
         // CTE, Decode — lightweight default.
         Operator::PhysicalWindow(_)
         | Operator::PhysicalRepeat(_)
+        | Operator::PhysicalChangeEventExpand(_)
         | Operator::PhysicalUnion(_)
         | Operator::PhysicalIntersect(_)
         | Operator::PhysicalExcept(_)

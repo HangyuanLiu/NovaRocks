@@ -979,7 +979,34 @@ impl Rule for RepeatToPhysical {
 }
 
 // ---------------------------------------------------------------------------
-// 14. UnionToPhysical
+// 14. ChangeEventExpandToPhysical
+// ---------------------------------------------------------------------------
+
+pub(crate) struct ChangeEventExpandToPhysical;
+
+impl Rule for ChangeEventExpandToPhysical {
+    fn name(&self) -> &str {
+        "ChangeEventExpandToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalChangeEventExpand(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalChangeEventExpand(op) = &expr.op else {
+            return vec![];
+        };
+        vec![NewExpr {
+            op: Operator::PhysicalChangeEventExpand(op.clone()),
+            children: expr.children.clone(),
+        }]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 15. UnionToPhysical
 // ---------------------------------------------------------------------------
 
 fn refresh_set_op_child_output_columns(

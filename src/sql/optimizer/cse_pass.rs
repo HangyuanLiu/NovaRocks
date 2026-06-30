@@ -79,6 +79,9 @@ fn rewrite_node(
         Operator::PhysicalSort(_) => rewrite_sort(node, scalars, factory),
         Operator::PhysicalTopN(_) => rewrite_topn(node, scalars, factory),
         Operator::PhysicalWindow(_) => rewrite_window(node, scalars, factory),
+        Operator::PhysicalChangeEventExpand(_) => {
+            rewrite_change_event_expand(node, scalars, factory)
+        }
         _ => {}
     }
 }
@@ -689,6 +692,11 @@ fn available_output_ids(node: &OptimizerPhysicalNode) -> HashSet<ColumnId> {
             );
             ids
         }
+        Operator::PhysicalChangeEventExpand(expand) => expand
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
         Operator::PhysicalDecode(decode) => decode
             .output_columns
             .iter()
@@ -1187,6 +1195,49 @@ fn rewrite_window(
         }
         for key in &mut spec.order_by {
             key.expr = substitute(scalars, key.expr, &subst);
+        }
+    }
+    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+}
+
+fn rewrite_change_event_expand(
+    node: &mut OptimizerPhysicalNode,
+    scalars: &mut ScalarArena,
+    factory: &mut ColumnRefFactory,
+) {
+    if node.children.len() != 1 {
+        return;
+    }
+    let Operator::PhysicalChangeEventExpand(expand) = &node.op else {
+        return;
+    };
+    let mut roots = Vec::new();
+    for event in &expand.events {
+        roots.extend(event.predicate);
+        roots.extend(
+            event
+                .assignments
+                .iter()
+                .filter_map(|assignment| assignment.expr),
+        );
+    }
+    let commons = pick_commons(scalars, &roots);
+    if commons.is_empty() {
+        return;
+    }
+
+    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let Operator::PhysicalChangeEventExpand(expand) = &mut node.op else {
+        unreachable!("checked change-event expand operator above");
+    };
+    for event in &mut expand.events {
+        if let Some(predicate) = event.predicate {
+            event.predicate = Some(substitute(scalars, predicate, &subst));
+        }
+        for assignment in &mut event.assignments {
+            if let Some(expr) = assignment.expr {
+                assignment.expr = Some(substitute(scalars, expr, &subst));
+            }
         }
     }
     insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
