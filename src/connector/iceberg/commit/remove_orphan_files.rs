@@ -597,6 +597,7 @@ mod tests {
                 column_sizes: std::collections::HashMap::new(),
                 value_counts: std::collections::HashMap::new(),
                 null_value_counts: std::collections::HashMap::new(),
+                nan_value_counts: std::collections::HashMap::new(),
                 lower_bounds: std::collections::HashMap::new(),
                 upper_bounds: std::collections::HashMap::new(),
                 key_metadata: None,

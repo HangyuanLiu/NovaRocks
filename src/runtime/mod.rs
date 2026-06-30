@@ -48,6 +48,7 @@ pub mod runtime_state;
 pub mod scan_executor;
 pub(crate) mod scheduler;
 pub mod sink_commit;
+pub(crate) mod sink_commit_wire;
 pub mod starlet_shard_registry;
 pub mod start_epoch;
 pub mod thread_cpu_time;

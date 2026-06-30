@@ -79,6 +79,7 @@ pub async fn write_equality_delete_file(
         column_sizes: HashMap::new(),
         value_counts: HashMap::new(),
         null_value_counts: HashMap::new(),
+        nan_value_counts: HashMap::new(),
         lower_bounds: HashMap::new(),
         upper_bounds: HashMap::new(),
         key_metadata: None,

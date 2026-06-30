@@ -27,6 +27,7 @@ pub(crate) struct IcebergColumnStats {
     pub(crate) column_sizes: BTreeMap<i32, i64>,
     pub(crate) value_counts: BTreeMap<i32, i64>,
     pub(crate) null_value_counts: BTreeMap<i32, i64>,
+    pub(crate) nan_value_counts: BTreeMap<i32, i64>,
     pub(crate) lower_bounds: BTreeMap<i32, Vec<u8>>,
     pub(crate) upper_bounds: BTreeMap<i32, Vec<u8>>,
 }
@@ -36,6 +37,7 @@ impl IcebergColumnStats {
         self.column_sizes.is_empty()
             && self.value_counts.is_empty()
             && self.null_value_counts.is_empty()
+            && self.nan_value_counts.is_empty()
             && self.lower_bounds.is_empty()
             && self.upper_bounds.is_empty()
     }
@@ -132,6 +134,7 @@ fn column_stats_from_written_file(
         column_sizes: u64_stats_to_i64(&file.column_sizes, "column_sizes")?,
         value_counts: u64_stats_to_i64(&file.value_counts, "value_counts")?,
         null_value_counts: u64_stats_to_i64(&file.null_value_counts, "null_value_counts")?,
+        nan_value_counts: u64_stats_to_i64(&file.nan_value_counts, "nan_value_counts")?,
         lower_bounds: datum_bounds_to_bytes(&file.lower_bounds, "lower_bounds")?,
         upper_bounds: datum_bounds_to_bytes(&file.upper_bounds, "upper_bounds")?,
     };
@@ -242,5 +245,136 @@ mod tests {
         stats.column_sizes.insert(1, 42);
 
         assert!(!stats.is_empty());
+    }
+
+    #[test]
+    fn nan_value_count_makes_stats_non_empty() {
+        let mut stats = IcebergColumnStats::default();
+        stats.nan_value_counts.insert(1, 2);
+
+        assert!(!stats.is_empty());
+    }
+
+    #[test]
+    fn writer_report_from_written_file_preserves_nan_value_counts() {
+        let metadata = iceberg::spec::TableMetadataBuilder::from_table_creation(
+            iceberg::TableCreation::builder()
+                .name("t".to_string())
+                .location("file:///warehouse/db/t".to_string())
+                .schema(
+                    iceberg::spec::Schema::builder()
+                        .with_schema_id(1)
+                        .with_fields(vec![std::sync::Arc::new(
+                            iceberg::spec::NestedField::required(
+                                1,
+                                "id",
+                                iceberg::spec::Type::Primitive(
+                                    iceberg::spec::PrimitiveType::Double,
+                                ),
+                            ),
+                        )])
+                        .build()
+                        .expect("schema"),
+                )
+                .partition_spec(iceberg::spec::PartitionSpec::unpartition_spec())
+                .format_version(iceberg::spec::FormatVersion::V2)
+                .build(),
+        )
+        .expect("table metadata builder")
+        .build()
+        .expect("table metadata")
+        .metadata;
+        let file = crate::connector::iceberg::commit::WrittenFile {
+            path: "file:///warehouse/t/data/a.parquet".to_string(),
+            format: iceberg::spec::DataFileFormat::Parquet,
+            content: iceberg::spec::DataContentType::Data,
+            partition_values: Struct::empty(),
+            partition_spec_id: metadata.default_partition_spec_id(),
+            record_count: 1,
+            file_size_in_bytes: 12,
+            split_offsets: Vec::new(),
+            column_sizes: Default::default(),
+            value_counts: Default::default(),
+            null_value_counts: Default::default(),
+            nan_value_counts: HashMap::from([(1, 1)]),
+            lower_bounds: Default::default(),
+            upper_bounds: Default::default(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
+        };
+
+        let report = writer_report_from_written_file(&file, &metadata).expect("writer report");
+
+        assert_eq!(
+            report
+                .file
+                .column_stats
+                .expect("column stats")
+                .nan_value_counts
+                .get(&1),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn writer_report_from_written_file_rejects_cardinality_overflow() {
+        let metadata = iceberg::spec::TableMetadataBuilder::from_table_creation(
+            iceberg::TableCreation::builder()
+                .name("t".to_string())
+                .location("file:///warehouse/db/t".to_string())
+                .schema(
+                    iceberg::spec::Schema::builder()
+                        .with_schema_id(1)
+                        .with_fields(vec![std::sync::Arc::new(
+                            iceberg::spec::NestedField::required(
+                                1,
+                                "id",
+                                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+                            ),
+                        )])
+                        .build()
+                        .expect("schema"),
+                )
+                .partition_spec(iceberg::spec::PartitionSpec::unpartition_spec())
+                .format_version(iceberg::spec::FormatVersion::V2)
+                .build(),
+        )
+        .expect("table metadata builder")
+        .build()
+        .expect("table metadata")
+        .metadata;
+        let file = crate::connector::iceberg::commit::WrittenFile {
+            path: "file:///warehouse/t/dv-00000000.puffin".to_string(),
+            format: iceberg::spec::DataFileFormat::Puffin,
+            content: iceberg::spec::DataContentType::PositionDeletes,
+            partition_values: Struct::empty(),
+            partition_spec_id: metadata.default_partition_spec_id(),
+            record_count: 3,
+            file_size_in_bytes: 40,
+            split_offsets: Vec::new(),
+            column_sizes: Default::default(),
+            value_counts: Default::default(),
+            null_value_counts: Default::default(),
+            nan_value_counts: Default::default(),
+            lower_bounds: Default::default(),
+            upper_bounds: Default::default(),
+            key_metadata: None,
+            referenced_data_file: Some("file:///warehouse/t/data-1.parquet".to_string()),
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: Some(4),
+            content_size_in_bytes: Some(12),
+            cardinality: Some(i64::MAX as u64 + 1),
+        };
+
+        let err = writer_report_from_written_file(&file, &metadata)
+            .expect_err("cardinality overflow should fail");
+
+        assert!(err.contains("cardinality"), "got: {err}");
     }
 }

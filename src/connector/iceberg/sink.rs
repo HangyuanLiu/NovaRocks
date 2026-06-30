@@ -50,7 +50,7 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::{Statistics, ValueStatistics};
 
 use super::data_writer::{
-    StagedWriteContext, StagedWriteOptions, to_sink_commit_info, write_record_batches,
+    StagedWriteContext, StagedWriteOptions, staged_data_file_to_writer_report, write_record_batches,
 };
 use crate::common::config;
 use crate::connector::iceberg::commit::{
@@ -61,7 +61,6 @@ use crate::connector::iceberg::report::{
     IcebergColumnStats, IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     partition_path_from_struct,
 };
-use crate::connector::iceberg::report_wire::emit_iceberg_writer_report;
 use crate::connector::iceberg::sink_plan::{
     IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkPlan,
 };
@@ -402,17 +401,23 @@ impl IcebergTableSinkBackend {
                 write_record_batches(&staged_ctx, [part_batch], &staged_opts).await?;
             let partition_path = self.partition_path_for_key(&key);
             for staged in staged_files {
-                let (commit_info, sketch_set) = to_sink_commit_info(
+                let partition_report = IcebergPartitionReport {
+                    partition_path: partition_path.clone(),
+                    null_fingerprint: key.null_fingerprint.clone(),
+                    partition_spec_id: staged.partition_spec_id,
+                    partition_values: staged.data_file.partition().clone(),
+                };
+                let (report, sketch_set) = staged_data_file_to_writer_report(
                     &staged,
-                    partition_path.clone(),
-                    key.null_fingerprint.clone(),
+                    partition_report,
                     self.plan.report_file_format.clone(),
                     IcebergFileContent::Data,
                 )?;
                 if let Some(sketch_set) = sketch_set {
                     state.add_iceberg_sketch_set(sketch_set);
                 }
-                state.add_sink_commit_info(commit_info);
+                let metadata = staged.metadata.as_ref();
+                state.add_iceberg_writer_report(report, metadata)?;
             }
         }
 
@@ -489,28 +494,29 @@ impl IcebergTableSinkBackend {
                     .map_err(|e| format!("iceberg row-lineage sink write failed: {e}"))?;
                 let mut first_row_id_cursor = first_row_id;
                 for staged in staged_files {
-                    let (mut commit_info, sketch_set) = to_sink_commit_info(
+                    let partition_report = IcebergPartitionReport {
+                        partition_path: partition_path.clone(),
+                        null_fingerprint: key.null_fingerprint.clone(),
+                        partition_spec_id: staged.partition_spec_id,
+                        partition_values: staged.data_file.partition().clone(),
+                    };
+                    let (mut report, sketch_set) = staged_data_file_to_writer_report(
                         &staged,
-                        partition_path.clone(),
-                        key.null_fingerprint.clone(),
+                        partition_report,
                         self.plan.report_file_format.clone(),
                         IcebergFileContent::Data,
                     )?;
-                    if let Some(data_file) = commit_info.iceberg_data_file.as_mut() {
-                        data_file.first_row_id = Some(first_row_id_cursor);
-                        let record_count = data_file.record_count.ok_or_else(|| {
-                            "iceberg row-lineage sink report missing record_count".to_string()
+                    report.file.first_row_id = Some(first_row_id_cursor);
+                    first_row_id_cursor = first_row_id_cursor
+                        .checked_add(report.file.record_count)
+                        .ok_or_else(|| {
+                            "iceberg row-lineage sink first_row_id overflow".to_string()
                         })?;
-                        first_row_id_cursor = first_row_id_cursor
-                            .checked_add(record_count)
-                            .ok_or_else(|| {
-                                "iceberg row-lineage sink first_row_id overflow".to_string()
-                            })?;
-                    }
                     if let Some(sketch_set) = sketch_set {
                         state.add_iceberg_sketch_set(sketch_set);
                     }
-                    state.add_sink_commit_info(commit_info);
+                    let metadata = staged.metadata.as_ref();
+                    state.add_iceberg_writer_report(report, metadata)?;
                 }
                 start = end;
             }
@@ -648,7 +654,7 @@ impl IcebergTableSinkBackend {
                 is_overwrite: None,
                 is_rewrite: None,
             };
-            emit_iceberg_writer_report(state, report, &descriptor_metadata)?;
+            state.add_iceberg_writer_report(report, &descriptor_metadata)?;
         }
 
         Ok(())
@@ -759,7 +765,7 @@ impl IcebergTableSinkBackend {
                 is_overwrite: None,
                 is_rewrite: None,
             };
-            emit_iceberg_writer_report(&state, report, &metadata)?;
+            state.add_iceberg_writer_report(report, &metadata)?;
         }
 
         self.pending_deletion_vectors.clear();
@@ -810,7 +816,7 @@ impl IcebergTableSinkBackend {
         let report = crate::connector::iceberg::report::writer_report_from_written_file(
             &written, &metadata,
         )?;
-        emit_iceberg_writer_report(state, report, &metadata)?;
+        state.add_iceberg_writer_report(report, &metadata)?;
         Ok(())
     }
 
@@ -1672,6 +1678,7 @@ fn collect_iceberg_column_stats(metadata: &ParquetMetaData) -> Option<IcebergCol
         column_sizes,
         value_counts,
         null_value_counts,
+        nan_value_counts: BTreeMap::new(),
         lower_bounds,
         upper_bounds,
     })
@@ -2613,28 +2620,30 @@ mod tests {
 
         let infos = crate::runtime::sink_commit::list(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
-        assert_eq!(infos.len(), 1);
-        let data_file = infos[0]
-            .iceberg_data_file
-            .as_ref()
-            .expect("iceberg equality-delete data file");
-        assert_eq!(data_file.format.as_deref(), Some("parquet"));
-        assert_eq!(data_file.record_count, Some(2));
-        let expected_content =
-            crate::connector::iceberg::report_wire::expected_file_content_for_test(
-                IcebergFileContent::EqualityDeletes,
-            );
-        assert_eq!(data_file.file_content.as_ref(), Some(&expected_content));
+        let target_writer_schema =
+            iceberg_schema_from_arrow_schema(&backend.plan.target_schema).expect("target schema");
+        let target_metadata = backend
+            .plan
+            .build_target_table_metadata(&target_writer_schema)
+            .expect("target metadata");
+        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+            infos,
+            &target_metadata,
+        )
+        .expect("decode writer reports");
+        assert_eq!(reports.len(), 1);
+        let data_file = &reports[0].file;
+        assert_eq!(data_file.format, "parquet");
+        assert_eq!(data_file.record_count, 2);
+        assert_eq!(data_file.content, IcebergFileContent::EqualityDeletes);
         assert_eq!(data_file.equality_ids, Some(vec![11, 12]));
-        assert_eq!(data_file.partition_path.as_deref(), Some(""));
-        assert_eq!(data_file.partition_spec_id, Some(0));
+        assert_eq!(data_file.partition.partition_path, "");
+        assert_eq!(data_file.partition.partition_spec_id, 0);
         assert!(
             data_file
                 .path
-                .as_deref()
-                .unwrap_or_default()
                 .starts_with(&format!("{data_location}/equality-delete-")),
-            "unexpected equality-delete path: {:?}",
+            "unexpected equality-delete path: {}",
             data_file.path
         );
     }
@@ -2772,37 +2781,29 @@ mod tests {
             path.starts_with(&format!("{data_location}/id_part=7/")),
             "staged sink context should write under FE data_location and partition path, got {path}"
         );
-        let (commit_info, _) = crate::connector::iceberg::data_writer::to_sink_commit_info(
-            &staged[0],
-            "id_part=7".to_string(),
-            "0".to_string(),
-            "parquet".to_string(),
-            crate::connector::iceberg::delete_file::IcebergFileContent::Data,
-        )
-        .expect("commit info");
-        let data_file = commit_info.iceberg_data_file.expect("iceberg data file");
-        assert_eq!(data_file.partition_spec_id, Some(7));
+        let (report, _) =
+            crate::connector::iceberg::data_writer::staged_data_file_to_writer_report(
+                &staged[0],
+                crate::connector::iceberg::report::IcebergPartitionReport {
+                    partition_path: "id_part=7".to_string(),
+                    null_fingerprint: "0".to_string(),
+                    partition_spec_id: 7,
+                    partition_values: staged[0].data_file.partition().clone(),
+                },
+                "parquet".to_string(),
+                crate::connector::iceberg::delete_file::IcebergFileContent::Data,
+            )
+            .expect("writer report");
+        assert_eq!(report.file.partition.partition_spec_id, 7);
         let target_writer_schema =
             iceberg_schema_from_arrow_schema(&plan.target_schema).expect("target writer schema");
         let target_metadata = plan
             .build_target_table_metadata(&target_writer_schema)
             .expect("target metadata");
         assert_eq!(target_metadata.default_partition_spec_id(), 7);
-        let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
-            data_file.partition_values_descriptor.clone(),
-            data_file
-                .partition_spec_id
-                .expect("writer report partition spec id"),
-            &target_metadata,
-        )
-        .expect("decode descriptor");
         assert_eq!(
-            decoded,
+            report.file.partition.partition_values,
             iceberg::spec::Struct::from_iter([Some(iceberg::spec::Literal::int(7))])
-        );
-        assert!(
-            data_file.partition_values_descriptor.is_some(),
-            "writer report must carry a descriptor for non-zero target spec id"
         );
     }
 
@@ -2963,28 +2964,31 @@ mod tests {
 
         let infos = crate::runtime::sink_commit::list(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
-        assert_eq!(infos.len(), 1);
-        let data_file = infos[0]
-            .iceberg_data_file
-            .as_ref()
-            .expect("iceberg data file");
-        let path = data_file.path.as_deref().expect("path");
+        let target_writer_schema =
+            iceberg_schema_from_arrow_schema(&backend.plan.target_schema).expect("target schema");
+        let target_metadata = backend
+            .plan
+            .build_target_table_metadata(&target_writer_schema)
+            .expect("target metadata");
+        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+            infos,
+            &target_metadata,
+        )
+        .expect("decode writer reports");
+        assert_eq!(reports.len(), 1);
+        let data_file = &reports[0].file;
+        let path = data_file.path.as_str();
         assert!(
             path.starts_with(&format!("{data_location}/id_part=7/novarocks-00000-")),
             "DATA sink should use staged writer kernel file naming under FE data_location, got {path}"
         );
-        assert_eq!(data_file.partition_path.as_deref(), Some("id_part=7"));
+        assert_eq!(data_file.partition.partition_path, "id_part=7");
         assert_eq!(
-            data_file.partition_spec_id,
-            Some(0),
+            data_file.partition.partition_spec_id, 0,
             "writer report must carry the target default partition spec id"
         );
-        assert_eq!(data_file.record_count, Some(2));
-        let expected_content =
-            crate::connector::iceberg::report_wire::expected_file_content_for_test(
-                IcebergFileContent::Data,
-            );
-        assert_eq!(data_file.file_content.as_ref(), Some(&expected_content));
+        assert_eq!(data_file.record_count, 2);
+        assert_eq!(data_file.content, IcebergFileContent::Data);
     }
 
     fn test_identity_partition_metadata(
@@ -3188,37 +3192,23 @@ mod tests {
 
         let infos = crate::runtime::sink_commit::list(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
-        assert_eq!(infos.len(), 1);
-        let data_file = infos[0]
-            .iceberg_data_file
-            .as_ref()
-            .expect("iceberg delete data file");
-        let path = data_file.path.as_deref().expect("path");
+        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+            infos,
+            &target_metadata,
+        )
+        .expect("decode writer reports");
+        assert_eq!(reports.len(), 1);
+        let data_file = &reports[0].file;
+        let path = data_file.path.as_str();
         assert!(
             path.starts_with(&format!("{data_location}/id_part=7/delete-")),
             "position delete sink should keep manual delete file naming, got {path}"
         );
-        let expected_content =
-            crate::connector::iceberg::report_wire::expected_file_content_for_test(
-                IcebergFileContent::PositionDeletes,
-            );
-        assert_eq!(data_file.file_content.as_ref(), Some(&expected_content));
-        assert_eq!(data_file.partition_spec_id, Some(7));
-        assert!(
-            data_file.partition_values_descriptor.is_some(),
-            "position-delete writer report must carry a partition descriptor"
-        );
+        assert_eq!(data_file.content, IcebergFileContent::PositionDeletes);
+        assert_eq!(data_file.partition.partition_spec_id, 7);
         assert_eq!(target_metadata.default_partition_spec_id(), 7);
-        let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
-            data_file.partition_values_descriptor.clone(),
-            data_file
-                .partition_spec_id
-                .expect("writer report partition spec id"),
-            &target_metadata,
-        )
-        .expect("decode position-delete descriptor");
         assert_eq!(
-            decoded,
+            data_file.partition.partition_values,
             iceberg::spec::Struct::from_iter([Some(iceberg::spec::Literal::int(7))])
         );
         assert_eq!(data_file.referenced_data_file.as_deref(), Some(referenced));
@@ -3336,21 +3326,20 @@ mod tests {
 
         let infos = crate::runtime::sink_commit::list(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
-        assert_eq!(infos.len(), 2);
-        let mut reports = infos
-            .iter()
-            .map(|info| {
-                let data_file = info
-                    .iceberg_data_file
-                    .as_ref()
-                    .expect("iceberg delete data file");
+        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+            infos,
+            &target_metadata,
+        )
+        .expect("decode writer reports");
+        assert_eq!(reports.len(), 2);
+        let mut reports = reports
+            .into_iter()
+            .map(|report| {
+                let data_file = report.file;
                 (
-                    data_file
-                        .referenced_data_file
-                        .clone()
-                        .expect("referenced file"),
-                    data_file.partition_spec_id.expect("partition spec id"),
-                    data_file.partition_values_descriptor.clone(),
+                    data_file.referenced_data_file.expect("referenced file"),
+                    data_file.partition.partition_spec_id,
+                    data_file.partition.partition_values,
                 )
             })
             .collect::<Vec<_>>();
@@ -3358,16 +3347,16 @@ mod tests {
 
         assert_eq!(reports[0].0, new_file);
         assert_eq!(reports[0].1, new_spec_id);
+        assert_eq!(
+            reports[0].2,
+            iceberg::spec::Struct::from_iter([Some(iceberg::spec::Literal::int(2))])
+        );
         assert_eq!(reports[1].0, old_file);
         assert_eq!(reports[1].1, old_spec_id);
-        for (_, spec_id, descriptor) in reports {
-            crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
-                descriptor,
-                spec_id,
-                &target_metadata,
-            )
-            .expect("descriptor should decode against the referenced file spec");
-        }
+        assert_eq!(
+            reports[1].2,
+            iceberg::spec::Struct::from_iter([Some(iceberg::spec::Literal::int(1))])
+        );
     }
 
     fn build_deletion_vector_backend_chunk(
@@ -3543,40 +3532,24 @@ mod tests {
 
         let infos = crate::runtime::sink_commit::list(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
-        assert_eq!(infos.len(), 1);
-        let data_file = infos[0]
-            .iceberg_data_file
-            .as_ref()
-            .expect("iceberg dv data file");
-        assert_eq!(data_file.format.as_deref(), Some("puffin"));
-        let expected_content =
-            crate::connector::iceberg::report_wire::expected_file_content_for_test(
-                IcebergFileContent::PositionDeletes,
-            );
-        assert_eq!(data_file.file_content.as_ref(), Some(&expected_content));
-        assert_eq!(data_file.referenced_data_file.as_deref(), Some(referenced));
-        assert_eq!(data_file.cardinality, Some(2));
-        assert_eq!(data_file.record_count, Some(2));
-        assert!(data_file.content_offset.is_some());
-        assert!(data_file.content_size_in_bytes.is_some());
-        assert!(
-            data_file
-                .path
-                .as_deref()
-                .unwrap_or_default()
-                .ends_with(".puffin")
-        );
-        assert_eq!(data_file.partition_path.as_deref(), Some("id_part=7"));
-        let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
-            data_file.partition_values_descriptor.clone(),
-            data_file
-                .partition_spec_id
-                .expect("writer report partition spec id"),
+        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+            infos,
             &target_metadata,
         )
-        .expect("decode deletion-vector descriptor");
+        .expect("decode writer reports");
+        assert_eq!(reports.len(), 1);
+        let data_file = &reports[0].file;
+        assert_eq!(data_file.format, "puffin");
+        assert_eq!(data_file.content, IcebergFileContent::PositionDeletes);
+        assert_eq!(data_file.referenced_data_file.as_deref(), Some(referenced));
+        assert_eq!(data_file.cardinality, Some(2));
+        assert_eq!(data_file.record_count, 2);
+        assert!(data_file.content_offset.is_some());
+        assert!(data_file.content_size_in_bytes.is_some());
+        assert!(data_file.path.ends_with(".puffin"));
+        assert_eq!(data_file.partition.partition_path, "id_part=7");
         assert_eq!(
-            decoded,
+            data_file.partition.partition_values,
             iceberg::spec::Struct::from_iter([Some(iceberg::spec::Literal::int(7))])
         );
     }
@@ -3608,7 +3581,7 @@ mod tests {
         let data_location = dir.path().join("custom-data").display().to_string();
         let referenced = "f.parquet";
         let finst_id = UniqueId { hi: 706, lo: 42 };
-        let (mut backend, state, first_chunk, _target_metadata) =
+        let (mut backend, state, first_chunk, target_metadata) =
             build_deletion_vector_backend_chunk(
                 table_location,
                 data_location,
@@ -3643,13 +3616,15 @@ mod tests {
             1,
             "same referenced data file should produce one Puffin DV per sink lifecycle"
         );
-        let data_file = infos[0]
-            .iceberg_data_file
-            .as_ref()
-            .expect("iceberg dv data file");
+        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+            infos,
+            &target_metadata,
+        )
+        .expect("decode writer reports");
+        let data_file = &reports[0].file;
         assert_eq!(data_file.referenced_data_file.as_deref(), Some(referenced));
         assert_eq!(data_file.cardinality, Some(3));
-        assert_eq!(data_file.record_count, Some(3));
+        assert_eq!(data_file.record_count, 3);
     }
 
     #[test]

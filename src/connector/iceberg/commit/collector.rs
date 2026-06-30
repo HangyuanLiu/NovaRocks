@@ -21,10 +21,9 @@
 //! before lowering, dropped after `run_iceberg_commit` returns.
 //!
 //! At pipeline finish, [`take_written_files`](IcebergCommitCollector::take_written_files)
-//! drains the per-fragment-instance entries from [`runtime::sink_commit`] and
-//! converts the recorded `TIcebergDataFile` values into [`WrittenFile`]s. Each
-//! file path is mirrored into the [`AbortLog`] so that a later commit failure
-//! can clean up via OpenDAL.
+//! consumes writer reports decoded by the runtime sink-commit wire adapter and
+//! converts them into [`WrittenFile`]s. Each file path is mirrored into the
+//! [`AbortLog`] so that a later commit failure can clean up via OpenDAL.
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +43,7 @@ use crate::common::types::UniqueId;
 use super::abort::AbortLog;
 use super::position_delete_writer::PositionDeleteGroup;
 use super::types::{CommitOpKind, WrittenFile};
+use crate::connector::iceberg::report::IcebergWriterReport;
 use crate::connector::iceberg::stats_assembler::FileSketchSet;
 
 /// Query-scoped Iceberg INSERT / INSERT OVERWRITE / DELETE state.
@@ -280,39 +280,20 @@ impl IcebergCommitCollector {
             .is_empty()
     }
 
-    /// Convert one writer-reported sink commit payload without mutating the
-    /// collector. This lets callers validate all writer payloads before any file
-    /// becomes visible to the commit-action or abort log.
-    pub(crate) fn convert_sink_commit_info(
-        &self,
-        info: crate::thrift::types::TSinkCommitInfo,
-    ) -> Result<WrittenFile, String> {
-        let df = info
-            .iceberg_data_file
-            .ok_or_else(|| "sink_commit_info missing iceberg_data_file".to_string())?;
-        self.convert(df)
+    pub(crate) fn inject_writer_report(&self, report: IcebergWriterReport) -> Result<(), String> {
+        self.inject_writer_reports([report])
     }
 
-    /// Pre-load one writer-reported sink commit payload without consulting the
-    /// process-global `runtime::sink_commit` table. Used by coordinated writes
-    /// where the engine already collected all writer reports.
-    pub(crate) fn inject_sink_commit_info(
-        &self,
-        info: crate::thrift::types::TSinkCommitInfo,
-    ) -> Result<(), String> {
-        self.inject_sink_commit_infos([info])
-    }
-
-    /// Pre-load a batch of writer-reported sink commit payloads atomically:
-    /// either every payload converts and becomes visible, or the collector and
-    /// abort log remain unchanged.
-    pub(crate) fn inject_sink_commit_infos<I>(&self, infos: I) -> Result<(), String>
+    /// Pre-load a batch of writer reports atomically: either every report
+    /// converts and becomes visible, or the collector and abort log remain
+    /// unchanged.
+    pub(crate) fn inject_writer_reports<I>(&self, reports: I) -> Result<(), String>
     where
-        I: IntoIterator<Item = crate::thrift::types::TSinkCommitInfo>,
+        I: IntoIterator<Item = IcebergWriterReport>,
     {
-        let files = infos
+        let files = reports
             .into_iter()
-            .map(|info| self.convert_sink_commit_info(info))
+            .map(|report| self.convert_writer_report(report))
             .collect::<Result<Vec<_>, _>>()?;
         self.inject_written_files(files);
         Ok(())
@@ -323,8 +304,8 @@ impl IcebergCommitCollector {
     /// If the engine pre-loaded files via [`inject_written_file`], those are
     /// returned and the per-fragment-instance `sink_commit` table is left
     /// untouched. Otherwise the collector drains
-    /// [`runtime::sink_commit::list`] and converts each `TIcebergDataFile`
-    /// into a [`WrittenFile`].
+    /// [`runtime::sink_commit::list`] and decodes each transport payload into a
+    /// writer report before converting it into a [`WrittenFile`].
     pub fn take_written_files(&self) -> Result<Vec<WrittenFile>, String> {
         {
             let mut guard = self
@@ -335,20 +316,24 @@ impl IcebergCommitCollector {
                 return Ok(std::mem::take(&mut *guard));
             }
         }
-        let infos = crate::runtime::sink_commit::list(self.finst_id);
-        let mut out = Vec::with_capacity(infos.len());
-        for info in infos {
-            let df = info
-                .iceberg_data_file
-                .ok_or_else(|| "sink_commit_info missing iceberg_data_file".to_string())?;
-            let wf = self.convert(df)?;
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            crate::common::engine_error::EngineError::iceberg_write_descriptor_mismatch(
+                "IcebergCommitCollector missing table metadata",
+            )
+            .to_bracketed_user_message()
+        })?;
+        let reports =
+            crate::runtime::sink_commit_wire::list_iceberg_writer_reports(self.finst_id, metadata)?;
+        let mut out = Vec::with_capacity(reports.len());
+        for report in reports {
+            let wf = self.convert_writer_report(report)?;
             self.abort_log.record_data_file(wf.path.clone());
             out.push(wf);
         }
         Ok(out)
     }
 
-    /// Reconstruct a [`WrittenFile`] from a writer-reported `TIcebergDataFile`.
+    /// Reconstruct a [`WrittenFile`] from a writer report.
     ///
     /// As of P6 this is descriptor-authoritative for Iceberg partition values
     /// and lossless against the inject path
@@ -365,94 +350,71 @@ impl IcebergCommitCollector {
     ///   `runtime::sink_commit::take_sketch_sets`), which is in-process today.
     ///   Cross-node sketch transport is required only when multi-BE append is
     ///   cut over and is out of scope for PR-0.
-    fn convert(&self, df: crate::thrift::types::TIcebergDataFile) -> Result<WrittenFile, String> {
+    pub(crate) fn convert_writer_report(
+        &self,
+        report: IcebergWriterReport,
+    ) -> Result<WrittenFile, String> {
+        use crate::connector::iceberg::delete_file::IcebergFileContent;
         use iceberg::spec::{DataContentType, DataFileFormat};
 
-        let path = df
-            .path
-            .ok_or_else(|| "TIcebergDataFile missing path".to_string())?;
-        let format = match df.format.as_deref() {
-            Some(format) => DataFileFormat::from_str(format).map_err(|e| {
-                format!("unsupported TIcebergDataFile format `{format}` in sink_commit_info: {e}")
-            })?,
-            None => DataFileFormat::Parquet,
-        };
-        let content = match df
-            .file_content
-            .unwrap_or(crate::thrift::types::TIcebergFileContent::DATA)
-        {
-            crate::thrift::types::TIcebergFileContent::DATA => DataContentType::Data,
-            crate::thrift::types::TIcebergFileContent::POSITION_DELETES => {
-                DataContentType::PositionDeletes
-            }
-            crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES => {
-                DataContentType::EqualityDeletes
-            }
-            other => {
-                return Err(format!(
-                    "unexpected TIcebergFileContent variant {other:?} in sink_commit_info"
-                ));
-            }
+        let IcebergWriterReport { file, .. } = report;
+        let format_name = file.format.clone();
+        let format = DataFileFormat::from_str(&format_name).map_err(|e| {
+            format!("unsupported Iceberg writer report format `{format_name}`: {e}")
+        })?;
+        let content = match file.content {
+            IcebergFileContent::Data => DataContentType::Data,
+            IcebergFileContent::PositionDeletes => DataContentType::PositionDeletes,
+            IcebergFileContent::EqualityDeletes => DataContentType::EqualityDeletes,
         };
         validate_puffin_dv_descriptor(
-            format,
-            content,
-            df.referenced_data_file.as_deref(),
-            df.content_offset,
-            df.content_size_in_bytes,
-            df.cardinality,
+            format.clone(),
+            content.clone(),
+            file.referenced_data_file.as_deref(),
+            file.content_offset,
+            file.content_size_in_bytes,
+            file.cardinality,
         )?;
 
-        let partition_spec_id = df.partition_spec_id.ok_or_else(|| {
-            crate::common::engine_error::EngineError::iceberg_write_descriptor_mismatch(
-                "TIcebergDataFile missing partition_spec_id",
-            )
-            .to_bracketed_user_message()
-        })?;
-        let metadata = self.metadata.as_ref().ok_or_else(|| {
-            crate::common::engine_error::EngineError::iceberg_write_descriptor_mismatch(
-                "IcebergCommitCollector missing table metadata",
-            )
-            .to_bracketed_user_message()
-        })?;
-        let partition_values =
-            crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
-                df.partition_values_descriptor,
-                partition_spec_id,
-                metadata,
-            )
-            .map_err(|e| {
-                crate::common::engine_error::EngineError::from(e).to_bracketed_user_message()
-            })?;
-
-        let stats = df.column_stats.unwrap_or_default();
-        let column_sizes = i64_map_to_u64(stats.column_sizes, "column_sizes")?;
-        let value_counts = i64_map_to_u64(stats.value_counts, "value_counts")?;
-        let null_value_counts = i64_map_to_u64(stats.null_value_counts, "null_value_counts")?;
-        let lower_bounds = self.decode_bounds(stats.lower_bounds, "lower_bounds")?;
-        let upper_bounds = self.decode_bounds(stats.upper_bounds, "upper_bounds")?;
+        let partition = file.partition;
+        let stats = file.column_stats.unwrap_or_default();
+        let column_sizes = i64_map_to_u64(Some(stats.column_sizes), "column_sizes")?;
+        let value_counts = i64_map_to_u64(Some(stats.value_counts), "value_counts")?;
+        let null_value_counts = i64_map_to_u64(Some(stats.null_value_counts), "null_value_counts")?;
+        let nan_value_counts = i64_map_to_u64(Some(stats.nan_value_counts), "nan_value_counts")?;
+        let lower_bounds = self.decode_bounds(Some(stats.lower_bounds), "lower_bounds")?;
+        let upper_bounds = self.decode_bounds(Some(stats.upper_bounds), "upper_bounds")?;
+        let split_offsets = i64_vec_non_negative(file.split_offsets, "split_offsets")?;
+        let first_row_id = i64_option_non_negative(file.first_row_id, "first_row_id")?;
+        let content_offset = i64_option_non_negative(file.content_offset, "content_offset")?;
+        let content_size_in_bytes =
+            i64_option_non_negative(file.content_size_in_bytes, "content_size_in_bytes")?;
 
         Ok(WrittenFile {
-            path,
+            path: file.path,
             format,
             content,
-            partition_values,
-            partition_spec_id,
-            record_count: df.record_count.unwrap_or(0).max(0) as u64,
-            file_size_in_bytes: df.file_size_in_bytes.unwrap_or(0).max(0) as u64,
-            split_offsets: df.split_offsets.unwrap_or_default(),
+            partition_values: partition.partition_values,
+            partition_spec_id: partition.partition_spec_id,
+            record_count: i64_to_u64(file.record_count, "record_count")?,
+            file_size_in_bytes: i64_to_u64(file.file_size_in_bytes, "file_size_in_bytes")?,
+            split_offsets,
             column_sizes,
             value_counts,
             null_value_counts,
+            nan_value_counts,
             lower_bounds,
             upper_bounds,
-            key_metadata: df.key_metadata,
-            referenced_data_file: df.referenced_data_file,
-            equality_ids: df.equality_ids,
-            first_row_id: df.first_row_id,
-            content_offset: df.content_offset,
-            content_size_in_bytes: df.content_size_in_bytes,
-            cardinality: df.cardinality.map(|c| c.max(0) as u64),
+            key_metadata: file.key_metadata,
+            referenced_data_file: file.referenced_data_file,
+            equality_ids: file.equality_ids,
+            first_row_id,
+            content_offset,
+            content_size_in_bytes,
+            cardinality: file
+                .cardinality
+                .map(|c| i64_to_u64(c, "cardinality"))
+                .transpose()?,
         })
     }
 
@@ -553,8 +515,36 @@ fn validate_puffin_dv_descriptor(
     }
 }
 
-/// Convert a thrift `map<i32, i64>` column-stat map into the `WrittenFile`
-/// `HashMap<i32, u64>` representation. Inverse of `data_writer::u64_stats_to_i64`.
+/// Convert signed writer-report counts into the `WrittenFile`
+/// `HashMap<i32, u64>` representation.
+fn i64_to_u64(value: i64, field: &str) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| format!("iceberg {field} value {value} is negative"))
+}
+
+fn i64_option_non_negative(value: Option<i64>, field: &str) -> Result<Option<i64>, String> {
+    if let Some(value) = value
+        && value < 0
+    {
+        return Err(format!("iceberg {field} value {value} is negative"));
+    }
+    Ok(value)
+}
+
+fn i64_vec_non_negative(values: Option<Vec<i64>>, field: &str) -> Result<Vec<i64>, String> {
+    values
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            if value < 0 {
+                Err(format!("iceberg {field}[{idx}] value {value} is negative"))
+            } else {
+                Ok(value)
+            }
+        })
+        .collect()
+}
+
 fn i64_map_to_u64(
     map: Option<BTreeMap<i32, i64>>,
     field: &str,
@@ -562,11 +552,8 @@ fn i64_map_to_u64(
     map.unwrap_or_default()
         .into_iter()
         .map(|(field_id, value)| {
-            u64::try_from(value)
+            i64_to_u64(value, &format!("column stat {field}[{field_id}]"))
                 .map(|value| (field_id, value))
-                .map_err(|_| {
-                    format!("iceberg column stat {field}[{field_id}] value {value} is negative")
-                })
         })
         .collect()
 }
@@ -1011,166 +998,55 @@ mod parity_tests {
         (collector, metadata, spec_id)
     }
 
+    fn writer_report_from_data_file(
+        df: &iceberg::spec::DataFile,
+        partition_spec_id: i32,
+        metadata: &TableMetadata,
+    ) -> crate::connector::iceberg::report::IcebergWriterReport {
+        let written =
+            crate::engine::iceberg_writer::data_file_to_written_file(df, partition_spec_id)
+                .expect("written file");
+        crate::connector::iceberg::report::writer_report_from_written_file(&written, metadata)
+            .expect("writer report")
+    }
+
     #[test]
-    fn convert_uses_partition_descriptor_not_partition_path() {
-        let (collector, metadata, spec_id) = string_partition_collector();
+    fn convert_writer_report_uses_partition_values_not_partition_path() {
+        let (collector, _metadata, spec_id) = string_partition_collector();
         let values = Struct::from_iter([Some(Literal::string("west"))]);
-        let descriptor = crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-            &values, spec_id, &metadata,
-        )
-        .expect("descriptor");
-        let thrift = crate::thrift::types::TIcebergDataFile {
-            path: Some("file:///warehouse/t/data/a.parquet".to_string()),
-            format: Some("PARQUET".to_string()),
-            record_count: Some(1),
-            file_size_in_bytes: Some(12),
-            partition_path: Some("region=east".to_string()),
-            split_offsets: None,
-            column_stats: None,
-            partition_null_fingerprint: Some("0".to_string()),
-            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
-            referenced_data_file: None,
-            first_row_id: None,
-            content_offset: None,
-            content_size_in_bytes: None,
-            cardinality: None,
-            equality_ids: None,
-            key_metadata: None,
-            partition_values_descriptor: Some(descriptor),
-            partition_spec_id: Some(spec_id),
-            ..Default::default()
+        let report = crate::connector::iceberg::report::IcebergWriterReport {
+            file: crate::connector::iceberg::report::IcebergWrittenFileReport {
+                path: "file:///warehouse/t/data/a.parquet".to_string(),
+                format: "PARQUET".to_string(),
+                content: crate::connector::iceberg::delete_file::IcebergFileContent::Data,
+                record_count: 1,
+                file_size_in_bytes: 12,
+                partition: crate::connector::iceberg::report::IcebergPartitionReport {
+                    partition_path: "region=east".to_string(),
+                    null_fingerprint: "0".to_string(),
+                    partition_spec_id: spec_id,
+                    partition_values: values.clone(),
+                },
+                split_offsets: None,
+                column_stats: None,
+                referenced_data_file: None,
+                first_row_id: None,
+                equality_ids: None,
+                key_metadata: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            },
+            is_overwrite: None,
+            is_rewrite: None,
         };
 
-        let written = collector.convert(thrift).expect("convert");
+        let written = collector
+            .convert_writer_report(report)
+            .expect("convert writer report");
 
         assert_eq!(written.partition_values, values);
         assert_eq!(written.partition_spec_id, spec_id);
-    }
-
-    #[test]
-    fn convert_rejects_missing_partition_descriptor() {
-        let (collector, _metadata, spec_id) = string_partition_collector();
-        let thrift = crate::thrift::types::TIcebergDataFile {
-            path: Some("file:///warehouse/t/data/a.parquet".to_string()),
-            format: Some("PARQUET".to_string()),
-            record_count: Some(1),
-            file_size_in_bytes: Some(12),
-            partition_path: Some("region=west".to_string()),
-            split_offsets: None,
-            column_stats: None,
-            partition_null_fingerprint: Some("0".to_string()),
-            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
-            referenced_data_file: None,
-            first_row_id: None,
-            content_offset: None,
-            content_size_in_bytes: None,
-            cardinality: None,
-            equality_ids: None,
-            key_metadata: None,
-            partition_values_descriptor: None,
-            partition_spec_id: Some(spec_id),
-            ..Default::default()
-        };
-
-        let err = collector
-            .convert(thrift)
-            .expect_err("missing descriptor should fail");
-
-        assert!(
-            err.starts_with("[IcebergWriteDescriptorMismatch] "),
-            "got: {err}"
-        );
-        assert!(err.contains("missing partition descriptor"), "got: {err}");
-    }
-
-    #[test]
-    fn convert_rejects_missing_partition_spec_id() {
-        let (collector, metadata, spec_id) = string_partition_collector();
-        let values = Struct::from_iter([Some(Literal::string("west"))]);
-        let descriptor = crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-            &values, spec_id, &metadata,
-        )
-        .expect("descriptor");
-        let thrift = crate::thrift::types::TIcebergDataFile {
-            path: Some("file:///warehouse/t/data/a.parquet".to_string()),
-            format: Some("PARQUET".to_string()),
-            record_count: Some(1),
-            file_size_in_bytes: Some(12),
-            partition_path: Some("region=west".to_string()),
-            split_offsets: None,
-            column_stats: None,
-            partition_null_fingerprint: Some("0".to_string()),
-            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
-            referenced_data_file: None,
-            first_row_id: None,
-            content_offset: None,
-            content_size_in_bytes: None,
-            cardinality: None,
-            equality_ids: None,
-            key_metadata: None,
-            partition_values_descriptor: Some(descriptor),
-            partition_spec_id: None,
-            ..Default::default()
-        };
-
-        let err = collector
-            .convert(thrift)
-            .expect_err("missing partition spec id should fail");
-
-        assert_eq!(
-            err,
-            "[IcebergWriteDescriptorMismatch] TIcebergDataFile missing partition_spec_id"
-        );
-    }
-
-    #[test]
-    fn convert_rejects_missing_collector_metadata() {
-        let (collector_with_metadata, metadata, spec_id) = string_partition_collector();
-        let values = Struct::from_iter([Some(Literal::string("west"))]);
-        let descriptor = crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-            &values, spec_id, &metadata,
-        )
-        .expect("descriptor");
-        let thrift = crate::thrift::types::TIcebergDataFile {
-            path: Some("file:///warehouse/t/data/a.parquet".to_string()),
-            format: Some("PARQUET".to_string()),
-            record_count: Some(1),
-            file_size_in_bytes: Some(12),
-            partition_path: Some("region=west".to_string()),
-            split_offsets: None,
-            column_stats: None,
-            partition_null_fingerprint: Some("0".to_string()),
-            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
-            referenced_data_file: None,
-            first_row_id: None,
-            content_offset: None,
-            content_size_in_bytes: None,
-            cardinality: None,
-            equality_ids: None,
-            key_metadata: None,
-            partition_values_descriptor: Some(descriptor),
-            partition_spec_id: Some(spec_id),
-            ..Default::default()
-        };
-        let collector = IcebergCommitCollector::new(
-            CommitOpKind::FastAppend,
-            TableIdent::from_strs(["db", "t"]).expect("ident"),
-            None,
-            metadata.last_sequence_number(),
-            Arc::clone(&collector_with_metadata.schema),
-            Arc::clone(&collector_with_metadata.partition_spec),
-            "file:///tmp/staging".to_string(),
-            UniqueId { hi: 1, lo: 2 },
-        );
-
-        let err = collector
-            .convert(thrift)
-            .expect_err("missing collector metadata should fail");
-
-        assert_eq!(
-            err,
-            "[IcebergWriteDescriptorMismatch] IcebergCommitCollector missing table metadata"
-        );
     }
 
     #[test]
@@ -1194,133 +1070,13 @@ mod parity_tests {
         let expected =
             crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
 
-        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
-            &df,
-            String::new(),
-            String::new(),
-            "PARQUET".to_string(),
-            crate::thrift::types::TIcebergFileContent::DATA,
-            Some(0),
-            &metadata,
-        )
-        .expect("thrift");
-
+        let report = writer_report_from_data_file(&df, 0, &metadata);
         let collector = unpartitioned_collector(int_schema());
-        let actual = collector.convert(thrift).expect("convert");
+        let actual = collector
+            .convert_writer_report(report)
+            .expect("convert writer report");
 
         assert_eq!(expected, actual);
-    }
-
-    #[test]
-    fn inject_sink_commit_info_converts_and_drains_written_file() {
-        let metadata = unpartitioned_metadata(int_schema());
-        let mut b = DataFileBuilder::default();
-        b.content(DataContentType::Data)
-            .file_path("file:///t/data-from-sink.parquet".to_string())
-            .file_format(DataFileFormat::Parquet)
-            .partition(Struct::empty())
-            .partition_spec_id(0)
-            .record_count(7)
-            .file_size_in_bytes(128);
-        let df = b.build().expect("data file");
-
-        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
-            &df,
-            String::new(),
-            String::new(),
-            "PARQUET".to_string(),
-            crate::thrift::types::TIcebergFileContent::DATA,
-            Some(0),
-            &metadata,
-        )
-        .expect("thrift");
-
-        let collector = unpartitioned_collector(int_schema());
-        collector
-            .inject_sink_commit_info(crate::thrift::types::TSinkCommitInfo {
-                iceberg_data_file: Some(thrift),
-                ..Default::default()
-            })
-            .expect("inject sink commit info");
-
-        let files = collector.take_written_files().expect("take written files");
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "file:///t/data-from-sink.parquet");
-        assert_eq!(files[0].record_count, 7);
-        assert!(
-            collector
-                .take_written_files()
-                .expect("second take")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn inject_sink_commit_info_rejects_missing_data_file() {
-        let collector = unpartitioned_collector(int_schema());
-        let err = collector
-            .inject_sink_commit_info(crate::thrift::types::TSinkCommitInfo {
-                iceberg_data_file: None,
-                ..Default::default()
-            })
-            .expect_err("missing data file should fail");
-        assert!(
-            err.contains("sink_commit_info missing iceberg_data_file"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn inject_sink_commit_infos_is_all_or_nothing() {
-        let metadata = unpartitioned_metadata(int_schema());
-        let mut b = DataFileBuilder::default();
-        b.content(DataContentType::Data)
-            .file_path("file:///t/atomic-data.parquet".to_string())
-            .file_format(DataFileFormat::Parquet)
-            .partition(Struct::empty())
-            .partition_spec_id(0)
-            .record_count(7)
-            .file_size_in_bytes(128);
-        let df = b.build().expect("data file");
-        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
-            &df,
-            String::new(),
-            String::new(),
-            "PARQUET".to_string(),
-            crate::thrift::types::TIcebergFileContent::DATA,
-            Some(0),
-            &metadata,
-        )
-        .expect("thrift");
-
-        let collector = unpartitioned_collector(int_schema());
-        let err = collector
-            .inject_sink_commit_infos([
-                crate::thrift::types::TSinkCommitInfo {
-                    iceberg_data_file: Some(thrift),
-                    ..Default::default()
-                },
-                crate::thrift::types::TSinkCommitInfo {
-                    iceberg_data_file: None,
-                    ..Default::default()
-                },
-            ])
-            .expect_err("batch with invalid sink payload must fail");
-        assert!(
-            err.contains("sink_commit_info missing iceberg_data_file"),
-            "got: {err}"
-        );
-        assert!(
-            collector
-                .take_written_files()
-                .expect("take written files")
-                .is_empty(),
-            "failed batch must not inject partially converted files"
-        );
-        assert!(
-            collector.abort_log.drain_data_files().is_empty(),
-            "failed batch must not partially populate abort log"
-        );
     }
 
     #[test]
@@ -1340,19 +1096,11 @@ mod parity_tests {
         let expected =
             crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
 
-        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
-            &df,
-            String::new(),
-            String::new(),
-            "PARQUET".to_string(),
-            crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES,
-            Some(0),
-            &metadata,
-        )
-        .expect("thrift");
-
+        let report = writer_report_from_data_file(&df, 0, &metadata);
         let collector = unpartitioned_collector(int_schema());
-        let actual = collector.convert(thrift).expect("convert");
+        let actual = collector
+            .convert_writer_report(report)
+            .expect("convert writer report");
 
         assert_eq!(expected, actual);
         assert_eq!(actual.equality_ids, Some(vec![1]));
@@ -1392,17 +1140,7 @@ mod parity_tests {
         let expected =
             crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
 
-        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
-            &df,
-            "k1=5".to_string(),
-            String::new(),
-            "PARQUET".to_string(),
-            crate::thrift::types::TIcebergFileContent::DATA,
-            Some(0),
-            &metadata,
-        )
-        .expect("thrift");
-
+        let report = writer_report_from_data_file(&df, 0, &metadata);
         let collector = IcebergCommitCollector::new(
             CommitOpKind::FastAppend,
             TableIdent::from_strs(["db", "t"]).expect("ident"),
@@ -1414,7 +1152,9 @@ mod parity_tests {
             UniqueId { hi: 0, lo: 0 },
         )
         .with_table_metadata(metadata.clone());
-        let actual = collector.convert(thrift).expect("convert");
+        let actual = collector
+            .convert_writer_report(report)
+            .expect("convert writer report");
 
         assert_eq!(expected.partition_values, actual.partition_values);
         assert_eq!(expected, actual);
@@ -1446,17 +1186,7 @@ mod parity_tests {
         let expected =
             crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
 
-        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
-            &df,
-            "k1_bucket=2".to_string(),
-            String::new(),
-            "PARQUET".to_string(),
-            crate::thrift::types::TIcebergFileContent::DATA,
-            Some(0),
-            &metadata,
-        )
-        .expect("thrift");
-
+        let report = writer_report_from_data_file(&df, 0, &metadata);
         let collector = IcebergCommitCollector::new(
             CommitOpKind::FastAppend,
             TableIdent::from_strs(["db", "t"]).expect("ident"),
@@ -1468,7 +1198,9 @@ mod parity_tests {
             UniqueId { hi: 0, lo: 0 },
         )
         .with_table_metadata(metadata.clone());
-        let actual = collector.convert(thrift).expect("convert");
+        let actual = collector
+            .convert_writer_report(report)
+            .expect("convert writer report");
 
         assert_eq!(expected.partition_values, actual.partition_values);
         assert_eq!(expected, actual);
@@ -1491,20 +1223,10 @@ mod parity_tests {
         b.lower_bounds(HashMap::from([(999, Datum::int(7))]));
         let df = b.build().expect("data file");
 
-        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
-            &df,
-            String::new(),
-            String::new(),
-            "PARQUET".to_string(),
-            crate::thrift::types::TIcebergFileContent::DATA,
-            Some(0),
-            &metadata,
-        )
-        .expect("thrift");
-
+        let report = writer_report_from_data_file(&df, 0, &metadata);
         let collector = unpartitioned_collector(int_schema());
         let actual = collector
-            .convert(thrift)
+            .convert_writer_report(report)
             .expect("convert should skip unknown field-id, not error");
         assert!(
             actual.lower_bounds.is_empty(),
@@ -1517,37 +1239,43 @@ mod parity_tests {
     fn convert_skips_bounds_for_variant_field_ids() {
         let metadata = unpartitioned_metadata(int_variant_schema());
         let partition_spec_id = metadata.default_partition_spec_id();
-        let partition_values_descriptor =
-            crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-                &Struct::empty(),
-                partition_spec_id,
-                &metadata,
-            )
-            .expect("descriptor");
-        let thrift = crate::thrift::types::TIcebergDataFile {
-            path: Some("file:///t/data-variant.parquet".to_string()),
-            format: Some("PARQUET".to_string()),
-            record_count: Some(1),
-            file_size_in_bytes: Some(10),
-            partition_path: Some(String::new()),
-            column_stats: Some(crate::thrift::types::TIcebergColumnStats {
-                column_sizes: Some(BTreeMap::from([(2, 8)])),
-                value_counts: Some(BTreeMap::from([(2, 1)])),
-                null_value_counts: Some(BTreeMap::from([(2, 0)])),
-                nan_value_counts: None,
-                lower_bounds: Some(BTreeMap::from([(2, vec![1, 2, 3])])),
-                upper_bounds: Some(BTreeMap::from([(2, vec![4, 5, 6])])),
-            }),
-            partition_null_fingerprint: Some(String::new()),
-            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
-            partition_values_descriptor: Some(partition_values_descriptor),
-            partition_spec_id: Some(partition_spec_id),
-            ..Default::default()
+        let report = crate::connector::iceberg::report::IcebergWriterReport {
+            file: crate::connector::iceberg::report::IcebergWrittenFileReport {
+                path: "file:///t/data-variant.parquet".to_string(),
+                format: "PARQUET".to_string(),
+                content: crate::connector::iceberg::delete_file::IcebergFileContent::Data,
+                record_count: 1,
+                file_size_in_bytes: 10,
+                partition: crate::connector::iceberg::report::IcebergPartitionReport {
+                    partition_path: String::new(),
+                    null_fingerprint: String::new(),
+                    partition_spec_id,
+                    partition_values: Struct::empty(),
+                },
+                split_offsets: None,
+                column_stats: Some(crate::connector::iceberg::report::IcebergColumnStats {
+                    column_sizes: BTreeMap::from([(2, 8)]),
+                    value_counts: BTreeMap::from([(2, 1)]),
+                    null_value_counts: BTreeMap::from([(2, 0)]),
+                    nan_value_counts: BTreeMap::from([(2, 3)]),
+                    lower_bounds: BTreeMap::from([(2, vec![1, 2, 3])]),
+                    upper_bounds: BTreeMap::from([(2, vec![4, 5, 6])]),
+                }),
+                referenced_data_file: None,
+                first_row_id: None,
+                equality_ids: None,
+                key_metadata: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            },
+            is_overwrite: None,
+            is_rewrite: None,
         };
 
         let collector = unpartitioned_collector(int_variant_schema());
         let actual = collector
-            .convert(thrift)
+            .convert_writer_report(report)
             .expect("variant bounds should be skipped, not decoded");
         assert!(
             actual.lower_bounds.is_empty(),
@@ -1562,6 +1290,7 @@ mod parity_tests {
         assert_eq!(actual.column_sizes.get(&2), Some(&8));
         assert_eq!(actual.value_counts.get(&2), Some(&1));
         assert_eq!(actual.null_value_counts.get(&2), Some(&0));
+        assert_eq!(actual.nan_value_counts.get(&2), Some(&3));
     }
 }
 
@@ -1570,8 +1299,8 @@ mod tests {
     use super::*;
 
     use iceberg::spec::{
-        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, TableMetadataBuilder,
-        Transform, Type,
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, TableMetadata,
+        TableMetadataBuilder, Transform, Type,
     };
 
     fn int_schema() -> SchemaRef {
@@ -1613,31 +1342,47 @@ mod tests {
         .with_table_metadata(metadata)
     }
 
+    fn unpartitioned_writer_report(
+        path: &str,
+        spec_id: i32,
+    ) -> crate::connector::iceberg::report::IcebergWriterReport {
+        crate::connector::iceberg::report::IcebergWriterReport {
+            file: crate::connector::iceberg::report::IcebergWrittenFileReport {
+                path: path.to_string(),
+                format: "parquet".to_string(),
+                content: crate::connector::iceberg::delete_file::IcebergFileContent::Data,
+                record_count: 3,
+                file_size_in_bytes: 40,
+                partition: crate::connector::iceberg::report::IcebergPartitionReport {
+                    partition_path: String::new(),
+                    null_fingerprint: String::new(),
+                    partition_spec_id: spec_id,
+                    partition_values: iceberg::spec::Struct::empty(),
+                },
+                split_offsets: None,
+                column_stats: None,
+                referenced_data_file: None,
+                first_row_id: None,
+                equality_ids: None,
+                key_metadata: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            },
+            is_overwrite: None,
+            is_rewrite: None,
+        }
+    }
+
     #[test]
     fn convert_preserves_puffin_dv_descriptor() {
         let collector = unpartitioned_collector(int_schema());
-        let df = crate::thrift::types::TIcebergDataFile {
-            path: Some("s3://b/data/dv-00000000.puffin".to_string()),
-            format: Some("puffin".to_string()),
-            record_count: Some(3),
-            file_size_in_bytes: Some(40),
-            file_content: Some(crate::thrift::types::TIcebergFileContent::POSITION_DELETES),
-            referenced_data_file: Some("s3://b/data/f.parquet".to_string()),
-            partition_spec_id: Some(0),
-            partition_values_descriptor: Some(
-                crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-                    &iceberg::spec::Struct::empty(),
-                    0,
-                    collector.metadata.as_ref().expect("metadata"),
-                )
-                .expect("descriptor"),
-            ),
-            content_offset: Some(4),
-            content_size_in_bytes: Some(12),
-            cardinality: Some(3),
-            ..Default::default()
-        };
-        let wf = collector.convert(df).expect("convert");
+        let report = valid_puffin_dv_report();
+
+        let wf = collector
+            .convert_writer_report(report)
+            .expect("convert writer report");
+
         assert_eq!(wf.format, iceberg::spec::DataFileFormat::Puffin);
         assert_eq!(wf.content_offset, Some(4));
         assert_eq!(wf.content_size_in_bytes, Some(12));
@@ -1648,40 +1393,26 @@ mod tests {
         );
     }
 
-    fn valid_puffin_dv_file(
-        collector: &IcebergCommitCollector,
-    ) -> crate::thrift::types::TIcebergDataFile {
-        crate::thrift::types::TIcebergDataFile {
-            path: Some("s3://b/data/dv-00000000.puffin".to_string()),
-            format: Some("puffin".to_string()),
-            record_count: Some(3),
-            file_size_in_bytes: Some(40),
-            file_content: Some(crate::thrift::types::TIcebergFileContent::POSITION_DELETES),
-            referenced_data_file: Some("s3://b/data/f.parquet".to_string()),
-            partition_spec_id: Some(0),
-            partition_values_descriptor: Some(
-                crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-                    &iceberg::spec::Struct::empty(),
-                    0,
-                    collector.metadata.as_ref().expect("metadata"),
-                )
-                .expect("descriptor"),
-            ),
-            content_offset: Some(4),
-            content_size_in_bytes: Some(12),
-            cardinality: Some(3),
-            ..Default::default()
-        }
+    fn valid_puffin_dv_report() -> crate::connector::iceberg::report::IcebergWriterReport {
+        let mut report = unpartitioned_writer_report("s3://b/data/dv-00000000.puffin", 0);
+        report.file.format = "puffin".to_string();
+        report.file.content =
+            crate::connector::iceberg::delete_file::IcebergFileContent::PositionDeletes;
+        report.file.referenced_data_file = Some("s3://b/data/f.parquet".to_string());
+        report.file.content_offset = Some(4);
+        report.file.content_size_in_bytes = Some(12);
+        report.file.cardinality = Some(3);
+        report
     }
 
     #[test]
     fn convert_rejects_puffin_dv_missing_required_descriptor_field() {
         let collector = unpartitioned_collector(int_schema());
-        let mut df = valid_puffin_dv_file(&collector);
-        df.referenced_data_file = Some(String::new());
+        let mut report = valid_puffin_dv_report();
+        report.file.referenced_data_file = Some(String::new());
 
         let err = collector
-            .convert(df)
+            .convert_writer_report(report)
             .expect_err("empty referenced_data_file should fail");
 
         assert!(err.contains("referenced_data_file"), "got: {err}");
@@ -1690,20 +1421,20 @@ mod tests {
     #[test]
     fn convert_rejects_puffin_dv_negative_descriptor_values() {
         let collector = unpartitioned_collector(int_schema());
-        let mut df = valid_puffin_dv_file(&collector);
-        df.content_offset = Some(-1);
+        let mut report = valid_puffin_dv_report();
+        report.file.content_offset = Some(-1);
 
         let err = collector
-            .convert(df)
+            .convert_writer_report(report)
             .expect_err("negative content_offset should fail");
 
         assert!(err.contains("content_offset"), "got: {err}");
 
-        let mut df = valid_puffin_dv_file(&collector);
-        df.cardinality = Some(-1);
+        let mut report = valid_puffin_dv_report();
+        report.file.cardinality = Some(-1);
 
         let err = collector
-            .convert(df)
+            .convert_writer_report(report)
             .expect_err("negative cardinality should fail");
 
         assert!(err.contains("cardinality"), "got: {err}");
@@ -1712,25 +1443,12 @@ mod tests {
     #[test]
     fn convert_parses_supported_non_parquet_format() {
         let collector = unpartitioned_collector(int_schema());
-        let df = crate::thrift::types::TIcebergDataFile {
-            path: Some("s3://b/data/a.orc".to_string()),
-            format: Some("ORC".to_string()),
-            record_count: Some(3),
-            file_size_in_bytes: Some(40),
-            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
-            partition_spec_id: Some(0),
-            partition_values_descriptor: Some(
-                crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-                    &iceberg::spec::Struct::empty(),
-                    0,
-                    collector.metadata.as_ref().expect("metadata"),
-                )
-                .expect("descriptor"),
-            ),
-            ..Default::default()
-        };
+        let mut report = unpartitioned_writer_report("s3://b/data/a.orc", 0);
+        report.file.format = "ORC".to_string();
 
-        let wf = collector.convert(df).expect("convert");
+        let wf = collector
+            .convert_writer_report(report)
+            .expect("convert writer report");
 
         assert_eq!(wf.format, iceberg::spec::DataFileFormat::Orc);
     }
@@ -1738,29 +1456,14 @@ mod tests {
     #[test]
     fn convert_rejects_unsupported_format() {
         let collector = unpartitioned_collector(int_schema());
-        let df = crate::thrift::types::TIcebergDataFile {
-            path: Some("s3://b/data/a.csv".to_string()),
-            format: Some("csv".to_string()),
-            record_count: Some(3),
-            file_size_in_bytes: Some(40),
-            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
-            partition_spec_id: Some(0),
-            partition_values_descriptor: Some(
-                crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
-                    &iceberg::spec::Struct::empty(),
-                    0,
-                    collector.metadata.as_ref().expect("metadata"),
-                )
-                .expect("descriptor"),
-            ),
-            ..Default::default()
-        };
+        let mut report = unpartitioned_writer_report("s3://b/data/a.csv", 0);
+        report.file.format = "csv".to_string();
 
         let err = collector
-            .convert(df)
+            .convert_writer_report(report)
             .expect_err("unsupported format should fail");
 
-        assert!(err.contains("unsupported TIcebergDataFile format `csv`"));
+        assert!(err.contains("unsupported Iceberg writer report format `csv`"));
     }
 
     fn fixture_schema_and_spec() -> (SchemaRef, PartitionSpecRef) {
@@ -1801,6 +1504,217 @@ mod tests {
             .build()
             .expect("build partition spec");
         (schema, Arc::new(spec))
+    }
+
+    fn test_string_partition_metadata(spec_id: i32) -> TableMetadata {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "region",
+                    Type::Primitive(PrimitiveType::String),
+                ))])
+                .build()
+                .expect("schema"),
+        );
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(spec_id)
+                .add_partition_field("region", "region", Transform::Identity)
+                .expect("partition field")
+                .build()
+                .expect("partition spec"),
+        );
+        let creation = iceberg::TableCreation::builder()
+            .name("t".to_string())
+            .location("file:///warehouse/db/t".to_string())
+            .schema(schema.as_ref().clone())
+            .partition_spec(partition_spec.as_ref().clone())
+            .format_version(FormatVersion::V2)
+            .build();
+        TableMetadataBuilder::from_table_creation(creation)
+            .expect("table metadata builder")
+            .build()
+            .expect("table metadata")
+            .metadata
+    }
+
+    fn test_collector_with_metadata(metadata: TableMetadata) -> IcebergCommitCollector {
+        let spec_id = metadata.default_partition_spec_id();
+        IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            TableIdent::from_strs(["db", "t"]).expect("ident"),
+            None,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata
+                .partition_spec_by_id(spec_id)
+                .expect("partition spec")
+                .clone(),
+            "file:///tmp/staging".to_string(),
+            UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata)
+    }
+
+    fn test_writer_report(
+        path: &str,
+        spec_id: i32,
+    ) -> crate::connector::iceberg::report::IcebergWriterReport {
+        crate::connector::iceberg::report::IcebergWriterReport {
+            file: crate::connector::iceberg::report::IcebergWrittenFileReport {
+                path: path.to_string(),
+                format: "parquet".to_string(),
+                content: crate::connector::iceberg::delete_file::IcebergFileContent::Data,
+                record_count: 1,
+                file_size_in_bytes: 12,
+                partition: crate::connector::iceberg::report::IcebergPartitionReport {
+                    partition_path: "region=west".to_string(),
+                    null_fingerprint: "0".to_string(),
+                    partition_spec_id: spec_id,
+                    partition_values: Struct::from_iter([Some(Literal::Primitive(
+                        PrimitiveLiteral::String("west".to_string()),
+                    ))]),
+                },
+                split_offsets: None,
+                column_stats: None,
+                referenced_data_file: None,
+                first_row_id: None,
+                equality_ids: None,
+                key_metadata: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            },
+            is_overwrite: None,
+            is_rewrite: None,
+        }
+    }
+
+    #[test]
+    fn inject_writer_report_converts_and_drains_written_file() {
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let collector = test_collector_with_metadata(metadata.clone());
+        let report = crate::connector::iceberg::report::IcebergWriterReport {
+            file: crate::connector::iceberg::report::IcebergWrittenFileReport {
+                path: "file:///warehouse/t/data/a.parquet".to_string(),
+                format: "parquet".to_string(),
+                content: crate::connector::iceberg::delete_file::IcebergFileContent::Data,
+                record_count: 1,
+                file_size_in_bytes: 12,
+                partition: crate::connector::iceberg::report::IcebergPartitionReport {
+                    partition_path: "region=west".to_string(),
+                    null_fingerprint: "0".to_string(),
+                    partition_spec_id: spec_id,
+                    partition_values: Struct::from_iter([Some(Literal::Primitive(
+                        PrimitiveLiteral::String("west".to_string()),
+                    ))]),
+                },
+                split_offsets: None,
+                column_stats: None,
+                referenced_data_file: None,
+                first_row_id: None,
+                equality_ids: None,
+                key_metadata: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            },
+            is_overwrite: None,
+            is_rewrite: None,
+        };
+
+        collector
+            .inject_writer_report(report)
+            .expect("inject report");
+        let files = collector.take_written_files().expect("take files");
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "file:///warehouse/t/data/a.parquet");
+        assert_eq!(files[0].partition_spec_id, spec_id);
+    }
+
+    #[test]
+    fn inject_writer_reports_is_all_or_nothing() {
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let collector = test_collector_with_metadata(metadata);
+        let good = test_writer_report("file:///warehouse/t/data/good.parquet", spec_id);
+        let mut bad = test_writer_report("file:///warehouse/t/data/bad.parquet", spec_id);
+        bad.file.record_count = -1;
+
+        let err = collector
+            .inject_writer_reports([good, bad])
+            .expect_err("negative record count should fail");
+
+        assert!(err.contains("record_count"), "got: {err}");
+        assert!(
+            collector
+                .take_written_files()
+                .expect("take files")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn convert_writer_report_rejects_negative_first_row_id() {
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let collector = test_collector_with_metadata(metadata);
+        let mut report = test_writer_report("file:///warehouse/t/data/a.parquet", spec_id);
+        report.file.first_row_id = Some(-1);
+
+        let err = collector
+            .convert_writer_report(report)
+            .expect_err("negative first_row_id should fail");
+
+        assert!(err.contains("first_row_id"), "got: {err}");
+    }
+
+    #[test]
+    fn convert_writer_report_rejects_negative_split_offsets() {
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let collector = test_collector_with_metadata(metadata);
+        let mut report = test_writer_report("file:///warehouse/t/data/a.parquet", spec_id);
+        report.file.split_offsets = Some(vec![0, -1]);
+
+        let err = collector
+            .convert_writer_report(report)
+            .expect_err("negative split_offsets should fail");
+
+        assert!(err.contains("split_offsets"), "got: {err}");
+    }
+
+    #[test]
+    fn convert_writer_report_rejects_negative_content_offset() {
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let collector = test_collector_with_metadata(metadata);
+        let mut report = test_writer_report("file:///warehouse/t/data/a.parquet", spec_id);
+        report.file.content_offset = Some(-1);
+
+        let err = collector
+            .convert_writer_report(report)
+            .expect_err("negative content_offset should fail");
+
+        assert!(err.contains("content_offset"), "got: {err}");
+    }
+
+    #[test]
+    fn convert_writer_report_rejects_negative_content_size_in_bytes() {
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let collector = test_collector_with_metadata(metadata);
+        let mut report = test_writer_report("file:///warehouse/t/data/a.parquet", spec_id);
+        report.file.content_size_in_bytes = Some(-1);
+
+        let err = collector
+            .convert_writer_report(report)
+            .expect_err("negative content_size_in_bytes should fail");
+
+        assert!(err.contains("content_size_in_bytes"), "got: {err}");
     }
 
     #[test]

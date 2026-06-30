@@ -28,9 +28,7 @@ use arrow::record_batch::RecordBatch;
 use iceberg::spec::DataFile;
 
 use crate::connector::iceberg::commit::IcebergCommitCollector;
-use crate::connector::iceberg::data_writer::{
-    IcebergStreamingDataFileWriter, written_file_to_sink_commit_info_for_metadata,
-};
+use crate::connector::iceberg::data_writer::IcebergStreamingDataFileWriter;
 use crate::engine::iceberg_writer::data_file_to_written_file;
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::chunk::Chunk;
@@ -157,16 +155,11 @@ impl ProcessorOperator for IcebergMergeSinkOperator {
             let data_files: Vec<DataFile> = data_block_on(writer.finish())??;
             let metadata = self.plan.target_table.metadata();
             let partition_spec_id = metadata.default_partition_spec_id();
-            let sink_commit_infos = data_files
+            let written_files = data_files
                 .into_iter()
-                .map(|df| {
-                    let wf = data_file_to_written_file(&df, partition_spec_id)?;
-                    written_file_to_sink_commit_info_for_metadata(&wf, metadata)
-                })
+                .map(|df| data_file_to_written_file(&df, partition_spec_id))
                 .collect::<Result<Vec<_>, _>>()?;
-            self.plan
-                .collector
-                .inject_sink_commit_infos(sink_commit_infos)?;
+            self.plan.collector.inject_written_files(written_files);
         }
         self.finished = true;
         Ok(())

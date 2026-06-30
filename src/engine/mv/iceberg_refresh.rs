@@ -23,9 +23,7 @@ use crate::connector::iceberg::commit::{
     RefAction, RefActionPlan, RunInput, execute_ref_action, publish_staging_branch_to_main,
     run_iceberg_commit, snapshot_matches_refresh_marker,
 };
-use crate::connector::iceberg::data_writer::{
-    write_record_batches_as_data_files, written_file_to_sink_commit_info_for_metadata,
-};
+use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::iceberg::operation_lifecycle::{
     operation_fact_from_commit_result, operation_fact_from_finalize_failure,
 };
@@ -9446,15 +9444,12 @@ fn inject_iceberg_mv_data_file_reports(
     data_files: Vec<DataFile>,
 ) -> Result<(), String> {
     let default_spec_id = metadata.default_partition_spec_id();
-    let sink_commit_infos = data_files
+    let written_files = data_files
         .into_iter()
-        .map(|df| {
-            let written =
-                crate::engine::iceberg_writer::data_file_to_written_file(&df, default_spec_id)?;
-            written_file_to_sink_commit_info_for_metadata(&written, metadata)
-        })
+        .map(|df| crate::engine::iceberg_writer::data_file_to_written_file(&df, default_spec_id))
         .collect::<Result<Vec<_>, _>>()?;
-    collector.inject_sink_commit_infos(sink_commit_infos)
+    collector.inject_written_files(written_files);
+    Ok(())
 }
 
 fn derive_refresh_contract_for_strategy_dispatch(

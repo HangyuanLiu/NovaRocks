@@ -189,6 +189,17 @@ impl RuntimeState {
         sink_commit::add(finst_id, info);
     }
 
+    pub(crate) fn add_iceberg_writer_report(
+        &self,
+        report: crate::connector::iceberg::report::IcebergWriterReport,
+        metadata: &iceberg::spec::TableMetadata,
+    ) -> Result<(), String> {
+        let commit_info =
+            crate::runtime::sink_commit_wire::writer_report_to_sink_commit_info(report, metadata)?;
+        self.add_sink_commit_info(commit_info);
+        Ok(())
+    }
+
     /// Push a per-file Theta sketch set produced by the Iceberg sink into
     /// the per-fragment-instance side channel. Subsequently drained by the
     /// commit collector via [`crate::runtime::sink_commit::take_sketch_sets`].

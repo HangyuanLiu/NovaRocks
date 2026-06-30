@@ -33,7 +33,6 @@ pub mod position_delete;
 pub(crate) mod position_delete_descriptor;
 pub(crate) mod read;
 pub(crate) mod report;
-pub(crate) mod report_wire;
 pub(crate) mod row_lineage_synth;
 pub mod scan_deletes;
 pub(crate) mod scan_planner;
