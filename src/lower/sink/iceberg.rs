@@ -35,7 +35,8 @@ use crate::connector::iceberg::schema::{
 };
 use crate::connector::iceberg::sink::{build_staged_file_io, parse_object_store_bucket_and_root};
 use crate::connector::iceberg::sink_plan::{
-    IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkPlan, PositionDeleteDataFilePartition,
+    IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan,
+    PositionDeleteDataFilePartition,
 };
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::row_position::{
@@ -46,7 +47,6 @@ use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCre
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::Layout;
 use crate::runtime::global_async_runtime::data_block_on;
-use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::thrift::{data_sinks, descriptors, exprs, types};
 
 type PartitionExprs = (Vec<String>, Vec<String>, Vec<String>, Vec<exprs::TExpr>);
@@ -699,7 +699,7 @@ fn resolve_data_location(sink: &data_sinks::TIcebergTableSink) -> Result<String,
 fn resolve_sink_s3_config(
     sink: &data_sinks::TIcebergTableSink,
     data_location: &str,
-) -> Result<Option<S3StoreConfig>, String> {
+) -> Result<Option<IcebergSinkObjectStoreConfig>, String> {
     let Some((bucket, _data_root)) = parse_object_store_bucket_and_root(data_location) else {
         return Ok(None);
     };
@@ -718,21 +718,17 @@ fn resolve_sink_s3_config(
         props,
     )?;
 
-    Ok(Some(S3StoreConfig {
-        endpoint: credentials.endpoint,
+    Ok(Some(IcebergSinkObjectStoreConfig::from_credentials(
         bucket,
-        access_key_id: credentials.access_key_id,
-        access_key_secret: credentials.access_key_secret,
-        region: credentials.region,
-        enable_path_style_access: credentials.enable_path_style_access,
-    }))
+        credentials,
+    )))
 }
 
 fn build_position_delete_data_file_partition_index(
     metadata: &TableMetadata,
     target_snapshot_id: Option<i64>,
     table_location: &str,
-    s3_config: Option<&S3StoreConfig>,
+    s3_config: Option<&IcebergSinkObjectStoreConfig>,
 ) -> Result<HashMap<String, PositionDeleteDataFilePartition>, String> {
     use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
 
@@ -1442,15 +1438,21 @@ mod tests {
     }
 
     #[test]
-    fn sink_s3_config_uses_shared_credentials_aliases() {
+    fn sink_s3_config_uses_shared_credentials_aliases_and_policy() {
         let table_location = "s3://bucket-a/warehouse/table-a";
         let mut sink = test_iceberg_table_sink(1, table_location);
         sink.cloud_configuration = Some(s3_cloud_configuration(&[
             ("aws.s3.endpoint_url", " http://localhost:9000 "),
             ("aws.s3.accessKeyId", " ak "),
             ("aws.s3.accessKeySecret", " sk "),
+            ("aws.s3.sessionToken", " token "),
             ("aws.s3.region", " us-east-1 "),
             ("aws.s3.enable_path_style_access", "yes"),
+            ("aws.s3.max_retries", "7"),
+            ("aws.s3.retry_min_delay_ms", "11"),
+            ("aws.s3.retry_max_delay_ms", "99"),
+            ("aws.s3.request_timeout_ms", "1234"),
+            ("aws.s3.io_timeout_ms", "5678"),
         ]));
 
         let s3 = resolve_sink_s3_config(
@@ -1466,8 +1468,30 @@ mod tests {
         assert_eq!(s3.endpoint, "http://localhost:9000");
         assert_eq!(s3.access_key_id, "ak");
         assert_eq!(s3.access_key_secret, "sk");
+        assert_eq!(s3.session_token.as_deref(), Some("token"));
         assert_eq!(s3.region.as_deref(), Some("us-east-1"));
         assert_eq!(s3.enable_path_style_access, Some(true));
+        assert_eq!(s3.retry_max_times, Some(7));
+        assert_eq!(s3.retry_min_delay_ms, Some(11));
+        assert_eq!(s3.retry_max_delay_ms, Some(99));
+        assert_eq!(s3.timeout_ms, Some(1234));
+        assert_eq!(s3.io_timeout_ms, Some(5678));
+
+        let factory = s3.to_s3_storage_factory();
+        assert_eq!(factory.session_token.as_deref(), Some("token"));
+        assert_eq!(factory.retry_max_times, Some(7));
+        assert_eq!(factory.retry_min_delay_ms, Some(11));
+        assert_eq!(factory.retry_max_delay_ms, Some(99));
+        assert_eq!(factory.timeout_ms, Some(1234));
+        assert_eq!(factory.io_timeout_ms, Some(5678));
+
+        let legacy = s3.to_object_store_config();
+        assert_eq!(legacy.session_token.as_deref(), Some("token"));
+        assert_eq!(legacy.retry_max_times, Some(7));
+        assert_eq!(legacy.retry_min_delay_ms, Some(11));
+        assert_eq!(legacy.retry_max_delay_ms, Some(99));
+        assert_eq!(legacy.timeout_ms, Some(1234));
+        assert_eq!(legacy.io_timeout_ms, Some(5678));
     }
 
     #[test]

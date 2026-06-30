@@ -342,19 +342,23 @@ pub(crate) struct S3StorageFactory {
 
 impl S3StorageFactory {
     /// Build from catalog properties (aws.s3.access_key, aws.s3.secret_key, etc.).
-    pub fn from_catalog_properties(props: &[(String, String)]) -> Option<Self> {
+    pub fn from_catalog_properties(
+        props: &[(String, String)],
+    ) -> std::result::Result<Option<Self>, String> {
         let props_map: BTreeMap<String, String> = props
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         let credentials =
-            crate::fs::object_store_credentials::ObjectStoreCredentials::from_aws_s3_properties(
+            crate::fs::object_store_credentials::ObjectStoreCredentials::optional_from_aws_s3_properties(
                 crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
                 &props_map,
-            )
-            .ok()?;
+            )?;
+        let Some(credentials) = credentials else {
+            return Ok(None);
+        };
 
-        Some(Self {
+        Ok(Some(Self {
             endpoint: credentials.endpoint,
             access_key_id: credentials.access_key_id,
             access_key_secret: credentials.access_key_secret,
@@ -368,7 +372,7 @@ impl S3StorageFactory {
             retry_max_delay_ms: credentials.retry_max_delay_ms,
             timeout_ms: credentials.timeout_ms,
             io_timeout_ms: credentials.io_timeout_ms,
-        })
+        }))
     }
 }
 
@@ -410,7 +414,9 @@ mod tests {
             ),
         ];
 
-        let factory = S3StorageFactory::from_catalog_properties(&props).expect("parse factory");
+        let factory = S3StorageFactory::from_catalog_properties(&props)
+            .expect("parse factory")
+            .expect("factory");
 
         assert_eq!(factory.endpoint, "http://localhost:9000");
         assert_eq!(factory.access_key_id, "ak");
@@ -431,7 +437,9 @@ mod tests {
             ("aws.s3.sessionToken".to_string(), "token".to_string()),
         ];
 
-        let factory = S3StorageFactory::from_catalog_properties(&props).expect("parse factory");
+        let factory = S3StorageFactory::from_catalog_properties(&props)
+            .expect("parse factory")
+            .expect("factory");
 
         assert_eq!(factory.session_token.as_deref(), Some("token"));
     }
@@ -452,12 +460,40 @@ mod tests {
             ("aws.s3.io_timeout_ms".to_string(), "5678".to_string()),
         ];
 
-        let factory = S3StorageFactory::from_catalog_properties(&props).expect("parse factory");
+        let factory = S3StorageFactory::from_catalog_properties(&props)
+            .expect("parse factory")
+            .expect("factory");
 
         assert_eq!(factory.retry_max_times, Some(7));
         assert_eq!(factory.retry_min_delay_ms, Some(11));
         assert_eq!(factory.retry_max_delay_ms, Some(99));
         assert_eq!(factory.timeout_ms, Some(1234));
         assert_eq!(factory.io_timeout_ms, Some(5678));
+    }
+
+    #[test]
+    fn s3_storage_factory_rejects_invalid_path_style_property() {
+        let props = vec![
+            (
+                "aws.s3.endpoint_url".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.accessKeyId".to_string(), "ak".to_string()),
+            ("aws.s3.accessKeySecret".to_string(), "sk".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "maybe".to_string(),
+            ),
+        ];
+
+        let err = S3StorageFactory::from_catalog_properties(&props)
+            .expect_err("invalid path style should fail");
+
+        assert!(
+            err.contains(
+                "aws_s3_properties object-store property aws.s3.enable_path_style_access has invalid boolean value: maybe"
+            ),
+            "{err}"
+        );
     }
 }

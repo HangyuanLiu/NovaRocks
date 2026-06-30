@@ -906,6 +906,7 @@ pub(crate) fn load_table(
 
         let storage_factory =
             crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
+                .map_err(|e| format!("parse S3 properties for FileIO: {e}"))?
                 .ok_or_else(|| "missing S3 properties for FileIO".to_string())?;
         let file_io = iceberg::io::FileIOBuilder::new(Arc::new(storage_factory)).build();
 
@@ -1940,6 +1941,7 @@ fn build_storage_factory_for_entry(
         let s3_factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(
             &entry.properties,
         )
+        .map_err(|e| format!("parse S3 iceberg catalog properties: {e}"))?
         .ok_or_else(|| {
             "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
                 .to_string()

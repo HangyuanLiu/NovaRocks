@@ -25,7 +25,8 @@ use crate::connector::iceberg::commit::EqualityDeleteColumn;
 use crate::connector::iceberg::delete_file::IcebergFileFormat;
 use crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorBinding;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::runtime::starlet_shard_registry::S3StoreConfig;
+use crate::fs::object_store::ObjectStoreConfig;
+use crate::fs::object_store_credentials::ObjectStoreCredentials;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IcebergSinkMode {
@@ -41,6 +42,80 @@ pub(crate) struct PositionDeleteDataFilePartition {
     pub(crate) partition_values: Struct,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IcebergSinkObjectStoreConfig {
+    pub(crate) endpoint: String,
+    pub(crate) bucket: String,
+    pub(crate) access_key_id: String,
+    pub(crate) access_key_secret: String,
+    pub(crate) session_token: Option<String>,
+    pub(crate) region: Option<String>,
+    pub(crate) enable_path_style_access: Option<bool>,
+    pub(crate) retry_max_times: Option<usize>,
+    pub(crate) retry_min_delay_ms: Option<u64>,
+    pub(crate) retry_max_delay_ms: Option<u64>,
+    pub(crate) timeout_ms: Option<u64>,
+    pub(crate) io_timeout_ms: Option<u64>,
+}
+
+impl IcebergSinkObjectStoreConfig {
+    pub(crate) fn from_credentials(bucket: String, credentials: ObjectStoreCredentials) -> Self {
+        Self {
+            endpoint: credentials.endpoint,
+            bucket,
+            access_key_id: credentials.access_key_id,
+            access_key_secret: credentials.access_key_secret,
+            session_token: credentials.session_token,
+            region: credentials.region,
+            enable_path_style_access: credentials.enable_path_style_access,
+            retry_max_times: credentials.retry_max_times,
+            retry_min_delay_ms: credentials.retry_min_delay_ms,
+            retry_max_delay_ms: credentials.retry_max_delay_ms,
+            timeout_ms: credentials.timeout_ms,
+            io_timeout_ms: credentials.io_timeout_ms,
+        }
+    }
+
+    pub(crate) fn to_object_store_config(&self) -> ObjectStoreConfig {
+        ObjectStoreConfig {
+            endpoint: self.endpoint.clone(),
+            bucket: self.bucket.clone(),
+            root: String::new(),
+            access_key_id: self.access_key_id.clone(),
+            access_key_secret: self.access_key_secret.clone(),
+            session_token: self.session_token.clone(),
+            enable_path_style_access: self.enable_path_style_access,
+            region: self.region.clone(),
+            retry_max_times: self.retry_max_times,
+            retry_min_delay_ms: self.retry_min_delay_ms,
+            retry_max_delay_ms: self.retry_max_delay_ms,
+            timeout_ms: self.timeout_ms,
+            io_timeout_ms: self.io_timeout_ms,
+        }
+    }
+
+    pub(crate) fn to_s3_storage_factory(
+        &self,
+    ) -> crate::connector::iceberg::catalog::s3_storage::S3StorageFactory {
+        crate::connector::iceberg::catalog::s3_storage::S3StorageFactory {
+            endpoint: self.endpoint.clone(),
+            access_key_id: self.access_key_id.clone(),
+            access_key_secret: self.access_key_secret.clone(),
+            session_token: self.session_token.clone(),
+            region: self
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_string()),
+            enable_path_style: self.enable_path_style_access.unwrap_or(false),
+            retry_max_times: self.retry_max_times,
+            retry_min_delay_ms: self.retry_min_delay_ms,
+            retry_max_delay_ms: self.retry_max_delay_ms,
+            timeout_ms: self.timeout_ms,
+            io_timeout_ms: self.io_timeout_ms,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct IcebergSinkPlan {
     pub(crate) mode: IcebergSinkMode,
@@ -51,7 +126,7 @@ pub(crate) struct IcebergSinkPlan {
     pub(crate) target_snapshot_id: Option<i64>,
     pub(crate) position_delete_data_file_partitions:
         HashMap<String, PositionDeleteDataFilePartition>,
-    pub(crate) object_store_s3: Option<S3StoreConfig>,
+    pub(crate) object_store_s3: Option<IcebergSinkObjectStoreConfig>,
     pub(crate) file_format: IcebergFileFormat,
     pub(crate) report_file_format: String,
     pub(crate) compression: Compression,

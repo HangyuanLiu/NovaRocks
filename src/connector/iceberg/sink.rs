@@ -62,7 +62,7 @@ use crate::connector::iceberg::report::{
     partition_path_from_struct,
 };
 use crate::connector::iceberg::sink_plan::{
-    IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkPlan,
+    IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -75,7 +75,6 @@ use crate::exec::row_position::{
 };
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::runtime::starlet_shard_registry::S3StoreConfig;
 
 #[derive(Clone)]
 /// Factory for Iceberg table sinks that write output chunks into committed table files.
@@ -839,7 +838,7 @@ impl IcebergTableSinkBackend {
             .plan
             .object_store_s3
             .as_ref()
-            .map(S3StoreConfig::to_object_store_config);
+            .map(IcebergSinkObjectStoreConfig::to_object_store_config);
         let table = iceberg::table::Table::builder()
             .file_io(file_io.clone())
             .metadata(Arc::new(metadata.clone()))
@@ -1445,7 +1444,7 @@ fn parse_transform_arg(raw: &str, name: &str) -> Result<Option<u32>, String> {
 
 pub(crate) fn build_staged_file_io(
     data_location: &str,
-    s3_config: Option<&S3StoreConfig>,
+    s3_config: Option<&IcebergSinkObjectStoreConfig>,
 ) -> Result<iceberg::io::FileIO, String> {
     if data_location.starts_with("s3://") || data_location.starts_with("oss://") {
         let s3 = s3_config.ok_or_else(|| {
@@ -1453,19 +1452,7 @@ pub(crate) fn build_staged_file_io(
                 "iceberg sink missing S3 config for staged writer data_location={data_location}"
             )
         })?;
-        let factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory {
-            endpoint: s3.endpoint.clone(),
-            access_key_id: s3.access_key_id.clone(),
-            access_key_secret: s3.access_key_secret.clone(),
-            session_token: None,
-            region: s3.region.clone().unwrap_or_else(|| "us-east-1".to_string()),
-            enable_path_style: s3.enable_path_style_access.unwrap_or(false),
-            retry_max_times: None,
-            retry_min_delay_ms: None,
-            retry_max_delay_ms: None,
-            timeout_ms: None,
-            io_timeout_ms: None,
-        };
+        let factory = s3.to_s3_storage_factory();
         return Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build());
     }
     Ok(iceberg::io::FileIO::new_with_fs())
@@ -1498,7 +1485,7 @@ fn normalize_path(path: &str) -> Result<String, String> {
 
 fn write_parquet_file(
     path: &str,
-    s3_config: Option<&S3StoreConfig>,
+    s3_config: Option<&IcebergSinkObjectStoreConfig>,
     schema: SchemaRef,
     batch: &RecordBatch,
     compression: Compression,
