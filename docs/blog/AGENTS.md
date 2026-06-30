@@ -75,3 +75,8 @@
   → apply 到目标表(配 SQL case + 数据表)→ Delta / Version 算子(join 两侧都变的 case + 图)
   → 刷新属性框架(从「唯一行 id」问题切入,配 case + 综合树图)→ staging 分支原子发布(先补 Iceberg 背景)
   → 收尾落到价值:把 MV 也存成 Iceberg 表换来的红利(跨引擎兼容 + 明细/汇总统一入口)。
+- [一条 SQL 把增量刷新算清楚:变更怎么落到 Iceberg 物化视图上](applying-incremental-changes-to-iceberg-materialized-views.md)
+  —— 上文的**专题续作**,围着「变更怎么落到 MV 表」的**完整 SQL** 讲、逐 CTE 走数据:逻辑身份 vs 物理位置的桥 →
+  join 两侧都变的**完整查询**(`两支 telescoping UNION ALL → GROUP BY 身份 SUM(±1) → HAVING net≠0 → LEFT JOIN 取 _file/_pos`),
+  逐段数据表 + 反面推演瞬态行为何必须**写前净化** → 聚合的**完整查询**(`delta 带符号状态 → LEFT JOIN mv_state state_merge → 产 __change_op 流`),
+  退场看**计数态**非可见值 + 快照钉定为何尤其致命 → 两条 SQL 收敛为同一骨架(+ 主干 Mermaid)→ 收尾:把刷新做成一条关系查询、与普通查询同源。
