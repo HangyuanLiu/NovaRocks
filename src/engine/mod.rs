@@ -42,6 +42,7 @@ pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
 pub(crate) mod catalog_mgr;
 pub(crate) mod dictionary;
+pub(crate) mod dml_change_stream;
 pub(crate) mod iceberg_change_stream_write;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_maintenance;
@@ -497,7 +498,7 @@ unsafe impl Send for TestSerializationGuard {}
 unsafe impl Sync for TestSerializationGuard {}
 
 #[cfg(test)]
-fn acquire_standalone_test_guard() -> TestSerializationGuard {
+pub(crate) fn acquire_standalone_test_guard() -> TestSerializationGuard {
     use std::sync::{Mutex, OnceLock};
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let guard = LOCK
@@ -3561,7 +3562,7 @@ fn change_stream_write_test_observer()
 }
 
 #[cfg(test)]
-struct ChangeStreamWriteTestObserverGuard;
+pub(crate) struct ChangeStreamWriteTestObserverGuard;
 
 #[cfg(test)]
 impl ChangeStreamWriteTestObserverGuard {
@@ -3587,7 +3588,7 @@ impl Drop for ChangeStreamWriteTestObserverGuard {
 }
 
 #[cfg(test)]
-fn install_change_stream_write_test_observer(
+pub(crate) fn install_change_stream_write_test_observer(
     short_circuit_after_build: bool,
 ) -> ChangeStreamWriteTestObserverGuard {
     let mut observer = change_stream_write_test_observer()

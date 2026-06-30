@@ -233,6 +233,26 @@ fn mutation_source_relation_to_sql(
     }
 }
 
+pub(crate) fn build_mor_deletion_vector_sink_spec(
+    target: &crate::engine::backend_resolver::TargetBackend,
+    resolved: &crate::connector::backend::ResolvedTable,
+    table: &iceberg::table::Table,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    target_ref: &str,
+) -> Result<IcebergWriteSinkSpec, String> {
+    let planned_snapshot_id = if target_ref == "main" {
+        table.metadata().current_snapshot().map(|s| s.snapshot_id())
+    } else {
+        crate::engine::delete_flow::resolve_branch_head_snapshot_id(table.metadata(), target_ref)?
+    };
+    let mut sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
+        target, resolved, table, entry,
+    )?;
+    sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
+    sink_spec.set_planned_snapshot_id(planned_snapshot_id)?;
+    Ok(sink_spec)
+}
+
 fn build_update_mor_distributed_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
@@ -274,16 +294,8 @@ fn build_update_mor_distributed_write(
     // planned snapshot and the commit base snapshot must agree; if a concurrent
     // writer ever breaks that, the commit's base-snapshot conflict check fails
     // fast rather than committing against a stale base.
-    let base_snapshot_id = if target_ref != "main" {
-        crate::engine::delete_flow::resolve_branch_head_snapshot_id(table.metadata(), target_ref)?
-    } else {
-        table.metadata().current_snapshot().map(|s| s.snapshot_id())
-    };
-    let mut dv_sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
-        target, &resolved, &table, &entry,
-    )?;
-    dv_sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
-    dv_sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
+    let dv_sink_spec =
+        build_mor_deletion_vector_sink_spec(target, &resolved, &table, &entry, target_ref)?;
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
     let source_sql = mutation_source_to_sql(state, &stmt.source, current_catalog, target)?;
     let where_sql = stmt.where_clause.as_ref().map(|expr| expr.to_string());
@@ -360,12 +372,8 @@ fn build_merge_mor_distributed_write(
     // loaded `table`. Under the single-writer assumption both observe the same
     // current snapshot and must agree (the commit's base-snapshot check fails
     // fast otherwise).
-    let base_snapshot_id = table.metadata().current_snapshot().map(|s| s.snapshot_id());
-    let mut dv_sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
-        target, &resolved, &table, &entry,
-    )?;
-    dv_sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
-    dv_sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
+    let dv_sink_spec =
+        build_mor_deletion_vector_sink_spec(target, &resolved, &table, &entry, "main")?;
     let new_sequence_number = table.metadata().last_sequence_number() + 1;
     let data_query = build_merge_mor_data_sink_query_from_matched(
         matched_rows,
@@ -2157,19 +2165,14 @@ pub(crate) fn execute_merge_statement(
                     }
                 },
                 MergeMatchedAction::Delete => {
-                    let base_snapshot_id =
-                        table.metadata().current_snapshot().map(|s| s.snapshot_id());
                     let resolved = {
                         let registry = state.connectors.read().expect("connector registry read");
                         let backend = registry.catalog_backend("iceberg")?;
                         backend.load_table(&target.catalog, &target.namespace, &target.table)?
                     };
-                    let mut dv_sink_spec =
-                        crate::engine::iceberg_writer::build_position_delete_sink_spec(
-                            &target, &resolved, &table, &entry,
-                        )?;
-                    dv_sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
-                    dv_sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
+                    let dv_sink_spec = build_mor_deletion_vector_sink_spec(
+                        &target, &resolved, &table, &entry, "main",
+                    )?;
                     let dv_query = build_merge_mor_dv_sink_query_from_matched(
                         &matched,
                         &dv_sink_spec.target_columns,
