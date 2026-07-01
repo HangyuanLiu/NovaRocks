@@ -27,6 +27,8 @@ use crate::connector::starrocks::fs_access::{
 };
 use crate::fs::access::{FsAccessResolver, FsScheme};
 
+const BUCKET_ROOT_COMPAT_MARKER: &str = "__novarocks_tablet_root_compat__";
+
 #[derive(Clone, Debug)]
 pub(crate) struct StarRocksFormatPathAccess {
     access: StarRocksFsAccess,
@@ -80,6 +82,18 @@ pub(crate) fn resolve_format_tablet_access(
     tablet_root_path: &str,
     object_store_profile: Option<&ObjectStoreProfile>,
 ) -> Result<StarRocksFormatTabletAccess, String> {
+    if let Some(bucket_root) = parse_bucket_root_object_store_tablet_path(tablet_root_path)? {
+        // FsLocation requires a non-empty object-store path. Resolve a synthetic
+        // path in the same bucket to build the operator while preserving the old
+        // bucket-root tablet semantics at this facade boundary.
+        let access = resolve_with_profile(&bucket_root.synthetic_path, object_store_profile)?;
+        return Ok(StarRocksFormatTabletAccess {
+            root_location: bucket_root.normalized_root,
+            root_relative_path: String::new(),
+            access,
+        });
+    }
+
     let access = resolve_with_profile(tablet_root_path, object_store_profile)?;
     let root_relative_path = access.single_relative_path()?.to_string();
     let root_location = normalize_root_location(tablet_root_path);
@@ -94,10 +108,17 @@ pub(crate) fn operator_relative_path_for_tablet_root(
     tablet_root_path: &str,
     rel_path: &str,
 ) -> Result<String, String> {
+    if parse_bucket_root_object_store_tablet_path(tablet_root_path)?.is_some() {
+        return Ok(rel_path.trim_start_matches('/').to_string());
+    }
+
     let location = FsAccessResolver::new().parse_location(tablet_root_path)?;
     let rel = rel_path.trim_start_matches('/');
     match location.scheme() {
-        FsScheme::Local => Ok(rel.to_string()),
+        FsScheme::Local => {
+            let access = resolve_with_profile(tablet_root_path, None)?;
+            Ok(join_path(access.single_relative_path()?, rel_path))
+        }
         FsScheme::ObjectStore => {
             let root = location.path().trim_matches('/');
             if root.is_empty() {
@@ -112,6 +133,40 @@ pub(crate) fn operator_relative_path_for_tablet_root(
             "StarRocks formats do not support hdfs tablet path yet: {tablet_root_path}"
         )),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BucketRootObjectStoreTabletPath {
+    normalized_root: String,
+    synthetic_path: String,
+}
+
+fn parse_bucket_root_object_store_tablet_path(
+    tablet_root_path: &str,
+) -> Result<Option<BucketRootObjectStoreTabletPath>, String> {
+    let tablet_root_path = tablet_root_path.trim();
+    let Some((scheme, rest)) = tablet_root_path.split_once("://") else {
+        return Ok(None);
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "s3" | "s3a" | "oss") {
+        return Ok(None);
+    }
+
+    let (bucket, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if bucket.is_empty() {
+        return Ok(None);
+    }
+    if !path.trim_matches('/').is_empty() {
+        return Ok(None);
+    }
+
+    let normalized_root = format!("{scheme}://{bucket}");
+    let synthetic_path = format!("{normalized_root}/{BUCKET_ROOT_COMPAT_MARKER}");
+    Ok(Some(BucketRootObjectStoreTabletPath {
+        normalized_root,
+        synthetic_path,
+    }))
 }
 
 fn normalize_root_location(path: &str) -> String {
@@ -157,6 +212,17 @@ mod tests {
         }
     }
 
+    fn expected_local_operator_relative_path(
+        tablet_root: &std::path::Path,
+        rel_path: &str,
+    ) -> String {
+        let tablet_name = tablet_root
+            .file_name()
+            .expect("tablet root must have a final component")
+            .to_string_lossy();
+        join_path(&tablet_name, rel_path)
+    }
+
     #[test]
     fn join_relative_path_appends_to_object_store_root() {
         assert_eq!(
@@ -196,7 +262,8 @@ mod tests {
     #[test]
     fn local_tablet_access_resolves_display_and_operator_paths() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let tablet_root = temp_dir.path().join("tablet").to_string_lossy().to_string();
+        let tablet_root_path = temp_dir.path().join("tablet");
+        let tablet_root = tablet_root_path.to_string_lossy().to_string();
         let access =
             resolve_format_tablet_access(&tablet_root, None).expect("resolve local tablet root");
 
@@ -205,10 +272,9 @@ mod tests {
             access.join_relative_path("meta/1.meta"),
             format!("{tablet_root}/meta/1.meta")
         );
-        assert!(
-            access
-                .operator_relative_path("meta/1.meta")
-                .ends_with("meta/1.meta")
+        assert_eq!(
+            access.operator_relative_path("meta/1.meta"),
+            expected_local_operator_relative_path(&tablet_root_path, "meta/1.meta")
         );
     }
 
@@ -248,11 +314,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_only_local_tablet_root_returns_input_relative_path() {
-        let rel = operator_relative_path_for_tablet_root("/tmp/tablet", "/data/seg.dat")
+    fn parse_only_local_tablet_root_matches_resolved_facade_operator_path() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let tablet_root = temp_dir.path().join("tablet");
+        let tablet_root_path = tablet_root.to_string_lossy().to_string();
+        let parse_only = operator_relative_path_for_tablet_root(&tablet_root_path, "/data/seg.dat")
             .expect("resolve local operator-relative path");
+        let resolved = resolve_format_tablet_access(&tablet_root_path, None)
+            .expect("resolve local tablet root")
+            .operator_relative_path("data/seg.dat");
 
-        assert_eq!(rel, "data/seg.dat");
+        assert_eq!(parse_only, resolved);
+        assert_eq!(
+            parse_only,
+            expected_local_operator_relative_path(&tablet_root, "data/seg.dat")
+        );
+    }
+
+    #[test]
+    fn parse_only_local_root_matches_resolved_facade_operator_path() {
+        let parse_only = operator_relative_path_for_tablet_root("/", "data/seg.dat")
+            .expect("resolve local root operator-relative path");
+        let resolved = resolve_format_tablet_access("/", None)
+            .expect("resolve local root")
+            .operator_relative_path("data/seg.dat");
+
+        assert_eq!(parse_only, resolved);
     }
 
     #[test]
@@ -264,6 +351,40 @@ mod tests {
         .expect("resolve object-store operator-relative path");
 
         assert_eq!(rel, "warehouse/db_1/table_2/100/data/seg.dat");
+    }
+
+    #[test]
+    fn parse_only_bucket_root_object_store_does_not_require_profile() {
+        let rel = operator_relative_path_for_tablet_root("s3://bucket", "data/seg.dat")
+            .expect("resolve bucket-root object-store operator-relative path");
+
+        assert_eq!(rel, "data/seg.dat");
+    }
+
+    #[test]
+    fn parse_only_bucket_root_object_store_empty_relative_path_returns_empty() {
+        let rel = operator_relative_path_for_tablet_root("s3://bucket/", "")
+            .expect("resolve bucket-root object-store empty operator-relative path");
+
+        assert_eq!(rel, "");
+    }
+
+    #[test]
+    fn bucket_root_object_store_tablet_access_resolves_with_empty_operator_root() {
+        let profile = ObjectStoreProfile::from_s3_store_config(&sample_s3_config())
+            .expect("build object-store profile");
+        let access = resolve_format_tablet_access("s3://bucket", Some(&profile))
+            .expect("resolve bucket-root object-store tablet root");
+
+        assert_eq!(access.scheme(), FsScheme::ObjectStore);
+        assert_eq!(
+            access.operator_relative_path("data/seg.dat"),
+            "data/seg.dat"
+        );
+        assert_eq!(
+            access.join_relative_path("data/seg.dat"),
+            "s3://bucket/data/seg.dat"
+        );
     }
 
     #[test]

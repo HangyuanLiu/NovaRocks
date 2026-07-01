@@ -1095,6 +1095,22 @@ mod tests {
     use prost::Message;
     use tempfile::TempDir;
 
+    fn expected_local_operator_relative_path(
+        tablet_root: &std::path::Path,
+        rel_path: &str,
+    ) -> String {
+        let tablet_name = tablet_root
+            .file_name()
+            .expect("tablet root must have a final component")
+            .to_string_lossy();
+        let rel_path = rel_path.trim_start_matches('/');
+        if rel_path.is_empty() {
+            tablet_name.to_string()
+        } else {
+            format!("{tablet_name}/{rel_path}")
+        }
+    }
+
     #[test]
     fn tablet_operator_relative_path_resolves_object_store_without_profile() {
         let rel =
@@ -1179,12 +1195,9 @@ mod tests {
         assert_eq!(snapshot.rowset_count, 1);
         assert_eq!(snapshot.segment_files.len(), 2);
         assert_eq!(snapshot.segment_files[0].name, "a.dat");
-        assert!(
-            snapshot.segment_files[0]
-                .relative_path
-                .ends_with("data/a.dat"),
-            "relative_path={}",
-            snapshot.segment_files[0].relative_path
+        assert_eq!(
+            snapshot.segment_files[0].relative_path,
+            expected_local_operator_relative_path(temp_dir.path(), "data/a.dat")
         );
         assert_eq!(snapshot.segment_files[0].segment_id, Some(7));
         assert_eq!(snapshot.segment_files[0].bundle_file_offset, Some(10));
@@ -1237,12 +1250,9 @@ mod tests {
         assert_eq!(snapshot.total_num_rows, 7);
         assert_eq!(snapshot.rowset_count, 1);
         assert_eq!(snapshot.segment_files.len(), 1);
-        assert!(
-            snapshot.segment_files[0]
-                .relative_path
-                .ends_with("data/seg0.dat"),
-            "relative_path={}",
-            snapshot.segment_files[0].relative_path
+        assert_eq!(
+            snapshot.segment_files[0].relative_path,
+            expected_local_operator_relative_path(temp_dir.path(), "data/seg0.dat")
         );
         assert_eq!(snapshot.segment_files[0].bundle_file_offset, None);
         assert_eq!(snapshot.segment_files[0].segment_size, None);
@@ -1869,9 +1879,12 @@ mod tests {
             .version_to_file_rel_path
             .get(&8)
             .expect("delvec file relative path");
-        assert!(
-            delvec_rel_path.ends_with("data/delvec_8"),
-            "relative_path={delvec_rel_path}"
+        assert_eq!(
+            delvec_rel_path,
+            &expected_local_operator_relative_path(
+                std::path::Path::new("/tmp/starrocks_tablet"),
+                "data/delvec_8"
+            )
         );
         let page = delvec_meta
             .segment_delvec_pages
