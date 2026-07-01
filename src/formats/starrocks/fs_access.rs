@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// FS-6 stages this facade before later migration tasks wire it into the
+// StarRocks writer, metadata, and reader paths.
+#![allow(dead_code)]
+
 use opendal::Operator;
 
 use crate::connector::starrocks::ObjectStoreProfile;
@@ -115,6 +119,35 @@ mod tests {
         assert_eq!(
             join_path("/tmp/warehouse/tablet/", "/meta/1.meta"),
             "/tmp/warehouse/tablet/meta/1.meta"
+        );
+    }
+
+    #[test]
+    fn join_relative_path_returns_root_when_relative_path_is_empty() {
+        assert_eq!(join_path("/tmp/root", ""), "/tmp/root");
+    }
+
+    #[test]
+    fn join_relative_path_returns_relative_path_when_root_is_empty() {
+        assert_eq!(join_path("", "/meta/1.meta"), "meta/1.meta");
+    }
+
+    #[test]
+    fn local_tablet_access_resolves_display_and_operator_paths() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let tablet_root = temp_dir.path().join("tablet").to_string_lossy().to_string();
+        let access =
+            resolve_format_tablet_access(&tablet_root, None).expect("resolve local tablet root");
+
+        assert_eq!(access.scheme(), FsScheme::Local);
+        assert_eq!(
+            access.join_relative_path("meta/1.meta"),
+            format!("{tablet_root}/meta/1.meta")
+        );
+        assert!(
+            access
+                .operator_relative_path("meta/1.meta")
+                .ends_with("meta/1.meta")
         );
     }
 }
