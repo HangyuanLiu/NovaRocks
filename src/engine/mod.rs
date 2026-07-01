@@ -3650,7 +3650,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     state: &Arc<StandaloneState>,
     _current_catalog: Option<&str>,
     current_database: &str,
-    physical_plan: &crate::sql::optimizer::PhysicalPlanNode,
+    physical_plan: &crate::sql::optimizer::OptimizerPhysicalNode,
     dag: &mut crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
@@ -3701,7 +3701,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
-    physical_plan: &crate::sql::optimizer::PhysicalPlanNode,
+    physical_plan: &crate::sql::optimizer::OptimizerPhysicalNode,
     dag: &mut crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec,
     query_opts: Option<TQueryOptions>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3852,7 +3852,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
 }
 
 pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
-    pub(crate) physical_plan: crate::sql::optimizer::PhysicalPlanNode,
+    pub(crate) physical_plan: crate::sql::optimizer::OptimizerPhysicalNode,
     pub(crate) output_columns: Vec<crate::sql::analysis::OutputColumn>,
     pub(crate) change_stream:
         crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
@@ -10301,8 +10301,8 @@ path = "meta/operations.sqlite"
         };
         use crate::sql::column_id::ColumnId;
         use crate::sql::optimizer::operator::{Operator, ValuesOp};
-        use crate::sql::optimizer::physical_plan::{
-            PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
+        use crate::sql::optimizer::physical_tree::{
+            OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
         };
         use crate::sql::optimizer::scalar::ScalarArena;
         use crate::sql::optimizer::statistics::Statistics;
@@ -10316,7 +10316,7 @@ path = "meta/operations.sqlite"
             nullable: false,
             is_internal: false,
         };
-        let mut physical_plan = PhysicalPlanNode {
+        let mut physical_plan = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
                 columns: vec![output_column.clone()],

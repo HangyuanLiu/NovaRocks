@@ -395,7 +395,7 @@ fn validate_edge_target_node(
         )
         })?;
 
-    let crate::sql::planner::PlanNodeKind::Exchange(exchange) = &target_node.kind else {
+    let crate::sql::planner::DistributedPlanKind::Exchange(exchange) = &target_node.kind else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -655,7 +655,7 @@ fn target_exchange_for_edge<'a>(
                 edge.target_exchange_node_id, target_fragment.fragment_id
             )
         })?;
-    let crate::sql::planner::PlanNodeKind::Exchange(exchange) = &target_node.kind else {
+    let crate::sql::planner::DistributedPlanKind::Exchange(exchange) = &target_node.kind else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -1154,68 +1154,56 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         node: &crate::sql::planner::DistributedPlanNode,
     ) -> Result<LoweredDistributedNode, String> {
         let mut lowered = match &node.kind {
-            crate::sql::planner::PlanNodeKind::Scan(scan) => self.lower_scan_node(node, scan)?,
-            crate::sql::planner::PlanNodeKind::Project(project) => {
+            crate::sql::planner::DistributedPlanKind::Scan(scan) => {
+                self.lower_scan_node(node, scan)?
+            }
+            crate::sql::planner::DistributedPlanKind::Project(project) => {
                 self.lower_project_node(node, project)?
             }
-            crate::sql::planner::PlanNodeKind::Filter(filter) => {
+            crate::sql::planner::DistributedPlanKind::Filter(filter) => {
                 self.lower_filter_node(node, filter)?
             }
-            crate::sql::planner::PlanNodeKind::Sort(sort) => self.lower_sort_node(node, sort)?,
-            crate::sql::planner::PlanNodeKind::TopN(topn) => self.lower_topn_node(node, topn)?,
-            crate::sql::planner::PlanNodeKind::Exchange(exchange) => {
+            crate::sql::planner::DistributedPlanKind::Sort(sort) => {
+                self.lower_sort_node(node, sort)?
+            }
+            crate::sql::planner::DistributedPlanKind::TopN(topn) => {
+                self.lower_topn_node(node, topn)?
+            }
+            crate::sql::planner::DistributedPlanKind::Exchange(exchange) => {
                 self.lower_exchange_node(node, exchange)?
             }
-            crate::sql::planner::PlanNodeKind::HashAggregate(agg) => {
+            crate::sql::planner::DistributedPlanKind::HashAggregate(agg) => {
                 self.lower_hash_aggregate_node(node, agg.as_ref())?
             }
-            crate::sql::planner::PlanNodeKind::HashJoin(hash_join) => {
+            crate::sql::planner::DistributedPlanKind::HashJoin(hash_join) => {
                 self.lower_hash_join_node(node, hash_join.as_ref())?
             }
-            crate::sql::planner::PlanNodeKind::NestLoopJoin(nest_loop) => {
+            crate::sql::planner::DistributedPlanKind::NestLoopJoin(nest_loop) => {
                 self.lower_nest_loop_join_node(node, nest_loop)?
             }
-            crate::sql::planner::PlanNodeKind::Values(values) => {
+            crate::sql::planner::DistributedPlanKind::Values(values) => {
                 self.lower_values_node(node, values)?
             }
-            crate::sql::planner::PlanNodeKind::AssertOneRow(assert_one_row) => {
+            crate::sql::planner::DistributedPlanKind::AssertOneRow(assert_one_row) => {
                 self.lower_assert_one_row_node(node, assert_one_row)?
             }
-            crate::sql::planner::PlanNodeKind::Decode(decode) => {
+            crate::sql::planner::DistributedPlanKind::Decode(decode) => {
                 self.lower_decode_node(node, decode)?
             }
-            crate::sql::planner::PlanNodeKind::Repeat(repeat) => {
+            crate::sql::planner::DistributedPlanKind::Repeat(repeat) => {
                 self.lower_repeat_node(node, repeat)?
             }
-            crate::sql::planner::PlanNodeKind::SetOp(set_op) => {
+            crate::sql::planner::DistributedPlanKind::SetOp(set_op) => {
                 self.lower_set_op_node(node, set_op)?
             }
-            crate::sql::planner::PlanNodeKind::Window(window) => {
+            crate::sql::planner::DistributedPlanKind::Window(window) => {
                 self.lower_window_node(node, window)?
             }
-            crate::sql::planner::PlanNodeKind::GenerateSeries(generate_series) => {
+            crate::sql::planner::DistributedPlanKind::GenerateSeries(generate_series) => {
                 self.lower_generate_series_node(node, generate_series)?
             }
-            crate::sql::planner::PlanNodeKind::TableFunction(table_function) => {
+            crate::sql::planner::DistributedPlanKind::TableFunction(table_function) => {
                 self.lower_table_function_node(node, table_function)?
-            }
-            crate::sql::planner::PlanNodeKind::Limit(_)
-            | crate::sql::planner::PlanNodeKind::Aggregate(_)
-            | crate::sql::planner::PlanNodeKind::Join(_)
-            | crate::sql::planner::PlanNodeKind::Union(_)
-            | crate::sql::planner::PlanNodeKind::Intersect(_)
-            | crate::sql::planner::PlanNodeKind::Except(_)
-            | crate::sql::planner::PlanNodeKind::CTEAnchor(_)
-            | crate::sql::planner::PlanNodeKind::CTEProduce(_)
-            | crate::sql::planner::PlanNodeKind::CTEConsume(_)
-            | crate::sql::planner::PlanNodeKind::AggregateStateMerge(_)
-            | crate::sql::planner::PlanNodeKind::Apply(_)
-            | crate::sql::planner::PlanNodeKind::ImvDelta(_)
-            | crate::sql::planner::PlanNodeKind::ImvVersion(_) => {
-                return Err(format!(
-                    "logical plan node {} leaked into distributed lowering",
-                    node.kind.variant_name()
-                ));
             }
         };
         if let Some(root) = lowered.plan_nodes.first_mut() {
@@ -1360,7 +1348,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     fn lower_topn_node(
         &mut self,
         node: &crate::sql::planner::DistributedPlanNode,
-        topn: &super::kind::DistributedTopNNode,
+        topn: &super::kind::PhysicalTopNNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
             return Err(format!(
@@ -1491,7 +1479,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     fn lower_hash_aggregate_node(
         &mut self,
         node: &crate::sql::planner::DistributedPlanNode,
-        agg: &super::kind::DistributedHashAggregateNode,
+        agg: &super::kind::PhysicalHashAggregateNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
             return Err(format!(
@@ -1518,7 +1506,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     fn lower_hash_join_node(
         &mut self,
         node: &crate::sql::planner::DistributedPlanNode,
-        hash_join: &super::kind::DistributedHashJoinNode,
+        hash_join: &super::kind::PhysicalHashJoinNode,
     ) -> Result<LoweredDistributedNode, String> {
         let (left_node, right_node) = binary_children(node, "HashJoin")?;
         let left = self.lower_node(left_node)?;
@@ -1560,7 +1548,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     fn lower_nest_loop_join_node(
         &mut self,
         node: &crate::sql::planner::DistributedPlanNode,
-        nest_loop: &super::kind::DistributedNestLoopJoinNode,
+        nest_loop: &super::kind::PhysicalNestLoopJoinNode,
     ) -> Result<LoweredDistributedNode, String> {
         let (left_node, right_node) = binary_children(node, "NestLoopJoin")?;
         let left = self.lower_node(left_node)?;
@@ -1712,7 +1700,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     fn lower_set_op_node(
         &mut self,
         node: &crate::sql::planner::DistributedPlanNode,
-        set_op: &super::kind::DistributedSetOpNode,
+        set_op: &super::kind::PhysicalSetOpNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.is_empty() {
             return Err("DistributedPlan SetOp has no inputs".to_string());
@@ -1924,7 +1912,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         join_node_id: i32,
         left_tuple_ids: &[i32],
         right_tuple_ids: &[i32],
-        op: &super::kind::DistributedHashJoinNode,
+        op: &super::kind::PhysicalHashJoinNode,
         left_scope: ExprScope,
         right_scope: ExprScope,
         execution_distribution: Option<JoinExecutionDistribution>,
@@ -2061,7 +2049,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         join_node_id: i32,
         left_tuple_ids: &[i32],
         right_tuple_ids: &[i32],
-        op: &super::kind::DistributedNestLoopJoinNode,
+        op: &super::kind::PhysicalNestLoopJoinNode,
         left_scope: ExprScope,
         right_scope: ExprScope,
     ) -> Result<(plan_nodes::TPlanNode, ExprScope, Vec<i32>), String> {
@@ -2894,7 +2882,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         agg_node_id: i32,
         agg_tuple_id: i32,
-        op: &super::kind::DistributedHashAggregateNode,
+        op: &super::kind::PhysicalHashAggregateNode,
         child_scope: &ExprScope,
     ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
         let state = &mut *self.state;
@@ -3213,7 +3201,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     pub(crate) fn lower_top_n_single_or_partial(
         &mut self,
         top_n_node_id: i32,
-        op: &super::kind::DistributedTopNNode,
+        op: &super::kind::PhysicalTopNNode,
         child_scope: &ExprScope,
         child_tuple_ids: &[i32],
     ) -> Result<plan_nodes::TPlanNode, String> {
@@ -4871,12 +4859,12 @@ mod tests {
     use crate::sql::codegen::expr_compiler::infer_agg_function_types;
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::ir::kind::{
-        DistributedExchangeNode, DistributedHashJoinEqCondition, DistributedHashJoinNode,
-        DistributedNestLoopJoinNode, DistributedValuesNode, ExchangeFlavor,
+        DistributedExchangeNode, DistributedValuesNode, ExchangeFlavor,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
     };
     use crate::sql::codegen::ir::{
-        DataPartition, DataSink, DistributedPlan, DistributedPlanNode, PartitionKind, PlanFragment,
-        PlanNodeKind, PlanNodeStats, build_distributed_plan,
+        DataPartition, DataSink, DistributedPlan, DistributedPlanKind, DistributedPlanNode,
+        PartitionKind, PlanFragment, PlanNodeStats, build_distributed_plan,
     };
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
@@ -5160,9 +5148,9 @@ mod tests {
         let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
         let (left_column_id, right_column_id, left_key, right_key, left_scope, right_scope) =
             hash_join_test_inputs(&mut state);
-        let op = DistributedHashJoinNode {
+        let op = PhysicalHashJoinNode {
             join_type: JoinKind::NullAwareLeftAnti,
-            eq_conditions: vec![DistributedHashJoinEqCondition {
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
                 left: left_key,
                 right: right_key,
                 null_safe: false,
@@ -5207,9 +5195,9 @@ mod tests {
         let connectors = ConnectorRegistry::new();
         let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
         let (left_column_id, _, _, _, left_scope, right_scope) = hash_join_test_inputs(&mut state);
-        let op = DistributedHashJoinNode {
+        let op = PhysicalHashJoinNode {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![DistributedHashJoinEqCondition {
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
                 left: qualified_column_ref(left_column_id, "l", "k", false),
                 right: qualified_column_ref(left_column_id, "l", "k", false),
                 null_safe: false,
@@ -5243,9 +5231,9 @@ mod tests {
         let (_, _, left_key, right_key, left_scope, right_scope) =
             hash_join_test_inputs(&mut state);
 
-        let op = DistributedHashJoinNode {
+        let op = PhysicalHashJoinNode {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![DistributedHashJoinEqCondition {
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
                 left: right_key,
                 right: left_key,
                 null_safe: false,
@@ -5354,7 +5342,7 @@ mod tests {
         let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
         let (left_column_id, right_column_id, _, _, left_scope, right_scope) =
             hash_join_test_inputs(&mut state);
-        let op = DistributedNestLoopJoinNode {
+        let op = PhysicalNestLoopJoinNode {
             join_type: JoinKind::NullAwareLeftAnti,
             condition: None,
         };
@@ -5486,7 +5474,8 @@ mod tests {
         );
 
         let mut mismatched_source = distributed_values_multi_fragment_plan();
-        let PlanNodeKind::Exchange(exchange) = &mut mismatched_source.fragments[1].root.kind else {
+        let DistributedPlanKind::Exchange(exchange) = &mut mismatched_source.fragments[1].root.kind
+        else {
             panic!("root should be exchange");
         };
         exchange.source_fragment_id = 42;
@@ -5643,7 +5632,7 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: PlanNodeStats::from_statistics(&Statistics::default()),
-            kind: PlanNodeKind::Values(DistributedValuesNode {
+            kind: DistributedPlanKind::Values(DistributedValuesNode {
                 rows: vec![],
                 columns,
             }),
@@ -5667,7 +5656,7 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: PlanNodeStats::from_statistics(&Statistics::default()),
-            kind: PlanNodeKind::Exchange(DistributedExchangeNode {
+            kind: DistributedPlanKind::Exchange(DistributedExchangeNode {
                 partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
                 partition_exprs: vec![],
                 source_fragment_id,

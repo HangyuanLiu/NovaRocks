@@ -169,8 +169,8 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
-        ApplyKind, LogicalApplyNode, LogicalFilterNode, LogicalJoinNode, LogicalProjectNode,
-        LogicalScanNode, PlanNodeKind,
+        ApplyKind, LogicalApplyNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind,
+        LogicalProjectNode, LogicalScanNode,
     };
 
     const OUTER_A: ColumnId = ColumnId(1);
@@ -213,7 +213,7 @@ mod tests {
 
     fn scan(table: &str, columns: Vec<OutputColumn>) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(LogicalScanNode {
                 database: "default".to_string(),
                 table: table_def(table),
                 alias: None,
@@ -303,12 +303,12 @@ mod tests {
         }
 
         LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: items,
                 output_qualifier: None,
             }),
             vec![LogicalPlanNode::new(
-                PlanNodeKind::Filter(LogicalFilterNode {
+                LogicalPlanKind::Filter(LogicalFilterNode {
                     predicate: correlation_predicate(predicate_nullable),
                 }),
                 vec![inner_scan(inner_b_nullable, inner_k_nullable)],
@@ -325,7 +325,7 @@ mod tests {
         correlated: bool,
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::In { negated },
                 subquery_expr: col_ref(OUTER_A, "a", outer_a_nullable),
                 output_column: bool_output(),
@@ -343,14 +343,14 @@ mod tests {
     }
 
     fn set_inner_output_column_id(plan: &mut LogicalPlanNode, inner_output_column_id: ColumnId) {
-        let PlanNodeKind::Apply(apply) = &mut plan.kind else {
+        let LogicalPlanKind::Apply(apply) = &mut plan.kind else {
             panic!("expected Apply plan, got: {plan:?}");
         };
         apply.inner_output_column_id = inner_output_column_id;
     }
 
     fn set_use_semi_anti(plan: &mut LogicalPlanNode, use_semi_anti: bool) {
-        let PlanNodeKind::Apply(apply) = &mut plan.kind else {
+        let LogicalPlanKind::Apply(apply) = &mut plan.kind else {
             panic!("expected Apply plan, got: {plan:?}");
         };
         apply.use_semi_anti = use_semi_anti;
@@ -389,7 +389,7 @@ mod tests {
             !contains_apply(plan),
             "result must not contain Apply: {plan:?}"
         );
-        let PlanNodeKind::Join(join) = &plan.kind else {
+        let LogicalPlanKind::Join(join) = &plan.kind else {
             panic!("expected Join, got: {plan:?}");
         };
         assert_eq!(join.join_type, expected_kind);
@@ -467,17 +467,17 @@ mod tests {
 
     fn contains_apply(plan: &LogicalPlanNode) -> bool {
         match &plan.kind {
-            PlanNodeKind::Apply(_) => true,
-            PlanNodeKind::Filter(_) | PlanNodeKind::Project(_) => {
+            LogicalPlanKind::Apply(_) => true,
+            LogicalPlanKind::Filter(_) | LogicalPlanKind::Project(_) => {
                 contains_apply(plan.unary_input())
             }
-            PlanNodeKind::Join(_) => contains_apply(plan.left()) || contains_apply(plan.right()),
+            LogicalPlanKind::Join(_) => contains_apply(plan.left()) || contains_apply(plan.right()),
             _ => false,
         }
     }
 
     fn project_outputs_column(plan: &LogicalPlanNode, expected: ColumnId) -> bool {
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             return false;
         };
         project
@@ -492,7 +492,7 @@ mod tests {
         let join = assert_join(&plan, JoinKind::LeftSemi);
 
         assert_eq_condition(join.condition.as_ref().unwrap(), OUTER_A, INNER_B);
-        assert!(matches!(&plan.right().kind, PlanNodeKind::Scan(_)));
+        assert!(matches!(&plan.right().kind, LogicalPlanKind::Scan(_)));
     }
 
     #[test]
@@ -501,7 +501,7 @@ mod tests {
         let join = assert_join(&plan, JoinKind::NullAwareLeftAnti);
 
         assert_eq_condition(join.condition.as_ref().unwrap(), OUTER_A, INNER_B);
-        assert!(matches!(&plan.right().kind, PlanNodeKind::Scan(_)));
+        assert!(matches!(&plan.right().kind, LogicalPlanKind::Scan(_)));
     }
 
     #[test]
@@ -510,7 +510,7 @@ mod tests {
         let join = assert_join(&plan, JoinKind::NullAwareLeftAnti);
 
         assert_eq_condition(join.condition.as_ref().unwrap(), OUTER_A, INNER_B);
-        assert!(matches!(&plan.right().kind, PlanNodeKind::Scan(_)));
+        assert!(matches!(&plan.right().kind, LogicalPlanKind::Scan(_)));
     }
 
     #[test]
@@ -519,7 +519,7 @@ mod tests {
         let join = assert_join(&plan, JoinKind::LeftAnti);
 
         assert_eq_condition(join.condition.as_ref().unwrap(), OUTER_A, INNER_B);
-        assert!(matches!(&plan.right().kind, PlanNodeKind::Scan(_)));
+        assert!(matches!(&plan.right().kind, LogicalPlanKind::Scan(_)));
     }
 
     #[test]
@@ -546,10 +546,13 @@ mod tests {
         assert!(has_outer_a_inner_b, "expected OUTER_A=INNER_B conjunct");
         assert!(has_outer_k_inner_k, "expected OUTER_K=INNER_K conjunct");
         let right = plan.right();
-        let PlanNodeKind::Project(_project) = &right.kind else {
+        let LogicalPlanKind::Project(_project) = &right.kind else {
             panic!("expected Project right, got: {:?}", right);
         };
-        assert!(matches!(&right.unary_input().kind, PlanNodeKind::Scan(_)));
+        assert!(matches!(
+            &right.unary_input().kind,
+            LogicalPlanKind::Scan(_)
+        ));
     }
 
     #[test]
@@ -573,10 +576,13 @@ mod tests {
         let coalesce_idx = if outer_a_inner_b_idx == 0 { 1 } else { 0 };
         assert_coalesce_false(&conjuncts[coalesce_idx], OUTER_K, INNER_K);
         let right = plan.right();
-        let PlanNodeKind::Project(_project) = &right.kind else {
+        let LogicalPlanKind::Project(_project) = &right.kind else {
             panic!("expected Project right, got: {:?}", right);
         };
-        assert!(matches!(&right.unary_input().kind, PlanNodeKind::Scan(_)));
+        assert!(matches!(
+            &right.unary_input().kind,
+            LogicalPlanKind::Scan(_)
+        ));
     }
 
     #[test]

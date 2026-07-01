@@ -121,8 +121,8 @@ mod tests {
     use crate::sql::planner::imv_rewrite::marker::{ImvVersionRef, plan_contains_imv_marker};
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,
-        LogicalProjectNode, LogicalScanNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,
+        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind,
+        LogicalPlanNode, LogicalProjectNode, LogicalScanNode, LogicalUnionNode, LogicalValuesNode,
     };
     use arrow::datatypes::DataType;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -178,7 +178,7 @@ mod tests {
 
     fn empty_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -200,7 +200,7 @@ mod tests {
             logical_type: None,
         };
         LogicalPlanNode::new(
-            PlanNodeKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
@@ -245,7 +245,7 @@ mod tests {
 
     fn top_level_project_filter_union_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Union(LogicalUnionNode {
+            LogicalPlanKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId(1),
@@ -262,7 +262,7 @@ mod tests {
 
     fn project_filter_branch(first_id: u32) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: column_ref(first_id, "k", DataType::Int64, false),
                     output_name: "k".to_string(),
@@ -271,7 +271,7 @@ mod tests {
                 output_qualifier: None,
             }),
             vec![LogicalPlanNode::new(
-                PlanNodeKind::Filter(LogicalFilterNode {
+                LogicalPlanKind::Filter(LogicalFilterNode {
                     predicate: TypedExpr {
                         kind: ExprKind::BinaryOp {
                             left: Box::new(column_ref(first_id, "k", DataType::Int64, false)),
@@ -314,15 +314,15 @@ mod tests {
     }
 
     fn locator_join_left_input(plan: &LogicalPlanNode) -> &LogicalPlanNode {
-        let PlanNodeKind::Project(_) = &plan.kind else {
+        let LogicalPlanKind::Project(_) = &plan.kind else {
             panic!("expected root Project over target locator join, got {plan:?}");
         };
         let join_plan = plan.unary_input();
-        let PlanNodeKind::Join(join) = &join_plan.kind else {
+        let LogicalPlanKind::Join(join) = &join_plan.kind else {
             panic!("expected target locator Join under root Project, got {join_plan:?}");
         };
         assert_eq!(join.join_type, JoinKind::LeftOuter);
-        let PlanNodeKind::Scan(scan) = &join_plan.right().kind else {
+        let LogicalPlanKind::Scan(scan) = &join_plan.right().kind else {
             panic!("expected target locator scan on join right side");
         };
         assert!(
@@ -334,7 +334,7 @@ mod tests {
 
     fn find_delta_scan(plan: &LogicalPlanNode) -> Option<&LogicalScanNode> {
         match &plan.kind {
-            PlanNodeKind::Scan(scan)
+            LogicalPlanKind::Scan(scan)
                 if matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. }) =>
             {
                 Some(scan)
@@ -345,7 +345,7 @@ mod tests {
 
     fn find_union_plan(plan: &LogicalPlanNode) -> Option<&LogicalPlanNode> {
         match &plan.kind {
-            PlanNodeKind::Union(_) => Some(plan),
+            LogicalPlanKind::Union(_) => Some(plan),
             _ => plan.children.iter().find_map(find_union_plan),
         }
     }
@@ -479,14 +479,14 @@ mod tests {
             },
         ];
         LogicalPlanNode::new(
-            PlanNodeKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
                     columns,
                     iceberg_row_lineage_metadata_columns: Vec::new(),
                     source: match &iceberg_scan_plan().kind {
-                        PlanNodeKind::Scan(scan) => scan.table.source.clone(),
+                        LogicalPlanKind::Scan(scan) => scan.table.source.clone(),
                         _ => unreachable!(),
                     },
                 },
@@ -520,7 +520,7 @@ mod tests {
 
     fn aggregate_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Aggregate(LogicalAggregateNode {
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![TypedExpr {
                     kind: ExprKind::ColumnRef {
                         column_id: ColumnId(1),
@@ -850,7 +850,7 @@ mod tests {
             },
         ];
         LogicalPlanNode::new(
-            PlanNodeKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: table.to_string(),
@@ -904,7 +904,7 @@ mod tests {
 
     fn project_all(input: LogicalPlanNode, first_id: u32) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: column_expr(first_id, "k", false),
@@ -940,7 +940,7 @@ mod tests {
         let left = project_all(join_base_scan("l", 1, 22), 1);
         let right = project_all(join_base_scan("r", 10, 44), 10);
         LogicalPlanNode::new(
-            PlanNodeKind::Aggregate(LogicalAggregateNode {
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![column_expr(1, "k", false)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
@@ -969,7 +969,7 @@ mod tests {
                 already_pushed: false,
             }),
             vec![LogicalPlanNode::new(
-                PlanNodeKind::Join(LogicalJoinNode {
+                LogicalPlanKind::Join(LogicalJoinNode {
                     join_type: JoinKind::Inner,
                     condition: Some(TypedExpr {
                         kind: ExprKind::BinaryOp {
@@ -992,7 +992,7 @@ mod tests {
         let left = project_all(join_base_scan("l", 1, 22), 1);
         let right = project_all(join_base_scan("r", 10, 44), 10);
         let join = LogicalPlanNode::new(
-            PlanNodeKind::Join(LogicalJoinNode {
+            LogicalPlanKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {
@@ -1008,7 +1008,7 @@ mod tests {
             None,
         );
         LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: column_expr(1, "k", false),
@@ -1029,13 +1029,13 @@ mod tests {
     }
 
     fn join_projection_filter_plan() -> LogicalPlanNode {
-        let PlanNodeKind::Project(project) = join_projection_plan().kind else {
+        let LogicalPlanKind::Project(project) = join_projection_plan().kind else {
             unreachable!("join projection helper must return Project");
         };
         let left = project_all(join_base_scan("l", 1, 22), 1);
         let right = project_all(join_base_scan("r", 10, 44), 10);
         let join = LogicalPlanNode::new(
-            PlanNodeKind::Join(LogicalJoinNode {
+            LogicalPlanKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {
@@ -1051,7 +1051,7 @@ mod tests {
             None,
         );
         let filter = LogicalPlanNode::new(
-            PlanNodeKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(LogicalFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
                         left: Box::new(column_expr(1, "k", false)),
@@ -1069,16 +1069,16 @@ mod tests {
             vec![join],
             None,
         );
-        LogicalPlanNode::new(PlanNodeKind::Project(project), vec![filter], None)
+        LogicalPlanNode::new(LogicalPlanKind::Project(project), vec![filter], None)
     }
 
     fn join_projection_left_filter_plan() -> LogicalPlanNode {
-        let PlanNodeKind::Project(project) = join_projection_plan().kind else {
+        let LogicalPlanKind::Project(project) = join_projection_plan().kind else {
             unreachable!("join projection helper must return Project");
         };
         let left_scan = join_base_scan("l", 1, 22);
         let left_filter = LogicalPlanNode::new(
-            PlanNodeKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(LogicalFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
                         left: Box::new(column_expr(1, "k", false)),
@@ -1099,7 +1099,7 @@ mod tests {
         let left = project_all(left_filter, 1);
         let right = project_all(join_base_scan("r", 10, 44), 10);
         let join = LogicalPlanNode::new(
-            PlanNodeKind::Join(LogicalJoinNode {
+            LogicalPlanKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {
@@ -1114,7 +1114,7 @@ mod tests {
             vec![left, right],
             None,
         );
-        LogicalPlanNode::new(PlanNodeKind::Project(project), vec![join], None)
+        LogicalPlanNode::new(LogicalPlanKind::Project(project), vec![join], None)
     }
 
     fn join_projection_refresh_context_for_test() -> (
@@ -1433,7 +1433,7 @@ mod tests {
         .expect("plain Iceberg scan should pass through IMV rewrite");
 
         assert_eq!(factory.borrow().peek_next_id(), 1);
-        assert!(matches!(outcome.plan.kind, PlanNodeKind::Scan(_)));
+        assert!(matches!(outcome.plan.kind, LogicalPlanKind::Scan(_)));
     }
 
     #[test]
@@ -1456,23 +1456,26 @@ mod tests {
     }
 
     #[test]
-    fn run_imv_rewrite_returns_stage_validation_error_for_invalid_logical_scan() {
+    fn run_imv_rewrite_normalizes_scan_mv_rewrite_sidecar() {
         let mut plan = iceberg_scan_plan();
-        let PlanNodeKind::Scan(scan) = &mut plan.kind else {
+        let LogicalPlanKind::Scan(scan) = &mut plan.kind else {
             panic!("expected scan plan");
         };
         scan.mv_rewritten_from = Some("mv_b".to_string());
 
-        let err = run_imv_rewrite(ImvRewriteInput {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
         })
-        .expect_err("invalid logical scan must return a stage validation error");
+        .expect("logical scan sidecars should not be stage validation errors");
 
-        assert!(err.contains("Scan.mv_rewritten_from"), "{err}");
+        let LogicalPlanKind::Scan(scan) = &outcome.plan.kind else {
+            panic!("expected scan plan");
+        };
+        assert_eq!(scan.mv_rewritten_from, None);
     }
 
     #[test]
@@ -1726,7 +1729,7 @@ mod tests {
         .expect("disabled wrap rule must let the pipeline succeed");
 
         // outcome.plan must still be the original (no marker added).
-        assert!(matches!(&outcome.plan.kind, PlanNodeKind::Values(_)));
+        assert!(matches!(&outcome.plan.kind, LogicalPlanKind::Values(_)));
     }
 
     #[test]
@@ -1778,7 +1781,7 @@ mod tests {
         })
         .expect("Delta(Scan) must bind successfully");
 
-        let PlanNodeKind::Scan(scan) = &outcome.plan.kind else {
+        let LogicalPlanKind::Scan(scan) = &outcome.plan.kind else {
             panic!("expected scan outcome");
         };
         match &scan.table.source {
@@ -1797,7 +1800,7 @@ mod tests {
     #[test]
     fn imv_pipeline_binds_version_from_scan() {
         let plan = LogicalPlanNode::new(
-            PlanNodeKind::ImvVersion(LogicalImvVersionNode {
+            LogicalPlanKind::ImvVersion(LogicalImvVersionNode {
                 version_ref: ImvVersionRef::from_snapshot(),
             }),
             vec![iceberg_scan_plan()],
@@ -1812,7 +1815,7 @@ mod tests {
         })
         .expect("Version(Scan, From) must bind and pass validation");
 
-        let PlanNodeKind::Scan(scan) = &outcome.plan.kind else {
+        let LogicalPlanKind::Scan(scan) = &outcome.plan.kind else {
             panic!("expected scan outcome");
         };
         match &scan.table.source {
@@ -1826,7 +1829,7 @@ mod tests {
     #[test]
     fn imv_pipeline_binds_version_to_scan() {
         let plan = LogicalPlanNode::new(
-            PlanNodeKind::ImvVersion(LogicalImvVersionNode {
+            LogicalPlanKind::ImvVersion(LogicalImvVersionNode {
                 version_ref: ImvVersionRef::to_snapshot(),
             }),
             vec![iceberg_scan_plan()],
@@ -1841,7 +1844,7 @@ mod tests {
         })
         .expect("Version(Scan, To) must bind and pass validation");
 
-        let PlanNodeKind::Scan(scan) = &outcome.plan.kind else {
+        let LogicalPlanKind::Scan(scan) = &outcome.plan.kind else {
             panic!("expected scan outcome");
         };
         match &scan.table.source {
@@ -1869,7 +1872,7 @@ mod tests {
         })
         .expect("pipeline must succeed");
 
-        let PlanNodeKind::Scan(scan) = &outcome.plan.kind else {
+        let LogicalPlanKind::Scan(scan) = &outcome.plan.kind else {
             panic!("expected scan outcome");
         };
         let action = scan
@@ -1888,7 +1891,7 @@ mod tests {
         // → propagate it into the Project → pass validation.
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -1918,7 +1921,7 @@ mod tests {
         .expect("Project over delta scan must rewrite and pass validation");
 
         // Outcome root is a Project that exposes the propagated action column.
-        let PlanNodeKind::Project(project) = &outcome.plan.kind else {
+        let LogicalPlanKind::Project(project) = &outcome.plan.kind else {
             panic!("expected Project outcome, got {:?}", outcome.plan);
         };
         assert!(
@@ -1953,7 +1956,7 @@ mod tests {
     fn imv_pipeline_projection_filter_outputs_target_locator_metadata() {
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: column_ref(1, "k", DataType::Int64, false),
                     output_name: "k".to_string(),
@@ -1974,7 +1977,7 @@ mod tests {
         })
         .expect("projection/filter rewrite must carry target locator metadata");
 
-        let PlanNodeKind::Project(project) = &outcome.plan.kind else {
+        let LogicalPlanKind::Project(project) = &outcome.plan.kind else {
             panic!("expected root Project, got {:?}", outcome.plan);
         };
         let output_names = project_output_names(project);
@@ -2009,7 +2012,7 @@ mod tests {
     fn imv_pipeline_rejects_preexisting_locator_metadata_name_collision() {
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: column_ref(1, "k", DataType::Int64, false),
@@ -2074,7 +2077,7 @@ mod tests {
             "final plan must not contain unresolved IMV markers: {:?}",
             outcome.plan
         );
-        let PlanNodeKind::Project(project) = &outcome.plan.kind else {
+        let LogicalPlanKind::Project(project) = &outcome.plan.kind else {
             panic!("expected root apply-key Project, got {:?}", outcome.plan);
         };
         assert!(
@@ -2101,7 +2104,7 @@ mod tests {
         );
         let union_plan = find_union_plan(locator_join_left_input(&outcome.plan))
             .expect("expected union under target locator join left side");
-        let PlanNodeKind::Union(union) = &union_plan.kind else {
+        let LogicalPlanKind::Union(union) = &union_plan.kind else {
             panic!(
                 "expected Union under target locator join left side, got {:?}",
                 union_plan
@@ -2121,7 +2124,7 @@ mod tests {
             "Union output must include action column"
         );
         for branch in &union_plan.children {
-            let PlanNodeKind::Project(branch_project) = &branch.kind else {
+            let LogicalPlanKind::Project(branch_project) = &branch.kind else {
                 panic!("expected normalized branch Project, got {branch:?}");
             };
             assert_eq!(
@@ -2224,7 +2227,7 @@ mod tests {
         // so the rule never matches and the slot stays None (P1 scope).
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: column_ref(1, "k", DataType::Int64, false),
                     output_name: "k".to_string(),
@@ -2259,15 +2262,15 @@ mod tests {
 
         assert_aggregate_change_stream_outcome(&outcome);
         let delta_input = find_signed_delta_project(&outcome.plan);
-        let PlanNodeKind::Project(_) = &delta_input.kind else {
+        let LogicalPlanKind::Project(_) = &delta_input.kind else {
             panic!("expected signed aggregate projection delta input");
         };
         let delta_aggregate_plan = delta_input.unary_input();
-        let PlanNodeKind::Aggregate(delta_aggregate) = &delta_aggregate_plan.kind else {
+        let LogicalPlanKind::Aggregate(delta_aggregate) = &delta_aggregate_plan.kind else {
             panic!("expected signed aggregate under projection");
         };
         assert_eq!(delta_aggregate.aggregates[0].name, "sum_state_signed");
-        let PlanNodeKind::Scan(scan) = &delta_aggregate_plan.unary_input().kind else {
+        let LogicalPlanKind::Scan(scan) = &delta_aggregate_plan.unary_input().kind else {
             panic!("expected bound delta scan under signed aggregate");
         };
         assert!(
@@ -2316,23 +2319,23 @@ mod tests {
             !plan_contains_imv_marker(delta_input),
             "final delta input must not contain unresolved IMV markers"
         );
-        let PlanNodeKind::Project(_) = &delta_input.kind else {
+        let LogicalPlanKind::Project(_) = &delta_input.kind else {
             panic!("expected signed aggregate projection delta input");
         };
         let delta_aggregate_plan = delta_input.unary_input();
-        let PlanNodeKind::Aggregate(delta_aggregate) = &delta_aggregate_plan.kind else {
+        let LogicalPlanKind::Aggregate(delta_aggregate) = &delta_aggregate_plan.kind else {
             panic!("expected signed aggregate under projection");
         };
         assert_eq!(delta_aggregate.aggregates[0].name, "sum_state_signed");
         let signed_action_id = signed_action_column_id(delta_aggregate);
 
         let union_plan = delta_aggregate_plan.unary_input();
-        let PlanNodeKind::Union(_) = &union_plan.kind else {
+        let LogicalPlanKind::Union(_) = &union_plan.kind else {
             panic!("expected join delta UnionAll under signed aggregate");
         };
         assert_join_delta_union_shape(union_plan, signed_action_id);
         let union_columns = match &union_plan.kind {
-            PlanNodeKind::Union(union) => &union.output_columns,
+            LogicalPlanKind::Union(union) => &union.output_columns,
             _ => unreachable!(),
         };
         let join_apply_key_from_plan = union_columns
@@ -2693,7 +2696,7 @@ mod tests {
         refresh_ctx: &IcebergMvRewriteContext,
     ) -> LogicalPlanNode {
         fn visit(plan: &mut LogicalPlanNode, refresh_ctx: &IcebergMvRewriteContext) {
-            if let PlanNodeKind::Scan(scan) = &mut plan.kind
+            if let LogicalPlanKind::Scan(scan) = &mut plan.kind
                 && let ScanSource::IcebergDataFiles { table, .. } = &mut scan.table.source
             {
                 let fqn = format!("{}.{}.{}", table.catalog, table.namespace, table.table);
@@ -2784,17 +2787,17 @@ mod tests {
 
         assert_aggregate_change_stream_shape(&rewritten);
         let delta_input = find_signed_delta_project(&rewritten);
-        let PlanNodeKind::Project(_) = &delta_input.kind else {
+        let LogicalPlanKind::Project(_) = &delta_input.kind else {
             panic!("expected signed aggregate projection delta input");
         };
         let delta_aggregate_plan = delta_input.unary_input();
-        let PlanNodeKind::Aggregate(delta_aggregate) = &delta_aggregate_plan.kind else {
+        let LogicalPlanKind::Aggregate(delta_aggregate) = &delta_aggregate_plan.kind else {
             panic!("expected signed aggregate under projection");
         };
         let signed_action_id = signed_action_column_id(delta_aggregate);
 
         let union_plan = delta_aggregate_plan.unary_input();
-        let PlanNodeKind::Union(union) = &union_plan.kind else {
+        let LogicalPlanKind::Union(union) = &union_plan.kind else {
             panic!("expected join delta UnionAll under signed aggregate");
         };
         assert!(
@@ -2844,7 +2847,7 @@ mod tests {
     }
 
     fn assert_project_refs_resolve_to_child_outputs(plan: &LogicalPlanNode) {
-        if let PlanNodeKind::Project(project) = &plan.kind {
+        if let LogicalPlanKind::Project(project) = &plan.kind {
             let child_output_ids = crate::sql::planner::plan_output_columns(plan.unary_input())
                 .expect("project child output columns")
                 .into_iter()
@@ -3029,10 +3032,10 @@ mod tests {
     }
 
     fn find_signed_delta_project(plan: &LogicalPlanNode) -> &LogicalPlanNode {
-        if let PlanNodeKind::Project(_) = &plan.kind
+        if let LogicalPlanKind::Project(_) = &plan.kind
             && matches!(
                 &plan.unary_input().kind,
-                PlanNodeKind::Aggregate(LogicalAggregateNode { aggregates, .. })
+                LogicalPlanKind::Aggregate(LogicalAggregateNode { aggregates, .. })
                     if aggregates.iter().any(|call| call.name.ends_with("_state_signed"))
             )
         {
@@ -3053,10 +3056,10 @@ mod tests {
     fn contains_signed_delta_project(plan: &LogicalPlanNode) -> bool {
         matches!(
             &plan.kind,
-            PlanNodeKind::Project(_)
+            LogicalPlanKind::Project(_)
                 if matches!(
                     &plan.unary_input().kind,
-                    PlanNodeKind::Aggregate(LogicalAggregateNode { aggregates, .. })
+                    LogicalPlanKind::Aggregate(LogicalAggregateNode { aggregates, .. })
                         if aggregates.iter().any(|call| call.name.ends_with("_state_signed"))
                 )
         ) || plan.children.iter().any(contains_signed_delta_project)
@@ -3065,7 +3068,7 @@ mod tests {
     fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
         matches!(
             &plan.kind,
-            PlanNodeKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(LogicalScanNode {
                 table: TableDef {
                     source: ScanSource::IcebergMvTargetState(_),
                     ..
@@ -3076,7 +3079,7 @@ mod tests {
     }
 
     fn assert_join_delta_union_shape(union_plan: &LogicalPlanNode, signed_action_id: ColumnId) {
-        let PlanNodeKind::Union(union) = &union_plan.kind else {
+        let LogicalPlanKind::Union(union) = &union_plan.kind else {
             panic!("expected Union, got {union_plan:?}");
         };
         assert!(union.all);
@@ -3123,7 +3126,7 @@ mod tests {
         plan: &LogicalPlanNode,
         signed_action_id: ColumnId,
     ) -> &LogicalPlanNode {
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected normalized branch Project");
         };
         assert!(
@@ -3136,7 +3139,7 @@ mod tests {
         );
 
         let join_plan = plan.unary_input();
-        let PlanNodeKind::Join(_) = &join_plan.kind else {
+        let LogicalPlanKind::Join(_) = &join_plan.kind else {
             panic!("expected Project(Join)");
         };
         join_plan
@@ -3187,10 +3190,10 @@ mod tests {
     }
 
     fn assert_project_scan_any_table(plan: &LogicalPlanNode) -> &LogicalScanNode {
-        let PlanNodeKind::Project(_) = &plan.kind else {
+        let LogicalPlanKind::Project(_) = &plan.kind else {
             panic!("expected Project");
         };
-        let PlanNodeKind::Scan(scan) = &plan.unary_input().kind else {
+        let LogicalPlanKind::Scan(scan) = &plan.unary_input().kind else {
             panic!("expected Project(Scan)");
         };
         scan

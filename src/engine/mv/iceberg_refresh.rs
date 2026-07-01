@@ -10969,14 +10969,14 @@ fn plan_canonical_select_for_imv(
 pub(crate) fn normalize_imv_rewrite_root_project(
     plan: crate::sql::planner::plan::LogicalPlanNode,
 ) -> crate::sql::planner::plan::LogicalPlanNode {
-    use crate::sql::planner::plan::{LogicalPlanNode, PlanNodeKind};
+    use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode};
 
     let LogicalPlanNode {
         kind,
         mut children,
         required_output_columns,
     } = plan;
-    let PlanNodeKind::Project(project) = kind else {
+    let LogicalPlanKind::Project(project) = kind else {
         return LogicalPlanNode::new(kind, children, required_output_columns);
     };
     let input = children.remove(0);
@@ -10985,26 +10985,26 @@ pub(crate) fn normalize_imv_rewrite_root_project(
         children: aggregate_children,
         required_output_columns: aggregate_required_output_columns,
     } = input;
-    let PlanNodeKind::Aggregate(mut aggregate) = input_kind else {
+    let LogicalPlanKind::Aggregate(mut aggregate) = input_kind else {
         let input = LogicalPlanNode::new(
             input_kind,
             aggregate_children,
             aggregate_required_output_columns,
         );
         return LogicalPlanNode::new(
-            PlanNodeKind::Project(project),
+            LogicalPlanKind::Project(project),
             vec![input],
             required_output_columns,
         );
     };
     if project.items.len() != aggregate.output_columns.len() {
         let input = LogicalPlanNode::new(
-            PlanNodeKind::Aggregate(aggregate),
+            LogicalPlanKind::Aggregate(aggregate),
             aggregate_children,
             aggregate_required_output_columns,
         );
         return LogicalPlanNode::new(
-            PlanNodeKind::Project(project),
+            LogicalPlanKind::Project(project),
             vec![input],
             required_output_columns,
         );
@@ -11021,7 +11021,7 @@ pub(crate) fn normalize_imv_rewrite_root_project(
         })
         .collect();
     LogicalPlanNode::new(
-        PlanNodeKind::Aggregate(aggregate),
+        LogicalPlanKind::Aggregate(aggregate),
         aggregate_children,
         aggregate_required_output_columns,
     )
@@ -11315,11 +11315,11 @@ mod aggregate_refresh_rewrite_validation_tests {
         SignedStateAggregateProof, TargetStateProof,
     };
     use crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome;
-    use crate::sql::planner::plan::{LogicalPlanNode, LogicalValuesNode, PlanNodeKind};
+    use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode, LogicalValuesNode};
 
     fn empty_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: Vec::new(),
                 columns: Vec::new(),
             }),
@@ -12033,7 +12033,7 @@ fn build_join_full_refresh_apply_input(
         mut children,
         required_output_columns: _,
     } = plan;
-    let crate::sql::planner::plan::PlanNodeKind::Project(mut project) = kind else {
+    let crate::sql::planner::plan::LogicalPlanKind::Project(mut project) = kind else {
         return Err("join full refresh logical route requires a root Project".to_string());
     };
     if children.len() != 1 {
@@ -12073,7 +12073,7 @@ fn build_join_full_refresh_apply_input(
         .items
         .push(project_item_for_column(&right_row_id_column));
     let plan = crate::sql::planner::plan::LogicalPlanNode::new(
-        crate::sql::planner::plan::PlanNodeKind::Project(project),
+        crate::sql::planner::plan::LogicalPlanKind::Project(project),
         vec![input],
         None,
     );
@@ -12143,7 +12143,7 @@ fn collect_join_full_refresh_base_scans(
     base_ref: &IcebergTableRef,
     scans: &mut Vec<JoinFullRefreshBaseScan>,
 ) {
-    if let crate::sql::planner::plan::PlanNodeKind::Scan(scan) = &plan.kind
+    if let crate::sql::planner::plan::LogicalPlanKind::Scan(scan) = &plan.kind
         && let Some(table) = iceberg_scan_table_info(&scan.table.source)
         && table.catalog.eq_ignore_ascii_case(&base_ref.catalog)
         && table.namespace.eq_ignore_ascii_case(&base_ref.namespace)
@@ -13810,7 +13810,7 @@ enum ImvChangeStreamProducerBranch {
 const IMV_CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
 
 struct ImvRefreshPlannedChangeStream<'a> {
-    physical_plan: crate::sql::optimizer::PhysicalPlanNode,
+    physical_plan: crate::sql::optimizer::OptimizerPhysicalNode,
     output_columns: Vec<OutputColumn>,
     change_stream: crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     producer_branches: Vec<ImvChangeStreamProducerBranch>,
@@ -13972,15 +13972,15 @@ fn imv_data_route_output_column(existing: &[OutputColumn]) -> OutputColumn {
 }
 
 fn add_imv_data_route_project(
-    child: crate::sql::optimizer::PhysicalPlanNode,
+    child: crate::sql::optimizer::OptimizerPhysicalNode,
     child_output_columns: &[OutputColumn],
     action_output: Option<&OutputColumn>,
     row_lineage_output: Option<&OutputColumn>,
     route_mode: ImvDataRouteMode,
     route_output: OutputColumn,
-) -> Result<crate::sql::optimizer::PhysicalPlanNode, String> {
+) -> Result<crate::sql::optimizer::OptimizerPhysicalNode, String> {
     use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
-    use crate::sql::optimizer::physical_plan::{PlanExecutionProps, attach_scalar_arena};
+    use crate::sql::optimizer::physical_tree::{PlanExecutionProps, attach_scalar_arena};
     use crate::sql::optimizer::scalar::ScalarNode;
 
     let existing_arena =
@@ -14019,7 +14019,7 @@ fn add_imv_data_route_project(
     let mut output_columns = child_output_columns.to_vec();
     output_columns.push(route_output);
     let arena = Arc::new(arena);
-    let mut plan = crate::sql::optimizer::PhysicalPlanNode {
+    let mut plan = crate::sql::optimizer::OptimizerPhysicalNode {
         op: Operator::PhysicalProject(ProjectOp {
             items,
             output_qualifier: None,

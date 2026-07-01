@@ -1106,6 +1106,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::JoinKind;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::PhysicalHashJoinEqCondition as OptimizerPhysicalHashJoinEqCondition;
     use crate::sql::optimizer::operator::*;
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec};
     use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
@@ -1221,7 +1222,7 @@ mod tests {
         arena: &mut ScalarArena,
         left_value: i64,
         right_value: i64,
-    ) -> PhysicalHashJoinEqCondition {
+    ) -> OptimizerPhysicalHashJoinEqCondition {
         let left = intern_typed(
             arena,
             &crate::sql::analysis::TypedExpr {
@@ -1242,7 +1243,7 @@ mod tests {
                 nullable: false,
             },
         );
-        PhysicalHashJoinEqCondition {
+        OptimizerPhysicalHashJoinEqCondition {
             left,
             right,
             null_safe: false,
@@ -1270,8 +1271,8 @@ mod tests {
         arena: &mut ScalarArena,
         left_id: u32,
         right_id: u32,
-    ) -> PhysicalHashJoinEqCondition {
-        PhysicalHashJoinEqCondition {
+    ) -> OptimizerPhysicalHashJoinEqCondition {
+        OptimizerPhysicalHashJoinEqCondition {
             left: column_ref(arena, left_id),
             right: column_ref(arena, right_id),
             null_safe: false,
@@ -1282,8 +1283,8 @@ mod tests {
         arena: &mut ScalarArena,
         left_id: u32,
         right_id: u32,
-    ) -> PhysicalHashJoinEqCondition {
-        PhysicalHashJoinEqCondition {
+    ) -> OptimizerPhysicalHashJoinEqCondition {
+        OptimizerPhysicalHashJoinEqCondition {
             left: nested_column_ref(arena, left_id),
             right: column_ref(arena, right_id),
             null_safe: false,

@@ -237,12 +237,12 @@ mod tests {
     use crate::sql::optimizer::scalar::{self, ScalarArena};
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
-        LogicalJoinNode, LogicalPlanNode, LogicalScanNode, PlanNodeKind,
+        LogicalJoinNode, LogicalPlanKind, LogicalPlanNode, LogicalScanNode,
     };
 
     fn make_scan(table_id: i64, cols: Vec<(ColumnId, &str)>) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(LogicalScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: format!("t{table_id}"),
@@ -353,7 +353,7 @@ mod tests {
             variant_columns: vec![],
             mv_rewritten_from: None,
         };
-        let plan = LogicalPlanNode::new(PlanNodeKind::Scan(scan_node), vec![], None);
+        let plan = LogicalPlanNode::new(LogicalPlanKind::Scan(scan_node), vec![], None);
         let mut arena = ScalarArena::new();
         let expr = logical_plan_to_opt_expr(&plan, &mut arena);
         let Operator::LogicalScan(scan) = &expr.op else {
@@ -377,7 +377,7 @@ mod tests {
         let left = make_scan(1, vec![]);
         let right = make_scan(2, vec![]);
         let join = LogicalPlanNode::new(
-            PlanNodeKind::Join(LogicalJoinNode {
+            LogicalPlanKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Cross,
                 condition: None,
             }),
@@ -406,7 +406,7 @@ mod tests {
         let left = make_scan(1, vec![]);
         let right = make_scan(1, vec![]);
         let join = LogicalPlanNode::new(
-            PlanNodeKind::Join(LogicalJoinNode {
+            LogicalPlanKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Cross,
                 condition: None,
             }),

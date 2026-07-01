@@ -16,7 +16,7 @@ use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal}
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalScanNode, PlanNodeKind};
+use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode, LogicalScanNode};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvSnapshotWindow {
@@ -45,8 +45,8 @@ impl LogicalRewriteRule for BindIcebergScanRule {
         let plan = opt_expr_to_plan(expr.clone(), ctx);
         matches!(
             &plan.kind,
-            PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_)
-        ) && matches!(&plan.unary_input().kind, PlanNodeKind::Scan(_))
+            LogicalPlanKind::ImvDelta(_) | LogicalPlanKind::ImvVersion(_)
+        ) && matches!(&plan.unary_input().kind, LogicalPlanKind::Scan(_))
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -69,8 +69,8 @@ impl LogicalRewriteRule for BindIcebergScanRule {
                 ..
             } = scan_plan;
             match &kind {
-                PlanNodeKind::ImvDelta(node) => {
-                    let PlanNodeKind::Scan(scan) = scan_kind else {
+                LogicalPlanKind::ImvDelta(node) => {
+                    let LogicalPlanKind::Scan(scan) = scan_kind else {
                         return Ok(PlanRewriteResult::Unchanged);
                     };
                     let mut bound = bind_delta_scan(scan, &ext.mv_ctx)?;
@@ -86,18 +86,18 @@ impl LogicalRewriteRule for BindIcebergScanRule {
                         );
                     }
                     Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                        PlanNodeKind::Scan(bound),
+                        LogicalPlanKind::Scan(bound),
                         vec![],
                         required_output_columns,
                     )))
                 }
-                PlanNodeKind::ImvVersion(node) => {
-                    let PlanNodeKind::Scan(scan) = scan_kind else {
+                LogicalPlanKind::ImvVersion(node) => {
+                    let LogicalPlanKind::Scan(scan) = scan_kind else {
                         return Ok(PlanRewriteResult::Unchanged);
                     };
                     let bound = bind_version_scan(scan, &ext.mv_ctx, node.version_ref.role)?;
                     Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                        PlanNodeKind::Scan(bound),
+                        LogicalPlanKind::Scan(bound),
                         vec![],
                         required_output_columns,
                     )))
@@ -341,13 +341,13 @@ mod tests {
             annotation: ImvPlanAnnotation::default(),
         });
         let plan = LogicalPlanNode::new(
-            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            LogicalPlanKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: false,
                 action_column: Some(ColumnId::new_for_test(77)),
                 branch_scope: None,
             }),
             vec![LogicalPlanNode::new(
-                PlanNodeKind::Scan(iceberg_scan(Some("uuid-b"))),
+                LogicalPlanKind::Scan(iceberg_scan(Some("uuid-b"))),
                 vec![],
                 None,
             )],
@@ -365,7 +365,7 @@ mod tests {
             changed_expr.clone(),
             &arena_ref.borrow(),
         );
-        let PlanNodeKind::Scan(bound) = &changed.kind else {
+        let LogicalPlanKind::Scan(bound) = &changed.kind else {
             panic!("expected changed scan");
         };
         let action = bound
@@ -412,12 +412,16 @@ mod tests {
             is_internal: false,
         });
         let plan = LogicalPlanNode::new(
-            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            LogicalPlanKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: false,
                 action_column: Some(ColumnId::new_for_test(77)),
                 branch_scope: None,
             }),
-            vec![LogicalPlanNode::new(PlanNodeKind::Scan(scan), vec![], None)],
+            vec![LogicalPlanNode::new(
+                LogicalPlanKind::Scan(scan),
+                vec![],
+                None,
+            )],
             None,
         );
 
@@ -433,7 +437,7 @@ mod tests {
             changed_expr,
             &arena_ref.borrow(),
         );
-        let PlanNodeKind::Scan(bound) = &changed.kind else {
+        let LogicalPlanKind::Scan(bound) = &changed.kind else {
             panic!("expected changed scan");
         };
         let actions = bound

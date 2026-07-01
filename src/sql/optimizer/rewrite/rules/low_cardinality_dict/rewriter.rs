@@ -1620,7 +1620,8 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
-        LogicalExceptNode, LogicalIntersectNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,
+        LogicalExceptNode, LogicalIntersectNode, LogicalPlanKind, LogicalUnionNode,
+        LogicalValuesNode,
     };
 
     fn output_col(id: u32, name: &str) -> OutputColumn {
@@ -1635,7 +1636,7 @@ mod tests {
 
     fn values_with_output(id: u32, name: &str) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![output_col(id, name)],
             }),
@@ -1652,7 +1653,7 @@ mod tests {
 
         let plans = vec![
             LogicalPlanNode::new(
-                PlanNodeKind::Union(LogicalUnionNode {
+                LogicalPlanKind::Union(LogicalUnionNode {
                     all: true,
                     output_columns: output_columns.clone(),
                 }),
@@ -1660,14 +1661,14 @@ mod tests {
                 None,
             ),
             LogicalPlanNode::new(
-                PlanNodeKind::Intersect(LogicalIntersectNode {
+                LogicalPlanKind::Intersect(LogicalIntersectNode {
                     output_columns: output_columns.clone(),
                 }),
                 vec![left.clone(), right.clone()],
                 None,
             ),
             LogicalPlanNode::new(
-                PlanNodeKind::Except(LogicalExceptNode {
+                LogicalPlanKind::Except(LogicalExceptNode {
                     output_columns: output_columns.clone(),
                 }),
                 vec![left, right],

@@ -17,7 +17,7 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
-use crate::sql::planner::plan::{LogicalPlanNode, PlanNodeKind};
+use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode};
 
 pub(crate) struct ImvRowIdColumn;
 
@@ -77,7 +77,7 @@ impl LogicalRewriteRule for InjectRowIdRule {
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         let plan = opt_expr_to_plan(expr.clone(), ctx);
         match &plan.kind {
-            PlanNodeKind::Scan(scan) => {
+            LogicalPlanKind::Scan(scan) => {
                 matches!(
                     scan.table.source,
                     ScanSource::IcebergDeltaTable { .. } | ScanSource::IcebergVersionTable { .. }
@@ -94,7 +94,7 @@ impl LogicalRewriteRule for InjectRowIdRule {
                 children,
                 required_output_columns,
             } = plan;
-            let PlanNodeKind::Scan(mut scan) = kind else {
+            let LogicalPlanKind::Scan(mut scan) = kind else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
             let column_id = crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column(
@@ -110,7 +110,7 @@ impl LogicalRewriteRule for InjectRowIdRule {
                 &mut scan.table.iceberg_row_lineage_metadata_columns,
             );
             Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                PlanNodeKind::Scan(scan),
+                LogicalPlanKind::Scan(scan),
                 children,
                 required_output_columns,
             )))
@@ -140,7 +140,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
-    use crate::sql::planner::plan::{LogicalPlanNode, LogicalScanNode, PlanNodeKind};
+    use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode, LogicalScanNode};
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
@@ -214,7 +214,7 @@ mod tests {
     }
 
     fn scan_plan(scan: LogicalScanNode) -> LogicalPlanNode {
-        LogicalPlanNode::new(PlanNodeKind::Scan(scan), vec![], None)
+        LogicalPlanNode::new(LogicalPlanKind::Scan(scan), vec![], None)
     }
 
     #[test]
@@ -243,7 +243,7 @@ mod tests {
             changed_expr,
             &arena.borrow(),
         );
-        let PlanNodeKind::Scan(scan) = changed.kind else {
+        let LogicalPlanKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
         assert!(scan.columns.iter().any(ImvRowIdColumn::matches));
@@ -272,7 +272,7 @@ mod tests {
             changed_expr,
             &arena.borrow(),
         );
-        let PlanNodeKind::Scan(scan) = changed.kind else {
+        let LogicalPlanKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
         assert!(scan.columns.iter().any(ImvRowIdColumn::matches));
@@ -337,7 +337,7 @@ mod tests {
             changed_expr,
             &arena.borrow(),
         );
-        let PlanNodeKind::Scan(scan) = changed.kind else {
+        let LogicalPlanKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
         let row_id_columns = scan

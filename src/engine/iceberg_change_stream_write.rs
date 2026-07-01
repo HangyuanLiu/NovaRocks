@@ -27,7 +27,7 @@ use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::codegen::iceberg_change_stream_write::{
     ChangeStreamWriteBranchKind, IcebergChangeStreamWriteDagSpec,
 };
-use crate::sql::optimizer::PhysicalPlanNode;
+use crate::sql::optimizer::OptimizerPhysicalNode;
 use crate::thrift::internal_service::TQueryOptions;
 use crate::thrift::types;
 
@@ -204,7 +204,7 @@ pub(crate) struct ChangeStreamPhysicalBuildInput {
     pub(crate) state: Arc<StandaloneState>,
     pub(crate) current_catalog: Option<String>,
     pub(crate) current_database: String,
-    pub(crate) physical_plan: PhysicalPlanNode,
+    pub(crate) physical_plan: OptimizerPhysicalNode,
     pub(crate) dag: IcebergChangeStreamWriteDagSpec,
     pub(crate) query_opts: Option<TQueryOptions>,
     pub(crate) mv_refresh_ctx:

@@ -503,7 +503,7 @@ impl PlanFragmentBuilder {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_via_distributed_plan_with_change_stream_write<'a>(
-        plan: &PhysicalPlanNode,
+        plan: &OptimizerPhysicalNode,
         catalog: &'a dyn CatalogProvider,
         connectors: &'a crate::connector::ConnectorRegistry,
         current_database: &str,

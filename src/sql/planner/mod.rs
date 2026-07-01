@@ -16,7 +16,7 @@ pub(crate) use distributed_build::build_distributed_plan;
 pub(crate) use distributed_fragment::{
     DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment,
 };
-pub(crate) use distributed_node::{DistributedPlanNode, PlanNodeKind, PlanNodeStats};
+pub(crate) use distributed_node::{DistributedPlanKind, DistributedPlanNode, PlanNodeStats};
 
 use arrow::datatypes::DataType;
 
@@ -97,13 +97,13 @@ fn plan_scoped_query(
     // disagreed with the fresh IDs that the parent scope uses to reference
     // the set-op output.
     match &mut body_plan.kind {
-        PlanNodeKind::Union(node) => {
+        LogicalPlanKind::Union(node) => {
             node.output_columns = output_columns.clone();
         }
-        PlanNodeKind::Intersect(node) => {
+        LogicalPlanKind::Intersect(node) => {
             node.output_columns = output_columns.clone();
         }
-        PlanNodeKind::Except(node) => {
+        LogicalPlanKind::Except(node) => {
             node.output_columns = output_columns.clone();
         }
         _ => {}
@@ -119,7 +119,7 @@ fn plan_scoped_query(
         let produce_input = plan_scoped_query(entry.resolved_query.clone(), cte_registry, factory)?;
         let produce_input = adapt_plan_output(produce_input, &entry.output_columns)?;
         let produce = LogicalPlanNode::new(
-            PlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+            LogicalPlanKind::CTEProduce(LogicalCTEProduceNode {
                 cte_id: entry.id,
                 output_columns: entry.output_columns.clone(),
             }),
@@ -127,7 +127,7 @@ fn plan_scoped_query(
             None,
         );
         root = LogicalPlanNode::new(
-            PlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: entry.id }),
+            LogicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: entry.id }),
             vec![produce, root],
             None,
         );
@@ -177,13 +177,13 @@ fn apply_query_modifiers(
             // continuity through the double-Project barrier for the Phase-1 tagging pass.
             let user_select: Option<Vec<(String, arrow::datatypes::DataType, bool, ColumnId)>> =
                 if let LogicalPlanNode {
-                    kind: PlanNodeKind::Project(proj),
+                    kind: LogicalPlanKind::Project(proj),
                     children,
                     ..
                 } = &mut body_plan
                 {
                     if let Some(child) = children.get_mut(0)
-                        && let PlanNodeKind::Aggregate(agg) = &mut child.kind
+                        && let LogicalPlanKind::Aggregate(agg) = &mut child.kind
                     {
                         for extra in &extra_items {
                             collect_aggregates(&extra.expr, &mut agg.aggregates, factory);
@@ -273,7 +273,7 @@ fn apply_query_modifiers(
 
             // Sort with extended scope
             body_plan = LogicalPlanNode::new(
-                PlanNodeKind::Sort(LogicalSortNode {
+                LogicalPlanKind::Sort(LogicalSortNode {
                     items: sort_items,
                     // Top-level ORDER BY — no analytic partition.
                     analytic_partition_by: Vec::new(),
@@ -335,7 +335,7 @@ fn apply_query_modifiers(
             });
         } else {
             body_plan = LogicalPlanNode::new(
-                PlanNodeKind::Sort(LogicalSortNode {
+                LogicalPlanKind::Sort(LogicalSortNode {
                     items: sort_items,
                     // Top-level ORDER BY — no analytic partition.
                     analytic_partition_by: Vec::new(),
@@ -353,7 +353,7 @@ fn apply_query_modifiers(
     // Wrap with Limit if LIMIT/OFFSET is present.
     if limit.is_some() || offset.is_some() {
         body_plan = LogicalPlanNode::new(
-            PlanNodeKind::Limit(LogicalLimitNode {
+            LogicalPlanKind::Limit(LogicalLimitNode {
                 limit: limit,
                 offset: offset,
             }),
@@ -364,7 +364,7 @@ fn apply_query_modifiers(
 
     if let Some(items) = final_projection {
         body_plan = LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: items,
                 output_qualifier: None,
             }),
@@ -563,9 +563,9 @@ fn plan_body_scoped(
 
 pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputColumn>, String> {
     match &plan.kind {
-        PlanNodeKind::Scan(node) => Ok(node.columns.clone()),
-        PlanNodeKind::Filter(_) => plan_output_columns(plan.unary_input()),
-        PlanNodeKind::Project(node) => {
+        LogicalPlanKind::Scan(node) => Ok(node.columns.clone()),
+        LogicalPlanKind::Filter(_) => plan_output_columns(plan.unary_input()),
+        LogicalPlanKind::Project(node) => {
             let input_columns = plan_output_columns(plan.unary_input())?;
             Ok(node
                 .items
@@ -579,55 +579,46 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
                 })
                 .collect())
         }
-        PlanNodeKind::Aggregate(node) => Ok(node.output_columns.clone()),
-        PlanNodeKind::Join(node) => {
+        LogicalPlanKind::Aggregate(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::Join(node) => {
             let left = plan_output_columns(plan.left())?;
             let right = plan_output_columns(plan.right())?;
             Ok(join_output_columns(node.join_type, left, right))
         }
-        PlanNodeKind::Sort(_) => plan_output_columns(plan.unary_input()),
-        PlanNodeKind::Limit(_) => plan_output_columns(plan.unary_input()),
-        PlanNodeKind::Union(node) => Ok(node.output_columns.clone()),
-        PlanNodeKind::Intersect(node) => Ok(node.output_columns.clone()),
-        PlanNodeKind::Except(node) => Ok(node.output_columns.clone()),
-        PlanNodeKind::Values(node) => Ok(node.columns.clone()),
-        PlanNodeKind::GenerateSeries(node) => Ok(vec![OutputColumn {
+        LogicalPlanKind::Sort(_) => plan_output_columns(plan.unary_input()),
+        LogicalPlanKind::Limit(_) => plan_output_columns(plan.unary_input()),
+        LogicalPlanKind::Union(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::Intersect(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::Except(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::Values(node) => Ok(node.columns.clone()),
+        LogicalPlanKind::GenerateSeries(node) => Ok(vec![OutputColumn {
             column_id: node.output_column_id,
             name: node.column_name.clone(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
             is_internal: false,
         }]),
-        PlanNodeKind::TableFunction(node) => {
+        LogicalPlanKind::TableFunction(node) => {
             let mut columns = plan_output_columns(plan.unary_input())?;
             columns.extend(node.output_columns.clone());
             Ok(columns)
         }
-        PlanNodeKind::Window(node) => Ok(node.output_columns.clone()),
-        PlanNodeKind::Repeat(_) => plan_output_columns(plan.unary_input()),
-        PlanNodeKind::CTEAnchor(_) => plan_output_columns(plan.child(1)),
-        PlanNodeKind::CTEProduce(node) => Ok(node.output_columns.clone()),
-        PlanNodeKind::CTEConsume(node) => Ok(node.output_columns.clone()),
-        PlanNodeKind::Decode(node) => Ok(node.output_columns.clone()),
-        PlanNodeKind::AggregateStateMerge(node) => Ok(node.output_columns.clone()),
-        PlanNodeKind::Apply(node) => {
+        LogicalPlanKind::Window(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::Repeat(_) => plan_output_columns(plan.unary_input()),
+        LogicalPlanKind::CTEAnchor(_) => plan_output_columns(plan.child(1)),
+        LogicalPlanKind::CTEProduce(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::CTEConsume(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::Decode(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::AggregateStateMerge(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::Apply(node) => {
             let mut columns = plan_output_columns(plan.left())?;
             columns.push(node.output_column.clone());
             Ok(columns)
         }
-        PlanNodeKind::AssertOneRow(_) => plan_output_columns(plan.unary_input()),
-        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
+        LogicalPlanKind::AssertOneRow(_) => plan_output_columns(plan.unary_input()),
+        LogicalPlanKind::ImvDelta(_) | LogicalPlanKind::ImvVersion(_) => {
             Err("imv marker leaked into non-IMV planner output adaptation".to_string())
         }
-        PlanNodeKind::TopN(_)
-        | PlanNodeKind::Exchange(_)
-        | PlanNodeKind::HashAggregate(_)
-        | PlanNodeKind::HashJoin(_)
-        | PlanNodeKind::NestLoopJoin(_)
-        | PlanNodeKind::SetOp(_) => Err(format!(
-            "distributed plan node {} leaked into logical planner output adaptation",
-            plan.kind.variant_name()
-        )),
     }
 }
 
@@ -711,7 +702,7 @@ pub(crate) fn adapt_plan_output_with_qualifier(
     }
 
     Ok(LogicalPlanNode::new(
-        PlanNodeKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(LogicalProjectNode {
             items: items,
             output_qualifier: output_qualifier.map(str::to_string),
         }),
@@ -770,7 +761,7 @@ fn make_nullable(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
 // Apply spec wrapping helpers
 // ---------------------------------------------------------------------------
 
-/// Wrap `input` in a left-deep chain of `PlanNodeKind::Apply` nodes, one per
+/// Wrap `input` in a left-deep chain of `LogicalPlanKind::Apply` nodes, one per
 /// spec whose clause matches `clause`. Each Apply's right child is the planned
 /// inner subquery. Matching specs are consumed (removed) from `specs`; the
 /// remaining specs are preserved for the other clause insertion points.
@@ -802,7 +793,7 @@ fn wrap_scalar_applies(
         let col_name = spec.output_column.name.clone();
         let col_type = spec.output_column.data_type.clone();
         current = LogicalPlanNode::new(
-            PlanNodeKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 inner_output_column_id: inner_output_column_id,
                 subquery_expr: TypedExpr {
@@ -830,7 +821,7 @@ fn wrap_scalar_applies(
     Ok(current)
 }
 
-/// Wrap `input` in a left-deep chain of `PlanNodeKind::Apply` nodes for each
+/// Wrap `input` in a left-deep chain of `LogicalPlanKind::Apply` nodes for each
 /// EXISTS/IN predicate spec whose clause matches `clause`. Mirrors
 /// `wrap_scalar_applies` but builds `ApplyKind::Exists` / `ApplyKind::In`
 /// semi/anti-collapsing applies. The M3 to-join rules read correlation and
@@ -883,7 +874,7 @@ fn wrap_predicate_applies(
         };
 
         current = LogicalPlanNode::new(
-            PlanNodeKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::Apply(LogicalApplyNode {
                 kind: kind,
                 subquery_expr: subquery_expr,
                 output_column: spec.output_column,
@@ -922,7 +913,7 @@ fn plan_select_scoped(
     let mut current = match select.from.take() {
         Some(relation) => plan_relation_scoped(relation, cte_registry, factory)?,
         None => LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: vec![vec![]],
                 columns: vec![],
             }),
@@ -951,7 +942,7 @@ fn plan_select_scoped(
 
     if let Some(predicate) = select.filter.take() {
         current = LogicalPlanNode::new(
-            PlanNodeKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(LogicalFilterNode {
                 predicate: predicate,
             }),
             vec![current],
@@ -968,7 +959,7 @@ fn plan_select_scoped(
             factory,
         );
         current = LogicalPlanNode::new(
-            PlanNodeKind::Repeat(LogicalRepeatNode {
+            LogicalPlanKind::Repeat(LogicalRepeatNode {
                 repeat_column_ref_list: repeat_info.repeat_column_ref_list,
                 repeat_column_ref_ids: repeat_info.repeat_column_ref_ids,
                 grouping_ids: repeat_info.grouping_ids,
@@ -1024,7 +1015,7 @@ fn plan_select_scoped(
                 factory,
             );
         current = LogicalPlanNode::new(
-            PlanNodeKind::Aggregate(LogicalAggregateNode {
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: select.group_by,
                 aggregates: agg_calls,
                 output_columns: output_columns,
@@ -1053,7 +1044,7 @@ fn plan_select_scoped(
 
         if let Some(having) = rewritten_having {
             current = LogicalPlanNode::new(
-                PlanNodeKind::Filter(LogicalFilterNode { predicate: having }),
+                LogicalPlanKind::Filter(LogicalFilterNode { predicate: having }),
                 vec![current],
                 None,
             );
@@ -1240,7 +1231,7 @@ fn prepare_repeat_input(
         .collect();
 
     *current = LogicalPlanNode::new(
-        PlanNodeKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(LogicalProjectNode {
             items: project_items,
             output_qualifier: None,
         }),
@@ -1480,7 +1471,7 @@ fn build_distinct(
         });
     }
     LogicalPlanNode::new(
-        PlanNodeKind::Aggregate(LogicalAggregateNode {
+        LogicalPlanKind::Aggregate(LogicalAggregateNode {
             group_by: group_by,
             aggregates: vec![],
             output_columns: output_columns,
@@ -1533,7 +1524,7 @@ fn build_window_and_project(
             input
         } else {
             LogicalPlanNode::new(
-                PlanNodeKind::Sort(LogicalSortNode {
+                LogicalPlanKind::Sort(LogicalSortNode {
                     items: sort_items,
                     analytic_partition_by: analytic_partition_by,
                     output_columns: vec![],
@@ -1547,7 +1538,7 @@ fn build_window_and_project(
         };
 
         let windowed = LogicalPlanNode::new(
-            PlanNodeKind::Window(LogicalWindowNode {
+            LogicalPlanKind::Window(LogicalWindowNode {
                 window_exprs: window_exprs,
                 output_columns: output_columns,
             }),
@@ -1555,7 +1546,7 @@ fn build_window_and_project(
             None,
         );
         Ok(LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: rewritten_items,
                 output_qualifier: None,
             }),
@@ -1564,7 +1555,7 @@ fn build_window_and_project(
         ))
     } else if !project_items.is_empty() {
         Ok(LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: project_items,
                 output_qualifier: None,
             }),
@@ -1582,14 +1573,14 @@ fn logical_plan_satisfies_window_ordering(
     partition_by: &[TypedExpr],
 ) -> bool {
     match &input.kind {
-        PlanNodeKind::Project(project) if project_preserves_column_identity(project) => {
+        LogicalPlanKind::Project(project) if project_preserves_column_identity(project) => {
             logical_plan_satisfies_window_ordering(
                 input.unary_input(),
                 required_items,
                 partition_by,
             )
         }
-        PlanNodeKind::Sort(sort) => {
+        LogicalPlanKind::Sort(sort) => {
             logical_sort_satisfies_window_ordering(sort, required_items, partition_by)
         }
         _ => false,
@@ -3091,7 +3082,7 @@ fn plan_relation_scoped(
                 });
             }
             Ok(LogicalPlanNode::new(
-                PlanNodeKind::Scan(LogicalScanNode {
+                LogicalPlanKind::Scan(LogicalScanNode {
                     database: scan.database,
                     table: scan.table,
                     alias: scan.alias,
@@ -3139,7 +3130,7 @@ fn plan_relation_scoped(
                     }
                     let left = plan_relation_scoped(left, cte_registry, factory)?;
                     Ok(LogicalPlanNode::new(
-                        PlanNodeKind::TableFunction(LogicalTableFunctionNode {
+                        LogicalPlanKind::TableFunction(LogicalTableFunctionNode {
                             function_name: "unnest".to_string(),
                             args: unnest.args,
                             output_columns: unnest.output_columns,
@@ -3154,7 +3145,7 @@ fn plan_relation_scoped(
                     let left = plan_relation_scoped(left, cte_registry, factory)?;
                     let right = plan_relation_scoped(right, cte_registry, factory)?;
                     Ok(LogicalPlanNode::new(
-                        PlanNodeKind::Join(LogicalJoinNode {
+                        LogicalPlanKind::Join(LogicalJoinNode {
                             join_type: join_type,
                             condition: condition,
                         }),
@@ -3165,7 +3156,7 @@ fn plan_relation_scoped(
             }
         }
         Relation::GenerateSeries(gs) => Ok(LogicalPlanNode::new(
-            PlanNodeKind::GenerateSeries(LogicalGenerateSeriesNode {
+            LogicalPlanKind::GenerateSeries(LogicalGenerateSeriesNode {
                 start: gs.start,
                 end: gs.end,
                 step: gs.step,
@@ -3182,7 +3173,7 @@ fn plan_relation_scoped(
             alias,
             output_columns,
         } => Ok(LogicalPlanNode::new(
-            PlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+            LogicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
                 cte_id: cte_id,
                 alias: alias,
                 output_columns: output_columns,
@@ -3206,7 +3197,7 @@ fn is_lateral_unnest_condition_supported(condition: &Option<TypedExpr>) -> bool 
 }
 
 /// Lower an analyzer-built `IcebergMetadataScanRelation` into a regular
-/// `PlanNodeKind::Scan` whose `TableDef` carries the synthetic
+/// `LogicalPlanKind::Scan` whose `TableDef` carries the synthetic
 /// `ScanSource::IcebergMetadataTable` source. The optimizer treats it
 /// like any other Scan; codegen branches on the source variant to emit
 /// an `HDFS_SCAN_NODE` whose lowering wires up the native-Rust
@@ -3293,7 +3284,7 @@ fn plan_iceberg_metadata_scan(
         },
     };
     Ok(LogicalPlanNode::new(
-        PlanNodeKind::Scan(LogicalScanNode {
+        LogicalPlanKind::Scan(LogicalScanNode {
             database: rel.database,
             table: synthetic_table,
             alias: rel.alias,
@@ -3434,7 +3425,7 @@ fn build_iceberg_partitions_payload(files: &[IcebergDataFileInfo]) -> Result<Str
 }
 
 /// Lower an analyzer-built `IcebergDeltaScanRelation` into a regular
-/// `PlanNodeKind::Scan` whose `TableDef` carries the synthetic
+/// `LogicalPlanKind::Scan` whose `TableDef` carries the synthetic
 /// `ScanSource::IcebergDeltaTable` storage. Codegen recognizes this
 /// storage variant and emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`
 /// (rather than `HDFS_SCAN_NODE`). Refresh/codegen expands the storage
@@ -3509,7 +3500,7 @@ fn plan_iceberg_delta_scan(
         },
     };
     Ok(LogicalPlanNode::new(
-        PlanNodeKind::Scan(LogicalScanNode {
+        LogicalPlanKind::Scan(LogicalScanNode {
             database: rel.namespace,
             table: synthetic_table,
             alias: rel.alias,
@@ -3575,7 +3566,7 @@ fn plan_set_operation_scoped(
 
     match set_op.kind {
         SetOpKind::Union => Ok(LogicalPlanNode::new(
-            PlanNodeKind::Union(LogicalUnionNode {
+            LogicalPlanKind::Union(LogicalUnionNode {
                 all: set_op.all,
                 output_columns: output_columns,
             }),
@@ -3583,14 +3574,14 @@ fn plan_set_operation_scoped(
             None,
         )),
         SetOpKind::Intersect => Ok(LogicalPlanNode::new(
-            PlanNodeKind::Intersect(LogicalIntersectNode {
+            LogicalPlanKind::Intersect(LogicalIntersectNode {
                 output_columns: output_columns,
             }),
             vec![left, right],
             None,
         )),
         SetOpKind::Except => Ok(LogicalPlanNode::new(
-            PlanNodeKind::Except(LogicalExceptNode {
+            LogicalPlanKind::Except(LogicalExceptNode {
                 output_columns: output_columns,
             }),
             vec![left, right],
@@ -3609,7 +3600,7 @@ fn plan_values(
 ) -> Result<LogicalPlanNode, String> {
     let columns = values.output_columns;
     Ok(LogicalPlanNode::new(
-        PlanNodeKind::Values(LogicalValuesNode {
+        LogicalPlanKind::Values(LogicalValuesNode {
             rows: values.rows,
             columns: columns,
         }),
@@ -3831,7 +3822,7 @@ mod tests {
     fn first_aggregate_calls(plan: &LogicalPlanNode) -> Vec<AggregateCall> {
         fn visit(plan: &LogicalPlanNode) -> Option<Vec<AggregateCall>> {
             match &plan.kind {
-                PlanNodeKind::Aggregate(node) => Some(node.aggregates.clone()),
+                LogicalPlanKind::Aggregate(node) => Some(node.aggregates.clone()),
                 _ => plan.children.iter().find_map(visit),
             }
         }
@@ -3841,7 +3832,7 @@ mod tests {
 
     fn first_aggregate_node(plan: &LogicalPlanNode) -> Option<&LogicalAggregateNode> {
         match &plan.kind {
-            PlanNodeKind::Aggregate(node) => Some(node),
+            LogicalPlanKind::Aggregate(node) => Some(node),
             _ => plan.children.iter().find_map(first_aggregate_node),
         }
     }
@@ -3849,10 +3840,10 @@ mod tests {
     fn root_project_over_aggregate(
         plan: &LogicalPlanNode,
     ) -> (&LogicalProjectNode, &LogicalAggregateNode) {
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let PlanNodeKind::Aggregate(aggregate) = &plan.unary_input().kind else {
+        let LogicalPlanKind::Aggregate(aggregate) = &plan.unary_input().kind else {
             panic!(
                 "expected Aggregate under Project, got {:?}",
                 plan.unary_input()
@@ -3868,14 +3859,14 @@ mod tests {
         &LogicalFilterNode,
         &LogicalAggregateNode,
     ) {
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
         let filter_plan = plan.unary_input();
-        let PlanNodeKind::Filter(filter) = &filter_plan.kind else {
+        let LogicalPlanKind::Filter(filter) = &filter_plan.kind else {
             panic!("expected Filter under Project, got {:?}", filter_plan);
         };
-        let PlanNodeKind::Aggregate(aggregate) = &filter_plan.unary_input().kind else {
+        let LogicalPlanKind::Aggregate(aggregate) = &filter_plan.unary_input().kind else {
             panic!(
                 "expected Aggregate under Filter, got {:?}",
                 filter_plan.unary_input()
@@ -3887,7 +3878,7 @@ mod tests {
     fn first_repeat_node(plan: &LogicalPlanNode) -> (&LogicalPlanNode, &LogicalRepeatNode) {
         fn visit(plan: &LogicalPlanNode) -> Option<(&LogicalPlanNode, &LogicalRepeatNode)> {
             match &plan.kind {
-                PlanNodeKind::Repeat(node) => Some((plan, node)),
+                LogicalPlanKind::Repeat(node) => Some((plan, node)),
                 _ => plan.children.iter().find_map(visit),
             }
         }
@@ -3905,10 +3896,10 @@ mod tests {
     fn root_project_over_window(
         plan: &LogicalPlanNode,
     ) -> (&LogicalProjectNode, &LogicalWindowNode) {
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let PlanNodeKind::Window(window) = &plan.unary_input().kind else {
+        let LogicalPlanKind::Window(window) = &plan.unary_input().kind else {
             panic!(
                 "expected Window under Project, got {:?}",
                 plan.unary_input()
@@ -3920,14 +3911,14 @@ mod tests {
     fn root_strip_sort_inner_project(
         plan: &LogicalPlanNode,
     ) -> (&LogicalProjectNode, &LogicalSortNode, &LogicalProjectNode) {
-        let PlanNodeKind::Project(outer_proj) = &plan.kind else {
+        let LogicalPlanKind::Project(outer_proj) = &plan.kind else {
             panic!("expected outer strip Project, got {plan:?}");
         };
         let sort_plan = plan.unary_input();
-        let PlanNodeKind::Sort(sort) = &sort_plan.kind else {
+        let LogicalPlanKind::Sort(sort) = &sort_plan.kind else {
             panic!("expected Sort under outer Project, got {:?}", sort_plan);
         };
-        let PlanNodeKind::Project(inner_proj) = &sort_plan.unary_input().kind else {
+        let LogicalPlanKind::Project(inner_proj) = &sort_plan.unary_input().kind else {
             panic!(
                 "expected inner Project under Sort, got {:?}",
                 sort_plan.unary_input()
@@ -3952,7 +3943,7 @@ mod tests {
     fn first_window_exprs(plan: &LogicalPlanNode) -> Vec<WindowExpr> {
         fn visit(plan: &LogicalPlanNode) -> Option<Vec<WindowExpr>> {
             match &plan.kind {
-                PlanNodeKind::Window(node) => Some(node.window_exprs.clone()),
+                LogicalPlanKind::Window(node) => Some(node.window_exprs.clone()),
                 _ => plan.children.iter().find_map(visit),
             }
         }
@@ -3963,7 +3954,7 @@ mod tests {
     fn first_window_output_columns(plan: &LogicalPlanNode) -> Vec<OutputColumn> {
         fn visit(plan: &LogicalPlanNode) -> Option<Vec<OutputColumn>> {
             match &plan.kind {
-                PlanNodeKind::Window(node) => Some(node.output_columns.clone()),
+                LogicalPlanKind::Window(node) => Some(node.output_columns.clone()),
                 _ => plan.children.iter().find_map(visit),
             }
         }
@@ -4021,7 +4012,7 @@ mod tests {
 
     fn strip_project_sort_limit(plan: &LogicalPlanNode) -> &LogicalPlanNode {
         match &plan.kind {
-            PlanNodeKind::Project(_) | PlanNodeKind::Sort(_) | PlanNodeKind::Limit(_) => {
+            LogicalPlanKind::Project(_) | LogicalPlanKind::Sort(_) | LogicalPlanKind::Limit(_) => {
                 strip_project_sort_limit(plan.unary_input())
             }
             _ => plan,
@@ -4035,7 +4026,7 @@ mod tests {
         // predicate-pushdown work), so more than one Project layer may sit
         // above the set-op.
         let mut current = plan;
-        while let PlanNodeKind::Project(_) = &current.kind {
+        while let LogicalPlanKind::Project(_) = &current.kind {
             current = current.unary_input();
         }
         current
@@ -4047,7 +4038,7 @@ mod tests {
         output_name: &str,
     ) -> bool {
         match &plan.kind {
-            PlanNodeKind::Project(project) => {
+            LogicalPlanKind::Project(project) => {
                 project.items.iter().any(|item| {
                     item.output_name == output_name
                         && matches!(
@@ -4070,7 +4061,7 @@ mod tests {
     fn adapt_plan_output_passthrough_when_outputs_match() {
         let source_id = ColumnId::new_for_test(10);
         let input = LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![OutputColumn {
                     column_id: source_id,
@@ -4092,7 +4083,7 @@ mod tests {
         }];
 
         let adapted = adapt_plan_output(input, &target).expect("adapter should succeed");
-        assert!(matches!(&adapted.kind, PlanNodeKind::Values(_)));
+        assert!(matches!(&adapted.kind, LogicalPlanKind::Values(_)));
     }
 
     #[test]
@@ -4100,7 +4091,7 @@ mod tests {
         let source_id = ColumnId::new_for_test(10);
         let target_id = ColumnId::new_for_test(20);
         let input = LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![OutputColumn {
                     column_id: source_id,
@@ -4122,7 +4113,7 @@ mod tests {
         }];
 
         let adapted = adapt_plan_output(input, &target).expect("adapter should succeed");
-        let PlanNodeKind::Project(project) = &adapted.kind else {
+        let LogicalPlanKind::Project(project) = &adapted.kind else {
             panic!("expected Project adapter");
         };
         assert_eq!(project.items.len(), 1);
@@ -4143,7 +4134,7 @@ mod tests {
         let source_id = ColumnId::new_for_test(10);
         let target_id = ColumnId::new_for_test(20);
         let input = LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![OutputColumn {
                     column_id: source_id,
@@ -4166,7 +4157,7 @@ mod tests {
 
         let adapted = adapt_plan_output_with_qualifier(input, &target, Some("w1"))
             .expect("adapter should succeed");
-        let PlanNodeKind::Project(project) = &adapted.kind else {
+        let LogicalPlanKind::Project(project) = &adapted.kind else {
             panic!("expected Project adapter");
         };
         assert_eq!(project.items[0].output_column_id, target_id);
@@ -4188,7 +4179,7 @@ mod tests {
     fn adapt_plan_output_with_qualifier_inserts_project_when_outputs_match() {
         let source_id = ColumnId::new_for_test(10);
         let input = LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![OutputColumn {
                     column_id: source_id,
@@ -4211,7 +4202,7 @@ mod tests {
 
         let adapted = adapt_plan_output_with_qualifier(input, &target, Some("asceding"))
             .expect("adapter should insert alias project");
-        let PlanNodeKind::Project(project) = &adapted.kind else {
+        let LogicalPlanKind::Project(project) = &adapted.kind else {
             panic!("expected Project adapter for qualified subquery output");
         };
         assert_eq!(project.items[0].output_name, "rnk");
@@ -4234,7 +4225,7 @@ mod tests {
         let source_id = ColumnId::new_for_test(10);
         let target_id = ColumnId::new_for_test(20);
         let input = LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![OutputColumn {
                     column_id: source_id,
@@ -4256,7 +4247,7 @@ mod tests {
         }];
 
         let adapted = adapt_plan_output(input, &target).expect("adapter should widen nullability");
-        let PlanNodeKind::Project(project) = &adapted.kind else {
+        let LogicalPlanKind::Project(project) = &adapted.kind else {
             panic!("expected Project adapter");
         };
         assert_eq!(project.items.len(), 1);
@@ -4267,7 +4258,7 @@ mod tests {
     #[test]
     fn adapt_plan_output_rejects_nullable_narrowing() {
         let input = LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![OutputColumn {
                     column_id: ColumnId::new_for_test(10),
@@ -4299,7 +4290,7 @@ mod tests {
     #[test]
     fn adapt_plan_output_rejects_shape_mismatch() {
         let input = LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -4330,9 +4321,12 @@ mod tests {
         .expect("planner should succeed");
 
         match &plan.kind {
-            PlanNodeKind::CTEAnchor(anchor) => {
+            LogicalPlanKind::CTEAnchor(anchor) => {
                 assert_eq!(anchor.cte_id, 0);
-                assert!(matches!(&plan.child(0).kind, PlanNodeKind::CTEProduce(_)));
+                assert!(matches!(
+                    &plan.child(0).kind,
+                    LogicalPlanKind::CTEProduce(_)
+                ));
             }
             other => panic!("expected CTEAnchor, got {other:?}"),
         }
@@ -4812,8 +4806,8 @@ mod tests {
         .expect("planner should succeed");
 
         match &plan.kind {
-            PlanNodeKind::CTEAnchor(anchor_a) => match &plan.child(1).kind {
-                PlanNodeKind::CTEAnchor(anchor_b) => {
+            LogicalPlanKind::CTEAnchor(anchor_a) => match &plan.child(1).kind {
+                LogicalPlanKind::CTEAnchor(anchor_b) => {
                     assert_eq!(anchor_a.cte_id, 0);
                     assert_eq!(anchor_b.cte_id, 1);
                 }
@@ -4829,8 +4823,8 @@ mod tests {
             .expect("planner should succeed");
 
         match &plan.kind {
-            PlanNodeKind::Project(_) => match &plan.unary_input().kind {
-                PlanNodeKind::Aggregate(agg) => {
+            LogicalPlanKind::Project(_) => match &plan.unary_input().kind {
+                LogicalPlanKind::Aggregate(agg) => {
                     assert_eq!(agg.aggregates.len(), 1);
                     assert_eq!(agg.aggregates[0].name, "sum_map");
                 }
@@ -4847,10 +4841,10 @@ mod tests {
         )
         .expect("planner should succeed");
 
-        let PlanNodeKind::Sort(sort) = &plan.kind else {
+        let LogicalPlanKind::Sort(sort) = &plan.kind else {
             panic!("expected Sort root");
         };
-        let PlanNodeKind::Project(project) = &plan.unary_input().kind else {
+        let LogicalPlanKind::Project(project) = &plan.unary_input().kind else {
             panic!("expected Project under Sort");
         };
         let ExprKind::ColumnRef {
@@ -4906,11 +4900,11 @@ mod tests {
         .expect("planner should succeed");
 
         match &plan.kind {
-            PlanNodeKind::CTEAnchor(outer_anchor) => {
+            LogicalPlanKind::CTEAnchor(outer_anchor) => {
                 assert_eq!(outer_anchor.cte_id, 0);
                 let subquery_input = strip_project_sort_limit(plan.child(1));
                 match &subquery_input.kind {
-                    PlanNodeKind::CTEAnchor(inner_anchor) => {
+                    LogicalPlanKind::CTEAnchor(inner_anchor) => {
                         assert_eq!(inner_anchor.cte_id, 1);
                     }
                     other => panic!("expected inner CTEAnchor inside subquery, got {other:?}"),
@@ -4930,11 +4924,11 @@ mod tests {
         .expect("planner should succeed");
 
         match &plan.kind {
-            PlanNodeKind::CTEAnchor(outer_anchor) => {
+            LogicalPlanKind::CTEAnchor(outer_anchor) => {
                 assert_eq!(outer_anchor.cte_id, 1);
                 match &plan.child(0).kind {
-                    PlanNodeKind::CTEProduce(_) => match &plan.child(0).unary_input().kind {
-                        PlanNodeKind::CTEAnchor(inner_anchor) => {
+                    LogicalPlanKind::CTEProduce(_) => match &plan.child(0).unary_input().kind {
+                        LogicalPlanKind::CTEAnchor(inner_anchor) => {
                             assert_eq!(inner_anchor.cte_id, 0);
                         }
                         other => {
@@ -5033,10 +5027,10 @@ mod tests {
         .expect("planner should succeed");
 
         match &plan.kind {
-            PlanNodeKind::Union(_) => {
+            LogicalPlanKind::Union(_) => {
                 assert_eq!(plan.children.len(), 2);
                 match &plan.child(1).kind {
-                    PlanNodeKind::CTEAnchor(anchor) => assert_eq!(anchor.cte_id, 0),
+                    LogicalPlanKind::CTEAnchor(anchor) => assert_eq!(anchor.cte_id, 0),
                     other => {
                         panic!("expected branch-local CTEAnchor in union input, got {other:?}")
                     }
@@ -5093,7 +5087,7 @@ mod tests {
         );
 
         let union_node = match &unwrap_project_input(&plan).kind {
-            PlanNodeKind::Union(n) => n,
+            LogicalPlanKind::Union(n) => n,
             other => panic!("expected Union below adapter, got {other:?}"),
         };
         let visible_columns = plan_output_columns(&plan).expect("plan output should be known");
@@ -5137,8 +5131,8 @@ mod tests {
 
             let visible_columns = plan_output_columns(&plan).expect("plan output should be known");
             let set_op_cols = match &unwrap_project_input(&plan).kind {
-                PlanNodeKind::Intersect(n) => &n.output_columns,
-                PlanNodeKind::Except(n) => &n.output_columns,
+                LogicalPlanKind::Intersect(n) => &n.output_columns,
+                LogicalPlanKind::Except(n) => &n.output_columns,
                 other => panic!("expected Intersect/Except below adapter, got {other:?}"),
             };
 
@@ -5182,13 +5176,13 @@ mod tests {
 
         // Expected shape: Aggregate(group_by=[ColumnRef(cid)]) <- Project(item.output_column_id=cid)
         let (agg_group_by_cid, inner_proj_output_cid) = match &plan.kind {
-            PlanNodeKind::Aggregate(agg) => {
+            LogicalPlanKind::Aggregate(agg) => {
                 let gb_cid = match &agg.group_by[0].kind {
                     ExprKind::ColumnRef { column_id, .. } => *column_id,
                     other => panic!("expected ColumnRef group_by, got {other:?}"),
                 };
                 let inner_proj = match &plan.unary_input().kind {
-                    PlanNodeKind::Project(p) => p,
+                    LogicalPlanKind::Project(p) => p,
                     other => panic!("expected Project under Aggregate, got {other:?}"),
                 };
                 let item_cid = inner_proj.items[0].output_column_id;
@@ -5240,7 +5234,7 @@ mod tests {
         // Walk down to find the outer and inner Projects.
         // Shape: outer-Project? <- Sort <- inner-Project <- Scan
         let outer_proj = match &plan.kind {
-            PlanNodeKind::Project(p) => p,
+            LogicalPlanKind::Project(p) => p,
             other => {
                 // If there is no outer Project (no extra items triggered), skip.
                 // The test is only meaningful when the strip-projection was built.
@@ -5254,8 +5248,8 @@ mod tests {
 
         let sort_plan = plan.unary_input();
         let inner_proj = match &sort_plan.kind {
-            PlanNodeKind::Sort(_) => match &sort_plan.unary_input().kind {
-                PlanNodeKind::Project(p) => p,
+            LogicalPlanKind::Sort(_) => match &sort_plan.unary_input().kind {
+                LogicalPlanKind::Project(p) => p,
                 other => panic!("expected inner Project under Sort, got {other:?}"),
             },
             other => panic!("expected Sort under outer Project, got {other:?}"),
@@ -5304,16 +5298,16 @@ mod tests {
         .expect("planner should succeed");
 
         let outer_proj = match &plan.kind {
-            PlanNodeKind::Project(p) => p,
+            LogicalPlanKind::Project(p) => p,
             other => panic!("expected outer strip Project, got {other:?}"),
         };
         let sort_plan = plan.unary_input();
         let sort = match &sort_plan.kind {
-            PlanNodeKind::Sort(s) => s,
+            LogicalPlanKind::Sort(s) => s,
             other => panic!("expected Sort under outer Project, got {other:?}"),
         };
         let inner_proj = match &sort_plan.unary_input().kind {
-            PlanNodeKind::Project(p) => p,
+            LogicalPlanKind::Project(p) => p,
             other => panic!("expected inner Project under Sort, got {other:?}"),
         };
 
@@ -5348,11 +5342,11 @@ mod tests {
                 .expect("planner should succeed");
 
         let sort = match &plan.kind {
-            PlanNodeKind::Sort(s) => s,
+            LogicalPlanKind::Sort(s) => s,
             other => panic!("expected Sort root, got {other:?}"),
         };
         let project = match &plan.unary_input().kind {
-            PlanNodeKind::Project(p) => p,
+            LogicalPlanKind::Project(p) => p,
             other => panic!("expected Project under Sort, got {other:?}"),
         };
         let project_output_id = project.items[0].output_column_id;
@@ -5382,16 +5376,16 @@ mod tests {
                 .expect("planner should succeed");
 
         let outer_proj = match &plan.kind {
-            PlanNodeKind::Project(p) => p,
+            LogicalPlanKind::Project(p) => p,
             other => panic!("expected outer strip Project, got {other:?}"),
         };
         let sort_plan = plan.unary_input();
         let sort = match &sort_plan.kind {
-            PlanNodeKind::Sort(s) => s,
+            LogicalPlanKind::Sort(s) => s,
             other => panic!("expected Sort under outer Project, got {other:?}"),
         };
         let inner_proj = match &sort_plan.unary_input().kind {
-            PlanNodeKind::Project(p) => p,
+            LogicalPlanKind::Project(p) => p,
             other => panic!("expected inner Project under Sort, got {other:?}"),
         };
 
@@ -5491,7 +5485,7 @@ mod tests {
         let analyzer_output_columns = resolved.output_columns.clone();
         let plan =
             plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
-        let PlanNodeKind::Values(values) = &plan.kind else {
+        let LogicalPlanKind::Values(values) = &plan.kind else {
             panic!("expected Values root");
         };
         assert_eq!(
@@ -5518,7 +5512,7 @@ mod tests {
     fn p2_generate_series_output_has_column_id_through_planner() {
         let plan = parse_analyze_and_plan("SELECT x FROM TABLE(generate_series(1, 3, 1)) AS gs(x)")
             .expect("planner should succeed");
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
         let child_output_columns = plan_output_columns(plan.unary_input())
@@ -5551,10 +5545,10 @@ mod tests {
     fn p2_base_scan_row_lineage_metadata_preserves_column_id_through_planner() {
         let plan = parse_analyze_and_plan("SELECT _row_id FROM iv_orders AS t")
             .expect("planner should succeed");
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let PlanNodeKind::Scan(scan) = &plan.unary_input().kind else {
+        let LogicalPlanKind::Scan(scan) = &plan.unary_input().kind else {
             panic!("expected Scan under Project, got {:?}", plan.unary_input());
         };
 
@@ -5584,7 +5578,7 @@ mod tests {
             .expect("planner should succeed");
         let (_project, aggregate) = root_project_over_aggregate(&plan);
         let (repeat_plan, repeat) = first_repeat_node(&plan);
-        let PlanNodeKind::Project(repeat_input_project) = &repeat_plan.unary_input().kind else {
+        let LogicalPlanKind::Project(repeat_input_project) = &repeat_plan.unary_input().kind else {
             panic!(
                 "expected Repeat input Project, got {:?}",
                 repeat_plan.unary_input()
@@ -5611,11 +5605,11 @@ mod tests {
     fn p2_subquery_alias_reexposes_producing_id() {
         let plan = parse_analyze_and_plan("SELECT x FROM (SELECT a AS x FROM t) s WHERE x > 1")
             .expect("planner should succeed");
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
         let filter_plan = plan.unary_input();
-        let PlanNodeKind::Filter(filter) = &filter_plan.kind else {
+        let LogicalPlanKind::Filter(filter) = &filter_plan.kind else {
             panic!("expected Filter under Project, got {:?}", filter_plan);
         };
         let child_output =
@@ -5654,10 +5648,10 @@ mod tests {
             "SELECT a AS merged FROM t l FULL OUTER JOIN t r USING(a) ORDER BY merged",
         )
         .expect("planner should succeed");
-        let PlanNodeKind::Sort(sort) = &plan.kind else {
+        let LogicalPlanKind::Sort(sort) = &plan.kind else {
             panic!("expected Sort root, got {plan:?}");
         };
-        let PlanNodeKind::Project(project) = &plan.unary_input().kind else {
+        let LogicalPlanKind::Project(project) = &plan.unary_input().kind else {
             panic!("expected Project under Sort, got {:?}", plan.unary_input());
         };
         let merged_output_id = project.items[0].output_column_id;
@@ -5681,13 +5675,13 @@ mod tests {
         .expect("planner should succeed");
 
         let sort = match &plan.kind {
-            PlanNodeKind::Sort(s) => s,
+            LogicalPlanKind::Sort(s) => s,
             other => {
                 panic!("qualified ORDER BY selected column must not add strip Project: {other:?}")
             }
         };
         let project = match &plan.unary_input().kind {
-            PlanNodeKind::Project(p) => p,
+            LogicalPlanKind::Project(p) => p,
             other => panic!("expected SELECT Project under Sort, got {other:?}"),
         };
         assert_eq!(
@@ -5717,7 +5711,7 @@ mod tests {
         use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
         use crate::sql::column_id::ColumnId;
         use crate::sql::planner::plan::{
-            ApplyKind, LogicalApplyNode, LogicalValuesNode, PlanNodeKind,
+            ApplyKind, LogicalApplyNode, LogicalPlanKind, LogicalValuesNode,
         };
 
         let left_col = OutputColumn {
@@ -5735,7 +5729,7 @@ mod tests {
             is_internal: true,
         };
         let plan = LogicalPlanNode::new(
-            PlanNodeKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -5757,7 +5751,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    PlanNodeKind::Values(LogicalValuesNode {
+                    LogicalPlanKind::Values(LogicalValuesNode {
                         rows: vec![],
                         columns: vec![left_col.clone()],
                     }),
@@ -5765,7 +5759,7 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    PlanNodeKind::Values(LogicalValuesNode {
+                    LogicalPlanKind::Values(LogicalValuesNode {
                         rows: vec![],
                         columns: vec![],
                     }),
@@ -5788,7 +5782,9 @@ mod tests {
 
         use crate::sql::analysis::OutputColumn;
         use crate::sql::column_id::ColumnId;
-        use crate::sql::planner::plan::{LogicalAssertOneRowNode, LogicalValuesNode, PlanNodeKind};
+        use crate::sql::planner::plan::{
+            LogicalAssertOneRowNode, LogicalPlanKind, LogicalValuesNode,
+        };
 
         let col = OutputColumn {
             column_id: ColumnId(21),
@@ -5798,11 +5794,11 @@ mod tests {
             is_internal: false,
         };
         let plan = LogicalPlanNode::new(
-            PlanNodeKind::AssertOneRow(LogicalAssertOneRowNode {
+            LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode {
                 subquery_text: "select 1".to_string(),
             }),
             vec![LogicalPlanNode::new(
-                PlanNodeKind::Values(LogicalValuesNode {
+                LogicalPlanKind::Values(LogicalValuesNode {
                     rows: vec![],
                     columns: vec![col.clone()],
                 }),
@@ -5849,16 +5845,16 @@ mod tests {
         let plan = parse_analyze_and_plan_apply(sql).expect("Apply framework plan must succeed");
 
         // Root shape: Project → Filter(WHERE) → Apply → Scan
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
         let filter_plan = plan.unary_input();
-        let PlanNodeKind::Filter(filter) = &filter_plan.kind else {
+        let LogicalPlanKind::Filter(filter) = &filter_plan.kind else {
             panic!("expected Filter under Project, got {:?}", filter_plan);
         };
         // The Apply must be directly under the WHERE Filter.
         let apply_plan = filter_plan.unary_input();
-        let PlanNodeKind::Apply(apply) = &apply_plan.kind else {
+        let LogicalPlanKind::Apply(apply) = &apply_plan.kind else {
             panic!("expected Apply under WHERE Filter, got {:?}", apply_plan);
         };
         assert_eq!(
@@ -5868,7 +5864,7 @@ mod tests {
         );
         // Apply.left must be the FROM Scan.
         assert!(
-            matches!(&apply_plan.left().kind, PlanNodeKind::Scan(_)),
+            matches!(&apply_plan.left().kind, LogicalPlanKind::Scan(_)),
             "Apply.left must be the FROM Scan, got {:?}",
             apply_plan.left()
         );
@@ -5892,18 +5888,18 @@ mod tests {
             .expect("Apply framework plan must succeed for HAVING");
 
         // Walk down: Project → Filter(HAVING) → Apply → Aggregate → ...
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
         let having_filter_plan = plan.unary_input();
-        let PlanNodeKind::Filter(having_filter) = &having_filter_plan.kind else {
+        let LogicalPlanKind::Filter(having_filter) = &having_filter_plan.kind else {
             panic!(
                 "expected HAVING Filter under Project, got {:?}",
                 having_filter_plan
             );
         };
         let apply_plan = having_filter_plan.unary_input();
-        let PlanNodeKind::Apply(apply) = &apply_plan.kind else {
+        let LogicalPlanKind::Apply(apply) = &apply_plan.kind else {
             panic!(
                 "expected Apply directly under HAVING Filter, got {:?}",
                 apply_plan
@@ -5912,7 +5908,7 @@ mod tests {
         assert_eq!(apply.kind, crate::sql::planner::plan::ApplyKind::Scalar);
         // Apply.left must be the Aggregate.
         assert!(
-            matches!(&apply_plan.left().kind, PlanNodeKind::Aggregate(_)),
+            matches!(&apply_plan.left().kind, LogicalPlanKind::Aggregate(_)),
             "Apply.left for HAVING spec must be the Aggregate, got {:?}",
             apply_plan.left()
         );
@@ -5934,11 +5930,11 @@ mod tests {
             .expect("Apply framework plan must succeed for Projection");
 
         // Root must be Project; its input must be Apply.
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
         let apply_plan = plan.unary_input();
-        let PlanNodeKind::Apply(apply) = &apply_plan.kind else {
+        let LogicalPlanKind::Apply(apply) = &apply_plan.kind else {
             panic!(
                 "expected Apply directly under Project, got {:?}",
                 apply_plan
@@ -5947,7 +5943,7 @@ mod tests {
         assert_eq!(apply.kind, crate::sql::planner::plan::ApplyKind::Scalar);
         // Apply.left must be the FROM Scan.
         assert!(
-            matches!(&apply_plan.left().kind, PlanNodeKind::Scan(_)),
+            matches!(&apply_plan.left().kind, LogicalPlanKind::Scan(_)),
             "Apply.left for Projection spec must be FROM Scan, got {:?}",
             apply_plan.left()
         );
@@ -5987,14 +5983,14 @@ mod tests {
     }
 
     fn direct_where_apply(plan: &LogicalPlanNode) -> &LogicalApplyNode {
-        let PlanNodeKind::Project(_) = &plan.kind else {
+        let LogicalPlanKind::Project(_) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
         let project_input = plan.unary_input();
         match &project_input.kind {
-            PlanNodeKind::Filter(_) => {
+            LogicalPlanKind::Filter(_) => {
                 let apply_plan = project_input.unary_input();
-                let PlanNodeKind::Apply(apply) = &apply_plan.kind else {
+                let LogicalPlanKind::Apply(apply) = &apply_plan.kind else {
                     panic!(
                         "expected Apply directly below WHERE Filter, got {:?}",
                         apply_plan
@@ -6002,7 +5998,7 @@ mod tests {
                 };
                 apply
             }
-            PlanNodeKind::Apply(apply) => apply,
+            LogicalPlanKind::Apply(apply) => apply,
             other => panic!("expected Filter->Apply or Apply below Project, got {other:?}"),
         }
     }
@@ -6041,18 +6037,18 @@ mod tests {
             "test query must record a correlated EXISTS predicate spec"
         );
 
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
         let filter_plan = plan.unary_input();
-        let PlanNodeKind::Filter(filter) = &filter_plan.kind else {
+        let LogicalPlanKind::Filter(filter) = &filter_plan.kind else {
             panic!(
                 "expected residual WHERE Filter under Project, got {:?}",
                 filter_plan
             );
         };
         let apply_plan = filter_plan.unary_input();
-        let PlanNodeKind::Apply(apply) = &apply_plan.kind else {
+        let LogicalPlanKind::Apply(apply) = &apply_plan.kind else {
             panic!(
                 "expected Apply directly below WHERE Filter, got {:?}",
                 apply_plan
