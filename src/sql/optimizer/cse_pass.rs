@@ -1374,6 +1374,10 @@ mod tests {
         OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
     };
     use crate::sql::optimizer::property::DistributionSpec;
+    use crate::sql::optimizer::representation::{
+        ColumnRepresentationSet, LogicalColumn, PhysicalRepresentation, PhysicalSlot,
+        RepresentationProperty,
+    };
     use crate::sql::optimizer::scalar::{
         HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey,
     };
@@ -1509,6 +1513,28 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         }
+    }
+
+    fn plain_representation_property(column_id: u32, name: &str) -> RepresentationProperty {
+        let mut property = RepresentationProperty::default();
+        property.insert(ColumnRepresentationSet {
+            logical_column: LogicalColumn {
+                column_id: ColumnId(column_id),
+                name: name.to_string(),
+                logical_type: DataType::Int64,
+                nullable: true,
+            },
+            current_slot: PhysicalSlot {
+                column_id: ColumnId(column_id),
+                name: name.to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+            representations: vec![PhysicalRepresentation::Plain {
+                logical_type: DataType::Int64,
+            }],
+        });
+        property
     }
 
     fn seed_factory_above_plan(factory: &mut ColumnRefFactory, root: &OptimizerPhysicalNode) {
@@ -1892,6 +1918,58 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_project_clears_representation_on_inserted_cse_project() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_plus_b = add(&mut arena, a, b);
+        let doubled = add(&mut arena, a_plus_b, a_plus_b);
+        let mut child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
+        child.execution_props.representation_property = plain_representation_property(101, "a");
+        let mut node = OptimizerPhysicalNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items: vec![
+                    project_item(a_plus_b, 110, "x"),
+                    project_item(doubled, 111, "y"),
+                ],
+                output_qualifier: None,
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            output_columns: vec![output_column(110, "x"), output_column(111, "y")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
+
+        let Operator::PhysicalProject(_) = &node.children[0].op else {
+            panic!("expected inserted CSE project");
+        };
+        assert!(
+            node.children[0]
+                .execution_props
+                .representation_property
+                .is_empty()
+        );
+        assert!(
+            node.children[0].children[0]
+                .execution_props
+                .representation_property
+                .get(ColumnId(101))
+                .is_some()
+        );
+    }
+
+    #[test]
     fn rewrite_reserves_factory_when_behind_plan_columns() {
         let mut arena = ScalarArena::new();
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();
@@ -2184,6 +2262,54 @@ mod tests {
         );
         assert_eq!(parent.children[0].children.len(), 1);
         assert_eq!(parent.children[0].stats.output_row_count, 42.0);
+    }
+
+    #[test]
+    fn insert_or_reuse_project_below_clears_representation_on_wrapper_project() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_plus_b = add(&mut arena, a, b);
+        let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
+        let mut child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
+        child.execution_props.representation_property = plain_representation_property(101, "a");
+        let mut parent = OptimizerPhysicalNode {
+            op: Operator::PhysicalFilter(FilterOp {
+                predicate: gt(&mut arena, a, b),
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::insert_or_reuse_project_below(
+            &mut parent.children[0],
+            prelude,
+            &mut arena,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
+
+        let Operator::PhysicalProject(_) = &parent.children[0].op else {
+            panic!("expected inserted physical project");
+        };
+        assert!(
+            parent.children[0]
+                .execution_props
+                .representation_property
+                .is_empty()
+        );
+        assert!(
+            parent.children[0].children[0]
+                .execution_props
+                .representation_property
+                .get(ColumnId(101))
+                .is_some()
+        );
     }
 
     #[test]

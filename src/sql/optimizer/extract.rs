@@ -594,6 +594,92 @@ mod tests {
     }
 
     #[test]
+    fn extract_enforcer_clears_representation_property_above_dict_scan() {
+        let mut memo = Memo::new();
+        let source_column_id = ColumnId(5);
+        let physical_column_id = ColumnId(6);
+        let dict_output = OutputColumn {
+            column_id: physical_column_id,
+            name: "__nr_dict_tbl_city".to_string(),
+            data_type: DataType::Int32,
+            nullable: true,
+            is_internal: false,
+        };
+        let snapshot = test_snapshot();
+        let root = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalScan(ScanOp {
+                database: "db".into(),
+                table: crate::sql::catalog::TableDef {
+                    name: "tbl".into(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: crate::sql::catalog::ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: None,
+                stats_ref: None,
+                columns: vec![dict_output.clone()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![ScanDictionaryColumn {
+                    source_column_id,
+                    source_column: "city".to_string(),
+                    dict_column: "__nr_dict_tbl_city".to_string(),
+                    dictionary: Arc::clone(&snapshot),
+                }],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            children: vec![],
+        });
+        memo.groups[root].logical_props = Some(
+            crate::sql::optimizer::memo::LogicalProperties::new(vec![dict_output], 1.0),
+        );
+
+        let required = PhysicalPropertySet::gather();
+        let pre_enforcer_output = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([source_column_id]),
+            ordering: OrderingSpec::Any,
+        };
+        let mut winners = HashMap::new();
+        winners.insert(
+            (root, required.clone()),
+            winner_for_test(
+                root,
+                0,
+                1.0,
+                Some(EnforcerInfo {
+                    kind: EnforcerKind::Distribution(required.distribution.clone()),
+                    child_props: pre_enforcer_output.clone(),
+                }),
+                required.clone(),
+                PropertyAlternativeKind::Default,
+                vec![],
+                vec![],
+            ),
+        );
+
+        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+
+        assert!(matches!(plan.op, Operator::PhysicalDistribution(_)));
+        assert!(plan.execution_props.representation_property.is_empty());
+        let inner_set = plan.children[0]
+            .execution_props
+            .representation_property
+            .get(source_column_id)
+            .expect("inner scan representation property");
+        assert_eq!(inner_set.logical_column.column_id, source_column_id);
+        assert_eq!(inner_set.current_slot.column_id, physical_column_id);
+        assert!(matches!(
+            inner_set.representations.as_slice(),
+            [PhysicalRepresentation::DictInt32(_)]
+        ));
+    }
+
+    #[test]
     fn extract_join_output_columns_follow_children_not_stale_group_props() {
         let mut memo = Memo::new();
         let left_key_col = OutputColumn {
