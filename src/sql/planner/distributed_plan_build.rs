@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet};
+
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
@@ -48,6 +50,7 @@ pub(crate) fn build_distributed_plan_v2(
         fragment_stack: Vec::new(),
         completed_fragments: Vec::new(),
         edges: Vec::new(),
+        cte_fragments: HashMap::new(),
     };
     let root_fragment_id = builder.alloc_fragment_id();
     let root_plan = if let PhysicalPlanKind::Redistribute(redistribute) = &plan.kind {
@@ -66,6 +69,7 @@ pub(crate) fn build_distributed_plan_v2(
     let popped_fragment_id = builder.fragment_stack.pop();
     debug_assert_eq!(popped_fragment_id, Some(root_fragment_id));
     let root = root_result?;
+    let root_cte_exchange_nodes = collect_cte_exchange_nodes(&root);
 
     let mut fragments = builder.completed_fragments;
     fragments.push(PlanFragmentV2 {
@@ -77,7 +81,7 @@ pub(crate) fn build_distributed_plan_v2(
         output_exprs: None,
         output_columns: root_plan.output_columns.clone(),
         cte_id: None,
-        cte_exchange_nodes: Vec::new(),
+        cte_exchange_nodes: root_cte_exchange_nodes,
     });
 
     Ok(DistributedPlanV2 {
@@ -94,6 +98,7 @@ struct DistributedPlanBuilderV2 {
     fragment_stack: Vec<FragmentId>,
     completed_fragments: Vec<PlanFragmentV2>,
     edges: Vec<FragmentEdge>,
+    cte_fragments: HashMap<CteId, usize>,
 }
 
 impl DistributedPlanBuilderV2 {
@@ -309,6 +314,11 @@ impl DistributedPlanBuilderV2 {
             PhysicalPlanKind::Redistribute(redistribute) => {
                 self.visit_redistribute(node, redistribute)
             }
+            PhysicalPlanKind::CTEAnchor(anchor) => self.visit_cte_anchor(node, anchor),
+            PhysicalPlanKind::CTEProduce(_) => Err(
+                "PhysicalCTEProduce emits no DistributedPlan node outside CTEAnchor".to_string(),
+            ),
+            PhysicalPlanKind::CTEConsume(consume) => self.visit_cte_consume(node, consume),
             other => Err(format!(
                 "build_distributed_plan_v2 does not handle PhysicalPlanKind::{} yet",
                 physical_kind_name(other)
@@ -388,7 +398,7 @@ impl DistributedPlanBuilderV2 {
             output_exprs: None,
             output_columns: child_plan.output_columns.clone(),
             cte_id: None,
-            cte_exchange_nodes: Vec::new(),
+            cte_exchange_nodes: collect_cte_exchange_nodes(&child),
         });
         self.edges.push(FragmentEdge {
             source_fragment_id: child_fragment_id,
@@ -417,6 +427,110 @@ impl DistributedPlanBuilderV2 {
                 output_columns: Vec::new(),
                 output_qualifier: None,
                 flavor: ExchangeFlavor::Distribution,
+            }),
+        })
+    }
+
+    fn visit_cte_anchor(
+        &mut self,
+        node: &PhysicalPlanNode,
+        _anchor: &crate::sql::planner::plan::LogicalCTEAnchorNode,
+    ) -> Result<DistributedNode, String> {
+        expect_child_count(node, 2)?;
+        let produce = &node.children[0];
+        let consume = &node.children[1];
+        let PhysicalPlanKind::CTEProduce(produce_payload) = &produce.kind else {
+            return Err("PhysicalCTEAnchor first child must be PhysicalCTEProduce".to_string());
+        };
+
+        self.visit_cte_produce(produce, produce_payload)?;
+        self.visit(consume)
+    }
+
+    fn visit_cte_produce(
+        &mut self,
+        node: &PhysicalPlanNode,
+        produce: &crate::sql::planner::plan::LogicalCTEProduceNode,
+    ) -> Result<(), String> {
+        expect_child_count(node, 1)?;
+        let child_plan = &node.children[0];
+        let cte_fragment_id = self.alloc_fragment_id();
+        self.fragment_stack.push(cte_fragment_id);
+        let child_result = self.visit(child_plan);
+        let popped_fragment_id = self.fragment_stack.pop();
+        debug_assert_eq!(popped_fragment_id, Some(cte_fragment_id));
+        let child = child_result?;
+
+        let idx = self.completed_fragments.len();
+        self.completed_fragments.push(PlanFragmentV2 {
+            fragment_id: cte_fragment_id,
+            root: child.clone(),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::Noop,
+            output_exprs: None,
+            output_columns: produce.output_columns.clone(),
+            cte_id: Some(produce.cte_id),
+            cte_exchange_nodes: collect_cte_exchange_nodes(&child),
+        });
+        self.cte_fragments.insert(produce.cte_id, idx);
+        Ok(())
+    }
+
+    fn visit_cte_consume(
+        &mut self,
+        node: &PhysicalPlanNode,
+        consume: &crate::sql::planner::plan::LogicalCTEConsumeNode,
+    ) -> Result<DistributedNode, String> {
+        expect_child_count(node, 0)?;
+        let cte_frag_idx = self
+            .cte_fragments
+            .get(&consume.cte_id)
+            .copied()
+            .ok_or_else(|| format!("CTE consume references unknown cte_id={}", consume.cte_id))?;
+        let cte_fragment_id = self.completed_fragments[cte_frag_idx].fragment_id;
+        validate_cte_consume_mapping(consume)?;
+        let receive_producer_column_ids = consume.producer_column_ids.clone();
+
+        let exchange_node_id = self.alloc_node();
+        let exchange_tuple_id = self.alloc_tuple();
+        let target_fragment_id = self.current_fragment_id()?;
+
+        self.edges.push(FragmentEdge {
+            source_fragment_id: cte_fragment_id,
+            target_fragment_id,
+            target_exchange_node_id: exchange_node_id,
+            output_partition: tdata_partition_placeholder(
+                partitions::TPartitionType::UNPARTITIONED,
+            ),
+            stream_kind: FragmentStreamKind::Broadcast,
+            edge_kind: FragmentEdgeKind::CteMulticast {
+                cte_id: consume.cte_id,
+                receive_producer_column_ids: receive_producer_column_ids.clone(),
+            },
+            output_slot_ids: Vec::new(),
+        });
+
+        Ok(DistributedNode {
+            node_id: exchange_node_id,
+            fragment_id: target_fragment_id,
+            tuple_ids: vec![exchange_tuple_id],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: synthetic_exchange_stats(&node.stats),
+            payload: DistributedPayload::Exchange(ExchangeReceiver {
+                partition_type: partitions::TPartitionType::UNPARTITIONED,
+                partition_exprs: Vec::new(),
+                source_fragment_id: cte_fragment_id,
+                output_columns: consume.output_columns.clone(),
+                output_qualifier: Some(consume.alias.clone()),
+                flavor: ExchangeFlavor::CteMulticast {
+                    cte_id: consume.cte_id,
+                    receive_producer_column_ids,
+                },
             }),
         })
     }
@@ -562,6 +676,62 @@ fn stream_kind_for_redistribute_mode(mode: &RedistributeMode) -> FragmentStreamK
     }
 }
 
+fn validate_cte_consume_mapping(
+    consume: &crate::sql::planner::plan::LogicalCTEConsumeNode,
+) -> Result<(), String> {
+    if consume.output_columns.len() != consume.producer_column_ids.len() {
+        return Err(format!(
+            "CTEConsume output/producers arity mismatch for cte_id={}",
+            consume.cte_id
+        ));
+    }
+    let mut seen = HashSet::new();
+    for column in &consume.output_columns {
+        if !seen.insert(column.column_id) {
+            return Err(format!(
+                "CTEConsume duplicate output column {} for cte_id={}",
+                column.column_id.0, consume.cte_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn synthetic_exchange_stats(
+    stats: &crate::sql::planner::PhysicalPlanStats,
+) -> crate::sql::planner::PhysicalPlanStats {
+    crate::sql::planner::PhysicalPlanStats {
+        output_row_count: stats.output_row_count,
+        row_count_confidence: stats.row_count_confidence,
+        column_statistics: stats.column_statistics.clone(),
+        cost_estimate: None,
+        broadcast_decision: None,
+    }
+}
+
+fn collect_cte_exchange_nodes(node: &DistributedNode) -> Vec<(CteId, i32, Vec<ColumnId>)> {
+    let mut nodes = Vec::new();
+    collect_cte_exchange_nodes_inner(node, &mut nodes);
+    nodes
+}
+
+fn collect_cte_exchange_nodes_inner(
+    node: &DistributedNode,
+    nodes: &mut Vec<(CteId, i32, Vec<ColumnId>)>,
+) {
+    if let DistributedPayload::Exchange(exchange) = &node.payload
+        && let ExchangeFlavor::CteMulticast {
+            cte_id,
+            receive_producer_column_ids,
+        } = &exchange.flavor
+    {
+        nodes.push((*cte_id, node.node_id, receive_producer_column_ids.clone()));
+    }
+    for child in &node.children {
+        collect_cte_exchange_nodes_inner(child, nodes);
+    }
+}
+
 fn expect_child_count(node: &PhysicalPlanNode, expected: usize) -> Result<(), String> {
     if node.children.len() == expected {
         return Ok(());
@@ -609,6 +779,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::build_distributed_plan_v2;
+    use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
@@ -620,13 +791,15 @@ mod tests {
     use crate::sql::planner::distributed_fragment::{DataSink, PartitionKind};
     use crate::sql::planner::distributed_node::DistributedPayload;
     use crate::sql::planner::plan::{
-        DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
-        PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode, PlanAssertOneRowNode,
-        PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode,
-        PlanRepeatNode, PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode,
-        PlanWindowNode, RedistributeMode, RedistributeNode, WindowExpr,
+        DistributedChangeEventExpandNode, ExchangeFlavor, LogicalCTEAnchorNode,
+        LogicalCTEConsumeNode, LogicalCTEProduceNode, PhysicalHashAggregateNode,
+        PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode,
+        PlanAssertOneRowNode, PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode,
+        PlanLimitNode, PlanProjectNode, PlanRepeatNode, PlanScanNode, PlanSortNode,
+        PlanTableFunctionNode, PlanValuesNode, PlanWindowNode, RedistributeMode, RedistributeNode,
+        WindowExpr,
     };
-    use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate};
     use crate::thrift::partitions::TPartitionType;
 
     #[test]
@@ -1528,6 +1701,323 @@ mod tests {
     }
 
     #[test]
+    fn build_distributed_plan_v2_cte_anchor_splits_produce_fragment_and_consume_exchange() {
+        let cte_id: CteId = 7;
+        let producer_columns = vec![output_col(1, "p_k", DataType::Int64, false)];
+        let consumer_columns = vec![output_col(2, "c_k", DataType::Int64, false)];
+        let scan = scan_node_with_columns(producer_columns.clone());
+        let produce = PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id,
+                output_columns: producer_columns.clone(),
+            }),
+            children: vec![scan],
+            output_columns: producer_columns.clone(),
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let consume = PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id,
+                alias: "cte_alias".to_string(),
+                output_columns: consumer_columns.clone(),
+                producer_column_ids: vec![producer_columns[0].column_id],
+            }),
+            children: vec![],
+            output_columns: consumer_columns.clone(),
+            stats: stats_with_cost(),
+            probe_runtime_filters: vec![],
+        };
+        let anchor = PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id }),
+            children: vec![produce, consume],
+            output_columns: consumer_columns.clone(),
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&anchor).expect("build_distributed_plan_v2");
+
+        assert_eq!(dp.fragments.len(), 2);
+        assert_eq!(dp.root_fragment_id, 0);
+        assert_eq!(dp.edges.len(), 1);
+
+        let produce_fragment = dp
+            .fragments
+            .iter()
+            .find(|fragment| fragment.cte_id == Some(cte_id))
+            .expect("produce fragment");
+        assert_eq!(produce_fragment.fragment_id, 1);
+        assert!(matches!(produce_fragment.sink, DataSink::Noop));
+        assert_eq!(
+            produce_fragment.output_columns.len(),
+            producer_columns.len()
+        );
+        assert_eq!(
+            produce_fragment.output_columns[0].column_id,
+            producer_columns[0].column_id
+        );
+        assert!(produce_fragment.cte_exchange_nodes.is_empty());
+        assert!(matches!(
+            &produce_fragment.root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
+        ));
+
+        let root_fragment = dp
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+            .expect("root fragment");
+        assert!(matches!(root_fragment.sink, DataSink::Result));
+        assert_eq!(root_fragment.cte_id, None);
+
+        let exchange = &root_fragment.root;
+        let receiver = match &exchange.payload {
+            DistributedPayload::Exchange(receiver) => receiver,
+            other => panic!("expected CTE consume Exchange root, got {other:?}"),
+        };
+        assert_eq!(exchange.fragment_id, dp.root_fragment_id);
+        assert_eq!(exchange.tuple_ids.len(), 1);
+        assert!(
+            exchange.stats.cost_estimate.is_none(),
+            "synthetic CTE Exchange must not inherit CTEConsume cost"
+        );
+        assert_eq!(receiver.source_fragment_id, produce_fragment.fragment_id);
+        assert_eq!(receiver.partition_type, TPartitionType::UNPARTITIONED);
+        assert!(receiver.partition_exprs.is_empty());
+        assert_eq!(receiver.output_columns.len(), consumer_columns.len());
+        assert_eq!(
+            receiver.output_columns[0].column_id,
+            consumer_columns[0].column_id
+        );
+        assert_eq!(receiver.output_qualifier.as_deref(), Some("cte_alias"));
+        let receive_producer_column_ids = match &receiver.flavor {
+            ExchangeFlavor::CteMulticast {
+                cte_id: flavor_cte_id,
+                receive_producer_column_ids,
+            } => {
+                assert_eq!(*flavor_cte_id, cte_id);
+                receive_producer_column_ids
+            }
+            other => panic!("expected CteMulticast exchange flavor, got {other:?}"),
+        };
+        assert_eq!(
+            receive_producer_column_ids,
+            &vec![producer_columns[0].column_id]
+        );
+
+        let edge = &dp.edges[0];
+        assert_eq!(edge.source_fragment_id, produce_fragment.fragment_id);
+        assert_eq!(edge.target_fragment_id, dp.root_fragment_id);
+        assert_eq!(edge.target_exchange_node_id, exchange.node_id);
+        assert_eq!(edge.stream_kind, FragmentStreamKind::Broadcast);
+        assert_eq!(edge.output_partition.type_, TPartitionType::UNPARTITIONED);
+        assert!(edge.output_slot_ids.is_empty());
+        match &edge.edge_kind {
+            FragmentEdgeKind::CteMulticast {
+                cte_id: edge_cte_id,
+                receive_producer_column_ids,
+            } => {
+                assert_eq!(*edge_cte_id, cte_id);
+                assert_eq!(
+                    receive_producer_column_ids,
+                    &vec![producer_columns[0].column_id]
+                );
+            }
+            other => panic!("expected CteMulticast edge, got {other:?}"),
+        }
+        assert_eq!(
+            root_fragment.cte_exchange_nodes,
+            vec![(
+                cte_id,
+                exchange.node_id,
+                vec![producer_columns[0].column_id]
+            )]
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_cte_produce_root_fails_without_visiting_child() {
+        let cte_id: CteId = 7;
+        let scan = scan_node(1, "k");
+        let limit = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Limit(PlanLimitNode {
+                limit: Some(1),
+                offset: None,
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let produce = PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id,
+                output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            }),
+            children: vec![limit],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let err = build_distributed_plan_v2(&produce)
+            .expect_err("direct CTEProduce must fail before visiting child");
+
+        assert!(
+            err.contains("PhysicalCTEProduce emits no DistributedPlan node outside CTEAnchor"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("PhysicalPlanKind::Limit"),
+            "direct CTEProduce should fail before visiting unsupported child: {err}"
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_cte_anchor_rejects_non_produce_first_child() {
+        let cte_id: CteId = 7;
+        let scan = scan_node(1, "k");
+        let consume = cte_consume_node(cte_id, 2, vec![ColumnId::new_for_test(1)]);
+        let anchor = PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id }),
+            children: vec![scan, consume],
+            output_columns: vec![output_col(2, "c_k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let err = build_distributed_plan_v2(&anchor)
+            .expect_err("CTEAnchor first child must be CTEProduce");
+
+        assert!(
+            err.contains("PhysicalCTEAnchor first child must be PhysicalCTEProduce"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_cte_consume_rejects_unknown_cte_id() {
+        let consume = cte_consume_node(7, 2, vec![ColumnId::new_for_test(1)]);
+
+        let err =
+            build_distributed_plan_v2(&consume).expect_err("unknown CTE id should be rejected");
+
+        assert!(
+            err.contains("CTE consume references unknown cte_id=7"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_cte_consume_rejects_bad_mapping() {
+        let cte_id: CteId = 7;
+        let producer_columns = vec![output_col(1, "p_k", DataType::Int64, false)];
+        let produce = cte_produce_node(cte_id, producer_columns.clone(), scan_node(1, "p_k"));
+        let bad_arity_consume = cte_consume_node(cte_id, 2, vec![]);
+        let anchor = PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id }),
+            children: vec![produce.clone(), bad_arity_consume],
+            output_columns: vec![output_col(2, "c_k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let err =
+            build_distributed_plan_v2(&anchor).expect_err("bad CTE mapping should be rejected");
+
+        assert!(
+            err.contains("CTEConsume output/producers arity mismatch for cte_id=7"),
+            "unexpected error: {err}"
+        );
+
+        let duplicate_output_consume = PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id,
+                alias: "cte_alias".to_string(),
+                output_columns: vec![
+                    output_col(2, "c_k", DataType::Int64, false),
+                    output_col(2, "c_k_dup", DataType::Int64, false),
+                ],
+                producer_column_ids: vec![
+                    producer_columns[0].column_id,
+                    producer_columns[0].column_id,
+                ],
+            }),
+            children: vec![],
+            output_columns: vec![output_col(2, "c_k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let anchor = PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id }),
+            children: vec![produce, duplicate_output_consume],
+            output_columns: vec![output_col(2, "c_k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let err = build_distributed_plan_v2(&anchor)
+            .expect_err("duplicate CTE consume output should be rejected");
+
+        assert!(
+            err.contains("CTEConsume duplicate output column 2 for cte_id=7"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_collects_multiple_cte_exchange_nodes_in_root_tree() {
+        let cte_id: CteId = 7;
+        let producer_columns = vec![output_col(1, "p_k", DataType::Int64, false)];
+        let produce = cte_produce_node(cte_id, producer_columns.clone(), scan_node(1, "p_k"));
+        let left_consume = cte_consume_node(cte_id, 2, vec![producer_columns[0].column_id]);
+        let right_consume = cte_consume_node(cte_id, 3, vec![producer_columns[0].column_id]);
+        let join = PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+                execution_mode: None,
+                build_runtime_filters: vec![],
+            })),
+            children: vec![left_consume, right_consume],
+            output_columns: vec![
+                output_col(2, "c_k", DataType::Int64, false),
+                output_col(3, "c_k", DataType::Int64, false),
+            ],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let anchor = PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id }),
+            children: vec![produce, join],
+            output_columns: vec![
+                output_col(2, "c_k", DataType::Int64, false),
+                output_col(3, "c_k", DataType::Int64, false),
+            ],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&anchor).expect("build_distributed_plan_v2");
+        let root_fragment = dp
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+            .expect("root fragment");
+
+        assert_eq!(root_fragment.cte_exchange_nodes.len(), 2);
+        assert_eq!(dp.edges.len(), 2);
+        assert!(root_fragment.cte_exchange_nodes.iter().all(
+            |(exchange_cte_id, _, producer_ids)| {
+                *exchange_cte_id == cte_id && producer_ids == &vec![producer_columns[0].column_id]
+            }
+        ));
+    }
+
+    #[test]
     fn build_distributed_plan_v2_rejects_unsupported_limit_root() {
         let scan = scan_node(1, "k");
         let limit = PhysicalPlanNode {
@@ -1588,6 +2078,17 @@ mod tests {
         }
     }
 
+    fn stats_with_cost() -> PhysicalPlanStats {
+        PhysicalPlanStats {
+            cost_estimate: Some(PlannerCostEstimate {
+                cpu_cost: 1.0,
+                memory_cost: 2.0,
+                network_cost: 3.0,
+            }),
+            ..stats()
+        }
+    }
+
     fn table_def() -> TableDef {
         TableDef {
             name: "t".to_string(),
@@ -1620,6 +2121,43 @@ mod tests {
             }),
             children: vec![],
             output_columns: scan_columns,
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    fn cte_produce_node(
+        cte_id: CteId,
+        output_columns: Vec<OutputColumn>,
+        child: PhysicalPlanNode,
+    ) -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id,
+                output_columns: output_columns.clone(),
+            }),
+            children: vec![child],
+            output_columns,
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    fn cte_consume_node(
+        cte_id: CteId,
+        output_column_id: u32,
+        producer_column_ids: Vec<ColumnId>,
+    ) -> PhysicalPlanNode {
+        let output_columns = vec![output_col(output_column_id, "c_k", DataType::Int64, false)];
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id,
+                alias: "cte_alias".to_string(),
+                output_columns: output_columns.clone(),
+                producer_column_ids,
+            }),
+            children: vec![],
+            output_columns,
             stats: stats(),
             probe_runtime_filters: vec![],
         }
