@@ -6,7 +6,7 @@
 //! the driver that enumerates branches and applies drop/rollback lives in
 //! `iceberg_refresh.rs`.
 
-/// Disposition of a staging branch relative to the storage table's `main`.
+/// Disposition of a staging branch relative to the MV table's `main`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StagingDisposition {
     /// Staging snapshot IS main's current snapshot (published, uncleaned).
