@@ -1,17 +1,22 @@
 #![allow(dead_code)]
 
 use crate::sql::analysis::cte::CteId;
-use crate::sql::analysis::{OutputColumn, TypedExpr};
+use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
-use crate::sql::codegen::{FragmentEdge, FragmentId};
+use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::property::OrderingSpec;
-use crate::sql::planner::distributed_fragment::{DataPartition, DataSink};
-use crate::sql::planner::distributed_node::{DistributedNode, DistributedPayload};
+use crate::sql::planner::distributed_fragment::{DataPartition, DataSink, PartitionKind};
+use crate::sql::planner::distributed_node::{
+    DistributedNode, DistributedPayload, ExchangeReceiver,
+};
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
-use crate::sql::planner::plan::{PhysicalPlanKind, PhysicalPlanNode};
+use crate::sql::planner::plan::{
+    ExchangeFlavor, PhysicalPlanKind, PhysicalPlanNode, RedistributeMode, RedistributeNode,
+};
+use crate::thrift::partitions;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedPlanV2 {
@@ -40,24 +45,45 @@ pub(crate) fn build_distributed_plan_v2(
         next_node_id: 1,
         next_tuple_id: 1,
         next_fragment_id: 0,
+        fragment_stack: Vec::new(),
+        completed_fragments: Vec::new(),
+        edges: Vec::new(),
     };
     let root_fragment_id = builder.alloc_fragment_id();
-    let root = builder.visit(plan, root_fragment_id)?;
+    let root_plan = if let PhysicalPlanKind::Redistribute(redistribute) = &plan.kind {
+        if matches!(redistribute.mode, RedistributeMode::Gather) {
+            expect_child_count(plan, 1)?;
+            &plan.children[0]
+        } else {
+            plan
+        }
+    } else {
+        plan
+    };
+
+    builder.fragment_stack.push(root_fragment_id);
+    let root_result = builder.visit(root_plan);
+    let popped_fragment_id = builder.fragment_stack.pop();
+    debug_assert_eq!(popped_fragment_id, Some(root_fragment_id));
+    let root = root_result?;
+
+    let mut fragments = builder.completed_fragments;
+    fragments.push(PlanFragmentV2 {
+        fragment_id: root_fragment_id,
+        root,
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Result,
+        output_exprs: None,
+        output_columns: root_plan.output_columns.clone(),
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    });
 
     Ok(DistributedPlanV2 {
-        fragments: vec![PlanFragmentV2 {
-            fragment_id: root_fragment_id,
-            root,
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::Result,
-            output_exprs: None,
-            output_columns: plan.output_columns.clone(),
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        }],
+        fragments,
         root_fragment_id,
-        edges: Vec::new(),
+        edges: builder.edges,
     })
 }
 
@@ -65,6 +91,9 @@ struct DistributedPlanBuilderV2 {
     next_node_id: i32,
     next_tuple_id: i32,
     next_fragment_id: FragmentId,
+    fragment_stack: Vec<FragmentId>,
+    completed_fragments: Vec<PlanFragmentV2>,
+    edges: Vec<FragmentEdge>,
 }
 
 impl DistributedPlanBuilderV2 {
@@ -86,11 +115,14 @@ impl DistributedPlanBuilderV2 {
         fragment_id
     }
 
-    fn visit(
-        &mut self,
-        node: &PhysicalPlanNode,
-        fragment_id: FragmentId,
-    ) -> Result<DistributedNode, String> {
+    fn current_fragment_id(&self) -> Result<FragmentId, String> {
+        self.fragment_stack.last().copied().ok_or_else(|| {
+            "build_distributed_plan_v2 internal error: no current fragment".to_string()
+        })
+    }
+
+    fn visit(&mut self, node: &PhysicalPlanNode) -> Result<DistributedNode, String> {
+        let fragment_id = self.current_fragment_id()?;
         match &node.kind {
             PhysicalPlanKind::Values(_) => {
                 expect_child_count(node, 0)?;
@@ -106,14 +138,14 @@ impl DistributedPlanBuilderV2 {
             }
             PhysicalPlanKind::Project(_) => {
                 expect_child_count(node, 1)?;
-                let child = self.visit(&node.children[0], fragment_id)?;
+                let child = self.visit(&node.children[0])?;
                 let node_id = self.alloc_node();
                 let tuple_id = self.alloc_tuple();
                 Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
             }
             PhysicalPlanKind::Filter(filter) => {
                 expect_child_count(node, 1)?;
-                let mut child = self.visit(&node.children[0], fragment_id)?;
+                let mut child = self.visit(&node.children[0])?;
                 if let DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) =
                     &mut child.payload
                 {
@@ -132,22 +164,22 @@ impl DistributedPlanBuilderV2 {
             }
             PhysicalPlanKind::Sort(_) => {
                 expect_child_count(node, 1)?;
-                let child = self.visit(&node.children[0], fragment_id)?;
+                let child = self.visit(&node.children[0])?;
                 let node_id = self.alloc_node();
                 let tuple_ids = child.tuple_ids.clone();
                 Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]))
             }
             PhysicalPlanKind::HashAggregate(_) => {
                 expect_child_count(node, 1)?;
-                let child = self.visit(&node.children[0], fragment_id)?;
+                let child = self.visit(&node.children[0])?;
                 let tuple_id = self.alloc_tuple();
                 let node_id = self.alloc_node();
                 Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
             }
             PhysicalPlanKind::HashJoin(_) => {
                 expect_child_count(node, 2)?;
-                let left = self.visit(&node.children[0], fragment_id)?;
-                let right = self.visit(&node.children[1], fragment_id)?;
+                let left = self.visit(&node.children[0])?;
+                let right = self.visit(&node.children[1])?;
                 let node_id = self.alloc_node();
                 let mut tuple_ids = left.tuple_ids.clone();
                 tuple_ids.extend(right.tuple_ids.iter().copied());
@@ -155,8 +187,8 @@ impl DistributedPlanBuilderV2 {
             }
             PhysicalPlanKind::NestLoopJoin(_) => {
                 expect_child_count(node, 2)?;
-                let left = self.visit(&node.children[0], fragment_id)?;
-                let right = self.visit(&node.children[1], fragment_id)?;
+                let left = self.visit(&node.children[0])?;
+                let right = self.visit(&node.children[1])?;
                 let node_id = self.alloc_node();
                 let mut tuple_ids = left.tuple_ids.clone();
                 tuple_ids.extend(right.tuple_ids.iter().copied());
@@ -164,21 +196,21 @@ impl DistributedPlanBuilderV2 {
             }
             PhysicalPlanKind::AssertOneRow(_) => {
                 expect_child_count(node, 1)?;
-                let child = self.visit(&node.children[0], fragment_id)?;
+                let child = self.visit(&node.children[0])?;
                 let node_id = self.alloc_node();
                 let tuple_ids = child.tuple_ids.clone();
                 Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]))
             }
             PhysicalPlanKind::Decode(_) => {
                 expect_child_count(node, 1)?;
-                let child = self.visit(&node.children[0], fragment_id)?;
+                let child = self.visit(&node.children[0])?;
                 let tuple_id = self.alloc_tuple();
                 let node_id = self.alloc_node();
                 Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
             }
             PhysicalPlanKind::Repeat(repeat) => {
                 expect_child_count(node, 1)?;
-                let child = self.visit(&node.children[0], fragment_id)?;
+                let child = self.visit(&node.children[0])?;
                 let node_id = self.alloc_node();
                 let virtual_tuple_id = self.alloc_tuple();
                 let mut tuple_ids = child.tuple_ids.clone();
@@ -198,7 +230,7 @@ impl DistributedPlanBuilderV2 {
             }
             PhysicalPlanKind::Window(window) => {
                 expect_child_count(node, 1)?;
-                let child = self.visit(&node.children[0], fragment_id)?;
+                let child = self.visit(&node.children[0])?;
                 let groups = group_win_exprs_by_sig(&window.window_exprs);
                 if groups.is_empty() {
                     return Err(
@@ -252,7 +284,7 @@ impl DistributedPlanBuilderV2 {
             }
             PhysicalPlanKind::ChangeEventExpand(_) => {
                 expect_child_count(node, 1)?;
-                let child = self.visit(&node.children[0], fragment_id)?;
+                let child = self.visit(&node.children[0])?;
                 let tuple_id = self.alloc_tuple();
                 let node_id = self.alloc_node();
                 Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
@@ -267,12 +299,15 @@ impl DistributedPlanBuilderV2 {
             }
             PhysicalPlanKind::TableFunction(_) => {
                 expect_child_count(node, 1)?;
-                let child = self.visit(&node.children[0], fragment_id)?;
+                let child = self.visit(&node.children[0])?;
                 let _ = self.alloc_tuple();
                 let _ = self.alloc_node();
                 let tuple_id = self.alloc_tuple();
                 let node_id = self.alloc_node();
                 Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
+            }
+            PhysicalPlanKind::Redistribute(redistribute) => {
+                self.visit_redistribute(node, redistribute)
             }
             other => Err(format!(
                 "build_distributed_plan_v2 does not handle PhysicalPlanKind::{} yet",
@@ -321,6 +356,70 @@ impl DistributedPlanBuilderV2 {
             payload: DistributedPayload::Physical(payload),
         }
     }
+
+    fn visit_redistribute(
+        &mut self,
+        node: &PhysicalPlanNode,
+        redistribute: &RedistributeNode,
+    ) -> Result<DistributedNode, String> {
+        expect_child_count(node, 1)?;
+        let parent_fragment_id = self.current_fragment_id()?;
+        let child_plan = &node.children[0];
+        let output_partition =
+            data_partition_for_redistribute_mode(&redistribute.mode, &redistribute.output_columns)?;
+        let stream_kind = stream_kind_for_redistribute_mode(&redistribute.mode);
+        let partition_type = partition_type_for_data_partition(&output_partition);
+        let partition_exprs = output_partition.exprs.clone();
+
+        let child_fragment_id = self.alloc_fragment_id();
+        self.fragment_stack.push(child_fragment_id);
+        let child_result = self.visit(child_plan);
+        let popped_fragment_id = self.fragment_stack.pop();
+        debug_assert_eq!(popped_fragment_id, Some(child_fragment_id));
+        let child = child_result?;
+
+        let exchange_node_id = self.alloc_node();
+        self.completed_fragments.push(PlanFragmentV2 {
+            fragment_id: child_fragment_id,
+            root: child.clone(),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: output_partition.clone(),
+            sink: DataSink::Noop,
+            output_exprs: None,
+            output_columns: child_plan.output_columns.clone(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        });
+        self.edges.push(FragmentEdge {
+            source_fragment_id: child_fragment_id,
+            target_fragment_id: parent_fragment_id,
+            target_exchange_node_id: exchange_node_id,
+            output_partition: tdata_partition_placeholder(partition_type),
+            stream_kind,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: Vec::new(),
+        });
+
+        Ok(DistributedNode {
+            node_id: exchange_node_id,
+            fragment_id: parent_fragment_id,
+            tuple_ids: child.tuple_ids.clone(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: node.stats.clone(),
+            payload: DistributedPayload::Exchange(ExchangeReceiver {
+                partition_type,
+                partition_exprs,
+                source_fragment_id: child_fragment_id,
+                output_columns: Vec::new(),
+                output_qualifier: None,
+                flavor: ExchangeFlavor::Distribution,
+            }),
+        })
+    }
 }
 
 fn distributed_node_ordering(node: &DistributedNode) -> OrderingSpec {
@@ -331,6 +430,10 @@ fn distributed_node_ordering(node: &DistributedNode) -> OrderingSpec {
         DistributedPayload::Physical(PhysicalPlanKind::TopN(topn)) => {
             ordering_spec_from_sort_items(&topn.items)
         }
+        DistributedPayload::Exchange(exchange) => match &exchange.flavor {
+            ExchangeFlavor::TopNSplit { items, .. } => ordering_spec_from_sort_items(items),
+            _ => OrderingSpec::Any,
+        },
         DistributedPayload::Physical(PhysicalPlanKind::AssertOneRow(_)) => node
             .children
             .first()
@@ -365,6 +468,97 @@ fn distributed_node_ordering(node: &DistributedNode) -> OrderingSpec {
             current_ordering
         }
         _ => OrderingSpec::Any,
+    }
+}
+
+fn data_partition_for_redistribute_mode(
+    mode: &RedistributeMode,
+    output_columns: &[OutputColumn],
+) -> Result<DataPartition, String> {
+    match mode {
+        RedistributeMode::Gather | RedistributeMode::Broadcast => {
+            Ok(DataPartition::unpartitioned())
+        }
+        RedistributeMode::Hash { cols, .. } => {
+            let exprs = partition_exprs_for_columns(cols, output_columns)?;
+            if exprs.is_empty() {
+                Ok(DataPartition::unpartitioned())
+            } else {
+                Ok(DataPartition {
+                    kind: PartitionKind::Hash,
+                    exprs,
+                })
+            }
+        }
+    }
+}
+
+fn partition_exprs_for_columns(
+    cols: &[ColumnId],
+    output_columns: &[OutputColumn],
+) -> Result<Vec<TypedExpr>, String> {
+    let mut exprs = Vec::with_capacity(cols.len());
+    let mut missing = Vec::new();
+    for col_id in cols {
+        match output_columns
+            .iter()
+            .find(|column| column.column_id == *col_id)
+        {
+            Some(column) => exprs.push(TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: column.column_id,
+                    qualifier: None,
+                    column: column.name.clone(),
+                },
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            }),
+            None => missing.push(*col_id),
+        }
+    }
+    if missing.is_empty() {
+        return Ok(exprs);
+    }
+
+    let missing = missing
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let available = output_columns
+        .iter()
+        .map(|column| format!("{}({})", column.column_id, column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "build_distributed_plan_v2: missing hash partition columns [{missing}]; available output columns [{available}]"
+    ))
+}
+
+fn partition_type_for_data_partition(partition: &DataPartition) -> partitions::TPartitionType {
+    match partition.kind {
+        PartitionKind::Unpartitioned => partitions::TPartitionType::UNPARTITIONED,
+        PartitionKind::Random => partitions::TPartitionType::RANDOM,
+        PartitionKind::Hash => partitions::TPartitionType::HASH_PARTITIONED,
+    }
+}
+
+fn tdata_partition_placeholder(
+    partition_type: partitions::TPartitionType,
+) -> partitions::TDataPartition {
+    partitions::TDataPartition::new(
+        partition_type,
+        None::<Vec<crate::thrift::exprs::TExpr>>,
+        None::<Vec<partitions::TRangePartition>>,
+        None::<Vec<partitions::TBucketProperty>>,
+    )
+}
+
+fn stream_kind_for_redistribute_mode(mode: &RedistributeMode) -> FragmentStreamKind {
+    match mode {
+        RedistributeMode::Gather => FragmentStreamKind::Gather,
+        RedistributeMode::Broadcast => FragmentStreamKind::Broadcast,
+        RedistributeMode::Hash { .. } => FragmentStreamKind::Partitioned,
     }
 }
 
@@ -419,18 +613,21 @@ mod tests {
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::codegen::{FragmentEdgeKind, FragmentStreamKind};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{AggMode, AggregateOutputLayout, JoinDistribution};
+    use crate::sql::optimizer::property::HashSource;
     use crate::sql::planner::distributed_fragment::{DataSink, PartitionKind};
     use crate::sql::planner::distributed_node::DistributedPayload;
     use crate::sql::planner::plan::{
         DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
         PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode, PlanAssertOneRowNode,
-        PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
-        PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
-        RedistributeMode, RedistributeNode, WindowExpr,
+        PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode,
+        PlanRepeatNode, PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode,
+        PlanWindowNode, RedistributeMode, RedistributeNode, WindowExpr,
     };
     use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
+    use crate::thrift::partitions::TPartitionType;
 
     #[test]
     fn build_distributed_plan_v2_values_shapes_root_fragment() {
@@ -1129,7 +1326,183 @@ mod tests {
     }
 
     #[test]
-    fn build_distributed_plan_v2_rejects_unsupported_redistribute_root() {
+    fn build_distributed_plan_v2_hash_redistribute_creates_exchange_edge() {
+        let scan = scan_node(1, "k");
+        let redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Hash {
+                    cols: vec![ColumnId::new_for_test(1)],
+                    source: HashSource::ShuffleJoin,
+                },
+                output_columns: scan.output_columns.clone(),
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let project = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Project(PlanProjectNode {
+                items: vec![ProjectItem {
+                    expr: column_ref_expr(1, "k", DataType::Int64, false),
+                    output_name: "k_alias".to_string(),
+                    output_column_id: ColumnId::new_for_test(2),
+                }],
+                output_qualifier: None,
+            }),
+            children: vec![redistribute],
+            output_columns: vec![output_col(2, "k_alias", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&project).expect("build_distributed_plan_v2");
+
+        assert_eq!(dp.fragments.len(), 2);
+        assert_eq!(dp.root_fragment_id, 0);
+        assert_eq!(dp.fragments[0].fragment_id, 1);
+        assert_eq!(dp.fragments[1].fragment_id, 0);
+        assert_eq!(dp.edges.len(), 1);
+
+        let root = &dp.fragments[1].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Project(_))
+        ));
+        assert_eq!(root.fragment_id, 0);
+        assert_eq!(root.children.len(), 1);
+
+        let exchange = &root.children[0];
+        let exchange_receiver = match &exchange.payload {
+            DistributedPayload::Exchange(exchange_receiver) => exchange_receiver,
+            other => panic!("expected Exchange child, got {other:?}"),
+        };
+        assert_eq!(exchange.fragment_id, 0);
+        assert_eq!(exchange_receiver.source_fragment_id, 1);
+        assert_eq!(
+            exchange_receiver.partition_type,
+            TPartitionType::HASH_PARTITIONED
+        );
+        assert_eq!(exchange_receiver.partition_exprs.len(), 1);
+        assert_column_ref(&exchange_receiver.partition_exprs[0], 1, "k");
+        assert!(matches!(
+            exchange_receiver.flavor,
+            crate::sql::planner::plan::ExchangeFlavor::Distribution
+        ));
+
+        let edge = &dp.edges[0];
+        assert_eq!(edge.source_fragment_id, 1);
+        assert_eq!(edge.target_fragment_id, 0);
+        assert_eq!(edge.target_exchange_node_id, exchange.node_id);
+        assert_eq!(edge.stream_kind, FragmentStreamKind::Partitioned);
+        assert!(matches!(edge.edge_kind, FragmentEdgeKind::Stream));
+
+        let child_fragment = &dp.fragments[0];
+        assert_eq!(exchange.tuple_ids, child_fragment.root.tuple_ids);
+        assert!(matches!(child_fragment.sink, DataSink::Noop));
+        assert!(matches!(
+            child_fragment.output_partition.kind,
+            PartitionKind::Hash
+        ));
+        assert_eq!(
+            child_fragment.output_columns[0].column_id,
+            ColumnId::new_for_test(1)
+        );
+        assert_eq!(
+            edge.output_partition.type_,
+            TPartitionType::HASH_PARTITIONED
+        );
+        assert!(matches!(
+            &child_fragment.root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
+        ));
+        assert_no_physical_redistribute(&dp.fragments[1].root);
+        assert_no_physical_redistribute(&child_fragment.root);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_hash_redistribute_rejects_missing_partition_column() {
+        let scan = scan_node(1, "k");
+        let redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Hash {
+                    cols: vec![ColumnId::new_for_test(1), ColumnId::new_for_test(99)],
+                    source: HashSource::ShuffleJoin,
+                },
+                output_columns: scan.output_columns.clone(),
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let err = build_distributed_plan_v2(&redistribute)
+            .expect_err("missing hash column should be rejected");
+
+        assert!(
+            err.contains("missing hash partition columns"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("c99"), "unexpected error: {err}");
+        assert!(err.contains("available"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_broadcast_redistribute_creates_broadcast_edge() {
+        let scan = scan_node(1, "k");
+        let redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Broadcast,
+                output_columns: scan.output_columns.clone(),
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let project = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Project(PlanProjectNode {
+                items: vec![ProjectItem {
+                    expr: column_ref_expr(1, "k", DataType::Int64, false),
+                    output_name: "k_alias".to_string(),
+                    output_column_id: ColumnId::new_for_test(2),
+                }],
+                output_qualifier: None,
+            }),
+            children: vec![redistribute],
+            output_columns: vec![output_col(2, "k_alias", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&project).expect("build_distributed_plan_v2");
+
+        assert_eq!(dp.fragments.len(), 2);
+        assert_eq!(dp.edges.len(), 1);
+        let root = &dp.fragments[1].root;
+        let exchange = &root.children[0];
+        let exchange_receiver = match &exchange.payload {
+            DistributedPayload::Exchange(exchange_receiver) => exchange_receiver,
+            other => panic!("expected Exchange child, got {other:?}"),
+        };
+        assert_eq!(
+            exchange_receiver.partition_type,
+            TPartitionType::UNPARTITIONED
+        );
+        assert!(exchange_receiver.partition_exprs.is_empty());
+        assert_eq!(dp.edges[0].stream_kind, FragmentStreamKind::Broadcast);
+        assert!(matches!(dp.edges[0].edge_kind, FragmentEdgeKind::Stream));
+        assert_eq!(
+            dp.edges[0].output_partition.type_,
+            TPartitionType::UNPARTITIONED
+        );
+        assert_no_physical_redistribute(root);
+        assert_no_physical_redistribute(&dp.fragments[0].root);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_root_gather_is_skipped() {
         let scan = scan_node(1, "k");
         let redistribute = PhysicalPlanNode {
             kind: PhysicalPlanKind::Redistribute(RedistributeNode {
@@ -1142,11 +1515,36 @@ mod tests {
             probe_runtime_filters: vec![],
         };
 
-        let err = build_distributed_plan_v2(&redistribute)
-            .expect_err("Redistribute is not supported in M3a3");
+        let dp = build_distributed_plan_v2(&redistribute).expect("build_distributed_plan_v2");
+
+        assert_eq!(dp.fragments.len(), 1);
+        assert!(dp.edges.is_empty());
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
+        ));
+        assert_no_physical_redistribute(root);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_rejects_unsupported_limit_root() {
+        let scan = scan_node(1, "k");
+        let limit = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Limit(PlanLimitNode {
+                limit: Some(10),
+                offset: None,
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let err = build_distributed_plan_v2(&limit).expect_err("Limit is not supported in M3b");
 
         assert!(
-            err.contains("PhysicalPlanKind::Redistribute"),
+            err.contains("PhysicalPlanKind::Limit"),
             "unexpected error: {err}"
         );
         assert!(err.contains("does not handle"), "unexpected error: {err}");
@@ -1388,6 +1786,33 @@ mod tests {
         match &right.kind {
             ExprKind::Literal(LiteralValue::Int(value)) => assert_eq!(*value, expected_value),
             other => panic!("expected Int literal, got {other:?}"),
+        }
+    }
+
+    fn assert_column_ref(expr: &TypedExpr, expected_column_id: u32, expected_column: &str) {
+        match &expr.kind {
+            ExprKind::ColumnRef {
+                column_id, column, ..
+            } => {
+                assert_eq!(*column_id, ColumnId::new_for_test(expected_column_id));
+                assert_eq!(column, expected_column);
+            }
+            other => panic!("expected ColumnRef, got {other:?}"),
+        }
+    }
+
+    fn assert_no_physical_redistribute(
+        node: &crate::sql::planner::distributed_node::DistributedNode,
+    ) {
+        assert!(
+            !matches!(
+                node.payload,
+                DistributedPayload::Physical(PhysicalPlanKind::Redistribute(_))
+            ),
+            "DistributedPayload::Physical(Redistribute) must not be emitted"
+        );
+        for child in &node.children {
+            assert_no_physical_redistribute(child);
         }
     }
 }
