@@ -19647,6 +19647,143 @@ mod tests {
         );
     }
 
+    /// Read one string cell out of the W0 stateless-rebuild report chunk.
+    /// Returns `None` for a NULL cell (the hash columns are nullable).
+    fn stateless_report_cell(result: &crate::engine::QueryResult, column: usize) -> Option<String> {
+        let chunk = &result.chunks[0];
+        let array = chunk
+            .batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("stateless report column is Utf8");
+        arrow::array::Array::is_valid(array, 0).then(|| array.value(0).to_string())
+    }
+
+    /// W0 `full` level: invoking the stateless-rebuild procedure at `full`
+    /// clears the MV's SQLite records and rebuilds them purely from the lake,
+    /// proving SQLite is a rebuildable cache (not just readable lake metadata as
+    /// `provenance` does). The report is `AvailableLevel=full`,
+    /// `RebuildSource=lake`, with non-null descriptor/provenance/waterline
+    /// hashes, and the MV's SQLite definition round-trips back to an equivalent
+    /// record.
+    #[test]
+    fn stateless_rebuild_full_clears_sqlite_and_rebuilds_from_lake() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "alfa")]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        // Refresh so the storage table's current snapshot carries provenance:
+        // this makes the `full` report exercise non-null provenance/waterline
+        // hashes AND a non-empty watermark to round-trip.
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("refresh iceberg mv");
+
+        // Golden: the SQLite definition + dependencies as they stand before the
+        // destructive round-trip.
+        let before =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+                .expect("mv definition present after refresh");
+        assert!(
+            !before.last_refresh_snapshots.is_empty(),
+            "refresh should have recorded a watermark: {before:?}"
+        );
+        let before_deps = list_mv_dependency_names(&env.state, before.mv_id);
+
+        // Drive the full-level probe directly through the guard-free core (the
+        // guard is exercised by the pure tests in `stateless_rebuild`; going
+        // direct avoids racing on process env).
+        let req = crate::engine::mv::stateless_rebuild::ImvStatelessRebuildRequest {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            mv: "mv_orders".to_string(),
+            required_level: crate::engine::mv::stateless_rebuild::StatelessLevel::Full,
+        };
+        let result = match crate::engine::mv::stateless_rebuild::execute_request(&env.state, &req)
+            .expect("full stateless rebuild succeeds")
+        {
+            StatementResult::Query(result) => result,
+            other => panic!("expected a query result, got {other:?}"),
+        };
+
+        // Report shape: columns are AvailableLevel, DescriptorHash,
+        // ProvenanceHash, WaterlineHash, RebuildSource.
+        assert_eq!(stateless_report_cell(&result, 0).as_deref(), Some("full"));
+        assert_eq!(stateless_report_cell(&result, 4).as_deref(), Some("lake"));
+        let descriptor_hash =
+            stateless_report_cell(&result, 1).expect("descriptor hash must be non-null");
+        assert!(!descriptor_hash.is_empty(), "descriptor hash empty");
+        let provenance_hash =
+            stateless_report_cell(&result, 2).expect("provenance hash must be non-null");
+        assert!(!provenance_hash.is_empty(), "provenance hash empty");
+        assert!(
+            stateless_report_cell(&result, 3).is_some(),
+            "waterline hash must be non-null when the current snapshot carries provenance"
+        );
+
+        // Round-trip proof: the SQLite definition reappeared and is equivalent
+        // to the pre-clear golden (same select_sql / target / schema contract /
+        // partition spec / watermark), and its dependencies were restored.
+        let after = find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+            .expect("mv definition reappears after full rebuild");
+        assert_eq!(after.select_sql, before.select_sql);
+        assert_eq!(after.storage_engine, before.storage_engine);
+        assert_eq!(after.target_catalog, before.target_catalog);
+        assert_eq!(after.target_namespace, before.target_namespace);
+        assert_eq!(after.target_table, before.target_table);
+        assert_eq!(after.schema_contract, before.schema_contract);
+        assert_eq!(after.partition_spec, before.partition_spec);
+        assert_eq!(after.last_refresh_snapshots, before.last_refresh_snapshots);
+        assert_eq!(
+            after.last_refresh_table_uuids,
+            before.last_refresh_table_uuids
+        );
+        assert_eq!(
+            list_mv_dependency_names(&env.state, after.mv_id),
+            before_deps
+        );
+    }
+
+    /// W0 `full` level statelessness precondition: if the MV has no SQLite
+    /// definition to clear, there is nothing to prove a round-trip against, so
+    /// the probe fails loud rather than silently reporting `full`.
+    #[test]
+    fn stateless_rebuild_full_errors_when_no_sqlite_definition_to_clear() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        // Forget the MV in SQLite (lake storage table stays), so `full` has no
+        // cached record to clear.
+        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
+
+        let req = crate::engine::mv::stateless_rebuild::ImvStatelessRebuildRequest {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            mv: "mv_orders".to_string(),
+            required_level: crate::engine::mv::stateless_rebuild::StatelessLevel::Full,
+        };
+        let err = crate::engine::mv::stateless_rebuild::execute_request(&env.state, &req)
+            .expect_err("full rebuild must fail with no SQLite definition to clear");
+        assert!(
+            err.contains("no SQLite definition to clear"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn create_writes_schema_contract_into_descriptor() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");

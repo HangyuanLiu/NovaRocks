@@ -2,8 +2,8 @@
 //! lake package (W1 descriptor + optional W3a provenance).
 //!
 //! This is the core of W4's "SQLite as a rebuildable cache" property: given
-//! nothing but the descriptor already inlined on the storage table (and,
-//! optionally, the provenance record carried by the storage table's current
+//! nothing but the descriptor already inlined on the MV table (and,
+//! optionally, the provenance record carried by the MV table's current
 //! snapshot), [`rebuild_mv_definition_from_lake`] reproduces exactly the
 //! inputs `create_iceberg_mv` would have persisted into SQLite at CREATE
 //! time, plus the refresh watermark a completed refresh would have recorded.
@@ -36,8 +36,8 @@ pub(crate) struct RebuiltMvDefinition {
 /// Reconstruct an MV's SQLite definition-create inputs purely from its lake
 /// package (descriptor + optional current-snapshot provenance). Pure: no I/O.
 ///
-/// `provenance` should be the [`MvProvenanceV1`] read from the storage
-/// table's current snapshot summary, if any. `None` means the MV was created
+/// `provenance` should be the [`MvProvenanceV1`] read from the MV table's
+/// current snapshot summary, if any. `None` means the MV was created
 /// but has never completed a refresh, matching a brand-new `StoredMvDefinition`
 /// whose watermark maps are empty.
 pub(crate) fn rebuild_mv_definition_from_lake(
@@ -45,8 +45,6 @@ pub(crate) fn rebuild_mv_definition_from_lake(
     provenance: Option<&MvProvenanceV1>,
 ) -> Result<RebuiltMvDefinition, String> {
     let descriptor = &discovered.descriptor;
-    let (storage_namespace, storage_table) =
-        split_storage_table_pointer(&descriptor.storage_table)?;
 
     let base_table_refs = descriptor
         .base_dependencies
@@ -67,8 +65,8 @@ pub(crate) fn rebuild_mv_definition_from_lake(
         primary_key_columns: Vec::new(),
         storage_engine: StarRocksMvStorageEngine::Iceberg.as_sql_str().to_string(),
         target_catalog: Some(discovered.catalog.clone()),
-        target_namespace: Some(storage_namespace),
-        target_table: Some(storage_table),
+        target_namespace: Some(discovered.namespace.clone()),
+        target_table: Some(discovered.table.clone()),
         schema_contract,
         partition_spec,
         created_at_ms: descriptor.created_at_ms,
@@ -94,27 +92,6 @@ pub(crate) fn rebuild_mv_definition_from_lake(
     })
 }
 
-/// Split a descriptor `storage_table` pointer (`"namespace.table"`, W1's
-/// single-level-namespace convention — see
-/// `iceberg_discovery::parse_storage_table_pointer`) into its two parts.
-fn split_storage_table_pointer(pointer: &str) -> Result<(String, String), String> {
-    let mut parts = pointer.split('.');
-    let namespace = parts
-        .next()
-        .filter(|part| !part.is_empty())
-        .ok_or_else(|| format!("invalid MV descriptor storage_table pointer `{pointer}`"))?;
-    let table = parts
-        .next()
-        .filter(|part| !part.is_empty())
-        .ok_or_else(|| format!("invalid MV descriptor storage_table pointer `{pointer}`"))?;
-    if parts.next().is_some() {
-        return Err(format!(
-            "invalid MV descriptor storage_table pointer `{pointer}`; W1 supports single-level namespaces"
-        ));
-    }
-    Ok((namespace.to_string(), table.to_string()))
-}
-
 /// Rebuild any lake-native Iceberg MV definitions that are present on the lake
 /// but missing from SQLite, making them visible and refreshable on a
 /// fresh-`[metadata]` cluster.
@@ -122,14 +99,14 @@ fn split_storage_table_pointer(pointer: &str) -> Result<(String, String), String
 /// This is the integration that fulfills W4 statelessness: SQLite is treated as
 /// a rebuildable cache over the lake. For every registered Iceberg catalog we
 /// enumerate its namespaces, discover the MV packages each namespace carries
-/// (projection-view marker + storage-table inline descriptor — never SQLite),
-/// and for each MV whose target is not already recorded in SQLite we
+/// (MV-table inline descriptor — never SQLite), and for each MV whose target is
+/// not already recorded in SQLite we
 /// reconstruct its definition-create inputs with
 /// [`rebuild_mv_definition_from_lake`] and persist them (definition + refresh
 /// watermark + dependencies) through the repository's ordinary create path.
 ///
 /// Idempotent: MVs already present in SQLite (cache hit, matched by target
-/// `catalog.namespace.storage_table`) are skipped, so calling this at startup
+/// `catalog.namespace.table`) are skipped, so calling this at startup
 /// on an already-populated cluster is a no-op.
 ///
 /// ## Enumeration scope (documented W4 limitation)
@@ -182,9 +159,14 @@ pub(crate) fn rebuild_imv_cache_from_lake(state: &Arc<StandaloneState>) -> Resul
 }
 
 /// Persist a single discovered MV's definition into SQLite if it is not already
-/// present. The MV is keyed by its target `catalog.namespace.storage_table`
+/// present. The MV is keyed by its target `catalog.namespace.table`
 /// (the same key the create path registers via `find_by_target`).
-fn rebuild_one_discovered_mv_if_missing(
+///
+/// Exposed to the crate so the W0 stateless-rebuild harness
+/// (`stateless_rebuild::execute_request`) can drive a *targeted* single-MV
+/// rebuild for the `full` level, instead of sweeping every registered catalog
+/// through [`rebuild_imv_cache_from_lake`].
+pub(crate) fn rebuild_one_discovered_mv_if_missing(
     state: &Arc<StandaloneState>,
     entry: &crate::connector::iceberg::catalog::registry::IcebergCatalogEntry,
     mv: &DiscoveredIcebergMv,
@@ -195,28 +177,25 @@ fn rebuild_one_discovered_mv_if_missing(
         .ok_or_else(|| "metadata provider required for IMV lake rebuild".to_string())?;
 
     // Cache-hit check: skip MVs already recorded in SQLite. The rebuilt target
-    // maps to (discovered.catalog, discovered.namespace, discovered.storage_table).
+    // maps to (discovered.catalog, discovered.namespace, discovered.table).
     {
         let read = provider
             .begin_read()
             .map_err(|e| format!("open IMV rebuild read transaction failed: {e}"))?;
         let existing = state
             .mv_repo
-            .find_by_target(read.as_ref(), &mv.catalog, &mv.namespace, &mv.storage_table)
+            .find_by_target(read.as_ref(), &mv.catalog, &mv.namespace, &mv.table)
             .map_err(|e| format!("look up MV definition during lake rebuild failed: {e}"))?;
         if existing.is_some() {
             return Ok(());
         }
     }
 
-    // Read the storage table's current-snapshot provenance for the refresh
-    // watermark. Absent provenance (created-but-never-refreshed MV) yields empty
-    // watermark maps, matching a freshly created definition.
-    let loaded = crate::connector::iceberg::catalog::registry::load_table(
-        entry,
-        &mv.namespace,
-        &mv.storage_table,
-    )?;
+    // Read the MV table's current-snapshot provenance for the refresh watermark.
+    // Absent provenance (created-but-never-refreshed MV) yields empty watermark
+    // maps, matching a freshly created definition.
+    let loaded =
+        crate::connector::iceberg::catalog::registry::load_table(entry, &mv.namespace, &mv.table)?;
     let provenance = loaded
         .table
         .metadata()
@@ -304,7 +283,6 @@ fn parse_dependency_storage_engine(value: &str) -> Result<MvDependencyStorageEng
 mod tests {
     use super::*;
     use crate::connector::iceberg::commit::mv_provenance::{ProvenanceBase, RefreshTechnique};
-    use crate::engine::mv::iceberg_discovery::IcebergMvDiscoverySource;
     use crate::meta::repository::mv_contract::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
         ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
@@ -345,7 +323,7 @@ mod tests {
             aggregate: None,
             branch: None,
             target: TargetContract {
-                table_fqn: "ice.analytics.__nr_mv_mv_orders".to_string(),
+                table_fqn: "ice.analytics.mv_orders".to_string(),
                 table_uuid: "uuid-mv".to_string(),
                 schema_id_at_create: 1,
                 visible_columns: vec![TargetVisibleColumn {
@@ -379,8 +357,6 @@ mod tests {
             package_id: "analytics.mv_orders".to_string(),
             logical_sql: "SELECT id FROM ice.sales.orders".to_string(),
             dialect: "starrocks".to_string(),
-            public_view: "analytics.mv_orders".to_string(),
-            storage_table: "analytics.__nr_mv_mv_orders".to_string(),
             visible_columns: vec!["id".to_string()],
             hidden_columns: vec!["__nova_base_row_id".to_string()],
             base_dependencies: vec![DescriptorDependency {
@@ -401,9 +377,8 @@ mod tests {
             catalog: "ice".to_string(),
             namespace: "analytics".to_string(),
             public_name: "mv_orders".to_string(),
-            storage_table: "__nr_mv_mv_orders".to_string(),
+            table: "mv_orders".to_string(),
             descriptor,
-            source: IcebergMvDiscoverySource::StorageTable,
         }
     }
 
@@ -446,7 +421,7 @@ mod tests {
         );
         assert_eq!(request.target_catalog.as_deref(), Some("ice"));
         assert_eq!(request.target_namespace.as_deref(), Some("analytics"));
-        assert_eq!(request.target_table.as_deref(), Some("__nr_mv_mv_orders"));
+        assert_eq!(request.target_table.as_deref(), Some("mv_orders"));
         assert_eq!(request.created_at_ms, 123);
 
         let contract = request
