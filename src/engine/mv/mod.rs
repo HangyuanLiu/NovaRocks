@@ -15,3 +15,4 @@ pub(crate) mod refresh_contract;
 pub(crate) mod refresh_driver;
 pub(crate) mod refresh_property;
 pub(crate) mod schema_contract;
+pub(crate) mod stateless_rebuild;

@@ -860,6 +860,13 @@ impl StandaloneSession {
         }
         if looks_like_call_procedure(&normalized) {
             let stmt = parse_call_procedure_sql(&normalized)?;
+            if stmt.procedure == crate::engine::mv::stateless_rebuild::PROCEDURE_NAME {
+                return crate::engine::mv::stateless_rebuild::execute_novarocks_imv_stateless_rebuild(
+                    &self.inner,
+                    &stmt,
+                    current_database,
+                );
+            }
             let request = crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(
                 &stmt,
                 current_database,
