@@ -129,12 +129,13 @@ pub(crate) struct OptimizerOptions {
     /// Hard cap on runtime-filter descriptors emitted by one optimize call.
     /// Prevents complex plans from producing unbounded RF lists.
     pub rf_max_count: usize,
-    /// Whether probe runtime filters may be placed across shuffle exchanges
-    /// when placement is conservative. Cross-exchange placement requires a
-    /// complete build RF; currently that means broadcast joins only. Partial
-    /// partitioned RFs still stop at exchange boundaries even when this flag is
-    /// true, and probe pushdown stops at outer/anti/null-preserving semantic
-    /// boundaries.
+    /// Whether probe runtime filters may be placed across shuffle exchanges at
+    /// all. When true, crossing is further gated per-join-distribution by
+    /// `CrossExchangeMode` (see `runtime_filter_pass.rs`): Broadcast RFs cross
+    /// unconditionally; Shuffle/Colocate RFs cross only exchanges that
+    /// re-partition on the probe key (shuffle-key alignment). Probe pushdown
+    /// always stops at outer/anti/null-preserving semantic boundaries
+    /// regardless of this flag.
     pub allow_cross_exchange_rf: bool,
     /// In-memo join-reorder knobs (algorithm toggles + size cutoffs). Defaults
     /// match StarRocks; overridable via the `cbo_enable_dp/greedy_join_reorder`
