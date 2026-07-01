@@ -8,6 +8,7 @@
 //! Decisions are explicit. There is NO fallback path: incompatible
 //! contracts result in fail-fast errors that propagate to the user.
 
+use crate::connector::iceberg::commit::mv_provenance::ProvenanceBase;
 use crate::meta::repository::mv_contract::{
     ApplyKeySource, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
     JOIN_APPLY_KEY_COLUMN_NAME, MvPartitionTransformContract, MvSchemaContract,
@@ -659,6 +660,37 @@ pub(crate) fn ensure_descriptor_schema_contract_matches(
         ),
         Some(_) => Ok(()),
     }
+}
+
+/// Assert the provenance watermark (from the storage table's current snapshot
+/// summary) matches the metadata store's last_refresh_snapshots. Fail-loud on
+/// drift — the summary is the authoritative watermark home (W3a).
+pub(crate) fn ensure_summary_watermark_matches_store(
+    provenance_bases: &[ProvenanceBase],
+    store_last_refresh_snapshots: &std::collections::BTreeMap<String, i64>,
+) -> Result<(), String> {
+    for base in provenance_bases {
+        match store_last_refresh_snapshots.get(&base.table_fqn) {
+            None => {
+                return Err(format!(
+                    "MV refresh watermark drift: base table {} is present in the storage \
+                     table's snapshot-summary provenance (to_snapshot={}) but missing from \
+                     the metadata store's last_refresh_snapshots",
+                    base.table_fqn, base.to_snapshot
+                ));
+            }
+            Some(&stored_snapshot) if stored_snapshot != base.to_snapshot => {
+                return Err(format!(
+                    "MV refresh watermark drift for base table {}: snapshot-summary \
+                     provenance says to_snapshot={}, metadata store says \
+                     last_refresh_snapshots={}",
+                    base.table_fqn, base.to_snapshot, stored_snapshot
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1466,5 +1498,72 @@ mod tests {
         let err = ensure_descriptor_schema_contract_matches(Some(&descriptor), &stored)
             .expect_err("drifted descriptor contract must fail");
         assert!(err.contains("drifted"), "err={err}");
+    }
+
+    fn provenance_base(table_fqn: &str, to_snapshot: i64) -> ProvenanceBase {
+        ProvenanceBase {
+            table_fqn: table_fqn.to_string(),
+            uuid: format!("uuid-{table_fqn}"),
+            from_snapshot: None,
+            to_snapshot,
+        }
+    }
+
+    #[test]
+    fn summary_watermark_matching_store_is_ok() {
+        let bases = vec![
+            provenance_base("ice.sales.orders", 200),
+            provenance_base("ice.sales.customers", 50),
+        ];
+        let store: std::collections::BTreeMap<String, i64> = [
+            ("ice.sales.orders".to_string(), 200),
+            ("ice.sales.customers".to_string(), 50),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(ensure_summary_watermark_matches_store(&bases, &store).is_ok());
+    }
+
+    #[test]
+    fn summary_watermark_ignores_store_entries_not_in_provenance() {
+        // The store may carry extra bases beyond what this snapshot's
+        // provenance references (e.g. a base dropped from the definition);
+        // the check only compares the bases actually present in provenance.
+        let bases = vec![provenance_base("ice.sales.orders", 200)];
+        let store: std::collections::BTreeMap<String, i64> = [
+            ("ice.sales.orders".to_string(), 200),
+            ("ice.sales.stale_base".to_string(), 999),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(ensure_summary_watermark_matches_store(&bases, &store).is_ok());
+    }
+
+    #[test]
+    fn summary_watermark_mismatch_is_fail_loud() {
+        let bases = vec![provenance_base("ice.sales.orders", 200)];
+        let store: std::collections::BTreeMap<String, i64> =
+            [("ice.sales.orders".to_string(), 199)]
+                .into_iter()
+                .collect();
+
+        let err = ensure_summary_watermark_matches_store(&bases, &store)
+            .expect_err("watermark mismatch must fail");
+        assert!(err.contains("ice.sales.orders"), "err={err}");
+        assert!(err.contains("200"), "err={err}");
+        assert!(err.contains("199"), "err={err}");
+    }
+
+    #[test]
+    fn summary_watermark_base_missing_from_store_is_fail_loud() {
+        let bases = vec![provenance_base("ice.sales.orders", 200)];
+        let store: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+
+        let err = ensure_summary_watermark_matches_store(&bases, &store)
+            .expect_err("missing base in store must fail");
+        assert!(err.contains("ice.sales.orders"), "err={err}");
+        assert!(err.contains("missing"), "err={err}");
     }
 }

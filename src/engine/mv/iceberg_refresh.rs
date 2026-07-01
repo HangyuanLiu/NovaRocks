@@ -3358,6 +3358,18 @@ fn refresh_iceberg_mv_with_planned_partitions(
             descriptor_contract.as_ref(),
             dispatch_schema_contract,
         )?;
+        // W3a: verify the watermark recorded in the storage table's current
+        // snapshot provenance matches the store. First refresh (no current
+        // snapshot, or a snapshot without provenance) has no watermark yet —
+        // skip.
+        if let Some(current) = loaded.table.metadata().current_snapshot() {
+            if let Some(prov) = MvProvenanceV1::from_snapshot_summary(current)? {
+                crate::engine::mv::schema_contract::ensure_summary_watermark_matches_store(
+                    &prov.bases,
+                    &mv_definition.last_refresh_snapshots,
+                )?;
+            }
+        }
     }
     let caps = RefreshCapabilities::from_schema_contract(dispatch_schema_contract)?;
     match (caps.has_agg_state, &caps.snapshot_policy, &caps.identity) {
