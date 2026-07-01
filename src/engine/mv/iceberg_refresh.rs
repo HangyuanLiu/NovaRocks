@@ -11032,12 +11032,12 @@ pub(crate) fn normalize_imv_rewrite_root_project(
         .collect::<Option<Vec<_>>>()
     else {
         let input = LogicalPlanNode::new(
-            PlanNodeKind::Aggregate(aggregate),
+            LogicalPlanKind::Aggregate(aggregate),
             aggregate_children,
             aggregate_required_output_columns,
         );
         return LogicalPlanNode::new(
-            PlanNodeKind::Project(project),
+            LogicalPlanKind::Project(project),
             vec![input],
             required_output_columns,
         );
@@ -15243,7 +15243,7 @@ mod tests {
             is_internal: false,
         };
         let child = LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: Vec::new(),
                 columns: vec![group_output.clone()],
             }),
@@ -15251,7 +15251,7 @@ mod tests {
             None,
         );
         let aggregate = LogicalPlanNode::new(
-            PlanNodeKind::Aggregate(LogicalAggregateNode {
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![column_ref_expr(&group_output)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
@@ -15268,7 +15268,7 @@ mod tests {
             None,
         );
         let root = LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: column_ref_expr(&group_output),
@@ -15288,7 +15288,7 @@ mod tests {
         );
 
         let normalized = normalize_imv_rewrite_root_project(root);
-        let PlanNodeKind::Aggregate(aggregate) = &normalized.kind else {
+        let LogicalPlanKind::Aggregate(aggregate) = &normalized.kind else {
             panic!(
                 "expected normalized root Aggregate, got {:?}",
                 normalized.kind
@@ -15327,8 +15327,8 @@ mod tests {
 
         let normalized = normalize_imv_rewrite_root_project(root);
 
-        assert!(matches!(&normalized.kind, PlanNodeKind::Project(_)));
-        let PlanNodeKind::Aggregate(aggregate) = &normalized.unary_input().kind else {
+        assert!(matches!(&normalized.kind, LogicalPlanKind::Project(_)));
+        let LogicalPlanKind::Aggregate(aggregate) = &normalized.unary_input().kind else {
             panic!("expected preserved Project over Aggregate");
         };
         assert_eq!(
@@ -15352,8 +15352,8 @@ mod tests {
 
         let normalized = normalize_imv_rewrite_root_project(root);
 
-        assert!(matches!(&normalized.kind, PlanNodeKind::Project(_)));
-        let PlanNodeKind::Aggregate(aggregate) = &normalized.unary_input().kind else {
+        assert!(matches!(&normalized.kind, LogicalPlanKind::Project(_)));
+        let LogicalPlanKind::Aggregate(aggregate) = &normalized.unary_input().kind else {
             panic!("expected preserved Project over Aggregate");
         };
         assert_eq!(
@@ -15377,7 +15377,7 @@ mod tests {
     fn normalization_project_over_aggregate(project_items: Vec<ProjectItem>) -> LogicalPlanNode {
         let (g1, g2, sum_output) = normalization_aggregate_outputs();
         let child = LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: Vec::new(),
                 columns: vec![g1.clone(), g2.clone()],
             }),
@@ -15385,7 +15385,7 @@ mod tests {
             None,
         );
         let aggregate = LogicalPlanNode::new(
-            PlanNodeKind::Aggregate(LogicalAggregateNode {
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![column_ref_expr(&g1), column_ref_expr(&g2)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
@@ -15402,7 +15402,7 @@ mod tests {
             None,
         );
         LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: project_items,
                 output_qualifier: None,
             }),

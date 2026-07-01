@@ -804,14 +804,14 @@ mod tests {
         let v = col(102, "v");
         let s = col(110, "s");
         let plan = LogicalPlanNode::new(
-            PlanNodeKind::Aggregate(LogicalAggregateNode {
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_ref(&a)],
                 aggregates: vec![sum_call(&v, &s)],
                 output_columns: vec![a.clone(), s.clone()],
                 already_pushed: false,
             }),
             vec![LogicalPlanNode::new(
-                PlanNodeKind::Filter(LogicalFilterNode {
+                LogicalPlanKind::Filter(LogicalFilterNode {
                     predicate: ge(col_ref(&a), mv_low),
                 }),
                 vec![base_scan(&[a.clone(), v.clone()])],
@@ -939,14 +939,14 @@ mod tests {
         let v = col(2, "v");
         let s = col(3, "s");
         let query_plan = LogicalPlanNode::new(
-            PlanNodeKind::Aggregate(LogicalAggregateNode {
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_ref(&a)],
                 aggregates: vec![sum_call(&v, &s)],
                 output_columns: vec![a.clone(), s.clone()],
                 already_pushed: false,
             }),
             vec![LogicalPlanNode::new(
-                PlanNodeKind::Filter(LogicalFilterNode {
+                LogicalPlanKind::Filter(LogicalFilterNode {
                     predicate: ge(col_ref(&a), 0),
                 }),
                 vec![base_scan(&[a.clone(), v.clone()])],
@@ -989,14 +989,14 @@ mod tests {
         let v = col(2, "v");
         let s = col(3, "s");
         let query_plan = LogicalPlanNode::new(
-            PlanNodeKind::Aggregate(LogicalAggregateNode {
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_ref(&a)],
                 aggregates: vec![sum_call(&v, &s)],
                 output_columns: vec![a.clone(), s.clone()],
                 already_pushed: false,
             }),
             vec![LogicalPlanNode::new(
-                PlanNodeKind::Filter(LogicalFilterNode {
+                LogicalPlanKind::Filter(LogicalFilterNode {
                     predicate: ge(col_ref(&a), 10),
                 }),
                 vec![base_scan(&[a.clone(), v.clone()])],
