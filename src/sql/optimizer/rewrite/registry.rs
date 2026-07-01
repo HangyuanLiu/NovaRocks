@@ -14,6 +14,11 @@ pub(crate) fn default_rewrite_phases() -> Vec<RewritePhase> {
 pub(crate) fn query_rewrite_pipeline() -> RewritePipeline {
     RewritePipeline::from_stages(vec![
         RewriteStage::new(
+            "UnionDistinctNormalize",
+            RewritePhase::LogicalNormalize,
+            rules::union_distinct_normalize_rules(),
+        ),
+        RewriteStage::new(
             "SubqueryRewrite",
             RewritePhase::StructuralRewrite,
             rules::subquery::subquery_rewrite_rules(),
@@ -119,6 +124,7 @@ mod tests {
         assert_eq!(
             pipeline.stage_names(),
             vec![
+                "UnionDistinctNormalize",
                 "SubqueryRewrite",
                 "PredicatePushdownPreJoin",
                 "PredicatePushdownPostJoin",
@@ -186,6 +192,7 @@ mod tests {
                 "RankingWindowPredicatePushdown",
                 "ScalarApplyToJoin",
                 "TagRequiredColumns",
+                "UnionDistinctToAggregate",
                 "VariantPathPushdown",
             ]
         );
@@ -239,6 +246,7 @@ mod tests {
         assert!(is_known_rewrite_rule_name("QuantifiedApplyToJoin"));
         // Ranking window predicate pushdown skeleton (Tasks 4.1+4.2).
         assert!(is_known_rewrite_rule_name("RankingWindowPredicatePushdown"));
+        assert!(is_known_rewrite_rule_name("UnionDistinctToAggregate"));
     }
 
     fn assert_default_phase_trace(ctx: &RewriteContext) {

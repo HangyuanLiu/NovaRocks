@@ -46,11 +46,18 @@ pub(crate) fn variant_path_pushdown_rules() -> Vec<Box<dyn LogicalRewriteRule>> 
     vec![Box::new(variant_path_pushdown::VariantPathPushdownRule)]
 }
 
+pub(crate) fn union_distinct_normalize_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
+    vec![Box::new(
+        union_distinct_to_aggregate::UnionDistinctToAggregate,
+    )]
+}
+
 /// All known query rewrite rules for registry and rule-name validation.
 /// Production ordering is defined by query_rewrite_pipeline(), not this set.
 #[allow(dead_code)]
 pub(crate) fn all_query_rewrite_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     let mut all = Vec::new();
+    all.extend(union_distinct_normalize_rules());
     all.extend(predicate_pushdown_rules());
     all.extend(predicate_move_around_rules());
     all.extend(column_pruning_rules());
@@ -71,8 +78,9 @@ mod tests {
         // 17 v2 pruning rules + 2 ukfk + 1 VariantPathPushdown
         // + 1 AggregatePushdown
         // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules
-        // + 1 predicate move-around rule + 1 DeriveJoinNotNullPredicate = 29
-        assert_eq!(rules.len(), 29);
+        // + 1 predicate move-around rule + 1 DeriveJoinNotNullPredicate
+        // + 1 UnionDistinctToAggregate = 30
+        assert_eq!(rules.len(), 30);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
@@ -106,6 +114,7 @@ mod tests {
                 "PushDownPredicateProject",
                 "PushDownPredicateScan",
                 "PushSemiAntiRightOnlyCondition",
+                "UnionDistinctToAggregate",
                 "VariantPathPushdown",
             ]
         );
