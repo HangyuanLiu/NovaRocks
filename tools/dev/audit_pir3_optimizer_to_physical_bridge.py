@@ -14,9 +14,173 @@ def read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
+def read_masked(path: str) -> str:
+    return mask_rust_code(read(path))
+
+
 def fail(message: str) -> None:
     print(f"ERROR: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def starts_raw_string(line: str, i: int) -> tuple[int, int] | None:
+    start = i
+    if line.startswith("br", i):
+        i += 2
+    elif line.startswith("r", i):
+        i += 1
+    else:
+        return None
+
+    hashes_start = i
+    while i < len(line) and line[i] == "#":
+        i += 1
+    if i < len(line) and line[i] == '"':
+        return i - hashes_start, i + 1 - start
+    return None
+
+
+def char_literal_end(line: str, i: int) -> int | None:
+    if i >= len(line) or line[i] != "'":
+        return None
+    j = i + 1
+    escaped = False
+    while j < len(line):
+        ch = line[j]
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == "'":
+            return j + 1
+        j += 1
+    return None
+
+
+def is_lifetime_or_label_start(line: str, i: int) -> bool:
+    if i + 1 >= len(line) or line[i] != "'":
+        return False
+    if not (line[i + 1].isalpha() or line[i + 1] == "_"):
+        return False
+
+    j = i + 2
+    while j < len(line) and (line[j].isalnum() or line[j] == "_"):
+        j += 1
+
+    return j >= len(line) or line[j] != "'"
+
+
+def mask_rust_non_code(line: str, state: dict[str, object]) -> tuple[str, dict[str, object]]:
+    out = []
+    i = 0
+    while i < len(line):
+        block_depth = int(state["block_depth"])
+        raw_hashes = state["raw_hashes"]
+        string_delim = state["string_delim"]
+        escaped = bool(state["escaped"])
+
+        if block_depth:
+            if line.startswith("/*", i):
+                state["block_depth"] = block_depth + 1
+                out.append("  ")
+                i += 2
+                continue
+            if line.startswith("*/", i):
+                state["block_depth"] = block_depth - 1
+                out.append("  ")
+                i += 2
+                continue
+            out.append(" ")
+            i += 1
+            continue
+
+        if raw_hashes is not None:
+            end = '"' + ("#" * int(raw_hashes))
+            if line.startswith(end, i):
+                state["raw_hashes"] = None
+                out.append(" " * len(end))
+                i += len(end)
+            else:
+                out.append(" ")
+                i += 1
+            continue
+
+        if string_delim is not None:
+            ch = line[i]
+            out.append(" ")
+            if escaped:
+                state["escaped"] = False
+            elif ch == "\\":
+                state["escaped"] = True
+            elif ch == string_delim:
+                state["string_delim"] = None
+            i += 1
+            continue
+
+        if line.startswith("//", i):
+            out.append(" " * (len(line) - i))
+            break
+
+        if line.startswith("/*", i):
+            state["block_depth"] = 1
+            out.append("  ")
+            i += 2
+            continue
+
+        raw_start = starts_raw_string(line, i)
+        if raw_start is not None:
+            hashes, consumed = raw_start
+            state["raw_hashes"] = hashes
+            out.append(" " * consumed)
+            i += consumed
+            continue
+
+        if line.startswith('b"', i):
+            state["string_delim"] = '"'
+            state["escaped"] = False
+            out.append("  ")
+            i += 2
+            continue
+
+        if line[i] == '"':
+            state["string_delim"] = '"'
+            state["escaped"] = False
+            out.append(" ")
+            i += 1
+            continue
+
+        if line.startswith("b'", i):
+            end = char_literal_end(line, i + 1)
+            if end is not None:
+                out.append(" " * (end - i))
+                i = end
+                continue
+
+        if line[i] == "'" and not is_lifetime_or_label_start(line, i):
+            end = char_literal_end(line, i)
+            if end is not None:
+                out.append(" " * (end - i))
+                i = end
+                continue
+
+        out.append(line[i])
+        i += 1
+
+    return "".join(out), state
+
+
+def mask_rust_code(text: str) -> str:
+    state: dict[str, object] = {
+        "block_depth": 0,
+        "raw_hashes": None,
+        "string_delim": None,
+        "escaped": False,
+    }
+    masked_lines = []
+    for line in text.splitlines():
+        masked_line, state = mask_rust_non_code(line, state)
+        masked_lines.append(masked_line)
+    return "\n".join(masked_lines)
 
 
 def violations_for(pattern: str, text: str, path: str, label: str) -> list[str]:
@@ -39,9 +203,74 @@ def assert_absent(
 def check_path_patterns(
     path: str, patterns: list[tuple[str, str]], violations: list[str]
 ) -> None:
-    text = read(path)
+    text = read_masked(path)
     for pattern, label in patterns:
         assert_absent(pattern, text, path, label, violations)
+
+
+def brace_body_range(text: str, open_brace: int) -> tuple[int, int] | None:
+    depth = 0
+    for i in range(open_brace, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return open_brace + 1, i
+    return None
+
+
+def enum_body_range(text: str, enum_name: str) -> tuple[int, int] | None:
+    match = re.search(rf"\benum\s+{re.escape(enum_name)}\b", text)
+    if not match:
+        return None
+    open_brace = text.find("{", match.end())
+    if open_brace == -1:
+        return None
+    return brace_body_range(text, open_brace)
+
+
+def enum_body_contains_variant(text: str, enum_name: str, variant_name: str) -> bool:
+    body_range = enum_body_range(text, enum_name)
+    if body_range is None:
+        return False
+    start, end = body_range
+    body = text[start:end]
+    return re.search(rf"(?m)^\s*{re.escape(variant_name)}\b", body) is not None
+
+
+def enum_variant_violations(
+    text: str, path: str, enum_name: str, variant_name: str, label: str
+) -> list[str]:
+    body_range = enum_body_range(text, enum_name)
+    if body_range is None:
+        return []
+    start, end = body_range
+    body = text[start:end]
+    match = re.search(rf"(?m)^\s*{re.escape(variant_name)}\b", body)
+    if match is None:
+        return []
+    line_no = text.count("\n", 0, start + match.start()) + 1
+    return [
+        f"{path}:{line_no}: {label}: found forbidden {enum_name}::{variant_name} variant"
+    ]
+
+
+def declares_type(text: str, type_name: str) -> bool:
+    pattern = rf"\b(?:struct|enum|type)\s+{re.escape(type_name)}\b"
+    return re.search(pattern, text) is not None
+
+
+def type_declaration_violations(
+    text: str, path: str, type_name: str, label: str
+) -> list[str]:
+    pattern = rf"\b(?:struct|enum|type)\s+{re.escape(type_name)}\b"
+    match = re.search(pattern, text)
+    if match is None:
+        return []
+    line_no = text.count("\n", 0, match.start()) + 1
+    return [f"{path}:{line_no}: {label}: found forbidden {type_name} declaration"]
 
 
 def main() -> int:
@@ -53,7 +282,7 @@ def main() -> int:
     ]
     dto_optimizer_path_patterns = [
         (
-            r"crate::sql::optimizer|sql::optimizer",
+            r"\boptimizer\s*::",
             "planner-owned DTO must not reference optimizer modules",
         ),
     ]
@@ -96,6 +325,35 @@ def main() -> int:
         "src/sql/planner/stats.rs",
     ]:
         check_path_patterns(path, forbidden_dto_patterns, violations)
+
+    plan_path = "src/sql/planner/plan.rs"
+    plan_rs = read_masked(plan_path)
+    violations.extend(
+        enum_variant_violations(
+            plan_rs,
+            plan_path,
+            "PhysicalPlanKind",
+            "Exchange",
+            "planner physical IR must not declare Exchange as a physical node kind",
+        )
+    )
+    violations.extend(
+        enum_variant_violations(
+            plan_rs,
+            plan_path,
+            "RedistributeMode",
+            "Random",
+            "planner physical IR must not declare random redistribution",
+        )
+    )
+    violations.extend(
+        type_declaration_violations(
+            plan_rs,
+            plan_path,
+            "PhysicalPlanProps",
+            "planner physical IR must not reintroduce the generic physical property bag",
+        )
+    )
 
     bridge_cost_patterns = [
         (
