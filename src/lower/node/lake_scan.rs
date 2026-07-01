@@ -21,7 +21,6 @@ use crate::connector::starrocks::fe_v2_meta::{
     LakeScanTabletRef, LakeTableIdentity, find_cached_table_identity_names,
     resolve_tablet_paths_for_lake_scan,
 };
-use crate::connector::starrocks::lake::context::get_tablet_runtime;
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::scan::LakeGlmScanInfo;
@@ -29,7 +28,6 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::row_position::{
     LakeRowPositionSpec, is_lake_row_id, is_lake_rss_id, is_lake_source_id, is_lake_tablet_id,
 };
-use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::lower::expr::parse_min_max_conjuncts;
 use crate::lower::layout::{
     Layout, chunk_schema_for_layout, chunk_schema_for_tuple, find_tuple_descriptor,
@@ -43,7 +41,6 @@ use crate::novarocks_connectors::{
 };
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::query_context::QueryId;
-use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::thrift::{descriptors, internal_service, plan_nodes, runtime_filter, types};
 
 /// Lower a LAKE_SCAN_NODE plan node to a `Lowered` ExecNode.
@@ -713,7 +710,6 @@ pub(crate) fn build_lake_properties(
     }
 
     let mut tablet_paths: BTreeMap<String, String> = BTreeMap::new();
-    let mut tablet_ids = Vec::with_capacity(tablet_path_map.len());
     for (tablet_id, path) in tablet_path_map {
         if *tablet_id <= 0 {
             return Err(format!(
@@ -729,10 +725,7 @@ pub(crate) fn build_lake_properties(
             ));
         }
         tablet_paths.insert(tablet_id.to_string(), trimmed.to_string());
-        tablet_ids.push(*tablet_id);
     }
-    tablet_ids.sort_unstable();
-    tablet_ids.dedup();
 
     let mut props = BTreeMap::new();
     props.insert(
@@ -741,55 +734,12 @@ pub(crate) fn build_lake_properties(
             .map_err(|e| format!("serialize tablet_root_paths json failed: {}", e))?,
     );
 
-    let scheme = classify_scan_paths(tablet_path_map.values().map(|v| v.as_str()))?;
-    match scheme {
-        ScanPathScheme::Local => {}
-        ScanPathScheme::Oss => {
-            let shard_infos = starlet_shard_registry::select_infos(&tablet_ids);
-            let mut selected_s3: Option<S3StoreConfig> = None;
-            for tablet_id in tablet_ids {
-                let tablet_path = tablet_path_map
-                    .get(&tablet_id)
-                    .map(String::as_str)
-                    .unwrap_or("<unknown>");
-                let s3_cfg = shard_infos
-                    .get(&tablet_id)
-                    .and_then(|info| info.s3.clone())
-                    .or_else(|| {
-                        get_tablet_runtime(tablet_id)
-                            .ok()
-                            .and_then(|runtime| runtime.s3_config.clone())
-                    })
-                    .or_else(|| starlet_shard_registry::infer_s3_config_for_path(tablet_path))
-                    .ok_or_else(|| {
-                        format!(
-                            "missing S3 config for lake scan tablet_id={} (path={})",
-                            tablet_id, tablet_path
-                        )
-                    })?;
-
-                match selected_s3.as_ref() {
-                    None => selected_s3 = Some(s3_cfg),
-                    Some(prev) if prev == &s3_cfg => {}
-                    Some(prev) => {
-                        return Err(format!(
-                            "inconsistent S3 config across tablets in one lake scan; \
-                            tablet_id={} endpoint={} bucket={} conflicts with endpoint={} bucket={}",
-                            tablet_id, s3_cfg.endpoint, s3_cfg.bucket, prev.endpoint, prev.bucket,
-                        ));
-                    }
-                }
-            }
-
-            let s3 = selected_s3.ok_or_else(|| {
-                "lake scan object-store path has no resolved S3 config".to_string()
-            })?;
-            for (k, v) in s3.to_aws_s3_properties() {
-                props.insert(k, v);
-            }
-        }
-        ScanPathScheme::Hdfs => {
-            return Err("lake scan does not support hdfs tablet paths yet".to_string());
+    let selected_s3 = crate::connector::starrocks::fs_access::common_runtime_s3_config_for_paths(
+        tablet_path_map.values().map(String::as_str),
+    )?;
+    if let Some(s3) = selected_s3 {
+        for (k, v) in s3.to_aws_s3_properties() {
+            props.insert(k, v);
         }
     }
     Ok(props)

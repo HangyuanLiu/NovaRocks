@@ -91,6 +91,59 @@ pub(crate) fn resolve_runtime_path(path: &str) -> Result<StarRocksFsAccess, Stri
     }
 }
 
+pub(crate) fn common_runtime_s3_config_for_paths<'a, I>(
+    paths: I,
+) -> Result<Option<crate::runtime::starlet_shard_registry::S3StoreConfig>, String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let paths = paths.into_iter().map(str::to_string).collect::<Vec<_>>();
+    let first = paths
+        .first()
+        .ok_or_else(|| "StarRocks runtime paths are empty".to_string())?;
+    let resolver = FsAccessResolver::new();
+    let locations = resolver.parse_locations(paths.iter().map(String::as_str))?;
+    let first_scheme = locations
+        .first()
+        .expect("non-empty runtime paths must produce locations")
+        .scheme();
+    if locations
+        .iter()
+        .any(|location| location.scheme() != first_scheme)
+    {
+        return Err("mixed StarRocks runtime path schemes are not allowed".to_string());
+    }
+
+    match first_scheme {
+        FsScheme::Local => Ok(None),
+        FsScheme::Hdfs => Err(format!(
+            "StarRocks lake does not support hdfs tablet path yet: {first}"
+        )),
+        FsScheme::ObjectStore => {
+            let mut selected: Option<crate::runtime::starlet_shard_registry::S3StoreConfig> = None;
+            for path in &paths {
+                let s3_config =
+                    crate::runtime::starlet_shard_registry::infer_s3_config_for_path(path)
+                        .ok_or_else(|| {
+                            format!("missing S3 config for StarRocks object-store path={path}")
+                        })?;
+                match selected.as_ref() {
+                    None => selected = Some(s3_config),
+                    Some(prev) if prev == &s3_config => {}
+                    Some(prev) => {
+                        return Err(format!(
+                            "inconsistent S3 config across StarRocks runtime paths: \
+                             current_endpoint={} current_bucket={} previous_endpoint={} previous_bucket={}",
+                            s3_config.endpoint, s3_config.bucket, prev.endpoint, prev.bucket
+                        ));
+                    }
+                }
+            }
+            Ok(selected)
+        }
+    }
+}
+
 pub(crate) fn resolve_runtime_paths<'a, I>(paths: I) -> Result<StarRocksFsAccess, String>
 where
     I: IntoIterator<Item = &'a str>,
@@ -700,6 +753,104 @@ mod tests {
             err.contains("StarRocks formats do not support hdfs path yet"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn common_runtime_s3_config_local_paths_return_none() {
+        let first = std::env::temp_dir()
+            .join("novarocks-fs-access-common")
+            .join("1.meta");
+        let second = std::env::temp_dir()
+            .join("novarocks-fs-access-common")
+            .join("2.dat");
+        let paths = [
+            first.to_string_lossy().to_string(),
+            second.to_string_lossy().to_string(),
+        ];
+
+        let selected = common_runtime_s3_config_for_paths(paths.iter().map(String::as_str))
+            .expect("local paths should not require S3 config");
+
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn common_runtime_s3_config_rejects_mixed_local_and_object_store_paths() {
+        let local = std::env::temp_dir()
+            .join("novarocks-fs-access-common")
+            .join("1.meta");
+        let local = local.to_string_lossy().to_string();
+        let paths = [local.as_str(), "s3://bucket-a/warehouse/tablet-1/1.meta"];
+
+        let err =
+            common_runtime_s3_config_for_paths(paths).expect_err("mixed runtime schemes must fail");
+
+        assert!(
+            err.contains("mixed StarRocks runtime path schemes are not allowed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn common_runtime_s3_config_returns_registered_object_store_config() {
+        let _guard = lock_runtime_test_state();
+        let expected = sample_s3_config();
+        register_tablet_runtime(&runtime_context(
+            91_005,
+            "s3://bucket-a/warehouse/tablet-1",
+            expected.clone(),
+        ))
+        .expect("register tablet runtime");
+
+        let selected = common_runtime_s3_config_for_paths([
+            "s3://bucket-a/warehouse/tablet-1/1.meta",
+            "s3://bucket-a/warehouse/tablet-1/2.dat",
+        ])
+        .expect("resolve registered object-store runtime paths");
+
+        assert_eq!(selected, Some(expected));
+    }
+
+    #[test]
+    fn common_runtime_s3_config_rejects_inconsistent_registered_configs() {
+        let _guard = lock_runtime_test_state();
+        let first_config = sample_s3_config();
+        let mut second_config = sample_s3_config();
+        second_config.endpoint = "http://127.0.0.2:9000".to_string();
+        second_config.bucket = "bucket-b".to_string();
+        register_tablet_runtime(&runtime_context(
+            91_006,
+            "s3://bucket-a/warehouse/tablet-1",
+            first_config,
+        ))
+        .expect("register first tablet runtime");
+        register_tablet_runtime(&runtime_context(
+            91_007,
+            "s3://bucket-b/warehouse/tablet-2",
+            second_config,
+        ))
+        .expect("register second tablet runtime");
+
+        let err = common_runtime_s3_config_for_paths([
+            "s3://bucket-a/warehouse/tablet-1/1.meta",
+            "s3://bucket-b/warehouse/tablet-2/1.meta",
+        ])
+        .expect_err("inconsistent runtime S3 configs must fail");
+
+        assert!(
+            err.contains("inconsistent S3 config across StarRocks runtime paths"),
+            "{err}"
+        );
+        assert!(
+            err.contains("current_endpoint=http://127.0.0.2:9000"),
+            "{err}"
+        );
+        assert!(err.contains("current_bucket=bucket-b"), "{err}");
+        assert!(
+            err.contains("previous_endpoint=http://127.0.0.1:9000"),
+            "{err}"
+        );
+        assert!(err.contains("previous_bucket=bucket-a"), "{err}");
     }
 
     fn test_s3_config() -> S3StoreConfig {
