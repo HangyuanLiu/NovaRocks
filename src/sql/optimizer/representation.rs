@@ -85,6 +85,43 @@ pub(crate) struct ColumnRepresentationSet {
     pub representations: Vec<PhysicalRepresentation>,
 }
 
+impl ColumnRepresentationSet {
+    /// The dictionary representation carried by this column, if any.
+    pub(crate) fn dictionary_representation(&self) -> Option<&DictInt32Representation> {
+        self.representations
+            .iter()
+            .find_map(|representation| match representation {
+                PhysicalRepresentation::DictInt32(dict) => Some(dict),
+                PhysicalRepresentation::Plain { .. } => None,
+            })
+    }
+
+    /// Re-key this set to a new output logical column identity, preserving the
+    /// underlying physical representation (the dictionary domain is unchanged).
+    pub(crate) fn remapped_to_output(
+        &self,
+        output_column_id: ColumnId,
+        output_name: &str,
+        nullable: bool,
+    ) -> Self {
+        ColumnRepresentationSet {
+            logical_column: LogicalColumn {
+                column_id: output_column_id,
+                name: output_name.to_string(),
+                logical_type: self.logical_column.logical_type.clone(),
+                nullable,
+            },
+            current_slot: PhysicalSlot {
+                column_id: output_column_id,
+                name: output_name.to_string(),
+                data_type: self.current_slot.data_type.clone(),
+                nullable,
+            },
+            representations: self.representations.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalColumn {
     pub column_id: ColumnId,
@@ -140,6 +177,63 @@ impl DictionaryDomain {
             order_preserving: snapshot.order_preserving,
             snapshot: Arc::clone(snapshot),
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_dictionary_snapshot(order_preserving: bool) -> Arc<DictionarySnapshot> {
+    use crate::sql::common::{
+        DictionaryOwner, DictionaryState, DictionaryValue, DictionaryWatermark,
+    };
+    Arc::new(DictionarySnapshot {
+        dictionary_id: 7,
+        owner: DictionaryOwner::StarRocksTable {
+            database: "db".to_string(),
+            table: "tbl".to_string(),
+            db_id: 11,
+            table_id: 13,
+        },
+        column_id: Some(17),
+        column_name: "city".to_string(),
+        data_type: DataType::Utf8,
+        version: 19,
+        watermark: DictionaryWatermark::Iceberg {
+            snapshot_id: Some(23),
+            schema_id: 29,
+        },
+        values: vec![DictionaryValue {
+            id: 1,
+            bytes: b"beijing".to_vec(),
+        }],
+        null_id: -1,
+        state: DictionaryState::Active,
+        order_preserving,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_dict_representation_set(
+    logical_column_id: ColumnId,
+    slot_column_id: ColumnId,
+    order_preserving: bool,
+) -> ColumnRepresentationSet {
+    let snapshot = test_dictionary_snapshot(order_preserving);
+    ColumnRepresentationSet {
+        logical_column: LogicalColumn {
+            column_id: logical_column_id,
+            name: "city".to_string(),
+            logical_type: DataType::Utf8,
+            nullable: true,
+        },
+        current_slot: PhysicalSlot {
+            column_id: slot_column_id,
+            name: "city_dict".to_string(),
+            data_type: DataType::Int32,
+            nullable: true,
+        },
+        representations: vec![PhysicalRepresentation::DictInt32(DictInt32Representation {
+            domain: DictionaryDomain::from_snapshot(&snapshot),
+        })],
     }
 }
 

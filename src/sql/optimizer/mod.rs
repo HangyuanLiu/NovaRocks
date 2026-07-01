@@ -1,6 +1,7 @@
 //! Cascades optimizer framework.
 
 pub(crate) mod binder;
+pub(crate) mod capability;
 pub(crate) mod cascades_rules;
 pub(crate) mod cost;
 mod cse_pass;
