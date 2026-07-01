@@ -1425,15 +1425,6 @@ fn parse_staged_partition_transform(raw: &str) -> Result<iceberg::spec::Transfor
     }
 }
 
-const OBJECT_STORE_SCHEME_PREFIXES: [&str; 3] = ["s3://", "s3a://", "oss://"];
-
-fn object_store_scheme_prefix(path: &str) -> Option<&'static str> {
-    OBJECT_STORE_SCHEME_PREFIXES
-        .iter()
-        .copied()
-        .find(|scheme| path.starts_with(scheme))
-}
-
 fn parse_transform_arg(raw: &str, name: &str) -> Result<Option<u32>, String> {
     let Some(rest) = raw.strip_prefix(name) else {
         return Ok(None);
@@ -1458,7 +1449,9 @@ pub(crate) fn build_staged_file_io(
     data_location: &str,
     s3_config: Option<&IcebergSinkObjectStoreConfig>,
 ) -> Result<iceberg::io::FileIO, String> {
-    if object_store_scheme_prefix(data_location).is_some() {
+    if crate::fs::access::is_object_store_location_parse_only(data_location)
+        .map_err(|e| format!("parse staged iceberg data_location {data_location}: {e}"))?
+    {
         let s3 = s3_config.ok_or_else(|| {
             format!(
                 "iceberg sink missing S3 config for staged writer data_location={data_location}"
@@ -1473,21 +1466,6 @@ pub(crate) fn build_staged_file_io(
         );
     }
     Ok(crate::connector::iceberg::fs_io::build_file_io_for_location(data_location, None))
-}
-
-pub(crate) fn parse_object_store_bucket_and_root(path: &str) -> Option<(String, String)> {
-    let path = path.trim();
-    for scheme in OBJECT_STORE_SCHEME_PREFIXES {
-        if let Some(rest) = path.strip_prefix(scheme) {
-            let (bucket, key_prefix) = rest.split_once('/').unwrap_or((rest, ""));
-            let bucket = bucket.trim();
-            if bucket.is_empty() {
-                return None;
-            }
-            return Some((bucket.to_string(), key_prefix.trim_matches('/').to_string()));
-        }
-    }
-    None
 }
 
 fn normalize_path(path: &str) -> Result<String, String> {
@@ -1512,7 +1490,9 @@ fn write_parquet_file(
         .set_compression(compression)
         .build();
 
-    if object_store_scheme_prefix(path).is_some() {
+    if crate::fs::access::is_object_store_location_parse_only(path)
+        .map_err(|e| format!("parse iceberg parquet output path {path}: {e}"))?
+    {
         let (data, write_result) = write_parquet_to_bytes(schema, batch, props)?;
         let s3 = s3_config.ok_or_else(|| {
             format!(

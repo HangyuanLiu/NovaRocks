@@ -1283,14 +1283,24 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
 ) -> Result<AbortCleanupOperator, String> {
     if let Some(s3_config) = entry.object_store_config() {
-        let (bucket, _) = crate::connector::iceberg::fs_io::parse_object_store_path_parse_only(
+        let access = crate::connector::iceberg::fs_io::resolve_access_for_location(
             &entry.warehouse_uri,
+            Some(s3_config),
         )
-        .map_err(|e| format!("parse warehouse URI for iceberg abort cleanup: {e}"))?;
-        let fs = crate::fs::object_store::build_object_store_operator(&bucket, s3_config)
-            .map_err(|e| format!("build S3 operator for iceberg abort cleanup: {e}"))?;
+        .map_err(|e| format!("resolve warehouse URI for iceberg abort cleanup: {e}"))?;
+        let bucket = access
+            .handle()
+            .authority()
+            .ok_or_else(|| {
+                format!(
+                    "resolve warehouse URI for iceberg abort cleanup missing bucket: {}",
+                    entry.warehouse_uri
+                )
+            })?
+            .to_string();
+        let fs = access.operator();
         let mapper: CleanupPathMapper = Arc::new(move |path| {
-            crate::connector::iceberg::fs_io::parse_object_store_path_parse_only(path)
+            crate::fs::access::parse_object_store_path_parse_only(path)
                 .ok()
                 .and_then(|(actual_bucket, key)| {
                     if actual_bucket == bucket {

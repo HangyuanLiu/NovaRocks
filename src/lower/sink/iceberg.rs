@@ -33,7 +33,7 @@ use crate::connector::iceberg::schema::{
     IcebergPartitionInfo, IcebergSchemaDescriptor, IcebergSchemaFieldDescriptor,
     IcebergTableColumn, IcebergTableDescriptor, apply_field_id_recursive, build_full_output_schema,
 };
-use crate::connector::iceberg::sink::{build_staged_file_io, parse_object_store_bucket_and_root};
+use crate::connector::iceberg::sink::build_staged_file_io;
 use crate::connector::iceberg::sink_plan::{
     IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan,
     PositionDeleteDataFilePartition,
@@ -700,9 +700,15 @@ fn resolve_sink_s3_config(
     sink: &data_sinks::TIcebergTableSink,
     data_location: &str,
 ) -> Result<Option<IcebergSinkObjectStoreConfig>, String> {
-    let Some((bucket, _data_root)) = parse_object_store_bucket_and_root(data_location) else {
+    if !crate::fs::access::is_object_store_location_parse_only(data_location)
+        .map_err(|e| format!("parse iceberg sink data_location {data_location}: {e}"))?
+    {
         return Ok(None);
-    };
+    }
+    let (bucket, _data_root) = crate::fs::access::parse_object_store_path_parse_only(data_location)
+        .map_err(|e| {
+            format!("parse iceberg sink object-store data_location {data_location}: {e}")
+        })?;
     let cloud = sink.cloud_configuration.as_ref().ok_or_else(|| {
         format!(
             "iceberg sink object-store path requires cloud_configuration: data_location={data_location}"

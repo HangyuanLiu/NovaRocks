@@ -47,6 +47,7 @@ use super::snapshot_lifecycle_helpers::{
 };
 
 use crate::connector::iceberg::fs_io;
+use crate::fs::access::{FsLocation, FsScheme};
 use crate::fs::object_store::ObjectStoreConfig;
 
 /// Result of a successful REMOVE ORPHAN FILES execution.
@@ -226,24 +227,21 @@ async fn list_files_for_location(
     location: &str,
     object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<Vec<ScannedFile>, String> {
-    // Determine the scheme + root.
-    if let Some(stripped) = location.strip_prefix("file://") {
-        let root_path = std::path::PathBuf::from(stripped);
-        list_files_local("file://", &root_path)
-    } else if location.starts_with('/') {
-        // Bare absolute path — treat as file:// internally.
-        let root_path = std::path::PathBuf::from(location);
-        list_files_local("", &root_path)
-    } else if location.starts_with("s3://")
-        || location.starts_with("s3a://")
-        || location.starts_with("oss://")
-        || location.starts_with("hdfs://")
-    {
-        list_files_opendal(location, object_store_config).await
-    } else {
-        Err(format!(
-            "remove_orphan_files listing unsupported for table location {location}"
-        ))
+    let parsed = FsLocation::parse(location)
+        .map_err(|e| format!("parse remove_orphan_files table location {location}: {e}"))?;
+    match parsed.scheme() {
+        FsScheme::Local => {
+            let scheme_prefix = if parsed.uri_scheme().is_some() {
+                "file://"
+            } else {
+                ""
+            };
+            let root_path = std::path::PathBuf::from(parsed.path());
+            list_files_local(scheme_prefix, &root_path)
+        }
+        FsScheme::ObjectStore | FsScheme::Hdfs => {
+            list_files_opendal(parsed.original(), object_store_config).await
+        }
     }
 }
 

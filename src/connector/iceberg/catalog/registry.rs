@@ -1535,13 +1535,20 @@ pub(crate) fn build_catalog_entry(
             "standalone iceberg catalog requires `iceberg.catalog.warehouse`".to_string()
         })?;
 
-    // Detect object-store storage: S3-compatible and OSS warehouses route
-    // through the shared fs adapter.
-    let is_s3 = raw_warehouse.starts_with("s3://")
-        || raw_warehouse.starts_with("s3a://")
-        || raw_warehouse.starts_with("oss://");
+    // Detect object-store storage through the shared fs classifier so catalog
+    // initialization follows the same scheme rules as runtime IO.
+    let is_object_store =
+        match crate::fs::access::is_object_store_location_parse_only(&raw_warehouse) {
+            Ok(is_object_store) => is_object_store,
+            Err(e) if e.contains("unsupported fs location scheme") => false,
+            Err(e) => {
+                return Err(format!(
+                    "parse iceberg catalog warehouse URI {raw_warehouse}: {e}"
+                ));
+            }
+        };
 
-    let (warehouse_uri, warehouse_path, s3_config) = if is_s3 {
+    let (warehouse_uri, warehouse_path, s3_config) = if is_object_store {
         let props_vec = sorted_properties(&props);
         let cfg = fs_io::object_store_config_from_catalog_properties(&props_vec)
             .map_err(|e| format!("parse Iceberg object-store catalog properties: {e}"))?

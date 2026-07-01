@@ -86,13 +86,18 @@ impl IcebergFsStorage {
         }
     }
 
-    fn resolve_path(&self, path: &str) -> Result<(IcebergFsAccess, String)> {
-        let access = resolve_access_for_location(path, self.object_store_config.as_ref())
-            .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("resolve fs path: {e}")))?;
+    fn resolve_path(&self, operation: &str, path: &str) -> Result<(IcebergFsAccess, String)> {
+        let access =
+            resolve_access_for_location(path, self.object_store_config.as_ref()).map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("fs {operation}({path}) resolve path: {e}"),
+                )
+            })?;
         let relative_path = access.single_relative_path().map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
-                format!("resolve fs relative path: {e}"),
+                format!("fs {operation}({path}) resolve relative path: {e}"),
             )
         })?;
         Ok((access.clone(), relative_path.to_string()))
@@ -126,7 +131,7 @@ impl IcebergFsStorage {
 #[async_trait]
 impl Storage for IcebergFsStorage {
     async fn exists(&self, path: &str) -> Result<bool> {
-        let (access, relative_path) = self.resolve_path(path)?;
+        let (access, relative_path) = self.resolve_path("exists", path)?;
         access.operator().exists(&relative_path).await.map_err(|e| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -136,7 +141,7 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
-        let (access, relative_path) = self.resolve_path(path)?;
+        let (access, relative_path) = self.resolve_path("metadata", path)?;
         let meta = access.operator().stat(&relative_path).await.map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -149,7 +154,7 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn read(&self, path: &str) -> Result<Bytes> {
-        let (access, relative_path) = self.resolve_path(path)?;
+        let (access, relative_path) = self.resolve_path("read", path)?;
         let data = access.operator().read(&relative_path).await.map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -160,7 +165,7 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
-        let (access, relative_path) = self.resolve_path(path)?;
+        let (access, relative_path) = self.resolve_path("reader", path)?;
         Ok(Box::new(IcebergFsFileRead {
             access,
             relative_path,
@@ -168,7 +173,7 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
-        let (access, relative_path) = self.resolve_path(path)?;
+        let (access, relative_path) = self.resolve_path("write", path)?;
         let op = access.operator();
         Self::ensure_parent_dir(&op, &relative_path).await?;
         op.write(&relative_path, bs).await.map_err(|e| {
@@ -181,7 +186,7 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
-        let (access, relative_path) = self.resolve_path(path)?;
+        let (access, relative_path) = self.resolve_path("writer", path)?;
         let op = access.operator();
         Self::ensure_parent_dir(&op, &relative_path).await?;
         let writer = op.writer(&relative_path).await.map_err(|e| {
@@ -196,7 +201,7 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
-        let (access, relative_path) = self.resolve_path(path)?;
+        let (access, relative_path) = self.resolve_path("delete", path)?;
         access.operator().delete(&relative_path).await.map_err(|e| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -206,7 +211,7 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn delete_prefix(&self, path: &str) -> Result<()> {
-        let (access, relative_path) = self.resolve_path(path)?;
+        let (access, relative_path) = self.resolve_path("delete_prefix", path)?;
         access
             .operator()
             .remove_all(&relative_path)
@@ -447,22 +452,6 @@ pub(crate) fn normalize_hdfs_path_parse_only(path: &str) -> std::result::Result<
     crate::fs::hdfs::parse_hdfs_path(location.original()).map(|parsed| parsed.rel_path)
 }
 
-pub(crate) fn parse_object_store_path_parse_only(
-    path: &str,
-) -> std::result::Result<(String, String), String> {
-    let location = FsAccessResolver::new()
-        .parse_location(path)
-        .map_err(|e| format!("parse object-store location {path}: {e}"))?;
-    if !location.scheme().is_object_store() {
-        return Err(format!("expected object-store location: {path}"));
-    }
-    let bucket = location
-        .authority()
-        .ok_or_else(|| format!("object-store location missing bucket: {path}"))?
-        .to_string();
-    Ok((bucket, location.path().trim_start_matches('/').to_string()))
-}
-
 pub(crate) fn read_exact_range(
     path: &str,
     range: Range<u64>,
@@ -645,6 +634,11 @@ mod tests {
             .await
             .expect_err("first object-store IO should fail");
 
+        assert!(
+            err.to_string()
+                .contains("fs exists(s3://bucket/table/metadata.json) resolve path"),
+            "{err}"
+        );
         assert!(
             err.to_string()
                 .contains("object-store location requires object store config"),

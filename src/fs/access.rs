@@ -141,6 +141,25 @@ impl FsLocation {
     }
 }
 
+pub(crate) fn is_object_store_location_parse_only(location: &str) -> Result<bool, String> {
+    FsLocation::parse(location).map(|location| location.scheme().is_object_store())
+}
+
+pub(crate) fn parse_object_store_path_parse_only(
+    location: &str,
+) -> Result<(String, String), String> {
+    let parsed = FsLocation::parse(location)
+        .map_err(|e| format!("parse object-store location {location}: {e}"))?;
+    if !parsed.scheme().is_object_store() {
+        return Err(format!("expected object-store location: {location}"));
+    }
+    let bucket = parsed
+        .authority()
+        .ok_or_else(|| format!("object-store location missing bucket: {location}"))?
+        .to_string();
+    Ok((bucket, parsed.path().trim_start_matches('/').to_string()))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedFsPath {
     location: FsLocation,
@@ -516,6 +535,38 @@ mod tests {
             assert_eq!(loc.authority(), Some("bucket"));
             assert_eq!(loc.path(), "warehouse/t/a.parquet");
         }
+    }
+
+    #[test]
+    fn parse_object_store_path_parse_only_returns_bucket_and_key() {
+        let (bucket, key) = parse_object_store_path_parse_only("s3a://bucket/warehouse/t")
+            .expect("parse object-store path");
+
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key, "warehouse/t");
+    }
+
+    #[test]
+    fn parse_object_store_path_parse_only_rejects_local_location() {
+        let err = parse_object_store_path_parse_only("file:///tmp/warehouse")
+            .expect_err("local path is not object-store");
+
+        assert!(err.contains("expected object-store location"), "{err}");
+    }
+
+    #[test]
+    fn is_object_store_location_parse_only_uses_fs_location_parser() {
+        assert!(
+            is_object_store_location_parse_only("oss://bucket/warehouse")
+                .expect("parse object-store location")
+        );
+        assert!(
+            !is_object_store_location_parse_only("file:///tmp/warehouse")
+                .expect("parse local location")
+        );
+        let err = is_object_store_location_parse_only("unsupported://warehouse/table")
+            .expect_err("unsupported scheme is rejected");
+        assert!(err.contains("unsupported fs location scheme"), "{err}");
     }
 
     #[test]

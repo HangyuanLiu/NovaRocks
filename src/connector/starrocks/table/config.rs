@@ -1,7 +1,7 @@
 use crate::common::app_config::StandaloneStarRocksTableConfig as AppStarRocksTableConfig;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 
-use crate::connector::iceberg::fs_io::parse_object_store_path_parse_only;
+use crate::fs::access::parse_object_store_path_parse_only;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StarRocksTableConfig {
