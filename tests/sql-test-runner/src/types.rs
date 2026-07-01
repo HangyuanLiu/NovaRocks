@@ -24,6 +24,20 @@ pub enum ImvStatelessLevel {
     Full,
 }
 
+impl ImvStatelessLevel {
+    /// Render as the string form expected by the server-side
+    /// `novarocks_imv_stateless_rebuild` procedure's `level` argument, and
+    /// returned (case-insensitively) as its `AvailableLevel` result column.
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            ImvStatelessLevel::Baseline => "baseline",
+            ImvStatelessLevel::Package => "package",
+            ImvStatelessLevel::Provenance => "provenance",
+            ImvStatelessLevel::Full => "full",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImvStatelessDirective {
     pub mv: String,
