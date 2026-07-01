@@ -10,6 +10,7 @@ pub(crate) mod predicate_pushdown;
 pub(crate) mod ranking_window_predicate_pushdown;
 pub(crate) mod subquery;
 pub(crate) mod ukfk;
+pub(crate) mod union_distinct_to_aggregate;
 pub(crate) mod utils;
 pub(crate) mod variant_path_pushdown;
 
