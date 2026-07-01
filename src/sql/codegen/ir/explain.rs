@@ -2205,6 +2205,7 @@ mod tests {
                 predicates: vec![],
                 required_columns: Some(vec!["s".to_string(), "__nr_dict_t_s".to_string()]),
                 dict_columns: vec![crate::sql::common::ScanDictionaryColumn {
+                    source_column_id: s.column_id,
                     source_column: "s".to_string(),
                     dict_column: "__nr_dict_t_s".to_string(),
                     dictionary: sample_dict_snapshot(),

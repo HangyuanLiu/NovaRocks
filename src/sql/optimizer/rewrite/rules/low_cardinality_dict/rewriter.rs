@@ -399,20 +399,11 @@ fn rewrite_scan(scan: &mut ScanOp, ctx: &mut DictionaryRewriteContext) -> DictSc
     // see the bindings.
     if !scan.dict_columns.is_empty() {
         for hint in &scan.dict_columns {
-            let source_column_id = scan
-                .columns
-                .iter()
-                .find(|c| {
-                    c.name.eq_ignore_ascii_case(&hint.dict_column)
-                        || c.name.eq_ignore_ascii_case(&hint.source_column)
-                })
-                .map(|c| c.column_id)
-                .unwrap_or(ColumnId::UNSET);
             scope.insert(
                 hint.source_column.clone(),
                 DictBinding {
                     dict_column: hint.dict_column.clone(),
-                    source_column_id,
+                    source_column_id: hint.source_column_id,
                     snapshot: hint.dictionary.clone(),
                 },
             );
@@ -466,6 +457,7 @@ fn rewrite_scan(scan: &mut ScanOp, ctx: &mut DictionaryRewriteContext) -> DictSc
             }
         }
         scan.dict_columns.push(ScanDictionaryColumn {
+            source_column_id,
             source_column: source_name.clone(),
             dict_column: dict_column.clone(),
             dictionary: snapshot.clone(),

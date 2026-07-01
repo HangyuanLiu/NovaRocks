@@ -22,6 +22,7 @@ pub(crate) enum ApplyKind {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScanDictionaryColumn {
+    pub source_column_id: ColumnId,
     pub source_column: String,
     pub dict_column: String,
     pub dictionary: Arc<DictionarySnapshot>,

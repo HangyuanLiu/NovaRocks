@@ -641,12 +641,21 @@ mod tests {
 
     #[test]
     fn group_by_string_rewrites_to_dict_column_and_decode() {
+        let source_column_id = ColumnId::new_for_test(42);
+        let mut source_column = s_output_column();
+        source_column.column_id = source_column_id;
+        let mut source_ref = s_column_ref();
+        if let ExprKind::ColumnRef { column_id, .. } = &mut source_ref.kind {
+            *column_id = source_column_id;
+        }
+        let mut group_output = s_output_column();
+        group_output.column_id = source_column_id;
         let scan = LogicalPlanNode::new(
             LogicalPlanKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: make_table(),
                 alias: None,
-                columns: vec![s_output_column()],
+                columns: vec![source_column],
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![],
@@ -658,7 +667,7 @@ mod tests {
         );
         let aggregate = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
-                group_by: vec![s_column_ref()],
+                group_by: vec![source_ref],
                 aggregates: vec![AggregateCall {
                     name: "count".to_string(),
                     args: vec![],
@@ -668,7 +677,7 @@ mod tests {
                     output_column_id: ColumnId::new_for_test(1001),
                 }],
                 output_columns: vec![
-                    s_output_column(),
+                    group_output,
                     OutputColumn {
                         column_id: ColumnId::new_for_test(1001),
                         name: "cnt".to_string(),
@@ -713,8 +722,10 @@ mod tests {
             panic!("expected scan under aggregate");
         };
         assert_eq!(scan.dict_columns.len(), 1);
+        assert_eq!(scan.dict_columns[0].source_column_id, source_column_id);
         assert_eq!(scan.dict_columns[0].dict_column, "__nr_dict_t_s");
         assert_eq!(scan.dict_columns[0].source_column, "s");
+        assert_eq!(scan.dict_columns[0].dictionary.data_type, DataType::Utf8);
         let dict_output = scan
             .columns
             .iter()

@@ -711,6 +711,7 @@ mod tests {
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![ScanDictionaryColumn {
+                    source_column_id: ColumnId::new_for_test(1),
                     source_column: "s".to_string(),
                     dict_column: "__nr_dict_t_s".to_string(),
                     dictionary: dict_snapshot_for_test(),

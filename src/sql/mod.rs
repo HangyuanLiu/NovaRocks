@@ -117,6 +117,7 @@ mod common_tests {
         };
 
         let scan_dictionary = ScanDictionaryColumn {
+            source_column_id: ColumnId::new_for_test(5),
             source_column: "k".to_string(),
             dict_column: "k_dict".to_string(),
             dictionary: Arc::new(snapshot.clone()),

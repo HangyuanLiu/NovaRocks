@@ -2308,6 +2308,7 @@ mod tests {
                 predicates: vec![],
                 required_columns: Some(vec!["s_dict".to_string()]),
                 dict_columns: vec![ScanDictionaryColumn {
+                    source_column_id: source_id,
                     source_column: "s".to_string(),
                     dict_column: "s_dict".to_string(),
                     dictionary: dict_snapshot_a_b(),

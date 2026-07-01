@@ -4847,6 +4847,7 @@ mod tests {
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![ScanDictionaryColumn {
+                    source_column_id: id_col,
                     source_column: "id".to_string(),
                     dict_column: "id_dict".to_string(),
                     dictionary: dict_snapshot_a_b(),
@@ -5011,11 +5012,13 @@ mod tests {
                 required_columns: None,
                 dict_columns: vec![
                     ScanDictionaryColumn {
+                        source_column_id: ColumnId::new_for_test(8101),
                         source_column: "id".to_string(),
                         dict_column: "id_dict".to_string(),
                         dictionary: dict_snapshot_a_b(),
                     },
                     ScanDictionaryColumn {
+                        source_column_id: ColumnId::new_for_test(8102),
                         source_column: "name".to_string(),
                         dict_column: "name_dict".to_string(),
                         dictionary: dict_snapshot_x_y_z(),
@@ -5226,6 +5229,7 @@ mod tests {
                 predicates: vec![],
                 required_columns: Some(vec!["__nr_dict_t_s".to_string()]),
                 dict_columns: vec![ScanDictionaryColumn {
+                    source_column_id: ColumnId::new_for_test(8301),
                     source_column: "s".to_string(),
                     dict_column: "__nr_dict_t_s".to_string(),
                     dictionary: dict_snapshot_a_b(),
@@ -5371,6 +5375,7 @@ mod tests {
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![ScanDictionaryColumn {
+                    source_column_id: ColumnId::new_for_test(8401),
                     source_column: "id".to_string(),
                     dict_column: "id_dict".to_string(),
                     dictionary: dict_snapshot_a_b(),
