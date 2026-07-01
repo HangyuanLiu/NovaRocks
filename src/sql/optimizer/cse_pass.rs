@@ -11,7 +11,9 @@ use arrow::datatypes::DataType;
 
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::common::OutputColumn;
-use crate::sql::optimizer::cost::{CostInput, CostOptions, compute_cost_estimate};
+use crate::sql::optimizer::cost::{
+    CostInput, CostOptions, broadcast_decision, compute_cost_estimate,
+};
 use crate::sql::optimizer::operator::{Operator, ScalarProjectItem};
 use crate::sql::optimizer::options::OptimizerOptions;
 use crate::sql::optimizer::physical_tree::{OptimizerExplainStats, OptimizerPhysicalNode};
@@ -801,6 +803,41 @@ fn synthetic_project_explain_stats(
     }
 }
 
+fn rewritten_node_explain_stats(
+    node: &OptimizerPhysicalNode,
+    scalars: &ScalarArena,
+    cost_options: &CostOptions,
+) -> OptimizerExplainStats {
+    let child_stats = node
+        .children
+        .iter()
+        .map(|child| &child.stats)
+        .collect::<Vec<_>>();
+    let child_outputs = node
+        .children
+        .iter()
+        .map(|child| &child.execution_props.output_property)
+        .collect::<Vec<_>>();
+    let cost_input = CostInput {
+        op: &node.op,
+        own_stats: &node.stats,
+        child_stats: &child_stats,
+        child_outputs: &child_outputs,
+        required_output: &node.execution_props.output_property,
+        alt_kind: &crate::sql::optimizer::derive::PropertyAlternativeKind::Default,
+        scalars: Some(scalars),
+        options: cost_options,
+    };
+    OptimizerExplainStats {
+        cost_estimate: Some(compute_cost_estimate(&cost_input).sanitized()),
+        broadcast_decision: if matches!(node.op, Operator::PhysicalHashJoin(_)) {
+            broadcast_decision(&cost_input)
+        } else {
+            None
+        },
+    }
+}
+
 fn wrap_project_around_child(
     child: &mut OptimizerPhysicalNode,
     prelude: Vec<ScalarProjectItem>,
@@ -1041,6 +1078,7 @@ fn rewrite_project(
         probe_runtime_filters: vec![],
     };
     node.children.push(cse_project);
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_filter(
@@ -1067,6 +1105,7 @@ fn rewrite_filter(
     };
     filter.predicate = substitute(scalars, filter.predicate, &subst);
     insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_aggregate(
@@ -1114,6 +1153,7 @@ fn rewrite_aggregate(
         }
     }
     insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_join(
@@ -1170,6 +1210,7 @@ fn rewrite_join(
         Operator::PhysicalNestLoopJoin(join) => join.condition = Some(new_condition),
         _ => unreachable!("checked join operator above"),
     }
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_sort(
@@ -1202,6 +1243,7 @@ fn rewrite_sort(
         *expr = substitute(scalars, *expr, &subst);
     }
     insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_topn(
@@ -1230,6 +1272,7 @@ fn rewrite_topn(
         key.expr = substitute(scalars, key.expr, &subst);
     }
     insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_window(
@@ -1271,6 +1314,7 @@ fn rewrite_window(
         }
     }
     insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_change_event_expand(
@@ -1331,12 +1375,14 @@ mod tests {
         PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp, ScalarAggregateSpec,
         ScalarProjectItem, ScalarWindowSpec, SortOp, TopNOp, TopNPhase, ValuesOp, WindowOp,
     };
-    use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+    use crate::sql::optimizer::physical_tree::{
+        OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
+    };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::{
         HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey,
     };
-    use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::optimizer::statistics::{CostEstimate, Statistics};
 
     use super::pick_commons;
 
@@ -2468,13 +2514,21 @@ mod tests {
         let lower = gt(&mut arena, a_plus_b, ten);
         let upper = lt(&mut arena, a_plus_b, twenty);
         let predicate = and(&mut arena, lower, upper);
+        let stale_filter_estimate = CostEstimate {
+            cpu_cost: 1.0,
+            memory_cost: 2.0,
+            network_cost: 3.0,
+        };
         let child = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![output_column(101, "a"), output_column(102, "b")],
             }),
             children: vec![],
-            stats: Statistics::default(),
+            stats: Statistics {
+                output_row_count: 128.0,
+                ..Statistics::default()
+            },
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
@@ -2484,8 +2538,14 @@ mod tests {
         let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalFilter(FilterOp { predicate }),
             children: vec![child],
-            stats: Statistics::default(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            stats: Statistics {
+                output_row_count: 64.0,
+                ..Statistics::default()
+            },
+            explain_stats: OptimizerExplainStats {
+                cost_estimate: Some(stale_filter_estimate.clone()),
+                broadcast_decision: None,
+            },
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -2538,6 +2598,21 @@ mod tests {
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
+        );
+        let estimate = node
+            .explain_stats
+            .cost_estimate
+            .as_ref()
+            .expect("rewritten filter should refresh explain self cost");
+        assert!(
+            estimate.cpu_cost != stale_filter_estimate.cpu_cost
+                || estimate.memory_cost != stale_filter_estimate.memory_cost
+                || estimate.network_cost != stale_filter_estimate.network_cost,
+            "rewritten filter explain cost should not keep stale estimate {estimate:?}"
+        );
+        assert!(
+            estimate.cpu_cost > 0.0 || estimate.memory_cost > 0.0,
+            "rewritten filter explain cost should be non-zero, got {estimate:?}"
         );
     }
 

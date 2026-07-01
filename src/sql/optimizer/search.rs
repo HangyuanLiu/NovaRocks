@@ -323,49 +323,53 @@ impl SearchContext {
                 );
 
                 // Bridge provided → required via enforcer if needed.
-                let (actual_output, enforcer_info, candidate_enforcer_estimate) = if provided
-                    .satisfies(required)
-                {
-                    (provided, None, None)
-                } else {
-                    let enforcers = super::derive::needed_enforcers(required, &provided);
-                    if enforcers.is_empty() {
-                        continue;
-                    }
-                    let group_stats =
-                        stats_for_group(&memo.groups[group_id], memo, &self.stats_input);
-                    let mut candidate_enforcer_estimate: Option<CostEstimate> = None;
-                    for enforcer in &enforcers {
-                        let enforcer_estimate = super::derive::estimate_enforcer_cost_estimate(
-                            enforcer,
-                            &group_stats,
-                            &self.cost_options,
+                let (actual_output, enforcer_info, candidate_materialized_enforcer_estimate) =
+                    if provided.satisfies(required) {
+                        (provided, None, None)
+                    } else {
+                        let enforcers = super::derive::needed_enforcers(required, &provided);
+                        if enforcers.is_empty() {
+                            continue;
+                        }
+                        let group_stats =
+                            stats_for_group(&memo.groups[group_id], memo, &self.stats_input);
+                        let mut candidate_materialized_enforcer_estimate: Option<CostEstimate> =
+                            None;
+                        for enforcer in &enforcers {
+                            let enforcer_estimate = super::derive::estimate_enforcer_cost_estimate(
+                                enforcer,
+                                &group_stats,
+                                &self.cost_options,
+                            )
+                            .sanitized();
+                            if candidate_materialized_enforcer_estimate.is_none() {
+                                candidate_materialized_enforcer_estimate =
+                                    Some(enforcer_estimate.clone());
+                            }
+                            candidate_estimate =
+                                candidate_estimate.add_sanitized(&enforcer_estimate);
+                        }
+                        let kind = enforcers.into_iter().next().unwrap();
+                        // Search cost includes every conceptual enforcer, but
+                        // extract.rs currently materializes only this first one.
+                        // The frozen explain self-cost must describe the exported
+                        // enforcer node rather than the full conceptual chain.
+                        (
+                            required.clone(),
+                            Some(EnforcerInfo {
+                                kind,
+                                child_props: provided,
+                            }),
+                            candidate_materialized_enforcer_estimate,
                         )
-                        .sanitized();
-                        candidate_enforcer_estimate = Some(
-                            candidate_enforcer_estimate
-                                .unwrap_or_default()
-                                .add_sanitized(&enforcer_estimate),
-                        );
-                        candidate_estimate = candidate_estimate.add_sanitized(&enforcer_estimate);
-                    }
-                    let kind = enforcers.into_iter().next().unwrap();
-                    (
-                        required.clone(),
-                        Some(EnforcerInfo {
-                            kind,
-                            child_props: provided,
-                        }),
-                        candidate_enforcer_estimate,
-                    )
-                };
+                    };
                 let candidate_cost = candidate_estimate.total_with_options(&self.cost_options);
 
                 if candidate_cost < best_cost {
                     best_cost = candidate_cost;
                     best_cost_estimate = candidate_estimate;
                     best_operator_cost_estimate = operator_estimate.clone();
-                    best_enforcer_cost_estimate = candidate_enforcer_estimate;
+                    best_enforcer_cost_estimate = candidate_materialized_enforcer_estimate;
                     best_operator_broadcast_decision = operator_broadcast_decision;
                     best_index = expr_idx;
                     best_enforcer = enforcer_info;
