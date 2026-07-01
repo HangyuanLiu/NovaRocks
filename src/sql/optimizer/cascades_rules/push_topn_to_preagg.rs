@@ -254,17 +254,18 @@ fn partial_order_by_for_local_group_by(
 }
 
 fn group_key_outputs(agg: &LogicalAggregateOp) -> Option<&[OutputColumn]> {
-    if agg.output_columns.len() < agg.group_by.len() {
+    if agg.output_layout.group_key_columns.len() != agg.group_by.len() {
         return None;
     }
-    let outputs = &agg.output_columns[..agg.group_by.len()];
-    if outputs
+    if agg
+        .output_layout
+        .group_key_columns
         .iter()
         .any(|column| column.column_id == ColumnId::UNSET)
     {
         return None;
     }
-    Some(outputs)
+    Some(&agg.output_layout.group_key_columns)
 }
 
 #[cfg(test)]
@@ -275,12 +276,23 @@ mod tests {
     use crate::sql::optimizer::binder::bind;
     use crate::sql::optimizer::memo::{MExpr, Memo};
     use crate::sql::optimizer::operator::{
-        AggStage, LogicalAggregateOp, ScalarAggregateSpec, TopNOp, TopNPhase, ValuesOp,
+        AggStage, AggregateOutputLayout, LogicalAggregateOp, ScalarAggregateSpec, TopNOp,
+        TopNPhase, ValuesOp,
     };
     use arrow::datatypes::DataType;
 
     fn output_column(id: u32, name: &str) -> OutputColumn {
         output_column_with_id(ColumnId::new_for_test(id), name)
+    }
+
+    fn full_aggregate_layout(
+        group_by_len: usize,
+        output_columns: &[OutputColumn],
+    ) -> AggregateOutputLayout {
+        AggregateOutputLayout::new(
+            output_columns.iter().take(group_by_len).cloned().collect(),
+            output_columns.iter().skip(group_by_len).cloned().collect(),
+        )
     }
 
     fn output_column_with_id(id: ColumnId, name: &str) -> OutputColumn {
@@ -312,6 +324,7 @@ mod tests {
 
     fn sum_spec(sales: crate::sql::optimizer::scalar::ScalarId) -> ScalarAggregateSpec {
         ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(201),
             name: "sum".to_string(),
             args: vec![sales],
             distinct: false,
@@ -320,16 +333,22 @@ mod tests {
     }
 
     fn global_agg(arena: &mut ScalarArena) -> LogicalAggregateOp {
+        let group_by = vec![col_ref(arena, 1), col_ref(arena, 2)];
+        let sales = col_ref(arena, 3);
+        let aggregates = vec![sum_spec(sales)];
+        let output_columns = vec![
+            output_column(101, "k1"),
+            output_column(102, "k2"),
+            output_column(201, "sum_v"),
+        ];
+        let output_layout = full_aggregate_layout(group_by.len(), &output_columns);
         LogicalAggregateOp::staged(
             AggStage::Global,
-            vec![col_ref(arena, 1), col_ref(arena, 2)],
-            vec![],
-            vec![
-                output_column(101, "k1"),
-                output_column(102, "k2"),
-                output_column(201, "sum_v"),
-            ],
-            vec![],
+            group_by,
+            aggregates,
+            output_layout,
+            output_columns,
+            vec![true],
             true,
         )
     }
@@ -362,13 +381,19 @@ mod tests {
         });
 
         let local_id = memo.next_expr_id();
+        let local_group_by = vec![city];
+        let local_aggregates = vec![sum.clone()];
+        let local_output_columns = vec![local_city_output.clone(), sum_output.clone()];
+        let local_output_layout =
+            full_aggregate_layout(local_group_by.len(), &local_output_columns);
         let local_group = memo.new_group(MExpr {
             id: local_id,
             op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
                 AggStage::Local,
-                vec![city],
-                vec![sum.clone()],
-                vec![local_city_output.clone(), sum_output.clone()],
+                local_group_by,
+                local_aggregates,
+                local_output_layout,
+                local_output_columns,
                 vec![false],
                 true,
             )),
@@ -376,13 +401,19 @@ mod tests {
         });
 
         let global_id = memo.next_expr_id();
+        let global_group_by = vec![city];
+        let global_aggregates = vec![sum];
+        let global_output_columns = vec![global_city_output, sum_output];
+        let global_output_layout =
+            full_aggregate_layout(global_group_by.len(), &global_output_columns);
         let global_group = memo.new_group(MExpr {
             id: global_id,
             op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
                 AggStage::Global,
-                vec![city],
-                vec![sum],
-                vec![global_city_output, sum_output],
+                global_group_by,
+                global_aggregates,
+                global_output_layout,
+                global_output_columns,
                 vec![true],
                 true,
             )),
@@ -522,7 +553,10 @@ mod tests {
     fn order_by_rejects_malformed_group_output_prefix() {
         let mut arena = ScalarArena::new();
         let mut global = global_agg(&mut arena);
-        global.output_columns.truncate(global.group_by.len() - 1);
+        global
+            .output_layout
+            .group_key_columns
+            .truncate(global.group_by.len() - 1);
         let items = vec![sort_key(&mut arena, 101)];
 
         assert!(!order_by_covers_group_by(&items, &global, &arena));
@@ -532,7 +566,7 @@ mod tests {
     fn order_by_rejects_unset_group_output() {
         let mut arena = ScalarArena::new();
         let mut global = global_agg(&mut arena);
-        global.output_columns[0] = output_column_with_id(ColumnId::UNSET, "bad");
+        global.output_layout.group_key_columns[0] = output_column_with_id(ColumnId::UNSET, "bad");
         let items = vec![sort_key(&mut arena, 102)];
 
         assert!(!order_by_covers_group_by(&items, &global, &arena));
@@ -572,6 +606,29 @@ mod tests {
         let mut fixture = preagg_memo();
         let expr = root_expr(&fixture);
 
+        let out = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+
+        assert_preagg_rewrite_shape(&out, &fixture.memo, &fixture);
+    }
+
+    #[test]
+    fn apply_uses_layout_group_keys_when_public_outputs_are_pruned() {
+        let mut fixture = preagg_memo();
+        let Operator::LogicalAggregate(local) =
+            &mut fixture.memo.groups[fixture.local_group].logical_exprs[0].op
+        else {
+            panic!("expected local LogicalAggregate");
+        };
+        local.output_columns = local.output_layout.aggregate_columns.clone();
+
+        let Operator::LogicalAggregate(global) =
+            &mut fixture.memo.groups[fixture.global_group].logical_exprs[0].op
+        else {
+            panic!("expected global LogicalAggregate");
+        };
+        global.output_columns = global.output_layout.aggregate_columns.clone();
+
+        let expr = root_expr(&fixture);
         let out = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
 
         assert_preagg_rewrite_shape(&out, &fixture.memo, &fixture);
@@ -635,17 +692,23 @@ mod tests {
         });
 
         let local_id = memo.next_expr_id();
+        let local_group_by = vec![city, sku];
+        let local_aggregates = vec![sum.clone()];
+        let local_output_columns = vec![
+            output_column(1, "city"),
+            output_column(2, "sku"),
+            output_column(201, "sum_sales"),
+        ];
+        let local_output_layout =
+            full_aggregate_layout(local_group_by.len(), &local_output_columns);
         let local_group = memo.new_group(MExpr {
             id: local_id,
             op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
                 AggStage::Local,
-                vec![city, sku],
-                vec![sum.clone()],
-                vec![
-                    output_column(1, "city"),
-                    output_column(2, "sku"),
-                    output_column(201, "sum_sales"),
-                ],
+                local_group_by,
+                local_aggregates,
+                local_output_layout,
+                local_output_columns,
                 vec![false],
                 true,
             )),
@@ -653,17 +716,23 @@ mod tests {
         });
 
         let global_id = memo.next_expr_id();
+        let global_group_by = vec![city, sku];
+        let global_aggregates = vec![sum];
+        let global_output_columns = vec![
+            output_column(101, "city"),
+            output_column(102, "sku"),
+            output_column(201, "sum_sales"),
+        ];
+        let global_output_layout =
+            full_aggregate_layout(global_group_by.len(), &global_output_columns);
         let global_group = memo.new_group(MExpr {
             id: global_id,
             op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
                 AggStage::Global,
-                vec![city, sku],
-                vec![sum],
-                vec![
-                    output_column(101, "city"),
-                    output_column(102, "sku"),
-                    output_column(201, "sum_sales"),
-                ],
+                global_group_by,
+                global_aggregates,
+                global_output_layout,
+                global_output_columns,
                 vec![true],
                 true,
             )),
@@ -747,12 +816,18 @@ mod tests {
         });
 
         let single_id = memo.next_expr_id();
+        let single_group_by = vec![city];
+        let single_aggregates = vec![sum];
+        let single_output_columns = vec![output_column(1, "city"), output_column(201, "sum_sales")];
+        let single_output_layout =
+            full_aggregate_layout(single_group_by.len(), &single_output_columns);
         let single_group = memo.new_group(MExpr {
             id: single_id,
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-                vec![city],
-                vec![sum],
-                vec![output_column(1, "city"), output_column(201, "sum_sales")],
+                single_group_by,
+                single_aggregates,
+                single_output_layout,
+                single_output_columns,
             )),
             children: vec![values_group],
         });
@@ -798,7 +873,7 @@ mod tests {
         else {
             panic!("expected local LogicalAggregate");
         };
-        agg.output_columns[0] = output_column_with_id(ColumnId::UNSET, "bad");
+        agg.output_layout.group_key_columns[0] = output_column_with_id(ColumnId::UNSET, "bad");
 
         assert_does_not_fire(&mut fixture);
     }

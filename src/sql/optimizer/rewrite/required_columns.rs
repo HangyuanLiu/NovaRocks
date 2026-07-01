@@ -406,40 +406,28 @@ fn tag_aggregate(
     let Operator::LogicalAggregate(node) = &expr.op else {
         unreachable!()
     };
-    expr.required_output_columns = parent_needed.clone();
 
-    // Conservative keep-all-aggregate-inputs strategy.
-    //
-    // Aggregate output metadata starts with the group-by output prefix used by
-    // the physical layout, while aggregate function identity lives on
-    // ScalarAggregateSpec (no per-call output_column_id in the optimizer IR).
-    // Required input derivation should not infer liveness from output positions;
-    // if the aggregate node is live at all, every expression it consumes remains
-    // needed.
-    //
-    // Conservative fix: child always needs ALL group-by column refs PLUS ALL
-    // aggregate args and order-by column refs, regardless of parent_needed.
-    // This matches the semantics of the old name-based PruneColumns pass and
-    // is correct: if the aggregate node is live at all, every input column it
-    // consumes is required.  Per-aggregate output pruning (Gap 5) is a
-    // follow-up.
-    //
-    // None-propagation discipline: when parent_needed is None (root / keep-all),
-    // pass None to the child so it also keeps all its columns.
-    let child_needed: Option<HashSet<ColumnId>> = parent_needed.as_ref().map(|_| {
-        let mut needed: HashSet<ColumnId> = HashSet::new();
+    let effective_parent_needed = parent_needed
+        .as_ref()
+        .map(|needed| node.effective_required_outputs(needed));
+    expr.required_output_columns = effective_parent_needed.clone();
+
+    let child_needed: Option<HashSet<ColumnId>> = effective_parent_needed.as_ref().map(|needed| {
+        let mut required_inputs: HashSet<ColumnId> = HashSet::new();
         for &gb in &node.group_by {
-            needed.extend(collect_scalar_column_id_refs(arena, gb));
+            required_inputs.extend(collect_scalar_column_id_refs(arena, gb));
         }
         for agg in &node.aggregates {
-            for &arg in &agg.args {
-                needed.extend(collect_scalar_column_id_refs(arena, arg));
-            }
-            for item in &agg.order_by {
-                needed.extend(collect_scalar_column_id_refs(arena, item.expr));
+            if needed.contains(&agg.output_column_id) {
+                for &arg in &agg.args {
+                    required_inputs.extend(collect_scalar_column_id_refs(arena, arg));
+                }
+                for item in &agg.order_by {
+                    required_inputs.extend(collect_scalar_column_id_refs(arena, item.expr));
+                }
             }
         }
-        needed
+        required_inputs
     });
 
     let mut children = expr.children;
@@ -447,7 +435,7 @@ fn tag_aggregate(
     OptExpr {
         op: expr.op,
         children: vec![tag_required_columns(input, arena, child_needed)],
-        required_output_columns: parent_needed,
+        required_output_columns: effective_parent_needed,
     }
 }
 
@@ -984,10 +972,10 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::optimizer::operator::{
-        CTEAnchorOp, CTEConsumeOp, CTEProduceOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp,
-        IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp, ProjectOp, RepeatOp,
-        ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec, ScanOp, SortOp, TableFunctionOp,
-        UnionOp, ValuesOp, WindowOp,
+        AggregateOutputLayout, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, ExceptOp, FilterOp,
+        GenerateSeriesOp, ImvDeltaOp, IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp,
+        ProjectOp, RepeatOp, ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec, ScanOp,
+        SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::scalar::{ScalarArena, SortKey};
     use arrow::datatypes::DataType;
@@ -1336,62 +1324,141 @@ mod tests {
     // Aggregate test
     // -----------------------------------------------------------------------
 
-    /// Bug A regression: tag_aggregate must use the conservative keep-all
-    /// strategy for aggregate args.
     #[test]
-    fn tag_aggregate_conservative_keeps_all_aggregate_args_in_child_needed() {
-        // Aggregate[group_by=[y@1], count(*)→301, sum(x@2)→302]
-        // parent_needed = {301}  (only count needed)
-        //
-        // Expected (conservative fix):
-        //   child_needed = {1, 2}  (group_by y@1 + ALL aggregate args: x@2)
-        //   c@3 (not referenced by any group_by or agg arg) is NOT needed.
+    fn tag_aggregate_prunes_unused_aggregate_inputs_from_child_needed() {
+        let id_group = ColumnId::new_for_test(1);
+        let id_sum_arg = ColumnId::new_for_test(2);
+        let id_sum_order = ColumnId::new_for_test(3);
+        let id_count_arg = ColumnId::new_for_test(4);
+        let out_group = ColumnId::new_for_test(101);
+        let out_sum = ColumnId::new_for_test(201);
+        let out_count = ColumnId::new_for_test(202);
+
         let arena_rc = make_arena();
         let mut arena_mut = arena_rc.borrow_mut();
-        let col1 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(1));
-        let col2 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(2));
+        let group_ref = col_ref_scalar(&mut arena_mut, id_group);
+        let sum_arg = col_ref_scalar(&mut arena_mut, id_sum_arg);
+        let sum_order = col_ref_scalar(&mut arena_mut, id_sum_order);
+        let count_arg = col_ref_scalar(&mut arena_mut, id_count_arg);
         drop(arena_mut);
 
-        let agg = OptExpr::new(
+        let group_column = make_output_column(out_group, "g");
+        let sum_column = make_output_column(out_sum, "sum_a");
+        let count_column = make_output_column(out_count, "count_b");
+        let layout = AggregateOutputLayout::new(
+            vec![group_column.clone()],
+            vec![sum_column.clone(), count_column.clone()],
+        );
+        let mut aggregate = OptExpr::new(
             Operator::LogicalAggregate(LogicalAggregateOp::single(
-                vec![col1],
+                vec![group_ref],
                 vec![
                     ScalarAggregateSpec {
-                        name: "count".to_string(),
-                        args: vec![],
-                        distinct: false,
-                        order_by: vec![],
-                    },
-                    ScalarAggregateSpec {
+                        output_column_id: out_sum,
                         name: "sum".to_string(),
-                        args: vec![col2],
+                        args: vec![sum_arg],
+                        distinct: false,
+                        order_by: vec![SortKey {
+                            expr: sum_order,
+                            asc: true,
+                            nulls_first: false,
+                            display: None,
+                        }],
+                    },
+                    ScalarAggregateSpec {
+                        output_column_id: out_count,
+                        name: "count".to_string(),
+                        args: vec![count_arg],
                         distinct: false,
                         order_by: vec![],
                     },
                 ],
-                vec![
-                    make_output_column(ColumnId::new_for_test(1), "y"),
-                    make_output_column(ColumnId::new_for_test(301), "count"),
-                    make_output_column(ColumnId::new_for_test(302), "sum_x"),
-                ],
+                layout,
+                vec![group_column, sum_column, count_column],
             )),
-            vec![scan_with_3_cols(&arena_rc)],
+            vec![make_values_with_columns(vec![
+                make_output_column(id_group, "g"),
+                make_output_column(id_sum_arg, "a"),
+                make_output_column(id_sum_order, "ord"),
+                make_output_column(id_count_arg, "b"),
+            ])],
         );
+
+        let mut parent_needed = HashSet::new();
+        parent_needed.insert(out_sum);
+        aggregate.required_output_columns = None;
+
         let arena = arena_rc.borrow();
-        let tagged = tag_required_columns(agg, &arena, Some(needed_set(&[301])));
-        assert!(matches!(&tagged.op, Operator::LogicalAggregate(_)));
-        let input = tagged.unary_input();
-        assert!(matches!(&input.op, Operator::LogicalScan(_)));
-        let req = required_columns(input);
-        // group_by y@1 must always be in child_needed.
-        assert!(req.contains(&ColumnId::new_for_test(1)), "group_by y@1");
-        // sum(x) arg x@2 must be in child_needed even though parent only needs count.
+        let tagged = tag_required_columns(aggregate, &arena, Some(parent_needed));
+        let child_needed = tagged.children[0]
+            .required_output_columns
+            .as_ref()
+            .expect("child must be tagged");
+
+        assert!(child_needed.contains(&id_group), "group-by input must stay");
         assert!(
-            req.contains(&ColumnId::new_for_test(2)),
-            "sum(x@2) arg must be kept (conservative keep-all)"
+            child_needed.contains(&id_sum_arg),
+            "retained sum input must stay"
         );
-        // c@3 is not referenced by group_by or any agg arg — may be absent.
-        // (We do not assert it is absent; correctness only requires the above.)
+        assert!(
+            child_needed.contains(&id_sum_order),
+            "retained sum order-by input must stay"
+        );
+        assert!(
+            !child_needed.contains(&id_count_arg),
+            "unused count input must be pruned"
+        );
+    }
+
+    #[test]
+    fn tag_aggregate_empty_parent_needed_uses_same_fallback_for_child_inputs() {
+        let id_arg = ColumnId::new_for_test(2);
+        let out_sum = ColumnId::new_for_test(201);
+
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let sum_arg = col_ref_scalar(&mut arena_mut, id_arg);
+        drop(arena_mut);
+
+        let sum_column = make_output_column(out_sum, "sum_a");
+        let layout = AggregateOutputLayout::new(vec![], vec![sum_column.clone()]);
+        let aggregate = OptExpr::new(
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![ScalarAggregateSpec {
+                    output_column_id: out_sum,
+                    name: "sum".to_string(),
+                    args: vec![sum_arg],
+                    distinct: false,
+                    order_by: vec![],
+                }],
+                layout,
+                vec![sum_column],
+            )),
+            vec![make_values_with_columns(vec![make_output_column(
+                id_arg, "a",
+            )])],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(aggregate, &arena, Some(HashSet::new()));
+
+        assert!(
+            tagged
+                .required_output_columns
+                .as_ref()
+                .expect("aggregate must be tagged")
+                .contains(&out_sum),
+            "fallback output must be the scalar aggregate output"
+        );
+        assert!(
+            tagged.children[0]
+                .required_output_columns
+                .as_ref()
+                .expect("child must be tagged")
+                .contains(&id_arg),
+            "fallback aggregate output must keep its input dependency"
+        );
     }
 
     /// tag_aggregate with parent_needed=None propagates None to the child
@@ -1404,16 +1471,25 @@ mod tests {
         let col2 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(2));
         drop(arena_mut);
 
+        let group_by = vec![col1];
+        let aggregates = vec![ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(301),
+            name: "sum".to_string(),
+            args: vec![col2],
+            distinct: false,
+            order_by: vec![],
+        }];
+        let output_columns = vec![make_output_column(ColumnId::new_for_test(301), "sum_x")];
+        let output_layout = AggregateOutputLayout::new(
+            vec![make_output_column(ColumnId::new_for_test(1), "y")],
+            output_columns.clone(),
+        );
         let agg = OptExpr::new(
             Operator::LogicalAggregate(LogicalAggregateOp::single(
-                vec![col1],
-                vec![ScalarAggregateSpec {
-                    name: "sum".to_string(),
-                    args: vec![col2],
-                    distinct: false,
-                    order_by: vec![],
-                }],
-                vec![make_output_column(ColumnId::new_for_test(301), "sum_x")],
+                group_by,
+                aggregates,
+                output_layout,
+                output_columns,
             )),
             vec![scan_with_3_cols(&arena_rc)],
         );

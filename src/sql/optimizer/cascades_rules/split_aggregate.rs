@@ -2,7 +2,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{
-    AggStage, LogicalAggregateOp, Operator, ScalarAggregateSpec,
+    AggStage, AggregateOutputLayout, LogicalAggregateOp, Operator, ScalarAggregateSpec,
 };
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
@@ -32,17 +32,35 @@ impl Rule for SplitAggregateRule {
         }
 
         let local_output_columns = local_output_columns(agg, &memo.scalars);
+        let local_output_layout = AggregateOutputLayout::new(
+            local_output_columns
+                .iter()
+                .take(agg.group_by.len())
+                .cloned()
+                .collect(),
+            local_output_columns
+                .iter()
+                .skip(agg.group_by.len())
+                .cloned()
+                .collect(),
+        );
         remember_group_key_output_displays(&mut memo.scalars, &agg.group_by, &local_output_columns);
         let local_group_by = aggregate_group_key_output_ref(
             &mut memo.scalars,
             &local_output_columns,
             agg.group_by.len(),
         );
-        remember_group_key_output_displays(&mut memo.scalars, &local_group_by, &agg.output_columns);
+        remember_group_key_output_displays(
+            &mut memo.scalars,
+            &local_group_by,
+            &agg.output_layout.group_key_columns,
+        );
+        let global_output_layout = agg.output_layout.clone();
         let local = LogicalAggregateOp::staged(
             AggStage::Local,
             agg.group_by.clone(),
             agg.aggregates.clone(),
+            local_output_layout,
             local_output_columns,
             vec![false; agg.aggregates.len()],
             true,
@@ -61,6 +79,7 @@ impl Rule for SplitAggregateRule {
             AggStage::Global,
             local_group_by,
             agg.aggregates.clone(),
+            global_output_layout,
             agg.output_columns.clone(),
             vec![true; agg.aggregates.len()],
             true,
@@ -99,30 +118,32 @@ fn is_splittable_aggregate(call: &ScalarAggregateSpec) -> bool {
 fn local_output_columns(agg: &LogicalAggregateOp, arena: &ScalarArena) -> Vec<OutputColumn> {
     let mut columns = Vec::with_capacity(agg.group_by.len() + agg.aggregates.len());
     columns.extend(agg.group_by.iter().enumerate().map(|(idx, expr)| {
-        let name = scalar_expr::scalar_display_name(arena, *expr);
-        // Non-ColumnRef group keys (constant/alias/expression, e.g. `'a' as g`)
-        // reuse the original aggregate's group output id *by position* (the
-        // first group_by.len() output columns are the group keys, in order).
-        // The previous by-name lookup returned ColumnId::UNSET when the output
-        // name was a SELECT alias rather than the expression's display name,
-        // which the id-binding verifier rejects once the aggregate is split.
-        let column_id = match arena.node(*expr) {
-            ScalarNode::ColumnRef(column_id) => *column_id,
-            _ => agg
-                .output_columns
-                .get(idx)
-                .map(|output| output.column_id)
-                .filter(|id| *id != ColumnId::UNSET)
-                .unwrap_or_else(|| {
-                    group_key_output_column_id(arena, *expr, &name, &agg.output_columns)
-                }),
-        };
+        let layout_column = agg
+            .output_layout
+            .group_key_columns
+            .get(idx)
+            .filter(|output| output.column_id != ColumnId::UNSET);
+        let name = layout_column
+            .map(|output| output.name.clone())
+            .unwrap_or_else(|| scalar_expr::scalar_display_name(arena, *expr));
+        let column_id = layout_column
+            .map(|output| output.column_id)
+            .unwrap_or_else(|| {
+                group_key_output_column_id(
+                    arena,
+                    *expr,
+                    &name,
+                    &agg.output_layout.group_key_columns,
+                )
+            });
         OutputColumn {
             column_id,
             name,
             data_type: arena.data_type(*expr).clone(),
             nullable: arena.nullable(*expr),
-            is_internal: false,
+            is_internal: layout_column
+                .map(|output| output.is_internal)
+                .unwrap_or(false),
         }
     }));
     columns.extend(agg.aggregates.iter().enumerate().map(|(idx, call)| {
@@ -177,7 +198,7 @@ fn aggregate_output_column(
     agg: &LogicalAggregateOp,
     aggregate_idx: usize,
 ) -> Option<&OutputColumn> {
-    agg.output_columns.get(agg.group_by.len() + aggregate_idx)
+    agg.output_layout.aggregate_columns.get(aggregate_idx)
 }
 
 pub(crate) fn aggregate_group_key_output_ref(
@@ -257,8 +278,69 @@ mod tests {
             distinct,
             result_type: DataType::Int64,
             order_by: vec![],
-            output_column_id: ColumnId::UNSET,
+            output_column_id: ColumnId::new_for_test(3),
         }
+    }
+
+    fn aggregate_output_layout(
+        group_by: &[TypedExpr],
+        aggregates: &[AggregateCall],
+        output_columns: &[OutputColumn],
+    ) -> AggregateOutputLayout {
+        let group_key_columns = group_by
+            .iter()
+            .enumerate()
+            .map(|(idx, expr)| {
+                if let ExprKind::ColumnRef {
+                    column_id, column, ..
+                } = &expr.kind
+                {
+                    output_columns
+                        .iter()
+                        .find(|output| output.column_id == *column_id)
+                        .cloned()
+                        .unwrap_or_else(|| OutputColumn {
+                            column_id: *column_id,
+                            name: column.clone(),
+                            data_type: expr.data_type.clone(),
+                            nullable: expr.nullable,
+                            is_internal: false,
+                        })
+                } else {
+                    output_columns
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_else(|| OutputColumn {
+                            column_id: ColumnId::new_for_test(9000 + idx as u32),
+                            name: format!("group_{idx}"),
+                            data_type: expr.data_type.clone(),
+                            nullable: expr.nullable,
+                            is_internal: false,
+                        })
+                }
+            })
+            .collect();
+        let aggregate_columns = aggregates
+            .iter()
+            .enumerate()
+            .map(|(idx, aggregate)| {
+                let mut column = output_columns
+                    .iter()
+                    .find(|output| output.column_id == aggregate.output_column_id)
+                    .cloned()
+                    .or_else(|| output_columns.get(group_by.len() + idx).cloned())
+                    .unwrap_or_else(|| OutputColumn {
+                        column_id: aggregate.output_column_id,
+                        name: aggregate.name.clone(),
+                        data_type: aggregate.result_type.clone(),
+                        nullable: true,
+                        is_internal: false,
+                    });
+                column.column_id = aggregate.output_column_id;
+                column
+            })
+            .collect();
+        AggregateOutputLayout::new(group_key_columns, aggregate_columns)
     }
 
     fn single_agg(
@@ -267,9 +349,10 @@ mod tests {
         aggregates: Vec<AggregateCall>,
         output_columns: Vec<OutputColumn>,
     ) -> LogicalAggregateOp {
+        let output_layout = aggregate_output_layout(&group_by, &aggregates, &output_columns);
         let group_by = intern_exprs(&mut memo.scalars, &group_by);
         let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
-        LogicalAggregateOp::single(group_by, aggregates, output_columns)
+        LogicalAggregateOp::single(group_by, aggregates, output_layout, output_columns)
     }
 
     fn staged_agg(
@@ -281,12 +364,14 @@ mod tests {
         is_merge: Vec<bool>,
         is_split: bool,
     ) -> LogicalAggregateOp {
+        let output_layout = aggregate_output_layout(&group_by, &aggregates, &output_columns);
         let group_by = intern_exprs(&mut memo.scalars, &group_by);
         let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
         LogicalAggregateOp::staged(
             stage,
             group_by,
             aggregates,
+            output_layout,
             output_columns,
             is_merge,
             is_split,
@@ -395,6 +480,65 @@ mod tests {
     }
 
     #[test]
+    fn split_aggregate_preserves_layout_when_visible_group_key_is_pruned() {
+        let mut memo = Memo::new();
+        let group_output_id = ColumnId::new_for_test(101);
+        let sum_output_id = ColumnId::new_for_test(201);
+        let group = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")])[0];
+        let arg = intern_exprs(&mut memo.scalars, &[col_ref(2, "v")])[0];
+        let agg = LogicalAggregateOp::single(
+            vec![group],
+            vec![ScalarAggregateSpec {
+                output_column_id: sum_output_id,
+                name: "sum".to_string(),
+                args: vec![arg],
+                distinct: false,
+                order_by: vec![],
+            }],
+            AggregateOutputLayout::new(
+                vec![OutputColumn {
+                    column_id: group_output_id,
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+                vec![OutputColumn {
+                    column_id: sum_output_id,
+                    name: "sum(v)".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                }],
+            ),
+            vec![OutputColumn {
+                column_id: sum_output_id,
+                name: "sum(v)".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+        );
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(agg),
+            children: vec![values_group(&mut memo)],
+        };
+
+        let out = SplitAggregateRule.apply(&expr, &mut memo);
+
+        let Operator::LogicalAggregate(global) = &out[0].op else {
+            panic!("expected global aggregate");
+        };
+        assert_eq!(global.output_columns.len(), 1);
+        assert_eq!(global.output_columns[0].column_id, sum_output_id);
+        assert_eq!(
+            global.output_layout.group_key_columns[0].column_id,
+            group_output_id
+        );
+    }
+
+    #[test]
     fn repeated_apply_reuses_existing_local_group() {
         let mut memo = Memo::new();
         let expr = single_grouped_expr(&mut memo);
@@ -437,7 +581,7 @@ mod tests {
             distinct: false,
             result_type: arrow::datatypes::DataType::Float64,
             order_by: vec![],
-            output_column_id: ColumnId::UNSET,
+            output_column_id: ColumnId::new_for_test(3),
         }
     }
 

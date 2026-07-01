@@ -35,11 +35,12 @@ mod tests {
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggMode, AggregateStateMergeOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
-        DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, IntersectOp, JoinDistribution, LimitOp,
-        Operator, PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalHashJoinEqCondition,
-        PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp, ScanDictionaryColumn,
-        ScanOp, SortOp, TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
+        AggMode, AggregateOutputLayout, AggregateStateMergeOp, AssertOneRowOp, CTEAnchorOp,
+        CTEConsumeOp, CTEProduceOp, DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, IntersectOp,
+        JoinDistribution, LimitOp, Operator, PhysicalDistributionOp, PhysicalHashAggregateOp,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp,
+        RepeatOp, ScanDictionaryColumn, ScanOp, SortOp, TableFunctionOp, TopNOp, TopNPhase,
+        UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::physical_tree::{
         OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
@@ -2270,6 +2271,7 @@ mod tests {
                     &[column_ref_expr(1, "k", DataType::Int64, false)],
                 ),
                 aggregates: vec![],
+                output_layout: AggregateOutputLayout::new(vec![k.clone()], vec![]),
                 output_columns: vec![k.clone()],
                 is_merge: vec![],
             }),
@@ -2299,6 +2301,7 @@ mod tests {
                     &[column_ref_expr(1, "k", DataType::Int64, false)],
                 ),
                 aggregates: intern_aggregate_calls(&mut scalars, &aggregate_calls),
+                output_layout: AggregateOutputLayout::new(vec![k.clone()], vec![count.clone()]),
                 output_columns: vec![k.clone(), count.clone()],
                 is_merge: vec![false],
             }),

@@ -102,10 +102,10 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{ApplyKind, ImvVersionRef, JoinKind, LiteralValue, OutputColumn};
     use crate::sql::optimizer::operator::{
-        AggregateStateMergeOp, ApplyOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
-        DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp,
-        LimitOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScanOp, SortOp,
-        TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
+        AggregateOutputLayout, AggregateStateMergeOp, ApplyOp, AssertOneRowOp, CTEAnchorOp,
+        CTEConsumeOp, CTEProduceOp, DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp,
+        ImvVersionOp, IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp,
+        RepeatOp, ScanOp, SortOp, TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
 
@@ -160,7 +160,12 @@ mod tests {
                 OpKind::Filter,
             ),
             (
-                Operator::LogicalAggregate(LogicalAggregateOp::single(vec![], vec![], vec![])),
+                Operator::LogicalAggregate(LogicalAggregateOp::single(
+                    vec![],
+                    vec![],
+                    AggregateOutputLayout::new(vec![], vec![]),
+                    vec![],
+                )),
                 OpKind::Aggregate,
             ),
             (

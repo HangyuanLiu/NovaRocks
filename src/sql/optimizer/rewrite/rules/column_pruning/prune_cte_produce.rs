@@ -87,7 +87,9 @@ mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{CTEProduceOp, LogicalAggregateOp, Operator, ValuesOp};
+    use crate::sql::optimizer::operator::{
+        AggregateOutputLayout, CTEProduceOp, LogicalAggregateOp, Operator, ValuesOp,
+    };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use arrow::datatypes::DataType;
@@ -116,7 +118,12 @@ mod tests {
 
     fn aggregate_input(output_columns: Vec<OutputColumn>) -> OptExpr {
         OptExpr::new(
-            Operator::LogicalAggregate(LogicalAggregateOp::single(vec![], vec![], output_columns)),
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![],
+                AggregateOutputLayout::new(output_columns.clone(), vec![]),
+                output_columns,
+            )),
             vec![values_input(vec![])],
         )
     }

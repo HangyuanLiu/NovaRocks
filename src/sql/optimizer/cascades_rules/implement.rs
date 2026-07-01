@@ -617,6 +617,7 @@ impl Rule for AggToHashAgg {
                 mode: op.stage.to_physical_mode(),
                 group_by: op.group_by.clone(),
                 aggregates: op.aggregates.clone(),
+                output_layout: op.output_layout.clone(),
                 output_columns: op.output_columns.clone(),
                 is_merge: op.is_merge.clone(),
             }),
@@ -2239,7 +2240,7 @@ mod two_phase_agg_tests {
             distinct,
             result_type: DataType::Int64,
             order_by: vec![],
-            output_column_id: ColumnId::UNSET,
+            output_column_id: ColumnId::new_for_test(3),
         }
     }
 
@@ -2251,7 +2252,19 @@ mod two_phase_agg_tests {
     ) -> LogicalAggregateOp {
         let group_by = intern_exprs(&mut memo.scalars, &group_by);
         let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
-        LogicalAggregateOp::single(group_by, aggregates, output_columns)
+        let output_layout = AggregateOutputLayout::new(
+            output_columns
+                .iter()
+                .take(group_by.len())
+                .cloned()
+                .collect(),
+            output_columns
+                .iter()
+                .skip(group_by.len())
+                .cloned()
+                .collect(),
+        );
+        LogicalAggregateOp::single(group_by, aggregates, output_layout, output_columns)
     }
 
     fn staged_agg(
@@ -2265,10 +2278,23 @@ mod two_phase_agg_tests {
     ) -> LogicalAggregateOp {
         let group_by = intern_exprs(&mut memo.scalars, &group_by);
         let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        let output_layout = AggregateOutputLayout::new(
+            output_columns
+                .iter()
+                .take(group_by.len())
+                .cloned()
+                .collect(),
+            output_columns
+                .iter()
+                .skip(group_by.len())
+                .cloned()
+                .collect(),
+        );
         LogicalAggregateOp::staged(
             stage,
             group_by,
             aggregates,
+            output_layout,
             output_columns,
             is_merge,
             is_split,
@@ -2378,7 +2404,7 @@ mod two_phase_agg_tests {
                     distinct: true,
                     result_type: DataType::Int64,
                     order_by: vec![],
-                    output_column_id: ColumnId::UNSET,
+                    output_column_id: ColumnId::new_for_test(6),
                 }],
                 vec![
                     OutputColumn {

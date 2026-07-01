@@ -18,8 +18,8 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::cost::{CostInput, broadcast_decision, compute_cost_estimate};
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::operator::{
-    CTEAnchorOp, CTEConsumeOp, CTEProduceOp, LimitOp, Operator, PhysicalDistributionOp, TopNOp,
-    TopNPhase, UnionOp,
+    AggregateOutputLayout, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, LimitOp, Operator,
+    PhysicalDistributionOp, TopNOp, TopNPhase, UnionOp,
 };
 use crate::sql::optimizer::options::{OptimizerOptions, current_session_optimizer_settings};
 use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
@@ -314,10 +314,10 @@ impl<'a> DistributedPlanBuilder<'a> {
                         aggregates: materialize_aggregate_calls(
                             self.scalars,
                             &op.aggregates,
-                            op.group_by.len(),
-                            &op.output_columns,
+                            &op.output_layout,
                         ),
                         is_merge: op.is_merge.clone(),
+                        output_layout: op.output_layout.clone(),
                         output_columns: op.output_columns.clone(),
                     })),
                 })
@@ -1125,6 +1125,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                 group_by,
                 aggregates: Vec::new(),
                 is_merge: Vec::new(),
+                output_layout: AggregateOutputLayout::new(output_columns.to_vec(), Vec::new()),
                 output_columns: output_columns.to_vec(),
             })),
         })

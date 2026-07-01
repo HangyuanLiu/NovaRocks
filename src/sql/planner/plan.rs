@@ -15,7 +15,9 @@ use crate::sql::column_id::ColumnId;
 pub(crate) use crate::sql::common::{
     ApplyKind, DecodeMapping, ScanDictionaryColumn, ScanVariantColumn,
 };
-use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
+use crate::sql::optimizer::operator::{
+    AggMode, AggregateOutputLayout, JoinDistribution, TopNPhase,
+};
 use crate::sql::optimizer::property::HashSource;
 
 // ---------------------------------------------------------------------------
@@ -282,6 +284,7 @@ pub(crate) struct PhysicalHashAggregateNode {
     pub group_by: Vec<TypedExpr>,
     pub aggregates: Vec<AggregateCall>,
     pub is_merge: Vec<bool>,
+    pub output_layout: AggregateOutputLayout,
     pub output_columns: Vec<OutputColumn>,
 }
 

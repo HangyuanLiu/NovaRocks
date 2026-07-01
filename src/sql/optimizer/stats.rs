@@ -2435,6 +2435,7 @@ mod tests {
     };
     use crate::sql::optimizer::estimate::selectivity::estimate_selectivity;
     use crate::sql::optimizer::memo::Memo;
+    use crate::sql::optimizer::operator::AggregateOutputLayout;
     use crate::sql::optimizer::stats_input::{
         BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue,
         StatsMissingReason, StatsRef, StatsSource,
@@ -2990,7 +2991,7 @@ mod tests {
                 distinct: false,
                 result_type: arrow::datatypes::DataType::Int64,
                 order_by: vec![],
-                output_column_id: ColumnId::UNSET,
+                output_column_id: ColumnId::new_for_test(3),
             }
         }
 
@@ -3030,13 +3031,16 @@ mod tests {
         ) -> MExpr {
             let group_by = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]);
             let aggregates = intern_aggregate_calls(&mut memo.scalars, &[count_call()]);
+            let output_columns = vec![output_column(1, "k"), output_column(3, "count(v)")];
+            let output_layout = full_aggregate_output_layout(group_by.len(), &output_columns);
             MExpr {
                 id: memo.next_expr_id(),
                 op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
                     stage,
                     group_by,
                     aggregates,
-                    vec![output_column(1, "k"), output_column(3, "count(v)")],
+                    output_layout,
+                    output_columns,
                     is_merge,
                     is_split,
                 )),
@@ -3044,12 +3048,18 @@ mod tests {
             }
         }
 
+        let single_group_by = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]);
+        let single_aggregates = intern_aggregate_calls(&mut memo.scalars, &[count_call()]);
+        let single_output_columns = vec![output_column(1, "k"), output_column(3, "count(v)")];
+        let single_output_layout =
+            full_aggregate_output_layout(single_group_by.len(), &single_output_columns);
         let single = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-                intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]),
-                intern_aggregate_calls(&mut memo.scalars, &[count_call()]),
-                vec![output_column(1, "k"), output_column(3, "count(v)")],
+                single_group_by,
+                single_aggregates,
+                single_output_layout,
+                single_output_columns,
             )),
             children: vec![child_group],
         };
@@ -3429,6 +3439,21 @@ mod tests {
         ]
     }
 
+    fn full_aggregate_output_layout(
+        group_by_len: usize,
+        output_columns: &[OutputColumn],
+    ) -> AggregateOutputLayout {
+        AggregateOutputLayout::new(
+            output_columns.iter().take(group_by_len).cloned().collect(),
+            output_columns.iter().skip(group_by_len).cloned().collect(),
+        )
+    }
+
+    fn aggregate_output_layout() -> AggregateOutputLayout {
+        let output_columns = aggregate_output_columns();
+        full_aggregate_output_layout(aggregate_group_keys().len(), &output_columns)
+    }
+
     #[test]
     fn logical_aggregate_stats_use_damped_group_ndv_and_child_confidence() {
         use crate::sql::optimizer::operator::{LogicalAggregateOp, Operator};
@@ -3446,6 +3471,7 @@ mod tests {
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
                 aggregate_group_key_ids(&mut memo),
                 vec![],
+                aggregate_output_layout(),
                 aggregate_output_columns(),
             )),
             children: vec![exact_child],
@@ -3455,6 +3481,7 @@ mod tests {
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
                 aggregate_group_key_ids(&mut memo),
                 vec![],
+                aggregate_output_layout(),
                 aggregate_output_columns(),
             )),
             children: vec![fallback_child],
@@ -3487,6 +3514,7 @@ mod tests {
                 mode: AggMode::Single,
                 group_by: aggregate_group_key_ids(&mut memo),
                 aggregates: vec![],
+                output_layout: aggregate_output_layout(),
                 output_columns: aggregate_output_columns(),
                 is_merge: vec![],
             }),
@@ -3498,6 +3526,7 @@ mod tests {
                 mode: AggMode::Single,
                 group_by: aggregate_group_key_ids(&mut memo),
                 aggregates: vec![],
+                output_layout: aggregate_output_layout(),
                 output_columns: aggregate_output_columns(),
                 is_merge: vec![],
             }),
@@ -3528,6 +3557,7 @@ mod tests {
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
                 aggregate_group_key_ids(&mut memo),
                 vec![],
+                aggregate_output_layout(),
                 aggregate_output_columns(),
             )),
             children: vec![child],
@@ -3538,6 +3568,7 @@ mod tests {
                 mode: AggMode::Single,
                 group_by: aggregate_group_key_ids(&mut memo),
                 aggregates: vec![],
+                output_layout: aggregate_output_layout(),
                 output_columns: aggregate_output_columns(),
                 is_merge: vec![],
             }),
@@ -3580,6 +3611,7 @@ mod tests {
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
                 vec![],
                 vec![],
+                AggregateOutputLayout::new(vec![stats_output_column(4, "count(*)")], vec![]),
                 vec![stats_output_column(4, "count(*)")],
             )),
             children: vec![child],
@@ -3590,6 +3622,10 @@ mod tests {
                 mode: AggMode::Single,
                 group_by: vec![],
                 aggregates: vec![],
+                output_layout: AggregateOutputLayout::new(
+                    vec![stats_output_column(4, "count(*)")],
+                    vec![],
+                ),
                 output_columns: vec![stats_output_column(4, "count(*)")],
                 is_merge: vec![],
             }),
@@ -3664,13 +3700,15 @@ mod tests {
         }
         fn agg_over(child: usize, memo: &mut Memo) -> MExpr {
             let group_by = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]);
+            let output_columns = vec![output_column(1, "k")];
             MExpr {
                 id: memo.next_expr_id(), // id is irrelevant to derive_statistics
                 op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                     mode: AggMode::Single,
                     group_by,
                     aggregates: vec![],
-                    output_columns: vec![output_column(1, "k")],
+                    output_layout: AggregateOutputLayout::new(output_columns.clone(), vec![]),
+                    output_columns,
                     is_merge: vec![],
                 }),
                 children: vec![child],

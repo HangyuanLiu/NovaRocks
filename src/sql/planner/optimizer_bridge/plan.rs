@@ -1,11 +1,11 @@
 //! Conversion between `LogicalPlanNode` and `OptExpr`.
 
-use crate::sql::analysis::SortItem;
+use crate::sql::analysis::{OutputColumn, SortItem};
 use crate::sql::optimizer::operator::{
-    AggregateStateMergeOp, ApplyOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
-    DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp, LimitOp,
-    LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScanOp, SortOp,
-    TableFunctionOp, UnionOp, ValuesOp, WindowOp,
+    AggregateOutputLayout, AggregateStateMergeOp, ApplyOp, AssertOneRowOp, CTEAnchorOp,
+    CTEConsumeOp, CTEProduceOp, DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp,
+    ImvVersionOp, IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp,
+    RepeatOp, ScalarAggregateSpec, ScanOp, SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::ScalarArena;
@@ -38,6 +38,47 @@ pub(crate) fn logical_plan_to_opt_expr(
     scalars: &mut ScalarArena,
 ) -> OptExpr {
     try_logical_plan_to_opt_expr(plan, scalars).expect("invalid logical plan stage")
+}
+
+fn aggregate_output_layout_from_plan(
+    group_by_len: usize,
+    aggregates: &[ScalarAggregateSpec],
+    output_columns: &[OutputColumn],
+) -> AggregateOutputLayout {
+    assert!(
+        output_columns.len() >= aggregates.len(),
+        "planner Aggregate output_columns must contain aggregate outputs"
+    );
+    let aggregate_output_ids: Vec<_> = aggregates
+        .iter()
+        .map(|aggregate| aggregate.output_column_id)
+        .collect();
+    let group_key_columns: Vec<_> = output_columns
+        .iter()
+        .filter(|column| !aggregate_output_ids.contains(&column.column_id))
+        .take(group_by_len)
+        .cloned()
+        .collect();
+    assert!(
+        group_key_columns.len() == group_by_len,
+        "planner Aggregate output_columns must contain group key outputs"
+    );
+    let aggregate_columns = aggregates
+        .iter()
+        .map(|aggregate| {
+            output_columns
+                .iter()
+                .find(|column| column.column_id == aggregate.output_column_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "aggregate output column id {} missing from planner Aggregate.output_columns",
+                        aggregate.output_column_id.0
+                    )
+                })
+                .clone()
+        })
+        .collect();
+    AggregateOutputLayout::new(group_key_columns, aggregate_columns)
 }
 
 fn logical_plan_to_opt_expr_unchecked(
@@ -88,13 +129,19 @@ fn logical_plan_to_opt_expr_unchecked(
         LogicalPlanKind::Aggregate(node) => {
             let child = logical_plan_to_opt_expr_unchecked(plan.unary_input(), scalars);
             let group_by = intern_exprs(scalars, &node.group_by);
-            for (scalar_id, output) in group_by.iter().zip(node.output_columns.iter()) {
+            let aggregates = intern_aggregate_calls(scalars, &node.aggregates);
+            let output_layout = aggregate_output_layout_from_plan(
+                node.group_by.len(),
+                &aggregates,
+                &node.output_columns,
+            );
+            for (scalar_id, output) in group_by.iter().zip(output_layout.group_key_columns.iter()) {
                 scalars.remember_column_display_from_scalar(output.column_id, *scalar_id);
             }
-            let aggregates = intern_aggregate_calls(scalars, &node.aggregates);
             let op = Operator::LogicalAggregate(LogicalAggregateOp::single(
                 group_by,
                 aggregates,
+                output_layout,
                 node.output_columns.clone(),
             ));
             OptExpr::new(op, vec![child])
@@ -396,12 +443,7 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
         }),
         Operator::LogicalAggregate(op) => {
             let group_by = materialize_exprs(arena, &op.group_by);
-            let aggregates = materialize_aggregate_calls(
-                arena,
-                &op.aggregates,
-                op.group_by.len(),
-                &op.output_columns,
-            );
+            let aggregates = materialize_aggregate_calls(arena, &op.aggregates, &op.output_layout);
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by,
                 aggregates,

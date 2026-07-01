@@ -205,25 +205,13 @@ fn apply_query_modifiers(
                         // `substr`/`substring` alias, where the SELECT output name keeps
                         // the SQL-text spelling but the analyzed expr canonicalizes the
                         // function name) keep a raw expression over the aggregate's
-                        // *input* columns. Rewrite them to reference the group-key output
-                        // columns, exactly as split_projection_for_aggregate does for
-                        // SELECT/HAVING (group keys occupy the first group_by.len() output
-                        // columns of the aggregate). Without this the post-aggregate
-                        // Project re-derives the group key from a pre-aggregate column
-                        // that the id-binding verifier rejects as "not produced by child
-                        // scope".
-                        let gb_targets: Vec<GroupByRewriteTarget> = agg
-                            .group_by
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, gb)| {
-                                agg.output_columns.get(i).map(|oc| GroupByRewriteTarget {
-                                    expr: gb.clone(),
-                                    column_id: oc.column_id,
-                                    display_name: typed_expr_display_name(gb),
-                                })
-                            })
-                            .collect();
+                        // *input* columns. Rewrite them to reference the planner
+                        // aggregate's group-key layout, exactly as
+                        // split_projection_for_aggregate does for SELECT/HAVING.
+                        // Without this the post-aggregate Project re-derives the group
+                        // key from a pre-aggregate column that the id-binding verifier
+                        // rejects as "not produced by child scope".
+                        let gb_targets = planner_aggregate_group_by_targets(agg);
                         for extra in &mut extra_items {
                             extra.expr = rewrite_agg_calls_to_refs(&extra.expr, &agg.aggregates);
                             extra.expr = rewrite_group_by_expr_refs(&extra.expr, &gb_targets);
@@ -2259,6 +2247,29 @@ fn ensure_aggregate_output_columns(agg: &mut LogicalAggregateNode) {
     }
 }
 
+fn planner_aggregate_group_by_targets(agg: &LogicalAggregateNode) -> Vec<GroupByRewriteTarget> {
+    let aggregate_output_ids: std::collections::HashSet<ColumnId> = agg
+        .aggregates
+        .iter()
+        .map(|call| call.output_column_id)
+        .filter(|id| *id != ColumnId::UNSET)
+        .collect();
+    let group_key_outputs = agg
+        .output_columns
+        .iter()
+        .filter(|column| !aggregate_output_ids.contains(&column.column_id));
+
+    agg.group_by
+        .iter()
+        .zip(group_key_outputs)
+        .map(|(gb, output_column)| GroupByRewriteTarget {
+            expr: gb.clone(),
+            column_id: output_column.column_id,
+            display_name: typed_expr_display_name(gb),
+        })
+        .collect()
+}
+
 fn group_by_output_column(
     group_by: &TypedExpr,
     projection: &[ProjectItem],
@@ -3893,6 +3904,55 @@ mod tests {
             panic!("expected ColumnRef, got {:?}", expr.kind);
         };
         *column_id
+    }
+
+    #[test]
+    fn planner_group_by_targets_ignore_aggregate_public_output_order() {
+        fn col(id: u32, name: &str) -> TypedExpr {
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(id),
+                    qualifier: None,
+                    column: name.to_string(),
+                },
+                data_type: DataType::Int64,
+                nullable: false,
+            }
+        }
+
+        fn output(id: u32, name: &str) -> OutputColumn {
+            OutputColumn {
+                column_id: ColumnId(id),
+                name: name.to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }
+        }
+
+        let aggregate = LogicalAggregateNode {
+            group_by: vec![col(1, "k"), col(2, "region")],
+            aggregates: vec![AggregateCall {
+                name: "sum".to_string(),
+                args: Vec::new(),
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: Vec::new(),
+                output_column_id: ColumnId(30),
+            }],
+            output_columns: vec![output(30, "sum(v)"), output(1, "k"), output(2, "region")],
+            already_pushed: false,
+        };
+
+        let targets = planner_aggregate_group_by_targets(&aggregate);
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId(1), ColumnId(2)]
+        );
     }
 
     fn root_project_over_window(

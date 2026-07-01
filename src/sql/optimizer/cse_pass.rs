@@ -1201,10 +1201,10 @@ mod tests {
     use crate::sql::common::OutputColumn;
     use crate::sql::common::{BinOp, JoinKind, LiteralValue};
     use crate::sql::optimizer::operator::{
-        AggMode, FilterOp, JoinDistribution, Operator, PhysicalDistributionOp,
-        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
-        PhysicalNestLoopJoinOp, ProjectOp, RepeatOp, ScalarAggregateSpec, ScalarProjectItem,
-        ScalarWindowSpec, SortOp, TopNOp, TopNPhase, ValuesOp, WindowOp,
+        AggMode, AggregateOutputLayout, FilterOp, JoinDistribution, Operator,
+        PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalHashJoinEqCondition,
+        PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp, ScalarAggregateSpec,
+        ScalarProjectItem, ScalarWindowSpec, SortOp, TopNOp, TopNPhase, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
     use crate::sql::optimizer::property::DistributionSpec;
@@ -2466,18 +2466,24 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(201),
                         name: "sum".to_string(),
                         args: vec![a_mul_b],
                         distinct: false,
                         order_by: vec![],
                     },
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(202),
                         name: "avg".to_string(),
                         args: vec![a_mul_b],
                         distinct: false,
                         order_by: vec![],
                     },
                 ],
+                output_layout: AggregateOutputLayout::new(
+                    vec![],
+                    vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
+                ),
                 output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
                 is_merge: vec![false, false],
             }),
@@ -2560,18 +2566,27 @@ mod tests {
                 group_by: vec![a, grouping],
                 aggregates: vec![
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(201),
                         name: "sum".to_string(),
                         args: vec![a_plus_b],
                         distinct: false,
                         order_by: vec![],
                     },
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(202),
                         name: "avg".to_string(),
                         args: vec![a_plus_b],
                         distinct: false,
                         order_by: vec![],
                     },
                 ],
+                output_layout: AggregateOutputLayout::new(
+                    vec![
+                        output_column(101, "a"),
+                        output_column(109, "__grouping_fn_0"),
+                    ],
+                    vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
+                ),
                 output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
                 is_merge: vec![false, false],
             }),
@@ -2623,18 +2638,24 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(201),
                         name: "sum".to_string(),
                         args: vec![a_mul_b],
                         distinct: false,
                         order_by: vec![],
                     },
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(202),
                         name: "avg".to_string(),
                         args: vec![a_mul_b],
                         distinct: false,
                         order_by: vec![],
                     },
                 ],
+                output_layout: AggregateOutputLayout::new(
+                    vec![],
+                    vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
+                ),
                 output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
                 is_merge: vec![true, true],
             }),
@@ -2671,18 +2692,27 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(201),
                         name: "array_agg".to_string(),
                         args: vec![a],
                         distinct: false,
                         order_by: vec![sort_key(a_mul_b)],
                     },
                     ScalarAggregateSpec {
+                        output_column_id: ColumnId::new_for_test(202),
                         name: "array_agg".to_string(),
                         args: vec![b],
                         distinct: false,
                         order_by: vec![sort_key(a_mul_b)],
                     },
                 ],
+                output_layout: AggregateOutputLayout::new(
+                    vec![],
+                    vec![
+                        output_column(201, "ordered_a"),
+                        output_column(202, "ordered_b"),
+                    ],
+                ),
                 output_columns: vec![
                     output_column(201, "ordered_a"),
                     output_column(202, "ordered_b"),

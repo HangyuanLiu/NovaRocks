@@ -352,20 +352,18 @@ mod tests {
     // Test 4 (ported from old column_pruning.rs):
     //   Aggregate[group_by=[b], sum(c)] → Scan[a,b,c]
     //   After pipeline:
-    //   - When Aggregate is the root (parent_needed=None), the conservative
-    //     tag_aggregate propagates None to the child, so Scan keeps all columns
-    //     (required_columns=None) — pruning is not possible without a parent
-    //     constraint.
+    //   - When Aggregate is the root (parent_needed=None), tag_aggregate
+    //     propagates None to the child, so Scan keeps all columns
+    //     (required_columns=None) — pruning is not possible without a parent constraint.
     //   - When a Project wraps the Aggregate and selects only some outputs,
     //     the Project provides a non-None parent_needed which tag_aggregate
-    //     receives as Some(_).  In that case the conservative strategy still
-    //     passes child_needed = ALL group-by + ALL agg args, so the Scan gets
-    //     required_output_columns = Some({b, c}) and PruneScanColumns sets
-    //     required_columns = ["b", "c"].
+    //     receives as Some(_).  In that case Task 3 requires only group-by
+    //     inputs and selected aggregate inputs to remain needed, so selecting
+    //     only the group key prunes the aggregate arg from Scan.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn aggregate_group_by_and_agg_args_propagate_to_scan() {
+    fn aggregate_group_key_prunes_unselected_agg_arg_from_scan() {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
@@ -383,7 +381,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: vec![],
-                    output_column_id: ColumnId::UNSET,
+                    output_column_id: out_sum,
                 }],
                 output_columns: vec![
                     OutputColumn {
@@ -409,7 +407,7 @@ mod tests {
 
         // Wrap in a Project that selects only out_b (b) so tag_project provides
         // a non-None parent_needed to tag_aggregate. tag_aggregate then passes
-        // child_needed = ALL group-by ∪ ALL agg args = {b@2, c@3} to the Scan.
+        // only the selected group-key dependency {b@2} to the Scan.
         let proj = LogicalPlanNode::new(
             LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
@@ -432,12 +430,12 @@ mod tests {
         let req_set: std::collections::HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
         assert!(req_set.contains("b"), "b must be kept (group_by)");
         assert!(
-            req_set.contains("c"),
-            "c must be kept (agg arg, conservative keep-all)"
+            !req_set.contains("c"),
+            "c must be pruned (unselected aggregate arg)"
         );
         assert!(
             !req_set.contains("a"),
-            "a must be pruned (not referenced by group_by or agg args)"
+            "a must be pruned (not referenced by selected group key)"
         );
     }
 }

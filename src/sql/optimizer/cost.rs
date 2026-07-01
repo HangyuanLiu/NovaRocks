@@ -2212,6 +2212,7 @@ mod tests {
             mode: AggMode::Single,
             group_by: vec![],
             aggregates: vec![],
+            output_layout: AggregateOutputLayout::new(vec![], vec![]),
             output_columns: vec![],
             is_merge: vec![],
         });
@@ -2243,6 +2244,7 @@ mod tests {
             mode: AggMode::Single,
             group_by: vec![],
             aggregates: vec![],
+            output_layout: AggregateOutputLayout::new(vec![], vec![]),
             output_columns: vec![],
             is_merge: vec![],
         });
@@ -3139,6 +3141,7 @@ mod tests {
             mode: AggMode::Single,
             group_by: vec![],
             aggregates: vec![],
+            output_layout: AggregateOutputLayout::new(vec![], vec![]),
             output_columns: vec![],
             is_merge: vec![],
         });
@@ -3146,6 +3149,7 @@ mod tests {
             mode: AggMode::Local,
             group_by: vec![],
             aggregates: vec![],
+            output_layout: AggregateOutputLayout::new(vec![], vec![]),
             output_columns: vec![],
             is_merge: vec![],
         });
@@ -3162,6 +3166,7 @@ mod tests {
             mode: AggMode::Single,
             group_by: vec![],
             aggregates: vec![],
+            output_layout: AggregateOutputLayout::new(vec![], vec![]),
             output_columns: vec![],
             is_merge: vec![],
         });
@@ -3169,6 +3174,7 @@ mod tests {
             mode: AggMode::Local,
             group_by: vec![],
             aggregates: vec![],
+            output_layout: AggregateOutputLayout::new(vec![], vec![]),
             output_columns: vec![],
             is_merge: vec![],
         });
@@ -3176,6 +3182,7 @@ mod tests {
             mode: AggMode::Global,
             group_by: vec![],
             aggregates: vec![],
+            output_layout: AggregateOutputLayout::new(vec![], vec![]),
             output_columns: vec![],
             is_merge: vec![],
         });

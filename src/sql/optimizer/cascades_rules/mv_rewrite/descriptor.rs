@@ -209,27 +209,31 @@ impl SpjgDescriptor {
                     .map(|c| substitute_aggregate(arena, c, &defs))
                     .collect::<Option<Vec<_>>>()
                     .ok_or_else(|| "unsupported aggregate order_by in MV rewrite".to_string())?;
-                // Aggregate output convention: [group keys..., agg results...]
-                if a.output_columns.len() != a.group_by.len() + a.aggregates.len() {
+                if a.output_layout.group_key_columns.len() != a.group_by.len()
+                    || a.output_layout.aggregate_columns.len() != a.aggregates.len()
+                {
                     return Err(format!(
-                        "aggregate output layout {} != group_by {} + aggs {}",
-                        a.output_columns.len(),
+                        "aggregate output layout mismatch: group_keys {} != group_by {}, aggregate_columns {} != aggs {}",
+                        a.output_layout.group_key_columns.len(),
                         a.group_by.len(),
+                        a.output_layout.aggregate_columns.len(),
                         a.aggregates.len()
                     ));
                 }
                 // Binding map at the aggregate's outputs.
                 let mut agg_outputs: Vec<SpjgOutput> = Vec::new();
-                for (i, oc) in a.output_columns.iter().enumerate() {
-                    let expr = if i < a.group_by.len() {
-                        SpjgOutputExpr::Dimension(group_by[i])
-                    } else {
-                        SpjgOutputExpr::Aggregate(aggregates[i - a.group_by.len()].clone())
-                    };
+                for (idx, oc) in a.output_layout.group_key_columns.iter().enumerate() {
                     agg_outputs.push(SpjgOutput {
                         name: oc.name.clone(),
                         column_id: oc.column_id,
-                        expr,
+                        expr: SpjgOutputExpr::Dimension(group_by[idx]),
+                    });
+                }
+                for (idx, oc) in a.output_layout.aggregate_columns.iter().enumerate() {
+                    agg_outputs.push(SpjgOutput {
+                        name: oc.name.clone(),
+                        column_id: oc.column_id,
+                        expr: SpjgOutputExpr::Aggregate(aggregates[idx].clone()),
                     });
                 }
                 let outputs = apply_top_project(arena, top_project, agg_outputs)?;
@@ -348,20 +352,24 @@ impl SpjgDescriptor {
                     .iter()
                     .map(|c| substitute_aggregate(&mut memo.scalars, c, &defs))
                     .collect::<Option<Vec<_>>>()?;
-                if a.output_columns.len() != a.group_by.len() + a.aggregates.len() {
+                if a.output_layout.group_key_columns.len() != a.group_by.len()
+                    || a.output_layout.aggregate_columns.len() != a.aggregates.len()
+                {
                     return None;
                 }
                 let mut agg_outputs: Vec<SpjgOutput> = Vec::new();
-                for (i, oc) in a.output_columns.iter().enumerate() {
-                    let out_expr = if i < a.group_by.len() {
-                        SpjgOutputExpr::Dimension(group_by[i])
-                    } else {
-                        SpjgOutputExpr::Aggregate(aggregates[i - a.group_by.len()].clone())
-                    };
+                for (idx, oc) in a.output_layout.group_key_columns.iter().enumerate() {
                     agg_outputs.push(SpjgOutput {
                         name: oc.name.clone(),
                         column_id: oc.column_id,
-                        expr: out_expr,
+                        expr: SpjgOutputExpr::Dimension(group_by[idx]),
+                    });
+                }
+                for (idx, oc) in a.output_layout.aggregate_columns.iter().enumerate() {
+                    agg_outputs.push(SpjgOutput {
+                        name: oc.name.clone(),
+                        column_id: oc.column_id,
+                        expr: SpjgOutputExpr::Aggregate(aggregates[idx].clone()),
                     });
                 }
                 (
@@ -515,6 +523,7 @@ fn substitute_aggregate(
         return None;
     }
     Some(ScalarAggregateSpec {
+        output_column_id: call.output_column_id,
         name: call.name.clone(),
         args: call
             .args
@@ -1726,7 +1735,9 @@ mod tests {
 
     #[test]
     fn from_memo_rejects_split_aggregate() {
-        use crate::sql::optimizer::operator::{LogicalAggregateOp, Operator};
+        use crate::sql::optimizer::operator::{
+            AggregateOutputLayout, LogicalAggregateOp, Operator,
+        };
         use crate::sql::planner::optimizer_bridge::scalar::{intern_aggregate_calls, intern_exprs};
         // A split (Local) aggregate is not the original Single shape and must
         // be rejected even when it sits at the matched position.
@@ -1754,11 +1765,25 @@ mod tests {
                 output_column_id: sum_out.column_id,
             }],
         );
+        let output_columns = vec![col(1, "a"), sum_out.clone()];
+        let output_layout = AggregateOutputLayout::new(
+            output_columns
+                .iter()
+                .take(group_by.len())
+                .cloned()
+                .collect(),
+            output_columns
+                .iter()
+                .skip(group_by.len())
+                .cloned()
+                .collect(),
+        );
         let split = LogicalAggregateOp::staged(
             AggStage::Local,
             group_by,
             aggregates,
-            vec![col(1, "a"), sum_out.clone()],
+            output_layout,
+            output_columns,
             vec![false],
             true,
         );
