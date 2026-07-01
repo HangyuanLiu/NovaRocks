@@ -20,6 +20,10 @@ use crate::sql::planner::plan::{
     ExchangeFlavor, PhysicalHashAggregateNode, PhysicalPlanKind, PhysicalPlanNode,
     PhysicalSetOpNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
 };
+use crate::sql::planner::{
+    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, WiredRuntimeFilterBuild,
+    WiredRuntimeFilterProbe,
+};
 use crate::thrift::partitions;
 
 #[derive(Clone, Debug)]
@@ -53,6 +57,8 @@ pub(crate) fn build_distributed_plan_v2(
         completed_fragments: Vec::new(),
         edges: Vec::new(),
         cte_fragments: HashMap::new(),
+        rf_build_intents: Vec::new(),
+        rf_probe_intents: Vec::new(),
     };
     let root_fragment_id = builder.alloc_fragment_id();
     let root_plan = if let PhysicalPlanKind::Redistribute(redistribute) = &plan.kind {
@@ -74,6 +80,8 @@ pub(crate) fn build_distributed_plan_v2(
     let root_cte_exchange_nodes = collect_cte_exchange_nodes(&root);
 
     let mut fragments = builder.completed_fragments;
+    let rf_build_intents = builder.rf_build_intents;
+    let rf_probe_intents = builder.rf_probe_intents;
     fragments.push(PlanFragmentV2 {
         fragment_id: root_fragment_id,
         root,
@@ -85,6 +93,7 @@ pub(crate) fn build_distributed_plan_v2(
         cte_id: None,
         cte_exchange_nodes: root_cte_exchange_nodes,
     });
+    wire_runtime_filters(&mut fragments, &rf_build_intents, &rf_probe_intents);
 
     Ok(DistributedPlanV2 {
         fragments,
@@ -101,6 +110,20 @@ struct DistributedPlanBuilderV2 {
     completed_fragments: Vec<PlanFragmentV2>,
     edges: Vec<FragmentEdge>,
     cte_fragments: HashMap<CteId, usize>,
+    rf_build_intents: Vec<RuntimeFilterBuildBinding>,
+    rf_probe_intents: Vec<RuntimeFilterProbeBinding>,
+}
+
+struct RuntimeFilterBuildBinding {
+    node_id: i32,
+    fragment_id: FragmentId,
+    intent: RuntimeFilterBuildIntent,
+}
+
+struct RuntimeFilterProbeBinding {
+    node_id: i32,
+    fragment_id: FragmentId,
+    intent: RuntimeFilterProbeIntent,
 }
 
 impl DistributedPlanBuilderV2 {
@@ -162,6 +185,11 @@ impl DistributedPlanBuilderV2 {
                             .cloned(),
                     );
                     child.stats = node.stats.clone();
+                    self.record_probe_runtime_filter_intents(
+                        child.node_id,
+                        child.fragment_id,
+                        &node.probe_runtime_filters,
+                    );
                     Ok(child)
                 } else {
                     let node_id = self.alloc_node();
@@ -333,7 +361,7 @@ impl DistributedPlanBuilderV2 {
     }
 
     fn make_node(
-        &self,
+        &mut self,
         node: &PhysicalPlanNode,
         fragment_id: FragmentId,
         node_id: i32,
@@ -351,7 +379,7 @@ impl DistributedPlanBuilderV2 {
     }
 
     fn make_node_with_payload(
-        &self,
+        &mut self,
         node: &PhysicalPlanNode,
         fragment_id: FragmentId,
         node_id: i32,
@@ -359,6 +387,7 @@ impl DistributedPlanBuilderV2 {
         children: Vec<DistributedNode>,
         payload: PhysicalPlanKind,
     ) -> DistributedNode {
+        self.record_runtime_filter_intents(node, node_id, fragment_id, &payload);
         DistributedNode {
             node_id,
             fragment_id,
@@ -370,6 +399,40 @@ impl DistributedPlanBuilderV2 {
             children,
             stats: node.stats.clone(),
             payload: DistributedPayload::Physical(payload),
+        }
+    }
+
+    fn record_runtime_filter_intents(
+        &mut self,
+        node: &PhysicalPlanNode,
+        node_id: i32,
+        fragment_id: FragmentId,
+        payload: &PhysicalPlanKind,
+    ) {
+        self.record_probe_runtime_filter_intents(node_id, fragment_id, &node.probe_runtime_filters);
+        if let PhysicalPlanKind::HashJoin(join) = payload {
+            for intent in &join.build_runtime_filters {
+                self.rf_build_intents.push(RuntimeFilterBuildBinding {
+                    node_id,
+                    fragment_id,
+                    intent: intent.clone(),
+                });
+            }
+        }
+    }
+
+    fn record_probe_runtime_filter_intents(
+        &mut self,
+        node_id: i32,
+        fragment_id: FragmentId,
+        intents: &[RuntimeFilterProbeIntent],
+    ) {
+        for intent in intents {
+            self.rf_probe_intents.push(RuntimeFilterProbeBinding {
+                node_id,
+                fragment_id,
+                intent: intent.clone(),
+            });
         }
     }
 
@@ -1011,6 +1074,92 @@ fn collect_cte_exchange_nodes_inner(
     }
 }
 
+fn wire_runtime_filters(
+    fragments: &mut [PlanFragmentV2],
+    build_bindings: &[RuntimeFilterBuildBinding],
+    probe_bindings: &[RuntimeFilterProbeBinding],
+) {
+    let mut source_fragment_by_filter = HashMap::new();
+    for build in build_bindings {
+        source_fragment_by_filter
+            .entry(build.intent.filter_id)
+            .or_insert(build.fragment_id);
+    }
+
+    let mut target_fragments_by_filter: HashMap<i32, Vec<FragmentId>> = HashMap::new();
+    for probe in probe_bindings {
+        if !source_fragment_by_filter.contains_key(&probe.intent.filter_id) {
+            continue;
+        }
+        let targets = target_fragments_by_filter
+            .entry(probe.intent.filter_id)
+            .or_default();
+        if !targets.contains(&probe.fragment_id) {
+            targets.push(probe.fragment_id);
+        }
+    }
+
+    let mut builds_by_node: HashMap<i32, Vec<WiredRuntimeFilterBuild>> = HashMap::new();
+    for build in build_bindings {
+        let target_fragment_ids = target_fragments_by_filter
+            .get(&build.intent.filter_id)
+            .cloned()
+            .unwrap_or_default();
+        builds_by_node
+            .entry(build.node_id)
+            .or_default()
+            .push(WiredRuntimeFilterBuild {
+                filter_id: build.intent.filter_id,
+                build_expr: build.intent.build_expr.clone(),
+                probe_expr: build.intent.probe_expr.clone(),
+                expr_order: build.intent.expr_order,
+                execution_mode: build.intent.execution_mode,
+                source_fragment_id: build.fragment_id,
+                target_fragment_ids,
+            });
+    }
+
+    let mut probes_by_node: HashMap<i32, Vec<WiredRuntimeFilterProbe>> = HashMap::new();
+    for probe in probe_bindings {
+        let Some(&source_fragment_id) = source_fragment_by_filter.get(&probe.intent.filter_id)
+        else {
+            continue;
+        };
+        let probes = probes_by_node.entry(probe.node_id).or_default();
+        if probes
+            .iter()
+            .any(|wired| wired.filter_id == probe.intent.filter_id)
+        {
+            continue;
+        }
+        probes.push(WiredRuntimeFilterProbe {
+            filter_id: probe.intent.filter_id,
+            probe_expr: probe.intent.probe_expr.clone(),
+            source_fragment_id,
+        });
+    }
+
+    for fragment in fragments {
+        wire_runtime_filters_in_node(&mut fragment.root, &mut builds_by_node, &mut probes_by_node);
+    }
+}
+
+fn wire_runtime_filters_in_node(
+    node: &mut DistributedNode,
+    builds_by_node: &mut HashMap<i32, Vec<WiredRuntimeFilterBuild>>,
+    probes_by_node: &mut HashMap<i32, Vec<WiredRuntimeFilterProbe>>,
+) {
+    if let Some(mut builds) = builds_by_node.remove(&node.node_id) {
+        node.build_runtime_filters.append(&mut builds);
+    }
+    if let Some(mut probes) = probes_by_node.remove(&node.node_id) {
+        node.probe_runtime_filters.append(&mut probes);
+    }
+    for child in &mut node.children {
+        wire_runtime_filters_in_node(child, builds_by_node, probes_by_node);
+    }
+}
+
 fn expect_child_count(node: &PhysicalPlanNode, expected: usize) -> Result<(), String> {
     if node.children.len() == expected {
         return Ok(());
@@ -1074,13 +1223,17 @@ mod tests {
     use crate::sql::planner::plan::{
         DistributedChangeEventExpandNode, ExchangeFlavor, LogicalCTEAnchorNode,
         LogicalCTEConsumeNode, LogicalCTEProduceNode, PhysicalHashAggregateNode,
-        PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode,
-        PhysicalSetOpNode, PhysicalTopNNode, PlanAssertOneRowNode, PlanDecodeNode, PlanFilterNode,
-        PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode, PlanRepeatNode, PlanScanNode,
-        PlanSetOpKind, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
-        RedistributeMode, RedistributeNode, WindowExpr,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
+        PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PhysicalTopNNode,
+        PlanAssertOneRowNode, PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode,
+        PlanLimitNode, PlanProjectNode, PlanRepeatNode, PlanScanNode, PlanSetOpKind, PlanSortNode,
+        PlanTableFunctionNode, PlanValuesNode, PlanWindowNode, RedistributeMode, RedistributeNode,
+        WindowExpr,
     };
-    use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate};
+    use crate::sql::planner::{
+        JoinExecutionMode, PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate,
+        RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+    };
     use crate::thrift::partitions::TPartitionType;
 
     #[test]
@@ -1433,6 +1586,190 @@ mod tests {
         assert_eq!(root.children[0].tuple_ids, vec![1]);
         assert_eq!(root.children[1].node_id, 2);
         assert_eq!(root.children[1].tuple_ids, vec![2]);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_wires_runtime_filters_across_redistribute_fragment() {
+        let filter_id = 77;
+        let probe_expr = column_ref_expr(1, "l_k", DataType::Int64, false);
+        let build_expr = column_ref_expr(2, "r_k", DataType::Int64, false);
+        let duplicate_probe_intent = RuntimeFilterProbeIntent {
+            filter_id,
+            probe_expr: probe_expr.clone(),
+        };
+        let mut left_scan = scan_node(1, "l_k");
+        left_scan.probe_runtime_filters = vec![duplicate_probe_intent.clone()];
+        let left_project = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Project(PlanProjectNode {
+                items: vec![ProjectItem {
+                    expr: probe_expr.clone(),
+                    output_name: "l_k".to_string(),
+                    output_column_id: ColumnId::new_for_test(1),
+                }],
+                output_qualifier: None,
+            }),
+            children: vec![left_scan],
+            output_columns: vec![output_col(1, "l_k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![duplicate_probe_intent],
+        };
+        let left_redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Hash {
+                    cols: vec![ColumnId::new_for_test(1)],
+                    source: HashSource::ShuffleJoin,
+                },
+                output_columns: left_project.output_columns.clone(),
+            }),
+            children: vec![left_project],
+            output_columns: vec![output_col(1, "l_k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let right = scan_node(2, "r_k");
+        let join = PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: probe_expr.clone(),
+                    right: build_expr.clone(),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+                execution_mode: Some(JoinExecutionMode::Partitioned),
+                build_runtime_filters: vec![RuntimeFilterBuildIntent {
+                    filter_id,
+                    build_expr: build_expr.clone(),
+                    probe_expr: probe_expr.clone(),
+                    expr_order: 3,
+                    execution_mode: JoinExecutionMode::Partitioned,
+                }],
+            })),
+            children: vec![left_redistribute, right],
+            output_columns: vec![
+                output_col(1, "l_k", DataType::Int64, false),
+                output_col(2, "r_k", DataType::Int64, false),
+            ],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&join).expect("build_distributed_plan_v2");
+
+        assert_eq!(dp.fragments.len(), 2);
+        let root_fragment = dp
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+            .expect("root fragment");
+        let probe_fragment = dp
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id != dp.root_fragment_id)
+            .expect("probe fragment");
+        let join_node = &root_fragment.root;
+        assert_eq!(join_node.fragment_id, dp.root_fragment_id);
+        assert!(matches!(
+            &join_node.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::HashJoin(_))
+        ));
+        assert_eq!(join_node.build_runtime_filters.len(), 1);
+        let build = &join_node.build_runtime_filters[0];
+        assert_eq!(build.filter_id, filter_id);
+        assert_column_ref(&build.build_expr, 2, "r_k");
+        assert_column_ref(&build.probe_expr, 1, "l_k");
+        assert_eq!(build.expr_order, 3);
+        assert_eq!(build.execution_mode, JoinExecutionMode::Partitioned);
+        assert_eq!(build.source_fragment_id, join_node.fragment_id);
+        assert_eq!(build.target_fragment_ids, vec![probe_fragment.fragment_id]);
+
+        let probe_project = &probe_fragment.root;
+        assert_eq!(probe_project.fragment_id, probe_fragment.fragment_id);
+        assert_eq!(probe_project.probe_runtime_filters.len(), 1);
+        assert_eq!(
+            probe_project.probe_runtime_filters[0].source_fragment_id,
+            join_node.fragment_id
+        );
+        let probe_scan = &probe_project.children[0];
+        assert!(matches!(
+            &probe_scan.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
+        ));
+        assert_eq!(probe_scan.probe_runtime_filters.len(), 1);
+        let probe = &probe_scan.probe_runtime_filters[0];
+        assert_eq!(probe.filter_id, filter_id);
+        assert_column_ref(&probe.probe_expr, 1, "l_k");
+        assert_eq!(probe.source_fragment_id, join_node.fragment_id);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_preserves_folded_filter_runtime_filter_probe() {
+        let filter_id = 78;
+        let probe_expr = column_ref_expr(1, "l_k", DataType::Int64, false);
+        let build_expr = column_ref_expr(2, "r_k", DataType::Int64, false);
+        let left_scan = scan_node(1, "l_k");
+        let left_filter = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Filter(PlanFilterNode {
+                predicate: cmp_expr(1, "l_k", BinOp::Gt, 10),
+            }),
+            children: vec![left_scan],
+            output_columns: vec![output_col(1, "l_k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![RuntimeFilterProbeIntent {
+                filter_id,
+                probe_expr: probe_expr.clone(),
+            }],
+        };
+        let right = scan_node(2, "r_k");
+        let join = PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: probe_expr.clone(),
+                    right: build_expr.clone(),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+                execution_mode: Some(JoinExecutionMode::Partitioned),
+                build_runtime_filters: vec![RuntimeFilterBuildIntent {
+                    filter_id,
+                    build_expr: build_expr.clone(),
+                    probe_expr: probe_expr.clone(),
+                    expr_order: 0,
+                    execution_mode: JoinExecutionMode::Partitioned,
+                }],
+            })),
+            children: vec![left_filter, right],
+            output_columns: vec![
+                output_col(1, "l_k", DataType::Int64, false),
+                output_col(2, "r_k", DataType::Int64, false),
+            ],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&join).expect("build_distributed_plan_v2");
+
+        assert_eq!(dp.fragments.len(), 1);
+        let join_node = &dp.fragments[0].root;
+        assert_eq!(join_node.build_runtime_filters.len(), 1);
+        assert_eq!(
+            join_node.build_runtime_filters[0].target_fragment_ids,
+            vec![join_node.fragment_id]
+        );
+        let scan = &join_node.children[0];
+        assert!(matches!(
+            &scan.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
+        ));
+        assert_eq!(scan.probe_runtime_filters.len(), 1);
+        assert_eq!(scan.probe_runtime_filters[0].filter_id, filter_id);
+        assert_eq!(
+            scan.probe_runtime_filters[0].source_fragment_id,
+            join_node.fragment_id
+        );
     }
 
     #[test]
