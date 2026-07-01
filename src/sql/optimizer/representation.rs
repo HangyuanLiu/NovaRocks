@@ -7,7 +7,7 @@ use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::DictionarySnapshot;
-use crate::sql::optimizer::operator::{Operator, ScanOp};
+use crate::sql::optimizer::operator::ScanOp;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RepresentationProperty {
@@ -45,13 +45,6 @@ impl RepresentationProperty {
             });
         }
         property
-    }
-
-    pub(crate) fn from_operator(op: &Operator) -> Self {
-        match op {
-            Operator::PhysicalScan(scan) => Self::from_scan(scan),
-            _ => Self::default(),
-        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {

@@ -2,11 +2,12 @@
 //! Operator capability contract for the low-cardinality dictionary
 //! representation model.
 //!
-//! P1 populates a [`RepresentationProperty`] for `PhysicalScan` only. This
-//! module extends that to interior operators via [`propagate_representation`],
-//! a pure function that computes an operator's output representation from its
-//! children's already-computed representation properties, per a conservative
-//! capability matrix.
+//! Scan representation originates from [`RepresentationProperty::from_scan`]
+//! (built from the scan plan's dictionary hints). All operator propagation —
+//! the scan case included — flows through the single entry point
+//! [`propagate_representation`], a pure function that computes an operator's
+//! output representation from its children's already-computed representation
+//! properties, per a conservative capability matrix.
 //!
 //! The contract is deliberately conservative: the default is to DROP (return
 //! an empty property), which the later planning pass reads as a materialization
@@ -129,6 +130,12 @@ pub(crate) fn propagate_representation(
                 };
                 // min/max is only representation-preserving when the dictionary
                 // ids order the same way as the logical values.
+                //
+                // Split/merge aggregation needs no special case here: for an
+                // order-preserving domain the Local phase preserves it, and
+                // min-of-mins / max-of-maxes over that domain preserves the same
+                // domain, so the merge (`is_merge`) phase is covered by this
+                // same rule.
                 if !dict.domain.order_preserving {
                     continue;
                 }
