@@ -7,8 +7,10 @@
 //! can program against `dyn CatalogBackend` without knowing which concrete
 //! connector fulfils the request.
 
-use arrow::record_batch::RecordBatch;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use arrow::record_batch::RecordBatch;
 
 use crate::connector::stats::TableStatsProvider;
 use crate::engine::mv::lifecycle::{
@@ -46,6 +48,8 @@ pub(crate) struct CreateViewRequest {
     pub view_sql: String,
     pub comment: Option<String>,
     pub or_replace: bool,
+    /// Extra view-metadata properties. Empty for plain user CREATE VIEW.
+    pub properties: Vec<(String, String)>,
 }
 
 /// A view loaded through a catalog backend.
@@ -56,6 +60,7 @@ pub(crate) struct ResolvedView {
     pub default_namespace: String,
     pub column_names: Vec<String>,
     pub comment: Option<String>,
+    pub properties: HashMap<String, String>,
 }
 
 /// Resolved table metadata returned by `CatalogBackend::load_table`. This is
