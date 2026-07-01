@@ -452,6 +452,40 @@ mod tests {
     }
 
     #[test]
+    fn add_partial_membership_returns_none_until_all_partitions_arrive() {
+        // Invariant (P0a): a single filter_id is published only after ALL build
+        // partitions have merged. Before that, the merger yields None (nothing is
+        // ever installed into the probe handle), so probe never sees a partial.
+        let merger = PartialRuntimeInFilterMerger::new(2, 1024);
+        let param = RuntimeMembershipFilterBuildParam::new(
+            7,
+            SlotId::new(11),
+            RuntimeFilterType::Int32,
+            RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+        );
+
+        let first = merger
+            .add_partial_membership(
+                0,
+                vec![param.clone()],
+                RuntimeMembershipBuildOptions::default(),
+            )
+            .expect("add partial membership partition 0");
+        assert!(
+            first.is_none(),
+            "must not publish before all partitions arrive"
+        );
+
+        let second = merger
+            .add_partial_membership(1, vec![param], RuntimeMembershipBuildOptions::default())
+            .expect("add partial membership partition 1");
+        assert!(
+            second.is_some(),
+            "must publish exactly once all partitions arrive"
+        );
+    }
+
+    #[test]
     fn broadcast_join_mode_constant_matches_starrocks_wire_value() {
         assert_eq!(RUNTIME_FILTER_JOIN_MODE_BROADCAST, 1);
     }
