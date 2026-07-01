@@ -14,6 +14,7 @@ use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use serde::{Deserialize, Serialize};
 
 use crate::common::engine_error::EngineError;
+use crate::connector::iceberg::catalog::registry::IcebergCatalogKind;
 use crate::connector::iceberg::changes::{
     IcebergChangePolicySignal, plan_changes, policy_signal_from_change_error,
 };
@@ -95,6 +96,8 @@ pub(crate) struct IcebergMvTarget {
 }
 
 pub(crate) const NR_MV_STORAGE_PREFIX: &str = "__nr_mv_";
+pub(crate) const NR_MV_VIEW_MARKER_PROP: &str = "novarocks.mv";
+pub(crate) const NR_MV_VIEW_STORAGE_TABLE_PROP: &str = "novarocks.mv.storage-table";
 
 pub(crate) fn nr_mv_storage_name(user_name: &str) -> String {
     format!("{NR_MV_STORAGE_PREFIX}{user_name}")
@@ -112,6 +115,112 @@ pub(crate) fn nr_mv_public_name(storage_name: &str) -> Option<String> {
     storage_name
         .strip_prefix(NR_MV_STORAGE_PREFIX)
         .map(str::to_string)
+}
+
+#[derive(Clone, Debug)]
+struct IcebergMvProjectionViewSpec {
+    view_sql: String,
+    columns: Vec<crate::sql::parser::ast::TableColumnDef>,
+    properties: Vec<(String, String)>,
+}
+
+fn simple_iceberg_identifier(identifier: &str, context: &str) -> Result<String, String> {
+    let Some(first) = identifier.as_bytes().first().copied() else {
+        return Err(format!(
+            "empty identifier cannot be used in MV projection view {context}"
+        ));
+    };
+    if !(first == b'_' || first.is_ascii_lowercase()) {
+        return Err(format!(
+            "identifier `{identifier}` in MV projection view {context} requires quoting; W1 supports only simple lowercase identifiers"
+        ));
+    }
+    if !identifier
+        .as_bytes()
+        .iter()
+        .all(|b| *b == b'_' || b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        return Err(format!(
+            "identifier `{identifier}` in MV projection view {context} requires quoting; W1 supports only simple lowercase identifiers"
+        ));
+    }
+    Ok(identifier.to_string())
+}
+
+fn iceberg_mv_projection_view_spec(
+    target: &IcebergMvTarget,
+    output_columns: &[OutputColumn],
+) -> Result<IcebergMvProjectionViewSpec, String> {
+    let namespace = simple_iceberg_identifier(&target.namespace, "namespace")?;
+    let storage_table = simple_iceberg_identifier(&target.table, "storage table")?;
+    let mut rendered_columns = Vec::with_capacity(output_columns.len());
+    let mut columns = Vec::with_capacity(output_columns.len());
+    for column in output_columns {
+        rendered_columns.push(simple_iceberg_identifier(&column.name, "column")?);
+        columns.push(output_column_to_table_column(column)?);
+    }
+    if rendered_columns.is_empty() {
+        return Err("MV projection view requires at least one visible column".to_string());
+    }
+    let storage_table_fqn = format!("{namespace}.{storage_table}");
+    Ok(IcebergMvProjectionViewSpec {
+        view_sql: format!(
+            "SELECT {} FROM {storage_table_fqn}",
+            rendered_columns.join(", ")
+        ),
+        columns,
+        properties: vec![
+            (NR_MV_VIEW_MARKER_PROP.to_string(), "true".to_string()),
+            (NR_MV_VIEW_STORAGE_TABLE_PROP.to_string(), storage_table_fqn),
+        ],
+    })
+}
+
+fn iceberg_mv_projection_views_supported(
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+) -> bool {
+    matches!(entry.kind, IcebergCatalogKind::Rest)
+}
+
+fn create_iceberg_mv_projection_view(
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    target: &IcebergMvTarget,
+    public_name: &str,
+    output_columns: &[OutputColumn],
+) -> Result<(), String> {
+    if !iceberg_mv_projection_views_supported(entry) {
+        return Ok(());
+    }
+    let spec = iceberg_mv_projection_view_spec(target, output_columns)?;
+    crate::connector::iceberg::catalog::views::create_view(
+        entry,
+        &target.namespace,
+        public_name,
+        &spec.columns,
+        &spec.view_sql,
+        None,
+        false,
+        &spec.properties,
+    )
+}
+
+fn drop_iceberg_mv_projection_view_if_supported(
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    target: &IcebergMvTarget,
+    public_name: &str,
+) -> Result<(), String> {
+    if !iceberg_mv_projection_views_supported(entry) {
+        return Ok(());
+    }
+    match crate::connector::iceberg::catalog::views::drop_view(
+        entry,
+        &target.namespace,
+        public_name,
+    ) {
+        Ok(()) => Ok(()),
+        Err(err) if err.contains("unknown view") => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -190,6 +299,18 @@ pub(crate) fn create_iceberg_mv(
         return Err(format!(
             "Iceberg MV target table {}.{}.{} already exists",
             target.catalog, target.namespace, target.table
+        ));
+    }
+    if iceberg_mv_projection_views_supported(&entry)
+        && crate::connector::iceberg::catalog::views::view_exists(
+            &entry,
+            &target.namespace,
+            &public_name,
+        )?
+    {
+        return Err(format!(
+            "Iceberg MV public projection view {}.{}.{} already exists",
+            target.catalog, target.namespace, public_name
         ));
     }
 
@@ -422,7 +543,12 @@ pub(crate) fn create_iceberg_mv(
             actual_apply_key_field_id,
         )?;
 
-        // 4. Persist MV metadata in the repository.
+        // 4. Create the public projection view on catalogs that support
+        // Iceberg views. Hadoop/Hive catalogs deliberately skip this because
+        // the Iceberg view API is REST-only in this connector.
+        create_iceberg_mv_projection_view(&entry, &target, &public_name, &analysis.output_columns)?;
+
+        // 5. Persist MV metadata in the repository.
         let primary_key_columns = stmt.primary_key.clone().unwrap_or_default();
         let provider = state
             .metadata_provider
@@ -473,7 +599,10 @@ pub(crate) fn create_iceberg_mv(
     })();
     if let Err(err) = post_create {
         return Err(cleanup_created_iceberg_mv_target_after_failure(
-            &entry, &target, err,
+            &entry,
+            &target,
+            &public_name,
+            err,
         ));
     }
     register_iceberg_mv_target_in_catalog(state, &target)?;
@@ -484,14 +613,16 @@ pub(crate) fn create_iceberg_mv(
 fn cleanup_created_iceberg_mv_target_after_failure(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target: &IcebergMvTarget,
+    public_name: &str,
     err: String,
 ) -> String {
+    let view_drop_result = drop_iceberg_mv_projection_view_if_supported(entry, target, public_name);
     let drop_result = crate::connector::iceberg::catalog::registry::drop_table(
         entry,
         &target.namespace,
         &target.table,
     );
-    format!("{err}; target cleanup={drop_result:?}")
+    format!("{err}; projection cleanup={view_drop_result:?}; target cleanup={drop_result:?}")
 }
 
 fn resolve_iceberg_mv_target(
@@ -15206,6 +15337,8 @@ pub(crate) fn drop_iceberg_mv(
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         catalogs.get(&target.catalog)?
     };
+    let public_name = nr_mv_public_name(&target.table).unwrap_or_else(|| target.table.clone());
+    drop_iceberg_mv_projection_view_if_supported(&entry, &target, &public_name)?;
     crate::connector::iceberg::catalog::registry::drop_table(
         &entry,
         &target.namespace,
@@ -21210,6 +21343,74 @@ mod tests {
             Some("mv_orders".to_string())
         );
         assert_eq!(nr_mv_public_name("orders"), None);
+    }
+
+    #[test]
+    fn projection_view_spec_uses_visible_columns_and_mv_properties() {
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "__nr_mv_mv_orders".to_string(),
+        };
+        let output_columns = vec![
+            OutputColumn {
+                column_id: ColumnId::new_for_test(1),
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: ColumnId::new_for_test(2),
+                name: "name".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+                is_internal: false,
+            },
+        ];
+
+        let spec = iceberg_mv_projection_view_spec(&target, &output_columns)
+            .expect("projection view spec");
+        assert_eq!(
+            spec.view_sql,
+            "SELECT id, name FROM analytics.__nr_mv_mv_orders"
+        );
+        assert_eq!(spec.columns.len(), 2);
+        assert_eq!(spec.columns[0].name, "id");
+        assert_eq!(
+            spec.properties
+                .iter()
+                .find(|(key, _)| key == NR_MV_VIEW_MARKER_PROP)
+                .map(|(_, value)| value.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            spec.properties
+                .iter()
+                .find(|(key, _)| key == NR_MV_VIEW_STORAGE_TABLE_PROP)
+                .map(|(_, value)| value.as_str()),
+            Some("analytics.__nr_mv_mv_orders")
+        );
+    }
+
+    #[test]
+    fn projection_view_spec_rejects_unsafe_identifiers_for_w1() {
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "__nr_mv_mv_orders".to_string(),
+        };
+        let output_columns = vec![OutputColumn {
+            column_id: ColumnId::new_for_test(1),
+            name: "OrderID".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }];
+
+        let err = iceberg_mv_projection_view_spec(&target, &output_columns)
+            .expect_err("uppercase column requires quoting and should fail in W1");
+        assert!(err.contains("requires quoting"), "got: {err}");
     }
 
     #[test]
