@@ -7,6 +7,7 @@ use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::DictionarySnapshot;
+use crate::sql::optimizer::operator::{Operator, ScanOp};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RepresentationProperty {
@@ -14,6 +15,45 @@ pub(crate) struct RepresentationProperty {
 }
 
 impl RepresentationProperty {
+    pub(crate) fn from_scan(scan: &ScanOp) -> Self {
+        let mut property = Self::default();
+        for hint in &scan.dict_columns {
+            let Some(physical_slot) = scan
+                .columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(&hint.dict_column))
+            else {
+                continue;
+            };
+
+            property.insert(ColumnRepresentationSet {
+                logical_column: LogicalColumn {
+                    column_id: hint.source_column_id,
+                    name: hint.source_column.clone(),
+                    logical_type: hint.dictionary.data_type.clone(),
+                    nullable: physical_slot.nullable,
+                },
+                current_slot: PhysicalSlot {
+                    column_id: physical_slot.column_id,
+                    name: physical_slot.name.clone(),
+                    data_type: physical_slot.data_type.clone(),
+                    nullable: physical_slot.nullable,
+                },
+                representations: vec![PhysicalRepresentation::DictInt32(DictInt32Representation {
+                    domain: DictionaryDomain::from_snapshot(&hint.dictionary),
+                })],
+            });
+        }
+        property
+    }
+
+    pub(crate) fn from_operator(op: &Operator) -> Self {
+        match op {
+            Operator::PhysicalScan(scan) => Self::from_scan(scan),
+            _ => Self::default(),
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.by_logical_column.is_empty()
     }
@@ -110,9 +150,12 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::common::{
         DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue, DictionaryWatermark,
+        OutputColumn, ScanDictionaryColumn,
     };
+    use crate::sql::optimizer::operator::ScanOp;
 
     #[test]
     fn empty_property_declares_no_representations() {
@@ -164,6 +207,138 @@ mod tests {
         assert_eq!(set.logical_column.column_id, logical_column_id);
         assert_eq!(set.current_slot.name, "city_dict");
         assert!(property.has_dictionary_representation());
+    }
+
+    #[test]
+    fn scan_without_dictionary_hints_has_empty_representation_property() {
+        let scan = test_scan(
+            vec![output_column(
+                ColumnId::new_for_test(1),
+                "city",
+                DataType::Utf8,
+                true,
+            )],
+            vec![],
+        );
+
+        let property = RepresentationProperty::from_scan(&scan);
+
+        assert!(property.is_empty());
+        assert!(!property.has_dictionary_representation());
+    }
+
+    #[test]
+    fn scan_dictionary_hint_builds_dict_int32_representation_property() {
+        let snapshot = test_snapshot();
+        let source_column_id = ColumnId::new_for_test(5);
+        let physical_column_id = ColumnId::new_for_test(6);
+        let scan = test_scan(
+            vec![output_column(
+                physical_column_id,
+                "__nr_dict_tbl_city",
+                DataType::Int32,
+                true,
+            )],
+            vec![ScanDictionaryColumn {
+                source_column_id,
+                source_column: "city".to_string(),
+                dict_column: "__NR_DICT_TBL_CITY".to_string(),
+                dictionary: Arc::clone(&snapshot),
+            }],
+        );
+
+        let property = RepresentationProperty::from_scan(&scan);
+
+        let set = property
+            .get(source_column_id)
+            .expect("dictionary representation exists");
+        assert_eq!(set.logical_column.column_id, source_column_id);
+        assert_eq!(set.logical_column.name, "city");
+        assert_eq!(set.logical_column.logical_type, DataType::Utf8);
+        assert!(set.logical_column.nullable);
+        assert_eq!(set.current_slot.column_id, physical_column_id);
+        assert_eq!(set.current_slot.name, "__nr_dict_tbl_city");
+        assert_eq!(set.current_slot.data_type, DataType::Int32);
+        assert!(set.current_slot.nullable);
+        assert_eq!(set.representations.len(), 1);
+        match &set.representations[0] {
+            PhysicalRepresentation::DictInt32(dict) => {
+                assert_eq!(dict.domain.dictionary_id, snapshot.dictionary_id);
+                assert_eq!(dict.domain.owner_key, snapshot.owner.stable_key());
+                assert_eq!(dict.domain.column_id, snapshot.column_id);
+                assert_eq!(dict.domain.column_name, snapshot.column_name);
+                assert_eq!(dict.domain.logical_type, snapshot.data_type);
+                assert_eq!(dict.domain.version, snapshot.version);
+                assert_eq!(dict.domain.watermark_json, snapshot.watermark.stable_json());
+                assert_eq!(dict.domain.null_id, snapshot.null_id);
+                assert_eq!(dict.domain.order_preserving, snapshot.order_preserving);
+                assert!(Arc::ptr_eq(&dict.domain.snapshot, &snapshot));
+            }
+            other => panic!("expected DictInt32 representation, got {other:?}"),
+        }
+        assert!(property.has_dictionary_representation());
+    }
+
+    #[test]
+    fn scan_dictionary_hint_missing_dict_output_column_is_ignored() {
+        let snapshot = test_snapshot();
+        let scan = test_scan(
+            vec![output_column(
+                ColumnId::new_for_test(5),
+                "city",
+                DataType::Utf8,
+                true,
+            )],
+            vec![ScanDictionaryColumn {
+                source_column_id: ColumnId::new_for_test(5),
+                source_column: "city".to_string(),
+                dict_column: "__nr_dict_tbl_city".to_string(),
+                dictionary: snapshot,
+            }],
+        );
+
+        let property = RepresentationProperty::from_scan(&scan);
+
+        assert!(property.is_empty());
+        assert!(!property.has_dictionary_representation());
+    }
+
+    fn output_column(
+        column_id: ColumnId,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> OutputColumn {
+        OutputColumn {
+            column_id,
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    fn test_scan(columns: Vec<OutputColumn>, dict_columns: Vec<ScanDictionaryColumn>) -> ScanOp {
+        ScanOp {
+            database: "db".to_string(),
+            table: TableDef {
+                name: "tbl".to_string(),
+                columns: vec![],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::StarRocks {
+                    db_id: 11,
+                    table_id: 13,
+                },
+            },
+            alias: None,
+            stats_ref: None,
+            columns,
+            predicates: vec![],
+            required_columns: None,
+            dict_columns,
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }
     }
 
     fn test_snapshot() -> Arc<DictionarySnapshot> {

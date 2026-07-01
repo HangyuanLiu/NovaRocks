@@ -11,6 +11,7 @@ use super::physical_tree::{
     JoinExecutionDistribution, OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
 };
 use super::property::{OrderingSpec, PhysicalPropertySet};
+use super::representation::RepresentationProperty;
 use super::search::{EnforcerKind, Winner};
 use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarNode, SortKey};
@@ -110,6 +111,7 @@ pub(crate) fn extract_best(
             JoinExecutionDistribution::Colocate => JoinDistribution::Colocate,
         };
     }
+    let representation_property = RepresentationProperty::from_operator(&op);
     let output_columns =
         output_columns_for_physical_expr(&op, &memo.scalars, output_columns, &children);
     let inner_output_property = winner
@@ -131,6 +133,7 @@ pub(crate) fn extract_best(
             output_property: inner_output_property.clone(),
             child_output_properties: winner.child_outputs.clone(),
             join_distribution,
+            representation_property,
             scalar_arena: None,
         },
         build_runtime_filters: Vec::new(),
@@ -171,6 +174,7 @@ pub(crate) fn extract_best(
                 output_property: required.clone(),
                 child_output_properties: vec![inner_output_property],
                 join_distribution: None,
+                representation_property: RepresentationProperty::default(),
                 scalar_arena: None,
             },
             build_runtime_filters: Vec::new(),
@@ -291,6 +295,10 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::common::{
+        DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue, DictionaryWatermark,
+        ScanDictionaryColumn,
+    };
     use crate::sql::optimizer::cost::CostOptions;
     use crate::sql::optimizer::derive::PropertyAlternativeKind;
     use crate::sql::optimizer::memo::{MExpr, Memo};
@@ -299,8 +307,10 @@ mod tests {
         ProjectOp, ScalarProjectItem, ScanOp, ValuesOp,
     };
     use crate::sql::optimizer::property::DistributionSpec;
+    use crate::sql::optimizer::representation::PhysicalRepresentation;
     use crate::sql::optimizer::search::{EnforcerInfo, Winner};
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
+    use std::sync::Arc;
 
     fn test_col(id: u32) -> TypedExpr {
         TypedExpr {
@@ -334,6 +344,33 @@ mod tests {
             dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
+        })
+    }
+
+    fn test_snapshot() -> Arc<DictionarySnapshot> {
+        Arc::new(DictionarySnapshot {
+            dictionary_id: 7,
+            owner: DictionaryOwner::StarRocksTable {
+                database: "db".to_string(),
+                table: "tbl".to_string(),
+                db_id: 11,
+                table_id: 13,
+            },
+            column_id: Some(17),
+            column_name: "city".to_string(),
+            data_type: DataType::Utf8,
+            version: 19,
+            watermark: DictionaryWatermark::Iceberg {
+                snapshot_id: Some(23),
+                schema_id: 29,
+            },
+            values: vec![DictionaryValue {
+                id: 1,
+                bytes: b"beijing".to_vec(),
+            }],
+            null_id: -1,
+            state: DictionaryState::Active,
+            order_preserving: true,
         })
     }
 
@@ -475,6 +512,85 @@ mod tests {
         assert_eq!(plan.output_columns[0].data_type, DataType::Int8);
         assert!(!plan.output_columns[0].nullable);
         assert!(plan.output_columns[0].is_internal);
+    }
+
+    #[test]
+    fn extract_physical_scan_carries_dict_representation_property() {
+        let mut memo = Memo::new();
+        let source_column_id = ColumnId(5);
+        let physical_column_id = ColumnId(6);
+        let dict_output = OutputColumn {
+            column_id: physical_column_id,
+            name: "__nr_dict_tbl_city".to_string(),
+            data_type: DataType::Int32,
+            nullable: true,
+            is_internal: false,
+        };
+        let snapshot = test_snapshot();
+        let root = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalScan(ScanOp {
+                database: "db".into(),
+                table: crate::sql::catalog::TableDef {
+                    name: "tbl".into(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: crate::sql::catalog::ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: None,
+                stats_ref: None,
+                columns: vec![dict_output.clone()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![ScanDictionaryColumn {
+                    source_column_id,
+                    source_column: "city".to_string(),
+                    dict_column: "__nr_dict_tbl_city".to_string(),
+                    dictionary: Arc::clone(&snapshot),
+                }],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            children: vec![],
+        });
+        memo.groups[root].logical_props = Some(
+            crate::sql::optimizer::memo::LogicalProperties::new(vec![dict_output], 1.0),
+        );
+
+        let required = PhysicalPropertySet::any();
+        let mut winners = HashMap::new();
+        winners.insert(
+            (root, required.clone()),
+            winner_for_test(
+                root,
+                0,
+                1.0,
+                None,
+                PhysicalPropertySet::any(),
+                PropertyAlternativeKind::Default,
+                vec![],
+                vec![],
+            ),
+        );
+
+        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let set = plan
+            .execution_props
+            .representation_property
+            .get(source_column_id)
+            .expect("scan representation property");
+
+        assert_eq!(set.logical_column.column_id, source_column_id);
+        assert_eq!(set.logical_column.logical_type, DataType::Utf8);
+        assert_eq!(set.current_slot.column_id, physical_column_id);
+        assert_eq!(set.current_slot.data_type, DataType::Int32);
+        assert!(matches!(
+            set.representations.as_slice(),
+            [PhysicalRepresentation::DictInt32(_)]
+        ));
     }
 
     #[test]

@@ -571,6 +571,7 @@ mod tests {
                 child_output_properties: vec![],
                 join_distribution: None,
                 scalar_arena: None,
+                ..PlanExecutionProps::default()
             },
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],

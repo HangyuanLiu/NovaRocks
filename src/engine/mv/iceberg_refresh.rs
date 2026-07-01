@@ -14106,6 +14106,7 @@ fn add_imv_data_route_project(
             child_output_properties: vec![output_property],
             join_distribution: None,
             scalar_arena: Some(Arc::clone(&arena)),
+            ..PlanExecutionProps::default()
         },
         build_runtime_filters: Vec::new(),
         probe_runtime_filters: Vec::new(),

@@ -883,7 +883,7 @@ fn wrap_project_around_child(
         output_qualifier: None,
     });
     let stats = original.stats.clone();
-    let execution_props = original.execution_props.clone();
+    let execution_props = original.execution_props.clone().with_empty_representation();
     let explain_stats = synthetic_project_explain_stats(
         &op,
         &stats,
@@ -1052,7 +1052,7 @@ fn rewrite_project(
         output_qualifier: None,
     });
     let stats = child.stats.clone();
-    let execution_props = child.execution_props.clone();
+    let execution_props = child.execution_props.clone().with_empty_representation();
     let explain_stats = synthetic_project_explain_stats(
         &op,
         &stats,
