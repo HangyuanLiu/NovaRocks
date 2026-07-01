@@ -37,6 +37,7 @@
 
 pub mod cache;
 pub mod data;
+pub(crate) mod fs_access;
 pub mod metadata;
 pub mod plan;
 pub(crate) mod range_read;
