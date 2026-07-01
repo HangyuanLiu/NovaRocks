@@ -90,3 +90,5 @@ PLAN FRAGMENT 3
      columns: k, pad1, pad2
      min-max stats
      predicates: p.k IS NOT NULL
+    probe runtime filters:
+    - filter_id = 0, probe_expr = (p.k)

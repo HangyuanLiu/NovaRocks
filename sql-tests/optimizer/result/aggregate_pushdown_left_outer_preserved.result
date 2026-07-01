@@ -42,3 +42,5 @@ PLAN FRAGMENT 3
      TABLE: db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_b
      columns: k
      min-max stats
+    probe runtime filters:
+    - filter_id = 0, probe_expr = (b.k)

@@ -77,6 +77,8 @@ PLAN FRAGMENT 4
      TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
      columns: id, score
      min-max stats
+    probe runtime filters:
+    - filter_id = 0, probe_expr = (l.id)
 
 -- query 13
 Explain String
