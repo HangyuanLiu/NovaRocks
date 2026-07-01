@@ -9,6 +9,24 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
+OPTIMIZER_MODULE_COMPONENT_PATTERN = (
+    r"(?:^|::|[{\s,])\s*optimizer\s*(?:::|[,};]|\bas\b|$)"
+)
+
+DTO_OPTIMIZER_PATH_PATTERNS = [
+    (
+        OPTIMIZER_MODULE_COMPONENT_PATTERN,
+        "planner-owned DTO must not reference optimizer modules",
+    ),
+]
+
+PLAN_RS_FORBIDDEN_DEPENDENCY_PATTERNS = [
+    (
+        r"\b(?:Operator|ScalarArena|PhysicalPropertySet)\b",
+        "planner physical IR must not depend on optimizer-owned plan facts",
+    ),
+]
+
 
 def read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
@@ -280,14 +298,8 @@ def main() -> int:
         "src/sql/planner/runtime_filter.rs",
         "src/sql/planner/stats.rs",
     ]
-    dto_optimizer_path_patterns = [
-        (
-            r"\boptimizer\s*::",
-            "planner-owned DTO must not reference optimizer modules",
-        ),
-    ]
     for path in dto_owned_files:
-        check_path_patterns(path, dto_optimizer_path_patterns, violations)
+        check_path_patterns(path, DTO_OPTIMIZER_PATH_PATTERNS, violations)
 
     forbidden_dto_patterns = [
         (
@@ -328,6 +340,8 @@ def main() -> int:
 
     plan_path = "src/sql/planner/plan.rs"
     plan_rs = read_masked(plan_path)
+    for pattern, label in PLAN_RS_FORBIDDEN_DEPENDENCY_PATTERNS:
+        assert_absent(pattern, plan_rs, plan_path, label, violations)
     violations.extend(
         enum_variant_violations(
             plan_rs,
