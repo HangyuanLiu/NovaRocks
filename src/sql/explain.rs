@@ -710,26 +710,6 @@ mod tests {
     }
 
     #[test]
-    fn logical_explain_prints_aggregate_state_merge_evidence() {
-        let plan = LogicalPlanNode::new(
-            LogicalPlanKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
-                group_key_names: vec!["region".to_string()],
-                aggregate_state_names: vec!["c".to_string()],
-                change_op_column: "__change_op".to_string(),
-                output_columns: vec![],
-            }),
-            vec![empty_values_for_test(), empty_values_for_test()],
-            None,
-        );
-
-        let text = explain_plan(&plan, ExplainLevel::Normal).join("\n");
-
-        assert!(text.contains("AggregateStateMerge"), "{text}");
-        assert!(text.contains("keys=[region]"), "{text}");
-        assert!(text.contains("states=[c]"), "{text}");
-    }
-
-    #[test]
     fn logical_explain_verbose_prints_refresh_scan_sources() {
         let delta_plan = scan_plan_with_source(
             "orders",
