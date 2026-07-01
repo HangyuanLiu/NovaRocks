@@ -2,6 +2,7 @@
 
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
+use crate::sql::codegen::helpers::split_and_conjuncts_typed;
 use crate::sql::codegen::{FragmentEdge, FragmentId};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed_fragment::{DataPartition, DataSink};
@@ -106,6 +107,25 @@ impl DistributedPlanBuilderV2 {
                 let tuple_id = self.alloc_tuple();
                 Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
             }
+            PhysicalPlanKind::Filter(filter) => {
+                expect_child_count(node, 1)?;
+                let mut child = self.visit(&node.children[0], fragment_id)?;
+                if let DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) =
+                    &mut child.payload
+                {
+                    scan.predicates.extend(
+                        split_and_conjuncts_typed(&filter.predicate)
+                            .into_iter()
+                            .cloned(),
+                    );
+                    child.stats = node.stats.clone();
+                    Ok(child)
+                } else {
+                    let node_id = self.alloc_node();
+                    let tuple_ids = child.tuple_ids.clone();
+                    Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]))
+                }
+            }
             other => Err(format!(
                 "build_distributed_plan_v2 does not handle PhysicalPlanKind::{} yet",
                 physical_kind_name(other)
@@ -183,14 +203,16 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::build_distributed_plan_v2;
-    use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed_fragment::{DataSink, PartitionKind};
     use crate::sql::planner::distributed_node::DistributedPayload;
     use crate::sql::planner::plan::{
         PhysicalPlanKind, PhysicalPlanNode, PlanFilterNode, PlanProjectNode, PlanScanNode,
-        PlanValuesNode,
+        PlanSortNode, PlanValuesNode,
     };
     use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
 
@@ -303,7 +325,146 @@ mod tests {
     }
 
     #[test]
-    fn build_distributed_plan_v2_rejects_unsupported_filter_root() {
+    fn build_distributed_plan_v2_folds_filter_predicate_into_scan() {
+        let scan_columns = vec![output_col(1, "k", DataType::Int64, false)];
+        let project_columns = vec![output_col(2, "k_alias", DataType::Int64, false)];
+        let scan = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Scan(PlanScanNode {
+                database: "db".to_string(),
+                table: table_def(),
+                alias: Some("t".to_string()),
+                columns: scan_columns.clone(),
+                predicates: vec![bool_lit(true)],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            children: vec![],
+            output_columns: scan_columns.clone(),
+            stats: stats_with_row_count(100.0),
+            probe_runtime_filters: vec![],
+        };
+        let filter = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Filter(PlanFilterNode {
+                predicate: and_expr(
+                    cmp_expr(1, "k", BinOp::Gt, 10),
+                    cmp_expr(1, "k", BinOp::Lt, 20),
+                ),
+            }),
+            children: vec![scan],
+            output_columns: scan_columns,
+            stats: stats_with_row_count(5.0),
+            probe_runtime_filters: vec![],
+        };
+        let project = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Project(PlanProjectNode {
+                items: vec![ProjectItem {
+                    expr: column_ref_expr(1, "k", DataType::Int64, false),
+                    output_name: "k_alias".to_string(),
+                    output_column_id: ColumnId::new_for_test(2),
+                }],
+                output_qualifier: None,
+            }),
+            children: vec![filter],
+            output_columns: project_columns,
+            stats: stats_with_row_count(5.0),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&project).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Project(_))
+        ));
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![2]);
+        assert_eq!(root.children.len(), 1);
+        let child = &root.children[0];
+        let scan = match &child.payload {
+            DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) => scan,
+            other => panic!("expected folded Scan child, got {other:?}"),
+        };
+        assert_eq!(child.node_id, 1);
+        assert_eq!(child.tuple_ids, vec![1]);
+        assert_eq!(scan.predicates.len(), 3);
+        assert_bool_lit(&scan.predicates[0], true);
+        assert_cmp_expr(&scan.predicates[1], 1, "k", BinOp::Gt, 10);
+        assert_cmp_expr(&scan.predicates[2], 1, "k", BinOp::Lt, 20);
+        assert_eq!(child.stats.output_row_count, 5.0);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_preserves_filter_over_project() {
+        let scan_columns = vec![output_col(1, "k", DataType::Int64, false)];
+        let project_columns = vec![output_col(2, "k_alias", DataType::Int64, false)];
+        let scan = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Scan(PlanScanNode {
+                database: "db".to_string(),
+                table: table_def(),
+                alias: Some("t".to_string()),
+                columns: scan_columns.clone(),
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            children: vec![],
+            output_columns: scan_columns.clone(),
+            stats: stats_with_row_count(100.0),
+            probe_runtime_filters: vec![],
+        };
+        let project = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Project(PlanProjectNode {
+                items: vec![ProjectItem {
+                    expr: column_ref_expr(1, "k", DataType::Int64, false),
+                    output_name: "k_alias".to_string(),
+                    output_column_id: ColumnId::new_for_test(2),
+                }],
+                output_qualifier: None,
+            }),
+            children: vec![scan],
+            output_columns: project_columns.clone(),
+            stats: stats_with_row_count(10.0),
+            probe_runtime_filters: vec![],
+        };
+        let filter = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Filter(PlanFilterNode {
+                predicate: cmp_expr(2, "k_alias", BinOp::Gt, 10),
+            }),
+            children: vec![project],
+            output_columns: project_columns,
+            stats: stats_with_row_count(5.0),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&filter).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        let root_filter = match &root.payload {
+            DistributedPayload::Physical(PhysicalPlanKind::Filter(filter)) => filter,
+            other => panic!("expected Filter root, got {other:?}"),
+        };
+        assert_cmp_expr(&root_filter.predicate, 2, "k_alias", BinOp::Gt, 10);
+        assert_eq!(root.node_id, 3);
+        assert_eq!(root.tuple_ids, vec![2]);
+        assert_eq!(root.stats.output_row_count, 5.0);
+        assert_eq!(root.children.len(), 1);
+
+        let child = &root.children[0];
+        assert!(matches!(
+            &child.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Project(_))
+        ));
+        assert_eq!(child.node_id, 2);
+        assert_eq!(child.tuple_ids, vec![2]);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_rejects_unsupported_sort_root() {
         let scan_columns = vec![output_col(1, "k", DataType::Int64, false)];
         let scan = PhysicalPlanNode {
             kind: PhysicalPlanKind::Scan(PlanScanNode {
@@ -322,9 +483,14 @@ mod tests {
             stats: stats(),
             probe_runtime_filters: vec![],
         };
-        let filter = PhysicalPlanNode {
-            kind: PhysicalPlanKind::Filter(PlanFilterNode {
-                predicate: column_ref_expr(1, "k", DataType::Boolean, false),
+        let sort = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Sort(PlanSortNode {
+                items: vec![],
+                analytic_partition_by: vec![],
+                output_columns: scan_columns.clone(),
+                offset: None,
+                partition_limit: None,
+                topn_type: None,
             }),
             children: vec![scan],
             output_columns: scan_columns,
@@ -332,10 +498,10 @@ mod tests {
             probe_runtime_filters: vec![],
         };
 
-        let err = build_distributed_plan_v2(&filter).expect_err("Filter is not supported in M3a1");
+        let err = build_distributed_plan_v2(&sort).expect_err("Sort is not supported in M3a2");
 
         assert!(
-            err.contains("PhysicalPlanKind::Filter"),
+            err.contains("PhysicalPlanKind::Sort"),
             "unexpected error: {err}"
         );
         assert!(err.contains("does not handle"), "unexpected error: {err}");
@@ -366,8 +532,12 @@ mod tests {
     }
 
     fn stats() -> PhysicalPlanStats {
+        stats_with_row_count(0.0)
+    }
+
+    fn stats_with_row_count(output_row_count: f64) -> PhysicalPlanStats {
         PhysicalPlanStats {
-            output_row_count: 0.0,
+            output_row_count,
             row_count_confidence: PlannerConfidence::Fallback,
             column_statistics: HashMap::new(),
             cost_estimate: None,
@@ -416,6 +586,80 @@ mod tests {
             },
             data_type,
             nullable,
+        }
+    }
+
+    fn bool_lit(value: bool) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Bool(value)),
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    fn int_lit(value: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(value)),
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn cmp_expr(column_id: u32, column: &str, op: BinOp, value: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(column_ref_expr(column_id, column, DataType::Int64, false)),
+                op,
+                right: Box::new(int_lit(value)),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::And,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    fn assert_bool_lit(expr: &TypedExpr, expected: bool) {
+        match &expr.kind {
+            ExprKind::Literal(LiteralValue::Bool(value)) => assert_eq!(*value, expected),
+            other => panic!("expected Bool literal, got {other:?}"),
+        }
+    }
+
+    fn assert_cmp_expr(
+        expr: &TypedExpr,
+        expected_column_id: u32,
+        expected_column: &str,
+        expected_op: BinOp,
+        expected_value: i64,
+    ) {
+        let (left, op, right) = match &expr.kind {
+            ExprKind::BinaryOp { left, op, right } => (left, op, right),
+            other => panic!("expected comparison expression, got {other:?}"),
+        };
+        assert_eq!(*op, expected_op);
+        match &left.kind {
+            ExprKind::ColumnRef {
+                column_id, column, ..
+            } => {
+                assert_eq!(*column_id, ColumnId::new_for_test(expected_column_id));
+                assert_eq!(column, expected_column);
+            }
+            other => panic!("expected column ref, got {other:?}"),
+        }
+        match &right.kind {
+            ExprKind::Literal(LiteralValue::Int(value)) => assert_eq!(*value, expected_value),
+            other => panic!("expected Int literal, got {other:?}"),
         }
     }
 }
