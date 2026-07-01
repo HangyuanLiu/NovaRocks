@@ -249,15 +249,6 @@ def enum_body_range(text: str, enum_name: str) -> tuple[int, int] | None:
     return brace_body_range(text, open_brace)
 
 
-def enum_body_contains_variant(text: str, enum_name: str, variant_name: str) -> bool:
-    body_range = enum_body_range(text, enum_name)
-    if body_range is None:
-        return False
-    start, end = body_range
-    body = text[start:end]
-    return re.search(rf"(?m)^\s*{re.escape(variant_name)}\b", body) is not None
-
-
 def enum_variant_violations(
     text: str, path: str, enum_name: str, variant_name: str, label: str
 ) -> list[str]:
@@ -273,11 +264,6 @@ def enum_variant_violations(
     return [
         f"{path}:{line_no}: {label}: found forbidden {enum_name}::{variant_name} variant"
     ]
-
-
-def declares_type(text: str, type_name: str) -> bool:
-    pattern = rf"\b(?:struct|enum|type)\s+{re.escape(type_name)}\b"
-    return re.search(pattern, text) is not None
 
 
 def type_declaration_violations(
