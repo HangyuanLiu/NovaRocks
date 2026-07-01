@@ -45,8 +45,17 @@ impl MvDescriptorV1 {
     }
 
     pub fn content_hash(&self) -> Result<String, String> {
-        let canonical_json = self.to_canonical_json()?;
-        Ok(hex_encode(&Sha256::digest(canonical_json.as_bytes())))
+        let mut value = serde_json::to_value(self)
+            .map_err(|err| format!("failed to serialize MV descriptor: {err}"))?;
+        // Physical fields excluded from the identity hash so a descriptor rebuilt
+        // from the same lake on a fresh cluster hashes identically (W0 acceptance:
+        // logical content equality, physical products may differ).
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("created_at_ms");
+        }
+        let canonical = serde_json::to_string(&sort_json_value(value))
+            .map_err(|err| format!("failed to render canonical MV descriptor hash JSON: {err}"))?;
+        Ok(hex_encode(&Sha256::digest(canonical.as_bytes())))
     }
 
     pub fn from_json(s: &str) -> Result<Self, String> {
@@ -233,7 +242,30 @@ mod tests {
         );
         assert_eq!(
             descriptor.content_hash().unwrap(),
-            "1cc794340a4c5415b7065669de028e103394b255aaee981c7fd64db1f60e85f9"
+            "d28301a7a51374da0211eac50ab64b8656a24520517e71ce96ac414a6e56b29f"
+        );
+    }
+
+    #[test]
+    fn content_hash_excludes_created_at_ms() {
+        let mut descriptor_a = sample();
+        descriptor_a.created_at_ms = 123;
+        let mut descriptor_b = sample();
+        descriptor_b.created_at_ms = 999_999;
+
+        assert_eq!(
+            descriptor_a.content_hash().unwrap(),
+            descriptor_b.content_hash().unwrap(),
+            "descriptors differing only in created_at_ms must hash identically"
+        );
+
+        let mut descriptor_c = descriptor_b.clone();
+        descriptor_c.logical_sql = "SELECT id FROM ice.sales.other".to_string();
+
+        assert_ne!(
+            descriptor_b.content_hash().unwrap(),
+            descriptor_c.content_hash().unwrap(),
+            "descriptors differing in a logical field must hash differently"
         );
     }
 
