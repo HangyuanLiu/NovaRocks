@@ -260,28 +260,6 @@ pub(crate) fn derive_statistics(
             child_statistics(memo, &expr.children, 0)
         }
 
-        Operator::LogicalAggregateStateMerge(merge) => {
-            let old_stats = child_statistics(memo, &expr.children, 0);
-            let delta_stats = child_statistics(memo, &expr.children, 1);
-            let output_rows = (old_stats.output_row_count + delta_stats.output_row_count).max(1.0);
-            // The merge is a union-all of the old and delta aggregate states:
-            // merge old/delta child column statistics positionally onto the
-            // merge's output columns instead of dropping them.
-            let column_statistics = merge_set_op_column_statistics(
-                memo,
-                &expr.children,
-                &merge.output_columns,
-                &[old_stats, delta_stats],
-                output_rows,
-                SetOpKind::Union { all: true },
-            );
-            Statistics {
-                output_row_count: output_rows,
-                row_count_confidence: Confidence::Estimated,
-                column_statistics,
-            }
-        }
-
         // -- Binary / multi-child operators --
         Operator::LogicalJoin(join) => {
             let left_stats = child_statistics(memo, &expr.children, 0);
@@ -649,24 +627,6 @@ pub(crate) fn derive_statistics(
             child_statistics(memo, &expr.children, 0)
         }
 
-        Operator::PhysicalAggregateStateMerge(merge) => {
-            let old_stats = child_statistics(memo, &expr.children, 0);
-            let delta_stats = child_statistics(memo, &expr.children, 1);
-            let output_rows = (old_stats.output_row_count + delta_stats.output_row_count).max(1.0);
-            let column_statistics = merge_set_op_column_statistics(
-                memo,
-                &expr.children,
-                &merge.output_columns,
-                &[old_stats, delta_stats],
-                output_rows,
-                SetOpKind::Union { all: true },
-            );
-            Statistics {
-                output_row_count: output_rows,
-                row_count_confidence: Confidence::Estimated,
-                column_statistics,
-            }
-        }
         Operator::LogicalAssertOneRow(_) | Operator::PhysicalAssertOneRow(_) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
             Statistics {
@@ -2278,7 +2238,6 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::commo
             })
             .collect(),
         Operator::LogicalAggregate(a) => a.output_columns.clone(),
-        Operator::LogicalAggregateStateMerge(a) => a.output_columns.clone(),
         Operator::LogicalChangeEventExpand(e) => e.output_columns.clone(),
         Operator::LogicalWindow(w) => w.output_columns.clone(),
         Operator::LogicalValues(v) => v.columns.clone(),
@@ -2359,7 +2318,6 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::commo
             })
             .collect(),
         Operator::PhysicalHashAggregate(a) => a.output_columns.clone(),
-        Operator::PhysicalAggregateStateMerge(a) => a.output_columns.clone(),
         Operator::PhysicalChangeEventExpand(e) => e.output_columns.clone(),
         Operator::PhysicalWindow(w) => w.output_columns.clone(),
         Operator::PhysicalValues(v) => v.columns.clone(),
@@ -5446,56 +5404,6 @@ mod tests {
         assert!(
             (cs.ndv_or_legacy_unknown_sentinel_for_test() - 50.0).abs() < 1e-9,
             "child NDV should pass through, got {}",
-            cs.ndv_or_legacy_unknown_sentinel_for_test()
-        );
-    }
-
-    #[test]
-    fn aggregate_state_merge_merges_child_column_statistics() {
-        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{AggregateStateMergeOp, Operator, ValuesOp};
-
-        fn child_with_key(memo: &mut Memo, col_id: u32, ndv: f64, rows: f64) -> usize {
-            let g = memo.new_group(MExpr {
-                id: memo.next_expr_id(),
-                op: Operator::LogicalValues(ValuesOp {
-                    rows: vec![],
-                    columns: vec![],
-                }),
-                children: vec![],
-            });
-            let mut props = LogicalProperties::new(vec![stats_output_column(col_id, "k")], rows);
-            props.row_count_confidence = Confidence::Estimated;
-            props.column_statistics.insert(
-                ColumnId::new_for_test(col_id),
-                set_op_column_stat(0.0, ndv, 0.0, 8.0, ndv, Confidence::Estimated),
-            );
-            memo.groups[g].logical_props = Some(props);
-            g
-        }
-
-        let mut memo = Memo::new();
-        let old = child_with_key(&mut memo, 1, 100.0, 1000.0);
-        let delta = child_with_key(&mut memo, 2, 30.0, 200.0);
-        let merge = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalAggregateStateMerge(AggregateStateMergeOp {
-                group_key_names: vec!["k".to_string()],
-                aggregate_state_names: vec![],
-                change_op_column: "op".to_string(),
-                output_columns: vec![stats_output_column(9, "k")],
-            }),
-            children: vec![old, delta],
-        };
-        let stats = derive_statistics(&merge, &memo, &empty_stats_input());
-        let cs = stats
-            .column_statistics
-            .get(&ColumnId::new_for_test(9))
-            .expect("aggregate-state-merge must carry merged child column statistics");
-        // union-all merge of NDV 100 and 30 -> >= max child NDV.
-        assert!(
-            cs.ndv_or_legacy_unknown_sentinel_for_test() >= 100.0,
-            "merged NDV should be >= max child NDV, got {}",
             cs.ndv_or_legacy_unknown_sentinel_for_test()
         );
     }

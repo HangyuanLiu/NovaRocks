@@ -1021,7 +1021,6 @@ mod tests {
             ),
             output_exprs: None,
             output_columns: Vec::new(),
-            direct_exec: None,
             boundary_schemas: Vec::new(),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),

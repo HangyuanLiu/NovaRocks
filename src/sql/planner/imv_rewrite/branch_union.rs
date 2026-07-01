@@ -606,10 +606,6 @@ mod tests {
             contains_signed_state_aggregate(branch),
             "change-stream branch must contain signed state aggregate"
         );
-        assert!(
-            !contains_aggregate_state_merge(branch),
-            "relation cutover must not emit AggregateStateMerge"
-        );
     }
 
     fn aggregate_change_stream_output_names(branch: &LogicalPlanNode) -> Vec<&str> {
@@ -819,11 +815,6 @@ mod tests {
             LogicalPlanKind::Aggregate(LogicalAggregateNode { aggregates, .. })
                 if aggregates.iter().any(|call| call.name.ends_with("_state_signed"))
         ) || plan.children.iter().any(contains_signed_state_aggregate)
-    }
-
-    fn contains_aggregate_state_merge(plan: &LogicalPlanNode) -> bool {
-        matches!(&plan.kind, LogicalPlanKind::AggregateStateMerge(_))
-            || plan.children.iter().any(contains_aggregate_state_merge)
     }
 
     fn single_state_column(type_signature: &str) -> AggregateStateColumnContract {

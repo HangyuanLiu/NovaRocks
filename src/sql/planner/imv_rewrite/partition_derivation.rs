@@ -29,13 +29,9 @@ impl LogicalRewriteRule for DerivePartitionSpecRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+    fn matches(&self, _expr: &OptExpr, ctx: &RewriteContext) -> bool {
         ctx.extension::<ImvExtension>().is_some_and(|ext| {
-            ext.annotation.partition.is_none()
-                && (matches!(
-                    &expr.op,
-                    crate::sql::optimizer::operator::Operator::LogicalAggregateStateMerge(_)
-                ) || ext.annotation.change_stream.has_aggregate())
+            ext.annotation.partition.is_none() && ext.annotation.change_stream.has_aggregate()
         })
     }
 

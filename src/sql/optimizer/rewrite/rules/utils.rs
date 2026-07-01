@@ -251,9 +251,6 @@ pub(crate) fn collect_output_ids_ordered_opt(expr: &OptExpr) -> Vec<ColumnId> {
         Operator::LogicalIntersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalExcept(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalDecode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
-        Operator::LogicalAggregateStateMerge(a) => {
-            a.output_columns.iter().map(|c| c.column_id).collect()
-        }
         Operator::LogicalValues(v) => v.columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalGenerateSeries(g) => {
             if g.output_column_id == ColumnId::UNSET {
@@ -335,11 +332,6 @@ fn collect_qualified_output_columns_opt_inner(expr: &OptExpr, out: &mut HashSet<
             collect_qualified_output_columns_opt_inner(expr.right(), out);
         }
         Operator::LogicalAggregate(a) => {
-            for c in &a.output_columns {
-                out.insert((None, c.name.to_lowercase()));
-            }
-        }
-        Operator::LogicalAggregateStateMerge(a) => {
             for c in &a.output_columns {
                 out.insert((None, c.name.to_lowercase()));
             }
@@ -630,9 +622,6 @@ mod typed_legacy {
             LogicalPlanKind::Intersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
             LogicalPlanKind::Except(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
             LogicalPlanKind::Decode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
-            LogicalPlanKind::AggregateStateMerge(a) => {
-                a.output_columns.iter().map(|c| c.column_id).collect()
-            }
             LogicalPlanKind::Values(v) => v.columns.iter().map(|c| c.column_id).collect(),
             LogicalPlanKind::GenerateSeries(g) => {
                 if g.output_column_id == ColumnId::UNSET {

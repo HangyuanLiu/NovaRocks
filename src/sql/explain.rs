@@ -207,17 +207,6 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
             out.push(format!("{pad}{body}"));
             format_node(plan.unary_input(), level, indent + 1, out);
         }
-        LogicalPlanKind::AggregateStateMerge(node) => {
-            out.push(format!(
-                "{}AggregateStateMerge keys=[{}] states=[{}] change_op={}",
-                pad,
-                node.group_key_names.join(","),
-                node.aggregate_state_names.join(","),
-                node.change_op_column
-            ));
-            format_node(plan.left(), level, indent + 1, out);
-            format_node(plan.right(), level, indent + 1, out);
-        }
         LogicalPlanKind::Apply(node) => {
             let kind = match node.kind {
                 ApplyKind::Scalar => "SCALAR",
@@ -595,9 +584,9 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{
-        ApplyKind, LogicalAggregateStateMergeNode, LogicalApplyNode, LogicalAssertOneRowNode,
-        LogicalFilterNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode, LogicalScanNode,
-        LogicalValuesNode, LogicalWindowNode, WindowExpr,
+        ApplyKind, LogicalApplyNode, LogicalAssertOneRowNode, LogicalFilterNode, LogicalPlanKind,
+        LogicalPlanNode, LogicalProjectNode, LogicalScanNode, LogicalValuesNode, LogicalWindowNode,
+        WindowExpr,
     };
 
     fn empty_values_for_test() -> LogicalPlanNode {
@@ -661,26 +650,6 @@ mod tests {
             data_type: DataType::Int64,
             nullable: false,
         }
-    }
-
-    #[test]
-    fn logical_explain_prints_aggregate_state_merge_evidence() {
-        let plan = LogicalPlanNode::new(
-            LogicalPlanKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
-                group_key_names: vec!["region".to_string()],
-                aggregate_state_names: vec!["c".to_string()],
-                change_op_column: "__change_op".to_string(),
-                output_columns: vec![],
-            }),
-            vec![empty_values_for_test(), empty_values_for_test()],
-            None,
-        );
-
-        let text = explain_plan(&plan, ExplainLevel::Normal).join("\n");
-
-        assert!(text.contains("AggregateStateMerge"), "{text}");
-        assert!(text.contains("keys=[region]"), "{text}");
-        assert!(text.contains("states=[c]"), "{text}");
     }
 
     #[test]

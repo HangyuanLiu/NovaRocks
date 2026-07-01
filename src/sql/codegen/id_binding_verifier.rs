@@ -7,9 +7,9 @@ use crate::sql::codegen::scalar_materialize::{
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
-    AggregateStateMergeOp, ChangeEventExpandOp, DecodeOp, GenerateSeriesOp, Operator,
-    PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp,
-    ProjectOp, RepeatOp, TableFunctionOp, WindowOp,
+    ChangeEventExpandOp, DecodeOp, GenerateSeriesOp, Operator, PhysicalDistributionOp,
+    PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp,
+    TableFunctionOp, WindowOp,
 };
 use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
 use crate::sql::optimizer::property::DistributionSpec;
@@ -156,10 +156,6 @@ fn verify_node(
             }
             Ok(child_outputs[1].clone())
         }
-        Operator::PhysicalAggregateStateMerge(op) => {
-            verify_aggregate_state_merge(op, &child_outputs)
-        }
-
         other => Err(format!(
             "non-physical operator reached codegen id verifier: {:?}",
             other
@@ -425,22 +421,6 @@ fn verify_distribution(
         }
     }
     Ok(())
-}
-
-fn verify_aggregate_state_merge(
-    op: &AggregateStateMergeOp,
-    child_outputs: &[HashSet<ColumnId>],
-) -> Result<HashSet<ColumnId>, String> {
-    if child_outputs.len() != 2 {
-        return Err(format!(
-            "PhysicalAggregateStateMerge expected 2 children, got {}",
-            child_outputs.len()
-        ));
-    }
-    // IMV AggregateStateMerge still has internal machine columns addressed by
-    // names in its dedicated operator metadata. It does not compile regular
-    // ColumnRef expressions here; keep this as the narrow P3 exception.
-    Ok(output_ids(op.output_columns.iter().map(|c| c.column_id)))
 }
 
 fn verify_expr(expr: &TypedExpr, input: &HashSet<ColumnId>, context: &str) -> Result<(), String> {

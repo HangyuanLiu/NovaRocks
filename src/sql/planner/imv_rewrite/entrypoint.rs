@@ -199,9 +199,6 @@ fn collect_plan_column_ids(plan: &LogicalPlanNode, max_id: &mut u32) {
         LogicalPlanKind::CTEConsume(consume) => {
             collect_output_columns(&consume.output_columns, max_id)
         }
-        LogicalPlanKind::AggregateStateMerge(merge) => {
-            collect_output_columns(&merge.output_columns, max_id)
-        }
         LogicalPlanKind::Apply(apply) => {
             collect_expr_column_ids(&apply.subquery_expr, max_id);
             collect_output_column(&apply.output_column, max_id);
@@ -2494,8 +2491,8 @@ mod tests {
 
     #[test]
     fn imv_pipeline_leaves_partition_annotation_unset_for_projection_filter() {
-        // Reuses the existing project-over-scan shape: no AggregateStateMerge,
-        // so the rule never matches and the slot stays None (P1 scope).
+        // Reuses the existing project-over-scan shape, so the rule never
+        // matches and the slot stays None (P1 scope).
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
             LogicalPlanKind::Project(LogicalProjectNode {

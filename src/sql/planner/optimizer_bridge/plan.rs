@@ -2,10 +2,10 @@
 
 use crate::sql::analysis::{OutputColumn, SortItem};
 use crate::sql::optimizer::operator::{
-    AggregateOutputLayout, AggregateStateMergeOp, ApplyOp, AssertOneRowOp, CTEAnchorOp,
-    CTEConsumeOp, CTEProduceOp, DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp,
-    ImvVersionOp, IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp,
-    RepeatOp, ScalarAggregateSpec, ScanOp, SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
+    AggregateOutputLayout, ApplyOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
+    DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp, LimitOp,
+    LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScalarAggregateSpec, ScanOp,
+    SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::ScalarArena;
@@ -15,13 +15,12 @@ use crate::sql::planner::optimizer_bridge::scalar::{
     materialize_project_items, materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::planner::plan::{
-    LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalApplyNode,
-    LogicalAssertOneRowNode, LogicalCTEAnchorNode, LogicalCTEConsumeNode, LogicalCTEProduceNode,
-    LogicalDecodeNode, LogicalExceptNode, LogicalFilterNode, LogicalGenerateSeriesNode,
-    LogicalImvDeltaNode, LogicalImvVersionNode, LogicalIntersectNode, LogicalJoinNode,
-    LogicalLimitNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode, LogicalRepeatNode,
-    LogicalScanNode, LogicalSortNode, LogicalTableFunctionNode, LogicalUnionNode,
-    LogicalValuesNode, LogicalWindowNode,
+    LogicalAggregateNode, LogicalApplyNode, LogicalAssertOneRowNode, LogicalCTEAnchorNode,
+    LogicalCTEConsumeNode, LogicalCTEProduceNode, LogicalDecodeNode, LogicalExceptNode,
+    LogicalFilterNode, LogicalGenerateSeriesNode, LogicalImvDeltaNode, LogicalImvVersionNode,
+    LogicalIntersectNode, LogicalJoinNode, LogicalLimitNode, LogicalPlanKind, LogicalPlanNode,
+    LogicalProjectNode, LogicalRepeatNode, LogicalScanNode, LogicalSortNode,
+    LogicalTableFunctionNode, LogicalUnionNode, LogicalValuesNode, LogicalWindowNode,
 };
 
 /// Bridge 1: convert a `LogicalPlanNode` tree into an `OptExpr` tree, interning
@@ -333,18 +332,6 @@ fn logical_plan_to_opt_expr_unchecked(
             OptExpr::new(op, vec![child])
         }
 
-        LogicalPlanKind::AggregateStateMerge(node) => {
-            let old_input = logical_plan_to_opt_expr_unchecked(plan.left(), scalars);
-            let delta_input = logical_plan_to_opt_expr_unchecked(plan.right(), scalars);
-            let op = Operator::LogicalAggregateStateMerge(AggregateStateMergeOp {
-                group_key_names: node.group_key_names.clone(),
-                aggregate_state_names: node.aggregate_state_names.clone(),
-                change_op_column: node.change_op_column.clone(),
-                output_columns: node.output_columns.clone(),
-            });
-            OptExpr::new(op, vec![old_input, delta_input])
-        }
-
         LogicalPlanKind::AssertOneRow(node) => {
             let child = logical_plan_to_opt_expr_unchecked(plan.unary_input(), scalars);
             let op = Operator::LogicalAssertOneRow(AssertOneRowOp {
@@ -482,14 +469,6 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
                 .collect(),
             columns: op.columns,
         }),
-        Operator::LogicalAggregateStateMerge(op) => {
-            LogicalPlanKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
-                group_key_names: op.group_key_names,
-                aggregate_state_names: op.aggregate_state_names,
-                change_op_column: op.change_op_column,
-                output_columns: op.output_columns,
-            })
-        }
         Operator::LogicalImvDelta(op) => LogicalPlanKind::ImvDelta(LogicalImvDeltaNode {
             is_root: op.is_root,
             action_column: op.action_column,

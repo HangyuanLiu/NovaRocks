@@ -326,14 +326,6 @@ impl LogicalAggregateOp {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct AggregateStateMergeOp {
-    pub(crate) group_key_names: Vec<String>,
-    pub(crate) aggregate_state_names: Vec<String>,
-    pub(crate) change_op_column: String,
-    pub(crate) output_columns: Vec<OutputColumn>,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct LogicalJoinOp {
     pub join_type: JoinKind,
     pub condition: Option<ScalarId>,
@@ -646,7 +638,6 @@ pub(crate) enum Operator {
     LogicalCTEProduce(CTEProduceOp),
     LogicalCTEConsume(CTEConsumeOp),
     LogicalDecode(DecodeOp),
-    LogicalAggregateStateMerge(AggregateStateMergeOp),
     LogicalAssertOneRow(AssertOneRowOp),
     /// Apply (correlated subquery). Eliminated by SubqueryRewrite before memo.
     LogicalApply(ApplyOp),
@@ -679,7 +670,6 @@ pub(crate) enum Operator {
     PhysicalGenerateSeries(GenerateSeriesOp),
     PhysicalTableFunction(TableFunctionOp),
     PhysicalDecode(DecodeOp),
-    PhysicalAggregateStateMerge(AggregateStateMergeOp),
     PhysicalAssertOneRow(AssertOneRowOp),
 }
 
@@ -708,7 +698,6 @@ impl Operator {
                 | Operator::LogicalCTEProduce(_)
                 | Operator::LogicalCTEConsume(_)
                 | Operator::LogicalDecode(_)
-                | Operator::LogicalAggregateStateMerge(_)
                 | Operator::LogicalAssertOneRow(_)
                 | Operator::LogicalApply(_)
                 | Operator::LogicalImvDelta(_)
