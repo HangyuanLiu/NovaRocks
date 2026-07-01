@@ -556,6 +556,9 @@ fn push_probe_down(
     };
 
     // Descend into EACH child; each subtree contributes at most one probe.
+    // Unlike the M2 single-probe form, we visit ALL children (no first-match
+    // short-circuit) so both sides of an inner join can each receive a probe
+    // for this filter_id.
     let mut placed_in_child = false;
     for child in &mut node.children {
         if push_probe_down(child, scalars, filter_id, &descend_set, policy) {
@@ -1433,6 +1436,92 @@ pub(crate) mod test_support {
         };
         with_scalars(plan, scalars)
     }
+
+    /// Semi-join-interior probe subtree (M3 output-survival gate). Shape:
+    ///
+    /// ```text
+    ///        TopJoin (Inner): eq (a = c)        <- build RF on c
+    ///        /              \
+    ///     J_semi (LeftSemi)   scan_C(col 3)     <- BUILD side of TopJoin
+    ///     eq (a = b)
+    ///     /       \
+    ///  scan_A(1)   scan_B(2)
+    /// ```
+    ///
+    /// `J_semi` is a `LeftSemi` join, so per `join_output_columns`
+    /// (`extract.rs`) its own `output_columns` is `children[0]`'s columns only
+    /// — `a` (col 1) — never `b` (col 2). `scan_B` is the existence-only side:
+    /// it decides whether an `A` row has a match but never contributes columns
+    /// upward. Because `b` never survives into `J_semi`'s output, the TopJoin's
+    /// probe key must itself be `a` (the only column visible above `J_semi`);
+    /// `b` only re-enters consideration if `expand_probe_set_across_join`'s
+    /// output-survival gate is bypassed.
+    ///
+    /// The direct probe member `a` is one side of `J_semi`'s own `a = b`
+    /// equi-condition, so a pushdown that ignores output-survival would expand
+    /// the set to include `b` and then place a second probe on `scan_B`. That
+    /// would be wrong: `scan_B` only participates in existence testing for the
+    /// semi join, and a probe runtime filter derived from `c` (unrelated to the
+    /// semi join's own semantics) could drop `B` rows that a matching `A` row
+    /// depends on, silently turning matching `A` rows into non-matches.
+    ///
+    /// An M3 pushdown must place the probe ONLY on `scan_A` (the preserved
+    /// side) and NEVER on `scan_B` (the dropped, existence-only side) — this is
+    /// exactly the invariant `expand_probe_set_across_join`'s survival gate
+    /// exists to protect.
+    pub(crate) fn semi_join_interior_probe_subtree() -> OptimizerPhysicalNode {
+        let mut scalars = ScalarArena::new();
+        let (a_oc, a_expr) = col(1, "a");
+        let (b_oc, b_expr) = col(2, "b");
+        let (c_oc, c_expr) = col(3, "c");
+
+        let scan_a = leaf(1_000_000.0, a_oc.clone());
+        let scan_b = leaf(1_000_000.0, b_oc.clone());
+        // J_semi: LEFT SEMI join on a = b. Only scan_A's columns (children[0])
+        // survive into output_columns; scan_B (children[1]) is existence-only
+        // and is dropped, mirroring `join_output_columns`'s LeftSemi arm.
+        let j_semi = OptimizerPhysicalNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::LeftSemi,
+                eq_conditions: vec![eq(&mut scalars, &a_expr, &b_expr)],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![scan_a, scan_b],
+            stats: Statistics {
+                output_row_count: 1_000_000.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            output_columns: vec![a_oc.clone()], // LeftSemi drops scan_B's columns.
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        // Build side of the top join: small so gates pass.
+        let scan_c = leaf(10.0, c_oc.clone());
+        let plan = OptimizerPhysicalNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![eq(&mut scalars, &a_expr, &c_expr)],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![j_semi, scan_c], // children[0]=probe subtree, children[1]=build
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            output_columns: vec![a_oc, c_oc],
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        with_scalars(plan, scalars)
+    }
 }
 
 #[cfg(test)]
@@ -1566,6 +1655,47 @@ mod tests {
         assert!(
             scan_d.probe_runtime_filters.is_empty(),
             "the equivalent column beyond the outer boundary must get NO probe"
+        );
+    }
+
+    #[test]
+    fn semi_join_interior_survival_gate_blocks_existence_only_side() {
+        // Output-survival gate (M3 correctness pivot, expand_probe_set_across_join):
+        // J_semi (LeftSemi, a = b) sits interior to the top join's probe subtree.
+        // The direct probe member `a` is preserved-side (survives J_semi's
+        // output); its eq-partner `b` lives on the existence-only side, which
+        // LeftSemi drops from its output. The gate must admit `a` alone and
+        // refuse to expand the equivalence set to `b`, so the probe reaches
+        // ONLY scan_A and NEVER scan_B.
+        let mut join = super::test_support::semi_join_interior_probe_subtree();
+        annotate_test(&mut join, &OptimizerOptions::default_settings());
+
+        assert_eq!(join.build_runtime_filters.len(), 1, "one build RF expected");
+        let filter_id = join.build_runtime_filters[0].filter_id;
+        let scalars = join.execution_props.scalar_arena.as_deref().unwrap();
+
+        let j_semi = &join.children[0];
+        let scan_a = &j_semi.children[0];
+        let scan_b = &j_semi.children[1];
+
+        // The probe descends past J_semi itself (it is not a semantic boundary
+        // for RF purposes — only outer/anti joins stop the pushdown).
+        assert!(
+            !j_semi
+                .probe_runtime_filters
+                .iter()
+                .any(|p| p.filter_id == filter_id),
+            "the probe should not rest on the semi join node itself"
+        );
+        assert_eq!(
+            probe_column_for(scan_a, scalars, filter_id),
+            Some(ColumnId::new_for_test(1)),
+            "the preserved-side scan (a, col 1) must receive the probe"
+        );
+        assert!(
+            scan_b.probe_runtime_filters.is_empty(),
+            "the existence-only side (scan_B) must NEVER receive a probe: it \
+             would drop join-preserving rows for the outer semi join"
         );
     }
 
