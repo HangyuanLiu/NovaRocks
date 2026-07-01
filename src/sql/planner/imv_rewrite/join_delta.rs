@@ -170,7 +170,8 @@ impl LogicalRewriteRule for InjectJoinApplyKeyRule {
 
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         let plan = opt_expr_to_plan(expr.clone(), ctx);
-        is_join_refresh_union_without_apply_key(&plan)
+        (is_join_refresh_union_without_apply_key(&plan)
+            && is_join_refresh_descriptor_candidate_context(ctx))
             || project_needs_join_refresh_internal_outputs(&plan)
     }
 
@@ -204,14 +205,9 @@ impl LogicalRewriteRule for RecordJoinRefreshDescriptorRule {
     }
 
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
-        if ctx
-            .extension::<ImvExtension>()
-            .is_some_and(|ext| ext.annotation.change_stream.join_refresh.is_some())
-        {
-            return false;
-        }
         let plan = opt_expr_to_plan(expr.clone(), ctx);
         is_join_refresh_union_with_apply_key(&plan)
+            && is_join_refresh_descriptor_candidate_context(ctx)
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
@@ -305,7 +301,11 @@ fn inject_join_apply_key(
     };
     for (branch, evidence) in plan.children.iter_mut().zip(branch_evidence.iter()) {
         inject_join_apply_key_into_branch(branch, evidence, &join_apply_key_column)?;
+        prune_raw_join_row_id_output_from_branch(branch, evidence)?;
     }
+    union
+        .output_columns
+        .retain(|column| !ImvRowIdColumn::matches(column));
     union.output_columns.push(join_apply_key_column);
     Ok(plan)
 }
@@ -322,6 +322,14 @@ fn project_needs_join_refresh_internal_outputs(plan: &LogicalPlanNode) -> bool {
                 .iter()
                 .any(|item| item.output_column_id == required.column_id)
         })
+}
+
+fn is_join_refresh_descriptor_candidate_context(ctx: &RewriteContext) -> bool {
+    let Some(ext) = ctx.extension::<ImvExtension>() else {
+        return false;
+    };
+    ext.annotation.change_stream.join_refresh.is_none()
+        && ext.mv_ctx.schema_contract.aggregate.is_none()
 }
 
 fn propagate_join_refresh_internal_outputs_through_project(
@@ -388,6 +396,26 @@ fn inject_join_apply_key_into_branch(
         expr: join_row_key_expr(evidence),
         output_name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
         output_column_id: join_apply_key_column.column_id,
+    });
+    Ok(())
+}
+
+fn prune_raw_join_row_id_output_from_branch(
+    branch: &mut LogicalPlanNode,
+    evidence: &JoinDeltaBranchEvidence,
+) -> Result<(), String> {
+    let LogicalPlanKind::Project(project) = &mut branch.kind else {
+        return Err("join apply-key pruning expected normalized Project branch".to_string());
+    };
+    let row_id_ids = [
+        evidence.left_row_id_column.column_id,
+        evidence.right_row_id_column.column_id,
+    ];
+    project.items.retain(|item| {
+        !item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
+            && !row_id_ids
+                .iter()
+                .any(|row_id| *row_id == item.output_column_id)
     });
     Ok(())
 }
@@ -795,41 +823,48 @@ fn build_join_payload_columns(
         ));
     }
 
-    schema_contract
+    let aggregate_contract = schema_contract.aggregate.is_some();
+    let mut payload_columns = Vec::new();
+    for (idx, (lineage, target)) in schema_contract
         .output
         .columns
         .iter()
         .zip(schema_contract.target.visible_columns.iter())
         .enumerate()
-        .map(|(idx, (lineage, target))| {
-            if lineage.expression.kind != ExpressionKind::Column {
-                return Err(format!(
-                    "join refresh descriptor payload column {idx} `{}` must be a direct column reference, got {:?}",
-                    target.output_name, lineage.expression.kind
-                ));
+    {
+        if lineage.expression.kind != ExpressionKind::Column {
+            if aggregate_contract {
+                continue;
             }
-            let [field] = lineage.expression.referenced_base_fields.as_slice() else {
-                return Err(format!(
-                    "join refresh descriptor payload column {idx} `{}` must reference exactly one base field, got {}",
-                    target.output_name,
-                    lineage.expression.referenced_base_fields.len()
-                ));
-            };
-            let (base_contract, output_columns, role) =
-                if field.table_fqn.eq_ignore_ascii_case(left_base_fqn) {
-                    (left_base_contract, left_output_columns, "left payload")
-                } else if field.table_fqn.eq_ignore_ascii_case(right_base_fqn) {
-                    (right_base_contract, right_output_columns, "right payload")
-                } else {
-                    return Err(format!(
-                        "join refresh descriptor payload column {idx} `{}` references base {} outside actual join bases {}, {}",
-                        target.output_name, field.table_fqn, left_base_fqn, right_base_fqn
-                    ));
-                };
-            let field_name = field_name_for_lineage(base_contract, field)?;
-            find_unique_output_column(output_columns, field_name, role)
-        })
-        .collect()
+            return Err(format!(
+                "join refresh descriptor payload column {idx} `{}` must be a direct column reference, got {:?}",
+                target.output_name, lineage.expression.kind
+            ));
+        }
+        let [field] = lineage.expression.referenced_base_fields.as_slice() else {
+            return Err(format!(
+                "join refresh descriptor payload column {idx} `{}` must reference exactly one base field, got {}",
+                target.output_name,
+                lineage.expression.referenced_base_fields.len()
+            ));
+        };
+        let (base_contract, output_columns, role) = if field
+            .table_fqn
+            .eq_ignore_ascii_case(left_base_fqn)
+        {
+            (left_base_contract, left_output_columns, "left payload")
+        } else if field.table_fqn.eq_ignore_ascii_case(right_base_fqn) {
+            (right_base_contract, right_output_columns, "right payload")
+        } else {
+            return Err(format!(
+                "join refresh descriptor payload column {idx} `{}` references base {} outside actual join bases {}, {}",
+                target.output_name, field.table_fqn, left_base_fqn, right_base_fqn
+            ));
+        };
+        let field_name = field_name_for_lineage(base_contract, field)?;
+        payload_columns.push(find_unique_output_column(output_columns, field_name, role)?);
+    }
+    Ok(payload_columns)
 }
 
 fn build_join_key_pairs(
@@ -1076,9 +1111,24 @@ fn join_delta_payload_output_columns(
         .chain(plan_output_columns(right)?)
         .filter(|column| {
             !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)
-                && !column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
+                && !is_iceberg_row_identity_metadata_output(column)
         })
         .collect())
+}
+
+fn is_iceberg_row_identity_metadata_output(column: &OutputColumn) -> bool {
+    column
+        .name
+        .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
+        || column
+            .name
+            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
+        || column
+            .name
+            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+        || column
+            .name
+            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
 }
 
 pub(crate) fn mark_delta_scan(
@@ -1907,6 +1957,22 @@ mod tests {
     }
 
     #[test]
+    fn join_delta_payload_excludes_iceberg_row_identity_metadata() {
+        let columns = join_delta_payload_output_columns(
+            JoinKind::Inner,
+            &project_over(scan_with_iceberg_metadata("left", 1)),
+            &project_over(scan_with_iceberg_metadata("right", 20)),
+        )
+        .expect("join delta payload columns");
+        let names = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["left_k", "left_v", "right_k", "right_v"]);
+    }
+
+    #[test]
     fn mark_version_scan_pushes_same_role_down_both_join_sides() {
         // Version marker over a Join distributes over the join:
         // Version(Join(a,b), from) == Join(Version(a, from), Version(b, from)).
@@ -2126,6 +2192,44 @@ mod tests {
             vec![input],
             None,
         )
+    }
+
+    fn scan_with_iceberg_metadata(name: &str, first_id: u32) -> LogicalPlanNode {
+        let mut plan = scan(name, first_id);
+        let LogicalPlanKind::Scan(scan) = &mut plan.kind else {
+            unreachable!();
+        };
+        scan.columns.extend([
+            OutputColumn {
+                column_id: ColumnId(first_id + 2),
+                name: crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: ColumnId(first_id + 3),
+                name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: ColumnId(first_id + 4),
+                name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: ColumnId(first_id + 5),
+                name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            },
+        ]);
+        plan
     }
 
     fn scan(name: &str, first_id: u32) -> LogicalPlanNode {

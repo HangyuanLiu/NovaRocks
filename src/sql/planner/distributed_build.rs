@@ -719,8 +719,13 @@ impl<'a> DistributedPlanBuilder<'a> {
             return self.visit_gather_distribution_over_limit(limit_op, &node.children[0], node);
         }
         let child_plan = &node.children[0];
-        let output_partition =
-            data_partition_for_distribution_spec(&op.spec, &child_plan.output_columns)?;
+        let prefer_partition_display = matches!(child_plan.op, Operator::PhysicalHashAggregate(_));
+        let output_partition = data_partition_for_distribution_spec(
+            &op.spec,
+            &child_plan.output_columns,
+            prefer_partition_display,
+            self.scalars,
+        )?;
         let partition_type = partition_type_for_data_partition(&output_partition);
         let partition_exprs = output_partition.exprs.clone();
         self.emit_fragment_exchange(
@@ -753,6 +758,8 @@ impl<'a> DistributedPlanBuilder<'a> {
         let output_partition = data_partition_for_distribution_spec(
             &DistributionSpec::Gather,
             &limit_node.output_columns,
+            false,
+            self.scalars,
         )?;
         let partition_type = partition_type_for_data_partition(&output_partition);
         self.emit_fragment_exchange(
@@ -790,6 +797,8 @@ impl<'a> DistributedPlanBuilder<'a> {
         let output_partition = data_partition_for_distribution_spec(
             &DistributionSpec::Gather,
             &child_plan.output_columns,
+            false,
+            self.scalars,
         )?;
         let partition_type = partition_type_for_data_partition(&output_partition);
         self.emit_fragment_exchange(
@@ -827,6 +836,8 @@ impl<'a> DistributedPlanBuilder<'a> {
         let output_partition = data_partition_for_distribution_spec(
             &DistributionSpec::Gather,
             &child_plan.output_columns,
+            false,
+            self.scalars,
         )?;
         let partition_type = partition_type_for_data_partition(&output_partition);
         let topn_items = materialize_sort_keys(self.scalars, &op.items);
@@ -1272,13 +1283,15 @@ fn fold_filter_into_scan(node: &mut DistributedPlanNode, predicate: &TypedExpr) 
 fn data_partition_for_distribution_spec(
     spec: &DistributionSpec,
     output_columns: &[crate::sql::analysis::OutputColumn],
+    prefer_display: bool,
+    scalars: &ScalarArena,
 ) -> Result<DataPartition, String> {
     match spec {
         DistributionSpec::Gather | DistributionSpec::Broadcast => {
             Ok(DataPartition::unpartitioned())
         }
         DistributionSpec::HashPartitioned { cols, .. } => {
-            let exprs = partition_exprs_for_columns(cols, output_columns);
+            let exprs = partition_exprs_for_columns(cols, prefer_display, output_columns, scalars);
             if exprs.is_empty() {
                 Ok(DataPartition::unpartitioned())
             } else {
@@ -1296,24 +1309,44 @@ fn data_partition_for_distribution_spec(
 
 fn partition_exprs_for_columns(
     cols: &[crate::sql::column_id::ColumnId],
+    prefer_display: bool,
     output_columns: &[crate::sql::analysis::OutputColumn],
+    scalars: &ScalarArena,
 ) -> Vec<TypedExpr> {
     cols.iter()
         .filter_map(|col_id| {
             output_columns
                 .iter()
                 .find(|column| column.column_id == *col_id)
-                .map(|column| TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: column.column_id,
-                        qualifier: None,
-                        column: column.name.clone(),
-                    },
-                    data_type: column.data_type.clone(),
-                    nullable: column.nullable,
+                .map(|column| {
+                    let (qualifier, name) =
+                        partition_column_display(column, prefer_display, scalars);
+                    TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: column.column_id,
+                            qualifier,
+                            column: name,
+                        },
+                        data_type: column.data_type.clone(),
+                        nullable: column.nullable,
+                    }
                 })
         })
         .collect()
+}
+
+fn partition_column_display(
+    column: &crate::sql::analysis::OutputColumn,
+    prefer_display: bool,
+    scalars: &ScalarArena,
+) -> (Option<String>, String) {
+    if !prefer_display {
+        return (None, column.name.clone());
+    }
+    let Some(display) = scalars.column_display(column.column_id) else {
+        return (None, column.name.clone());
+    };
+    (display.qualifier.clone(), display.column.clone())
 }
 
 fn partition_type_for_data_partition(partition: &DataPartition) -> partitions::TPartitionType {

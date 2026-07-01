@@ -2071,6 +2071,14 @@ fn cast_with_special_rules_with_field_schema(
             cast_map_to_map(array, target_entries, *ordered)
         }
         // Explicit timestamp→timestamp handling.
+        // Same-unit casts can differ only by timezone metadata. Retag the
+        // physical array so descriptor-bound scans expose the authoritative
+        // Iceberg timestamptz Arrow type without changing values.
+        (DataType::Timestamp(source_unit, _), DataType::Timestamp(target_unit, _))
+            if source_unit == target_unit =>
+        {
+            retag_timestamp_same_unit(array, target_type)
+        }
         // Narrowing (nanosecond→microsecond or same-unit): defer to Arrow, which truncates
         // toward zero — the correct behavior for narrowing casts.
         // Widening (microsecond→nanosecond): validate that ×1000 does not overflow i64
@@ -2100,6 +2108,16 @@ fn cast_with_special_rules_with_field_schema(
         }
         _ => cast(array.as_ref(), target_type).map_err(|e| e.to_string()),
     }
+}
+
+fn retag_timestamp_same_unit(array: &ArrayRef, target_type: &DataType) -> Result<ArrayRef, String> {
+    let data = array
+        .to_data()
+        .into_builder()
+        .data_type(target_type.clone())
+        .build()
+        .map_err(|e| format!("retag timestamp timezone metadata failed: {e}"))?;
+    Ok(make_array(data))
 }
 
 fn cast_utf8_to_decimal_with_empty_as_null(
@@ -4560,6 +4578,19 @@ mod tests {
     }
 
     // IV3-7 Task 12: nanosecond timestamp cast semantics
+
+    #[test]
+    fn cast_same_unit_timestamp_retags_timezone_metadata() {
+        let src = Arc::new(TimestampMicrosecondArray::from(vec![Some(1_000_i64)])) as ArrayRef;
+        let target = DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()));
+        let out = cast_with_special_rules(&src, &target).unwrap();
+        assert_eq!(out.data_type(), &target);
+        let a = out
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(a.value(0), 1_000);
+    }
 
     #[test]
     fn cast_nanos_to_micros_truncates() {

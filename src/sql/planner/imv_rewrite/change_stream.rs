@@ -292,7 +292,7 @@ fn build_relational_change_stream_root_descriptor(
             change_stream_project_output_column(project).filter(|_| {
                 project_filter_contains_state_all_zero(plan)
                     && contains_join_kind(plan, JoinKind::LeftOuter)
-                    && contains_join_kind(plan, JoinKind::Cross)
+                    && contains_supported_delta_join_kind(plan)
                     && contains_branch_marker_values(plan)
                     && contains_target_state_scan(plan)
                     && contains_signed_state_aggregate(plan)
@@ -433,6 +433,10 @@ fn contains_join_kind(plan: &LogicalPlanNode, join_type: JoinKind) -> bool {
         .children
         .iter()
         .any(|child| contains_join_kind(child, join_type))
+}
+
+fn contains_supported_delta_join_kind(plan: &LogicalPlanNode) -> bool {
+    contains_join_kind(plan, JoinKind::Inner) || contains_join_kind(plan, JoinKind::Cross)
 }
 
 fn contains_branch_marker_values(plan: &LogicalPlanNode) -> bool {

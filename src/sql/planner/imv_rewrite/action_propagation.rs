@@ -9,7 +9,9 @@
 //! predicates.
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN;
-use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
+use crate::sql::analysis::{
+    ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+};
 use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -167,6 +169,7 @@ fn is_change_stream_propagation_boundary(plan: &LogicalPlanNode) -> bool {
                 && contains_signed_state_aggregate(plan))
                 || is_cte_consumer_change_stream_boundary(plan)
         }
+        LogicalPlanKind::Project(_) => is_relational_change_stream_propagation_boundary(plan),
         LogicalPlanKind::CTEAnchor(_) if plan.children.len() == 2 => {
             union_outputs_action_column(plan.child(1))
                 && contains_target_state_scan(plan.child(0))
@@ -174,6 +177,130 @@ fn is_change_stream_propagation_boundary(plan: &LogicalPlanNode) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_relational_change_stream_propagation_boundary(plan: &LogicalPlanNode) -> bool {
+    let LogicalPlanKind::Project(project) = &plan.kind else {
+        return false;
+    };
+    project
+        .items
+        .iter()
+        .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+        && project_filter_contains_state_all_zero(plan)
+        && contains_join_kind(plan, JoinKind::LeftOuter)
+        && contains_supported_delta_join_kind(plan)
+        && contains_branch_marker_values(plan)
+        && contains_target_state_scan(plan)
+        && contains_signed_state_aggregate(plan)
+}
+
+fn project_filter_contains_state_all_zero(plan: &LogicalPlanNode) -> bool {
+    let LogicalPlanKind::Project(_) = &plan.kind else {
+        return false;
+    };
+    let Some(filter_plan) = plan.children.first() else {
+        return false;
+    };
+    let LogicalPlanKind::Filter(filter) = &filter_plan.kind else {
+        return false;
+    };
+    expr_contains_function(&filter.predicate, "state_all_zero")
+}
+
+fn expr_contains_function(expr: &TypedExpr, name: &str) -> bool {
+    match &expr.kind {
+        ExprKind::FunctionCall {
+            name: func, args, ..
+        }
+        | ExprKind::AggregateCall {
+            name: func, args, ..
+        } => {
+            func.eq_ignore_ascii_case(name)
+                || args.iter().any(|arg| expr_contains_function(arg, name))
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            expr_contains_function(left, name) || expr_contains_function(right, name)
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. } => expr_contains_function(expr, name),
+        ExprKind::InList { expr, list, .. } => {
+            expr_contains_function(expr, name)
+                || list.iter().any(|item| expr_contains_function(item, name))
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_function(expr, name)
+                || expr_contains_function(low, name)
+                || expr_contains_function(high, name)
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            expr_contains_function(expr, name) || expr_contains_function(pattern, name)
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|expr| expr_contains_function(expr, name))
+                || when_then.iter().any(|(when_expr, then_expr)| {
+                    expr_contains_function(when_expr, name)
+                        || expr_contains_function(then_expr, name)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|expr| expr_contains_function(expr, name))
+        }
+        ExprKind::LambdaFunction { body, .. } => expr_contains_function(body, name),
+        ExprKind::Nested(expr) | ExprKind::Lambda { body: expr, .. } => {
+            expr_contains_function(expr, name)
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter().any(|arg| expr_contains_function(arg, name))
+                || partition_by
+                    .iter()
+                    .any(|expr| expr_contains_function(expr, name))
+                || order_by
+                    .iter()
+                    .any(|item| expr_contains_function(&item.expr, name))
+        }
+        ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => false,
+    }
+}
+
+fn contains_join_kind(plan: &LogicalPlanNode, join_type: JoinKind) -> bool {
+    matches!(
+        &plan.kind,
+        LogicalPlanKind::Join(join) if join.join_type == join_type
+    ) || plan
+        .children
+        .iter()
+        .any(|child| contains_join_kind(child, join_type))
+}
+
+fn contains_supported_delta_join_kind(plan: &LogicalPlanNode) -> bool {
+    contains_join_kind(plan, JoinKind::Inner) || contains_join_kind(plan, JoinKind::Cross)
+}
+
+fn contains_branch_marker_values(plan: &LogicalPlanNode) -> bool {
+    matches!(&plan.kind, LogicalPlanKind::Values(values)
+        if values.columns.iter().any(|column| {
+            column.name.eq_ignore_ascii_case("__imv_change_branch")
+        })
+    ) || plan.children.iter().any(contains_branch_marker_values)
 }
 
 fn is_cte_consumer_change_stream_boundary(plan: &LogicalPlanNode) -> bool {
@@ -322,6 +449,7 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
             }
             LogicalPlanKind::Join(_) => {
                 (subtree_has_action_column(plan.left()) || subtree_has_action_column(plan.right()))
+                    && !is_join_delta_fixpoint_candidate(&plan)
                     && !is_supported_join_delta_branch(&plan)
             }
             LogicalPlanKind::Union(_) => {
@@ -329,6 +457,8 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                     false
                 } else if branch_delta_union_needs_row_id_output(&plan) {
                     true
+                } else if union_outputs_action_column(&plan) {
+                    false
                 } else {
                     plan.children.iter().any(subtree_has_action_column)
                         && !is_supported_join_delta_union(&plan)
@@ -426,6 +556,20 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
     }
 }
 
+fn is_join_delta_fixpoint_candidate(plan: &LogicalPlanNode) -> bool {
+    let LogicalPlanKind::Join(join) = &plan.kind else {
+        return false;
+    };
+    if !matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
+        return false;
+    }
+    let left_has_action = subtree_has_action_column(plan.left());
+    let right_has_action = subtree_has_action_column(plan.right());
+    let left_has_version = subtree_has_version_scan(plan.left());
+    let right_has_version = subtree_has_version_scan(plan.right());
+    (left_has_action && right_has_version) || (right_has_action && left_has_version)
+}
+
 fn branch_delta_union_needs_row_id_output(plan: &LogicalPlanNode) -> bool {
     let LogicalPlanKind::Union(node) = &plan.kind else {
         return false;
@@ -434,6 +578,7 @@ fn branch_delta_union_needs_row_id_output(plan: &LogicalPlanNode) -> bool {
         && !plan.children.is_empty()
         && node.output_columns.iter().any(ImvActionColumn::matches)
         && !node.output_columns.iter().any(ImvRowIdColumn::matches)
+        && !is_supported_join_delta_union(plan)
         && plan.children.iter().all(|child| {
             branch_project_has_row_id(child) && branch_output_action_column_id(child).is_some()
         })
@@ -632,6 +777,8 @@ fn subtree_has_delta_scan(plan: &LogicalPlanNode) -> bool {
         LogicalPlanKind::ImvDelta(_) => true,
         LogicalPlanKind::Filter(_)
         | LogicalPlanKind::Project(_)
+        | LogicalPlanKind::Aggregate(_)
+        | LogicalPlanKind::AggregateStateMerge(_)
         | LogicalPlanKind::Join(_)
         | LogicalPlanKind::Union(_)
         | LogicalPlanKind::ImvVersion(_) => plan.children.iter().any(subtree_has_delta_scan),
@@ -647,6 +794,8 @@ fn subtree_has_version_scan(plan: &LogicalPlanNode) -> bool {
         LogicalPlanKind::ImvVersion(_) => true,
         LogicalPlanKind::Filter(_)
         | LogicalPlanKind::Project(_)
+        | LogicalPlanKind::Aggregate(_)
+        | LogicalPlanKind::AggregateStateMerge(_)
         | LogicalPlanKind::Join(_)
         | LogicalPlanKind::Union(_)
         | LogicalPlanKind::ImvDelta(_) => plan.children.iter().any(subtree_has_version_scan),

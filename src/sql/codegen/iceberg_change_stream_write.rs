@@ -9,6 +9,7 @@ pub(crate) use crate::sql::common::change_stream::{
 use crate::thrift::data_sinks;
 use crate::thrift::partitions;
 
+pub(crate) type ChangeStreamOutputPartition = partitions::TDataPartition;
 impl ChangeStreamWriteBranchKind {
     pub(crate) fn to_thrift(self) -> data_sinks::TIcebergChangeStreamRouterBranchKind {
         match self {
@@ -39,10 +40,19 @@ pub(crate) struct ChangeStreamWriteBranchSpec {
     pub(crate) branch_kind: ChangeStreamWriteBranchKind,
     pub(crate) stream_output_slots: Vec<i32>,
     pub(crate) stream_output_ordinals: Option<Vec<usize>>,
-    pub(crate) output_partition: partitions::TDataPartition,
+    pub(crate) output_partition: ChangeStreamOutputPartition,
     pub(crate) output_partition_ordinals: Option<Vec<usize>>,
     pub(crate) sink_spec: IcebergWriteSinkSpec,
     pub(crate) writer_fragment_id: Option<FragmentId>,
+}
+
+pub(crate) fn unpartitioned_change_stream_output_partition() -> ChangeStreamOutputPartition {
+    partitions::TDataPartition::new(
+        partitions::TPartitionType::UNPARTITIONED,
+        None::<Vec<crate::thrift::exprs::TExpr>>,
+        None::<Vec<partitions::TRangePartition>>,
+        None::<Vec<partitions::TBucketProperty>>,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -94,12 +104,7 @@ impl ChangeStreamWriteBranchSpec {
             branch_kind,
             stream_output_slots: Vec::new(),
             stream_output_ordinals: None,
-            output_partition: partitions::TDataPartition::new(
-                partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::thrift::exprs::TExpr>>,
-                None::<Vec<partitions::TRangePartition>>,
-                None::<Vec<partitions::TBucketProperty>>,
-            ),
+            output_partition: unpartitioned_change_stream_output_partition(),
             output_partition_ordinals: None,
             sink_spec: crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec(),
             writer_fragment_id: None,

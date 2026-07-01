@@ -268,7 +268,15 @@ impl AggregateFunction for MultiDistinctSumAgg {
             | DataType::Int64
             | DataType::Boolean => DataType::Int64,
             DataType::Float32 | DataType::Float64 => DataType::Float64,
-            DataType::Decimal128(precision, scale) => DataType::Decimal128(*precision, *scale),
+            DataType::Decimal128(..) => {
+                crate::types::canonical_agg_decimal_type("multi_distinct_sum", data_type)
+                    .ok_or_else(|| {
+                        format!(
+                            "multi_distinct_sum unsupported decimal input type: {:?}",
+                            data_type
+                        )
+                    })?
+            }
             DataType::Decimal256(precision, scale) => DataType::Decimal256(*precision, *scale),
             other => {
                 return Err(format!(
@@ -519,6 +527,25 @@ mod tests {
             .build_spec_from_type(&func, Some(&DataType::Int64), false)
             .unwrap();
         assert!(matches!(spec.kind, AggKind::MultiDistinctSum));
+    }
+
+    #[test]
+    fn test_multi_distinct_sum_decimal128_spec_uses_canonical_sum_type() {
+        let func = AggFunction {
+            name: "multi_distinct_sum".to_string(),
+            inputs: vec![],
+            input_is_intermediate: false,
+            types: Some(crate::exec::node::aggregate::AggTypeSignature {
+                intermediate_type: Some(DataType::Binary),
+                output_type: Some(DataType::Decimal128(38, 2)),
+                input_arg_type: Some(DataType::Decimal128(32, 2)),
+            }),
+            ..Default::default()
+        };
+        let spec = MultiDistinctSumAgg
+            .build_spec_from_type(&func, Some(&DataType::Decimal128(32, 2)), false)
+            .unwrap();
+        assert_eq!(spec.output_type, DataType::Decimal128(38, 2));
     }
 
     #[test]

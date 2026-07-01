@@ -3157,19 +3157,17 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
                     &canonical_select_query,
                 )?;
-            let is_composed_join_aggregate =
-                matches!(
-                    (&caps.snapshot_policy, &caps.identity),
-                    (
-                        BaseSnapshotPolicy::AllBasesRequired,
-                        RefreshIdentity::GroupRowId
-                    )
-                ) && !from_clause_is_fan_in_union(&canonical_select_query);
+            let all_bases_is_fan_in = matches!(
+                (&caps.snapshot_policy, &caps.identity),
+                (
+                    BaseSnapshotPolicy::AllBasesRequired,
+                    RefreshIdentity::GroupRowId
+                )
+            ) && from_clause_is_fan_in_union(&canonical_select_query);
             let join_aliases = if matches!(
                 caps.snapshot_policy,
                 BaseSnapshotPolicy::JoinPairPartialInitialSkip
-            ) || is_composed_join_aggregate
-            {
+            ) {
                 Some(
                     crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
                         &canonical_select_query,
@@ -3191,6 +3189,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 &base_refs,
                 &caps,
                 &aggregate_calls,
+                all_bases_is_fan_in,
                 join_aliases.as_ref(),
                 refresh_contract.apply_key,
                 planned_affected_partitions,
@@ -3844,6 +3843,7 @@ fn refresh_iceberg_aggregate_mv(
     base_refs: &[IcebergTableRef],
     caps: &RefreshCapabilities,
     aggregate_calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
+    all_bases_is_fan_in: bool,
     join_aliases: Option<&crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases>,
     apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
@@ -3855,15 +3855,13 @@ fn refresh_iceberg_aggregate_mv(
     // additionally consumes the join aliases for base-ref matching.
     match &caps.snapshot_policy {
         BaseSnapshotPolicy::AllBasesRequired => {
-            let refresh = if let Some(join_aliases) = join_aliases {
-                validate_join_aliases_base_refs(join_aliases, base_refs)?;
-                AllBasesAggregateRefresh::ComposedJoinAggregate {
+            let refresh = if all_bases_is_fan_in {
+                AllBasesAggregateRefresh::FanIn {
                     schema_contract,
                     aggregate_calls,
-                    join_aliases,
                 }
             } else {
-                AllBasesAggregateRefresh::FanIn {
+                AllBasesAggregateRefresh::ComposedAggregate {
                     schema_contract,
                     aggregate_calls,
                 }
@@ -4218,11 +4216,10 @@ enum AllBasesAggregateRefresh<'a> {
     /// a zero-key CROSS JOIN. The change stream still uses the aggregate
     /// rewrite-merge path; the apply-key evidence decides whether join-delta
     /// proof is required.
-    ComposedJoinAggregate {
+    ComposedAggregate {
         schema_contract: &'a crate::meta::repository::mv_contract::MvSchemaContract,
         aggregate_calls:
             &'a crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
-        join_aliases: &'a crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     },
     /// UNION ALL of aggregate branches (`BranchScoped` identity): the union sits
     /// above per-branch aggregates and the first refresh injects `__branch_id__`.
@@ -4272,10 +4269,9 @@ fn refresh_fan_in_aggregate_iceberg_mv(
             validate_aggregate_fan_in_base_refs(base_refs)?;
             *schema_contract
         }
-        AllBasesAggregateRefresh::ComposedJoinAggregate {
+        AllBasesAggregateRefresh::ComposedAggregate {
             schema_contract,
             aggregate_calls: _,
-            join_aliases: _,
         } => *schema_contract,
         AllBasesAggregateRefresh::BranchUnion {
             branch_count,
@@ -4290,7 +4286,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
     };
     let refresh_kind_label = match &refresh {
         AllBasesAggregateRefresh::FanIn { .. } => "aggregate-over-UNION-ALL",
-        AllBasesAggregateRefresh::ComposedJoinAggregate { .. } => "composed join aggregate",
+        AllBasesAggregateRefresh::ComposedAggregate { .. } => "composed aggregate",
         AllBasesAggregateRefresh::BranchUnion { .. } => "branch UNION ALL aggregate",
     };
 
@@ -4487,7 +4483,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
                     refresh_id,
                     aggregate_calls,
                 ),
-                AllBasesAggregateRefresh::ComposedJoinAggregate {
+                AllBasesAggregateRefresh::ComposedAggregate {
                     aggregate_calls, ..
                 } => first_refresh_iceberg_aggregate_mv(
                     state,
@@ -4528,14 +4524,6 @@ fn refresh_fan_in_aggregate_iceberg_mv(
             )
         },
         || {
-            if let AllBasesAggregateRefresh::ComposedJoinAggregate { join_aliases, .. } = &refresh {
-                let (left_ref, right_ref) = join_base_refs_for_aliases(join_aliases, base_refs)?;
-                return incremental_refresh_iceberg_join_mv(
-                    state,
-                    &ctx,
-                    &[left_ref.clone(), right_ref.clone()],
-                );
-            }
             let changes = loaded_bases
                 .iter()
                 .map(|(base_ref, loaded, current_snapshot_id, current_table_uuid)| {
@@ -14301,8 +14289,32 @@ fn imv_change_op_output_ordinal(
     refresh_plan
         .output_columns
         .iter()
-        .position(crate::sql::planner::imv_rewrite::action_column::ImvActionColumn::matches)
-        .ok_or_else(|| "IMV change-stream write requires __change_op output column".to_string())
+        .position(is_imv_change_op_output_column)
+        .ok_or_else(|| {
+            let outputs = refresh_plan
+                .output_columns
+                .iter()
+                .enumerate()
+                .map(|(idx, column)| {
+                    format!(
+                        "#{idx}:{}:{:?}:internal={}",
+                        column.name, column.column_id, column.is_internal
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "IMV change-stream write requires __change_op output column; outputs=[{outputs}]"
+            )
+        })
+}
+
+fn is_imv_change_op_output_column(column: &OutputColumn) -> bool {
+    column
+        .name
+        .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+        && column.data_type == DataType::Int8
+        && !column.nullable
 }
 
 fn build_imv_change_stream_branches(
@@ -14397,13 +14409,9 @@ fn build_imv_change_stream_branches(
         .collect()
 }
 
-fn unpartitioned_change_stream_output() -> crate::thrift::partitions::TDataPartition {
-    crate::thrift::partitions::TDataPartition::new(
-        crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-        None::<Vec<crate::thrift::exprs::TExpr>>,
-        None::<Vec<crate::thrift::partitions::TRangePartition>>,
-        None::<Vec<crate::thrift::partitions::TBucketProperty>>,
-    )
+fn unpartitioned_change_stream_output()
+-> crate::sql::codegen::iceberg_change_stream_write::ChangeStreamOutputPartition {
+    crate::sql::codegen::iceberg_change_stream_write::unpartitioned_change_stream_output_partition()
 }
 
 fn output_ordinals_for_sink_columns(
@@ -15581,6 +15589,19 @@ mod tests {
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique.len(), allocated.len());
+    }
+
+    #[test]
+    fn imv_change_stream_write_recognizes_physical_change_op_by_reserved_shape() {
+        let output = OutputColumn {
+            column_id: ColumnId(17),
+            name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal: false,
+        };
+
+        assert!(is_imv_change_op_output_column(&output));
     }
 
     #[test]

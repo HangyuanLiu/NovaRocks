@@ -612,8 +612,10 @@ mod tests {
             .await
             .expect("reader");
 
+        let invalid_start = 7;
+        let invalid_end = 3;
         let err = reader
-            .read(7..3)
+            .read(invalid_start..invalid_end)
             .await
             .expect_err("invalid range should fail");
 

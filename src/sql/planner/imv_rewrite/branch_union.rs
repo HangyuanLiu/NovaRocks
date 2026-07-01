@@ -521,17 +521,15 @@ mod tests {
             &arena.borrow(),
         );
 
-        // Top is a Union whose branches are branch-scoped aggregate
-        // change-streams carrying __branch_id__ and __change_op, with no IMV
-        // marker left anywhere.
+        // The root may be an apply-key Project above the branch Union. The
+        // branch Union itself carries branch-scoped aggregate change-streams
+        // with __branch_id__ and __change_op, and no IMV marker may remain.
         assert!(
             !plan_contains_imv_marker(&out),
             "no marker may survive validation"
         );
-        let LogicalPlanKind::Union(union) = &out.kind else {
-            panic!("expected top Union, got {out:?}")
-        };
-        assert_eq!(out.children.len(), 2);
+        let (union, branches) = top_branch_union(&out);
+        assert_eq!(branches.len(), 2);
         assert!(
             union
                 .output_columns
@@ -546,7 +544,7 @@ mod tests {
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
         );
-        for branch in &out.children {
+        for branch in branches {
             assert_aggregate_change_stream_branch(branch);
         }
     }
@@ -629,6 +627,18 @@ mod tests {
             LogicalPlanKind::CTEAnchor(_) => aggregate_change_stream_output_names(branch.child(1)),
             other => panic!("expected aggregate change-stream branch, got {other:?}"),
         }
+    }
+
+    fn top_branch_union(plan: &LogicalPlanNode) -> (&LogicalUnionNode, &[LogicalPlanNode]) {
+        let union_plan = match &plan.kind {
+            LogicalPlanKind::Project(_) => plan.unary_input(),
+            LogicalPlanKind::Union(_) => plan,
+            other => panic!("expected top Union or Project over Union, got {other:?}"),
+        };
+        let LogicalPlanKind::Union(union) = &union_plan.kind else {
+            unreachable!("top_branch_union only returns a Union plan")
+        };
+        (union, union_plan.children.as_slice())
     }
 
     fn assert_locator_columns_precede_action(output_names: &[&str]) {
@@ -1355,7 +1365,8 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_aggregate_over_nested_join_fails_closed_for_descriptor_recording() {
+    fn pipeline_aggregate_over_nested_join_uses_aggregate_change_stream() {
+        use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
         use crate::sql::planner::imv_rewrite::pipeline::build_imv_pipeline;
 
         let mut ctx = build_two_base_join_ctx();
@@ -1365,12 +1376,25 @@ mod tests {
 
         let arena_rc = ctx.scalar_arena();
         let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
-        let err = build_imv_pipeline()
+        let out_expr = build_imv_pipeline()
             .rewrite(expr, &mut ctx)
-            .expect_err("nested join descriptor recording must fail closed");
+            .expect("nested join aggregate must use aggregate change stream");
+        let arena = ctx.scalar_arena();
+        let out = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            out_expr,
+            &arena.borrow(),
+        );
+
         assert!(
-            err.contains("requires one left branch base"),
-            "unexpected error: {err}"
+            !plan_contains_imv_marker(&out),
+            "no IMV marker may survive: {out:?}"
+        );
+        assert!(
+            ctx.extension::<ImvExtension>()
+                .expect("extension")
+                .annotation
+                .change_stream
+                .has_aggregate()
         );
     }
 
@@ -1408,10 +1432,8 @@ mod tests {
             !plan_contains_imv_marker(&out),
             "no marker may survive: each Project-over-Aggregate branch must fully decompose"
         );
-        let LogicalPlanKind::Union(union) = &out.kind else {
-            panic!("expected top Union, got {out:?}")
-        };
-        assert_eq!(out.children.len(), 2);
+        let (union, branches) = top_branch_union(&out);
+        assert_eq!(branches.len(), 2);
         assert!(
             union
                 .output_columns
@@ -1426,7 +1448,7 @@ mod tests {
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
         );
-        for branch in &out.children {
+        for branch in branches {
             assert_aggregate_change_stream_branch(branch);
         }
     }
