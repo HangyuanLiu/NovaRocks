@@ -124,7 +124,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
                     required_output_columns.clone(),
                 ),
                 &output_columns,
-            );
+            )?;
 
             let right_delta_branch = normalize_branch_output(
                 LogicalPlanNode::new(
@@ -139,7 +139,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
                     required_output_columns.clone(),
                 ),
                 &output_columns,
-            );
+            )?;
 
             Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
                 LogicalPlanKind::Union(LogicalUnionNode {
@@ -1074,7 +1074,10 @@ fn join_delta_payload_output_columns(
     Ok(plan_output_columns(left)?
         .into_iter()
         .chain(plan_output_columns(right)?)
-        .filter(|column| !ImvActionColumn::matches(column))
+        .filter(|column| {
+            !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)
+                && !column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
+        })
         .collect())
 }
 
@@ -1109,6 +1112,9 @@ fn mark_scan(plan: LogicalPlanNode, marker: MarkerKind) -> Result<LogicalPlanNod
             marker,
         ),
         LogicalPlanKind::Project(mut project) => {
+            project
+                .items
+                .retain(|item| !item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME));
             if let MarkerKind::Delta(action_column) = &marker {
                 let action_output = ImvActionColumn::output_column(*action_column);
                 if !project
@@ -1209,30 +1215,89 @@ fn plan_kind_from_kind(kind: &LogicalPlanKind) -> &'static str {
 pub(crate) fn normalize_branch_output(
     input: LogicalPlanNode,
     output_columns: &[OutputColumn],
-) -> LogicalPlanNode {
-    LogicalPlanNode::new(
+) -> Result<LogicalPlanNode, String> {
+    let input_columns = plan_output_columns(&input)?;
+    Ok(LogicalPlanNode::new(
         LogicalPlanKind::Project(LogicalProjectNode {
             output_qualifier: None,
-            items: output_columns
-                .iter()
-                .map(|column| ProjectItem {
-                    expr: crate::sql::analysis::TypedExpr {
-                        kind: crate::sql::analysis::ExprKind::ColumnRef {
-                            column_id: column.column_id,
-                            qualifier: None,
-                            column: column.name.clone(),
-                        },
-                        data_type: column.data_type.clone(),
-                        nullable: column.nullable,
-                    },
-                    output_name: column.name.clone(),
-                    output_column_id: column.column_id,
-                })
-                .collect(),
+            items: normalize_branch_project_items(&input_columns, output_columns)?,
         }),
         vec![input],
         None,
-    )
+    ))
+}
+
+fn normalize_branch_project_items(
+    input_columns: &[OutputColumn],
+    output_columns: &[OutputColumn],
+) -> Result<Vec<ProjectItem>, String> {
+    if let Some(items) = normalize_branch_project_items_by_id(input_columns, output_columns) {
+        return Ok(items);
+    }
+
+    let comparable_inputs = comparable_branch_inputs(input_columns, output_columns);
+    if comparable_inputs.len() != output_columns.len() {
+        return Err(format!(
+            "join delta branch normalization column count mismatch: input has {}, comparable input has {}, output has {}; input_names={:?}; output_names={:?}",
+            input_columns.len(),
+            comparable_inputs.len(),
+            output_columns.len(),
+            input_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>()
+        ));
+    }
+    Ok(comparable_inputs
+        .iter()
+        .zip(output_columns.iter())
+        .map(|(input_column, output_column)| ProjectItem {
+            expr: column_ref_expr(input_column),
+            output_name: output_column.name.clone(),
+            output_column_id: output_column.column_id,
+        })
+        .collect())
+}
+
+fn normalize_branch_project_items_by_id(
+    input_columns: &[OutputColumn],
+    output_columns: &[OutputColumn],
+) -> Option<Vec<ProjectItem>> {
+    let input_by_id = input_columns
+        .iter()
+        .map(|column| (column.column_id, column))
+        .collect::<HashMap<_, _>>();
+    output_columns
+        .iter()
+        .map(|output_column| {
+            input_by_id
+                .get(&output_column.column_id)
+                .map(|input_column| ProjectItem {
+                    expr: column_ref_expr(input_column),
+                    output_name: output_column.name.clone(),
+                    output_column_id: output_column.column_id,
+                })
+        })
+        .collect()
+}
+
+fn comparable_branch_inputs<'a>(
+    input_columns: &'a [OutputColumn],
+    output_columns: &[OutputColumn],
+) -> Vec<&'a OutputColumn> {
+    let output_contains_row_id = output_columns
+        .iter()
+        .any(|column| column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME));
+    input_columns
+        .iter()
+        .filter(|column| {
+            output_contains_row_id || !column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
+        })
+        .collect()
 }
 
 pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputColumn>, String> {
@@ -1282,6 +1347,10 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
         LogicalPlanKind::AssertOneRow(_) => plan_output_columns(plan.unary_input())?,
         LogicalPlanKind::ImvDelta(delta) => {
             let mut out = plan_output_columns(plan.unary_input())?;
+            out.retain(|column| {
+                !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)
+                    || delta.action_column == Some(column.column_id)
+            });
             if let Some(action_column) = delta.action_column
                 && !out.iter().any(|column| column.column_id == action_column)
             {
@@ -1289,7 +1358,10 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
             }
             out
         }
-        LogicalPlanKind::ImvVersion(_) => plan_output_columns(plan.unary_input())?,
+        LogicalPlanKind::ImvVersion(_) => plan_output_columns(plan.unary_input())?
+            .into_iter()
+            .filter(|column| !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+            .collect(),
     })
 }
 
@@ -1543,6 +1615,77 @@ mod tests {
             assert_eq!(action_items.len(), 1);
             assert_eq!(action_items[0].output_column_id, ColumnId(100));
         }
+    }
+
+    #[test]
+    fn normalize_branch_output_maps_duplicate_internal_row_ids_by_position() {
+        let payload = output_column(1, "payload");
+        let left_row_id = internal_output_column(7, ImvRowIdColumn::NAME);
+        let right_row_id = internal_output_column(8, ImvRowIdColumn::NAME);
+        let output_left_row_id = internal_output_column(6, ImvRowIdColumn::NAME);
+        let output_right_row_id = internal_output_column(9, ImvRowIdColumn::NAME);
+
+        let items = normalize_branch_project_items(
+            &[payload.clone(), left_row_id, right_row_id],
+            &[payload, output_left_row_id, output_right_row_id],
+        )
+        .expect("branch output normalization");
+
+        assert_project_item_reads_column(&items[1], ColumnId(7));
+        assert_eq!(items[1].output_column_id, ColumnId(6));
+        assert_project_item_reads_column(&items[2], ColumnId(8));
+        assert_eq!(items[2].output_column_id, ColumnId(9));
+    }
+
+    #[test]
+    fn normalize_branch_output_selects_output_schema_from_wider_branch_inputs() {
+        let left_payload = output_column(1, "left_payload");
+        let left_row_id = internal_output_column(7, ImvRowIdColumn::NAME);
+        let action = ImvActionColumn::output_column(ColumnId(100));
+        let right_payload = output_column(10, "right_payload");
+        let right_row_id = internal_output_column(12, ImvRowIdColumn::NAME);
+
+        let items = normalize_branch_project_items(
+            &[
+                left_payload.clone(),
+                left_row_id,
+                action.clone(),
+                right_payload.clone(),
+                right_row_id,
+            ],
+            &[left_payload, right_payload, action],
+        )
+        .expect("branch output normalization");
+
+        assert_project_item_reads_column(&items[0], ColumnId(1));
+        assert_eq!(items[0].output_column_id, ColumnId(1));
+        assert_project_item_reads_column(&items[1], ColumnId(10));
+        assert_eq!(items[1].output_column_id, ColumnId(10));
+        assert_project_item_reads_column(&items[2], ColumnId(100));
+        assert_eq!(items[2].output_column_id, ColumnId(100));
+    }
+
+    #[test]
+    fn join_delta_payload_output_columns_exclude_raw_row_lineage_columns() {
+        let left = project_over(scan_with_external_row_id_metadata("left", 1, 6));
+        let right = project_over(scan_with_row_id_metadata("right", 10, 12));
+
+        let columns =
+            join_delta_payload_output_columns(JoinKind::Inner, &left, &right).expect("payload");
+
+        assert!(
+            columns
+                .iter()
+                .all(|column| !column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)),
+            "join row-id columns are inputs for join apply-key construction, not UNION payload outputs: {columns:?}"
+        );
+        assert!(
+            columns.iter().any(|column| column.column_id == ColumnId(1))
+                && columns
+                    .iter()
+                    .any(|column| column.column_id == ColumnId(10)),
+            "ordinary left/right payload columns must stay visible"
+        );
     }
 
     #[test]
@@ -2046,6 +2189,35 @@ mod tests {
         plan
     }
 
+    fn scan_with_row_id_metadata(name: &str, first_id: u32, row_id: u32) -> LogicalPlanNode {
+        let mut plan = scan(name, first_id);
+        let LogicalPlanKind::Scan(scan) = &mut plan.kind else {
+            unreachable!();
+        };
+        scan.columns
+            .push(ImvRowIdColumn::output_column(ColumnId(row_id)));
+        plan
+    }
+
+    fn scan_with_external_row_id_metadata(
+        name: &str,
+        first_id: u32,
+        row_id: u32,
+    ) -> LogicalPlanNode {
+        let mut plan = scan(name, first_id);
+        let LogicalPlanKind::Scan(scan) = &mut plan.kind else {
+            unreachable!();
+        };
+        scan.columns.push(OutputColumn {
+            column_id: ColumnId(row_id),
+            name: ImvRowIdColumn::NAME.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        });
+        plan
+    }
+
     fn column_def(name: &str) -> ColumnDef {
         ColumnDef {
             name: name.to_string(),
@@ -2064,6 +2236,20 @@ mod tests {
             nullable: false,
             is_internal: false,
         }
+    }
+
+    fn internal_output_column(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            is_internal: true,
+            ..output_column(id, name)
+        }
+    }
+
+    fn assert_project_item_reads_column(item: &ProjectItem, expected: ColumnId) {
+        assert!(matches!(
+            &item.expr.kind,
+            ExprKind::ColumnRef { column_id, .. } if *column_id == expected
+        ));
     }
 
     fn col_expr(id: u32, name: &str) -> TypedExpr {

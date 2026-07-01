@@ -435,6 +435,27 @@ pub(crate) struct RepeatOp {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ChangeEventExpandOp {
+    pub(crate) events: Vec<ChangeEventSpec>,
+    pub(crate) output_columns: Vec<OutputColumn>,
+    pub(crate) change_op_column_id: ColumnId,
+    pub(crate) data_route_column_id: Option<ColumnId>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChangeEventSpec {
+    pub(crate) predicate: Option<ScalarId>,
+    pub(crate) branch_kind: crate::sql::common::change_stream::ChangeStreamBranchKind,
+    pub(crate) assignments: Vec<ChangeEventOutputExpr>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChangeEventOutputExpr {
+    pub(crate) output_column_id: ColumnId,
+    pub(crate) expr: Option<ScalarId>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct CTEAnchorOp {
     pub cte_id: CteId,
 }
@@ -620,6 +641,7 @@ pub(crate) enum Operator {
     LogicalGenerateSeries(GenerateSeriesOp),
     LogicalTableFunction(TableFunctionOp),
     LogicalRepeat(RepeatOp),
+    LogicalChangeEventExpand(ChangeEventExpandOp),
     LogicalCTEAnchor(CTEAnchorOp),
     LogicalCTEProduce(CTEProduceOp),
     LogicalCTEConsume(CTEConsumeOp),
@@ -649,6 +671,7 @@ pub(crate) enum Operator {
     PhysicalCTEProduce(CTEProduceOp),
     PhysicalCTEConsume(CTEConsumeOp),
     PhysicalRepeat(RepeatOp),
+    PhysicalChangeEventExpand(ChangeEventExpandOp),
     PhysicalUnion(UnionOp),
     PhysicalIntersect(IntersectOp),
     PhysicalExcept(ExceptOp),
@@ -680,6 +703,7 @@ impl Operator {
                 | Operator::LogicalGenerateSeries(_)
                 | Operator::LogicalTableFunction(_)
                 | Operator::LogicalRepeat(_)
+                | Operator::LogicalChangeEventExpand(_)
                 | Operator::LogicalCTEAnchor(_)
                 | Operator::LogicalCTEProduce(_)
                 | Operator::LogicalCTEConsume(_)

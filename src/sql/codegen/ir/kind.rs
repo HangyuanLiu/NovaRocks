@@ -1,7 +1,7 @@
 #[cfg(test)]
 pub(crate) use crate::sql::planner::plan::PhysicalHashJoinEqCondition;
 pub(crate) use crate::sql::planner::plan::{
-    DistributedExchangeNode, ExchangeFlavor,
+    DistributedChangeEventExpandNode, DistributedExchangeNode, ExchangeFlavor,
     PhysicalHashAggregateNode as DistributedHashAggregateNode, PhysicalHashAggregateNode,
     PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode, PhysicalTopNNode,
     PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanDecodeNode as DistributedDecodeNode,

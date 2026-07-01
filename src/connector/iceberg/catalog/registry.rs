@@ -969,15 +969,11 @@ pub(crate) fn load_table(
             // ParquetWriter::write, so we expose LargeBinary at the
             // ColumnDef level for INSERT-side literal building.
             let logical_type_override = logical_types.get(&field_name);
-            let data_type = match nested.field_type.as_ref() {
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Variant) => {
-                    DataType::LargeBinary
-                }
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Binary) => {
-                    DataType::Binary
-                }
-                _ => apply_logical_type_override(field.data_type(), logical_type_override),
-            };
+            let data_type = column_def_arrow_type_for_iceberg_field(
+                nested.field_type.as_ref(),
+                field.data_type(),
+                logical_type_override,
+            );
             // Only BITMAP/HLL need to surface as ColumnDef.logical_type: the
             // Arrow data_type collapses both onto Binary, but the analyzer
             // needs to reject ORDER BY / GROUP BY / comparison / key /
@@ -2985,6 +2981,28 @@ fn apply_logical_type_override(data_type: &DataType, logical_type: Option<&SqlTy
     }
 }
 
+fn column_def_arrow_type_for_iceberg_field(
+    iceberg_type: &Type,
+    arrow_type: &DataType,
+    logical_type: Option<&SqlType>,
+) -> DataType {
+    match iceberg_type {
+        Type::Primitive(PrimitiveType::Variant) => DataType::LargeBinary,
+        Type::Primitive(PrimitiveType::Binary) => DataType::Binary,
+        // NovaRocks exposes Iceberg timestamp-with-time-zone as the same
+        // DATETIME/TIMESTAMP_NS logical type as timestamp-without-time-zone.
+        // Parquet reads may materialize timestamp arrays without Arrow timezone
+        // metadata, so the ColumnDef must not advertise a stricter root type.
+        Type::Primitive(PrimitiveType::Timestamptz) => {
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        }
+        Type::Primitive(PrimitiveType::TimestamptzNs) => {
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        }
+        _ => apply_logical_type_override(arrow_type, logical_type),
+    }
+}
+
 fn parse_timestamp_literal_to_micros(value: &str) -> Result<i64, String> {
     let timestamp = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
@@ -3385,9 +3403,9 @@ mod build_literal_array_tests {
     use std::sync::Arc;
 
     use arrow::array::{Array, Int32Array, Int64Array, ListArray, MapArray, StringArray};
-    use arrow::datatypes::{DataType, Field};
+    use arrow::datatypes::{DataType, Field, TimeUnit};
 
-    use super::{Literal, build_literal_array};
+    use super::{Literal, build_literal_array, column_def_arrow_type_for_iceberg_field};
 
     fn list_int64_type() -> DataType {
         DataType::List(Arc::new(Field::new("element", DataType::Int64, true)))
@@ -3426,6 +3444,20 @@ mod build_literal_array_tests {
             false,
         );
         DataType::Map(Arc::new(entries), false)
+    }
+
+    #[test]
+    fn column_def_arrow_type_normalizes_iceberg_timestamptz_to_datetime() {
+        let source = DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()));
+
+        assert_eq!(
+            column_def_arrow_type_for_iceberg_field(
+                &iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Timestamptz),
+                &source,
+                None,
+            ),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
     }
 
     #[test]

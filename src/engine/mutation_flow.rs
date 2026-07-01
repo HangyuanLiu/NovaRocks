@@ -102,42 +102,37 @@ pub(crate) fn execute_update_statement(
     let partition_columns = iceberg_partition_source_columns(&table)?;
     validate_update_assignments(&stmt.assignments, &target_columns, &partition_columns)?;
 
-    let matched = materialize_update_matches(state, &target, stmt, current_catalog)?;
-    if matched.row_ids.is_empty() {
-        return Ok(StatementResult::Ok);
-    }
-    validate_unique_target_row_ids(&matched.row_ids)?;
-
     let mode = select_iceberg_update_mode(&table)?;
     match mode {
-        IcebergUpdateMode::CopyOnWrite => execute_cow_update(
-            state,
-            &target,
-            catalog,
-            table_ident,
-            table,
-            matched,
-            &target_columns,
-            entry,
-            &target_ref,
-        ),
+        IcebergUpdateMode::CopyOnWrite => {
+            let matched = materialize_update_matches(state, &target, stmt, current_catalog)?;
+            if matched.row_ids.is_empty() {
+                return Ok(StatementResult::Ok);
+            }
+            validate_unique_target_row_ids(&matched.row_ids)?;
+            execute_cow_update(
+                state,
+                &target,
+                catalog,
+                table_ident,
+                table,
+                matched,
+                &target_columns,
+                entry,
+                &target_ref,
+            )
+        }
         IcebergUpdateMode::MergeOnRead => execute_mor_update(
             state,
             &target,
             catalog,
             table_ident,
             table,
-            matched,
+            stmt,
+            current_catalog,
+            &target_columns,
             entry,
             &target_ref,
-            build_update_mor_distributed_write(
-                state,
-                &target,
-                stmt,
-                current_catalog,
-                &target_columns,
-                &target_ref,
-            )?,
         ),
     }
 }
@@ -233,488 +228,711 @@ fn mutation_source_relation_to_sql(
     }
 }
 
-fn build_update_mor_distributed_write(
+pub(crate) fn build_mor_deletion_vector_sink_spec(
+    target: &crate::engine::backend_resolver::TargetBackend,
+    resolved: &crate::connector::backend::ResolvedTable,
+    table: &iceberg::table::Table,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    target_ref: &str,
+) -> Result<IcebergWriteSinkSpec, String> {
+    let planned_snapshot_id = if target_ref == "main" {
+        table.metadata().current_snapshot().map(|s| s.snapshot_id())
+    } else {
+        crate::engine::delete_flow::resolve_branch_head_snapshot_id(table.metadata(), target_ref)?
+    };
+    let mut sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
+        target, resolved, table, entry,
+    )?;
+    sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
+    sink_spec.set_planned_snapshot_id(planned_snapshot_id)?;
+    Ok(sink_spec)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_update_mor_change_stream_write_plan(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
     target_columns: &[crate::engine::catalog::ColumnDef],
     target_ref: &str,
-) -> Result<MorUpdateDistributedWrite, String> {
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&target.catalog)?
-    };
-    let catalog = build_iceberg_catalog(&entry)?;
-    let table_ident = iceberg::TableIdent::new(
-        iceberg::NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-    let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
-        .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
-    let resolved = {
-        let registry = state.connectors.read().expect("connector registry read");
-        let backend = registry.catalog_backend("iceberg")?;
-        backend.load_table(&target.catalog, &target.namespace, &target.table)?
-    };
-    let data_sink_spec = crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
-        target, &resolved, &table, &entry,
-    )?;
-    // The old-row deletions are written by the BE as deletion vectors. Build a
-    // DeletionVectors-mode sink pinned to the base snapshot, mirroring the
-    // Phase-1 DV DELETE path.
-    //
-    // This snapshot is derived from this builder's own `load_table` above,
-    // whereas `execute_mor_update` derives the collector/transaction base
-    // snapshot from the caller's already-loaded `table`. Under the single-writer
-    // assumption both loads observe the same current snapshot, so the DV sink's
-    // planned snapshot and the commit base snapshot must agree; if a concurrent
-    // writer ever breaks that, the commit's base-snapshot conflict check fails
-    // fast rather than committing against a stale base.
-    let base_snapshot_id = if target_ref != "main" {
-        crate::engine::delete_flow::resolve_branch_head_snapshot_id(table.metadata(), target_ref)?
-    } else {
-        table.metadata().current_snapshot().map(|s| s.snapshot_id())
-    };
-    let mut dv_sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
-        target, &resolved, &table, &entry,
-    )?;
-    dv_sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
-    dv_sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
+    new_sequence_number: i64,
+) -> Result<crate::engine::dml_change_stream::DmlChangeStreamWritePlan, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
     let source_sql = mutation_source_to_sql(state, &stmt.source, current_catalog, target)?;
     let where_sql = stmt.where_clause.as_ref().map(|expr| expr.to_string());
-    let assignments_sql = stmt
-        .assignments
+    let assignments_sql = update_assignment_projection_sql(&stmt.assignments, target_columns)?;
+    let assignments_sql_refs = assignments_sql
         .iter()
-        .map(|assignment| (assignment.column.as_str(), assignment.value.to_string()))
+        .map(|(column, expr)| (column.as_str(), expr.as_str()))
         .collect::<Vec<_>>();
-    let assignments_sql = assignments_sql
-        .iter()
-        .map(|(column, expr)| (*column, expr.as_str()))
-        .collect::<Vec<_>>();
-    let new_sequence_number = table.metadata().last_sequence_number() + 1;
-    let data_query = build_update_mor_data_sink_query(
-        target,
+    let target_sql = update_change_stream_target_sql(target, target_alias, target_ref);
+    let match_sql = build_update_match_query_sql(
+        &target_sql,
         target_alias,
         source_sql.as_deref(),
-        &assignments_sql,
+        &assignments_sql_refs,
         where_sql.as_deref(),
-        target_columns,
-        target_ref,
-        new_sequence_number,
-    )?;
-    // The DV SELECT shares the data query's `[FOR VERSION AS OF] [CROSS JOIN
-    // source] WHERE <pred>` tail, so the matched old rows are identical.
-    let dv_query = build_update_dv_sink_query(
-        target,
-        target_alias,
-        source_sql.as_deref(),
-        where_sql.as_deref(),
-        target_ref,
-        &dv_sink_spec.target_columns,
-    )?;
-    Ok(MorUpdateDistributedWrite {
-        data_query,
-        data_sink_spec,
-        dv_query,
-        dv_sink_spec,
-    })
-}
-
-fn build_merge_mor_distributed_write(
-    state: &Arc<StandaloneState>,
-    target: &crate::engine::backend_resolver::TargetBackend,
-    matched_rows: &MatchedUpdateBatch,
-    target_columns: &[crate::engine::catalog::ColumnDef],
-) -> Result<MorUpdateDistributedWrite, String> {
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&target.catalog)?
-    };
-    let catalog = build_iceberg_catalog(&entry)?;
-    let table_ident = iceberg::TableIdent::new(
-        iceberg::NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
     );
-    let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
-        .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
-    let resolved = {
-        let registry = state.connectors.read().expect("connector registry read");
-        let backend = registry.catalog_backend("iceberg")?;
-        backend.load_table(&target.catalog, &target.namespace, &target.table)?
-    };
-    let data_sink_spec = crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
-        target, &resolved, &table, &entry,
+    let mut query = parse_generated_query(&match_sql, "MOR UPDATE change-stream producer")?;
+    if crate::engine::query_prep::has_time_travel_refs(&query) {
+        crate::engine::query_prep::rewrite_time_travel_refs(
+            state,
+            Some(&target.catalog),
+            &target.namespace,
+            &mut query,
+        )?;
+    }
+
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let catalog_mgr_snapshot = crate::engine::catalog_mgr_snapshot(state);
+    let analyzer_provider = crate::engine::build_analyzer_provider(
+        Some(&target.catalog),
+        &catalog_snapshot,
+        &catalog_mgr_snapshot,
+        &connectors_snapshot,
+        crate::sql::catalog::TableLookupMode::SchemaOnly,
+    );
+    let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
+        &query,
+        &analyzer_provider,
+        &connectors_snapshot,
+        &target.namespace,
+        None,
+        None,
+        false,
     )?;
-    // MERGE matched-UPDATE is `main`-only; pin the DV sink to the current
-    // snapshot so the BE writes deletion vectors for the matched old rows.
-    // This snapshot is derived from this builder's own `load_table` above;
-    // `execute_mor_update` derives the commit base snapshot from the caller's
-    // loaded `table`. Under the single-writer assumption both observe the same
-    // current snapshot and must agree (the commit's base-snapshot check fails
-    // fast otherwise).
-    let base_snapshot_id = table.metadata().current_snapshot().map(|s| s.snapshot_id());
-    let mut dv_sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
-        target, &resolved, &table, &entry,
-    )?;
-    dv_sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
-    dv_sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
-    let new_sequence_number = table.metadata().last_sequence_number() + 1;
-    let data_query = build_merge_mor_data_sink_query_from_matched(
-        matched_rows,
+    let producer = build_update_mor_change_event_expand_plan(
+        planned.physical_plan,
         target_columns,
         new_sequence_number,
     )?;
-    let dv_query =
-        build_merge_mor_dv_sink_query_from_matched(matched_rows, &dv_sink_spec.target_columns)?;
-    Ok(MorUpdateDistributedWrite {
-        data_query,
-        data_sink_spec,
-        dv_query,
-        dv_sink_spec,
-    })
+    let mut plan = crate::engine::dml_change_stream::build_dml_change_stream_write_plan(
+        state,
+        target,
+        producer,
+        crate::engine::dml_change_stream::DmlChangeStreamBranchSet::UpdateMor,
+        target_ref,
+    )?;
+    plan.pre_expand_keyed_assert =
+        Some(crate::engine::dml_change_stream::DmlPreExpandKeyedAssert {
+            key_column_name: "__nr_row_id".to_string(),
+            key_label: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            message_prefix: "MOR UPDATE matched target row".to_string(),
+        });
+    Ok(plan)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_update_mor_data_sink_query(
-    target: &crate::engine::backend_resolver::TargetBackend,
-    target_alias: &str,
-    source_sql: Option<&str>,
-    assignments_sql: &[(&str, &str)],
-    where_sql: Option<&str>,
+fn update_assignment_projection_sql(
+    assignments: &[crate::sql::parser::ast::UpdateAssignment],
     target_columns: &[crate::engine::catalog::ColumnDef],
-    target_ref: &str,
-    new_sequence_number: i64,
-) -> Result<sqlparser::ast::Query, String> {
-    let assignment_by_column = assignments_sql
+) -> Result<Vec<(String, String)>, String> {
+    assignments
         .iter()
-        .map(|(column, expr)| (column.to_ascii_lowercase(), *expr))
-        .collect::<HashMap<_, _>>();
-    let mut select_items = Vec::with_capacity(target_columns.len() + 2);
-    for column in target_columns {
-        let expr = assignment_by_column
-            .get(&column.name.to_ascii_lowercase())
-            .map(|expr| format!("({expr})"))
-            .unwrap_or_else(|| qualify_column(target_alias, &column.name));
-        select_items.push(format!("{expr} AS {}", sql_identifier(&column.name)));
-    }
-    select_items.push(format!(
-        "{} AS {}",
-        qualify_column(target_alias, crate::exec::row_position::ICEBERG_ROW_ID_COL),
-        sql_identifier(crate::exec::row_position::ICEBERG_ROW_ID_COL)
-    ));
-    select_items.push(format!(
-        "{} AS {}",
-        new_sequence_number,
-        sql_identifier(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
-    ));
-    let sql = build_update_distributed_select_sql(
-        target,
-        target_alias,
-        source_sql,
-        where_sql,
-        target_ref,
-        select_items,
-        Some(qualify_column(
-            target_alias,
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
-        )),
-    );
-    parse_generated_query(&sql, "MOR UPDATE data sink")
-}
-
-/// Build the DELETE side of a MOR UPDATE as a SELECT of the position-delete
-/// sink's input columns (`_file`, `_pos`, and partition source columns, with
-/// `_file` first) for the matched old rows. Reuses the same target / version /
-/// CROSS JOIN / WHERE tail as the data sink query so both sinks observe an
-/// identical matched set.
-fn build_update_dv_sink_query(
-    target: &crate::engine::backend_resolver::TargetBackend,
-    target_alias: &str,
-    source_sql: Option<&str>,
-    where_sql: Option<&str>,
-    target_ref: &str,
-    dv_sink_columns: &[crate::engine::catalog::ColumnDef],
-) -> Result<sqlparser::ast::Query, String> {
-    let select_items = dv_sink_columns
-        .iter()
-        .map(|column| {
-            format!(
-                "{} AS {}",
-                qualify_column(target_alias, &column.name),
-                sql_identifier(&column.name)
-            )
-        })
-        .collect::<Vec<_>>();
-    let sql = build_update_distributed_select_sql(
-        target,
-        target_alias,
-        source_sql,
-        where_sql,
-        target_ref,
-        select_items,
-        Some(qualify_column(
-            target_alias,
-            crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_FILE_COLUMN,
-        )),
-    );
-    parse_generated_query(&sql, "MOR UPDATE DV sink")
-}
-
-/// Build the DELETE side of a MERGE matched-UPDATE as a VALUES projection of
-/// the position-delete sink's input columns (`_file`, `_pos`, and partition
-/// source columns). The matched old-row identities and partition values are
-/// taken from the already-materialized `matched` batch; the BE turns them into
-/// deletion-vector files keyed by `_file`.
-fn build_merge_mor_dv_sink_query_from_matched(
-    matched: &MatchedUpdateBatch,
-    dv_sink_columns: &[crate::engine::catalog::ColumnDef],
-) -> Result<sqlparser::ast::Query, String> {
-    if matched.row_ids.is_empty() {
-        return Err("MERGE MOR UPDATE DV sink requires at least one matched row".to_string());
-    }
-    if matched.file_paths.len() != matched.row_ids.len()
-        || matched.row_positions.len() != matched.row_ids.len()
-    {
-        return Err(format!(
-            "MERGE MOR UPDATE matched identity count mismatch: file_paths={}, row_positions={}, row_ids={}",
-            matched.file_paths.len(),
-            matched.row_positions.len(),
-            matched.row_ids.len()
-        ));
-    }
-    // Partition source values are read positionally from `old_rows`, so its row
-    // count must match the matched identities (mirrors the data sink's
-    // `new_rows.num_rows()` guard).
-    if matched.old_rows.num_rows() != matched.row_ids.len() {
-        return Err(format!(
-            "MERGE MOR UPDATE matched old-row count mismatch: old_rows={}, row_ids={}",
-            matched.old_rows.num_rows(),
-            matched.row_ids.len()
-        ));
-    }
-
-    let alias = "__nr_dv";
-    // The first two sink columns are always the row-identity `_file` / `_pos`;
-    // any remaining columns are partition source columns read from old_rows.
-    let file_col = crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_FILE_COLUMN;
-    let pos_col = crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_POS_COLUMN;
-    let partition_columns = &dv_sink_columns[dv_sink_columns
-        .iter()
-        .position(|column| {
-            !column.name.eq_ignore_ascii_case(file_col)
-                && !column.name.eq_ignore_ascii_case(pos_col)
-        })
-        .unwrap_or(dv_sink_columns.len())..];
-
-    let mut rows = Vec::with_capacity(matched.row_ids.len());
-    for row in 0..matched.row_ids.len() {
-        let mut values = Vec::with_capacity(dv_sink_columns.len());
-        values.push(sql_string_literal(&matched.file_paths[row]));
-        values.push(matched.row_positions[row].to_string());
-        for partition_column in partition_columns {
-            let idx = matched
-                .old_rows
-                .schema()
-                .index_of(&partition_column.name)
-                .map_err(|_| {
+        .map(|assignment| {
+            let target_column = target_columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(&assignment.column))
+                .ok_or_else(|| {
                     format!(
-                        "MERGE MOR UPDATE old-row batch missing partition source column `{}`",
-                        partition_column.name
+                        "UPDATE assignment references unknown target column `{}`",
+                        assignment.column
                     )
                 })?;
-            let literal =
-                crate::engine::sql_expr::literal_from_batch(matched.old_rows.column(idx), row)?;
-            values.push(
-                crate::engine::iceberg_writer::literal_to_sql_for_arrow_type(
-                    &literal,
-                    &partition_column.data_type,
+            Ok((
+                target_column.name.clone(),
+                crate::engine::iceberg_writer::target_cast_expr_sql(
+                    &format!("({})", assignment.value),
+                    target_column,
                 )?,
-            );
-        }
-        rows.push(format!("({})", values.join(", ")));
-    }
-
-    let value_columns = dv_sink_columns
-        .iter()
-        .map(|column| sql_identifier(&column.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let values_sql = format!(
-        "(VALUES {}) AS {}({})",
-        rows.join(", "),
-        sql_identifier(alias),
-        value_columns
-    );
-
-    let mut select_items = Vec::with_capacity(dv_sink_columns.len());
-    select_items.push(format!(
-        "CAST({} AS STRING) AS {}",
-        qualify_column(alias, file_col),
-        sql_identifier(file_col)
-    ));
-    select_items.push(format!(
-        "CAST({} AS BIGINT) AS {}",
-        qualify_column(alias, pos_col),
-        sql_identifier(pos_col)
-    ));
-    for partition_column in partition_columns {
-        select_items.push(format!(
-            "{} AS {}",
-            crate::engine::iceberg_writer::target_cast_expr_sql(
-                &qualify_column(alias, &partition_column.name),
-                partition_column,
-            )?,
-            sql_identifier(&partition_column.name)
-        ));
-    }
-
-    let sql = format!(
-        "SELECT {} FROM {} ORDER BY {}",
-        select_items.join(", "),
-        values_sql,
-        qualify_column(alias, file_col)
-    );
-    parse_generated_query(&sql, "MERGE MOR UPDATE DV sink")
+            ))
+        })
+        .collect()
 }
 
-fn build_merge_mor_data_sink_query_from_matched(
-    matched: &MatchedUpdateBatch,
-    target_columns: &[crate::engine::catalog::ColumnDef],
-    new_sequence_number: i64,
-) -> Result<sqlparser::ast::Query, String> {
-    if matched.row_ids.is_empty() {
-        return Err("MERGE MOR UPDATE data sink requires at least one matched row".to_string());
-    }
-    if matched.new_rows.num_rows() != matched.row_ids.len() {
-        return Err(format!(
-            "MERGE MOR UPDATE matched row count mismatch: new_rows={}, row_ids={}",
-            matched.new_rows.num_rows(),
-            matched.row_ids.len()
-        ));
-    }
-
-    let alias = "__nr_m";
-    let mut value_column_names = target_columns
-        .iter()
-        .map(|column| column.name.as_str())
-        .collect::<Vec<_>>();
-    value_column_names.push(crate::exec::row_position::ICEBERG_ROW_ID_COL);
-    value_column_names.push(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL);
-
-    let mut rows = Vec::with_capacity(matched.new_rows.num_rows());
-    for row in 0..matched.new_rows.num_rows() {
-        let mut values = Vec::with_capacity(target_columns.len() + 2);
-        for target_column in target_columns {
-            let idx = matched
-                .new_rows
-                .schema()
-                .index_of(&target_column.name)
-                .map_err(|_| {
-                    format!(
-                        "MERGE MOR UPDATE new-row batch missing target column `{}`",
-                        target_column.name
-                    )
-                })?;
-            let literal =
-                crate::engine::sql_expr::literal_from_batch(matched.new_rows.column(idx), row)?;
-            values.push(literal_to_sql_for_values_target_column(
-                &literal,
-                target_column,
-            )?);
-        }
-        values.push(matched.row_ids[row].to_string());
-        values.push(new_sequence_number.to_string());
-        rows.push(format!("({})", values.join(", ")));
-    }
-
-    let value_columns = value_column_names
-        .iter()
-        .map(|name| sql_identifier(name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let values_sql = format!(
-        "(VALUES {}) AS {}({})",
-        rows.join(", "),
-        sql_identifier(alias),
-        value_columns
-    );
-
-    let mut select_items = Vec::with_capacity(target_columns.len() + 2);
-    for column in target_columns {
-        select_items.push(format!(
-            "{} AS {}",
-            crate::engine::iceberg_writer::target_cast_expr_sql(
-                &qualify_column(alias, &column.name),
-                column,
-            )?,
-            sql_identifier(&column.name)
-        ));
-    }
-    select_items.push(format!(
-        "CAST({} AS BIGINT) AS {}",
-        qualify_column(alias, crate::exec::row_position::ICEBERG_ROW_ID_COL),
-        sql_identifier(crate::exec::row_position::ICEBERG_ROW_ID_COL)
-    ));
-    select_items.push(format!(
-        "CAST({} AS BIGINT) AS {}",
-        qualify_column(
-            alias,
-            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
-        ),
-        sql_identifier(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
-    ));
-
-    let sql = format!(
-        "SELECT {} FROM {} ORDER BY {}",
-        select_items.join(", "),
-        values_sql,
-        qualify_column(alias, crate::exec::row_position::ICEBERG_ROW_ID_COL)
-    );
-    parse_generated_query(&sql, "MERGE MOR UPDATE data sink")
-}
-
-fn build_update_distributed_select_sql(
+fn update_change_stream_target_sql(
     target: &crate::engine::backend_resolver::TargetBackend,
     target_alias: &str,
-    source_sql: Option<&str>,
-    where_sql: Option<&str>,
     target_ref: &str,
-    select_items: Vec<String>,
-    order_by: Option<String>,
 ) -> String {
     let version_clause = if target_ref == "main" {
         String::new()
     } else {
         format!(" FOR VERSION AS OF {}", sql_string_literal(target_ref))
     };
-    let mut sql = format!(
-        "SELECT {} FROM {}{} AS {}",
-        select_items.join(", "),
+    format!(
+        "{}{} AS {}",
         qualify_iceberg_table(target),
         version_clause,
-        sql_identifier(target_alias)
+        target_alias
+    )
+}
+
+fn build_update_mor_change_event_expand_plan(
+    physical: crate::sql::optimizer::OptimizerPhysicalNode,
+    target_columns: &[crate::engine::catalog::ColumnDef],
+    new_sequence_number: i64,
+) -> Result<crate::sql::optimizer::OptimizerPhysicalNode, String> {
+    use crate::sql::optimizer::operator::{
+        ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec, Operator,
+        PhysicalDistributionOp,
+    };
+    use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+    use crate::sql::optimizer::property::DistributionSpec;
+    use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
+
+    let mut scalar_arena = physical
+        .execution_props
+        .scalar_arena
+        .as_deref()
+        .cloned()
+        .ok_or_else(|| "MOR UPDATE physical plan is missing scalar arena".to_string())?;
+    let child_outputs = physical.output_columns.clone();
+    let row_id_input = output_column_by_name(&child_outputs, "__nr_row_id", "UPDATE row id")?;
+    let hash_distribution = DistributionSpec::shuffle_agg([row_id_input.column_id]);
+
+    let child_stats = physical.stats.clone();
+    let distributed = OptimizerPhysicalNode {
+        op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+            spec: hash_distribution,
+        }),
+        children: vec![physical],
+        stats: child_stats.clone(),
+        output_columns: child_outputs.clone(),
+        execution_props: PlanExecutionProps::default(),
+        build_runtime_filters: Vec::new(),
+        probe_runtime_filters: Vec::new(),
+    };
+
+    let mut next_column_id = max_physical_column_id(&distributed) + 1;
+    let mut alloc_output =
+        |name: &str, data_type: arrow::datatypes::DataType, nullable: bool, is_internal: bool| {
+            let column = crate::sql::analysis::OutputColumn {
+                column_id: crate::sql::column_id::ColumnId(next_column_id),
+                name: name.to_string(),
+                data_type,
+                nullable,
+                is_internal,
+            };
+            next_column_id += 1;
+            column
+        };
+
+    let file_output = alloc_output(
+        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        arrow::datatypes::DataType::Utf8,
+        true,
+        true,
     );
-    if let Some(source) = source_sql {
-        sql.push_str(" CROSS JOIN ");
-        sql.push_str(source);
+    let pos_output = alloc_output(
+        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        arrow::datatypes::DataType::Int64,
+        true,
+        true,
+    );
+    let mut target_outputs = Vec::with_capacity(target_columns.len());
+    for column in target_columns {
+        target_outputs.push((
+            column.name.clone(),
+            alloc_output(
+                &column.name,
+                column.data_type.clone(),
+                column.nullable,
+                false,
+            ),
+        ));
     }
-    if let Some(pred) = where_sql {
-        sql.push_str(" WHERE ");
-        sql.push_str(pred);
+    let row_id_output = alloc_output(
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        arrow::datatypes::DataType::Int64,
+        true,
+        true,
+    );
+    let last_sequence_output = alloc_output(
+        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        arrow::datatypes::DataType::Int64,
+        true,
+        true,
+    );
+    let change_op_output = alloc_output(
+        crate::exec::change_op::CHANGE_OP_COLUMN,
+        arrow::datatypes::DataType::Int8,
+        false,
+        true,
+    );
+    let data_route_output = alloc_output(
+        crate::engine::dml_change_stream::DML_CHANGE_STREAM_DATA_ROUTE_COLUMN,
+        arrow::datatypes::DataType::Int32,
+        true,
+        true,
+    );
+
+    let file_expr = child_column_expr(
+        &mut scalar_arena,
+        &child_outputs,
+        "__nr_file",
+        "UPDATE old file",
+    )?;
+    let pos_expr = child_column_expr(
+        &mut scalar_arena,
+        &child_outputs,
+        "__nr_pos",
+        "UPDATE old row position",
+    )?;
+    let row_id_expr = child_column_expr(
+        &mut scalar_arena,
+        &child_outputs,
+        "__nr_row_id",
+        "UPDATE old row id",
+    )?;
+    let new_sequence_expr = scalar_arena.intern(
+        ScalarNode::Literal(HashableLiteral(crate::sql::analysis::LiteralValue::Int(
+            new_sequence_number,
+        ))),
+        arrow::datatypes::DataType::Int64,
+        false,
+    );
+
+    let mut delete_assignments = vec![
+        ChangeEventOutputExpr {
+            output_column_id: file_output.column_id,
+            expr: Some(file_expr),
+        },
+        ChangeEventOutputExpr {
+            output_column_id: pos_output.column_id,
+            expr: Some(pos_expr),
+        },
+    ];
+    let mut reuse_assignments = Vec::with_capacity(target_columns.len() + 2);
+    for (name, output) in &target_outputs {
+        let old_expr = child_column_expr(
+            &mut scalar_arena,
+            &child_outputs,
+            name,
+            "UPDATE old target column",
+        )?;
+        delete_assignments.push(ChangeEventOutputExpr {
+            output_column_id: output.column_id,
+            expr: Some(old_expr),
+        });
+
+        let new_name = format!("__nr_new_{name}");
+        let new_expr = match maybe_output_column_by_name(&child_outputs, &new_name)? {
+            Some(column) => scalar_arena.intern(
+                ScalarNode::ColumnRef(column.column_id),
+                column.data_type.clone(),
+                column.nullable,
+            ),
+            None => child_column_expr(
+                &mut scalar_arena,
+                &child_outputs,
+                name,
+                "UPDATE unchanged target column",
+            )?,
+        };
+        reuse_assignments.push(ChangeEventOutputExpr {
+            output_column_id: output.column_id,
+            expr: Some(new_expr),
+        });
     }
-    if let Some(order_by) = order_by {
-        sql.push_str(" ORDER BY ");
-        sql.push_str(&order_by);
+    reuse_assignments.push(ChangeEventOutputExpr {
+        output_column_id: row_id_output.column_id,
+        expr: Some(row_id_expr),
+    });
+    reuse_assignments.push(ChangeEventOutputExpr {
+        output_column_id: last_sequence_output.column_id,
+        expr: Some(new_sequence_expr),
+    });
+
+    let mut output_columns = Vec::with_capacity(target_columns.len() + 6);
+    output_columns.push(file_output);
+    output_columns.push(pos_output);
+    output_columns.extend(target_outputs.into_iter().map(|(_, column)| column));
+    output_columns.push(row_id_output.clone());
+    output_columns.push(last_sequence_output);
+    output_columns.push(change_op_output.clone());
+    output_columns.push(data_route_output.clone());
+
+    let mut stats = child_stats;
+    stats.output_row_count *= 2.0;
+    let mut root = OptimizerPhysicalNode {
+        op: Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
+            events: vec![
+                ChangeEventSpec {
+                    predicate: None,
+                    branch_kind:
+                        crate::sql::common::change_stream::ChangeStreamBranchKind::DeleteDv,
+                    assignments: delete_assignments,
+                },
+                ChangeEventSpec {
+                    predicate: None,
+                    branch_kind:
+                        crate::sql::common::change_stream::ChangeStreamBranchKind::ReuseData,
+                    assignments: reuse_assignments,
+                },
+            ],
+            output_columns: output_columns.clone(),
+            change_op_column_id: change_op_output.column_id,
+            data_route_column_id: Some(data_route_output.column_id),
+        }),
+        children: vec![distributed],
+        stats,
+        output_columns,
+        execution_props: PlanExecutionProps::default(),
+        build_runtime_filters: Vec::new(),
+        probe_runtime_filters: Vec::new(),
+    };
+    crate::sql::optimizer::physical_tree::attach_scalar_arena(&mut root, Arc::new(scalar_arena));
+    Ok(root)
+}
+
+fn build_merge_mor_change_event_expand_plan(
+    physical: crate::sql::optimizer::OptimizerPhysicalNode,
+    target_columns: &[crate::engine::catalog::ColumnDef],
+    new_sequence_number: i64,
+    matched_update: bool,
+    matched_delete: bool,
+    not_matched_insert: bool,
+) -> Result<crate::sql::optimizer::OptimizerPhysicalNode, String> {
+    use crate::sql::common::BinOp;
+    use crate::sql::optimizer::operator::{
+        ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec, Operator,
+        PhysicalDistributionOp,
+    };
+    use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+    use crate::sql::optimizer::property::DistributionSpec;
+    use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
+
+    let mut scalar_arena = physical
+        .execution_props
+        .scalar_arena
+        .as_deref()
+        .cloned()
+        .ok_or_else(|| "MOR MERGE physical plan is missing scalar arena".to_string())?;
+    let child_outputs = physical.output_columns.clone();
+    let assert_key_input =
+        output_column_by_name(&child_outputs, "__nr_merge_assert_key", "MERGE assert key")?;
+    let hash_distribution = DistributionSpec::shuffle_agg([assert_key_input.column_id]);
+
+    let child_stats = physical.stats.clone();
+    let distributed = OptimizerPhysicalNode {
+        op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+            spec: hash_distribution,
+        }),
+        children: vec![physical],
+        stats: child_stats.clone(),
+        output_columns: child_outputs.clone(),
+        execution_props: PlanExecutionProps::default(),
+        build_runtime_filters: Vec::new(),
+        probe_runtime_filters: Vec::new(),
+    };
+
+    let mut next_column_id = max_physical_column_id(&distributed) + 1;
+    let mut alloc_output =
+        |name: &str, data_type: arrow::datatypes::DataType, nullable: bool, is_internal: bool| {
+            let column = crate::sql::analysis::OutputColumn {
+                column_id: crate::sql::column_id::ColumnId(next_column_id),
+                name: name.to_string(),
+                data_type,
+                nullable,
+                is_internal,
+            };
+            next_column_id += 1;
+            column
+        };
+
+    let file_output = alloc_output(
+        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        arrow::datatypes::DataType::Utf8,
+        true,
+        true,
+    );
+    let pos_output = alloc_output(
+        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        arrow::datatypes::DataType::Int64,
+        true,
+        true,
+    );
+    let mut target_outputs = Vec::with_capacity(target_columns.len());
+    for column in target_columns {
+        target_outputs.push((
+            column.name.clone(),
+            alloc_output(
+                &column.name,
+                column.data_type.clone(),
+                column.nullable,
+                false,
+            ),
+        ));
     }
-    sql
+    let row_id_output = alloc_output(
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        arrow::datatypes::DataType::Int64,
+        true,
+        true,
+    );
+    let last_sequence_output = alloc_output(
+        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        arrow::datatypes::DataType::Int64,
+        true,
+        true,
+    );
+    let change_op_output = alloc_output(
+        crate::exec::change_op::CHANGE_OP_COLUMN,
+        arrow::datatypes::DataType::Int8,
+        false,
+        true,
+    );
+    let data_route_output = alloc_output(
+        crate::engine::dml_change_stream::DML_CHANGE_STREAM_DATA_ROUTE_COLUMN,
+        arrow::datatypes::DataType::Int32,
+        true,
+        true,
+    );
+
+    let file_expr = child_column_expr(
+        &mut scalar_arena,
+        &child_outputs,
+        "__nr_file",
+        "MERGE old file",
+    )?;
+    let pos_expr = child_column_expr(
+        &mut scalar_arena,
+        &child_outputs,
+        "__nr_pos",
+        "MERGE old row position",
+    )?;
+    let row_id_expr = child_column_expr(
+        &mut scalar_arena,
+        &child_outputs,
+        "__nr_row_id",
+        "MERGE old row id",
+    )?;
+    let new_sequence_expr = scalar_arena.intern(
+        ScalarNode::Literal(HashableLiteral(crate::sql::analysis::LiteralValue::Int(
+            new_sequence_number,
+        ))),
+        arrow::datatypes::DataType::Int64,
+        false,
+    );
+
+    let mut delete_assignments = vec![
+        ChangeEventOutputExpr {
+            output_column_id: file_output.column_id,
+            expr: Some(file_expr),
+        },
+        ChangeEventOutputExpr {
+            output_column_id: pos_output.column_id,
+            expr: Some(pos_expr),
+        },
+    ];
+    let mut reuse_assignments = Vec::with_capacity(target_columns.len() + 2);
+    let mut fresh_assignments = Vec::with_capacity(target_columns.len());
+    for (name, output) in &target_outputs {
+        let old_expr = child_column_expr(
+            &mut scalar_arena,
+            &child_outputs,
+            name,
+            "MERGE old target column",
+        )?;
+        delete_assignments.push(ChangeEventOutputExpr {
+            output_column_id: output.column_id,
+            expr: Some(old_expr),
+        });
+
+        let new_name = format!("__nr_new_{name}");
+        let reuse_expr = match maybe_output_column_by_name(&child_outputs, &new_name)? {
+            Some(column) => scalar_arena.intern(
+                ScalarNode::ColumnRef(column.column_id),
+                column.data_type.clone(),
+                column.nullable,
+            ),
+            None => child_column_expr(
+                &mut scalar_arena,
+                &child_outputs,
+                name,
+                "MERGE unchanged target column",
+            )?,
+        };
+        reuse_assignments.push(ChangeEventOutputExpr {
+            output_column_id: output.column_id,
+            expr: Some(reuse_expr),
+        });
+
+        let insert_name = format!("__nr_ins_{name}");
+        if let Some(column) = maybe_output_column_by_name(&child_outputs, &insert_name)? {
+            let fresh_expr = scalar_arena.intern(
+                ScalarNode::ColumnRef(column.column_id),
+                column.data_type.clone(),
+                column.nullable,
+            );
+            fresh_assignments.push(ChangeEventOutputExpr {
+                output_column_id: output.column_id,
+                expr: Some(fresh_expr),
+            });
+        }
+    }
+    reuse_assignments.push(ChangeEventOutputExpr {
+        output_column_id: row_id_output.column_id,
+        expr: Some(row_id_expr),
+    });
+    reuse_assignments.push(ChangeEventOutputExpr {
+        output_column_id: last_sequence_output.column_id,
+        expr: Some(new_sequence_expr),
+    });
+
+    let action_predicate = |arena: &mut crate::sql::optimizer::scalar::ScalarArena,
+                            action: i32|
+     -> Result<crate::sql::optimizer::scalar::ScalarId, String> {
+        let action_expr =
+            child_column_expr(arena, &child_outputs, "__nr_merge_action", "MERGE action")?;
+        let literal = arena.intern(
+            ScalarNode::Literal(HashableLiteral(crate::sql::analysis::LiteralValue::Int(
+                i64::from(action),
+            ))),
+            arrow::datatypes::DataType::Int64,
+            false,
+        );
+        Ok(arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Eq,
+                left: action_expr,
+                right: literal,
+            },
+            arrow::datatypes::DataType::Boolean,
+            false,
+        ))
+    };
+
+    let mut events = Vec::new();
+    if matched_update {
+        let predicate = action_predicate(&mut scalar_arena, MERGE_ACTION_MATCHED_UPDATE)?;
+        events.push(ChangeEventSpec {
+            predicate: Some(predicate),
+            branch_kind: crate::sql::common::change_stream::ChangeStreamBranchKind::DeleteDv,
+            assignments: delete_assignments.clone(),
+        });
+        events.push(ChangeEventSpec {
+            predicate: Some(predicate),
+            branch_kind: crate::sql::common::change_stream::ChangeStreamBranchKind::ReuseData,
+            assignments: reuse_assignments,
+        });
+    }
+    if matched_delete {
+        events.push(ChangeEventSpec {
+            predicate: Some(action_predicate(
+                &mut scalar_arena,
+                MERGE_ACTION_MATCHED_DELETE,
+            )?),
+            branch_kind: crate::sql::common::change_stream::ChangeStreamBranchKind::DeleteDv,
+            assignments: delete_assignments,
+        });
+    }
+    if not_matched_insert {
+        events.push(ChangeEventSpec {
+            predicate: Some(action_predicate(
+                &mut scalar_arena,
+                MERGE_ACTION_NOT_MATCHED_INSERT,
+            )?),
+            branch_kind: crate::sql::common::change_stream::ChangeStreamBranchKind::FreshData,
+            assignments: fresh_assignments,
+        });
+    }
+    if events.is_empty() {
+        return Err("MOR MERGE change-stream expand requires at least one event".to_string());
+    }
+
+    let mut output_columns = Vec::with_capacity(target_columns.len() + 6);
+    output_columns.push(file_output);
+    output_columns.push(pos_output);
+    output_columns.extend(target_outputs.into_iter().map(|(_, column)| column));
+    output_columns.push(row_id_output);
+    output_columns.push(last_sequence_output);
+    output_columns.push(change_op_output.clone());
+    output_columns.push(data_route_output.clone());
+
+    let mut stats = child_stats;
+    if matched_update {
+        stats.output_row_count *= 2.0;
+    }
+    let mut root = OptimizerPhysicalNode {
+        op: Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
+            events,
+            output_columns: output_columns.clone(),
+            change_op_column_id: change_op_output.column_id,
+            data_route_column_id: Some(data_route_output.column_id),
+        }),
+        children: vec![distributed],
+        stats,
+        output_columns,
+        execution_props: PlanExecutionProps::default(),
+        build_runtime_filters: Vec::new(),
+        probe_runtime_filters: Vec::new(),
+    };
+    crate::sql::optimizer::physical_tree::attach_scalar_arena(&mut root, Arc::new(scalar_arena));
+    Ok(root)
+}
+
+fn output_column_by_name(
+    columns: &[crate::sql::analysis::OutputColumn],
+    name: &str,
+    label: &str,
+) -> Result<crate::sql::analysis::OutputColumn, String> {
+    maybe_output_column_by_name(columns, name)?.ok_or_else(|| {
+        format!("MOR UPDATE change-stream {label} column `{name}` not found in producer output")
+    })
+}
+
+fn maybe_output_column_by_name(
+    columns: &[crate::sql::analysis::OutputColumn],
+    name: &str,
+) -> Result<Option<crate::sql::analysis::OutputColumn>, String> {
+    let mut matches = columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(name));
+    let Some(column) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "MOR UPDATE change-stream producer column `{name}` is ambiguous"
+        ));
+    }
+    Ok(Some(column.clone()))
+}
+
+fn child_column_expr(
+    scalar_arena: &mut crate::sql::optimizer::scalar::ScalarArena,
+    columns: &[crate::sql::analysis::OutputColumn],
+    name: &str,
+    label: &str,
+) -> Result<crate::sql::optimizer::scalar::ScalarId, String> {
+    use crate::sql::optimizer::scalar::ScalarNode;
+
+    let column = output_column_by_name(columns, name, label)?;
+    Ok(scalar_arena.intern(
+        ScalarNode::ColumnRef(column.column_id),
+        column.data_type,
+        column.nullable,
+    ))
+}
+
+fn max_physical_column_id(node: &crate::sql::optimizer::OptimizerPhysicalNode) -> u32 {
+    node.output_columns
+        .iter()
+        .map(|column| column.column_id.0)
+        .chain(node.children.iter().map(max_physical_column_id))
+        .max()
+        .unwrap_or(0)
 }
 
 fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
@@ -751,14 +969,12 @@ fn execute_mor_update(
     catalog: Arc<dyn Catalog>,
     table_ident: iceberg::TableIdent,
     table: iceberg::table::Table,
-    matched: MatchedUpdateBatch,
+    stmt: &UpdateStmt,
+    current_catalog: Option<&str>,
+    target_columns: &[crate::engine::catalog::ColumnDef],
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
-    write: MorUpdateDistributedWrite,
 ) -> Result<StatementResult, String> {
-    if matched.row_ids.is_empty() {
-        return Ok(StatementResult::Ok);
-    }
     // For branch DML, read partition metadata at the branch head snapshot.
     let read_snapshot_id: Option<i64> = if target_ref != "main" {
         crate::engine::delete_flow::resolve_branch_head_snapshot_id(table.metadata(), target_ref)?
@@ -788,7 +1004,16 @@ fn execute_mor_update(
         )
         .with_table_metadata(metadata.clone()),
     );
-    run_mor_update_distributed_transaction(
+    let write = build_update_mor_change_stream_write_plan(
+        state,
+        target,
+        stmt,
+        current_catalog,
+        target_columns,
+        target_ref,
+        metadata.last_sequence_number() + 1,
+    )?;
+    run_mor_update_change_stream_transaction(
         state,
         target,
         catalog,
@@ -802,91 +1027,66 @@ fn execute_mor_update(
     Ok(StatementResult::Ok)
 }
 
-struct MorUpdateDistributedWrite {
-    data_query: sqlparser::ast::Query,
-    data_sink_spec: IcebergWriteSinkSpec,
-    /// SELECT that projects `[_file, _pos, <partition src>]` for the matched
-    /// old rows. The BE writes a deletion-vector (Puffin) file per data file
-    /// through `dv_sink_spec`; the coordinator never materializes positions.
-    dv_query: sqlparser::ast::Query,
-    dv_sink_spec: IcebergWriteSinkSpec,
-}
-
-struct DistributedMorUpdateExecutor {
+struct MorUpdateChangeStreamExecutor {
     state: Arc<StandaloneState>,
     target: crate::engine::backend_resolver::TargetBackend,
-    write: MorUpdateDistributedWrite,
+    write: Mutex<Option<crate::engine::dml_change_stream::DmlChangeStreamWritePlan>>,
     commit_executor: IcebergWriteCommitExecutor,
+    commit_plan:
+        Mutex<Option<crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan>>,
 }
 
-fn run_mor_data_and_dv(
-    state: &Arc<StandaloneState>,
-    target: &crate::engine::backend_resolver::TargetBackend,
-    write: &MorUpdateDistributedWrite,
-    data_empty_msg: &str,
-    dv_empty_msg: &str,
-) -> Result<(CoordinatedQueryResult, CoordinatedQueryResult), String> {
-    // Write the replacement rows (content=Data) on the BE.
-    let data = crate::engine::execute_query_as_iceberg_write(
-        state,
-        Some(&target.catalog),
-        &target.namespace,
-        &write.data_query,
-        write.data_sink_spec.clone(),
-        None,
-        None,
-    )?;
-    if data.write_abort.is_none()
-        && data
-            .write_commit
-            .as_ref()
-            .is_none_or(|commit| !write_commit_has_files(commit))
-    {
-        return Err(data_empty_msg.to_string());
-    }
-
-    // Write the old-row deletion vectors (content=PositionDeletes/Puffin)
-    // on the BE, shuffled per `_file` so each data file gets one DV writer.
-    let dv = crate::engine::execute_query_as_iceberg_write(
-        state,
-        Some(&target.catalog),
-        &target.namespace,
-        &write.dv_query,
-        write.dv_sink_spec.clone(),
-        None,
-        Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
-    )?;
-    // The matched set is already known non-empty (the data guard above
-    // enforced it), so a file-less but non-aborted DV result is a real bug:
-    // without the DV files, the commit would keep old+new rows live. Fail fast
-    // instead of silently half-committing.
-    if dv.write_abort.is_none()
-        && dv
-            .write_commit
-            .as_ref()
-            .is_none_or(|commit| !write_commit_has_files(commit))
-    {
-        return Err(dv_empty_msg.to_string());
-    }
-
-    Ok((data, dv))
+struct MorMergeChangeStreamExecutor {
+    state: Arc<StandaloneState>,
+    target: crate::engine::backend_resolver::TargetBackend,
+    write: Mutex<Option<crate::engine::dml_change_stream::DmlChangeStreamWritePlan>>,
+    commit_executor: IcebergWriteCommitExecutor,
+    commit_plan:
+        Mutex<Option<crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan>>,
 }
 
-impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor {
+impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<CoordinatedQueryResult, String> {
-        let (data, dv) = run_mor_data_and_dv(
+        let mut plan = self
+            .write
+            .lock()
+            .expect("MOR UPDATE change-stream plan lock poisoned")
+            .take()
+            .ok_or_else(|| "MOR UPDATE change-stream plan was already consumed".to_string())?;
+        let planned = crate::engine::dml_change_stream::plan_dml_change_stream_write(
             &self.state,
             &self.target,
-            &self.write,
-            "MOR UPDATE distributed data sink produced no replacement data files",
-            "MOR UPDATE distributed DV sink produced no deletion-vector files",
+            &mut plan,
         )?;
-        // Both sets of sink_commit_infos flow into one collector → one commit:
-        // data files committed as content=Data, DV files as Puffin DVs.
-        merge_write_commits(data, dv)
+        let crate::engine::PlannedIcebergChangeStreamWrite {
+            build_result,
+            commit_plan,
+        } = planned;
+        *self
+            .commit_plan
+            .lock()
+            .expect("MOR UPDATE change-stream commit plan lock poisoned") = Some(commit_plan);
+        #[cfg(test)]
+        if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&plan.dag) {
+            return Ok(result);
+        }
+        let result =
+            crate::engine::execute_planned_iceberg_change_stream_write(build_result, None)?;
+        if let Some(commit) = result.write_commit.as_ref()
+            && !write_commit_has_files(commit)
+        {
+            if commit.writers.iter().any(|writer| writer.loaded_rows > 0) {
+                return Err(
+                    "MOR UPDATE change-stream write produced rows but no data or DV files"
+                        .to_string(),
+                );
+            }
+            return Ok(no_mutation_write_result());
+        }
+        Ok(result)
     }
 
     fn commit(
@@ -894,7 +1094,19 @@ impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor {
         _spec: &IcebergWriteTransactionSpec,
         write_commit: &WriteCommitInput,
     ) -> Result<CommitOutcome, CommitServiceError> {
-        self.commit_executor.commit_write_input(write_commit)
+        let guard = self
+            .commit_plan
+            .lock()
+            .expect("MOR UPDATE change-stream commit plan lock poisoned");
+        let plan = guard.as_ref().ok_or_else(|| {
+            CommitServiceError::known_uncommitted(
+                "MOR UPDATE change-stream commit plan is missing; coordinated write did not complete"
+                    .to_string(),
+                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
+            )
+        })?;
+        self.commit_executor
+            .commit_change_stream_write_input(write_commit, plan)
     }
 
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
@@ -902,25 +1114,76 @@ impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor {
     }
 }
 
-/// Merge the two BE writes of a MOR UPDATE (replacement data files + old-row
-/// deletion vectors) into a single coordinated result. The two writers' commit
-/// inputs are concatenated into one `WriteCommitInput` so a single collector
-/// drives one `RowDeltaDvFromFiles` commit. If either side reported a
-/// `write_abort`, that is propagated so the transaction runner can clean up.
-fn merge_write_commits(
-    data: CoordinatedQueryResult,
-    dv: CoordinatedQueryResult,
-) -> Result<CoordinatedQueryResult, String> {
-    // Two-part fold (MOR UPDATE: replacement data + old-row DVs). The data-side
-    // and DV-side produced-no-files guards in `run_coordinated_write` reject a
-    // file-less, non-aborted result before we get here, so a single-sided
-    // success is unreachable; any single-sided commit here implies an abort,
-    // and the partial commit is discarded by the transaction runner. The N-ary
-    // path documents the same invariant.
-    merge_all_write_commits(vec![data, dv])
+impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
+    fn run_coordinated_write(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+    ) -> Result<CoordinatedQueryResult, String> {
+        let mut plan = self
+            .write
+            .lock()
+            .expect("MOR MERGE change-stream plan lock poisoned")
+            .take()
+            .ok_or_else(|| "MOR MERGE change-stream plan was already consumed".to_string())?;
+        let planned = crate::engine::dml_change_stream::plan_dml_change_stream_write(
+            &self.state,
+            &self.target,
+            &mut plan,
+        )?;
+        let crate::engine::PlannedIcebergChangeStreamWrite {
+            build_result,
+            commit_plan,
+        } = planned;
+        *self
+            .commit_plan
+            .lock()
+            .expect("MOR MERGE change-stream commit plan lock poisoned") = Some(commit_plan);
+        #[cfg(test)]
+        if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&plan.dag) {
+            return Ok(result);
+        }
+        let result =
+            crate::engine::execute_planned_iceberg_change_stream_write(build_result, None)?;
+        if let Some(commit) = result.write_commit.as_ref()
+            && !write_commit_has_files(commit)
+        {
+            if commit.writers.iter().any(|writer| writer.loaded_rows > 0) {
+                return Err(
+                    "MOR MERGE change-stream write produced rows but no data or DV files"
+                        .to_string(),
+                );
+            }
+            return Ok(no_mutation_write_result());
+        }
+        Ok(result)
+    }
+
+    fn commit(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+        write_commit: &WriteCommitInput,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        let guard = self
+            .commit_plan
+            .lock()
+            .expect("MOR MERGE change-stream commit plan lock poisoned");
+        let plan = guard.as_ref().ok_or_else(|| {
+            CommitServiceError::known_uncommitted(
+                "MOR MERGE change-stream commit plan is missing; coordinated write did not complete"
+                    .to_string(),
+                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
+            )
+        })?;
+        self.commit_executor
+            .commit_change_stream_write_input(write_commit, plan)
+    }
+
+    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
+        self.commit_executor.finalize()
+    }
 }
 
-/// N-ary generalization of [`merge_write_commits`]: concatenate every part's
+/// N-ary fold for MERGE branch writes: concatenate every part's
 /// `WriteCommitInput.writers` into one transaction-wide `WriteCommitInput` so a
 /// single collector drives one commit. Used by the folded multi-branch MERGE
 /// executor (matched data/DV writers all share one collector). The first
@@ -959,7 +1222,7 @@ fn merge_all_write_commits(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_mor_update_distributed_transaction(
+fn run_mor_update_change_stream_transaction(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     catalog: Arc<dyn Catalog>,
@@ -968,7 +1231,7 @@ fn run_mor_update_distributed_transaction(
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
     target_ref: &str,
-    write: MorUpdateDistributedWrite,
+    write: crate::engine::dml_change_stream::DmlChangeStreamWritePlan,
 ) -> Result<(), String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
@@ -993,7 +1256,7 @@ fn run_mor_update_distributed_transaction(
         },
         operation_kind: IcebergOperationKind::RowDelta,
         attempt_id: format!(
-            "{}.{}.{}:mor-update-distributed:{}",
+            "{}.{}.{}:mor-update-change-stream:{}",
             target.catalog,
             target.namespace,
             target.table,
@@ -1011,11 +1274,77 @@ fn run_mor_update_distributed_transaction(
         },
         source: IcebergWriteSource::CoordinatedPlan,
     };
-    let executor = DistributedMorUpdateExecutor {
+    let executor = MorUpdateChangeStreamExecutor {
         state: Arc::clone(state),
         target: target.clone(),
-        write,
+        write: Mutex::new(Some(write)),
         commit_executor,
+        commit_plan: Mutex::new(None),
+    };
+    let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
+    let _outcome = runner.run(spec)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mor_merge_change_stream_transaction(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    catalog: Arc<dyn Catalog>,
+    table: iceberg::table::Table,
+    collector: Arc<IcebergCommitCollector>,
+    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    base_snapshot_id: Option<i64>,
+    target_ref: &str,
+    write: crate::engine::dml_change_stream::DmlChangeStreamWritePlan,
+) -> Result<(), String> {
+    let abort_cleanup =
+        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
+    let commit_executor = IcebergWriteCommitExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        catalog,
+        table,
+        collector,
+        fs: abort_cleanup.fs,
+        cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_rewrite: None,
+        target_ref: target_ref.to_string(),
+        snapshot_properties: BTreeMap::new(),
+    };
+    let spec = IcebergWriteTransactionSpec {
+        target: IcebergOperationTarget {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            ref_name: (target_ref != "main").then(|| target_ref.to_string()),
+        },
+        operation_kind: IcebergOperationKind::RowDelta,
+        attempt_id: format!(
+            "{}.{}.{}:mor-merge-change-stream:{}",
+            target.catalog,
+            target.namespace,
+            target.table,
+            uuid::Uuid::new_v4()
+        ),
+        commit: IcebergWriteCommitPolicy {
+            commit_op_kind: CommitOpKind::RowDeltaDvFromFiles,
+            base_snapshot_id,
+            base_snapshot_map: BTreeMap::new(),
+            target_ref: target_ref.to_string(),
+            snapshot_properties: BTreeMap::new(),
+        },
+        validation: IcebergWriteValidationPolicy {
+            require_v3_for_branch: target_ref != "main",
+        },
+        source: IcebergWriteSource::CoordinatedPlan,
+    };
+    let executor = MorMergeChangeStreamExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        write: Mutex::new(Some(write)),
+        commit_executor,
+        commit_plan: Mutex::new(None),
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
@@ -2004,6 +2333,9 @@ fn build_update_match_query_sql(
 
 const MERGE_TARGET_DEFAULT_ALIAS: &str = "__nr_t";
 const MERGE_SOURCE_DEFAULT_ALIAS: &str = "__nr_s";
+const MERGE_ACTION_MATCHED_UPDATE: i32 = 1;
+const MERGE_ACTION_MATCHED_DELETE: i32 = 2;
+const MERGE_ACTION_NOT_MATCHED_INSERT: i32 = 3;
 
 pub(crate) fn execute_merge_statement(
     state: &Arc<StandaloneState>,
@@ -2053,7 +2385,7 @@ pub(crate) fn execute_merge_statement(
     // The match SELECT is built against the v3 row-lineage target so the
     // matched-side path can reuse the UPDATE executor. Validate the v3
     // requirement up front instead of letting the executor surface it.
-    let _ = select_iceberg_update_mode(&table)?;
+    let table_write_mode = select_iceberg_update_mode(&table)?;
 
     if let Some(clause) = stmt.matched.as_ref()
         && let MergeMatchedAction::Update { assignments } = &clause.action
@@ -2069,6 +2401,74 @@ pub(crate) fn execute_merge_statement(
         None
     };
 
+    let has_matched_update = matches!(
+        stmt.matched.as_ref().map(|clause| &clause.action),
+        Some(MergeMatchedAction::Update { .. })
+    );
+    let has_matched_delete = matches!(
+        stmt.matched.as_ref().map(|clause| &clause.action),
+        Some(MergeMatchedAction::Delete)
+    );
+    let has_not_matched_insert = stmt.not_matched.is_some();
+
+    // MERGE matched-side DML is `main`-only here. Pin the unified transaction's
+    // base snapshot to the freshly-loaded table's current snapshot; each
+    // matched-branch builder derives its sink snapshot from its own
+    // `load_table`, and under the single-writer assumption all observe the same
+    // current snapshot (the commit's base-snapshot check fails fast otherwise).
+    let target_ref = "main";
+
+    let use_mor_change_stream =
+        table_write_mode == IcebergUpdateMode::MergeOnRead || has_matched_delete;
+    if use_mor_change_stream {
+        if !has_matched_update && !has_matched_delete && !has_not_matched_insert {
+            return Ok(StatementResult::Ok);
+        }
+
+        let base_snapshot_id = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+        let metadata = table.metadata();
+        let staging_dir = format!(
+            "{}/data/_staging/{}",
+            metadata.location(),
+            uuid::Uuid::new_v4()
+        );
+        let collector = Arc::new(
+            IcebergCommitCollector::new(
+                CommitOpKind::RowDeltaDvFromFiles,
+                table_ident.clone(),
+                base_snapshot_id,
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                staging_dir,
+                crate::common::types::UniqueId { hi: 0, lo: 0 },
+            )
+            .with_table_metadata(metadata.clone()),
+        );
+        let write = build_merge_mor_change_stream_write_plan(
+            state,
+            &target,
+            stmt,
+            current_catalog,
+            &target_columns,
+            insert_columns_resolved.as_deref(),
+            target_ref,
+            metadata.last_sequence_number() + 1,
+        )?;
+        run_mor_merge_change_stream_transaction(
+            state,
+            &target,
+            catalog,
+            table,
+            collector,
+            entry,
+            base_snapshot_id,
+            target_ref,
+            write,
+        )?;
+        return Ok(StatementResult::Ok);
+    }
+
     let match_rows = materialize_merge_match(
         state,
         &target,
@@ -2077,13 +2477,6 @@ pub(crate) fn execute_merge_statement(
         &target_columns,
         insert_columns_resolved.as_deref(),
     )?;
-
-    // MERGE matched-side DML is `main`-only here. Pin the unified transaction's
-    // base snapshot to the freshly-loaded table's current snapshot; each
-    // matched-branch builder derives its sink snapshot from its own
-    // `load_table`, and under the single-writer assumption all observe the same
-    // current snapshot (the commit's base-snapshot check fails fast otherwise).
-    let target_ref = "main";
 
     // Build the not-matched INSERT branch only when there are unmatched rows to
     // insert. Its data files are FRESH (net-new rows, no preserved `_row_id`).
@@ -2131,53 +2524,25 @@ pub(crate) fn execute_merge_statement(
         } else {
             validate_unique_target_row_ids(&matched.row_ids)?;
             match &clause.action {
-                MergeMatchedAction::Update { .. } => match select_iceberg_update_mode(&table)? {
-                    IcebergUpdateMode::CopyOnWrite => {
-                        let base_snapshot_id =
-                            table.metadata().current_snapshot().map(|s| s.snapshot_id());
-                        let write = build_cow_update_distributed_write(
-                            state,
-                            &target,
-                            &table,
-                            &matched,
-                            &target_columns,
-                            &entry,
-                            base_snapshot_id,
-                        )?;
-                        MergeMatchedBranch::CowUpdate(write)
-                    }
-                    IcebergUpdateMode::MergeOnRead => {
-                        let write = build_merge_mor_distributed_write(
-                            state,
-                            &target,
-                            &matched,
-                            &target_columns,
-                        )?;
-                        MergeMatchedBranch::MorUpdate(write)
-                    }
-                },
-                MergeMatchedAction::Delete => {
+                MergeMatchedAction::Update { .. } => {
                     let base_snapshot_id =
                         table.metadata().current_snapshot().map(|s| s.snapshot_id());
-                    let resolved = {
-                        let registry = state.connectors.read().expect("connector registry read");
-                        let backend = registry.catalog_backend("iceberg")?;
-                        backend.load_table(&target.catalog, &target.namespace, &target.table)?
-                    };
-                    let mut dv_sink_spec =
-                        crate::engine::iceberg_writer::build_position_delete_sink_spec(
-                            &target, &resolved, &table, &entry,
-                        )?;
-                    dv_sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
-                    dv_sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
-                    let dv_query = build_merge_mor_dv_sink_query_from_matched(
+                    let write = build_cow_update_distributed_write(
+                        state,
+                        &target,
+                        &table,
                         &matched,
-                        &dv_sink_spec.target_columns,
+                        &target_columns,
+                        &entry,
+                        base_snapshot_id,
                     )?;
-                    MergeMatchedBranch::Delete(MergeMatchedDeleteDistributedWrite {
-                        dv_query,
-                        dv_sink_spec,
-                    })
+                    MergeMatchedBranch::CowUpdate(write)
+                }
+                MergeMatchedAction::Delete => {
+                    return Err(
+                        "internal error: MERGE matched DELETE should use MOR change-stream path"
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -2193,9 +2558,6 @@ pub(crate) fn execute_merge_statement(
     // - INSERT only, no matched → FastAppend.
     let commit_op_kind = match &matched_branch {
         MergeMatchedBranch::CowUpdate(_) => CommitOpKind::CowUpdate,
-        MergeMatchedBranch::MorUpdate(_) | MergeMatchedBranch::Delete(_) => {
-            CommitOpKind::RowDeltaDvFromFiles
-        }
         MergeMatchedBranch::None => CommitOpKind::FastAppend,
     };
 
@@ -2521,8 +2883,25 @@ fn materialize_merge_match(
     let matched_assignments_sql = match stmt.matched.as_ref().map(|c| &c.action) {
         Some(MergeMatchedAction::Update { assignments }) => assignments
             .iter()
-            .map(|a| (a.column.clone(), a.value.to_string()))
-            .collect::<Vec<_>>(),
+            .map(|a| {
+                let target_column = target_columns
+                    .iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(&a.column))
+                    .ok_or_else(|| {
+                        format!(
+                            "MERGE UPDATE assignment references unknown target column `{}`",
+                            a.column
+                        )
+                    })?;
+                Ok((
+                    target_column.name.clone(),
+                    crate::engine::iceberg_writer::target_cast_expr_sql(
+                        &format!("({})", a.value),
+                        target_column,
+                    )?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?,
         _ => Vec::new(),
     };
     let matched_assignments_sql_borrow: Vec<(&str, &str)> = matched_assignments_sql
@@ -2535,10 +2914,23 @@ fn materialize_merge_match(
             (Some(cols), Some(action)) => cols
                 .iter()
                 .filter_map(|col| {
-                    col.value_index
-                        .map(|idx| (col.name.clone(), action.values[idx].to_string()))
+                    col.value_index.map(|idx| {
+                        let target_column = target_columns
+                            .iter()
+                            .find(|target_column| {
+                                target_column.name.eq_ignore_ascii_case(&col.name)
+                            })
+                            .expect("resolved MERGE INSERT column exists in target columns");
+                        Ok((
+                            col.name.clone(),
+                            crate::engine::iceberg_writer::target_cast_expr_sql(
+                                &format!("({})", action.values[idx]),
+                                target_column,
+                            )?,
+                        ))
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, String>>()?,
             _ => Vec::new(),
         };
     let insert_values_sql_borrow: Vec<(&str, &str)> = insert_values_sql
@@ -2556,10 +2948,203 @@ fn materialize_merge_match(
         target_columns,
         &matched_assignments_sql_borrow,
         &insert_values_sql_borrow,
+        stmt.matched.as_ref().map(|clause| match clause.action {
+            MergeMatchedAction::Update { .. } => MERGE_ACTION_MATCHED_UPDATE,
+            MergeMatchedAction::Delete => MERGE_ACTION_MATCHED_DELETE,
+        }),
+        stmt.not_matched.is_some(),
     );
 
     let result = execute_merge_match_query(state, Some(&target.catalog), &sql, &target.namespace)?;
     Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_merge_mor_change_stream_write_plan(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    stmt: &MergeStmt,
+    current_catalog: Option<&str>,
+    target_columns: &[crate::engine::catalog::ColumnDef],
+    insert_columns: Option<&[MergeInsertColumn]>,
+    target_ref: &str,
+    new_sequence_number: i64,
+) -> Result<crate::engine::dml_change_stream::DmlChangeStreamWritePlan, String> {
+    let target_alias = stmt
+        .target_alias
+        .clone()
+        .unwrap_or_else(|| MERGE_TARGET_DEFAULT_ALIAS.to_string());
+    let target_sql = update_change_stream_target_sql(target, &target_alias, target_ref);
+    let source_table_sql =
+        mutation_source_relation_to_sql(state, &stmt.source, current_catalog, target)?;
+    let source_sql = match &stmt.source {
+        crate::sql::parser::ast::MutationSource::Table { alias, .. }
+        | crate::sql::parser::ast::MutationSource::Query { alias, .. } => {
+            if alias.is_some() {
+                source_table_sql
+            } else {
+                format!("{source_table_sql} AS {MERGE_SOURCE_DEFAULT_ALIAS}")
+            }
+        }
+    };
+
+    let matched_assignments_sql = match stmt.matched.as_ref().map(|c| &c.action) {
+        Some(MergeMatchedAction::Update { assignments }) => assignments
+            .iter()
+            .map(|a| {
+                let target_column = target_columns
+                    .iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(&a.column))
+                    .ok_or_else(|| {
+                        format!(
+                            "MERGE UPDATE assignment references unknown target column `{}`",
+                            a.column
+                        )
+                    })?;
+                Ok((
+                    target_column.name.clone(),
+                    crate::engine::iceberg_writer::target_cast_expr_sql(
+                        &format!("({})", a.value),
+                        target_column,
+                    )?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        _ => Vec::new(),
+    };
+    let matched_assignments_sql_borrow = matched_assignments_sql
+        .iter()
+        .map(|(c, e)| (c.as_str(), e.as_str()))
+        .collect::<Vec<_>>();
+
+    let insert_values_sql: Vec<(String, String)> =
+        match (insert_columns, stmt.not_matched.as_ref().map(|c| &c.action)) {
+            (Some(cols), Some(action)) => cols
+                .iter()
+                .filter_map(|col| {
+                    col.value_index.map(|idx| {
+                        let target_column = target_columns
+                            .iter()
+                            .find(|target_column| {
+                                target_column.name.eq_ignore_ascii_case(&col.name)
+                            })
+                            .expect("resolved MERGE INSERT column exists in target columns");
+                        Ok((
+                            col.name.clone(),
+                            crate::engine::iceberg_writer::target_cast_expr_sql(
+                                &format!("({})", action.values[idx]),
+                                target_column,
+                            )?,
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            _ => Vec::new(),
+        };
+    let insert_values_sql_borrow = insert_values_sql
+        .iter()
+        .map(|(c, e)| (c.as_str(), e.as_str()))
+        .collect::<Vec<_>>();
+
+    let matched_action = stmt.matched.as_ref().map(|clause| match clause.action {
+        MergeMatchedAction::Update { .. } => MERGE_ACTION_MATCHED_UPDATE,
+        MergeMatchedAction::Delete => MERGE_ACTION_MATCHED_DELETE,
+    });
+    let has_matched_update = matched_action == Some(MERGE_ACTION_MATCHED_UPDATE);
+    let has_matched_delete = matched_action == Some(MERGE_ACTION_MATCHED_DELETE);
+    let has_not_matched_insert = stmt.not_matched.is_some();
+    let matched_predicate_sql = stmt
+        .matched
+        .as_ref()
+        .and_then(|c| c.predicate.as_ref())
+        .map(|expr| expr.to_string());
+    let not_matched_predicate_sql = stmt
+        .not_matched
+        .as_ref()
+        .and_then(|c| c.predicate.as_ref())
+        .map(|expr| expr.to_string());
+
+    let match_sql = build_merge_match_query_sql(
+        &target_sql,
+        &target_alias,
+        &source_sql,
+        &stmt.on.to_string(),
+        matched_predicate_sql.as_deref(),
+        not_matched_predicate_sql.as_deref(),
+        target_columns,
+        &matched_assignments_sql_borrow,
+        &insert_values_sql_borrow,
+        matched_action,
+        has_not_matched_insert,
+    );
+    let mut query = parse_generated_query(&match_sql, "MOR MERGE change-stream producer")?;
+    if crate::engine::query_prep::has_time_travel_refs(&query) {
+        crate::engine::query_prep::rewrite_time_travel_refs(
+            state,
+            Some(&target.catalog),
+            &target.namespace,
+            &mut query,
+        )?;
+    }
+
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let catalog_mgr_snapshot = crate::engine::catalog_mgr_snapshot(state);
+    let analyzer_provider = crate::engine::build_analyzer_provider(
+        Some(&target.catalog),
+        &catalog_snapshot,
+        &catalog_mgr_snapshot,
+        &connectors_snapshot,
+        crate::sql::catalog::TableLookupMode::SchemaOnly,
+    );
+    let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
+        &query,
+        &analyzer_provider,
+        &connectors_snapshot,
+        &target.namespace,
+        None,
+        None,
+        false,
+    )?;
+    let producer = build_merge_mor_change_event_expand_plan(
+        planned.physical_plan,
+        target_columns,
+        new_sequence_number,
+        has_matched_update,
+        has_matched_delete,
+        has_not_matched_insert,
+    )?;
+    let mut plan = crate::engine::dml_change_stream::build_dml_change_stream_write_plan(
+        state,
+        target,
+        producer,
+        crate::engine::dml_change_stream::DmlChangeStreamBranchSet::Merge {
+            matched_update: has_matched_update,
+            matched_delete: has_matched_delete,
+            not_matched_insert: has_not_matched_insert,
+        },
+        target_ref,
+    )?;
+    if has_matched_update || has_matched_delete {
+        plan.pre_expand_keyed_assert =
+            Some(crate::engine::dml_change_stream::DmlPreExpandKeyedAssert {
+                // Matched rows use the real target `_row_id`; unmatched rows use
+                // a generated negative row number so fresh-only rows do not
+                // collide under the same NULL key before expansion.
+                key_column_name: "__nr_merge_assert_key".to_string(),
+                key_label: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                message_prefix: "MOR MERGE matched target row".to_string(),
+            });
+    }
+    Ok(plan)
 }
 
 fn execute_merge_match_query(
@@ -2603,6 +3188,8 @@ fn build_merge_match_query_sql(
     target_columns: &[crate::engine::catalog::ColumnDef],
     matched_assignments_sql: &[(&str, &str)],
     insert_values_sql: &[(&str, &str)],
+    matched_action: Option<i32>,
+    has_not_matched_insert: bool,
 ) -> String {
     let quote_ident = |ident: &str| format!("`{}`", ident.replace('`', "``"));
     let qualify = |column: &str| {
@@ -2612,10 +3199,36 @@ fn build_merge_match_query_sql(
             format!("{target_alias}.{}", quote_ident(column))
         }
     };
+    let row_id = qualify("_row_id");
     let nullable_target_column = |column: &str| {
-        let row_id = qualify("_row_id");
         let value = qualify(column);
         format!("CASE WHEN {row_id} IS NOT NULL THEN {value} ELSE NULL END")
+    };
+    let matched_apply_expr = format!(
+        "(CASE WHEN ({}) THEN TRUE ELSE FALSE END)",
+        matched_predicate_sql.unwrap_or("TRUE")
+    );
+    let unmatched_apply_expr = format!(
+        "(CASE WHEN ({}) THEN TRUE ELSE FALSE END)",
+        not_matched_predicate_sql.unwrap_or("TRUE")
+    );
+    let mut action_cases = Vec::new();
+    if let Some(action) = matched_action {
+        action_cases.push(format!(
+            "WHEN {row_id} IS NOT NULL AND ({}) THEN {action}",
+            matched_predicate_sql.unwrap_or("TRUE")
+        ));
+    }
+    if has_not_matched_insert {
+        action_cases.push(format!(
+            "WHEN {row_id} IS NULL AND ({}) THEN {MERGE_ACTION_NOT_MATCHED_INSERT}",
+            not_matched_predicate_sql.unwrap_or("TRUE")
+        ));
+    }
+    let action_expr = if action_cases.is_empty() {
+        "0".to_string()
+    } else {
+        format!("CASE {} ELSE 0 END", action_cases.join(" "))
     };
     let target_select_items = target_columns
         .iter()
@@ -2637,19 +3250,17 @@ fn build_merge_match_query_sql(
             nullable_target_column("_last_updated_sequence_number")
         ),
         format!(
+            "CASE WHEN {row_id} IS NOT NULL THEN {row_id} ELSE -ROW_NUMBER() OVER () END AS __nr_merge_assert_key"
+        ),
+        format!("({action_expr}) AS __nr_merge_action"),
+        format!(
             "(CASE WHEN {} IS NOT NULL THEN 'matched' ELSE 'unmatched' END) AS __nr_match_kind",
-            qualify("_row_id")
+            row_id
         ),
     ];
     select_items.extend(target_select_items);
-    select_items.push(format!(
-        "(CASE WHEN ({}) THEN TRUE ELSE FALSE END) AS __nr_matched_apply",
-        matched_predicate_sql.unwrap_or("TRUE")
-    ));
-    select_items.push(format!(
-        "(CASE WHEN ({}) THEN TRUE ELSE FALSE END) AS __nr_unmatched_apply",
-        not_matched_predicate_sql.unwrap_or("TRUE")
-    ));
+    select_items.push(format!("{matched_apply_expr} AS __nr_matched_apply"));
+    select_items.push(format!("{unmatched_apply_expr} AS __nr_unmatched_apply"));
     for (column, expr) in matched_assignments_sql {
         select_items.push(format!("({expr}) AS __nr_new_{column}"));
     }
@@ -2736,26 +3347,11 @@ fn build_merge_unmatched_insert_query(
     parse_generated_query(&sql, "MERGE unmatched INSERT sink")
 }
 
-/// The matched-DELETE branch of a folded MERGE: a pure deletion-vector write
-/// (no data files). The BE writes a deletion-vector (Puffin) file per data
-/// file from `dv_query`; `DistributedMergeExecutor` runs this branch and folds
-/// its DV result into the shared single-commit collector. The coordinator never
-/// materializes position-delete groups.
-struct MergeMatchedDeleteDistributedWrite {
-    /// SELECT that projects `[_file, _pos, <partition src>]` for the matched
-    /// old rows. The BE writes a deletion-vector (Puffin) file per data file
-    /// through `dv_sink_spec`; the coordinator never materializes positions.
-    dv_query: sqlparser::ast::Query,
-    dv_sink_spec: IcebergWriteSinkSpec,
-}
-
 /// The matched-side write plan of a folded MERGE, by table write mode. `None`
 /// when the statement has no matched clause (or the matched batch is empty).
 enum MergeMatchedBranch {
     None,
     CowUpdate(CowUpdateDistributedWrite),
-    MorUpdate(MorUpdateDistributedWrite),
-    Delete(MergeMatchedDeleteDistributedWrite),
 }
 
 /// All active write branches of one MERGE statement, fed to
@@ -2865,41 +3461,6 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
 
         match branches.matched {
             MergeMatchedBranch::None => {}
-            MergeMatchedBranch::MorUpdate(write) => {
-                let (data, dv) = run_mor_data_and_dv(
-                    &self.state,
-                    &self.target,
-                    &write,
-                    "MERGE MOR UPDATE data sink produced no replacement data files",
-                    "MERGE MOR UPDATE DV sink produced no deletion-vector files",
-                )?;
-                commit_parts.push(data);
-                commit_parts.push(dv);
-            }
-            MergeMatchedBranch::Delete(write) => {
-                // Matched old-row deletion vectors only (no data files).
-                let dv = crate::engine::execute_query_as_iceberg_write(
-                    &self.state,
-                    Some(&self.target.catalog),
-                    &self.target.namespace,
-                    &write.dv_query,
-                    write.dv_sink_spec.clone(),
-                    None,
-                    Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
-                )?;
-                if dv.write_abort.is_none()
-                    && dv
-                        .write_commit
-                        .as_ref()
-                        .is_none_or(|commit| !write_commit_has_files(commit))
-                {
-                    return Err(
-                        "MERGE matched-DELETE DV sink produced no deletion-vector files"
-                            .to_string(),
-                    );
-                }
-                commit_parts.push(dv);
-            }
             MergeMatchedBranch::CowUpdate(write) => {
                 // The per-file rewrite outputs land in the shared collector's
                 // flat `written` channel via the returned `WriteCommitInput`.
@@ -3010,6 +3571,16 @@ mod tests {
         }
     }
 
+    fn non_null_col(name: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        }
+    }
+
     fn iceberg_target() -> crate::engine::backend_resolver::TargetBackend {
         crate::engine::backend_resolver::TargetBackend {
             backend_name: "iceberg",
@@ -3017,6 +3588,218 @@ mod tests {
             namespace: "db1".to_string(),
             table: "t".to_string(),
         }
+    }
+
+    fn optimizer_output_column(
+        name: &str,
+        column_id: u32,
+        data_type: DataType,
+        nullable: bool,
+        is_internal: bool,
+    ) -> crate::sql::analysis::OutputColumn {
+        crate::sql::analysis::OutputColumn {
+            column_id: crate::sql::column_id::ColumnId::new_for_test(column_id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal,
+        }
+    }
+
+    fn update_mor_expand_child_plan_for_test() -> crate::sql::optimizer::OptimizerPhysicalNode {
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
+        use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+        use crate::sql::optimizer::statistics::Statistics;
+
+        let output_columns = vec![
+            optimizer_output_column("__nr_file", 1, DataType::Utf8, false, true),
+            optimizer_output_column("__nr_pos", 2, DataType::Int64, false, true),
+            optimizer_output_column("__nr_row_id", 3, DataType::Int64, false, true),
+            optimizer_output_column("id", 4, DataType::Int64, false, false),
+            optimizer_output_column("qty", 5, DataType::Int64, true, false),
+            optimizer_output_column("__nr_new_qty", 6, DataType::Int64, true, true),
+        ];
+        let mut node = OptimizerPhysicalNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: Vec::new(),
+                columns: output_columns.clone(),
+            }),
+            children: Vec::new(),
+            stats: Statistics {
+                output_row_count: 3.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns,
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        crate::sql::optimizer::physical_tree::attach_scalar_arena(
+            &mut node,
+            Arc::new(crate::sql::optimizer::scalar::ScalarArena::new()),
+        );
+        node
+    }
+
+    fn merge_mor_expand_child_plan_for_test(
+        include_insert_qty: bool,
+    ) -> crate::sql::optimizer::OptimizerPhysicalNode {
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
+        use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+        use crate::sql::optimizer::statistics::Statistics;
+
+        let mut output_columns = vec![
+            optimizer_output_column("__nr_file", 1, DataType::Utf8, true, true),
+            optimizer_output_column("__nr_pos", 2, DataType::Int64, true, true),
+            optimizer_output_column("__nr_row_id", 3, DataType::Int64, true, true),
+            optimizer_output_column("__nr_merge_assert_key", 4, DataType::Int64, false, true),
+            optimizer_output_column("__nr_merge_action", 5, DataType::Int64, false, true),
+            optimizer_output_column("id", 6, DataType::Int64, true, false),
+            optimizer_output_column("qty", 7, DataType::Int64, true, false),
+            optimizer_output_column("__nr_new_qty", 8, DataType::Int64, true, true),
+            optimizer_output_column("__nr_ins_id", 9, DataType::Int64, true, true),
+        ];
+        if include_insert_qty {
+            output_columns.push(optimizer_output_column(
+                "__nr_ins_qty",
+                10,
+                DataType::Int64,
+                true,
+                true,
+            ));
+        }
+
+        let mut node = OptimizerPhysicalNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: Vec::new(),
+                columns: output_columns.clone(),
+            }),
+            children: Vec::new(),
+            stats: Statistics {
+                output_row_count: 5.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns,
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        crate::sql::optimizer::physical_tree::attach_scalar_arena(
+            &mut node,
+            Arc::new(crate::sql::optimizer::scalar::ScalarArena::new()),
+        );
+        node
+    }
+
+    fn output_column_by_name_for_test<'a>(
+        columns: &'a [crate::sql::analysis::OutputColumn],
+        name: &str,
+    ) -> &'a crate::sql::analysis::OutputColumn {
+        columns
+            .iter()
+            .find(|column| column.name == name)
+            .unwrap_or_else(|| panic!("missing output column {name}"))
+    }
+
+    fn assignment_expr_for_output(
+        event: &crate::sql::optimizer::operator::ChangeEventSpec,
+        output_column_id: crate::sql::column_id::ColumnId,
+    ) -> crate::sql::optimizer::scalar::ScalarId {
+        event
+            .assignments
+            .iter()
+            .find(|assignment| assignment.output_column_id == output_column_id)
+            .unwrap_or_else(|| panic!("missing assignment for output {output_column_id:?}"))
+            .expr
+            .expect("assignment expression")
+    }
+
+    fn assert_assignment_is_column_ref(
+        arena: &crate::sql::optimizer::scalar::ScalarArena,
+        expr: crate::sql::optimizer::scalar::ScalarId,
+        expected: u32,
+    ) {
+        assert_eq!(
+            arena.node(expr),
+            &crate::sql::optimizer::scalar::ScalarNode::ColumnRef(
+                crate::sql::column_id::ColumnId::new_for_test(expected)
+            )
+        );
+    }
+
+    fn assert_assignment_is_int_literal(
+        arena: &crate::sql::optimizer::scalar::ScalarArena,
+        expr: crate::sql::optimizer::scalar::ScalarId,
+        expected: i64,
+    ) {
+        assert_eq!(
+            arena.node(expr),
+            &crate::sql::optimizer::scalar::ScalarNode::Literal(
+                crate::sql::optimizer::scalar::HashableLiteral(
+                    crate::sql::analysis::LiteralValue::Int(expected)
+                )
+            )
+        );
+    }
+
+    fn assert_no_assignment_for_output(
+        event: &crate::sql::optimizer::operator::ChangeEventSpec,
+        output_column_id: crate::sql::column_id::ColumnId,
+    ) {
+        assert!(
+            event
+                .assignments
+                .iter()
+                .all(|assignment| assignment.output_column_id != output_column_id),
+            "unexpected assignment for output {output_column_id:?}"
+        );
+    }
+
+    fn assert_event_predicate_matches_action(
+        arena: &crate::sql::optimizer::scalar::ScalarArena,
+        event: &crate::sql::optimizer::operator::ChangeEventSpec,
+        expected_action: i32,
+    ) {
+        use crate::sql::common::BinOp;
+        use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
+
+        let predicate = event.predicate.expect("action predicate");
+        let ScalarNode::BinaryOp { op, left, right } = arena.node(predicate) else {
+            panic!("expected action equality predicate");
+        };
+        assert_eq!(*op, BinOp::Eq);
+
+        let mut saw_action_column = false;
+        let mut saw_action_literal = false;
+        for child in [*left, *right] {
+            match arena.node(child) {
+                ScalarNode::ColumnRef(id)
+                    if *id == crate::sql::column_id::ColumnId::new_for_test(5) =>
+                {
+                    saw_action_column = true;
+                }
+                ScalarNode::Literal(HashableLiteral(crate::sql::analysis::LiteralValue::Int(
+                    value,
+                ))) if *value == i64::from(expected_action) => {
+                    saw_action_literal = true;
+                }
+                other => panic!("unexpected action predicate child: {other:?}"),
+            }
+        }
+        assert!(saw_action_column, "predicate must read __nr_merge_action");
+        assert!(saw_action_literal, "predicate must compare expected action");
+    }
+
+    fn branch_kinds_for_test(
+        expand: &crate::sql::optimizer::operator::ChangeEventExpandOp,
+    ) -> Vec<crate::sql::common::change_stream::ChangeStreamBranchKind> {
+        expand
+            .events
+            .iter()
+            .map(|event| event.branch_kind)
+            .collect()
     }
 
     #[test]
@@ -3060,6 +3843,423 @@ mod tests {
     }
 
     #[test]
+    fn update_mor_change_event_expand_plan_has_expected_shape() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::Operator;
+        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+        use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
+
+        let target_columns = vec![non_null_col("id"), col("qty")];
+        let plan = build_update_mor_change_event_expand_plan(
+            update_mor_expand_child_plan_for_test(),
+            &target_columns,
+            77,
+        )
+        .expect("MOR UPDATE expand plan");
+        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
+            panic!("expected PhysicalChangeEventExpand");
+        };
+        assert_eq!(plan.children.len(), 1);
+        let Operator::PhysicalDistribution(distribution) = &plan.children[0].op else {
+            panic!("expected pre-expand PhysicalDistribution");
+        };
+        assert_eq!(
+            distribution.spec,
+            DistributionSpec::HashPartitioned {
+                cols: vec![crate::sql::column_id::ColumnId::new_for_test(3)],
+                source: HashSource::ShuffleAgg,
+            }
+        );
+
+        assert_eq!(expand.events.len(), 2);
+        assert_eq!(
+            expand.events[0].branch_kind,
+            ChangeStreamBranchKind::DeleteDv
+        );
+        assert_eq!(
+            expand.events[1].branch_kind,
+            ChangeStreamBranchKind::ReuseData
+        );
+
+        let file = output_column_by_name_for_test(&expand.output_columns, "_file");
+        let pos = output_column_by_name_for_test(&expand.output_columns, "_pos");
+        let id = output_column_by_name_for_test(&expand.output_columns, "id");
+        let qty = output_column_by_name_for_test(&expand.output_columns, "qty");
+        let row_id = output_column_by_name_for_test(&expand.output_columns, "_row_id");
+        let seq =
+            output_column_by_name_for_test(&expand.output_columns, "_last_updated_sequence_number");
+        let change_op = output_column_by_name_for_test(&expand.output_columns, "__change_op");
+        let route = output_column_by_name_for_test(&expand.output_columns, "__change_data_route");
+        assert!(file.is_internal);
+        assert!(pos.is_internal);
+        assert!(!id.is_internal);
+        assert!(!qty.is_internal);
+        assert!(row_id.is_internal);
+        assert!(seq.is_internal);
+        assert!(change_op.is_internal);
+        assert!(route.is_internal);
+        assert_eq!(expand.change_op_column_id, change_op.column_id);
+        assert_eq!(expand.data_route_column_id, Some(route.column_id));
+        assert_eq!(plan.output_columns.len(), expand.output_columns.len());
+        assert!(
+            plan.output_columns
+                .iter()
+                .zip(&expand.output_columns)
+                .all(|(left, right)| left.column_id == right.column_id
+                    && left.name == right.name
+                    && left.is_internal == right.is_internal)
+        );
+
+        let arena = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("scalar arena");
+        let delete = &expand.events[0];
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(delete, file.column_id),
+            1,
+        );
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(delete, pos.column_id),
+            2,
+        );
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(delete, id.column_id), 4);
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(delete, qty.column_id),
+            5,
+        );
+
+        let reuse = &expand.events[1];
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(reuse, id.column_id), 4);
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(reuse, qty.column_id), 6);
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(reuse, row_id.column_id),
+            3,
+        );
+        let seq_expr = assignment_expr_for_output(reuse, seq.column_id);
+        assert_eq!(
+            arena.node(seq_expr),
+            &ScalarNode::Literal(HashableLiteral(crate::sql::analysis::LiteralValue::Int(77)))
+        );
+    }
+
+    #[test]
+    fn merge_mor_change_event_expand_matched_update_shape() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::Operator;
+        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+
+        let target_columns = vec![non_null_col("id"), col("qty")];
+        let plan = build_merge_mor_change_event_expand_plan(
+            merge_mor_expand_child_plan_for_test(true),
+            &target_columns,
+            101,
+            true,
+            false,
+            false,
+        )
+        .expect("MOR MERGE matched UPDATE expand plan");
+        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
+            panic!("expected PhysicalChangeEventExpand");
+        };
+        let Operator::PhysicalDistribution(distribution) = &plan.children[0].op else {
+            panic!("expected pre-expand PhysicalDistribution");
+        };
+        assert_eq!(
+            distribution.spec,
+            DistributionSpec::HashPartitioned {
+                cols: vec![crate::sql::column_id::ColumnId::new_for_test(4)],
+                source: HashSource::ShuffleAgg,
+            }
+        );
+
+        assert_eq!(expand.events.len(), 2);
+        assert_eq!(
+            branch_kinds_for_test(expand),
+            vec![
+                ChangeStreamBranchKind::DeleteDv,
+                ChangeStreamBranchKind::ReuseData,
+            ]
+        );
+
+        let file = output_column_by_name_for_test(&expand.output_columns, "_file");
+        let pos = output_column_by_name_for_test(&expand.output_columns, "_pos");
+        let id = output_column_by_name_for_test(&expand.output_columns, "id");
+        let qty = output_column_by_name_for_test(&expand.output_columns, "qty");
+        let row_id = output_column_by_name_for_test(&expand.output_columns, "_row_id");
+        let seq =
+            output_column_by_name_for_test(&expand.output_columns, "_last_updated_sequence_number");
+        let change_op = output_column_by_name_for_test(&expand.output_columns, "__change_op");
+        let route = output_column_by_name_for_test(&expand.output_columns, "__change_data_route");
+        assert!(file.is_internal);
+        assert!(pos.is_internal);
+        assert!(!id.is_internal);
+        assert!(!qty.is_internal);
+        assert!(row_id.is_internal);
+        assert!(seq.is_internal);
+        assert!(change_op.is_internal);
+        assert!(route.is_internal);
+        assert_eq!(expand.change_op_column_id, change_op.column_id);
+        assert_eq!(expand.data_route_column_id, Some(route.column_id));
+
+        let arena = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("scalar arena");
+        let delete = &expand.events[0];
+        assert_event_predicate_matches_action(arena, delete, MERGE_ACTION_MATCHED_UPDATE);
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(delete, file.column_id),
+            1,
+        );
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(delete, pos.column_id),
+            2,
+        );
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(delete, id.column_id), 6);
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(delete, qty.column_id),
+            7,
+        );
+
+        let reuse = &expand.events[1];
+        assert_event_predicate_matches_action(arena, reuse, MERGE_ACTION_MATCHED_UPDATE);
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(reuse, id.column_id), 6);
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(reuse, qty.column_id), 8);
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(reuse, row_id.column_id),
+            3,
+        );
+        assert_assignment_is_int_literal(
+            arena,
+            assignment_expr_for_output(reuse, seq.column_id),
+            101,
+        );
+    }
+
+    #[test]
+    fn merge_mor_change_event_expand_matched_delete_shape() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::Operator;
+
+        let target_columns = vec![non_null_col("id"), col("qty")];
+        let plan = build_merge_mor_change_event_expand_plan(
+            merge_mor_expand_child_plan_for_test(true),
+            &target_columns,
+            101,
+            false,
+            true,
+            false,
+        )
+        .expect("MOR MERGE matched DELETE expand plan");
+        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
+            panic!("expected PhysicalChangeEventExpand");
+        };
+        assert_eq!(
+            branch_kinds_for_test(expand),
+            vec![ChangeStreamBranchKind::DeleteDv]
+        );
+
+        let arena = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("scalar arena");
+        let delete = &expand.events[0];
+        assert_event_predicate_matches_action(arena, delete, MERGE_ACTION_MATCHED_DELETE);
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(
+                delete,
+                output_column_by_name_for_test(&expand.output_columns, "_file").column_id,
+            ),
+            1,
+        );
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(
+                delete,
+                output_column_by_name_for_test(&expand.output_columns, "_pos").column_id,
+            ),
+            2,
+        );
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(
+                delete,
+                output_column_by_name_for_test(&expand.output_columns, "id").column_id,
+            ),
+            6,
+        );
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(
+                delete,
+                output_column_by_name_for_test(&expand.output_columns, "qty").column_id,
+            ),
+            7,
+        );
+    }
+
+    #[test]
+    fn merge_mor_change_event_expand_fresh_only_omitted_insert_column_outputs_null() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::Operator;
+
+        let target_columns = vec![non_null_col("id"), col("qty")];
+        let plan = build_merge_mor_change_event_expand_plan(
+            merge_mor_expand_child_plan_for_test(false),
+            &target_columns,
+            101,
+            false,
+            false,
+            true,
+        )
+        .expect("MOR MERGE fresh-only expand plan");
+        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
+            panic!("expected PhysicalChangeEventExpand");
+        };
+        assert_eq!(
+            branch_kinds_for_test(expand),
+            vec![ChangeStreamBranchKind::FreshData]
+        );
+
+        let arena = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("scalar arena");
+        let fresh = &expand.events[0];
+        assert_event_predicate_matches_action(arena, fresh, MERGE_ACTION_NOT_MATCHED_INSERT);
+        let id = output_column_by_name_for_test(&expand.output_columns, "id");
+        let qty = output_column_by_name_for_test(&expand.output_columns, "qty");
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(fresh, id.column_id), 9);
+        // Omitted INSERT target columns intentionally have no event assignment;
+        // ChangeEventExpand fills unassigned output slots with NULL.
+        assert_no_assignment_for_output(fresh, qty.column_id);
+    }
+
+    #[test]
+    fn merge_mor_change_event_expand_mixed_update_and_insert_shape() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::Operator;
+
+        let target_columns = vec![non_null_col("id"), col("qty")];
+        let plan = build_merge_mor_change_event_expand_plan(
+            merge_mor_expand_child_plan_for_test(true),
+            &target_columns,
+            101,
+            true,
+            false,
+            true,
+        )
+        .expect("MOR MERGE update+insert expand plan");
+        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
+            panic!("expected PhysicalChangeEventExpand");
+        };
+        assert_eq!(
+            branch_kinds_for_test(expand),
+            vec![
+                ChangeStreamBranchKind::DeleteDv,
+                ChangeStreamBranchKind::ReuseData,
+                ChangeStreamBranchKind::FreshData,
+            ]
+        );
+
+        let arena = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("scalar arena");
+        assert_event_predicate_matches_action(
+            arena,
+            &expand.events[0],
+            MERGE_ACTION_MATCHED_UPDATE,
+        );
+        assert_event_predicate_matches_action(
+            arena,
+            &expand.events[1],
+            MERGE_ACTION_MATCHED_UPDATE,
+        );
+        assert_event_predicate_matches_action(
+            arena,
+            &expand.events[2],
+            MERGE_ACTION_NOT_MATCHED_INSERT,
+        );
+
+        let fresh = &expand.events[2];
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(
+                fresh,
+                output_column_by_name_for_test(&expand.output_columns, "id").column_id,
+            ),
+            9,
+        );
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(
+                fresh,
+                output_column_by_name_for_test(&expand.output_columns, "qty").column_id,
+            ),
+            10,
+        );
+    }
+
+    #[test]
+    fn merge_mor_change_event_expand_mixed_delete_and_insert_shape() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::Operator;
+
+        let target_columns = vec![non_null_col("id"), col("qty")];
+        let plan = build_merge_mor_change_event_expand_plan(
+            merge_mor_expand_child_plan_for_test(true),
+            &target_columns,
+            101,
+            false,
+            true,
+            true,
+        )
+        .expect("MOR MERGE delete+insert expand plan");
+        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
+            panic!("expected PhysicalChangeEventExpand");
+        };
+        assert_eq!(
+            branch_kinds_for_test(expand),
+            vec![
+                ChangeStreamBranchKind::DeleteDv,
+                ChangeStreamBranchKind::FreshData,
+            ]
+        );
+
+        let arena = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("scalar arena");
+        assert_event_predicate_matches_action(
+            arena,
+            &expand.events[0],
+            MERGE_ACTION_MATCHED_DELETE,
+        );
+        assert_event_predicate_matches_action(
+            arena,
+            &expand.events[1],
+            MERGE_ACTION_NOT_MATCHED_INSERT,
+        );
+    }
+
+    #[test]
     fn mor_update_uses_be_dv_sink_not_coordinator_inject() {
         let source = include_str!("mutation_flow.rs");
 
@@ -3070,7 +4270,7 @@ mod tests {
             .split("fn execute_mor_update")
             .nth(1)
             .expect("execute_mor_update fn")
-            .split("\nstruct MorUpdateDistributedWrite")
+            .split("\nstruct MorUpdateChangeStreamExecutor")
             .next()
             .expect("execute_mor_update body");
         assert!(
@@ -3086,12 +4286,12 @@ mod tests {
         // RowDeltaDvFromFiles and must not fall back to the coordinator-built
         // RowDeltaDv path. The trailing space avoids matching RowDeltaDvFromFiles.
         let transaction = source
-            .split("fn run_mor_update_distributed_transaction")
+            .split("fn run_mor_update_change_stream_transaction")
             .nth(1)
-            .expect("run_mor_update_distributed_transaction fn")
+            .expect("run_mor_update_change_stream_transaction fn")
             .split("\nfn no_mutation_write_result")
             .next()
-            .expect("run_mor_update_distributed_transaction body");
+            .expect("run_mor_update_change_stream_transaction body");
         assert!(
             transaction.contains("RowDeltaDvFromFiles"),
             "MOR-update transaction must commit BE-written Puffin DV files via RowDeltaDvFromFiles"
@@ -3107,135 +4307,223 @@ mod tests {
     }
 
     #[test]
-    fn mor_update_data_and_dv_paths_share_helper_and_return_merge_errors() {
-        let source = include_str!("mutation_flow.rs");
-        let production_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source");
-        assert!(
-            production_source.contains("fn run_mor_data_and_dv"),
-            "MOR UPDATE data+DV writes must be routed through a shared helper"
-        );
-
-        let merge_write_commits = production_source
-            .split("fn merge_write_commits")
-            .nth(1)
-            .expect("merge_write_commits fn")
-            .split("\n/// N-ary generalization")
-            .next()
-            .expect("merge_write_commits body");
-        assert!(
-            !merge_write_commits.contains("unreachable!("),
-            "merge_write_commits must return merge_all_write_commits errors instead of panicking"
-        );
-
-        let mor_executor = production_source
-            .split("impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor")
-            .nth(1)
-            .expect("DistributedMorUpdateExecutor impl")
-            .split("\n    fn commit(")
-            .next()
-            .expect("DistributedMorUpdateExecutor run_coordinated_write");
-        assert!(
-            mor_executor.contains("run_mor_data_and_dv"),
-            "standalone MOR UPDATE must use the shared data+DV helper"
-        );
-
-        let merge_mor_arm = production_source
-            .split("MergeMatchedBranch::MorUpdate(write) =>")
-            .nth(1)
-            .expect("MERGE MOR UPDATE arm")
-            .split("MergeMatchedBranch::Delete(write) =>")
-            .next()
-            .expect("MERGE MOR UPDATE arm body");
-        assert!(
-            merge_mor_arm.contains("run_mor_data_and_dv"),
-            "MERGE MOR UPDATE must use the shared data+DV helper"
-        );
-    }
-
-    #[test]
-    fn merge_matched_delete_writes_dv_on_be_not_coordinator() {
-        let src = include_str!("mutation_flow.rs");
-
-        // The folded MERGE matched-DELETE branch (built in `execute_merge_statement`'s
-        // matched-branch dispatch) must configure a BE `DeletionVectors` sink and
-        // must NOT materialize or inject coordinator-local position-delete groups.
-        // Slice the `MergeMatchedAction::Delete` arm up to its terminal
-        // `MergeMatchedBranch::Delete(..)` expression.
-        let branch = src
-            .split("MergeMatchedAction::Delete =>")
-            .nth(1)
-            .expect("matched-DELETE branch arm")
-            .split("MergeMatchedBranch::Delete(MergeMatchedDeleteDistributedWrite")
-            .next()
-            .expect("matched-DELETE branch body");
-        assert!(
-            !branch.contains("build_position_delete_groups_from_matched"),
-            "matched-DELETE must not materialize position groups on the coordinator"
-        );
-        assert!(
-            !branch.contains("inject_delete_group"),
-            "matched-DELETE must not inject coordinator delete groups (FE central write)"
-        );
-        assert!(
-            branch.contains("IcebergWriteSinkMode::DeletionVectors"),
-            "matched-DELETE must write its DV via the BE DeletionVectors sink"
-        );
-
-        // The fold's executor runs that branch on the BE via
-        // `execute_query_as_iceberg_write` (no coordinator-side delete injection).
-        let exec_arm = src
-            .split("MergeMatchedBranch::Delete(write) => {")
-            .nth(1)
-            .expect("fold matched-DELETE executor arm")
-            .split("\n            MergeMatchedBranch::CowUpdate(write) => {")
-            .next()
-            .expect("fold matched-DELETE executor body");
-        assert!(
-            exec_arm.contains("execute_query_as_iceberg_write"),
-            "fold matched-DELETE branch must write its DV on the BE"
-        );
-        assert!(
-            !exec_arm.contains("inject_delete_group"),
-            "fold matched-DELETE branch must not inject coordinator delete groups"
-        );
-    }
-
-    #[test]
-    fn mor_update_and_merge_reuse_position_delete_descriptor_builder() {
+    fn mor_update_no_longer_uses_data_and_dv_query_pair() {
         let source = include_str!("mutation_flow.rs");
         let update_section = source
-            .split("fn build_update_mor_distributed_write")
+            .split("pub(crate) fn execute_update_statement")
             .nth(1)
-            .expect("UPDATE MOR builder")
-            .split("fn build_merge_mor_distributed_write")
+            .expect("execute_update_statement")
+            .split("// ---------------------------------------------------------------------------\n// MERGE INTO")
             .next()
             .expect("UPDATE section");
         assert!(
-            update_section.contains("build_position_delete_sink_spec"),
-            "UPDATE MOR delete side must reuse descriptor builder"
+            !update_section.contains("MorUpdateDistributedWrite"),
+            "MOR UPDATE must use ChangeEventExpand + W10 DAG, not MorUpdateDistributedWrite"
         );
         assert!(
-            update_section.contains("IcebergWriteSinkMode::DeletionVectors"),
-            "UPDATE MOR delete side must still select DV sink mode"
+            !update_section.contains("run_mor_data_and_dv"),
+            "MOR UPDATE must not execute data and DV writes separately"
+        );
+    }
+
+    #[test]
+    fn mor_update_change_stream_routes_commit_plan() {
+        let source = include_str!("mutation_flow.rs");
+        let production_source = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source");
+        let mor_executor = production_source
+            .split("impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor")
+            .nth(1)
+            .expect("MorUpdateChangeStreamExecutor impl")
+            .split("\n    fn commit(")
+            .next()
+            .expect("MorUpdateChangeStreamExecutor run_coordinated_write");
+        assert!(
+            mor_executor.contains("plan_dml_change_stream_write"),
+            "MOR UPDATE must build the W10 change-stream write DAG through the shared DML path"
+        );
+        assert!(
+            !mor_executor.contains("build_physical_plan_as_iceberg_change_stream_write"),
+            "MOR UPDATE must not bypass the shared DML change-stream planning path"
+        );
+        let commit = production_source
+            .split("impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor")
+            .nth(1)
+            .expect("MorUpdateChangeStreamExecutor impl")
+            .split("\n    fn finalize")
+            .next()
+            .expect("MorUpdateChangeStreamExecutor commit");
+        assert!(
+            commit.contains("commit_change_stream_write_input"),
+            "MOR UPDATE must route writer reports through ChangeStreamWriterCommitPlan at commit"
+        );
+    }
+
+    #[test]
+    fn mor_merge_no_longer_uses_branch_specific_write_queries() {
+        let source = include_str!("mutation_flow.rs");
+        let merge_section = source
+            .split("// ---------------------------------------------------------------------------\n// MERGE INTO")
+            .nth(1)
+            .expect("MERGE section");
+        let data_query_helper = ["build_merge_mor", "data_sink_query_from_matched"].join("_");
+        let dv_query_helper = ["build_merge_mor", "dv_sink_query_from_matched"].join("_");
+        let dual_write_runner = ["run_merge_matched_update", "data_and_dv"].join("_");
+        assert!(
+            !merge_section.contains(&data_query_helper),
+            "MERGE matched UPDATE must not build a VALUES data sink query"
+        );
+        assert!(
+            !merge_section.contains(&dv_query_helper),
+            "MERGE matched UPDATE/DELETE must not build a separate DV sink query"
+        );
+        assert!(
+            !merge_section.contains(&dual_write_runner),
+            "MERGE must not run MOR data and DV sinks separately"
+        );
+    }
+
+    #[test]
+    fn mor_merge_uses_change_stream_expand_and_dml_dag() {
+        let source = include_str!("mutation_flow.rs");
+        let merge_builder = source
+            .split("fn build_merge_mor_change_stream_write_plan")
+            .nth(1)
+            .expect("MERGE MOR change-stream builder")
+            .split("fn execute_merge_match_query")
+            .next()
+            .expect("MERGE MOR builder body");
+        assert!(
+            merge_builder.contains("build_merge_match_query_sql"),
+            "MOR MERGE must build one producer relation"
+        );
+        assert!(
+            merge_builder.contains("DmlChangeStreamBranchSet::Merge"),
+            "MOR MERGE must use the DML change-stream Merge branch set"
+        );
+        assert!(
+            merge_builder.contains("pre_expand_keyed_assert"),
+            "MOR MERGE matched branches must request keyed AssertNumRows before ChangeEventExpand"
         );
 
-        let merge_section = source
-            .split("fn build_merge_mor_distributed_write")
+        let expand = source
+            .split("fn build_merge_mor_change_event_expand_plan")
             .nth(1)
-            .expect("MERGE MOR builder")
-            .split("#[allow(clippy::too_many_arguments)]")
+            .expect("MERGE MOR ChangeEventExpand builder")
+            .split("fn output_column_by_name")
             .next()
-            .expect("MERGE section");
+            .expect("MERGE MOR expand body");
         assert!(
-            merge_section.contains("build_position_delete_sink_spec"),
-            "MERGE matched UPDATE delete side must reuse descriptor builder"
+            expand.contains("PhysicalDistribution"),
+            "MOR MERGE must hash exchange before ChangeEventExpand"
         );
         assert!(
-            merge_section.contains("build_merge_mor_dv_sink_query_from_matched"),
-            "MERGE matched UPDATE must build query from descriptor-backed sink columns"
+            expand.contains("PhysicalChangeEventExpand"),
+            "MOR MERGE must insert ChangeEventExpand"
+        );
+        assert!(
+            expand.contains("MERGE_ACTION_MATCHED_UPDATE"),
+            "MOR MERGE matched UPDATE events must be action-predicated"
+        );
+        assert!(
+            expand.contains("MERGE_ACTION_MATCHED_DELETE"),
+            "MOR MERGE matched DELETE events must be action-predicated"
+        );
+        assert!(
+            expand.contains("MERGE_ACTION_NOT_MATCHED_INSERT"),
+            "MOR MERGE not-matched INSERT events must be action-predicated"
+        );
+    }
+
+    #[test]
+    fn mor_update_uses_change_stream_expand_and_dml_dag() {
+        let source = include_str!("mutation_flow.rs");
+        let update_section = source
+            .split("fn build_update_mor_change_stream_write_plan")
+            .nth(1)
+            .expect("UPDATE MOR change-stream builder")
+            .split("fn build_merge_mor_change_event_expand_plan")
+            .next()
+            .expect("UPDATE section");
+        assert!(
+            update_section.contains("build_update_match_query_sql"),
+            "UPDATE MOR must build one matched/source producer relation"
+        );
+        assert!(
+            update_section.contains("DmlChangeStreamBranchSet::UpdateMor"),
+            "UPDATE MOR must use the DML change-stream UpdateMor branch set"
+        );
+        assert!(
+            update_section.contains("pre_expand_keyed_assert"),
+            "UPDATE MOR must request keyed AssertNumRows before ChangeEventExpand"
+        );
+
+        let expand_section = source
+            .split("fn build_update_mor_change_event_expand_plan")
+            .nth(1)
+            .expect("UPDATE MOR ChangeEventExpand builder")
+            .split("fn output_column_by_name")
+            .next()
+            .expect("ChangeEventExpand section");
+        assert!(
+            expand_section.contains("PhysicalDistribution"),
+            "UPDATE MOR must hash exchange by row id before ChangeEventExpand"
+        );
+        assert!(
+            expand_section.contains("PhysicalChangeEventExpand"),
+            "UPDATE MOR must insert ChangeEventExpand"
+        );
+        assert!(
+            expand_section.contains("ChangeStreamBranchKind::DeleteDv"),
+            "UPDATE MOR expand must emit DeleteDv events"
+        );
+        assert!(
+            expand_section.contains("ChangeStreamBranchKind::ReuseData"),
+            "UPDATE MOR expand must emit ReuseData events"
+        );
+    }
+
+    #[test]
+    fn mor_update_change_stream_uses_keyed_assert_not_host_duplicate_validation() {
+        let source = include_str!("mutation_flow.rs");
+        let update_builder = source
+            .split("fn build_update_mor_change_stream_write_plan")
+            .nth(1)
+            .expect("UPDATE MOR change-stream builder")
+            .split("fn update_assignment_projection_sql")
+            .next()
+            .expect("UPDATE MOR change-stream builder body");
+
+        assert!(
+            update_builder.contains("pre_expand_keyed_assert"),
+            "MOR UPDATE must request keyed AssertNumRows before ChangeEventExpand"
+        );
+        assert!(
+            !update_builder.contains("validate_unique_target_row_ids"),
+            "MOR UPDATE change-stream path must not fail through host-side duplicate validation"
+        );
+    }
+
+    #[test]
+    fn mor_merge_change_stream_uses_keyed_assert_not_host_duplicate_validation() {
+        let source = include_str!("mutation_flow.rs");
+        let merge_builder = source
+            .split("fn build_merge_mor_change_stream_write_plan")
+            .nth(1)
+            .expect("MERGE MOR change-stream builder")
+            .split("fn execute_merge_match_query")
+            .next()
+            .expect("MERGE MOR builder body");
+
+        assert!(
+            merge_builder.contains("pre_expand_keyed_assert"),
+            "MOR MERGE matched branches must request keyed AssertNumRows before ChangeEventExpand"
+        );
+        assert!(
+            !merge_builder.contains("validate_unique_target_row_ids"),
+            "MOR MERGE change-stream path must not fail through host-side duplicate validation"
         );
     }
 
@@ -3433,7 +4721,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_row_ids_are_rejected() {
+    fn cow_host_duplicate_row_ids_are_rejected_before_rewrite() {
         let err = validate_unique_target_row_ids(&[7, 8, 7]).expect_err("duplicate");
         assert!(err.contains("_row_id=7"), "{err}");
     }
@@ -3453,58 +4741,64 @@ mod tests {
     }
 
     #[test]
-    fn update_mor_data_sink_query_projects_row_lineage_columns() {
-        let query = build_update_mor_data_sink_query(
-            &iceberg_target(),
-            "t",
-            Some("staging.s AS s"),
-            &[("v", "s.v")],
-            Some("t.id = s.id"),
-            &[col("id"), col("v")],
-            "main",
-            42,
-        )
-        .expect("query");
-        let sql = query.to_string();
-        assert!(sql.contains("_row_id"), "{sql}");
-        assert!(sql.contains("_last_updated_sequence_number"), "{sql}");
-        assert!(sql.contains("42"), "{sql}");
-        assert!(sql.contains("ORDER BY"), "{sql}");
+    fn update_change_stream_target_sql_pins_branch_read_snapshot() {
+        let sql = update_change_stream_target_sql(&iceberg_target(), "t", "dev");
+        assert!(sql.contains("FOR VERSION AS OF 'dev'"), "{sql}");
+        assert!(sql.ends_with(" AS t"), "{sql}");
     }
 
     #[test]
-    fn merge_mor_data_sink_query_uses_materialized_matched_rows() {
-        let schema = Arc::new(Schema::new(vec![
-            arrow::datatypes::Field::new("id", DataType::Int64, true),
-            arrow::datatypes::Field::new("v", DataType::Int64, true),
-        ]));
-        let new_rows = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(arrow::array::Int64Array::from(vec![2])) as ArrayRef,
-                Arc::new(arrow::array::Int64Array::from(vec![22])) as ArrayRef,
+    fn update_assignment_projection_casts_to_target_type() {
+        let assignments = vec![crate::sql::parser::ast::UpdateAssignment {
+            column: "v".to_string(),
+            value: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("src_v")),
+        }];
+        let projected = update_assignment_projection_sql(
+            &assignments,
+            &[
+                typed_col("id", DataType::Int64),
+                typed_col("v", DataType::Int32),
             ],
         )
-        .expect("new rows");
-        let old_rows = RecordBatch::new_empty(schema);
-        let matched = MatchedUpdateBatch {
-            row_ids: vec![7],
-            file_paths: vec!["file.parquet".to_string()],
-            row_positions: vec![3],
-            old_rows,
-            new_rows,
-        };
+        .expect("assignment projection");
 
-        let query =
-            build_merge_mor_data_sink_query_from_matched(&matched, &[col("id"), col("v")], 42)
-                .expect("query");
-        let sql = query.to_string();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].0, "v");
+        assert!(
+            projected[0].1.contains("CAST((src_v) AS INT)"),
+            "{:?}",
+            projected
+        );
+    }
 
-        assert!(sql.contains("VALUES"), "{sql}");
-        assert!(sql.contains("AS `_row_id`"), "{sql}");
-        assert!(sql.contains("_last_updated_sequence_number"), "{sql}");
-        assert!(!sql.contains("JOIN"), "{sql}");
-        assert!(!sql.contains("ice.db1.t"), "{sql}");
+    #[test]
+    fn update_change_stream_match_query_uses_casted_assignment_projection() {
+        let assignments = vec![crate::sql::parser::ast::UpdateAssignment {
+            column: "v".to_string(),
+            value: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("src_v")),
+        }];
+        let projected = update_assignment_projection_sql(
+            &assignments,
+            &[
+                typed_col("id", DataType::Int64),
+                typed_col("v", DataType::Int32),
+            ],
+        )
+        .expect("assignment projection");
+        let projected_refs = projected
+            .iter()
+            .map(|(column, expr)| (column.as_str(), expr.as_str()))
+            .collect::<Vec<_>>();
+        let target_sql = update_change_stream_target_sql(&iceberg_target(), "t", "main");
+        let sql = build_update_match_query_sql(
+            &target_sql,
+            "t",
+            Some("staging.s AS s"),
+            &projected_refs,
+            Some("t.id = s.id"),
+        );
+        assert!(sql.contains("CAST((src_v) AS INT) AS __nr_new_v"), "{sql}");
+        assert!(sql.contains("t._row_id AS __nr_row_id"), "{sql}");
     }
 
     fn typed_col(name: &str, data_type: DataType) -> ColumnDef {
@@ -3515,134 +4809,6 @@ mod tests {
             write_default: None,
             logical_type: None,
         }
-    }
-
-    fn dv_sink_columns() -> Vec<ColumnDef> {
-        vec![
-            typed_col(
-                crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_FILE_COLUMN,
-                DataType::Utf8,
-            ),
-            typed_col(
-                crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_POS_COLUMN,
-                DataType::Int64,
-            ),
-            typed_col("id", DataType::Int64),
-        ]
-    }
-
-    #[test]
-    fn update_dv_sink_query_projects_file_pos_and_partition_sources() {
-        let query = build_update_dv_sink_query(
-            &iceberg_target(),
-            "t",
-            Some("staging.s AS s"),
-            Some("t.id = s.id"),
-            "main",
-            &dv_sink_columns(),
-        )
-        .expect("query");
-        let sql = query.to_string();
-
-        // Projects the position-delete identity + partition source columns,
-        // all qualified by the target alias, with the same CROSS JOIN / WHERE
-        // tail as the data sink query and ordered by `_file` for the per-file
-        // DV shuffle.
-        assert!(sql.contains("`t`.`_file` AS `_file`"), "{sql}");
-        assert!(sql.contains("`t`.`_pos` AS `_pos`"), "{sql}");
-        assert!(sql.contains("`t`.`id` AS `id`"), "{sql}");
-        assert!(
-            sql.find("`t`.`_file` AS `_file`").unwrap() < sql.find("`t`.`_pos` AS `_pos`").unwrap(),
-            "{sql}"
-        );
-        assert!(
-            sql.find("`t`.`_pos` AS `_pos`").unwrap() < sql.find("`t`.`id` AS `id`").unwrap(),
-            "{sql}"
-        );
-        assert!(sql.contains("CROSS JOIN staging.s AS s"), "{sql}");
-        assert!(sql.contains("WHERE t.id = s.id"), "{sql}");
-        assert!(sql.contains("ORDER BY `t`.`_file`"), "{sql}");
-        assert!(!sql.contains("FOR VERSION AS OF"), "{sql}");
-    }
-
-    #[test]
-    fn update_dv_sink_query_pins_branch_read_snapshot() {
-        let query = build_update_dv_sink_query(
-            &iceberg_target(),
-            "t",
-            None,
-            Some("t.id = 1"),
-            "dev",
-            &dv_sink_columns(),
-        )
-        .expect("query");
-        let sql = query.to_string();
-        assert!(
-            sql.contains("FOR SYSTEM_TIME AS OF '__nr_ref:dev'"),
-            "{sql}"
-        );
-    }
-
-    #[test]
-    fn merge_mor_dv_sink_query_uses_materialized_matched_identities() {
-        let schema = Arc::new(Schema::new(vec![
-            arrow::datatypes::Field::new("id", DataType::Int64, true),
-            arrow::datatypes::Field::new("v", DataType::Int64, true),
-        ]));
-        // Distinctive partition value (42) so we can assert it flows from
-        // old_rows into the generated VALUES rather than from any other field
-        // (row_ids=7, row_positions=3, file path). `v` is not a partition
-        // source column so its value (55) must not leak into the projection.
-        let old_rows = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(arrow::array::Int64Array::from(vec![42])) as ArrayRef,
-                Arc::new(arrow::array::Int64Array::from(vec![55])) as ArrayRef,
-            ],
-        )
-        .expect("old rows");
-        let new_rows = RecordBatch::new_empty(schema);
-        let matched = MatchedUpdateBatch {
-            row_ids: vec![7],
-            file_paths: vec!["file.parquet".to_string()],
-            row_positions: vec![3],
-            old_rows,
-            new_rows,
-        };
-
-        let query = build_merge_mor_dv_sink_query_from_matched(&matched, &dv_sink_columns())
-            .expect("query");
-        let sql = query.to_string();
-
-        // VALUES-based DV side: identities come from the matched batch (no
-        // target scan / join), partition source `id` read from old_rows.
-        assert!(sql.contains("VALUES"), "{sql}");
-        assert!(sql.contains("'file.parquet'"), "{sql}");
-        assert!(sql.contains("AS `_file`"), "{sql}");
-        assert!(sql.contains("AS `_pos`"), "{sql}");
-        assert!(sql.contains("AS `id`"), "{sql}");
-        assert!(
-            sql.find("AS `_file`").unwrap() < sql.find("AS `_pos`").unwrap(),
-            "{sql}"
-        );
-        assert!(
-            sql.find("AS `_pos`").unwrap() < sql.find("AS `id`").unwrap(),
-            "{sql}"
-        );
-        // The partition value must come from old_rows: the distinctive literal
-        // 42 appears in the VALUES, while the non-partition `v` value 55 does
-        // not leak into the generated SQL.
-        assert!(
-            sql.contains("42"),
-            "partition value must come from old_rows: {sql}"
-        );
-        assert!(
-            !sql.contains("55"),
-            "non-partition column value must not leak: {sql}"
-        );
-        assert!(sql.contains("ORDER BY"), "{sql}");
-        assert!(!sql.contains("JOIN"), "{sql}");
-        assert!(!sql.contains("ice.db1.t"), "{sql}");
     }
 
     #[test]
@@ -3657,6 +4823,8 @@ mod tests {
             &[col("id"), col("v")],
             &[("v", "s.v")],
             &[("id", "s.id"), ("v", "s.v")],
+            Some(MERGE_ACTION_MATCHED_UPDATE),
+            true,
         );
 
         assert!(!sql.contains("t.*"), "{sql}");
@@ -3666,6 +4834,8 @@ mod tests {
         );
         assert!(sql.contains("(s.v) AS __nr_new_v"), "{sql}");
         assert!(sql.contains("(s.id) AS __nr_ins_id"), "{sql}");
+        assert!(sql.contains("AS __nr_merge_action"), "{sql}");
+        assert!(sql.contains("AS __nr_merge_assert_key"), "{sql}");
     }
 
     #[test]

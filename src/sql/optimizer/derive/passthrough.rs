@@ -56,7 +56,8 @@ pub(crate) fn passthrough_required_full(
 }
 
 use crate::sql::optimizer::operator::{
-    CTEProduceOp, DecodeOp, FilterOp, LimitOp, ProjectOp, RepeatOp, TableFunctionOp,
+    CTEProduceOp, ChangeEventExpandOp, DecodeOp, FilterOp, LimitOp, ProjectOp, RepeatOp,
+    TableFunctionOp,
 };
 
 use super::{DeriveOutput, DeriveRequired};
@@ -106,6 +107,27 @@ impl DeriveOutput for RepeatOp {
 }
 
 impl DeriveRequired for RepeatOp {
+    fn derive_required(
+        &self,
+        _scalars: &ScalarArena,
+        _parent_required: &PhysicalPropertySet,
+        _n: usize,
+    ) -> Vec<PhysicalPropertySet> {
+        vec![PhysicalPropertySet::any()]
+    }
+}
+
+impl DeriveOutput for ChangeEventExpandOp {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
+        PhysicalPropertySet::any()
+    }
+}
+
+impl DeriveRequired for ChangeEventExpandOp {
     fn derive_required(
         &self,
         _scalars: &ScalarArena,

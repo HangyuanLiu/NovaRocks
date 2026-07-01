@@ -2470,6 +2470,42 @@ mod tests {
     }
 
     #[test]
+    fn pure_join_refresh_union_branches_match_declared_output_schema() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: join_projection_plan(),
+            mv_ctx: join_projection_mv_ctx(),
+            disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
+            deadline: None,
+            column_ref_factory: test_column_ref_factory_reserved_until(30),
+        })
+        .expect("join projection IMV pipeline must rewrite and validate");
+        let union_plan = find_union_plan(&outcome.plan).expect("join delta union");
+        let LogicalPlanKind::Union(union) = &union_plan.kind else {
+            panic!("expected Union");
+        };
+        let output_names = union
+            .output_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+
+        for child in &union_plan.children {
+            let LogicalPlanKind::Project(project) = &child.kind else {
+                panic!("expected normalized Project branch");
+            };
+            let child_names = project
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                child_names, output_names,
+                "join refresh union branch output must match union schema"
+            );
+        }
+    }
+
+    #[test]
     fn pure_join_refresh_coalesce_plan_keeps_project_refs_in_child_scope() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),

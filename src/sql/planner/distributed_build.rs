@@ -30,6 +30,7 @@ use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
 use crate::sql::planner::plan::{
+    DistributedChangeEventExpandNode, DistributedChangeEventOutputExpr, DistributedChangeEventSpec,
     DistributedExchangeNode, ExchangeFlavor, PhysicalHashAggregateNode,
     PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode,
     PhysicalTopNNode, PlanAssertOneRowNode as DistributedAssertOneRowNode,
@@ -498,6 +499,50 @@ impl<'a> DistributedPlanBuilder<'a> {
                         grouping_fn_arg_ids: op.grouping_fn_arg_ids.clone(),
                         grouping_fn_ids: op.grouping_fn_ids.clone(),
                     }),
+                })
+            }
+            Operator::PhysicalChangeEventExpand(op) => {
+                let child_plan = expect_single_child(node, "PhysicalChangeEventExpand")?;
+                let child = self.visit(child_plan)?;
+                let tuple_id = self.alloc_tuple();
+                let node_id = self.alloc_node();
+                let events = op
+                    .events
+                    .iter()
+                    .map(|event| DistributedChangeEventSpec {
+                        predicate: event
+                            .predicate
+                            .map(|predicate| materialize(self.scalars, predicate)),
+                        branch_kind: event.branch_kind,
+                        assignments: event
+                            .assignments
+                            .iter()
+                            .map(|assignment| DistributedChangeEventOutputExpr {
+                                output_column_id: assignment.output_column_id,
+                                expr: assignment.expr.map(|expr| materialize(self.scalars, expr)),
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                Ok(DistributedPlanNode {
+                    node_id,
+                    fragment_id,
+                    tuple_ids: vec![tuple_id],
+                    nullable_tuple_ids: vec![],
+                    limit: -1,
+                    execution_join_distribution: node.execution_props.join_distribution,
+                    build_runtime_filters: node.build_runtime_filters.clone(),
+                    probe_runtime_filters: node.probe_runtime_filters.clone(),
+                    children: vec![child],
+                    stats: stats_for_physical_node(node),
+                    kind: DistributedPlanKind::ChangeEventExpand(
+                        DistributedChangeEventExpandNode {
+                            events,
+                            output_columns: op.output_columns.clone(),
+                            change_op_column_id: op.change_op_column_id,
+                            data_route_column_id: op.data_route_column_id,
+                        },
+                    ),
                 })
             }
             Operator::PhysicalWindow(op) => {

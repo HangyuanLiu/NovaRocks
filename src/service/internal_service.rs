@@ -1921,6 +1921,7 @@ mod tests {
             None::<plan_nodes::TBenchmarkScanNode>,
             None::<plan_nodes::TCacheStatsScanNode>,
             None::<plan_nodes::TIcebergDeltaScanNode>,
+            None::<plan_nodes::TChangeEventExpandNode>,
         )
     }
 

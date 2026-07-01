@@ -100,6 +100,9 @@ fn collect_glm_metadata(
         ExecNodeKind::Repeat(node) => {
             collect_glm_metadata(&node.input, row_pos_descs)?;
         }
+        ExecNodeKind::ChangeEventExpand(node) => {
+            collect_glm_metadata(&node.input, row_pos_descs)?;
+        }
         ExecNodeKind::UnionAll(node) => {
             for input in &node.inputs {
                 collect_glm_metadata(input, row_pos_descs)?;

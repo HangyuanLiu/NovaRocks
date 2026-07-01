@@ -12,6 +12,9 @@
 
 use std::collections::HashSet;
 
+use arrow::datatypes::DataType;
+
+use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -21,6 +24,7 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::column_pruning::keep_at_least_one;
+use crate::sql::optimizer::rewrite::rules::utils::collect_output_ids_ordered_opt;
 
 pub(crate) struct PruneUnionColumns;
 
@@ -93,21 +97,36 @@ impl LogicalRewriteRule for PruneUnionColumns {
             .map(|idx| node.output_columns[*idx].clone())
             .collect();
 
-        if new_output_columns.len() == original_len {
+        let new_child_output_columns = if node.child_output_columns.is_empty() {
+            Vec::new()
+        } else {
+            children
+                .iter()
+                .enumerate()
+                .map(|(child_idx, child)| {
+                    let existing = node
+                        .child_output_columns
+                        .get(child_idx)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let current = child_output_columns_from_expr(child, existing);
+                    keep_positions
+                        .iter()
+                        .filter_map(|idx| current.get(*idx).cloned())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let output_changed = new_output_columns.len() != original_len;
+        let child_output_changed = !node.child_output_columns.is_empty()
+            && !nested_output_column_ids_eq(&node.child_output_columns, &new_child_output_columns);
+
+        if !output_changed && !child_output_changed {
             return Ok(RewriteResult::Unchanged);
         }
 
         if !node.child_output_columns.is_empty() {
-            node.child_output_columns = node
-                .child_output_columns
-                .into_iter()
-                .map(|columns| {
-                    keep_positions
-                        .iter()
-                        .filter_map(|idx| columns.get(*idx).cloned())
-                        .collect()
-                })
-                .collect();
+            node.child_output_columns = new_child_output_columns;
         }
         node.output_columns = new_output_columns;
         Ok(RewriteResult::Changed(OptExpr {
@@ -118,15 +137,51 @@ impl LogicalRewriteRule for PruneUnionColumns {
     }
 }
 
+fn child_output_columns_from_expr(child: &OptExpr, existing: &[OutputColumn]) -> Vec<OutputColumn> {
+    let ids = collect_output_ids_ordered_opt(child);
+    if ids.is_empty() {
+        return existing.to_vec();
+    }
+    ids.into_iter()
+        .enumerate()
+        .map(|(idx, id)| {
+            existing
+                .iter()
+                .find(|column| column.column_id == id)
+                .cloned()
+                .or_else(|| {
+                    existing.get(idx).cloned().map(|mut column| {
+                        column.column_id = id;
+                        column
+                    })
+                })
+                .unwrap_or_else(|| OutputColumn {
+                    column_id: id,
+                    name: format!("col_{}", idx + 1),
+                    data_type: DataType::Null,
+                    nullable: true,
+                    is_internal: false,
+                })
+        })
+        .collect()
+}
+
+fn nested_output_column_ids_eq(left: &[Vec<OutputColumn>], right: &[Vec<OutputColumn>]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right.iter()).all(|(left, right)| {
+            left.iter()
+                .map(|column| column.column_id)
+                .eq(right.iter().map(|column| column.column_id))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{Operator, UnionOp, ValuesOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use arrow::datatypes::DataType;
 
     fn ctx() -> RewriteContext {
         RewriteContext::new(RewriteConsumer::Query)
@@ -146,6 +201,13 @@ mod tests {
         OptExpr::leaf(Operator::LogicalValues(ValuesOp {
             rows: vec![],
             columns: vec![],
+        }))
+    }
+
+    fn values_input(columns: Vec<OutputColumn>) -> OptExpr {
+        OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns,
         }))
     }
 
@@ -262,6 +324,68 @@ mod tests {
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>(),
             vec![right_a, right_c]
+        );
+    }
+
+    #[test]
+    fn prune_union_syncs_child_output_columns_even_when_schema_width_is_unchanged() {
+        let id_a = ColumnId::new_for_test(1);
+        let id_row = ColumnId::new_for_test(6);
+        let stale_left_row = ColumnId::new_for_test(7);
+        let stale_right_row = ColumnId::new_for_test(8);
+
+        let mut needed = HashSet::new();
+        needed.insert(id_a);
+        needed.insert(id_row);
+
+        let mut expr = OptExpr::new(
+            Operator::LogicalUnion(UnionOp {
+                all: true,
+                output_columns: vec![
+                    make_output_column(id_a, "a"),
+                    make_output_column(id_row, "_row_id"),
+                ],
+                child_output_columns: vec![
+                    vec![
+                        make_output_column(id_a, "left_a"),
+                        make_output_column(stale_left_row, "_row_id"),
+                    ],
+                    vec![
+                        make_output_column(id_a, "right_a"),
+                        make_output_column(stale_right_row, "_row_id"),
+                    ],
+                ],
+            }),
+            vec![
+                values_input(vec![
+                    make_output_column(id_a, "left_a"),
+                    make_output_column(id_row, "_row_id"),
+                ]),
+                values_input(vec![
+                    make_output_column(id_a, "right_a"),
+                    make_output_column(id_row, "_row_id"),
+                ]),
+            ],
+        );
+        expr.required_output_columns = Some(needed);
+
+        let rule = PruneUnionColumns;
+        let result = rule.apply(expr, &mut ctx()).unwrap();
+
+        let changed = match result {
+            RewriteResult::Changed(p) => p,
+            other => panic!("expected Changed, got {:?}", other),
+        };
+        let Operator::LogicalUnion(pruned) = &changed.op else {
+            panic!("expected Union");
+        };
+        assert_eq!(
+            pruned
+                .child_output_columns
+                .iter()
+                .map(|columns| columns[1].column_id)
+                .collect::<Vec<_>>(),
+            vec![id_row, id_row]
         );
     }
 

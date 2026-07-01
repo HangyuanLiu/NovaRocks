@@ -42,6 +42,7 @@ pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
 pub(crate) mod catalog_mgr;
 pub(crate) mod dictionary;
+pub(crate) mod dml_change_stream;
 pub(crate) mod iceberg_change_stream_write;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_maintenance;
@@ -497,7 +498,7 @@ unsafe impl Send for TestSerializationGuard {}
 unsafe impl Sync for TestSerializationGuard {}
 
 #[cfg(test)]
-fn acquire_standalone_test_guard() -> TestSerializationGuard {
+pub(crate) fn acquire_standalone_test_guard() -> TestSerializationGuard {
     use std::sync::{Mutex, OnceLock};
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let guard = LOCK
@@ -3561,7 +3562,7 @@ fn change_stream_write_test_observer()
 }
 
 #[cfg(test)]
-struct ChangeStreamWriteTestObserverGuard;
+pub(crate) struct ChangeStreamWriteTestObserverGuard;
 
 #[cfg(test)]
 impl ChangeStreamWriteTestObserverGuard {
@@ -3587,7 +3588,7 @@ impl Drop for ChangeStreamWriteTestObserverGuard {
 }
 
 #[cfg(test)]
-fn install_change_stream_write_test_observer(
+pub(crate) fn install_change_stream_write_test_observer(
     short_circuit_after_build: bool,
 ) -> ChangeStreamWriteTestObserverGuard {
     let mut observer = change_stream_write_test_observer()
@@ -9583,9 +9584,12 @@ path = "meta/operations.sqlite"
     }
 
     #[test]
-    fn iceberg_v3_update_from_rejects_duplicate_source_match() {
+    fn iceberg_v3_mor_update_from_rejects_duplicate_source_match_with_keyed_assert() {
         let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        let (_engine, session) = open_row_lineage_iceberg_session_with_table_extra_props(
+            &warehouse,
+            &[("novarocks.update.mode", "merge-on-read")],
+        );
         session
             .execute_in_database(
                 r#"create table ice.db1.src (id int, new_v string) tblproperties("format-version"="3","write.row-lineage"="true")"#,
@@ -9608,8 +9612,12 @@ path = "meta/operations.sqlite"
             )
             .expect_err("duplicate source rows must fail");
         assert!(
-            err.contains("more than once"),
-            "expected dedup error, got: {err}"
+            err.contains("MOR UPDATE matched target row: duplicate _row_id="),
+            "expected MOR keyed assert duplicate _row_id error, got: {err}"
+        );
+        assert!(
+            !err.contains("more than once"),
+            "MOR duplicate check must not use host-side validation: {err}"
         );
     }
 

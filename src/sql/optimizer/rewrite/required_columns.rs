@@ -65,6 +65,9 @@ pub(crate) fn tag_required_columns(
         Operator::LogicalCTEProduce(_) => tag_cte_produce(expr, arena, parent_needed),
         Operator::LogicalWindow(_) => tag_window(expr, arena, parent_needed),
         Operator::LogicalRepeat(_) => tag_repeat(expr, arena, parent_needed),
+        Operator::LogicalChangeEventExpand(_) => {
+            tag_change_event_expand(expr, arena, parent_needed)
+        }
         Operator::LogicalDecode(_) => tag_decode(expr, arena, parent_needed),
         Operator::LogicalAggregateStateMerge(_) => {
             tag_aggregate_state_merge(expr, arena, parent_needed)
@@ -492,6 +495,35 @@ fn tag_repeat(
     }
 }
 
+fn tag_change_event_expand(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    let Operator::LogicalChangeEventExpand(node) = &expr.op else {
+        unreachable!()
+    };
+    expr.required_output_columns = parent_needed.clone();
+    let mut child_needed = HashSet::new();
+    for event in &node.events {
+        if let Some(predicate) = event.predicate {
+            child_needed.extend(collect_scalar_column_id_refs(arena, predicate));
+        }
+        for assignment in &event.assignments {
+            if let Some(expr) = assignment.expr {
+                child_needed.extend(collect_scalar_column_id_refs(arena, expr));
+            }
+        }
+    }
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, Some(child_needed))],
+        required_output_columns: parent_needed,
+    }
+}
+
 /// Decode node: ColumnIds are pass-through transparent (same ids on both sides
 /// of the decode boundary per the rewriter invariant). Pass parent_needed to
 /// the child unchanged.
@@ -655,34 +687,42 @@ fn tag_union(
     }
 }
 
-fn join_refresh_union_protocol_ids(node: &UnionOp) -> Option<(ColumnId, ColumnId)> {
-    let action_id = node
+fn join_refresh_union_protocol_ids(node: &UnionOp) -> Option<Vec<ColumnId>> {
+    let has_action = node
         .output_columns
         .iter()
-        .find(|column| is_join_refresh_action_column(column))
-        .map(|column| column.column_id);
-    let join_apply_key_id = node
+        .any(is_join_refresh_action_column);
+    let has_join_apply_key = node
         .output_columns
         .iter()
-        .find(|column| is_join_refresh_apply_key_column(column))
-        .map(|column| column.column_id);
+        .any(is_join_refresh_apply_key_column);
+    if !has_action || !has_join_apply_key {
+        return None;
+    }
 
-    action_id.zip(join_apply_key_id)
+    Some(
+        node.output_columns
+            .iter()
+            .filter(|column| is_join_refresh_protocol_column(column))
+            .map(|column| column.column_id)
+            .collect(),
+    )
 }
 
 fn require_join_refresh_union_protocol_columns(
-    protocol_ids: Option<(ColumnId, ColumnId)>,
+    protocol_ids: Option<Vec<ColumnId>>,
     parent_needed: Option<HashSet<ColumnId>>,
 ) -> Option<HashSet<ColumnId>> {
-    let Some((action_id, join_apply_key_id)) = protocol_ids else {
+    let Some(protocol_ids) = protocol_ids else {
         return parent_needed;
     };
 
     match parent_needed {
         None => None,
         Some(mut needed) => {
-            needed.insert(action_id);
-            needed.insert(join_apply_key_id);
+            for protocol_id in protocol_ids {
+                needed.insert(protocol_id);
+            }
             Some(needed)
         }
     }
@@ -709,10 +749,14 @@ fn require_join_refresh_branch_protocol_columns(
     }
 
     for column in child_outputs {
-        if is_join_refresh_action_column(column) || is_join_refresh_apply_key_column(column) {
+        if is_join_refresh_protocol_column(column) {
             child_needed.insert(column.column_id);
         }
     }
+}
+
+fn is_join_refresh_protocol_column(column: &crate::sql::analysis::OutputColumn) -> bool {
+    is_join_refresh_action_column(column) || is_join_refresh_apply_key_column(column)
 }
 
 fn is_join_refresh_action_column(column: &crate::sql::analysis::OutputColumn) -> bool {
@@ -1650,7 +1694,7 @@ mod tests {
         assert_eq!(
             required_columns(&tagged),
             &needed_set(&[1, 2, 3, 9, 14, 15]),
-            "join refresh UNION must keep internal protocol columns in its own required set"
+            "join refresh UNION must keep action and join row key in its own required set"
         );
         for child in &tagged.children {
             assert_eq!(
@@ -2369,6 +2413,62 @@ mod tests {
         assert!(req.contains(&ColumnId::new_for_test(1)));
         assert!(req.contains(&ColumnId::new_for_test(2)));
         assert!(req.contains(&ColumnId::new_for_test(3)));
+    }
+
+    #[test]
+    fn change_event_expand_required_columns_include_predicates_and_assignments() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::{
+            ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec,
+        };
+
+        let arena_rc = make_arena();
+        let predicate;
+        let assignment_expr;
+        {
+            let mut arena = arena_rc.borrow_mut();
+            let c1 = col_ref_scalar(&mut arena, ColumnId::new_for_test(1));
+            let one = int_literal_scalar(&mut arena, 1);
+            predicate = binop_scalar(&mut arena, c1, BinOp::Eq, one);
+            assignment_expr = col_ref_scalar(&mut arena, ColumnId::new_for_test(2));
+        }
+
+        let output_columns = vec![
+            make_output_column(ColumnId::new_for_test(101), "_file"),
+            make_output_column(ColumnId::new_for_test(102), "_pos"),
+            make_output_column(ColumnId::new_for_test(103), "__change_op"),
+        ];
+        let expand = OptExpr::new(
+            Operator::LogicalChangeEventExpand(ChangeEventExpandOp {
+                events: vec![ChangeEventSpec {
+                    predicate: Some(predicate),
+                    branch_kind: ChangeStreamBranchKind::DeleteDv,
+                    assignments: vec![
+                        ChangeEventOutputExpr {
+                            output_column_id: ColumnId::new_for_test(101),
+                            expr: Some(assignment_expr),
+                        },
+                        ChangeEventOutputExpr {
+                            output_column_id: ColumnId::new_for_test(103),
+                            expr: None,
+                        },
+                    ],
+                }],
+                output_columns,
+                change_op_column_id: ColumnId::new_for_test(103),
+                data_route_column_id: None,
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(expand, &arena, Some(needed_set(&[103])));
+        assert!(matches!(&tagged.op, Operator::LogicalChangeEventExpand(_)));
+        assert_eq!(required_columns(&tagged), &needed_set(&[103]));
+        assert_eq!(
+            scan_required_columns(tagged.unary_input()),
+            &needed_set(&[1, 2])
+        );
     }
 
     #[test]

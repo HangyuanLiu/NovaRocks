@@ -5,10 +5,11 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::cost::BroadcastDecision;
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, CostEstimate, Statistics};
 use crate::sql::planner::plan::{
-    DistributedExchangeNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
-    PhysicalNestLoopJoinNode, PhysicalSetOpNode, PhysicalTopNNode, PlanAssertOneRowNode,
-    PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
-    PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
+    DistributedChangeEventExpandNode, DistributedExchangeNode, PhysicalHashAggregateNode,
+    PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode, PhysicalTopNNode,
+    PlanAssertOneRowNode, PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode,
+    PlanRepeatNode, PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode,
+    PlanWindowNode,
 };
 
 /// Migration-only lowering kind for the existing DistributedPlan node tree.
@@ -35,6 +36,7 @@ pub(crate) enum DistributedPlanKind {
     HashJoin(Box<PhysicalHashJoinNode>),
     NestLoopJoin(PhysicalNestLoopJoinNode),
     SetOp(PhysicalSetOpNode),
+    ChangeEventExpand(DistributedChangeEventExpandNode),
 }
 
 impl DistributedPlanKind {
@@ -57,6 +59,7 @@ impl DistributedPlanKind {
             DistributedPlanKind::HashJoin(_) => "HashJoin",
             DistributedPlanKind::NestLoopJoin(_) => "NestLoopJoin",
             DistributedPlanKind::SetOp(_) => "SetOp",
+            DistributedPlanKind::ChangeEventExpand(_) => "ChangeEventExpand",
         }
     }
 }

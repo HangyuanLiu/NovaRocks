@@ -2,45 +2,14 @@ use std::collections::BTreeSet;
 
 use crate::sql::codegen::FragmentId;
 use crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec;
+pub(crate) use crate::sql::common::change_stream::{
+    CHANGE_OP_DELETE, CHANGE_OP_INSERT, ChangeStreamBranchKind as ChangeStreamWriteBranchKind,
+    ChangeStreamRouteKey, DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
+};
 use crate::thrift::data_sinks;
 use crate::thrift::partitions;
 
-pub(crate) const CHANGE_OP_DELETE: i32 = -1;
-pub(crate) const CHANGE_OP_INSERT: i32 = 1;
-pub(crate) const DATA_ROUTE_REUSE: i32 = 1;
-pub(crate) const DATA_ROUTE_FRESH: i32 = 2;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum ChangeStreamWriteBranchKind {
-    DeleteDv,
-    ReuseData,
-    FreshData,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ChangeStreamRouteKey {
-    pub(crate) change_op: i32,
-    pub(crate) data_route: Option<i32>,
-}
-
 impl ChangeStreamWriteBranchKind {
-    pub(crate) fn route_key(self) -> ChangeStreamRouteKey {
-        match self {
-            Self::DeleteDv => ChangeStreamRouteKey {
-                change_op: CHANGE_OP_DELETE,
-                data_route: None,
-            },
-            Self::ReuseData => ChangeStreamRouteKey {
-                change_op: CHANGE_OP_INSERT,
-                data_route: Some(DATA_ROUTE_REUSE),
-            },
-            Self::FreshData => ChangeStreamRouteKey {
-                change_op: CHANGE_OP_INSERT,
-                data_route: Some(DATA_ROUTE_FRESH),
-            },
-        }
-    }
-
     pub(crate) fn to_thrift(self) -> data_sinks::TIcebergChangeStreamRouterBranchKind {
         match self {
             Self::DeleteDv => data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV,
