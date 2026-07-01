@@ -360,7 +360,7 @@ fn remap_plan_node_references(
         {
             remap_btree_map_keys(ranges, node_id_map)?;
         }
-        for (_, exchange_node_id) in &mut fragment.cte_exchange_nodes {
+        for (_, exchange_node_id, _) in &mut fragment.cte_exchange_nodes {
             *exchange_node_id = remap_node_id(*exchange_node_id, node_id_map)?;
         }
         for boundary in &mut fragment.boundary_schemas {

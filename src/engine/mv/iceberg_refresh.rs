@@ -10548,9 +10548,14 @@ fn first_refresh_iceberg_join_mv(
         .read()
         .expect("standalone connector registry read lock")
         .clone();
+    let JoinRefreshLogicalPlan {
+        plan,
+        factory,
+        change_stream: change_stream_override,
+    } = logical_plan;
     let planned_query = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
-        logical_plan.plan,
-        logical_plan.factory,
+        plan,
+        factory,
         &connectors_snapshot,
     )
     .map_err(|err| {
@@ -10566,7 +10571,7 @@ fn first_refresh_iceberg_join_mv(
         ImvRefreshPlannedChangeStream {
             physical_plan: planned_query.physical_plan,
             output_columns: planned_query.output_columns,
-            change_stream: planned_query.change_stream,
+            change_stream: change_stream_override.unwrap_or(planned_query.change_stream),
             producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
             mv_refresh_ctx: Some(ctx),
         },
@@ -11062,9 +11067,8 @@ fn run_imv_rewrite_for_refresh_explain(
     // Thread the active session's disable_optimizer_rules into IMV. When
     // refresh runs outside a user session (e.g. background scheduler),
     // the thread-local default is empty, so this is a safe no-op.
-    let disabled_rules = crate::sql::optimizer::options::current_session_optimizer_settings()
-        .disabled_rules
-        .clone();
+    let disabled_rules =
+        refresh_explain_rewrite_disabled_rules(ctx.rewrite.schema_contract.aggregate.is_some());
     let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
         crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
             plan,
@@ -11079,6 +11083,20 @@ fn run_imv_rewrite_for_refresh_explain(
         .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
         .into_inner();
     Ok(outcome)
+}
+
+fn refresh_explain_rewrite_disabled_rules(is_aggregate_refresh: bool) -> Vec<String> {
+    let mut disabled_rules = crate::sql::optimizer::options::current_session_optimizer_settings()
+        .disabled_rules
+        .clone();
+    if is_aggregate_refresh
+        && !disabled_rules
+            .iter()
+            .any(|rule| rule == "RecordJoinRefreshDescriptor")
+    {
+        disabled_rules.push("RecordJoinRefreshDescriptor".to_string());
+    }
+    disabled_rules
 }
 
 fn validate_aggregate_refresh_rewrite_outcome(
@@ -11563,6 +11581,18 @@ mod join_delta_append_only_fast_path_tests {
     }
 
     #[test]
+    fn aggregate_refresh_explain_disables_join_refresh_descriptor_recording() {
+        let disabled_rules = refresh_explain_rewrite_disabled_rules(true);
+
+        assert!(
+            disabled_rules
+                .iter()
+                .any(|rule| rule == "RecordJoinRefreshDescriptor"),
+            "aggregate refresh explain must not record a pure join refresh descriptor"
+        );
+    }
+
+    #[test]
     fn join_incremental_refresh_production_route_uses_logical_executors() {
         let source = std::fs::read_to_string(file!()).expect("read source");
         let route_body = source_between(
@@ -11942,6 +11972,8 @@ fn select_join_incremental_refresh_route(
 struct JoinRefreshLogicalPlan {
     plan: crate::sql::planner::plan::LogicalPlanNode,
     factory: crate::sql::column_id::ColumnRefFactory,
+    change_stream:
+        Option<crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12033,7 +12065,11 @@ fn build_join_full_refresh_logical_plan(
         )
         .map_err(|e| format!("build join full refresh apply-key logical plan: {e}"))?;
     reserve_factory_for_logical_plan(&mut factory, &plan)?;
-    Ok(JoinRefreshLogicalPlan { plan, factory })
+    Ok(JoinRefreshLogicalPlan {
+        plan,
+        factory,
+        change_stream: Some(join_refresh_change_stream_descriptor(descriptor)),
+    })
 }
 
 struct JoinFullRefreshApplyInput {
@@ -12502,6 +12538,7 @@ fn build_join_incremental_refresh_logical_plan(
     let mut factory = std::rc::Rc::try_unwrap(factory_cell)
         .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
         .into_inner();
+    let mut change_stream = None;
     let plan = match route {
         JoinIncrementalRefreshRoute::LogicalAppendOnly => outcome.plan,
         JoinIncrementalRefreshRoute::LogicalCoalesce if is_aggregate_refresh => outcome.plan,
@@ -12523,61 +12560,37 @@ fn build_join_incremental_refresh_logical_plan(
                     target_fqn_string(&ctx.rewrite.target)
                 )
             })?;
-            let net_column_id = factory
-                .create(
-                    None,
-                    "net".to_string(),
-                    arrow::datatypes::DataType::Int64,
-                    false,
-                )
-                .0;
-            let locator_file_column_id = factory
-                .create(
-                    None,
-                    crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
-                    arrow::datatypes::DataType::Utf8,
-                    true,
-                )
-                .0;
-            let locator_pos_column_id = factory
-                .create(
-                    None,
-                    crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
-                    arrow::datatypes::DataType::Int64,
-                    true,
-                )
-                .0;
-            let locator_row_id_column_id = factory
-                .create(
-                    None,
-                    crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
-                    arrow::datatypes::DataType::Int64,
-                    true,
-                )
-                .0;
-            let locator_last_updated_seq_column_id = factory
-                .create(
-                    None,
-                    crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-                    arrow::datatypes::DataType::Int64,
-                    true,
-                )
-                .0;
+            change_stream = Some(join_refresh_change_stream_descriptor(descriptor.clone()));
+            let locator_columns =
+                allocate_join_coalesce_locator_column_ids(&mut factory, &outcome.plan)?;
             crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
                 outcome.plan,
                 &descriptor,
                 &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_rewrite_context(&ctx.rewrite),
-                net_column_id,
-                locator_file_column_id,
-                locator_pos_column_id,
-                locator_row_id_column_id,
-                locator_last_updated_seq_column_id,
+                locator_columns.net,
+                locator_columns.file,
+                locator_columns.pos,
+                locator_columns.row_id,
+                locator_columns.last_updated_sequence_number,
             )
             .map_err(|e| format!("build join refresh coalesce logical plan: {e}"))?
         }
     };
     reserve_factory_for_logical_plan(&mut factory, &plan)?;
-    Ok(JoinRefreshLogicalPlan { plan, factory })
+    Ok(JoinRefreshLogicalPlan {
+        plan,
+        factory,
+        change_stream,
+    })
+}
+
+fn join_refresh_change_stream_descriptor(
+    descriptor: crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor,
+) -> crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor {
+    crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor {
+        aggregate: None,
+        join_refresh: Some(descriptor),
+    }
 }
 
 fn join_refresh_logical_execution_disabled_rules(is_aggregate_refresh: bool) -> Vec<String> {
@@ -12598,6 +12611,64 @@ fn join_refresh_logical_execution_disabled_rules(is_aggregate_refresh: bool) -> 
         disabled_rules.push("RecordJoinRefreshDescriptor".to_string());
     }
     disabled_rules
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JoinCoalesceLocatorColumnIds {
+    net: u32,
+    file: u32,
+    pos: u32,
+    row_id: u32,
+    last_updated_sequence_number: u32,
+}
+
+fn allocate_join_coalesce_locator_column_ids(
+    factory: &mut crate::sql::column_id::ColumnRefFactory,
+    plan: &crate::sql::planner::plan::LogicalPlanNode,
+) -> Result<JoinCoalesceLocatorColumnIds, String> {
+    reserve_factory_for_logical_plan(factory, plan)?;
+    Ok(JoinCoalesceLocatorColumnIds {
+        net: factory
+            .create(
+                None,
+                "net".to_string(),
+                arrow::datatypes::DataType::Int64,
+                false,
+            )
+            .0,
+        file: factory
+            .create(
+                None,
+                crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+                arrow::datatypes::DataType::Utf8,
+                true,
+            )
+            .0,
+        pos: factory
+            .create(
+                None,
+                crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+                arrow::datatypes::DataType::Int64,
+                true,
+            )
+            .0,
+        row_id: factory
+            .create(
+                None,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                arrow::datatypes::DataType::Int64,
+                true,
+            )
+            .0,
+        last_updated_sequence_number: factory
+            .create(
+                None,
+                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                arrow::datatypes::DataType::Int64,
+                true,
+            )
+            .0,
+    })
 }
 
 fn reserve_factory_for_logical_plan(
@@ -12729,9 +12800,14 @@ fn execute_join_delta_branches_logical(
         .read()
         .expect("standalone connector registry read lock")
         .clone();
+    let JoinRefreshLogicalPlan {
+        plan,
+        factory,
+        change_stream: change_stream_override,
+    } = logical_plan;
     let planned_query = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
-        logical_plan.plan,
-        logical_plan.factory,
+        plan,
+        factory,
         &connectors_snapshot,
     )
     .map_err(|err| {
@@ -12764,7 +12840,7 @@ fn execute_join_delta_branches_logical(
         ImvRefreshPlannedChangeStream {
             physical_plan: planned_query.physical_plan,
             output_columns: planned_query.output_columns,
-            change_stream: planned_query.change_stream,
+            change_stream: change_stream_override.unwrap_or(planned_query.change_stream),
             producer_branches,
             mv_refresh_ctx: Some(ctx),
         },
@@ -15436,6 +15512,74 @@ mod tests {
             nullable,
             is_internal: false,
         }
+    }
+
+    #[test]
+    fn join_coalesce_locator_ids_reserve_rewritten_plan_outputs() {
+        let child_output = crate::sql::analysis::OutputColumn {
+            column_id: crate::sql::column_id::ColumnId(42),
+            name: "child_k".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        };
+        let root_output = crate::sql::analysis::OutputColumn {
+            column_id: crate::sql::column_id::ColumnId(6),
+            name: "root_k".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        };
+        let child = crate::sql::planner::plan::LogicalPlanNode::new(
+            crate::sql::planner::plan::LogicalPlanKind::Values(
+                crate::sql::planner::plan::LogicalValuesNode {
+                    rows: Vec::new(),
+                    columns: vec![child_output.clone()],
+                },
+            ),
+            Vec::new(),
+            None,
+        );
+        let plan = crate::sql::planner::plan::LogicalPlanNode::new(
+            crate::sql::planner::plan::LogicalPlanKind::Project(
+                crate::sql::planner::plan::LogicalProjectNode {
+                    items: vec![crate::sql::analysis::ProjectItem {
+                        expr: crate::sql::analysis::TypedExpr {
+                            kind: crate::sql::analysis::ExprKind::ColumnRef {
+                                column_id: child_output.column_id,
+                                qualifier: None,
+                                column: child_output.name.clone(),
+                            },
+                            data_type: child_output.data_type.clone(),
+                            nullable: child_output.nullable,
+                        },
+                        output_name: root_output.name.clone(),
+                        output_column_id: root_output.column_id,
+                    }],
+                    output_qualifier: None,
+                },
+            ),
+            vec![child],
+            None,
+        );
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+
+        let ids = allocate_join_coalesce_locator_column_ids(&mut factory, &plan)
+            .expect("allocate locator column ids");
+
+        let allocated = [
+            ids.net,
+            ids.file,
+            ids.pos,
+            ids.row_id,
+            ids.last_updated_sequence_number,
+        ];
+        assert!(allocated.iter().all(|id| *id > child_output.column_id.0));
+        let unique = allocated
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), allocated.len());
     }
 
     #[test]

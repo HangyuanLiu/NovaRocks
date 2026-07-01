@@ -19,9 +19,8 @@ use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::plan::{
     DistributedChangeEventExpandNode, DistributedExchangeNode, ExchangeFlavor,
     PhysicalHashAggregateNode, PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode,
-    PhysicalTopNNode,
-    PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanDecodeNode as DistributedDecodeNode,
-    PlanFilterNode as DistributedFilterNode,
+    PhysicalTopNNode, PlanAssertOneRowNode as DistributedAssertOneRowNode,
+    PlanDecodeNode as DistributedDecodeNode, PlanFilterNode as DistributedFilterNode,
     PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
     PlanProjectNode as DistributedProjectNode, PlanRepeatNode as DistributedRepeatNode,
     PlanScanNode as DistributedScanNode, PlanSetOpKind as SetOpKind,

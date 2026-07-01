@@ -156,7 +156,7 @@ fn mark_fan_in_union_through_unary(
                 let mut branch_output = plan_output_columns(&branch)?;
                 branch_output.push(action_output.clone());
                 let marked = mark_delta_scan(branch, action_column)?;
-                rewritten_inputs.push(normalize_branch_output(marked, &branch_output));
+                rewritten_inputs.push(normalize_branch_output(marked, &branch_output)?);
             }
             let mut union_output_columns = union.output_columns;
             union_output_columns.push(action_output.clone());

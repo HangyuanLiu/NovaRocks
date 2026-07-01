@@ -687,34 +687,42 @@ fn tag_union(
     }
 }
 
-fn join_refresh_union_protocol_ids(node: &UnionOp) -> Option<(ColumnId, ColumnId)> {
-    let action_id = node
+fn join_refresh_union_protocol_ids(node: &UnionOp) -> Option<Vec<ColumnId>> {
+    let has_action = node
         .output_columns
         .iter()
-        .find(|column| is_join_refresh_action_column(column))
-        .map(|column| column.column_id);
-    let join_apply_key_id = node
+        .any(is_join_refresh_action_column);
+    let has_join_apply_key = node
         .output_columns
         .iter()
-        .find(|column| is_join_refresh_apply_key_column(column))
-        .map(|column| column.column_id);
+        .any(is_join_refresh_apply_key_column);
+    if !has_action || !has_join_apply_key {
+        return None;
+    }
 
-    action_id.zip(join_apply_key_id)
+    Some(
+        node.output_columns
+            .iter()
+            .filter(|column| is_join_refresh_protocol_column(column))
+            .map(|column| column.column_id)
+            .collect(),
+    )
 }
 
 fn require_join_refresh_union_protocol_columns(
-    protocol_ids: Option<(ColumnId, ColumnId)>,
+    protocol_ids: Option<Vec<ColumnId>>,
     parent_needed: Option<HashSet<ColumnId>>,
 ) -> Option<HashSet<ColumnId>> {
-    let Some((action_id, join_apply_key_id)) = protocol_ids else {
+    let Some(protocol_ids) = protocol_ids else {
         return parent_needed;
     };
 
     match parent_needed {
         None => None,
         Some(mut needed) => {
-            needed.insert(action_id);
-            needed.insert(join_apply_key_id);
+            for protocol_id in protocol_ids {
+                needed.insert(protocol_id);
+            }
             Some(needed)
         }
     }
@@ -741,10 +749,14 @@ fn require_join_refresh_branch_protocol_columns(
     }
 
     for column in child_outputs {
-        if is_join_refresh_action_column(column) || is_join_refresh_apply_key_column(column) {
+        if is_join_refresh_protocol_column(column) {
             child_needed.insert(column.column_id);
         }
     }
+}
+
+fn is_join_refresh_protocol_column(column: &crate::sql::analysis::OutputColumn) -> bool {
+    is_join_refresh_action_column(column) || is_join_refresh_apply_key_column(column)
 }
 
 fn is_join_refresh_action_column(column: &crate::sql::analysis::OutputColumn) -> bool {
@@ -1682,7 +1694,7 @@ mod tests {
         assert_eq!(
             required_columns(&tagged),
             &needed_set(&[1, 2, 3, 9, 14, 15]),
-            "join refresh UNION must keep internal protocol columns in its own required set"
+            "join refresh UNION must keep action and join row key in its own required set"
         );
         for child in &tagged.children {
             assert_eq!(

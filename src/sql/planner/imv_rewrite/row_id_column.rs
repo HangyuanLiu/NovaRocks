@@ -97,12 +97,19 @@ impl LogicalRewriteRule for InjectRowIdRule {
             let LogicalPlanKind::Scan(mut scan) = kind else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
-            let column_id = crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column(
-                ctx,
-                ImvRowIdColumn::NAME,
-                DataType::Int64,
-                false,
-            )?;
+            let column_id = match scan
+                .columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
+            {
+                Some(existing) => existing.column_id,
+                None => crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column(
+                    ctx,
+                    ImvRowIdColumn::NAME,
+                    DataType::Int64,
+                    false,
+                )?,
+            };
             scan.columns
                 .retain(|column| !column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME));
             scan.columns.push(ImvRowIdColumn::output_column(column_id));
@@ -312,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn inject_row_id_replaces_preexisting_non_internal_row_id_column() {
+    fn inject_row_id_normalizes_preexisting_non_internal_row_id_column_id_in_place() {
         let rule = InjectRowIdRule;
         let mut ctx = build_ctx();
         let mut scan = delta_scan();
@@ -346,7 +353,7 @@ mod tests {
             .filter(|column| column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
             .collect::<Vec<_>>();
         assert_eq!(row_id_columns.len(), 1);
-        assert_eq!(row_id_columns[0].column_id, ColumnId(100));
+        assert_eq!(row_id_columns[0].column_id, ColumnId(9));
         assert!(row_id_columns[0].is_internal);
     }
 

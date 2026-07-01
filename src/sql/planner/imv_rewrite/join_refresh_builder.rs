@@ -1567,6 +1567,11 @@ mod tests {
                     crate::exec::row_position::ICEBERG_ROW_POS_COL,
                     ColumnId(102)
                 ),
+                (crate::exec::row_position::ICEBERG_ROW_ID_COL, ColumnId(103)),
+                (
+                    crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                    ColumnId(104)
+                ),
             ]
         );
     }
