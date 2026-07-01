@@ -23,13 +23,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use futures::TryStreamExt;
 use prost::Message;
 
+use crate::formats::starrocks::fs_access::resolve_format_path;
 use crate::formats::starrocks::writer::io::read_bytes_if_exists;
 use crate::formats::starrocks::writer::io::write_bytes;
 use crate::formats::starrocks::writer::layout::{
     BUNDLE_TABLET_ID, INITIAL_VERSION, META_DIR, bundle_meta_file_path, initial_meta_file_path,
     join_tablet_path, standalone_meta_file_path, tablet_meta_rel_path,
 };
-use crate::fs::path::{ScanPathScheme, classify_scan_paths};
+use crate::fs::access::FsScheme;
 use crate::service::grpc_client::proto::starrocks::{
     BundleTabletMetadataPb, PagePointerPb, RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb,
 };
@@ -434,15 +435,13 @@ pub fn load_latest_tablet_metadata(
 #[allow(dead_code)]
 pub fn discover_latest_bundle_version(tablet_root_path: &str) -> Result<Option<i64>, String> {
     let meta_root = join_tablet_path(tablet_root_path, META_DIR)?;
-    let scheme = classify_scan_paths([meta_root.as_str()])?;
-    match scheme {
-        ScanPathScheme::Local => discover_latest_bundle_version_local(&meta_root),
-        ScanPathScheme::Oss => discover_latest_bundle_version_oss(&meta_root),
-        ScanPathScheme::Hdfs => Err(format!(
-            "discover latest bundle version does not support hdfs path yet: {}",
-            meta_root
-        )),
+    let mut latest: Option<i64> = None;
+    for name in list_metadata_file_names(&meta_root)? {
+        if let Some(version) = parse_bundle_version_from_meta_file_name(&name) {
+            latest = Some(latest.map(|prev| prev.max(version)).unwrap_or(version));
+        }
     }
+    Ok(latest)
 }
 
 #[allow(dead_code)]
@@ -487,88 +486,8 @@ fn discover_latest_metadata_version_in_dir(
     tablet_id: i64,
     max_version: i64,
 ) -> Result<Option<i64>, String> {
-    let scheme = classify_scan_paths([meta_root])?;
-    match scheme {
-        ScanPathScheme::Local => {
-            discover_latest_metadata_version_local(meta_root, tablet_id, max_version)
-        }
-        ScanPathScheme::Oss => {
-            discover_latest_metadata_version_oss(meta_root, tablet_id, max_version)
-        }
-        ScanPathScheme::Hdfs => Err(format!(
-            "discover latest metadata version does not support hdfs path yet: {}",
-            meta_root
-        )),
-    }
-}
-
-#[allow(dead_code)]
-pub fn discover_latest_bundle_version_local(meta_root: &str) -> Result<Option<i64>, String> {
-    let dir = PathBuf::from(meta_root);
-    if !dir.exists() {
-        return Ok(None);
-    }
-    if !dir.is_dir() {
-        return Err(format!("meta path is not a directory: {}", meta_root));
-    }
-
     let mut latest: Option<i64> = None;
-    let entries = fs::read_dir(&dir).map_err(|e| {
-        format!(
-            "read local meta directory failed: path={}, error={}",
-            meta_root, e
-        )
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            format!(
-                "iterate local meta directory failed: path={}, error={}",
-                meta_root, e
-            )
-        })?;
-        let Some(name) = entry.file_name().to_str().map(|v| v.to_string()) else {
-            continue;
-        };
-        if let Some(version) = parse_bundle_version_from_meta_file_name(&name) {
-            latest = match latest {
-                Some(prev) => Some(prev.max(version)),
-                None => Some(version),
-            };
-        }
-    }
-    Ok(latest)
-}
-
-fn discover_latest_metadata_version_local(
-    meta_root: &str,
-    tablet_id: i64,
-    max_version: i64,
-) -> Result<Option<i64>, String> {
-    let dir = PathBuf::from(meta_root);
-    if !dir.exists() {
-        return Ok(None);
-    }
-    if !dir.is_dir() {
-        return Err(format!("meta path is not a directory: {}", meta_root));
-    }
-
-    let mut latest: Option<i64> = None;
-    let entries = fs::read_dir(&dir).map_err(|e| {
-        format!(
-            "read local meta directory failed: path={}, error={}",
-            meta_root, e
-        )
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            format!(
-                "iterate local meta directory failed: path={}, error={}",
-                meta_root, e
-            )
-        })?;
-        let Some(name) = entry.file_name().to_str().map(|v| v.to_string()) else {
-            continue;
-        };
+    for name in list_metadata_file_names(meta_root)? {
         if let Some((file_tablet_id, version)) = parse_meta_file_name(&name)
             && version <= max_version
             && (file_tablet_id == tablet_id || file_tablet_id == BUNDLE_TABLET_ID)
@@ -579,55 +498,52 @@ fn discover_latest_metadata_version_local(
     Ok(latest)
 }
 
-#[allow(dead_code)]
-pub fn discover_latest_bundle_version_oss(meta_root: &str) -> Result<Option<i64>, String> {
-    let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(meta_root)?;
-    let (op, rel_root) = crate::fs::path::resolve_object_store_operator_and_path(meta_root, &cfg)?;
-    let list_prefix = if rel_root.is_empty() {
-        String::new()
-    } else if rel_root.ends_with('/') {
-        rel_root
-    } else {
-        format!("{}/", rel_root)
-    };
-    crate::fs::oss::oss_block_on(async move {
-        let mut latest: Option<i64> = None;
-        let mut lister = op
-            .lister_with(&list_prefix)
-            .recursive(false)
-            .await
-            .map_err(|e| {
-                format!(
-                    "list oss meta directory failed: path={}, error={}",
-                    meta_root, e
-                )
-            })?;
-        while let Some(entry) = lister.try_next().await.map_err(|e| {
-            format!(
-                "iterate oss meta directory failed: path={}, error={}",
-                meta_root, e
-            )
-        })? {
-            let path = entry.path();
-            let name = path.rsplit('/').next().unwrap_or(path);
-            if let Some(version) = parse_bundle_version_from_meta_file_name(name) {
-                latest = match latest {
-                    Some(prev) => Some(prev.max(version)),
-                    None => Some(version),
-                };
-            }
-        }
-        Ok(latest)
-    })?
+fn list_metadata_file_names(meta_root: &str) -> Result<Vec<String>, String> {
+    let access = resolve_format_path(meta_root)?;
+    match access.scheme() {
+        FsScheme::Local => list_metadata_file_names_local(meta_root),
+        FsScheme::ObjectStore => list_metadata_file_names_object_store(meta_root, &access),
+        FsScheme::Hdfs => Err(format!(
+            "discover latest metadata version does not support hdfs path yet: {}",
+            meta_root
+        )),
+    }
 }
 
-fn discover_latest_metadata_version_oss(
+fn list_metadata_file_names_local(meta_root: &str) -> Result<Vec<String>, String> {
+    let dir = PathBuf::from(meta_root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    if !dir.is_dir() {
+        return Err(format!("meta path is not a directory: {}", meta_root));
+    }
+
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| {
+        format!(
+            "read local meta directory failed: path={}, error={}",
+            meta_root, e
+        )
+    })? {
+        let entry = entry.map_err(|e| {
+            format!(
+                "iterate local meta directory failed: path={}, error={}",
+                meta_root, e
+            )
+        })?;
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+fn list_metadata_file_names_object_store(
     meta_root: &str,
-    tablet_id: i64,
-    max_version: i64,
-) -> Result<Option<i64>, String> {
-    let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(meta_root)?;
-    let (op, rel_root) = crate::fs::path::resolve_object_store_operator_and_path(meta_root, &cfg)?;
+    access: &crate::formats::starrocks::fs_access::StarRocksFormatPathAccess,
+) -> Result<Vec<String>, String> {
+    let rel_root = access.single_relative_path()?.to_string();
     let list_prefix = if rel_root.is_empty() {
         String::new()
     } else if rel_root.ends_with('/') {
@@ -635,9 +551,10 @@ fn discover_latest_metadata_version_oss(
     } else {
         format!("{}/", rel_root)
     };
-    crate::fs::oss::oss_block_on(async move {
-        let mut latest: Option<i64> = None;
-        let mut lister = op
+    crate::fs::oss::oss_block_on(async {
+        let mut names = Vec::new();
+        let mut lister = access
+            .operator()
             .lister_with(&list_prefix)
             .recursive(false)
             .await
@@ -653,21 +570,13 @@ fn discover_latest_metadata_version_oss(
                 meta_root, e
             )
         })? {
-            let meta = entry.metadata();
-            if meta.is_dir() {
+            if entry.metadata().is_dir() {
                 continue;
             }
-            let Some(name) = entry.name().rsplit('/').next() else {
-                continue;
-            };
-            if let Some((file_tablet_id, version)) = parse_meta_file_name(name)
-                && version <= max_version
-                && (file_tablet_id == tablet_id || file_tablet_id == BUNDLE_TABLET_ID)
-            {
-                latest = Some(latest.map(|prev| prev.max(version)).unwrap_or(version));
-            }
+            let path = entry.path();
+            names.push(path.rsplit('/').next().unwrap_or(path).to_string());
         }
-        Ok(latest)
+        Ok(names)
     })?
 }
 
