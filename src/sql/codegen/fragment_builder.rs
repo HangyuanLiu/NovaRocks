@@ -619,6 +619,7 @@ impl PlanFragmentBuilder {
                     branch_id: branch.branch_id,
                     branch_kind: branch.branch_kind,
                 },
+                output_slot_ids: Vec::new(),
             });
             append_change_stream_edge_boundary_schemas(
                 &mut build,

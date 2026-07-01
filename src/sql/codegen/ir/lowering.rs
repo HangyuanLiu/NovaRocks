@@ -427,9 +427,13 @@ fn validate_edge_target_node(
             Ok(())
         }
         (
-            crate::sql::codegen::FragmentEdgeKind::CteMulticast { cte_id },
+            crate::sql::codegen::FragmentEdgeKind::CteMulticast {
+                cte_id,
+                receive_producer_column_ids,
+            },
             super::kind::ExchangeFlavor::CteMulticast {
                 cte_id: exchange_cte_id,
+                receive_producer_column_ids: exchange_receive_producer_column_ids,
             },
         ) => {
             if cte_id != exchange_cte_id {
@@ -437,6 +441,15 @@ fn validate_edge_target_node(
                     "lower_distributed_plan CTE multicast edge cte_id={} does not match Exchange cte_id={} for target_exchange_node_id={} in target fragment id={}",
                     cte_id,
                     exchange_cte_id,
+                    edge.target_exchange_node_id,
+                    target_fragment.fragment_id
+                ));
+            }
+            if receive_producer_column_ids != exchange_receive_producer_column_ids {
+                return Err(format!(
+                    "lower_distributed_plan CTE multicast edge receive_producer_column_ids={:?} does not match Exchange receive_producer_column_ids={:?} for target_exchange_node_id={} in target fragment id={}",
+                    receive_producer_column_ids,
+                    exchange_receive_producer_column_ids,
                     edge.target_exchange_node_id,
                     target_fragment.fragment_id
                 ));
@@ -530,6 +543,16 @@ fn lower_fragment_edges(
                 })?;
             lowered_edge.output_partition =
                 lower_exchange_output_partition(exchange, &source.scope, state.slot_allocator())?;
+            if matches!(
+                edge.edge_kind,
+                crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }
+            ) {
+                lowered_edge.output_slot_ids = lower_cte_receive_output_slot_ids(
+                    exchange,
+                    &source.scope,
+                    "lower_fragment_edges",
+                )?;
+            }
         }
         lowered_edges.push(lowered_edge);
     }
@@ -578,6 +601,37 @@ fn lower_exchange_output_partition(
         None::<Vec<partitions::TRangePartition>>,
         None::<Vec<partitions::TBucketProperty>>,
     ))
+}
+
+fn lower_cte_receive_output_slot_ids(
+    exchange: &super::kind::DistributedExchangeNode,
+    source_scope: &ExprScope,
+    edge_label: &str,
+) -> Result<Vec<i32>, String> {
+    let super::kind::ExchangeFlavor::CteMulticast {
+        cte_id,
+        receive_producer_column_ids,
+    } = &exchange.flavor
+    else {
+        return Ok(Vec::new());
+    };
+    if receive_producer_column_ids.len() != exchange.output_columns.len() {
+        return Err(format!(
+            "CTE multicast receive/output arity mismatch for cte_id={}",
+            cte_id
+        ));
+    }
+    let mut slots = Vec::with_capacity(receive_producer_column_ids.len());
+    for producer_id in receive_producer_column_ids {
+        let binding = source_scope.resolve_by_id(*producer_id).ok_or_else(|| {
+            format!(
+                "CTE multicast receive column {} is not produced by cte_id={} ({})",
+                producer_id.0, cte_id, edge_label
+            )
+        })?;
+        slots.push(binding.slot_id);
+    }
+    Ok(slots)
 }
 
 fn edge_boundary_schemas(
@@ -673,11 +727,27 @@ fn target_exchange_for_edge<'a>(
         | (
             crate::sql::codegen::FragmentEdgeKind::Stream,
             super::kind::ExchangeFlavor::TopNSplit { .. },
-        )
-        | (
-            crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. },
-            super::kind::ExchangeFlavor::CteMulticast { .. },
         ) => Ok(exchange),
+        (
+            crate::sql::codegen::FragmentEdgeKind::CteMulticast {
+                cte_id,
+                receive_producer_column_ids,
+            },
+            super::kind::ExchangeFlavor::CteMulticast {
+                cte_id: exchange_cte_id,
+                receive_producer_column_ids: exchange_receive_producer_column_ids,
+            },
+        ) => {
+            if cte_id != exchange_cte_id
+                || receive_producer_column_ids != exchange_receive_producer_column_ids
+            {
+                return Err(format!(
+                    "lower_distributed_plan CTE multicast edge metadata does not match Exchange metadata for target_exchange_node_id={} in target fragment id={}",
+                    edge.target_exchange_node_id, target_fragment.fragment_id
+                ));
+            }
+            Ok(exchange)
+        }
         (crate::sql::codegen::FragmentEdgeKind::Stream, _) => Err(format!(
             "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target stream Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -4869,7 +4939,10 @@ mod tests {
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{JoinDistribution, Operator, ProjectOp, ScanOp};
+    use crate::sql::optimizer::operator::{
+        CTEAnchorOp, CTEConsumeOp, CTEProduceOp, JoinDistribution, Operator, ProjectOp, ScanOp,
+        ValuesOp,
+    };
     use crate::sql::optimizer::physical_tree::{
         OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
     };
@@ -5253,6 +5326,87 @@ mod tests {
         assert!(hash_join.other_join_conjuncts.is_none());
     }
 
+    fn cte_receive_distributed_plan_for_lowering_test(
+        producer_columns: Vec<OutputColumn>,
+        consumer_columns: Vec<OutputColumn>,
+        receive_producer_column_ids: Vec<ColumnId>,
+    ) -> DistributedPlan {
+        let cte_id = 77;
+        let produce_child = physical_node(
+            Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: producer_columns.clone(),
+            }),
+            vec![],
+            producer_columns.clone(),
+        );
+        let produce = physical_node(
+            Operator::PhysicalCTEProduce(CTEProduceOp {
+                cte_id,
+                output_columns: producer_columns.clone(),
+            }),
+            vec![produce_child],
+            producer_columns,
+        );
+        let consume = physical_node(
+            Operator::PhysicalCTEConsume(CTEConsumeOp {
+                cte_id,
+                alias: "c".to_string(),
+                output_columns: consumer_columns.clone(),
+                producer_column_ids: receive_producer_column_ids,
+            }),
+            vec![],
+            consumer_columns.clone(),
+        );
+        let anchor = physical_node(
+            Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id }),
+            vec![produce, consume],
+            consumer_columns,
+        );
+        build_distributed_plan(&anchor).expect("distributed cte plan")
+    }
+
+    #[test]
+    fn cte_multicast_edge_lowers_receive_producer_columns_to_sender_slot_ids() {
+        let p0 = output_col(10, "a", DataType::Int64, false);
+        let p2 = output_col(12, "c", DataType::Int64, false);
+        let exchange_output = vec![output_col(210, "a", DataType::Int64, false)];
+        let dp = cte_receive_distributed_plan_for_lowering_test(
+            vec![
+                p0.clone(),
+                output_col(11, "b", DataType::Int64, false),
+                p2.clone(),
+            ],
+            exchange_output,
+            vec![p2.column_id],
+        );
+
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        let result =
+            super::lower_distributed_plan(&dp, &catalog, &connectors, None).expect("lower plan");
+        let edge = result
+            .edges
+            .iter()
+            .find(|edge| matches!(edge.edge_kind, FragmentEdgeKind::CteMulticast { .. }))
+            .expect("cte edge");
+        let source_fragment = result
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == edge.source_fragment_id)
+            .expect("source fragment");
+        let expected_p2_slot_id = source_fragment
+            .desc_tbl
+            .slot_descriptors
+            .as_ref()
+            .expect("slot descriptors")
+            .iter()
+            .find(|slot| slot.col_name.as_deref() == Some("c"))
+            .and_then(|slot| slot.id)
+            .expect("producer column c slot id");
+        assert_eq!(edge.output_slot_ids, vec![expected_p2_slot_id]);
+    }
+
     #[test]
     fn lower_distributed_plan_accepts_multi_fragment_result_and_noop_children() {
         let catalog = DummyCatalog;
@@ -5612,6 +5766,7 @@ mod tests {
             ),
             stream_kind: FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: Vec::new(),
         }
     }
 

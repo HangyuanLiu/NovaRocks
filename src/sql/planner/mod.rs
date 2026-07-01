@@ -3172,11 +3172,13 @@ fn plan_relation_scoped(
             cte_id,
             alias,
             output_columns,
+            producer_column_ids,
         } => Ok(LogicalPlanNode::new(
             LogicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
                 cte_id: cte_id,
                 alias: alias,
                 output_columns: output_columns,
+                producer_column_ids: producer_column_ids,
             }),
             vec![],
             None,
