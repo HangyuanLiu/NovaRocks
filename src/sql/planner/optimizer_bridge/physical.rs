@@ -28,6 +28,7 @@ impl BridgeCtx<'_> {
                 node.op
             ));
         }
+        validate_shape(node)?;
 
         let children = node
             .children
@@ -107,7 +108,11 @@ impl BridgeCtx<'_> {
             Operator::PhysicalHashJoin(op) => {
                 let execution_mode =
                     join_execution_mode(node.execution_props.join_distribution);
-                let rf_execution_mode = runtime_filter_execution_mode(node, &op.distribution);
+                let rf_execution_mode = if node.build_runtime_filters.is_empty() {
+                    None
+                } else {
+                    Some(runtime_filter_execution_mode(node)?)
+                };
                 Ok(PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
                     join_type: op.join_type,
                     eq_conditions: op
@@ -132,7 +137,9 @@ impl BridgeCtx<'_> {
                             build_expr: materialize(self.scalars, rf.build_expr),
                             probe_expr: materialize(self.scalars, rf.probe_expr),
                             expr_order: rf.expr_order,
-                            execution_mode: rf_execution_mode,
+                            execution_mode: rf_execution_mode.expect(
+                                "runtime filter execution mode is resolved for non-empty RF list",
+                            ),
                         })
                         .collect(),
                 })))
@@ -256,6 +263,116 @@ impl BridgeCtx<'_> {
     }
 }
 
+fn validate_shape(node: &OptimizerPhysicalNode) -> Result<(), String> {
+    match &node.op {
+        Operator::PhysicalScan(_)
+        | Operator::PhysicalValues(_)
+        | Operator::PhysicalGenerateSeries(_)
+        | Operator::PhysicalCTEConsume(_) => expect_arity(node, operator_name(&node.op), 0),
+
+        Operator::PhysicalFilter(_)
+        | Operator::PhysicalProject(_)
+        | Operator::PhysicalSort(_)
+        | Operator::PhysicalLimit(_)
+        | Operator::PhysicalTopN(_)
+        | Operator::PhysicalHashAggregate(_)
+        | Operator::PhysicalAssertOneRow(_)
+        | Operator::PhysicalDecode(_)
+        | Operator::PhysicalRepeat(_)
+        | Operator::PhysicalWindow(_)
+        | Operator::PhysicalTableFunction(_)
+        | Operator::PhysicalCTEProduce(_)
+        | Operator::PhysicalDistribution(_)
+        | Operator::PhysicalAggregateStateMerge(_) => {
+            expect_arity(node, operator_name(&node.op), 1)
+        }
+
+        Operator::PhysicalHashJoin(_)
+        | Operator::PhysicalNestLoopJoin(_)
+        | Operator::PhysicalCTEAnchor(_) => expect_arity(node, operator_name(&node.op), 2),
+
+        Operator::PhysicalUnion(op) => {
+            validate_set_op_shape(node, "PhysicalUnion", &op.child_output_columns)
+        }
+        Operator::PhysicalIntersect(op) => {
+            validate_set_op_shape(node, "PhysicalIntersect", &op.child_output_columns)
+        }
+        Operator::PhysicalExcept(op) => {
+            validate_set_op_shape(node, "PhysicalExcept", &op.child_output_columns)
+        }
+
+        op if op.is_logical() => Ok(()),
+        op => Err(format!(
+            "Bridge 2a has no shape contract for physical operator {op:?}"
+        )),
+    }
+}
+
+fn expect_arity(
+    node: &OptimizerPhysicalNode,
+    operator: &'static str,
+    expected: usize,
+) -> Result<(), String> {
+    let got = node.children.len();
+    if got == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "Bridge 2a invalid {operator} shape: expected {expected} children, got {got}"
+        ))
+    }
+}
+
+fn validate_set_op_shape(
+    node: &OptimizerPhysicalNode,
+    operator: &'static str,
+    child_output_columns: &[Vec<crate::sql::common::OutputColumn>],
+) -> Result<(), String> {
+    let got = node.children.len();
+    if got == 0 {
+        return Err(format!(
+            "Bridge 2a invalid {operator} shape: expected at least 1 child, got 0"
+        ));
+    }
+    if !child_output_columns.is_empty() && child_output_columns.len() != got {
+        return Err(format!(
+            "Bridge 2a invalid {operator} shape: child_output_columns metadata expected {got} entries, got {}",
+            child_output_columns.len()
+        ));
+    }
+    Ok(())
+}
+
+fn operator_name(op: &Operator) -> &'static str {
+    match op {
+        Operator::PhysicalScan(_) => "PhysicalScan",
+        Operator::PhysicalFilter(_) => "PhysicalFilter",
+        Operator::PhysicalProject(_) => "PhysicalProject",
+        Operator::PhysicalHashJoin(_) => "PhysicalHashJoin",
+        Operator::PhysicalNestLoopJoin(_) => "PhysicalNestLoopJoin",
+        Operator::PhysicalHashAggregate(_) => "PhysicalHashAggregate",
+        Operator::PhysicalSort(_) => "PhysicalSort",
+        Operator::PhysicalLimit(_) => "PhysicalLimit",
+        Operator::PhysicalTopN(_) => "PhysicalTopN",
+        Operator::PhysicalWindow(_) => "PhysicalWindow",
+        Operator::PhysicalDistribution(_) => "PhysicalDistribution",
+        Operator::PhysicalCTEAnchor(_) => "PhysicalCTEAnchor",
+        Operator::PhysicalCTEProduce(_) => "PhysicalCTEProduce",
+        Operator::PhysicalCTEConsume(_) => "PhysicalCTEConsume",
+        Operator::PhysicalRepeat(_) => "PhysicalRepeat",
+        Operator::PhysicalUnion(_) => "PhysicalUnion",
+        Operator::PhysicalIntersect(_) => "PhysicalIntersect",
+        Operator::PhysicalExcept(_) => "PhysicalExcept",
+        Operator::PhysicalValues(_) => "PhysicalValues",
+        Operator::PhysicalGenerateSeries(_) => "PhysicalGenerateSeries",
+        Operator::PhysicalTableFunction(_) => "PhysicalTableFunction",
+        Operator::PhysicalDecode(_) => "PhysicalDecode",
+        Operator::PhysicalAggregateStateMerge(_) => "PhysicalAggregateStateMerge",
+        Operator::PhysicalAssertOneRow(_) => "PhysicalAssertOneRow",
+        _ => "LogicalOperator",
+    }
+}
+
 fn join_execution_mode(
     distribution: Option<JoinExecutionDistribution>,
 ) -> Option<JoinExecutionMode> {
@@ -268,22 +385,11 @@ fn join_execution_mode(
 
 fn runtime_filter_execution_mode(
     node: &OptimizerPhysicalNode,
-    fallback_join_distribution: &crate::sql::optimizer::operator::JoinDistribution,
-) -> JoinExecutionMode {
-    join_execution_mode(node.execution_props.join_distribution).unwrap_or(
-        match fallback_join_distribution {
-            crate::sql::optimizer::operator::JoinDistribution::Shuffle => {
-                JoinExecutionMode::Partitioned
-            }
-            crate::sql::optimizer::operator::JoinDistribution::Colocate => {
-                JoinExecutionMode::Colocate
-            }
-            crate::sql::optimizer::operator::JoinDistribution::Broadcast
-            | crate::sql::optimizer::operator::JoinDistribution::Unknown => {
-                JoinExecutionMode::Broadcast
-            }
-        },
-    )
+) -> Result<JoinExecutionMode, String> {
+    join_execution_mode(node.execution_props.join_distribution).ok_or_else(|| {
+        "Bridge 2a cannot convert hash join runtime filters without resolved join execution distribution"
+            .to_string()
+    })
 }
 
 fn convert_probe_runtime_filters(
@@ -393,12 +499,14 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::common::OutputColumn;
+    use crate::sql::common::{JoinKind, OutputColumn};
     use crate::sql::optimizer::operator::{
-        AggregateStateMergeOp, Operator, PhysicalDistributionOp, ValuesOp,
+        AggregateStateMergeOp, JoinDistribution, Operator, PhysicalDistributionOp,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, UnionOp, ValuesOp,
     };
     use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
     use crate::sql::optimizer::property::{DistributionSpec, HashSource, PhysicalPropertySet};
+    use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::{Confidence, Statistics};
     use crate::sql::planner::PhysicalPlanKind;
@@ -418,6 +526,28 @@ mod tests {
     ) -> OptimizerPhysicalNode {
         node.execution_props.scalar_arena = Some(arena);
         node
+    }
+
+    fn output_column(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn col_expr(id: u32, name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(id),
+                qualifier: None,
+                column: name.to_string(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        }
     }
 
     fn base_node(op: Operator) -> OptimizerPhysicalNode {
@@ -440,6 +570,13 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         }
+    }
+
+    fn raw_values_node() -> OptimizerPhysicalNode {
+        base_node(Operator::PhysicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![],
+        }))
     }
 
     fn values_node() -> OptimizerPhysicalNode {
@@ -498,15 +635,14 @@ mod tests {
 
     #[test]
     fn physical_distribution_becomes_redistribute_hash() {
-        let node = attach_arena(
-            base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
-                spec: DistributionSpec::HashPartitioned {
-                    cols: vec![ColumnId::new_for_test(7)],
-                    source: HashSource::ShuffleJoin,
-                },
-            })),
-            Arc::new(ScalarArena::new()),
-        );
+        let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
+            spec: DistributionSpec::HashPartitioned {
+                cols: vec![ColumnId::new_for_test(7)],
+                source: HashSource::ShuffleJoin,
+            },
+        }));
+        node.children.push(raw_values_node());
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
         let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
         let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
@@ -523,15 +659,121 @@ mod tests {
 
     #[test]
     fn physical_distribution_any_is_rejected() {
+        let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
+            spec: DistributionSpec::Any,
+        }));
+        node.children.push(raw_values_node());
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let err = optimizer_physical_to_plan(&node).expect_err("Any should be rejected");
+        assert!(err.contains("DistributionSpec::Any"));
+    }
+
+    #[test]
+    fn malformed_distribution_arity_is_rejected() {
         let node = attach_arena(
             base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
-                spec: DistributionSpec::Any,
+                spec: DistributionSpec::Gather,
             })),
             Arc::new(ScalarArena::new()),
         );
 
-        let err = optimizer_physical_to_plan(&node).expect_err("Any should be rejected");
-        assert!(err.contains("DistributionSpec::Any"));
+        let err = optimizer_physical_to_plan(&node).expect_err("distribution needs one child");
+        assert!(err.contains("PhysicalDistribution"));
+        assert!(err.contains("expected 1 children, got 0"));
+    }
+
+    #[test]
+    fn malformed_hash_join_arity_is_rejected() {
+        let mut node = base_node(Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        }));
+        node.children.push(raw_values_node());
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let err = optimizer_physical_to_plan(&node).expect_err("hash join needs two children");
+        assert!(err.contains("PhysicalHashJoin"));
+        assert!(err.contains("expected 2 children, got 1"));
+    }
+
+    #[test]
+    fn set_op_child_output_metadata_mismatch_is_rejected() {
+        let mut node = base_node(Operator::PhysicalUnion(UnionOp {
+            all: true,
+            output_columns: vec![output_column(1, "u")],
+            child_output_columns: vec![vec![output_column(2, "c0")]],
+        }));
+        node.children.push(raw_values_node());
+        node.children.push(raw_values_node());
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let err = optimizer_physical_to_plan(&node).expect_err("set-op metadata must match");
+        assert!(err.contains("PhysicalUnion"));
+        assert!(err.contains("child_output_columns metadata expected 2 entries, got 1"));
+    }
+
+    fn hash_join_with_runtime_filter(
+        join_distribution: Option<JoinExecutionDistribution>,
+    ) -> OptimizerPhysicalNode {
+        let mut arena = ScalarArena::new();
+        let left = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_expr(1, "l"),
+        );
+        let right = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_expr(2, "r"),
+        );
+        let mut node = base_node(Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left,
+                right,
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Shuffle,
+        }));
+        node.children.push(raw_values_node());
+        node.children.push(raw_values_node());
+        node.execution_props.join_distribution = join_distribution;
+        node.build_runtime_filters.push(RuntimeFilterDesc {
+            filter_id: 11,
+            build_expr: right,
+            probe_expr: left,
+            expr_order: 0,
+            distribution: JoinDistribution::Shuffle,
+        });
+        attach_arena(node, Arc::new(arena))
+    }
+
+    #[test]
+    fn hash_join_build_runtime_filter_requires_resolved_execution_distribution() {
+        let node = hash_join_with_runtime_filter(None);
+
+        let err = optimizer_physical_to_plan(&node).expect_err("RF needs resolved execution mode");
+        assert!(err.contains(
+            "Bridge 2a cannot convert hash join runtime filters without resolved join execution distribution"
+        ));
+    }
+
+    #[test]
+    fn hash_join_build_runtime_filter_uses_resolved_partitioned_execution_mode() {
+        let node = hash_join_with_runtime_filter(Some(JoinExecutionDistribution::Partitioned));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let PhysicalPlanKind::HashJoin(join) = physical.kind else {
+            panic!("expected HashJoin");
+        };
+        assert_eq!(join.build_runtime_filters.len(), 1);
+        assert_eq!(
+            join.build_runtime_filters[0].execution_mode,
+            JoinExecutionMode::Partitioned
+        );
+        assert_eq!(join.execution_mode, Some(JoinExecutionMode::Partitioned));
     }
 
     #[test]
@@ -550,17 +792,16 @@ mod tests {
 
     #[test]
     fn bridge_rejects_aggregate_state_merge_with_pir7_message() {
-        let node = attach_arena(
-            base_node(Operator::PhysicalAggregateStateMerge(
-                AggregateStateMergeOp {
-                    group_key_names: vec![],
-                    aggregate_state_names: vec![],
-                    change_op_column: "op".to_string(),
-                    output_columns: vec![],
-                },
-            )),
-            Arc::new(ScalarArena::new()),
-        );
+        let mut node = base_node(Operator::PhysicalAggregateStateMerge(
+            AggregateStateMergeOp {
+                group_key_names: vec![],
+                aggregate_state_names: vec![],
+                change_op_column: "op".to_string(),
+                output_columns: vec![],
+            },
+        ));
+        node.children.push(raw_values_node());
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
         let err = optimizer_physical_to_plan(&node).expect_err("IMV direct-exec op is PIR-7");
         assert!(err.contains("PIR-7"));
