@@ -11,12 +11,23 @@ mod distributed_node;
 pub(crate) mod imv_rewrite;
 pub(crate) mod optimizer_bridge;
 pub(crate) mod plan;
+pub(crate) mod runtime_filter;
+pub(crate) mod stats;
 
 pub(crate) use distributed_build::build_distributed_plan;
 pub(crate) use distributed_fragment::{
     DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment,
 };
 pub(crate) use distributed_node::{DistributedPlanKind, DistributedPlanNode, PlanNodeStats};
+#[allow(unused_imports)]
+pub(crate) use runtime_filter::{
+    JoinExecutionMode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+};
+#[allow(unused_imports)]
+pub(crate) use stats::{
+    PhysicalPlanStats, PlannerBroadcastDecision, PlannerColumnStatistic, PlannerConfidence,
+    PlannerCostEstimate,
+};
 
 use arrow::datatypes::DataType;
 

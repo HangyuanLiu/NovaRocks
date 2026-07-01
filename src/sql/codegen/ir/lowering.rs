@@ -5587,6 +5587,8 @@ mod tests {
             }],
             other_condition: None,
             distribution: JoinDistribution::Broadcast,
+            execution_mode: None,
+            build_runtime_filters: Vec::new(),
         };
 
         let (plan_node, scope, tuple_ids) = {
@@ -5634,6 +5636,8 @@ mod tests {
             }],
             other_condition: None,
             distribution: JoinDistribution::Broadcast,
+            execution_mode: None,
+            build_runtime_filters: Vec::new(),
         };
 
         let plan_node = {
@@ -5670,6 +5674,8 @@ mod tests {
             }],
             other_condition: None,
             distribution: JoinDistribution::Broadcast,
+            execution_mode: None,
+            build_runtime_filters: Vec::new(),
         };
 
         let plan_node = {

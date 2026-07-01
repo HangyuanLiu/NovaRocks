@@ -366,6 +366,8 @@ impl<'a> DistributedPlanBuilder<'a> {
                             .other_condition
                             .map(|condition| materialize(self.scalars, condition)),
                         distribution: op.distribution.clone(),
+                        execution_mode: None,
+                        build_runtime_filters: Vec::new(),
                     })),
                 })
             }
