@@ -386,7 +386,9 @@ fn build_update_mor_change_event_expand_plan(
         ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec, Operator,
         PhysicalDistributionOp,
     };
-    use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+    use crate::sql::optimizer::physical_tree::{
+        OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
+    };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
 
@@ -407,6 +409,7 @@ fn build_update_mor_change_event_expand_plan(
         }),
         children: vec![physical],
         stats: child_stats.clone(),
+        explain_stats: OptimizerExplainStats::default(),
         output_columns: child_outputs.clone(),
         execution_props: PlanExecutionProps::default(),
         build_runtime_filters: Vec::new(),
@@ -586,6 +589,7 @@ fn build_update_mor_change_event_expand_plan(
         }),
         children: vec![distributed],
         stats,
+        explain_stats: OptimizerExplainStats::default(),
         output_columns,
         execution_props: PlanExecutionProps::default(),
         build_runtime_filters: Vec::new(),
@@ -608,7 +612,9 @@ fn build_merge_mor_change_event_expand_plan(
         ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec, Operator,
         PhysicalDistributionOp,
     };
-    use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+    use crate::sql::optimizer::physical_tree::{
+        OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
+    };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
 
@@ -630,6 +636,7 @@ fn build_merge_mor_change_event_expand_plan(
         }),
         children: vec![physical],
         stats: child_stats.clone(),
+        explain_stats: OptimizerExplainStats::default(),
         output_columns: child_outputs.clone(),
         execution_props: PlanExecutionProps::default(),
         build_runtime_filters: Vec::new(),
@@ -873,6 +880,7 @@ fn build_merge_mor_change_event_expand_plan(
         }),
         children: vec![distributed],
         stats,
+        explain_stats: OptimizerExplainStats::default(),
         output_columns,
         execution_props: PlanExecutionProps::default(),
         build_runtime_filters: Vec::new(),
@@ -3608,7 +3616,9 @@ mod tests {
 
     fn update_mor_expand_child_plan_for_test() -> crate::sql::optimizer::OptimizerPhysicalNode {
         use crate::sql::optimizer::operator::{Operator, ValuesOp};
-        use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+        use crate::sql::optimizer::physical_tree::{
+            OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
+        };
         use crate::sql::optimizer::statistics::Statistics;
 
         let output_columns = vec![
@@ -3630,6 +3640,7 @@ mod tests {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
@@ -3646,7 +3657,9 @@ mod tests {
         include_insert_qty: bool,
     ) -> crate::sql::optimizer::OptimizerPhysicalNode {
         use crate::sql::optimizer::operator::{Operator, ValuesOp};
-        use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+        use crate::sql::optimizer::physical_tree::{
+            OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
+        };
         use crate::sql::optimizer::statistics::Statistics;
 
         let mut output_columns = vec![
@@ -3681,6 +3694,7 @@ mod tests {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
