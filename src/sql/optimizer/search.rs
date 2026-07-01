@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::cost::{CostInput, CostOptions, compute_cost_estimate};
+use super::cost::{CostInput, CostOptions, broadcast_decision, compute_cost_estimate};
 use super::derive::PropertyAlternativeKind;
 use super::memo::{GroupId, Memo, TotalCost};
 #[cfg(test)]
@@ -32,6 +32,9 @@ pub(crate) struct Winner {
     /// Index into `group.physical_exprs`.
     pub(crate) expr_index: usize,
     pub(crate) cost_estimate: CostEstimate,
+    pub(crate) operator_cost_estimate: CostEstimate,
+    pub(crate) enforcer_cost_estimate: Option<CostEstimate>,
+    pub(crate) operator_broadcast_decision: Option<super::cost::BroadcastDecision>,
     pub(crate) total_cost: TotalCost,
     /// If present, the winner needs an enforcer on top of the physical expr.
     pub(crate) enforcer: Option<EnforcerInfo>,
@@ -50,6 +53,9 @@ impl Winner {
         group_id: GroupId,
         expr_index: usize,
         cost_estimate: CostEstimate,
+        operator_cost_estimate: CostEstimate,
+        enforcer_cost_estimate: Option<CostEstimate>,
+        operator_broadcast_decision: Option<super::cost::BroadcastDecision>,
         cost_options: &CostOptions,
         enforcer: Option<EnforcerInfo>,
         output: PhysicalPropertySet,
@@ -62,6 +68,9 @@ impl Winner {
             group_id,
             expr_index,
             cost_estimate,
+            operator_cost_estimate,
+            enforcer_cost_estimate,
+            operator_broadcast_decision,
             total_cost,
             enforcer,
             output,
@@ -94,7 +103,10 @@ impl Winner {
         Self {
             group_id,
             expr_index,
+            operator_cost_estimate: cost_estimate.clone(),
             cost_estimate,
+            enforcer_cost_estimate: None,
+            operator_broadcast_decision: None,
             total_cost,
             enforcer,
             output,
@@ -109,6 +121,9 @@ impl Winner {
             group_id,
             expr_index: 0,
             cost_estimate: CostEstimate::default(),
+            operator_cost_estimate: CostEstimate::default(),
+            enforcer_cost_estimate: None,
+            operator_broadcast_decision: None,
             total_cost: f64::INFINITY,
             enforcer: None,
             output: PhysicalPropertySet::any(),
@@ -202,6 +217,9 @@ impl SearchContext {
 
         let mut best_cost = f64::INFINITY;
         let mut best_cost_estimate = CostEstimate::default();
+        let mut best_operator_cost_estimate = CostEstimate::default();
+        let mut best_enforcer_cost_estimate = None;
+        let mut best_operator_broadcast_decision = None;
         let mut best_index: usize = 0;
         let mut best_enforcer: Option<EnforcerInfo> = None;
         let mut best_output = PhysicalPropertySet::any();
@@ -295,6 +313,7 @@ impl SearchContext {
                     options: &self.cost_options,
                 };
                 let operator_estimate = compute_cost_estimate(&cost_input).sanitized();
+                let operator_broadcast_decision = broadcast_decision(&cost_input);
                 let mut candidate_estimate = child_cost_estimate.add_sanitized(&operator_estimate);
                 let provided = super::derive::derive_output_for_alternative(
                     &expr.op,
@@ -304,8 +323,10 @@ impl SearchContext {
                 );
 
                 // Bridge provided → required via enforcer if needed.
-                let (actual_output, enforcer_info) = if provided.satisfies(required) {
-                    (provided, None)
+                let (actual_output, enforcer_info, candidate_enforcer_estimate) = if provided
+                    .satisfies(required)
+                {
+                    (provided, None, None)
                 } else {
                     let enforcers = super::derive::needed_enforcers(required, &provided);
                     if enforcers.is_empty() {
@@ -313,6 +334,7 @@ impl SearchContext {
                     }
                     let group_stats =
                         stats_for_group(&memo.groups[group_id], memo, &self.stats_input);
+                    let mut candidate_enforcer_estimate: Option<CostEstimate> = None;
                     for enforcer in &enforcers {
                         let enforcer_estimate = super::derive::estimate_enforcer_cost_estimate(
                             enforcer,
@@ -320,6 +342,11 @@ impl SearchContext {
                             &self.cost_options,
                         )
                         .sanitized();
+                        candidate_enforcer_estimate = Some(
+                            candidate_enforcer_estimate
+                                .unwrap_or_default()
+                                .add_sanitized(&enforcer_estimate),
+                        );
                         candidate_estimate = candidate_estimate.add_sanitized(&enforcer_estimate);
                     }
                     let kind = enforcers.into_iter().next().unwrap();
@@ -329,6 +356,7 @@ impl SearchContext {
                             kind,
                             child_props: provided,
                         }),
+                        candidate_enforcer_estimate,
                     )
                 };
                 let candidate_cost = candidate_estimate.total_with_options(&self.cost_options);
@@ -336,6 +364,9 @@ impl SearchContext {
                 if candidate_cost < best_cost {
                     best_cost = candidate_cost;
                     best_cost_estimate = candidate_estimate;
+                    best_operator_cost_estimate = operator_estimate.clone();
+                    best_enforcer_cost_estimate = candidate_enforcer_estimate;
+                    best_operator_broadcast_decision = operator_broadcast_decision;
                     best_index = expr_idx;
                     best_enforcer = enforcer_info;
                     best_output = actual_output;
@@ -358,6 +389,9 @@ impl SearchContext {
                 group_id,
                 best_index,
                 best_cost_estimate,
+                best_operator_cost_estimate,
+                best_enforcer_cost_estimate,
+                best_operator_broadcast_decision,
                 &self.cost_options,
                 best_enforcer,
                 best_output,
@@ -971,6 +1005,58 @@ mod tests {
     }
 
     #[test]
+    fn search_records_operator_and_enforcer_explain_costs_separately() {
+        let (memo, gid) = single_scan_memo();
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
+        let required = PhysicalPropertySet::gather();
+
+        ctx.optimize_group(&memo, gid, &required).expect("search");
+
+        let winner = ctx.winners.get(&(gid, required.clone())).expect("winner");
+        let expr = memo.groups[gid]
+            .physical_exprs
+            .get(winner.expr_index)
+            .expect("winner expression");
+        let own_stats = stats_for_group(&memo.groups[gid], &memo, &ctx.stats_input);
+        let child_outputs: Vec<&PhysicalPropertySet> = Vec::new();
+        let child_stats: Vec<&crate::sql::optimizer::statistics::Statistics> = Vec::new();
+        let scan_input = CostInput {
+            op: &expr.op,
+            own_stats: &own_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_outputs,
+            required_output: &required,
+            alt_kind: &winner.alt_kind,
+            scalars: Some(&memo.scalars),
+            options: &ctx.cost_options,
+        };
+        let scan_estimate = super::super::cost::compute_cost_estimate(&scan_input).sanitized();
+        let enforcer = winner
+            .enforcer
+            .as_ref()
+            .expect("gather requirement should require distribution enforcer");
+        let enforcer_estimate = super::super::derive::estimate_enforcer_cost_estimate(
+            &enforcer.kind,
+            &own_stats,
+            &ctx.cost_options,
+        )
+        .sanitized();
+
+        assert_cost_estimate_close(&winner.operator_cost_estimate, &scan_estimate);
+        assert_cost_estimate_close(
+            winner
+                .enforcer_cost_estimate
+                .as_ref()
+                .expect("enforcer explain cost"),
+            &enforcer_estimate,
+        );
+        assert_cost_estimate_close(
+            &winner.cost_estimate,
+            &scan_estimate.add_sanitized(&enforcer_estimate),
+        );
+    }
+
+    #[test]
     fn search_returned_total_matches_winner_flattened_cost_for_finite_scan_path() {
         let (memo, gid) = single_scan_memo();
         let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
@@ -1201,6 +1287,9 @@ mod tests {
             7,
             3,
             estimate.clone(),
+            estimate.clone(),
+            None,
+            None,
             &options,
             None,
             PhysicalPropertySet::gather(),
@@ -1224,7 +1313,10 @@ mod tests {
         let winner = Winner::new(
             7,
             3,
+            estimate.clone(),
             estimate,
+            None,
+            None,
             &options,
             None,
             PhysicalPropertySet::gather(),

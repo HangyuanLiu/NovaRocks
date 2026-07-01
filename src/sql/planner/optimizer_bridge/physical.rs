@@ -43,6 +43,7 @@ mod tests {
                 row_count_confidence: Confidence::Exact,
                 ..Default::default()
             },
+            explain_stats: Default::default(),
             output_columns: vec![],
             execution_props: PlanExecutionProps {
                 output_property: PhysicalPropertySet::gather(),
@@ -50,7 +51,6 @@ mod tests {
                 join_distribution: None,
                 scalar_arena: None,
             },
-            explain_stats: Default::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         })
