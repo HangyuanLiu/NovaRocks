@@ -126,6 +126,96 @@ impl DistributedPlanBuilderV2 {
                     Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]))
                 }
             }
+            PhysicalPlanKind::Sort(_) => {
+                expect_child_count(node, 1)?;
+                let child = self.visit(&node.children[0], fragment_id)?;
+                let node_id = self.alloc_node();
+                let tuple_ids = child.tuple_ids.clone();
+                Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]))
+            }
+            PhysicalPlanKind::HashAggregate(_) => {
+                expect_child_count(node, 1)?;
+                let child = self.visit(&node.children[0], fragment_id)?;
+                let tuple_id = self.alloc_tuple();
+                let node_id = self.alloc_node();
+                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
+            }
+            PhysicalPlanKind::HashJoin(_) => {
+                expect_child_count(node, 2)?;
+                let left = self.visit(&node.children[0], fragment_id)?;
+                let right = self.visit(&node.children[1], fragment_id)?;
+                let node_id = self.alloc_node();
+                let mut tuple_ids = left.tuple_ids.clone();
+                tuple_ids.extend(right.tuple_ids.iter().copied());
+                Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![left, right]))
+            }
+            PhysicalPlanKind::NestLoopJoin(_) => {
+                expect_child_count(node, 2)?;
+                let left = self.visit(&node.children[0], fragment_id)?;
+                let right = self.visit(&node.children[1], fragment_id)?;
+                let node_id = self.alloc_node();
+                let mut tuple_ids = left.tuple_ids.clone();
+                tuple_ids.extend(right.tuple_ids.iter().copied());
+                Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![left, right]))
+            }
+            PhysicalPlanKind::AssertOneRow(_) => {
+                expect_child_count(node, 1)?;
+                let child = self.visit(&node.children[0], fragment_id)?;
+                let node_id = self.alloc_node();
+                let tuple_ids = child.tuple_ids.clone();
+                Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]))
+            }
+            PhysicalPlanKind::Decode(_) => {
+                expect_child_count(node, 1)?;
+                let child = self.visit(&node.children[0], fragment_id)?;
+                let tuple_id = self.alloc_tuple();
+                let node_id = self.alloc_node();
+                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
+            }
+            PhysicalPlanKind::Repeat(repeat) => {
+                expect_child_count(node, 1)?;
+                let child = self.visit(&node.children[0], fragment_id)?;
+                let node_id = self.alloc_node();
+                let virtual_tuple_id = self.alloc_tuple();
+                let mut tuple_ids = child.tuple_ids.clone();
+                if !repeat.grouping_fn_args.is_empty() {
+                    tuple_ids.push(virtual_tuple_id);
+                }
+                let mut payload = repeat.clone();
+                payload.virtual_tuple_id = Some(virtual_tuple_id);
+                Ok(self.make_node_with_payload(
+                    node,
+                    fragment_id,
+                    node_id,
+                    tuple_ids,
+                    vec![child],
+                    PhysicalPlanKind::Repeat(payload),
+                ))
+            }
+            PhysicalPlanKind::ChangeEventExpand(_) => {
+                expect_child_count(node, 1)?;
+                let child = self.visit(&node.children[0], fragment_id)?;
+                let tuple_id = self.alloc_tuple();
+                let node_id = self.alloc_node();
+                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
+            }
+            PhysicalPlanKind::GenerateSeries(_) => {
+                expect_child_count(node, 0)?;
+                let _ = self.alloc_tuple();
+                let _ = self.alloc_node();
+                let tuple_id = self.alloc_tuple();
+                let node_id = self.alloc_node();
+                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], Vec::new()))
+            }
+            PhysicalPlanKind::TableFunction(_) => {
+                expect_child_count(node, 1)?;
+                let child = self.visit(&node.children[0], fragment_id)?;
+                let _ = self.alloc_tuple();
+                let _ = self.alloc_node();
+                let tuple_id = self.alloc_tuple();
+                let node_id = self.alloc_node();
+                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
+            }
             other => Err(format!(
                 "build_distributed_plan_v2 does not handle PhysicalPlanKind::{} yet",
                 physical_kind_name(other)
@@ -141,6 +231,25 @@ impl DistributedPlanBuilderV2 {
         tuple_ids: Vec<i32>,
         children: Vec<DistributedNode>,
     ) -> DistributedNode {
+        self.make_node_with_payload(
+            node,
+            fragment_id,
+            node_id,
+            tuple_ids,
+            children,
+            node.kind.clone(),
+        )
+    }
+
+    fn make_node_with_payload(
+        &self,
+        node: &PhysicalPlanNode,
+        fragment_id: FragmentId,
+        node_id: i32,
+        tuple_ids: Vec<i32>,
+        children: Vec<DistributedNode>,
+        payload: PhysicalPlanKind,
+    ) -> DistributedNode {
         DistributedNode {
             node_id,
             fragment_id,
@@ -151,7 +260,7 @@ impl DistributedPlanBuilderV2 {
             probe_runtime_filters: Vec::new(),
             children,
             stats: node.stats.clone(),
-            payload: DistributedPayload::Physical(node.kind.clone()),
+            payload: DistributedPayload::Physical(payload),
         }
     }
 }
@@ -204,15 +313,19 @@ mod tests {
 
     use super::build_distributed_plan_v2;
     use crate::sql::analysis::{
-        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::{AggMode, AggregateOutputLayout, JoinDistribution};
     use crate::sql::planner::distributed_fragment::{DataSink, PartitionKind};
     use crate::sql::planner::distributed_node::DistributedPayload;
     use crate::sql::planner::plan::{
-        PhysicalPlanKind, PhysicalPlanNode, PlanFilterNode, PlanProjectNode, PlanScanNode,
-        PlanSortNode, PlanValuesNode,
+        DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
+        PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode, PlanAssertOneRowNode,
+        PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
+        PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, RedistributeMode,
+        RedistributeNode,
     };
     use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
 
@@ -464,44 +577,347 @@ mod tests {
     }
 
     #[test]
-    fn build_distributed_plan_v2_rejects_unsupported_sort_root() {
-        let scan_columns = vec![output_col(1, "k", DataType::Int64, false)];
-        let scan = PhysicalPlanNode {
-            kind: PhysicalPlanKind::Scan(PlanScanNode {
-                database: "db".to_string(),
-                table: table_def(),
-                alias: Some("t".to_string()),
-                columns: scan_columns.clone(),
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![],
-                variant_columns: vec![],
-                mv_rewritten_from: None,
-            }),
-            children: vec![],
-            output_columns: scan_columns.clone(),
-            stats: stats(),
-            probe_runtime_filters: vec![],
-        };
+    fn build_distributed_plan_v2_sort_reuses_child_tuple() {
+        let scan = scan_node(1, "k");
         let sort = PhysicalPlanNode {
             kind: PhysicalPlanKind::Sort(PlanSortNode {
                 items: vec![],
                 analytic_partition_by: vec![],
-                output_columns: scan_columns.clone(),
+                output_columns: scan.output_columns.clone(),
                 offset: None,
                 partition_limit: None,
                 topn_type: None,
             }),
             children: vec![scan],
-            output_columns: scan_columns,
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
             stats: stats(),
             probe_runtime_filters: vec![],
         };
 
-        let err = build_distributed_plan_v2(&sort).expect_err("Sort is not supported in M3a2");
+        let dp = build_distributed_plan_v2(&sort).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Sort(_))
+        ));
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![1]);
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].node_id, 1);
+        assert!(matches!(
+            &root.children[0].payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
+        ));
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_hash_aggregate_allocates_new_tuple() {
+        let scan = scan_node(1, "k");
+        let aggregate = PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
+                mode: AggMode::Single,
+                group_by: vec![],
+                aggregates: vec![],
+                is_merge: vec![],
+                output_layout: AggregateOutputLayout::new(vec![], vec![]),
+                output_columns: vec![],
+            })),
+            children: vec![scan],
+            output_columns: vec![],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&aggregate).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::HashAggregate(_))
+        ));
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![2]);
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].tuple_ids, vec![1]);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_hash_join_combines_child_tuples() {
+        let left = scan_node(1, "l_k");
+        let right = scan_node(2, "r_k");
+        let output_columns = vec![
+            output_col(1, "l_k", DataType::Int64, false),
+            output_col(2, "r_k", DataType::Int64, false),
+        ];
+        let join = PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![],
+                other_condition: None,
+                distribution: JoinDistribution::Unknown,
+                execution_mode: None,
+                build_runtime_filters: vec![],
+            })),
+            children: vec![left, right],
+            output_columns,
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&join).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::HashJoin(_))
+        ));
+        assert_eq!(root.node_id, 3);
+        assert_eq!(root.tuple_ids, vec![1, 2]);
+        assert_eq!(root.children.len(), 2);
+        assert_eq!(root.children[0].node_id, 1);
+        assert_eq!(root.children[0].tuple_ids, vec![1]);
+        assert_eq!(root.children[1].node_id, 2);
+        assert_eq!(root.children[1].tuple_ids, vec![2]);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_nest_loop_join_combines_child_tuples() {
+        let left = scan_node(1, "l_k");
+        let right = scan_node(2, "r_k");
+        let join = PhysicalPlanNode {
+            kind: PhysicalPlanKind::NestLoopJoin(PhysicalNestLoopJoinNode {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            children: vec![left, right],
+            output_columns: vec![
+                output_col(1, "l_k", DataType::Int64, false),
+                output_col(2, "r_k", DataType::Int64, false),
+            ],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&join).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::NestLoopJoin(_))
+        ));
+        assert_eq!(root.node_id, 3);
+        assert_eq!(root.tuple_ids, vec![1, 2]);
+        assert_eq!(root.children[0].tuple_ids, vec![1]);
+        assert_eq!(root.children[1].tuple_ids, vec![2]);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_assert_one_row_reuses_child_tuple() {
+        let scan = scan_node(1, "k");
+        let assert_one_row = PhysicalPlanNode {
+            kind: PhysicalPlanKind::AssertOneRow(PlanAssertOneRowNode {
+                subquery_text: "select k from t".to_string(),
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&assert_one_row).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::AssertOneRow(_))
+        ));
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![1]);
+        assert_eq!(root.children[0].node_id, 1);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_decode_and_change_event_expand_allocate_new_tuple() {
+        let scan = scan_node(1, "k");
+        let decode = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Decode(PlanDecodeNode {
+                mappings: vec![],
+                output_columns: vec![output_col(2, "decoded", DataType::Utf8, false)],
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(2, "decoded", DataType::Utf8, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&decode).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Decode(_))
+        ));
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![2]);
+        assert_eq!(root.children[0].tuple_ids, vec![1]);
+
+        let scan = scan_node(1, "k");
+        let expand = PhysicalPlanNode {
+            kind: PhysicalPlanKind::ChangeEventExpand(DistributedChangeEventExpandNode {
+                events: vec![],
+                output_columns: vec![
+                    output_col(2, "payload", DataType::Int64, false),
+                    output_col(3, "change_op", DataType::Int64, false),
+                ],
+                change_op_column_id: ColumnId::new_for_test(3),
+                data_route_column_id: None,
+            }),
+            children: vec![scan],
+            output_columns: vec![
+                output_col(2, "payload", DataType::Int64, false),
+                output_col(3, "change_op", DataType::Int64, false),
+            ],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&expand).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::ChangeEventExpand(_))
+        ));
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![2]);
+        assert_eq!(root.children[0].tuple_ids, vec![1]);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_repeat_appends_virtual_tuple_only_when_grouping_fn_args_present() {
+        let scan = scan_node(1, "k");
+        let repeat = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Repeat(repeat_node(false)),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&repeat).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        let repeat = match &root.payload {
+            DistributedPayload::Physical(PhysicalPlanKind::Repeat(repeat)) => repeat,
+            other => panic!("expected Repeat root, got {other:?}"),
+        };
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![1]);
+        assert_eq!(repeat.virtual_tuple_id, Some(2));
+
+        let scan = scan_node(1, "k");
+        let repeat = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Repeat(repeat_node(true)),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&repeat).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        let repeat = match &root.payload {
+            DistributedPayload::Physical(PhysicalPlanKind::Repeat(repeat)) => repeat,
+            other => panic!("expected Repeat root, got {other:?}"),
+        };
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![1, 2]);
+        assert_eq!(repeat.virtual_tuple_id, Some(2));
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_generate_series_replicates_dummy_allocations() {
+        let output_columns = vec![output_col(1, "x", DataType::Int64, false)];
+        let generate_series = PhysicalPlanNode {
+            kind: PhysicalPlanKind::GenerateSeries(PlanGenerateSeriesNode {
+                start: 1,
+                end: 3,
+                step: 1,
+                column_name: "x".to_string(),
+                alias: None,
+                output_column_id: ColumnId::new_for_test(1),
+            }),
+            children: vec![],
+            output_columns,
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&generate_series).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::GenerateSeries(_))
+        ));
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![2]);
+        assert!(root.children.is_empty());
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_table_function_replicates_dummy_allocations() {
+        let scan = scan_node(1, "k");
+        let output_columns = vec![output_col(2, "item", DataType::Int64, false)];
+        let table_function = PhysicalPlanNode {
+            kind: PhysicalPlanKind::TableFunction(PlanTableFunctionNode {
+                function_name: "unnest".to_string(),
+                args: vec![],
+                output_columns: output_columns.clone(),
+                alias: None,
+                is_left_join: false,
+            }),
+            children: vec![scan],
+            output_columns,
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&table_function).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::TableFunction(_))
+        ));
+        assert_eq!(root.node_id, 3);
+        assert_eq!(root.tuple_ids, vec![3]);
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].node_id, 1);
+        assert_eq!(root.children[0].tuple_ids, vec![1]);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_rejects_unsupported_redistribute_root() {
+        let scan = scan_node(1, "k");
+        let redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Gather,
+                output_columns: scan.output_columns.clone(),
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let err = build_distributed_plan_v2(&redistribute)
+            .expect_err("Redistribute is not supported in M3a3");
 
         assert!(
-            err.contains("PhysicalPlanKind::Sort"),
+            err.contains("PhysicalPlanKind::Redistribute"),
             "unexpected error: {err}"
         );
         assert!(err.contains("does not handle"), "unexpected error: {err}");
@@ -554,6 +970,58 @@ mod tests {
                 db_id: 1,
                 table_id: 2,
             },
+        }
+    }
+
+    fn scan_node(column_id: u32, column_name: &str) -> PhysicalPlanNode {
+        let scan_columns = vec![output_col(column_id, column_name, DataType::Int64, false)];
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::Scan(PlanScanNode {
+                database: "db".to_string(),
+                table: table_def(),
+                alias: Some("t".to_string()),
+                columns: scan_columns.clone(),
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            children: vec![],
+            output_columns: scan_columns,
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    fn repeat_node(with_grouping_fn_arg: bool) -> PlanRepeatNode {
+        let grouping_fn_args = if with_grouping_fn_arg {
+            vec![("grouping_k".to_string(), vec!["k".to_string()])]
+        } else {
+            vec![]
+        };
+        let grouping_fn_arg_ids = if with_grouping_fn_arg {
+            vec![vec![ColumnId::new_for_test(1)]]
+        } else {
+            vec![]
+        };
+        let grouping_fn_ids = if with_grouping_fn_arg {
+            vec![("grouping_k".to_string(), ColumnId::new_for_test(2))]
+        } else {
+            vec![]
+        };
+
+        PlanRepeatNode {
+            repeat_column_ref_list: vec![],
+            repeat_column_ref_ids: vec![],
+            grouping_ids: vec![],
+            all_rollup_columns: vec![],
+            all_rollup_column_ids: vec![],
+            grouping_key_aliases: vec![],
+            grouping_fn_args,
+            grouping_fn_arg_ids,
+            grouping_fn_ids,
+            virtual_tuple_id: None,
         }
     }
 
