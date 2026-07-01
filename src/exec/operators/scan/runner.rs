@@ -66,6 +66,9 @@ const JOIN_RUNTIME_FILTER_OUTPUT_ROWS: &str = "JoinRuntimeFilterOutputRows";
 const JOIN_RUNTIME_FILTER_EVALUATE: &str = "JoinRuntimeFilterEvaluate";
 const RUNTIME_FILTER_NUM: &str = "RuntimeFilterNum";
 const RUNTIME_IN_FILTER_NUM: &str = "RuntimeInFilterNum";
+const RUNTIME_FILTER_PLANNED: &str = "RuntimeFilterPlanned";
+const RUNTIME_FILTER_COMPLETE: &str = "RuntimeFilterComplete";
+const RUNTIME_FILTER_UNAVAILABLE: &str = "RuntimeFilterUnavailable";
 const SCAN_ASYNC_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 const IO_TASK_EXEC_TIME: &str = "IOTaskExecTime";
 const SCAN_TIME: &str = "ScanTime";
@@ -444,6 +447,31 @@ impl ScanAsyncRunner {
             }
         } else {
             self.runtime_filter_ctx = None;
+        }
+        if let Some(profile) = self.profiles.as_ref() {
+            profile
+                .common
+                .counter_set_unit(RUNTIME_FILTER_PLANNED, self.runtime_filters_expected as i64);
+            match &acquired {
+                AcquiredRuntimeFilters::Complete(snapshot) => {
+                    let complete = snapshot.in_filters().len()
+                        + snapshot.membership_filters().len()
+                        + snapshot.min_max_filters().len();
+                    profile
+                        .common
+                        .counter_set_unit(RUNTIME_FILTER_COMPLETE, complete as i64);
+                    profile
+                        .common
+                        .counter_set_unit(RUNTIME_FILTER_UNAVAILABLE, 0);
+                }
+                AcquiredRuntimeFilters::Unavailable(_) => {
+                    profile.common.counter_set_unit(RUNTIME_FILTER_COMPLETE, 0);
+                    profile.common.counter_set_unit(
+                        RUNTIME_FILTER_UNAVAILABLE,
+                        self.runtime_filters_expected as i64,
+                    );
+                }
+            }
         }
         self.acquired = Some(acquired);
         self.runtime_filters_loaded = true;
@@ -2013,6 +2041,9 @@ mod tests {
         )));
         let mut runtime_filter_exprs = HashMap::new();
         runtime_filter_exprs.insert(7, expr);
+        let profiles = crate::runtime::profile::OperatorProfiles::new(
+            crate::runtime::profile::RuntimeProfile::new("scan"),
+        );
         let mut runner = ScanAsyncRunner::new(
             "scan".to_string(),
             scan,
@@ -2021,13 +2052,25 @@ mod tests {
             runtime_filter_exprs,
             1,
             arena,
-            None,
+            Some(profiles.clone()),
             0,
         );
         let state = ScanAsyncState::new(1, "runtime-filter-snapshot-test".to_string());
         runner
             .prepare_runtime_filters(&state)
             .expect("prepare runtime filters");
+        assert_eq!(
+            profiles.common.counter_value(RUNTIME_FILTER_PLANNED),
+            Some(1)
+        );
+        assert_eq!(
+            profiles.common.counter_value(RUNTIME_FILTER_COMPLETE),
+            Some(1)
+        );
+        assert_eq!(
+            profiles.common.counter_value(RUNTIME_FILTER_UNAVAILABLE),
+            Some(0)
+        );
 
         hub.publish_min_max_filter(
             7,
