@@ -897,8 +897,16 @@ fn insert_or_reuse_project_below(
                     .map(|item| output_column_for_project_item(scalars, item)),
             );
             project.items.extend(prelude);
-            return;
         }
+        child.explain_stats = synthetic_project_explain_stats(
+            &child.op,
+            &child.stats,
+            &child.children[0],
+            &child.execution_props.output_property,
+            scalars,
+            cost_options,
+        );
+        return;
     }
 
     wrap_project_around_child(child, prelude, scalars, cost_options);
@@ -2151,7 +2159,10 @@ mod tests {
                 columns: vec![output_column(101, "a"), output_column(102, "b")],
             }),
             children: vec![],
-            stats: Statistics::default(),
+            stats: Statistics {
+                output_row_count: 128.0,
+                ..Statistics::default()
+            },
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
@@ -2225,7 +2236,10 @@ mod tests {
                 grouping_fn_ids: vec![("__grouping_fn_0".to_string(), ColumnId(109))],
             }),
             children: vec![values],
-            stats: Statistics::default(),
+            stats: Statistics {
+                output_row_count: 128.0,
+                ..Statistics::default()
+            },
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
@@ -2418,6 +2432,15 @@ mod tests {
                 .map(|column| (column.name.as_str(), column.is_internal))
                 .collect::<Vec<_>>(),
             vec![("a", false), ("b", false), ("__cse_0", true)]
+        );
+        let estimate = child_project
+            .explain_stats
+            .cost_estimate
+            .as_ref()
+            .expect("reused CSE project should refresh explain self cost");
+        assert!(
+            estimate.cpu_cost > 0.0 || estimate.memory_cost > 0.0,
+            "reused CSE project explain cost should be non-zero, got {estimate:?}"
         );
         let cse_expr = project
             .items
