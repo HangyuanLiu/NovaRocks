@@ -141,6 +141,7 @@ pub(crate) fn create_iceberg_view(
         view_sql,
         comment: stmt.comment.clone(),
         or_replace: stmt.or_replace,
+        properties: vec![],
     })?;
     Ok(StatementResult::Ok)
 }

@@ -143,6 +143,7 @@ impl CatalogBackend for IcebergCatalogBackend {
             &req.view_sql,
             req.comment.as_deref(),
             req.or_replace,
+            &req.properties,
         )
     }
 
@@ -163,6 +164,7 @@ impl CatalogBackend for IcebergCatalogBackend {
             default_namespace: loaded.default_namespace,
             column_names: loaded.column_names,
             comment: loaded.comment,
+            properties: loaded.properties,
         })
     }
 

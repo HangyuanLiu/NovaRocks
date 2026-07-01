@@ -561,10 +561,18 @@ pub(crate) fn alter_mv(
     };
     state
         .mv_repo
-        .update_refresh_metadata(txn.as_mut(), req)
+        .update_refresh_metadata(txn.as_mut(), req.clone())
         .map_err(|e| format!("update MV refresh metadata failed: {e}"))?;
     txn.commit()
         .map_err(|e| format!("commit MV refresh metadata failed: {e}"))?;
+    crate::engine::mv::iceberg_refresh::sync_iceberg_mv_descriptor_refresh_contract(
+        state,
+        &definition,
+        &req.refresh_policy,
+        req.refresh_paused,
+        req.refresh_interval_ms,
+    )
+    .map_err(|e| format!("sync Iceberg MV descriptor refresh metadata failed: {e}"))?;
     Ok(StatementResult::Ok)
 }
 

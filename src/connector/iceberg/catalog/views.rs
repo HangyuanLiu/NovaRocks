@@ -36,6 +36,7 @@ pub(crate) struct LoadedIcebergView {
     pub default_namespace: String,
     pub column_names: Vec<String>,
     pub comment: Option<String>,
+    pub properties: HashMap<String, String>,
 }
 
 fn catalog_for_views(entry: &IcebergCatalogEntry) -> Result<std::sync::Arc<dyn Catalog>, String> {
@@ -96,6 +97,7 @@ pub(crate) fn create_view(
     view_sql: &str,
     comment: Option<&str>,
     or_replace: bool,
+    extra_properties: &[(String, String)],
 ) -> Result<(), String> {
     let catalog = catalog_for_views(entry)?;
     let (ns, ident) = view_ident(namespace, view_name)?;
@@ -108,6 +110,9 @@ pub(crate) fn create_view(
     let mut properties = HashMap::new();
     if let Some(comment) = comment {
         properties.insert("comment".to_string(), comment.to_string());
+    }
+    for (key, value) in extra_properties {
+        properties.insert(key.clone(), value.clone());
     }
     let mut summary = HashMap::new();
     summary.insert("engine-name".to_string(), "novarocks".to_string());
@@ -296,12 +301,14 @@ fn loaded_view_from_metadata(
         .iter()
         .map(|field| field.name.clone())
         .collect();
+    let properties = metadata.properties().clone();
     Ok(LoadedIcebergView {
         sql: chosen.sql.clone(),
         dialect: chosen.dialect.clone(),
         default_namespace,
         column_names,
-        comment: metadata.properties().get("comment").cloned(),
+        comment: properties.get("comment").cloned(),
+        properties,
     })
 }
 
@@ -335,6 +342,10 @@ mod rest_view_tests {
     /// Minimal spec-valid LoadViewResult body with the given representations
     /// JSON array (e.g. `[{"type":"sql","sql":"SELECT 1","dialect":"spark"}]`).
     fn load_view_body(representations: &str) -> String {
+        load_view_body_with_properties(representations, r#"{"comment": "a test view"}"#)
+    }
+
+    fn load_view_body_with_properties(representations: &str, properties: &str) -> String {
         format!(
             r#"{{
               "metadata-location": "s3://warehouse/db/v/metadata/00001-x.metadata.json",
@@ -357,7 +368,7 @@ mod rest_view_tests {
                   "type": "struct",
                   "fields": [{{"id": 1, "name": "id", "required": false, "type": "long"}}]
                 }}],
-                "properties": {{"comment": "a test view"}}
+                "properties": {properties}
               }},
               "config": {{}}
             }}"#
@@ -404,6 +415,7 @@ mod rest_view_tests {
                 "SELECT id FROM t",
                 Some("a test view"),
                 false,
+                &[],
             )
             .expect("create view via mock");
         })
@@ -442,6 +454,44 @@ mod rest_view_tests {
         assert_eq!(view.default_namespace, "analytics");
         assert_eq!(view.column_names, vec!["id".to_string()]);
         assert_eq!(view.comment.as_deref(), Some("a test view"));
+    }
+
+    #[tokio::test]
+    async fn load_view_exposes_all_metadata_properties() {
+        let mut server = Server::new_async().await;
+        let _config = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(EMPTY_CONFIG_BODY)
+            .create_async()
+            .await;
+        let _load = server
+            .mock("GET", "/v1/namespaces/analytics/views/v_demo")
+            .with_status(200)
+            .with_body(load_view_body_with_properties(
+                r#"[{"type":"sql","sql":"SELECT id FROM analytics.__nr_mv_mv_orders","dialect":"starrocks"}]"#,
+                r#"{"comment":"a test view","novarocks.mv":"true","novarocks.mv.storage-table":"analytics.__nr_mv_mv_orders"}"#,
+            ))
+            .create_async()
+            .await;
+
+        let entry = rest_entry(&server.url());
+        let view = tokio::task::spawn_blocking(move || {
+            load_view(&entry, "analytics", "v_demo").expect("load view")
+        })
+        .await
+        .expect("join");
+        assert_eq!(view.comment.as_deref(), Some("a test view"));
+        assert_eq!(
+            view.properties.get("novarocks.mv").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            view.properties
+                .get("novarocks.mv.storage-table")
+                .map(String::as_str),
+            Some("analytics.__nr_mv_mv_orders")
+        );
     }
 
     #[tokio::test]
