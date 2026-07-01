@@ -28,8 +28,9 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
+use crate::formats::starrocks::fs_access::resolve_format_path;
 use crate::formats::starrocks::metadata::StarRocksTabletSnapshot;
-use crate::fs::path::{ScanPathScheme, classify_scan_paths};
+use crate::fs::access::FsScheme;
 
 pub fn read_bundle_parquet_snapshot_if_any(
     snapshot: &StarRocksTabletSnapshot,
@@ -70,10 +71,11 @@ pub fn write_parquet_file(path: &str, batch: &RecordBatch) -> Result<u64, String
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .build();
-    let scheme = classify_scan_paths([path])?;
+    let access =
+        resolve_format_path(path).map_err(|e| map_hdfs_error(path, "write_parquet_file", e))?;
 
-    match scheme {
-        ScanPathScheme::Local => {
+    match access.scheme() {
+        FsScheme::Local => {
             let path_buf = PathBuf::from(path);
             if let Some(parent) = path_buf.parent() {
                 fs::create_dir_all(parent)
@@ -93,9 +95,8 @@ pub fn write_parquet_file(path: &str, batch: &RecordBatch) -> Result<u64, String
                 fs::metadata(&path_buf).map_err(|e| format!("stat parquet failed: {}", e))?;
             Ok(meta.len())
         }
-        ScanPathScheme::Oss => {
-            let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
-            let (op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, &cfg)?;
+        FsScheme::ObjectStore => {
+            let rel = access.single_relative_path()?.to_string();
             let mut bytes = Vec::new();
             {
                 let cursor = Cursor::new(&mut bytes);
@@ -109,11 +110,11 @@ pub fn write_parquet_file(path: &str, batch: &RecordBatch) -> Result<u64, String
                     .map_err(|e| format!("close parquet writer failed: {}", e))?;
             }
             let size = bytes.len() as u64;
-            let write_result = crate::fs::oss::oss_block_on(op.write(&rel, bytes))?;
+            let write_result = crate::fs::oss::oss_block_on(access.operator().write(&rel, bytes))?;
             write_result.map_err(|e| format!("write parquet object failed: {}", e))?;
             Ok(size)
         }
-        ScanPathScheme::Hdfs => Err(format!(
+        FsScheme::Hdfs => Err(format!(
             "write_parquet_file does not support hdfs path yet: {}",
             path
         )),
@@ -121,9 +122,10 @@ pub fn write_parquet_file(path: &str, batch: &RecordBatch) -> Result<u64, String
 }
 
 pub fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>, String> {
-    let scheme = classify_scan_paths([path])?;
-    match scheme {
-        ScanPathScheme::Local => {
+    let access =
+        resolve_format_path(path).map_err(|e| map_hdfs_error(path, "read_parquet_file", e))?;
+    match access.scheme() {
+        FsScheme::Local => {
             let file = fs::File::open(path).map_err(|e| format!("open parquet failed: {}", e))?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(file)
                 .map_err(|e| format!("create parquet reader failed: {}", e))?
@@ -135,10 +137,9 @@ pub fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>, String> {
             }
             Ok(out)
         }
-        ScanPathScheme::Oss => {
-            let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
-            let (op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, &cfg)?;
-            let read_result = crate::fs::oss::oss_block_on(op.read(&rel))?;
+        FsScheme::ObjectStore => {
+            let rel = access.single_relative_path()?.to_string();
+            let read_result = crate::fs::oss::oss_block_on(access.operator().read(&rel))?;
             let bytes = read_result.map_err(|e| format!("read parquet object failed: {}", e))?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.to_bytes())
                 .map_err(|e| format!("create parquet reader failed: {}", e))?
@@ -150,10 +151,18 @@ pub fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>, String> {
             }
             Ok(out)
         }
-        ScanPathScheme::Hdfs => Err(format!(
+        FsScheme::Hdfs => Err(format!(
             "read_parquet_file does not support hdfs path yet: {}",
             path
         )),
+    }
+}
+
+fn map_hdfs_error(path: &str, function_name: &str, err: String) -> String {
+    if err == format!("StarRocks formats do not support hdfs path yet: {path}") {
+        format!("{function_name} does not support hdfs path yet: {path}")
+    } else {
+        err
     }
 }
 
@@ -260,4 +269,81 @@ fn concat_batches(
     let out = RecordBatch::try_new(output_schema, merged)
         .map_err(|e| format!("build batch failed: {}", e))?;
     Ok(Some(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn sample_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("a"), None])) as ArrayRef,
+            ],
+        )
+        .expect("build sample batch")
+    }
+
+    #[test]
+    fn parquet_helpers_round_trip_local_path() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let path = temp_dir
+            .path()
+            .join("nested")
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let batch = sample_batch();
+
+        let size = write_parquet_file(&path, &batch).expect("write parquet");
+        let batches = read_parquet_file(&path).expect("read parquet");
+
+        assert!(size > 0);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+        let keys = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int column");
+        assert_eq!(keys.value(0), 1);
+        assert_eq!(keys.value(1), 2);
+        let values = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string column");
+        assert_eq!(values.value(0), "a");
+        assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn parquet_helpers_use_format_path_resolver_for_object_store_credentials() {
+        let _guard = crate::connector::starrocks::lake::context::lock_runtime_test_state();
+        let path = "s3://missing-bucket/warehouse/tablet-1/data.parquet";
+
+        let read_err = read_parquet_file(path).expect_err("missing runtime S3 config must fail");
+        assert!(
+            read_err.contains("missing S3 config for StarRocks object-store path="),
+            "{read_err}"
+        );
+
+        let batch = sample_batch();
+        let write_err =
+            write_parquet_file(path, &batch).expect_err("missing runtime S3 config must fail");
+        assert!(
+            write_err.contains("missing S3 config for StarRocks object-store path="),
+            "{write_err}"
+        );
+    }
 }
