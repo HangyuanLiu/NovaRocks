@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use super::capability;
 use super::memo::{GroupId, Memo};
 use super::operator::{JoinDistribution, Operator, PhysicalDistributionOp, ProjectOp, SortOp};
 use super::physical_tree::{
@@ -111,7 +112,12 @@ pub(crate) fn extract_best(
             JoinExecutionDistribution::Colocate => JoinDistribution::Colocate,
         };
     }
-    let representation_property = RepresentationProperty::from_operator(&op);
+    let child_props: Vec<&RepresentationProperty> = children
+        .iter()
+        .map(|child| &child.execution_props.representation_property)
+        .collect();
+    let representation_property =
+        capability::propagate_representation(&op, &child_props, &memo.scalars);
     let output_columns =
         output_columns_for_physical_expr(&op, &memo.scalars, output_columns, &children);
     let inner_output_property = winner
@@ -591,6 +597,130 @@ mod tests {
             set.representations.as_slice(),
             [PhysicalRepresentation::DictInt32(_)]
         ));
+    }
+
+    #[test]
+    fn extract_project_above_dict_scan_propagates_representation() {
+        let mut memo = Memo::new();
+        let source_column_id = ColumnId(5);
+        let physical_column_id = ColumnId(6);
+        let dict_output = OutputColumn {
+            column_id: physical_column_id,
+            name: "__nr_dict_tbl_city".to_string(),
+            data_type: DataType::Int32,
+            nullable: true,
+            is_internal: false,
+        };
+        let snapshot = test_snapshot();
+        let scan = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalScan(ScanOp {
+                database: "db".into(),
+                table: crate::sql::catalog::TableDef {
+                    name: "tbl".into(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: crate::sql::catalog::ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: None,
+                stats_ref: None,
+                columns: vec![dict_output.clone()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![ScanDictionaryColumn {
+                    source_column_id,
+                    source_column: "city".to_string(),
+                    dict_column: "__nr_dict_tbl_city".to_string(),
+                    dictionary: Arc::clone(&snapshot),
+                }],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            children: vec![],
+        });
+        memo.groups[scan].logical_props = Some(
+            crate::sql::optimizer::memo::LogicalProperties::new(vec![dict_output], 1.0),
+        );
+
+        // Parent project: `project_output := ColumnRef(source_column_id)` — a
+        // pure passthrough that must carry the dict representation upward,
+        // re-keyed to the project's output column id.
+        let project_output_column_id = ColumnId(14);
+        let project_expr = memo.scalars.intern(
+            ScalarNode::ColumnRef(source_column_id),
+            DataType::Int32,
+            true,
+        );
+        let project_output = OutputColumn {
+            column_id: project_output_column_id,
+            name: "city".to_string(),
+            data_type: DataType::Int32,
+            nullable: true,
+            is_internal: false,
+        };
+        let root = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalProject(ProjectOp {
+                items: vec![ScalarProjectItem {
+                    expr: project_expr,
+                    output_name: "city".to_string(),
+                    output_column_id: project_output_column_id,
+                    expr_display: None,
+                }],
+                output_qualifier: None,
+            }),
+            children: vec![scan],
+        });
+        memo.groups[root].logical_props = Some(
+            crate::sql::optimizer::memo::LogicalProperties::new(vec![project_output], 1.0),
+        );
+
+        let required = PhysicalPropertySet::any();
+        let mut winners = HashMap::new();
+        winners.insert(
+            (scan, required.clone()),
+            winner_for_test(
+                scan,
+                0,
+                1.0,
+                None,
+                PhysicalPropertySet::any(),
+                PropertyAlternativeKind::Default,
+                vec![],
+                vec![],
+            ),
+        );
+        winners.insert(
+            (root, required.clone()),
+            winner_for_test(
+                root,
+                0,
+                2.0,
+                None,
+                PhysicalPropertySet::any(),
+                PropertyAlternativeKind::Default,
+                vec![PhysicalPropertySet::any()],
+                vec![PhysicalPropertySet::any()],
+            ),
+        );
+
+        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let set = plan
+            .execution_props
+            .representation_property
+            .get(project_output_column_id)
+            .expect("project propagates the dict representation to its output column");
+        assert!(set.dictionary_representation().is_some());
+        // The scan child still carries its own representation.
+        assert!(
+            plan.children[0]
+                .execution_props
+                .representation_property
+                .has_dictionary_representation()
+        );
     }
 
     #[test]
