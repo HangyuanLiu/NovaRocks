@@ -1045,8 +1045,10 @@ pub(crate) fn list_mv_rows(
             let Some(target_table) = mv.target_table.clone() else {
                 continue;
             };
+            let public_name = crate::engine::mv::iceberg_refresh::nr_mv_public_name(&target_table)
+                .unwrap_or_else(|| target_table.clone());
             rows.push(MvListRow {
-                name: target_table,
+                name: public_name,
                 database: target_namespace,
                 storage_engine: mv.storage_engine.clone(),
                 refresh_mode: mv.refresh_policy.as_sql_str().to_string(),
@@ -2500,6 +2502,32 @@ mod tests {
 
         assert_query_result_contains(&result, "mv_orders");
         assert_query_result_contains(&result, "iceberg");
+    }
+
+    #[test]
+    fn show_materialized_views_strips_iceberg_internal_storage_prefix() {
+        let (state, _dir) = open_state_with_sqlite_store();
+        insert_iceberg_mv_relationship(
+            &state,
+            "ice",
+            "analytics",
+            "__nr_mv_mv_orders",
+            "SELECT id FROM ice.sales.orders",
+        );
+
+        let stmt = ShowMaterializedViewsStmt { database: None };
+        let rows = list_mv_rows(&state, Some("ice"), &stmt, None).expect("show mvs");
+        let row = rows
+            .iter()
+            .find(|row| row.name == "mv_orders")
+            .expect("public MV row should be present");
+
+        assert_eq!(row.database, "analytics");
+        assert_eq!(row.storage_engine, "iceberg");
+        assert!(
+            rows.iter().all(|row| !row.name.starts_with("__nr_mv_")),
+            "rows={rows:?}"
+        );
     }
 
     #[test]
