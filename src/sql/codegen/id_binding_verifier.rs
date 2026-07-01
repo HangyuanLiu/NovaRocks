@@ -899,6 +899,7 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![int_col(aggregate_output_id, "sum(a)")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],

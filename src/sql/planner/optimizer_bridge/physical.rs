@@ -97,9 +97,9 @@ impl BridgeCtx<'_> {
                         aggregates: materialize_aggregate_calls(
                             self.scalars,
                             &op.aggregates,
-                            op.group_by.len(),
-                            &op.output_columns,
+                            &op.output_layout,
                         ),
+                        output_layout: op.output_layout.clone(),
                         is_merge: op.is_merge.clone(),
                         output_columns: op.output_columns.clone(),
                     },
