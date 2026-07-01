@@ -54,6 +54,12 @@ REFRESH MATERIALIZED VIEW mv_${uuid0};
 REFRESH MATERIALIZED VIEW mv_${uuid0} FULL;
 
 -- query 5
+-- EXPLAIN REFRESH ... FULL must return the same disabled error as executing
+-- FULL (W6: EXPLAIN/exec same-source, no divergent "not supported").
+-- @expect_error=currently disabled pending redesign
+EXPLAIN REFRESH MATERIALIZED VIEW mv_${uuid0} FULL;
+
+-- query 6
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_${uuid0};
 DROP TABLE ice_ivm_a11_full_disabled_${uuid0}.ns_${uuid0}.base_${uuid0} FORCE;
