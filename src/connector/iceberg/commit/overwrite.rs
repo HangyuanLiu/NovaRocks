@@ -731,7 +731,6 @@ mod enumerate_tests {
     //! TRUNCATE plan), where a real iceberg backend produces all four
     //! content types.
     use super::*;
-    use iceberg::io::FileIO;
     use iceberg::spec::{
         FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
         TableMetadataBuilder, Type,
@@ -748,11 +747,12 @@ mod enumerate_tests {
             .build()
             .unwrap();
 
+        let location = "file:///novarocks-test/table".to_string();
         let metadata = TableMetadataBuilder::new(
             schema,
             PartitionSpec::unpartition_spec().into_unbound(),
             SortOrder::unsorted_order(),
-            "file:///novarocks-test/table".to_string(),
+            location.clone(),
             FormatVersion::V2,
             HashMap::new(),
         )
@@ -761,7 +761,7 @@ mod enumerate_tests {
         .unwrap()
         .metadata;
 
-        let file_io = FileIO::new_with_fs();
+        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None);
         let ident = TableIdent::new(NamespaceIdent::new("db".to_string()), "table".to_string());
         Table::builder()
             .file_io(file_io)

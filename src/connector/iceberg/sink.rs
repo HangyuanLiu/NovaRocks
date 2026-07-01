@@ -1449,30 +1449,23 @@ pub(crate) fn build_staged_file_io(
     data_location: &str,
     s3_config: Option<&IcebergSinkObjectStoreConfig>,
 ) -> Result<iceberg::io::FileIO, String> {
-    if data_location.starts_with("s3://") || data_location.starts_with("oss://") {
+    if crate::fs::access::is_object_store_location_parse_only(data_location)
+        .map_err(|e| format!("parse staged iceberg data_location {data_location}: {e}"))?
+    {
         let s3 = s3_config.ok_or_else(|| {
             format!(
                 "iceberg sink missing S3 config for staged writer data_location={data_location}"
             )
         })?;
-        let factory = s3.to_s3_storage_factory();
-        return Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build());
+        let object_store_config = s3.to_object_store_config();
+        return Ok(
+            crate::connector::iceberg::fs_io::build_file_io_for_location(
+                data_location,
+                Some(&object_store_config),
+            ),
+        );
     }
-    Ok(iceberg::io::FileIO::new_with_fs())
-}
-
-pub(crate) fn parse_object_store_bucket_and_root(path: &str) -> Option<(String, String)> {
-    for scheme in ["s3://", "oss://"] {
-        if let Some(rest) = path.trim().strip_prefix(scheme) {
-            let (bucket, key_prefix) = rest.split_once('/').unwrap_or((rest, ""));
-            let bucket = bucket.trim();
-            if bucket.is_empty() {
-                return None;
-            }
-            return Some((bucket.to_string(), key_prefix.trim_matches('/').to_string()));
-        }
-    }
-    None
+    Ok(crate::connector::iceberg::fs_io::build_file_io_for_location(data_location, None))
 }
 
 fn normalize_path(path: &str) -> Result<String, String> {
@@ -1497,7 +1490,9 @@ fn write_parquet_file(
         .set_compression(compression)
         .build();
 
-    if path.starts_with("oss://") || path.starts_with("s3://") {
+    if crate::fs::access::is_object_store_location_parse_only(path)
+        .map_err(|e| format!("parse iceberg parquet output path {path}: {e}"))?
+    {
         let (data, write_result) = write_parquet_to_bytes(schema, batch, props)?;
         let s3 = s3_config.ok_or_else(|| {
             format!(
@@ -1506,9 +1501,15 @@ fn write_parquet_file(
             )
         })?;
         let object_store_cfg = s3.to_object_store_config();
-        let (op, rel) =
-            crate::fs::path::resolve_object_store_operator_and_path(path, &object_store_cfg)?;
-        data_block_on(op.write(&rel, data))
+        let access = crate::connector::iceberg::fs_io::resolve_access_for_location(
+            path,
+            Some(&object_store_cfg),
+        )
+        .map_err(|e| format!("resolve Iceberg parquet output {path}: {e}"))?;
+        let rel = access
+            .single_relative_path()
+            .map_err(|e| format!("resolve Iceberg parquet output path {path}: {e}"))?;
+        data_block_on(access.operator().write(rel, data))
             .map_err(|e| format!("run object-store write on data runtime failed: {e}"))?
             .map_err(|e| format!("opendal write failed: {e}"))?;
         return Ok(write_result);
@@ -2339,7 +2340,8 @@ mod tests {
         IcebergTableSinkBackend, IcebergTableSinkFactory, align_arrays_to_schema,
         collect_theta_sketches_by_name, iceberg_partition_key_for_row,
         iceberg_schema_from_arrow_schema, merge_deletion_vectors_by_file, row_lineage_row_id_index,
-        schema_has_reserved_row_lineage_columns, unique_file_path, write_parquet_to_bytes,
+        schema_has_reserved_row_lineage_columns, unique_file_path, write_parquet_file,
+        write_parquet_to_bytes,
     };
     use crate::connector::iceberg::commit::EqualityDeleteColumn;
     use crate::connector::iceberg::data_writer::{StagedWriteOptions, write_record_batches};
@@ -3784,6 +3786,36 @@ mod tests {
 
         assert_eq!(value_counts.get(&1), Some(&1));
         assert_eq!(null_value_counts.get(&1), Some(&1));
+    }
+
+    #[test]
+    fn write_parquet_file_treats_s3a_as_object_store() {
+        let mut metadata = HashMap::new();
+        metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true).with_metadata(metadata),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![Some(1)]))],
+        )
+        .expect("record batch");
+        let unique_key = format!("nr-s3a-regression-{}", uuid::Uuid::new_v4());
+        let path = format!("s3a://bucket/{unique_key}/data/file.parquet");
+
+        let err = match write_parquet_file(&path, None, schema, &batch, Compression::SNAPPY) {
+            Ok(_) => {
+                let _ = std::fs::remove_dir_all("s3a:");
+                panic!("s3a path without object-store config should fail");
+            }
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("missing S3 config"),
+            "s3a path should use object-store branch, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all("s3a:");
     }
 
     #[test]

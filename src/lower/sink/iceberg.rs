@@ -33,7 +33,7 @@ use crate::connector::iceberg::schema::{
     IcebergPartitionInfo, IcebergSchemaDescriptor, IcebergSchemaFieldDescriptor,
     IcebergTableColumn, IcebergTableDescriptor, apply_field_id_recursive, build_full_output_schema,
 };
-use crate::connector::iceberg::sink::{build_staged_file_io, parse_object_store_bucket_and_root};
+use crate::connector::iceberg::sink::build_staged_file_io;
 use crate::connector::iceberg::sink_plan::{
     IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan,
     PositionDeleteDataFilePartition,
@@ -700,9 +700,15 @@ fn resolve_sink_s3_config(
     sink: &data_sinks::TIcebergTableSink,
     data_location: &str,
 ) -> Result<Option<IcebergSinkObjectStoreConfig>, String> {
-    let Some((bucket, _data_root)) = parse_object_store_bucket_and_root(data_location) else {
+    if !crate::fs::access::is_object_store_location_parse_only(data_location)
+        .map_err(|e| format!("parse iceberg sink data_location {data_location}: {e}"))?
+    {
         return Ok(None);
-    };
+    }
+    let (bucket, _data_root) = crate::fs::access::parse_object_store_path_parse_only(data_location)
+        .map_err(|e| {
+            format!("parse iceberg sink object-store data_location {data_location}: {e}")
+        })?;
     let cloud = sink.cloud_configuration.as_ref().ok_or_else(|| {
         format!(
             "iceberg sink object-store path requires cloud_configuration: data_location={data_location}"
@@ -1477,21 +1483,13 @@ mod tests {
         assert_eq!(s3.timeout_ms, Some(1234));
         assert_eq!(s3.io_timeout_ms, Some(5678));
 
-        let factory = s3.to_s3_storage_factory();
-        assert_eq!(factory.session_token.as_deref(), Some("token"));
-        assert_eq!(factory.retry_max_times, Some(7));
-        assert_eq!(factory.retry_min_delay_ms, Some(11));
-        assert_eq!(factory.retry_max_delay_ms, Some(99));
-        assert_eq!(factory.timeout_ms, Some(1234));
-        assert_eq!(factory.io_timeout_ms, Some(5678));
-
-        let legacy = s3.to_object_store_config();
-        assert_eq!(legacy.session_token.as_deref(), Some("token"));
-        assert_eq!(legacy.retry_max_times, Some(7));
-        assert_eq!(legacy.retry_min_delay_ms, Some(11));
-        assert_eq!(legacy.retry_max_delay_ms, Some(99));
-        assert_eq!(legacy.timeout_ms, Some(1234));
-        assert_eq!(legacy.io_timeout_ms, Some(5678));
+        let object_store_config = s3.to_object_store_config();
+        assert_eq!(object_store_config.session_token.as_deref(), Some("token"));
+        assert_eq!(object_store_config.retry_max_times, Some(7));
+        assert_eq!(object_store_config.retry_min_delay_ms, Some(11));
+        assert_eq!(object_store_config.retry_max_delay_ms, Some(99));
+        assert_eq!(object_store_config.timeout_ms, Some(1234));
+        assert_eq!(object_store_config.io_timeout_ms, Some(5678));
     }
 
     #[test]

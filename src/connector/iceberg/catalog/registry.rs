@@ -14,7 +14,6 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::io::LocalFsStorageFactory;
 use iceberg::spec::{
     DataFile, FormatVersion, ListType, Literal as IcebergLiteral, MapType, NestedField,
     PrimitiveLiteral, PrimitiveType, Schema, StructType, TableMetadata, Transform, Type,
@@ -30,6 +29,7 @@ use crate::connector::iceberg::commit::{
     IcebergWriteMode, WrittenFile, classify_iceberg_write_mode,
 };
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
+use crate::connector::iceberg::fs_io;
 use crate::connector::iceberg::variant_write::parse_variant_shredding_properties;
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::engine::parquet::parse_datetime_string_to_nanos;
@@ -230,19 +230,16 @@ impl IcebergCatalogEntry {
     }
 }
 
-fn build_s3_operator_for_entry(
+fn resolve_warehouse_access_for_entry(
     entry: &IcebergCatalogEntry,
     context: &str,
-) -> Result<opendal::Operator, String> {
-    let s3_config = entry
+) -> Result<crate::connector::iceberg::fs_io::IcebergFsAccess, String> {
+    let object_store_config = entry
         .s3_config
         .as_ref()
-        .ok_or_else(|| format!("missing S3 config for {context}"))?;
-    let (bucket, _) =
-        crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
-            .map_err(|e| format!("parse warehouse URI: {e}"))?;
-    crate::fs::object_store::build_object_store_operator(&bucket, s3_config)
-        .map_err(|e| format!("build S3 operator for {context}: {e}"))
+        .ok_or_else(|| format!("missing object-store config for {context}"))?;
+    fs_io::resolve_access_for_location(&entry.warehouse_uri, Some(object_store_config))
+        .map_err(|e| format!("resolve warehouse fs access for {context}: {e}"))
 }
 
 pub(crate) fn create_namespace(
@@ -261,7 +258,8 @@ pub(crate) fn create_namespace(
         .map_err(|e| format!("create iceberg namespace {namespace}: {e}"));
     }
     if entry.s3_config.is_some() {
-        let op = build_s3_operator_for_entry(entry, "namespace create")?;
+        let access = resolve_warehouse_access_for_entry(entry, "namespace create")?;
+        let op = access.operator();
         let root_marker_key = s3_namespace_root_marker_key(entry, &ns_name)?;
         let marker_key = s3_namespace_marker_key(entry, &ns_name)?;
         block_on_iceberg(async {
@@ -297,7 +295,8 @@ pub(crate) fn namespace_exists(
             .map_err(|e| format!("check iceberg namespace failed: {e}"));
     }
     if entry.s3_config.is_some() {
-        let op = build_s3_operator_for_entry(entry, "namespace check")?;
+        let access = resolve_warehouse_access_for_entry(entry, "namespace check")?;
+        let op = access.operator();
         let ns_prefix = s3_namespace_prefix(entry, &ns_name)?;
         let root_marker_key = s3_namespace_root_marker_key(entry, &ns_name)?;
         let marker_key = format!("{ns_prefix}{S3_NAMESPACE_MARKER_FILE}");
@@ -344,10 +343,9 @@ pub(crate) fn list_namespaces(entry: &IcebergCatalogEntry) -> Result<Vec<String>
         return Ok(names);
     }
     if entry.s3_config.is_some() {
-        let op = build_s3_operator_for_entry(entry, "list namespaces")?;
-        let (_, root_prefix) =
-            crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
-                .map_err(|e| format!("parse warehouse URI: {e}"))?;
+        let access = resolve_warehouse_access_for_entry(entry, "list namespaces")?;
+        let op = access.operator();
+        let root_prefix = access.single_relative_path()?;
         // Trailing slash ensures we list direct children of the warehouse root.
         let warehouse_prefix = if root_prefix.trim_matches('/').is_empty() {
             String::new()
@@ -414,7 +412,8 @@ pub(crate) fn drop_namespace(
             .map_err(|e| format!("drop iceberg namespace {namespace}: {e}"));
     }
     if entry.s3_config.is_some() {
-        let op = build_s3_operator_for_entry(entry, "namespace drop")?;
+        let access = resolve_warehouse_access_for_entry(entry, "namespace drop")?;
+        let op = access.operator();
         let root_marker_key = s3_namespace_root_marker_key(entry, &ns_name)?;
         let marker_key = s3_namespace_marker_key(entry, &ns_name)?;
         block_on_iceberg(async {
@@ -445,9 +444,8 @@ pub(crate) fn drop_namespace(
 }
 
 fn s3_namespace_prefix(entry: &IcebergCatalogEntry, ns_name: &str) -> Result<String, String> {
-    let (_, root_prefix) =
-        crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
-            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+    let access = resolve_warehouse_access_for_entry(entry, "namespace prefix")?;
+    let root_prefix = access.single_relative_path()?;
     let root = root_prefix.trim_matches('/');
     if root.is_empty() {
         Ok(format!("{ns_name}/"))
@@ -503,10 +501,9 @@ pub(crate) fn list_tables(
         return Ok(tables);
     }
     if entry.s3_config.is_some() {
-        let op = build_s3_operator_for_entry(entry, "list tables")?;
-        let (_, root_prefix) =
-            crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
-                .map_err(|e| format!("parse warehouse URI: {e}"))?;
+        let access = resolve_warehouse_access_for_entry(entry, "list tables")?;
+        let op = access.operator();
+        let root_prefix = access.single_relative_path()?;
         let ns_prefix = format!("{}/{}/", root_prefix.trim_end_matches('/'), ns_name);
         block_on_iceberg(async {
             let entries = op
@@ -853,7 +850,8 @@ fn drop_s3_table_prefix(
     ns_name: &str,
     tbl_name: &str,
 ) -> Result<(), String> {
-    let op = build_s3_operator_for_entry(entry, "table drop")?;
+    let access = resolve_warehouse_access_for_entry(entry, "table drop")?;
+    let op = access.operator();
     let table_prefix = s3_table_prefix(entry, ns_name, tbl_name)?;
     if table_prefix.trim_matches('/').is_empty() {
         return Err(format!(
@@ -905,11 +903,8 @@ pub(crate) fn load_table(
         let metadata_location =
             format!("{warehouse_trimmed}/{ns_name}/{tbl_name}/metadata/{metadata_file_name}");
 
-        let storage_factory =
-            crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
-                .map_err(|e| format!("parse S3 properties for FileIO: {e}"))?
-                .ok_or_else(|| "missing S3 properties for FileIO".to_string())?;
-        let file_io = iceberg::io::FileIOBuilder::new(Arc::new(storage_factory)).build();
+        let file_io =
+            fs_io::build_file_io_for_location(&entry.warehouse_uri, entry.s3_config.as_ref());
 
         iceberg::table::Table::builder()
             .file_io(file_io)
@@ -933,10 +928,7 @@ pub(crate) fn load_table(
         let metadata: iceberg::spec::TableMetadata = serde_json::from_slice(&metadata_bytes)
             .map_err(|e| format!("deserialize iceberg metadata: {e}"))?;
 
-        let file_io = iceberg::io::FileIOBuilder::new(
-            Arc::new(LocalFsStorageFactory) as Arc<dyn iceberg::io::StorageFactory>
-        )
-        .build();
+        let file_io = fs_io::build_file_io_for_location(&entry.warehouse_uri, None);
 
         iceberg::table::Table::builder()
             .file_io(file_io)
@@ -1543,21 +1535,29 @@ pub(crate) fn build_catalog_entry(
             "standalone iceberg catalog requires `iceberg.catalog.warehouse`".to_string()
         })?;
 
-    // Detect S3 storage: if warehouse starts with s3:// or oss://, use S3StorageFactory
-    let is_s3 = raw_warehouse.starts_with("s3://")
-        || raw_warehouse.starts_with("s3a://")
-        || raw_warehouse.starts_with("oss://");
+    // Detect object-store storage through the shared fs classifier so catalog
+    // initialization follows the same scheme rules as runtime IO.
+    let is_object_store =
+        match crate::fs::access::is_object_store_location_parse_only(&raw_warehouse) {
+            Ok(is_object_store) => is_object_store,
+            Err(e) if e.contains("unsupported fs location scheme") => false,
+            Err(e) => {
+                return Err(format!(
+                    "parse iceberg catalog warehouse URI {raw_warehouse}: {e}"
+                ));
+            }
+        };
 
-    let (warehouse_uri, warehouse_path, s3_config) = if is_s3 {
-        let (_bucket, _root_prefix) =
-            crate::connector::iceberg::catalog::add_files::parse_s3_path(&raw_warehouse)
-                .map_err(|e| format!("parse warehouse URI: {e}"))?;
-        let credentials =
-            optional_object_store_credentials_from_props(&props)?.ok_or_else(|| {
-                "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
+    let (warehouse_uri, warehouse_path, s3_config) = if is_object_store {
+        let props_vec = sorted_properties(&props);
+        let cfg = fs_io::object_store_config_from_catalog_properties(&props_vec)
+            .map_err(|e| format!("parse Iceberg object-store catalog properties: {e}"))?
+            .ok_or_else(|| {
+                "object-store iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
                     .to_string()
             })?;
-        let cfg = object_store_config_from_credentials(credentials);
+        fs_io::resolve_access_for_location(&raw_warehouse, Some(&cfg))
+            .map_err(|e| format!("parse warehouse URI: {e}"))?;
         // S3 warehouse: keep URI as-is, use a temp local path for metadata cache
         let cache_dir = std::env::temp_dir()
             .join("novarocks_iceberg_cache")
@@ -1613,34 +1613,8 @@ fn optional_object_store_config_from_props(
     props: &HashMap<String, String>,
     _warehouse: &str,
 ) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String> {
-    let Some(credentials) = optional_object_store_credentials_from_props(props)? else {
-        return Ok(None);
-    };
-    Ok(Some(object_store_config_from_credentials(credentials)))
-}
-
-fn optional_object_store_credentials_from_props(
-    props: &HashMap<String, String>,
-) -> Result<Option<crate::fs::object_store_credentials::ObjectStoreCredentials>, String> {
-    let props_map: BTreeMap<String, String> = props
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    crate::fs::object_store_credentials::ObjectStoreCredentials::optional_from_aws_s3_properties(
-        crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
-        &props_map,
-    )
-}
-
-fn object_store_config_from_credentials(
-    credentials: crate::fs::object_store_credentials::ObjectStoreCredentials,
-) -> crate::fs::object_store::ObjectStoreConfig {
-    let mut cfg = credentials.to_object_store_config();
-    if cfg.region.is_none() {
-        cfg.region = Some("us-east-1".to_string());
-    }
-    crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
-    cfg
+    let props_vec = sorted_properties(props);
+    fs_io::object_store_config_from_catalog_properties(&props_vec)
 }
 
 /// Build an [`IcebergCatalogEntry`] for `iceberg.catalog.type = rest`. The
@@ -1789,8 +1763,7 @@ fn build_hms_catalog_entry(
 pub(crate) fn build_hadoop_catalog(
     entry: &IcebergCatalogEntry,
 ) -> Result<crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog, String> {
-    let storage_factory = build_storage_factory_for_entry(entry)?;
-    let file_io = iceberg::io::FileIOBuilder::new(storage_factory).build();
+    let file_io = fs_io::build_file_io_for_location(&entry.warehouse_uri, entry.s3_config.as_ref());
     Ok(
         crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
             file_io,
@@ -1917,19 +1890,10 @@ pub(crate) async fn build_hms_catalog(
 fn build_storage_factory_for_entry(
     entry: &IcebergCatalogEntry,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, String> {
-    if entry.is_s3() {
-        let s3_factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(
-            &entry.properties,
-        )
-        .map_err(|e| format!("parse S3 iceberg catalog properties: {e}"))?
-        .ok_or_else(|| {
-            "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
-                .to_string()
-        })?;
-        Ok(Arc::new(s3_factory))
-    } else {
-        Ok(Arc::new(iceberg::io::LocalFsStorageFactory))
-    }
+    Ok(fs_io::build_storage_factory_for_location(
+        &entry.warehouse_uri,
+        entry.s3_config.as_ref(),
+    ))
 }
 
 /// Synchronous dispatcher that returns an `Arc<dyn Catalog>` regardless of
@@ -2042,10 +2006,9 @@ fn latest_table_metadata_file_s3(
     ns_name: &str,
     tbl_name: &str,
 ) -> Result<(String, Vec<u8>), String> {
-    let op = build_s3_operator_for_entry(entry, "load_table")?;
-    let (_, root_prefix) =
-        crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
-            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+    let access = resolve_warehouse_access_for_entry(entry, "load_table")?;
+    let op = access.operator();
+    let root_prefix = access.single_relative_path()?;
     let meta_prefix = format!(
         "{}/{}/{}/metadata/",
         root_prefix.trim_end_matches('/'),

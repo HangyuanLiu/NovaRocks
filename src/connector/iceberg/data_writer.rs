@@ -1579,6 +1579,7 @@ mod tests {
             .tempdir()
             .expect("create table dir");
         let location = format!("file://{}", dir.path().display());
+        let file_io_location = location.clone();
 
         let schema = Arc::new(
             iceberg::spec::Schema::builder()
@@ -1645,7 +1646,12 @@ mod tests {
 
         let table = iceberg::table::Table::builder()
             .identifier(iceberg::TableIdent::from_strs(["db", name]).expect("table ident"))
-            .file_io(iceberg::io::FileIO::new_with_fs())
+            .file_io(
+                crate::connector::iceberg::fs_io::build_file_io_for_location(
+                    &file_io_location,
+                    None,
+                ),
+            )
             .metadata(metadata)
             .build()
             .expect("table");
@@ -2095,7 +2101,7 @@ mod tests {
         .metadata;
         let table = iceberg::table::Table::builder()
             .identifier(iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
-            .file_io(iceberg::io::FileIO::new_with_fs())
+            .file_io(crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None))
             .metadata(metadata)
             .build()
             .expect("table");
@@ -2235,7 +2241,7 @@ mod tests {
         .metadata;
         let table = iceberg::table::Table::builder()
             .identifier(iceberg::TableIdent::from_strs(["db", "t_shred"]).unwrap())
-            .file_io(iceberg::io::FileIO::new_with_fs())
+            .file_io(crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None))
             .metadata(metadata)
             .build()
             .expect("table");
@@ -2313,7 +2319,7 @@ mod tests {
         .metadata;
         let table = iceberg::table::Table::builder()
             .identifier(iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
-            .file_io(iceberg::io::FileIO::new_with_fs())
+            .file_io(crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None))
             .metadata(metadata)
             .build()
             .expect("table");

@@ -420,7 +420,10 @@ mod tests {
 
     #[test]
     fn test_table_location() {
-        let file_io = iceberg::io::FileIO::new_with_fs();
+        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(
+            "oss://bucket/warehouse",
+            None,
+        );
         let catalog = HadoopFileSystemCatalog::new(file_io, "oss://bucket/warehouse".to_string());
         let ident = TableIdent::from_strs(["ns1", "my_table"]).unwrap();
         assert_eq!(

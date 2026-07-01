@@ -5,7 +5,6 @@ pub(crate) mod add_files;
 pub(crate) mod backend;
 pub(crate) mod hadoop_catalog;
 pub(crate) mod registry;
-pub(crate) mod s3_storage;
 pub(crate) mod schema_update;
 pub(crate) mod views;
 

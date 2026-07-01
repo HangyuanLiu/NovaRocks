@@ -536,7 +536,9 @@ mod tests {
         .metadata;
         iceberg::table::Table::builder()
             .identifier(iceberg::TableIdent::from_strs(["d", "t"]).unwrap())
-            .file_io(iceberg::io::FileIO::new_with_fs())
+            .file_io(
+                crate::connector::iceberg::fs_io::build_file_io_for_location("file:///tmp/x", None),
+            )
             .metadata(metadata)
             .build()
             .expect("table")

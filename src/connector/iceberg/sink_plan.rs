@@ -91,27 +91,6 @@ impl IcebergSinkObjectStoreConfig {
             io_timeout_ms: self.io_timeout_ms,
         }
     }
-
-    pub(crate) fn to_s3_storage_factory(
-        &self,
-    ) -> crate::connector::iceberg::catalog::s3_storage::S3StorageFactory {
-        crate::connector::iceberg::catalog::s3_storage::S3StorageFactory {
-            endpoint: self.endpoint.clone(),
-            access_key_id: self.access_key_id.clone(),
-            access_key_secret: self.access_key_secret.clone(),
-            session_token: self.session_token.clone(),
-            region: self
-                .region
-                .clone()
-                .unwrap_or_else(|| "us-east-1".to_string()),
-            enable_path_style: self.enable_path_style_access.unwrap_or(false),
-            retry_max_times: self.retry_max_times,
-            retry_min_delay_ms: self.retry_min_delay_ms,
-            retry_max_delay_ms: self.retry_max_delay_ms,
-            timeout_ms: self.timeout_ms,
-            io_timeout_ms: self.io_timeout_ms,
-        }
-    }
 }
 
 #[derive(Clone)]
