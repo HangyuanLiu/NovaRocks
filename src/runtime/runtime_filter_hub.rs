@@ -851,11 +851,15 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use super::{RuntimeFilterHub, RuntimeFilterProbe};
+    use super::{RuntimeFilterHandle, RuntimeFilterHub, RuntimeFilterProbe};
     use crate::common::ids::SlotId;
     use crate::exec::expr::ExprId;
     use crate::exec::node::RuntimeFilterProbeSpec;
     use crate::exec::pipeline::dependency::DependencyManager;
+    use crate::exec::runtime_filter::{
+        RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeEmptyFilter, RuntimeFilterType,
+        RuntimeMembershipFilter, RuntimeMinMaxFilter,
+    };
 
     fn new_probe_with_timeouts() -> RuntimeFilterProbe {
         let hub = RuntimeFilterHub::new(DependencyManager::new());
@@ -887,6 +891,38 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(dep.is_ready(), "runtime filter dependency did not time out");
+    }
+
+    fn test_membership_filter(filter_id: i32) -> RuntimeMembershipFilter {
+        let min_max =
+            RuntimeMinMaxFilter::full_range(RuntimeFilterType::Int32).expect("min/max range");
+        RuntimeMembershipFilter::Empty(RuntimeEmptyFilter::new(
+            filter_id,
+            SlotId::new(11),
+            RuntimeFilterType::Int32,
+            false,
+            RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+            0,
+            min_max,
+        ))
+    }
+
+    #[test]
+    fn snapshot_excludes_filter_until_membership_published() {
+        // Invariant (P0a): the probe handle exposes empty -> complete, never partial.
+        let handle = RuntimeFilterHandle::new();
+        assert!(handle.snapshot().is_empty(), "handle starts empty");
+
+        let filter = test_membership_filter(42);
+        handle.update_membership_filter(filter);
+
+        let snap = handle.snapshot();
+        assert_eq!(
+            snap.membership_filters().len(),
+            1,
+            "complete filter visible after publish"
+        );
+        assert_eq!(snap.membership_filters()[0].filter_id(), 42);
     }
 
     #[test]
