@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::meta::repository::mv_contract::MvSchemaContract;
+
 pub const MV_DESCRIPTOR_VERSION: u16 = 1;
 pub const MV_DESCRIPTOR_PACKAGE_ID_PROP: &str = "novarocks.mv.descriptor.package-id";
 pub const MV_DESCRIPTOR_HASH_PROP: &str = "novarocks.mv.descriptor.hash";
@@ -99,6 +101,27 @@ impl MvDescriptorV1 {
         }
 
         Ok(descriptor)
+    }
+
+    /// Store a typed MV schema contract into this descriptor's
+    /// `schema_contract` field, serializing it to `serde_json::Value`.
+    pub fn set_schema_contract(&mut self, contract: &MvSchemaContract) -> Result<(), String> {
+        self.schema_contract = Some(
+            serde_json::to_value(contract)
+                .map_err(|e| format!("serialize MV schema contract into descriptor: {e}"))?,
+        );
+        Ok(())
+    }
+
+    /// Parse this descriptor's `schema_contract` field into a typed MV
+    /// schema contract, if present.
+    pub fn schema_contract_typed(&self) -> Result<Option<MvSchemaContract>, String> {
+        match &self.schema_contract {
+            None => Ok(None),
+            Some(value) => serde_json::from_value::<MvSchemaContract>(value.clone())
+                .map(Some)
+                .map_err(|e| format!("parse MV schema contract from descriptor: {e}")),
+        }
     }
 }
 
@@ -278,5 +301,73 @@ mod tests {
             "got: {err}"
         );
         assert!(err.contains("externalized descriptor"), "got: {err}");
+    }
+
+    #[test]
+    fn schema_contract_typed_round_trips() {
+        use crate::meta::repository::mv_contract::{
+            ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
+            ExpressionLineage, HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage,
+            OutputContract, TargetContract, TargetVisibleColumn,
+        };
+        let contract = MvSchemaContract {
+            contract_version: 1,
+            base: BaseContract {
+                table_fqn: "ice.ns.orders".to_string(),
+                table_uuid: "u".to_string(),
+                alias_at_create: None,
+                schema_id_at_create: 0,
+                schema_at_create: BaseSchemaSnapshot {
+                    fields: vec![BaseFieldRecord {
+                        field_id: 1,
+                        name_at_create: "id".to_string(),
+                        type_signature: "long".to_string(),
+                        required: true,
+                    }],
+                },
+            },
+            bases: vec![],
+            output: OutputContract {
+                columns: vec![OutputColumnLineage {
+                    expression: ExpressionLineage {
+                        kind: ExpressionKind::Column,
+                        referenced_base_field_ids: vec![1],
+                        referenced_base_fields: vec![],
+                    },
+                }],
+                filter: None,
+            },
+            join: None,
+            aggregate: None,
+            branch: None,
+            target: TargetContract {
+                table_fqn: "ice.ns.mv".to_string(),
+                table_uuid: "t".to_string(),
+                schema_id_at_create: 0,
+                visible_columns: vec![TargetVisibleColumn {
+                    output_name: "id".to_string(),
+                    target_field_id: 1,
+                    type_signature: "long".to_string(),
+                    nullable: false,
+                }],
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: "__nova_base_row_id".to_string(),
+                    target_field_id: 2,
+                    source: ApplyKeySource::BaseRowId,
+                },
+                partition: None,
+            },
+        };
+        let mut d = sample();
+        d.set_schema_contract(&contract).unwrap();
+        assert_eq!(d.schema_contract_typed().unwrap().as_ref(), Some(&contract));
+
+        // A descriptor with no contract yields None. `sample()` itself sets
+        // `schema_contract` to an arbitrary JSON blob (for canonical-JSON/hash
+        // tests elsewhere), so build the `None` case explicitly here rather
+        // than relying on `sample()`'s default.
+        let mut empty = sample();
+        empty.schema_contract = None;
+        assert_eq!(empty.schema_contract_typed().unwrap(), None);
     }
 }
