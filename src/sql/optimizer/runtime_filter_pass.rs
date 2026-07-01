@@ -383,65 +383,191 @@ fn is_probe_semantic_boundary(node: &OptimizerPhysicalNode) -> bool {
     )
 }
 
-/// Descend into `node` and attach `probe` at the DEEPEST descendant that can
-/// bind the probe expression. Returns `true` when the probe has been placed.
+/// Choose the deterministic representative of a bindable equivalence-set member
+/// to place on a node: the member with the lexicographically smallest column-id
+/// vector. All members are join-key-equal, so any is correct; a stable choice
+/// keeps EXPLAIN goldens deterministic. When the set is a single expression
+/// (the common M2 case) this returns that expression unchanged.
+fn best_member(scalars: &ScalarArena, members: &[ScalarId]) -> Option<ScalarId> {
+    members
+        .iter()
+        .copied()
+        .min_by(|a, b| column_id_vec(scalars, *a).cmp(&column_id_vec(scalars, *b)))
+}
+
+/// Members of `members` bindable at `node` (a superset survives interior nodes;
+/// each child re-filters). Preserves input order.
+fn bindable_members(
+    node: &OptimizerPhysicalNode,
+    scalars: &ScalarArena,
+    members: &[ScalarId],
+) -> Vec<ScalarId> {
+    members
+        .iter()
+        .copied()
+        .filter(|m| could_bound(node, scalars, *m))
+        .collect()
+}
+
+/// Push a probe onto `node`, keyed on the best bindable member of `members`.
+fn place_probe(
+    node: &mut OptimizerPhysicalNode,
+    scalars: &ScalarArena,
+    filter_id: i32,
+    members: &[ScalarId],
+) -> bool {
+    let Some(expr) = best_member(scalars, members) else {
+        return false;
+    };
+    node.probe_runtime_filters.push(RuntimeFilterProbe {
+        filter_id,
+        probe_expr: expr,
+    });
+    true
+}
+
+/// Expand `members` by ONE equivalence hop across an INNER/SEMI `join` node,
+/// using that join's own equi-conditions (their `ScalarId`s already exist, so no
+/// arena interning is needed). For each eq-condition `l = r`, if a member shares
+/// a column with one side, the OTHER side is added — but ONLY when that other
+/// side survives in `join.output_columns`.
 ///
-/// Rules:
-/// 1. Crossable exchange (HashPartitioned/shuffle): descend transparently only
-///    when the policy allows it and `policy.cross_exchange` permits crossing
-///    THIS node — `Unconditional` (complete build RF, e.g. Broadcast) always
-///    permits it; `KeyAligned` (Shuffle/Colocate) permits it only when the
-///    exchange re-partitions on the probe key (`hash_partition_carries_probe_key`);
-///    `Disabled` never crosses. Shuffle exchanges preserve column ids and carry
-///    no projection, so no exchange bind check is needed once crossing is
-///    permitted. When crossing is not permitted, the exchange falls through to
-///    rule 2 and becomes a hard boundary.
+/// The output-survival gate is the correctness pivot for semi/anti joins: a
+/// LEFT/RIGHT semi join drops its build side's columns from its output, so the
+/// build-side key never enters the set and no probe can be chased into the
+/// existence-only child (which would drop rows that legitimately pass the
+/// upstream join). For inner joins both sides survive, so both partners expand.
+/// Outer/anti joins never reach here — they are stopped earlier as semantic
+/// boundaries. Results are deduped by column id via the incoming set.
+fn expand_probe_set_across_join(
+    join: &OptimizerPhysicalNode,
+    scalars: &ScalarArena,
+    eq_conditions: &[PhysicalHashJoinEqCondition],
+    members: &[ScalarId],
+) -> Vec<ScalarId> {
+    let mut expanded: Vec<ScalarId> = members.to_vec();
+    let mut seen: HashSet<Vec<ColumnId>> =
+        members.iter().map(|m| column_id_vec(scalars, *m)).collect();
+    let output_cols = child_column_set(join);
+
+    // A partner is only admissible if all of its columns survive in the join's
+    // output (excludes the dropped side of a semi join).
+    let survives = |expr: ScalarId| -> bool {
+        let cols = column_id_vec(scalars, expr);
+        !cols.is_empty() && cols.iter().all(|c| output_cols.contains(c))
+    };
+
+    for eq in eq_conditions {
+        if eq.null_safe {
+            // Null-safe keys carry different match semantics; do not treat them
+            // as plain equivalences for RF expansion.
+            continue;
+        }
+        let left_cols = column_id_vec(scalars, eq.left);
+        let right_cols = column_id_vec(scalars, eq.right);
+        if left_cols.is_empty() || right_cols.is_empty() {
+            continue;
+        }
+        for member in members {
+            let member_cols = column_id_vec(scalars, *member);
+            // Add the partner side when the member matches the opposite side.
+            if member_cols == left_cols && survives(eq.right) && seen.insert(right_cols.clone()) {
+                expanded.push(eq.right);
+            }
+            if member_cols == right_cols && survives(eq.left) && seen.insert(left_cols.clone()) {
+                expanded.push(eq.left);
+            }
+        }
+    }
+    expanded
+}
+
+/// Descend into `node` carrying a SET of equivalent probe expressions (all
+/// sharing `filter_id`) and place a rewritten probe at the deepest binder in
+/// EACH child subtree that binds a set member. Returns `true` when at least one
+/// probe was placed in this subtree.
+///
+/// Rules (M3 — set-carrying, multi-target; supersedes the M2 single-probe form):
+/// 1. Crossable exchange (HashPartitioned/shuffle): descend transparently with
+///    the subset of members permitted to cross THIS node — `Unconditional`
+///    (complete build RF, e.g. Broadcast) lets every member cross; `KeyAligned`
+///    (Shuffle/Colocate) lets a member cross only when the exchange re-partitions
+///    on that member (`hash_partition_carries_probe_key`); `Disabled` never
+///    crosses. When no member may cross, the exchange falls through to rule 2.
 /// 2. Non-crossable exchange (Gather/Any): hard fragment boundary — stop.
-/// 3. If `node` cannot bind the probe, stop (return false) — do not descend.
-/// 4. Outer/anti/null-preserving joins are semantic boundaries: place there.
-/// 5. Try each child recursively; if a child accepts the probe, we are done.
-/// 6. If no child accepted it, place the probe on `node` itself (the deepest
-///    reachable binder).
+/// 3. Filter the set to members bindable at `node`; if none bind, stop.
+/// 4. Outer/anti/null-preserving joins are semantic boundaries: place ONE best
+///    bindable member here and stop — never expand across, never descend past.
+/// 5. If `node` is an INNER/SEMI join, expand the set by one hop using its
+///    equi-conditions (partner columns admitted only if they survive the join's
+///    output — see `expand_probe_set_across_join`).
+/// 6. Descend into EACH child with the (expanded) set; a child selects its own
+///    bindable member. At most one probe per child subtree emerges.
+/// 7. If NO child accepted a probe, place ONE best bindable member on `node`
+///    itself (the deepest reachable binder in this subtree).
 fn push_probe_down(
     node: &mut OptimizerPhysicalNode,
     scalars: &ScalarArena,
-    probe: &RuntimeFilterProbe,
+    filter_id: i32,
+    members: &[ScalarId],
     policy: ProbePushPolicy,
 ) -> bool {
     if policy.allow_cross_exchange && distribution_is_crossable(node) {
-        let may_cross = match policy.cross_exchange {
-            CrossExchangeMode::Unconditional => true,
-            CrossExchangeMode::KeyAligned => {
-                hash_partition_carries_probe_key(node, scalars, probe.probe_expr)
-            }
-            CrossExchangeMode::Disabled => false,
+        let crossable: Vec<ScalarId> = match policy.cross_exchange {
+            CrossExchangeMode::Unconditional => members.to_vec(),
+            CrossExchangeMode::KeyAligned => members
+                .iter()
+                .copied()
+                .filter(|m| hash_partition_carries_probe_key(node, scalars, *m))
+                .collect(),
+            CrossExchangeMode::Disabled => Vec::new(),
         };
-        if may_cross {
+        if !crossable.is_empty() {
             if let Some(child) = node.children.first_mut() {
-                return push_probe_down(child, scalars, probe, policy);
+                return push_probe_down(child, scalars, filter_id, &crossable, policy);
             }
             return false;
         }
-        // Not allowed to cross this exchange: fall through so it is treated as a
-        // hard boundary (probe stays build-only for this branch).
+        // No member may cross this exchange: fall through so it is treated as a
+        // hard boundary (RF stays build-only for this branch).
     }
     if is_exchange(node) {
         return false;
     }
-    if !could_bound(node, scalars, probe.probe_expr) {
+
+    let bindable = bindable_members(node, scalars, members);
+    if bindable.is_empty() {
         return false;
     }
+
+    // Outer/anti/null-preserving boundary: place the best member here and stop.
+    // Never expand the equivalence set across it, never descend past it.
     if is_probe_semantic_boundary(node) {
-        node.probe_runtime_filters.push(probe.clone());
-        return true;
+        return place_probe(node, scalars, filter_id, &bindable);
     }
+
+    // Expand the equivalence set by one hop across an inner/semi join.
+    let descend_set = match &node.op {
+        Operator::PhysicalHashJoin(join) => {
+            let eq_conditions = join.eq_conditions.clone();
+            expand_probe_set_across_join(node, scalars, &eq_conditions, &bindable)
+        }
+        _ => bindable.clone(),
+    };
+
+    // Descend into EACH child; each subtree contributes at most one probe.
+    let mut placed_in_child = false;
     for child in &mut node.children {
-        if push_probe_down(child, scalars, probe, policy) {
-            return true;
+        if push_probe_down(child, scalars, filter_id, &descend_set, policy) {
+            placed_in_child = true;
         }
     }
-    node.probe_runtime_filters.push(probe.clone());
-    true
+    if placed_in_child {
+        return true;
+    }
+
+    // Deepest reachable binder: no child accepted, so place here.
+    place_probe(node, scalars, filter_id, &bindable)
 }
 
 /// StarRocks LogicalJoinNode.java: only Shuffle/Partitioned gate on build size.
@@ -578,24 +704,25 @@ fn annotate_node(
         });
     }
 
-    // Push each probe descriptor down to the deepest binding descendant within
-    // the true probe child. Stops at exchange (fragment) boundaries unless
-    // `CrossExchangeMode` permits crossing (see `push_probe_down`).
-    // If no binding node is found the RF is build-only (probe remains unplaced).
+    // Push each probe descriptor down through the true probe child, carrying an
+    // equivalence SET seeded with the oriented probe key. The set is expanded by
+    // one hop across each inner/semi join descended through, and a rewritten
+    // probe (sharing the one filter id) is placed at the deepest binder in each
+    // child subtree that binds a set member. Stops at exchange (fragment)
+    // boundaries unless `CrossExchangeMode` permits crossing, and never expands
+    // across outer/anti boundaries (see `push_probe_down`). If no member binds
+    // anywhere the RF is build-only (probe remains unplaced).
     let policy = ProbePushPolicy {
         allow_cross_exchange: options.allow_cross_exchange_rf,
         cross_exchange: CrossExchangeMode::from(&distribution),
     };
     for d in &descs {
-        let probe = RuntimeFilterProbe {
-            filter_id: d.filter_id,
-            probe_expr: d.probe_expr,
-        };
-        // Descend into the true probe side to the deepest binding node.
+        // Descend into the true probe side, seeded with the single probe key.
         let _ = push_probe_down(
             &mut node.children[sides.probe_child],
             scalars,
-            &probe,
+            d.filter_id,
+            &[d.probe_expr],
             policy,
         );
     }
@@ -1173,6 +1300,139 @@ pub(crate) mod test_support {
         };
         with_scalars(plan, scalars)
     }
+
+    /// Transitive-equivalence probe subtree (M3). Shape:
+    ///
+    /// ```text
+    ///        TopJoin (Inner): eq (b = c)        <- build RF on c
+    ///        /              \
+    ///     J_ab (Inner)       scan_C(col 3)      <- BUILD side of TopJoin
+    ///     eq (a = b)
+    ///     /       \
+    ///  scan_A(1)   scan_B(2)
+    /// ```
+    ///
+    /// The build key `c` (col 3) is transitively equal to both `b` (col 2, the
+    /// direct probe key) and `a` (col 1) via `J_ab`'s `a = b`. An M3 pushdown
+    /// must place one probe (sharing the single filter id) on BOTH `scan_A` and
+    /// `scan_B`, and NONE on the build-side `scan_C`.
+    pub(crate) fn transitive_inner_join_probe_subtree() -> OptimizerPhysicalNode {
+        let mut scalars = ScalarArena::new();
+        let (a_oc, a_expr) = col(1, "a");
+        let (b_oc, b_expr) = col(2, "b");
+        let (c_oc, c_expr) = col(3, "c");
+
+        let scan_a = leaf(1_000_000.0, a_oc.clone());
+        let scan_b = leaf(1_000_000.0, b_oc.clone());
+        // J_ab: inner join on a = b, outputs both a and b.
+        let j_ab = OptimizerPhysicalNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![eq(&mut scalars, &a_expr, &b_expr)],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![scan_a, scan_b],
+            stats: Statistics {
+                output_row_count: 1_000_000.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            output_columns: vec![a_oc.clone(), b_oc.clone()],
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        // Build side of the top join: small so gates pass.
+        let scan_c = leaf(10.0, c_oc.clone());
+        let plan = OptimizerPhysicalNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![eq(&mut scalars, &b_expr, &c_expr)],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![j_ab, scan_c], // children[0]=probe subtree, children[1]=build
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            output_columns: vec![a_oc, b_oc, c_oc],
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        with_scalars(plan, scalars)
+    }
+
+    /// Probe subtree with an equivalent column that lives BEYOND a left-outer
+    /// boundary (M3 outer/anti stop). Shape:
+    ///
+    /// ```text
+    ///        TopJoin (Inner): eq (b = c)      <- build RF on c
+    ///        /              \
+    ///     LeftOuter          scan_C(col 3)    <- BUILD side of TopJoin
+    ///     eq (b = d)
+    ///     /       \
+    ///  scan_B(2)   scan_D(4)  <- null-supplying side
+    /// ```
+    ///
+    /// The direct probe key `b` (col 2) is equal to `d` (col 4) ONLY through the
+    /// null-preserving left-outer join. An M3 pushdown must NOT expand across the
+    /// outer boundary: it places the probe on the LeftOuter node itself and
+    /// leaves `scan_D` (and `scan_B`) unfiltered.
+    pub(crate) fn transitive_probe_subtree_over_outer_boundary() -> OptimizerPhysicalNode {
+        let mut scalars = ScalarArena::new();
+        let (b_oc, b_expr) = col(2, "b");
+        let (d_oc, d_expr) = col(4, "d");
+        let (c_oc, c_expr) = col(3, "c");
+
+        let scan_b = leaf(1_000_000.0, b_oc.clone());
+        let scan_d = leaf(1_000_000.0, d_oc.clone());
+        let left_outer = OptimizerPhysicalNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::LeftOuter,
+                eq_conditions: vec![eq(&mut scalars, &b_expr, &d_expr)],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![scan_b, scan_d],
+            stats: Statistics {
+                output_row_count: 1_000_000.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            output_columns: vec![b_oc.clone(), d_oc.clone()],
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let scan_c = leaf(10.0, c_oc.clone());
+        let plan = OptimizerPhysicalNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![eq(&mut scalars, &b_expr, &c_expr)],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left_outer, scan_c], // children[0]=probe subtree, children[1]=build
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            output_columns: vec![b_oc, d_oc, c_oc],
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        with_scalars(plan, scalars)
+    }
 }
 
 #[cfg(test)]
@@ -1196,6 +1456,117 @@ mod tests {
         annotate_test(&mut join, &OptimizerOptions::default_settings());
         assert_eq!(join.build_runtime_filters.len(), 1);
         assert_eq!(join.build_runtime_filters[0].filter_id, 0);
+    }
+
+    /// Returns the single column id targeted by the probe for `filter_id` on
+    /// `node`, asserting there is at most ONE probe for that filter id here
+    /// (the "one probe per equivalence class per subtree" invariant) and that
+    /// its key is a lone ColumnRef (all RF keys in these fixtures are). A node
+    /// may still carry probes for OTHER filter ids (e.g. a nested join's own RF).
+    fn probe_column_for(
+        node: &OptimizerPhysicalNode,
+        scalars: &ScalarArena,
+        filter_id: i32,
+    ) -> Option<ColumnId> {
+        let matching: Vec<_> = node
+            .probe_runtime_filters
+            .iter()
+            .filter(|p| p.filter_id == filter_id)
+            .collect();
+        assert!(
+            matching.len() <= 1,
+            "at most one probe per equivalence class (filter id) per subtree"
+        );
+        matching.first().map(|p| {
+            let cols = column_id_vec(scalars, p.probe_expr);
+            assert_eq!(cols.len(), 1, "fixture probe keys are single columns");
+            cols[0]
+        })
+    }
+
+    #[test]
+    fn transitive_bilateral_places_probe_on_both_equivalent_scans() {
+        // build on c (col 3); probe subtree joins a=b (J_ab) then b=c (top).
+        // The single RF must reach BOTH transitively-equal scans: scan_A(col 1)
+        // and scan_B(col 2), sharing one filter id.
+        let mut join = super::test_support::transitive_inner_join_probe_subtree();
+        annotate_test(&mut join, &OptimizerOptions::default_settings());
+
+        assert_eq!(join.build_runtime_filters.len(), 1, "one build RF expected");
+        let filter_id = join.build_runtime_filters[0].filter_id;
+
+        let scalars = join.execution_props.scalar_arena.as_deref().unwrap();
+        let j_ab = &join.children[0];
+        let scan_a = &j_ab.children[0];
+        let scan_b = &j_ab.children[1];
+
+        // Neither the top probe child (J_ab) nor an interior node keeps the probe:
+        // it is pushed all the way to the two leaf scans.
+        assert!(
+            !j_ab
+                .probe_runtime_filters
+                .iter()
+                .any(|p| p.filter_id == filter_id),
+            "the top join's probe should not stop at the intermediate inner join"
+        );
+        assert_eq!(
+            probe_column_for(scan_a, scalars, filter_id),
+            Some(ColumnId::new_for_test(1)),
+            "equivalent column a (col 1) must receive the top join's probe"
+        );
+        assert_eq!(
+            probe_column_for(scan_b, scalars, filter_id),
+            Some(ColumnId::new_for_test(2)),
+            "direct probe column b (col 2) must receive the top join's probe"
+        );
+    }
+
+    #[test]
+    fn transitive_pushdown_does_not_place_probe_on_build_scan() {
+        // Correctness invariant 2: a probe must NEVER land on the building join's
+        // own build-side scan (that scan would wait on an RF built from itself).
+        let mut join = super::test_support::transitive_inner_join_probe_subtree();
+        annotate_test(&mut join, &OptimizerOptions::default_settings());
+
+        let scan_c = &join.children[1]; // build side of the top join
+        assert!(
+            scan_c.probe_runtime_filters.is_empty(),
+            "the build-side scan must never receive a probe runtime filter"
+        );
+    }
+
+    #[test]
+    fn equivalent_column_beyond_outer_boundary_gets_no_probe() {
+        // Correctness invariant 1: the equivalence set must NOT expand across a
+        // null-preserving (left-outer) boundary. `d` (col 4) is equal to the
+        // probe key `b` only through the outer join, so it must stay unfiltered;
+        // the probe stops on the outer-join node itself.
+        let mut join = super::test_support::transitive_probe_subtree_over_outer_boundary();
+        annotate_test(&mut join, &OptimizerOptions::default_settings());
+
+        assert_eq!(join.build_runtime_filters.len(), 1, "one build RF expected");
+        let filter_id = join.build_runtime_filters[0].filter_id;
+        let scalars = join.execution_props.scalar_arena.as_deref().unwrap();
+
+        let left_outer = &join.children[0];
+        let scan_b = &left_outer.children[0];
+        let scan_d = &left_outer.children[1];
+
+        // Probe stops ON the outer-join boundary, bound to the surviving probe
+        // key `b` (col 2) — never expanded to the far side.
+        assert_eq!(
+            probe_column_for(left_outer, scalars, filter_id),
+            Some(ColumnId::new_for_test(2)),
+            "probe should rest on the outer-join boundary, keyed on b"
+        );
+        assert!(
+            scan_b.probe_runtime_filters.is_empty(),
+            "probe must not descend past the outer boundary into the preserved side"
+        );
+        assert!(
+            scan_d.probe_runtime_filters.is_empty(),
+            "the equivalent column beyond the outer boundary must get NO probe"
+        );
     }
 
     #[test]
