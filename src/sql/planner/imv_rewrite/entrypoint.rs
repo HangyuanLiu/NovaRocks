@@ -2737,12 +2737,13 @@ mod tests {
 
     #[test]
     fn pure_join_refresh_coalesce_plan_keeps_project_refs_in_child_scope() {
+        let factory_cell = test_column_ref_factory_reserved_until(30);
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
             mv_ctx: join_projection_mv_ctx(),
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
             deadline: None,
-            column_ref_factory: test_column_ref_factory_reserved_until(30),
+            column_ref_factory: Rc::clone(&factory_cell),
         })
         .expect("join projection IMV pipeline must rewrite and validate");
         let descriptor = outcome
@@ -2751,19 +2752,23 @@ mod tests {
             .join_refresh
             .as_ref()
             .expect("join projection rewrite must record join refresh descriptor");
-        let coalesce = crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-            outcome.plan,
-            descriptor,
-            &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                target_table_uuid: "uuid-tgt".to_string(),
-                target_snapshot_id: Some(99),
-            },
-            200,
-            201,
-            202,
-            203,
-            204,
-        )
+        let coalesce = {
+            let mut factory = factory_cell.borrow_mut();
+            crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+                outcome.plan,
+                descriptor,
+                &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                    target_table_uuid: "uuid-tgt".to_string(),
+                    target_snapshot_id: Some(99),
+                },
+                &mut factory,
+                200,
+                201,
+                202,
+                203,
+                204,
+            )
+        }
         .expect("join projection coalesce plan");
 
         assert_project_refs_resolve_to_child_outputs(&coalesce);
@@ -2775,12 +2780,13 @@ mod tests {
             .name("imv-join-physical-scope-test".to_string())
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
+                let factory_cell = test_column_ref_factory_reserved_until(30);
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_plan(),
                     mv_ctx: join_projection_mv_ctx(),
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                     deadline: None,
-                    column_ref_factory: test_column_ref_factory_reserved_until(30),
+                    column_ref_factory: Rc::clone(&factory_cell),
                 })
                 .expect("join projection IMV pipeline must rewrite and validate");
                 let descriptor = outcome
@@ -2789,19 +2795,23 @@ mod tests {
                     .join_refresh
                     .as_ref()
                     .expect("join projection rewrite must record join refresh descriptor");
-                let coalesce = crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                    outcome.plan,
-                    descriptor,
-                    &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                        target_table_uuid: "uuid-tgt".to_string(),
-                        target_snapshot_id: Some(99),
-                    },
-                    200,
-                    201,
-                    202,
-                    203,
-                    204,
-                )
+                let coalesce = {
+                    let mut factory = factory_cell.borrow_mut();
+                    crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+                        outcome.plan,
+                        descriptor,
+                        &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                            target_table_uuid: "uuid-tgt".to_string(),
+                            target_snapshot_id: Some(99),
+                        },
+                        &mut factory,
+                        200,
+                        201,
+                        202,
+                        203,
+                        204,
+                    )
+                }
                 .expect("join projection coalesce plan");
                 let physical = optimize_logical_for_test(coalesce);
 
@@ -2818,12 +2828,13 @@ mod tests {
             .name("imv-join-filter-physical-scope-test".to_string())
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
+                let factory_cell = test_column_ref_factory_reserved_until(30);
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_filter_plan(),
                     mv_ctx: join_projection_mv_ctx(),
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                     deadline: None,
-                    column_ref_factory: test_column_ref_factory_reserved_until(30),
+                    column_ref_factory: Rc::clone(&factory_cell),
                 })
                 .expect("join projection/filter IMV pipeline must rewrite and validate");
                 let descriptor = outcome
@@ -2832,19 +2843,23 @@ mod tests {
                     .join_refresh
                     .as_ref()
                     .expect("join projection/filter rewrite must record join refresh descriptor");
-                let coalesce = crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                    outcome.plan,
-                    descriptor,
-                    &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                        target_table_uuid: "uuid-tgt".to_string(),
-                        target_snapshot_id: Some(99),
-                    },
-                    200,
-                    201,
-                    202,
-                    203,
-                    204,
-                )
+                let coalesce = {
+                    let mut factory = factory_cell.borrow_mut();
+                    crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+                        outcome.plan,
+                        descriptor,
+                        &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                            target_table_uuid: "uuid-tgt".to_string(),
+                            target_snapshot_id: Some(99),
+                        },
+                        &mut factory,
+                        200,
+                        201,
+                        202,
+                        203,
+                        204,
+                    )
+                }
                 .expect("join projection/filter coalesce plan");
                 let physical = optimize_logical_for_test(coalesce);
 
@@ -2863,12 +2878,13 @@ mod tests {
             .name("imv-join-side-filter-physical-scope-test".to_string())
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
+                let factory_cell = test_column_ref_factory_reserved_until(30);
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_left_filter_plan(),
                     mv_ctx: join_projection_mv_ctx(),
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                     deadline: None,
-                    column_ref_factory: test_column_ref_factory_reserved_until(30),
+                    column_ref_factory: Rc::clone(&factory_cell),
                 })
                 .expect("join projection side-filter IMV pipeline must rewrite and validate");
                 let descriptor = outcome
@@ -2877,19 +2893,23 @@ mod tests {
                     .join_refresh
                     .as_ref()
                     .expect("join side-filter rewrite must record join refresh descriptor");
-                let coalesce = crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                    outcome.plan,
-                    descriptor,
-                    &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                        target_table_uuid: "uuid-tgt".to_string(),
-                        target_snapshot_id: Some(99),
-                    },
-                    200,
-                    201,
-                    202,
-                    203,
-                    204,
-                )
+                let coalesce = {
+                    let mut factory = factory_cell.borrow_mut();
+                    crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+                        outcome.plan,
+                        descriptor,
+                        &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                            target_table_uuid: "uuid-tgt".to_string(),
+                            target_snapshot_id: Some(99),
+                        },
+                        &mut factory,
+                        200,
+                        201,
+                        202,
+                        203,
+                        204,
+                    )
+                }
                 .expect("join side-filter coalesce plan");
                 let physical = optimize_logical_for_test(coalesce);
 
@@ -2911,12 +2931,13 @@ mod tests {
                     join_projection_plan(),
                     &refresh_ctx.rewrite,
                 );
+                let factory_cell = test_column_ref_factory_reserved_until(30);
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan,
                     mv_ctx: Arc::clone(&refresh_ctx.rewrite),
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                     deadline: None,
-                    column_ref_factory: test_column_ref_factory_reserved_until(30),
+                    column_ref_factory: Rc::clone(&factory_cell),
                 })
                 .expect("join projection IMV pipeline must rewrite and validate");
                 let descriptor = outcome
@@ -2925,16 +2946,20 @@ mod tests {
                     .join_refresh
                     .as_ref()
                     .expect("join projection rewrite must record join refresh descriptor");
-                let coalesce = crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                    outcome.plan,
-                    descriptor,
-                    &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_rewrite_context(&refresh_ctx.rewrite),
-                    200,
-                    201,
-                    202,
-                    203,
-                    204,
-                )
+                let coalesce = {
+                    let mut factory = factory_cell.borrow_mut();
+                    crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+                        outcome.plan,
+                        descriptor,
+                        &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_rewrite_context(&refresh_ctx.rewrite),
+                        &mut factory,
+                        200,
+                        201,
+                        202,
+                        203,
+                        204,
+                    )
+                }
                 .expect("join projection coalesce plan");
                 let physical = optimize_logical_for_test(coalesce);
                 let catalog = crate::engine::catalog::InMemoryCatalog::default();
