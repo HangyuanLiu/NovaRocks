@@ -506,9 +506,9 @@ mod tests {
     };
     use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
     use crate::sql::optimizer::property::{DistributionSpec, HashSource, PhysicalPropertySet};
-    use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
+    use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::optimizer::statistics::{Confidence, Statistics};
+    use crate::sql::optimizer::statistics::{Confidence, CostEstimate, Statistics};
     use crate::sql::planner::PhysicalPlanKind;
     use std::sync::Arc;
 
@@ -548,6 +548,17 @@ mod tests {
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
         }
+    }
+
+    fn assert_column_ref(expr: &TypedExpr, expected_id: u32, expected_name: &str) {
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &expr.kind
+        else {
+            panic!("expected ColumnRef, got {:?}", expr.kind);
+        };
+        assert_eq!(*column_id, ColumnId::new_for_test(expected_id));
+        assert_eq!(column, expected_name);
     }
 
     fn base_node(op: Operator) -> OptimizerPhysicalNode {
@@ -655,6 +666,31 @@ mod tests {
                 source: HashSource::ShuffleJoin,
             }
         );
+        assert_eq!(physical.children.len(), 1);
+        assert!(matches!(
+            physical.children[0].kind,
+            PhysicalPlanKind::Values(_)
+        ));
+    }
+
+    #[test]
+    fn root_gather_distribution_is_preserved_as_redistribute() {
+        let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
+            spec: DistributionSpec::Gather,
+        }));
+        node.children.push(raw_values_node());
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
+            panic!("expected Redistribute");
+        };
+        assert_eq!(redistribute.mode, RedistributeMode::Gather);
+        assert_eq!(physical.children.len(), 1);
+        assert!(matches!(
+            physical.children[0].kind,
+            PhysicalPlanKind::Values(_)
+        ));
     }
 
     #[test]
@@ -790,6 +826,60 @@ mod tests {
             JoinExecutionMode::Partitioned
         );
         assert_eq!(join.execution_mode, Some(JoinExecutionMode::Partitioned));
+        assert_eq!(join.build_runtime_filters[0].filter_id, 11);
+        assert_eq!(join.build_runtime_filters[0].expr_order, 0);
+        assert_column_ref(&join.build_runtime_filters[0].build_expr, 2, "r");
+        assert_column_ref(&join.build_runtime_filters[0].probe_expr, 1, "l");
+    }
+
+    #[test]
+    fn probe_runtime_filter_intent_stays_on_target_node() {
+        let mut arena = ScalarArena::new();
+        let probe_expr = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_expr(9, "probe_key"),
+        );
+        let mut node = base_node(Operator::PhysicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![output_column(9, "probe_key")],
+        }));
+        node.probe_runtime_filters.push(RuntimeFilterProbe {
+            filter_id: 21,
+            probe_expr,
+        });
+        let node = attach_arena(node, Arc::new(arena));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        assert!(matches!(physical.kind, PhysicalPlanKind::Values(_)));
+        assert!(physical.children.is_empty());
+        assert_eq!(physical.probe_runtime_filters.len(), 1);
+        assert_eq!(physical.probe_runtime_filters[0].filter_id, 21);
+        assert_column_ref(
+            &physical.probe_runtime_filters[0].probe_expr,
+            9,
+            "probe_key",
+        );
+    }
+
+    #[test]
+    fn frozen_cost_stats_are_copied_without_recompute() {
+        let mut node = values_node();
+        node.explain_stats.cost_estimate = Some(CostEstimate {
+            cpu_cost: 11.0,
+            memory_cost: 12.0,
+            network_cost: 13.0,
+        });
+        node.explain_stats.broadcast_decision = None;
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let cost = physical
+            .stats
+            .cost_estimate
+            .expect("cost estimate should be copied");
+        assert_eq!(cost.cpu_cost, 11.0);
+        assert_eq!(cost.memory_cost, 12.0);
+        assert_eq!(cost.network_cost, 13.0);
+        assert!(physical.stats.broadcast_decision.is_none());
     }
 
     #[test]
