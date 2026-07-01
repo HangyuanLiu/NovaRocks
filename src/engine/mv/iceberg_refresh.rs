@@ -3358,7 +3358,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
             descriptor_contract.as_ref(),
             dispatch_schema_contract,
         )?;
-        // W3a: verify the watermark recorded in the storage table's current
+        // W3a: verify the watermark recorded in the MV table's current
         // snapshot provenance matches the store. First refresh (no current
         // snapshot, or a snapshot without provenance) has no watermark yet —
         // skip.

@@ -662,7 +662,7 @@ pub(crate) fn ensure_descriptor_schema_contract_matches(
     }
 }
 
-/// Assert the provenance watermark (from the storage table's current snapshot
+/// Assert the provenance watermark (from the MV table's current snapshot
 /// summary) matches the metadata store's last_refresh_snapshots. Fail-loud on
 /// drift — the summary is the authoritative watermark home (W3a).
 pub(crate) fn ensure_summary_watermark_matches_store(
@@ -673,7 +673,7 @@ pub(crate) fn ensure_summary_watermark_matches_store(
         match store_last_refresh_snapshots.get(&base.table_fqn) {
             None => {
                 return Err(format!(
-                    "MV refresh watermark drift: base table {} is present in the storage \
+                    "MV refresh watermark drift: base table {} is present in the MV \
                      table's snapshot-summary provenance (to_snapshot={}) but missing from \
                      the metadata store's last_refresh_snapshots",
                     base.table_fqn, base.to_snapshot

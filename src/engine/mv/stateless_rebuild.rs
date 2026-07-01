@@ -14,8 +14,14 @@
 //!
 //! W1 (MV package descriptors) already carries the definition, the visible
 //! schema, and the base dependencies, all covered by the descriptor content
-//! hash, so the server can reconstruct the `package` level today. The
-//! `provenance` and `full` levels arrive with later umbrella tasks (W3a/W4).
+//! hash, so the server can reconstruct the `package` level today. W3a adds the
+//! `provenance` level: when the MV table's current snapshot carries a
+//! `provenance.v1` record (stamped by every MV refresh, see
+//! `crate::connector::iceberg::commit::mv_provenance`), the server also
+//! reports `ProvenanceHash`/`WaterlineHash` derived from it. An MV that was
+//! created but never refreshed (no current snapshot, or a snapshot without
+//! provenance) still reports `package` with those hashes NULL. The `full`
+//! level arrives with a later umbrella task (W4).
 
 use std::sync::Arc;
 
@@ -149,9 +155,34 @@ fn execute_request(
         })?;
 
     let descriptor_hash = mv.descriptor.content_hash()?;
-    // W1 landed the package descriptor, so the package level is reconstructable
-    // today. W3a/W4 will raise this to provenance/full.
-    let available = StatelessLevel::Package;
+
+    // W3a: the MV table's current snapshot may carry a `provenance.v1`
+    // summary property (stamped by every MV refresh since M3). When present,
+    // the server can reconstruct the provenance level purely from the lake;
+    // otherwise (no current snapshot, or an MV that was created but never
+    // refreshed) it falls back to the W1 package level.
+    let entry = {
+        let catalogs = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        catalogs.get(&req.catalog)?
+    };
+    let loaded =
+        crate::connector::iceberg::catalog::registry::load_table(&entry, &mv.namespace, &mv.table)?;
+    let provenance = loaded
+        .table
+        .metadata()
+        .current_snapshot()
+        .map(|current| {
+            crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1::from_snapshot_summary(
+                current,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let (provenance_hash, waterline_hash, available) = provenance_level(provenance.as_ref())?;
+
     let rebuild_source = "lake-mv-table";
     // The procedure reports the level it CAN reconstruct; the sql-test runner
     // asserts `available >= required`, so `required_level` is not gated here.
@@ -160,16 +191,43 @@ fn execute_request(
     Ok(StatementResult::Query(build_rebuild_result(
         available,
         &descriptor_hash,
+        provenance_hash.as_deref(),
+        waterline_hash.as_deref(),
         rebuild_source,
     )?))
 }
 
+/// Pure level-selection: given the MV table's current-snapshot
+/// provenance record (or `None` when there is no current snapshot, or the
+/// current snapshot predates provenance stamping), decide the
+/// `(ProvenanceHash, WaterlineHash, AvailableLevel)` triple.
+///
+/// `Some(prov)` reconstructs the `provenance` level with both hashes
+/// populated; `None` falls back to `package` with both hashes NULL. Isolated
+/// as a pure function so the level-selection contract is unit-testable
+/// without loading a live Iceberg table.
+fn provenance_level(
+    provenance: Option<&crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1>,
+) -> Result<(Option<String>, Option<String>, StatelessLevel), String> {
+    match provenance {
+        Some(prov) => Ok((
+            Some(prov.content_hash()?),
+            Some(prov.waterline_hash()?),
+            StatelessLevel::Provenance,
+        )),
+        None => Ok((None, None, StatelessLevel::Package)),
+    }
+}
+
 /// Build the fixed one-row rebuild report. Columns are all `Utf8`; the three
-/// hash columns are nullable because only the descriptor hash is populated at
-/// the package level.
+/// hash columns are nullable because `ProvenanceHash`/`WaterlineHash` are only
+/// populated once the MV table's current snapshot carries a
+/// `provenance.v1` record (see `execute_request`).
 fn build_rebuild_result(
     available: StatelessLevel,
     descriptor_hash: &str,
+    provenance_hash: Option<&str>,
+    waterline_hash: Option<&str>,
     rebuild_source: &str,
 ) -> Result<QueryResult, String> {
     let columns = vec![
@@ -182,8 +240,8 @@ fn build_rebuild_result(
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![available.as_sql().to_string()])),
         Arc::new(StringArray::from(vec![Some(descriptor_hash.to_string())])),
-        Arc::new(StringArray::from(vec![None::<String>])),
-        Arc::new(StringArray::from(vec![None::<String>])),
+        Arc::new(StringArray::from(vec![provenance_hash.map(str::to_string)])),
+        Arc::new(StringArray::from(vec![waterline_hash.map(str::to_string)])),
         Arc::new(StringArray::from(vec![rebuild_source.to_string()])),
     ];
     build_query_result(columns, arrays)
@@ -230,6 +288,46 @@ mod tests {
     #[test]
     fn guard_accepts_when_flag_enabled() {
         assert!(ensure_stateless_rebuild_enabled(Some("1")).is_ok());
+    }
+
+    fn sample_provenance() -> crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1 {
+        use crate::connector::iceberg::commit::mv_provenance::{
+            MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
+        };
+        MvProvenanceV1 {
+            provenance_version: MV_PROVENANCE_VERSION,
+            refresh_id: 1,
+            mv_id: 1,
+            token: "token-1".to_string(),
+            technique: RefreshTechnique::Full,
+            bases: vec![ProvenanceBase {
+                table_fqn: "ice.sales.orders".to_string(),
+                uuid: "uuid-orders".to_string(),
+                from_snapshot: None,
+                to_snapshot: 200,
+            }],
+            definition_fingerprint: "fp-abc".to_string(),
+            rows: 3,
+        }
+    }
+
+    #[test]
+    fn provenance_level_reports_provenance_with_hashes_when_present() {
+        let prov = sample_provenance();
+        let (provenance_hash, waterline_hash, available) = provenance_level(Some(&prov)).unwrap();
+
+        assert_eq!(available, StatelessLevel::Provenance);
+        assert_eq!(provenance_hash, Some(prov.content_hash().unwrap()));
+        assert_eq!(waterline_hash, Some(prov.waterline_hash().unwrap()));
+    }
+
+    #[test]
+    fn provenance_level_falls_back_to_package_with_null_hashes_when_absent() {
+        let (provenance_hash, waterline_hash, available) = provenance_level(None).unwrap();
+
+        assert_eq!(available, StatelessLevel::Package);
+        assert_eq!(provenance_hash, None);
+        assert_eq!(waterline_hash, None);
     }
 
     #[test]

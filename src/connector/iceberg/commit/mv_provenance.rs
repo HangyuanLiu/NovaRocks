@@ -360,7 +360,6 @@ mod tests {
 #[cfg(test)]
 mod spike_tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use iceberg::spec::{Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary};
     use iceberg::table::Table;
