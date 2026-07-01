@@ -563,6 +563,7 @@ impl PhysicalPlanKind {
 #[derive(Clone, Debug)]
 pub(crate) struct RedistributeNode {
     pub mode: RedistributeMode,
+    pub partition_exprs: Vec<TypedExpr>,
     pub output_columns: Vec<OutputColumn>,
 }
 
@@ -879,6 +880,7 @@ mod plan_tests {
 
         accepts_physical(PhysicalPlanKind::Redistribute(RedistributeNode {
             mode: RedistributeMode::Gather,
+            partition_exprs: vec![],
             output_columns: vec![],
         }));
 

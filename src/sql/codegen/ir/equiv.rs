@@ -41,7 +41,7 @@ mod tests {
         ScanOp, SortOp, TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::physical_tree::{
-        OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
+        JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
@@ -637,9 +637,10 @@ mod tests {
 
     fn build_distributed_plan(
         case_name: &str,
-        plan: OptimizerPhysicalNode,
+        mut plan: OptimizerPhysicalNode,
         connectors: &ConnectorRegistry,
     ) -> MultiFragmentBuildResult {
+        prepare_bridge2_test_props(&mut plan);
         let catalog = DummyCatalog;
         PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, connectors, "test_db")
             .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"))
@@ -647,10 +648,11 @@ mod tests {
 
     fn build_distributed_plan_with_mv_refresh_ctx(
         case_name: &str,
-        plan: OptimizerPhysicalNode,
+        mut plan: OptimizerPhysicalNode,
         connectors: &ConnectorRegistry,
         mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     ) -> MultiFragmentBuildResult {
+        prepare_bridge2_test_props(&mut plan);
         let catalog = DummyCatalog;
         PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
             &plan,
@@ -664,8 +666,9 @@ mod tests {
 
     fn build_distributed_plan_only(
         case_name: &str,
-        plan: OptimizerPhysicalNode,
+        mut plan: OptimizerPhysicalNode,
     ) -> MultiFragmentBuildResult {
+        prepare_bridge2_test_props(&mut plan);
         let catalog = DummyCatalog;
         let connectors = ConnectorRegistry::new();
         PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &connectors, "test_db")
@@ -674,9 +677,10 @@ mod tests {
 
     fn assert_distributed_plan_error_contains(
         case_name: &str,
-        plan: OptimizerPhysicalNode,
+        mut plan: OptimizerPhysicalNode,
         expected: &str,
     ) {
+        prepare_bridge2_test_props(&mut plan);
         let catalog = DummyCatalog;
         let connectors = ConnectorRegistry::new();
         let err = match PlanFragmentBuilder::build_via_distributed_plan(
@@ -692,6 +696,27 @@ mod tests {
             err.contains(expected),
             "{case_name}: expected error to contain `{expected}`, got `{err}`"
         );
+    }
+
+    fn prepare_bridge2_test_props(node: &mut OptimizerPhysicalNode) {
+        for child in &mut node.children {
+            prepare_bridge2_test_props(child);
+        }
+        if let Operator::PhysicalHashJoin(join) = &node.op {
+            node.execution_props.join_distribution =
+                join_execution_distribution_for_test(join.distribution.clone());
+        }
+    }
+
+    fn join_execution_distribution_for_test(
+        distribution: JoinDistribution,
+    ) -> Option<JoinExecutionDistribution> {
+        match distribution {
+            JoinDistribution::Broadcast => Some(JoinExecutionDistribution::Broadcast),
+            JoinDistribution::Shuffle => Some(JoinExecutionDistribution::Partitioned),
+            JoinDistribution::Colocate => Some(JoinExecutionDistribution::Colocate),
+            JoinDistribution::Unknown => None,
+        }
     }
 
     fn assert_multi_fragment_ir_structure(
@@ -2346,7 +2371,7 @@ mod tests {
 
     fn window_row_number_over_scan_plan() -> OptimizerPhysicalNode {
         let k = output_col(901, "k", DataType::Int64, false);
-        let mut child = single_column_scan_plan(k.clone());
+        let child = single_column_scan_plan(k.clone());
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let k = output_col(901, "k", DataType::Int64, false);
         let row_number = output_col(902, "rn", DataType::Int64, false);

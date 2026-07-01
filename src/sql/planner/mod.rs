@@ -5,7 +5,6 @@
 //! physical optimizer plans into planner-side distributed plan fragments before
 //! codegen lowers them to Thrift.
 
-mod distributed_build;
 mod distributed_fragment;
 mod distributed_node;
 mod distributed_plan_build;
@@ -15,16 +14,13 @@ pub(crate) mod plan;
 pub(crate) mod runtime_filter;
 pub(crate) mod stats;
 
-pub(crate) use distributed_build::build_distributed_plan;
 pub(crate) use distributed_fragment::{
     DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment,
 };
-#[allow(unused_imports)]
 pub(crate) use distributed_node::{DistributedNode, DistributedPayload, ExchangeReceiver};
-pub(crate) use distributed_node::{DistributedPlanKind, DistributedPlanNode, PlanNodeStats};
-// Temporary PIR-4 M3 migration API; M4 will switch production and rename this path.
-#[allow(unused_imports)]
-pub(crate) use distributed_plan_build::build_distributed_plan_v2;
+pub(crate) use distributed_plan_build::{
+    build_distributed_plan, union_distinct_must_be_rewritten_error,
+};
 pub(crate) use runtime_filter::{
     JoinExecutionMode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };
@@ -62,13 +58,13 @@ fn expr_column_id(expr: &TypedExpr, name: &str, factory: &mut ColumnRefFactory) 
 
 #[cfg(test)]
 mod bridge2_export_tests {
-    use super::{DistributedPlan, DistributedPlanNode, build_distributed_plan};
-    use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
+    use super::{DistributedNode, DistributedPlan, build_distributed_plan};
+    use crate::sql::planner::plan::PhysicalPlanNode;
 
     #[test]
     fn planner_exports_bridge2_distributed_plan_api() {
-        fn accepts_builder(_: fn(&OptimizerPhysicalNode) -> Result<DistributedPlan, String>) {}
-        fn accepts_node(_: Option<DistributedPlanNode>) {}
+        fn accepts_builder(_: fn(&PhysicalPlanNode) -> Result<DistributedPlan, String>) {}
+        fn accepts_node(_: Option<DistributedNode>) {}
 
         accepts_builder(build_distributed_plan);
         accepts_node(None);

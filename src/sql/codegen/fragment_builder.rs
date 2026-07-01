@@ -216,13 +216,18 @@ impl PlanFragmentBuilder {
                     crate::sql::optimizer::property::DistributionSpec::Gather
                 ) =>
             {
+                // Preserve the historical root-gather bypass: the distributed
+                // builder also skips root Gather, but the direct-exec paths
+                // below match on the real payload under that wrapper.
                 plan.children
                     .first()
                     .ok_or_else(|| "root PhysicalDistribution(Gather) missing child".to_string())?
             }
             _ => plan,
         };
-        let dp = crate::sql::planner::build_distributed_plan(plan)?;
+        let physical =
+            crate::sql::planner::optimizer_bridge::physical::optimizer_physical_to_plan(plan)?;
+        let dp = crate::sql::planner::build_distributed_plan(&physical)?;
         crate::sql::codegen::ir::lower_distributed_plan(&dp, catalog, connectors, mv_refresh_ctx)
     }
 

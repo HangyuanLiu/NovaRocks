@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::sql::analysis::TypedExpr;
 use crate::sql::codegen::scalar_materialize::{
     materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
@@ -277,8 +278,15 @@ impl BridgeCtx<'_> {
                 }))
             }
             Operator::PhysicalDistribution(op) => {
+                let mode = redistribute_mode(op)?;
+                let child = node.children.first().ok_or_else(|| {
+                    "Bridge 2a invalid PhysicalDistribution shape: expected 1 children, got 0"
+                        .to_string()
+                })?;
+                let partition_exprs = redistribute_partition_exprs(self.scalars, &mode, child);
                 Ok(PhysicalPlanKind::Redistribute(RedistributeNode {
-                    mode: redistribute_mode(op)?,
+                    mode,
+                    partition_exprs,
                     output_columns: node.output_columns.clone(),
                 }))
             }
@@ -444,6 +452,36 @@ fn redistribute_mode(op: &PhysicalDistributionOp) -> Result<RedistributeMode, St
     }
 }
 
+fn redistribute_partition_exprs(
+    scalars: &ScalarArena,
+    mode: &RedistributeMode,
+    child: &OptimizerPhysicalNode,
+) -> Vec<TypedExpr> {
+    let RedistributeMode::Hash { cols, .. } = mode else {
+        return Vec::new();
+    };
+    let Operator::PhysicalHashAggregate(aggregate) = &child.op else {
+        return Vec::new();
+    };
+
+    let mut exprs = Vec::with_capacity(cols.len());
+    for col_id in cols {
+        let Some(position) = aggregate
+            .output_layout
+            .group_key_columns
+            .iter()
+            .position(|column| column.column_id == *col_id)
+        else {
+            return Vec::new();
+        };
+        let Some(group_by) = aggregate.group_by.get(position) else {
+            return Vec::new();
+        };
+        exprs.push(materialize(scalars, *group_by));
+    }
+    exprs
+}
+
 fn planner_confidence(confidence: Confidence) -> PlannerConfidence {
     match confidence {
         Confidence::Fallback => PlannerConfidence::Fallback,
@@ -526,9 +564,10 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{ChangeStreamBranchKind, JoinKind, OutputColumn};
     use crate::sql::optimizer::operator::{
-        AggregateStateMergeOp, ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec,
-        JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinEqCondition,
-        PhysicalHashJoinOp, UnionOp, ValuesOp,
+        AggMode, AggregateOutputLayout, ChangeEventExpandOp, ChangeEventOutputExpr,
+        ChangeEventSpec, JoinDistribution, Operator, PhysicalDistributionOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, UnionOp,
+        ValuesOp,
     };
     use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
     use crate::sql::optimizer::property::{DistributionSpec, HashSource, PhysicalPropertySet};
@@ -689,7 +728,10 @@ mod tests {
                 source: HashSource::ShuffleJoin,
             },
         }));
-        node.children.push(raw_values_node());
+        node.output_columns = vec![output_column(7, "parent_k")];
+        let mut child = raw_values_node();
+        child.output_columns = vec![output_column(7, "child_k")];
+        node.children.push(child);
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
         let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
@@ -703,11 +745,70 @@ mod tests {
                 source: HashSource::ShuffleJoin,
             }
         );
+        assert!(redistribute.partition_exprs.is_empty());
+        assert_output_columns_eq(
+            &redistribute.output_columns,
+            &[output_column(7, "parent_k")],
+        );
         assert_eq!(physical.children.len(), 1);
         assert!(matches!(
             physical.children[0].kind,
             PhysicalPlanKind::Values(_)
         ));
+    }
+
+    #[test]
+    fn physical_distribution_over_aggregate_carries_group_key_partition_expr() {
+        let mut arena = ScalarArena::new();
+        let group_expr = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId::new_for_test(7),
+                    qualifier: Some("a".to_string()),
+                    column: "k".to_string(),
+                },
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+            },
+        );
+        let group_column = output_column(7, "k");
+        let mut aggregate = base_node(Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::Local,
+            group_by: vec![group_expr],
+            aggregates: vec![],
+            output_layout: AggregateOutputLayout::new(vec![group_column.clone()], vec![]),
+            output_columns: vec![group_column.clone()],
+            is_merge: vec![],
+        }));
+        aggregate.children.push(raw_values_node());
+        let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
+            spec: DistributionSpec::HashPartitioned {
+                cols: vec![ColumnId::new_for_test(7)],
+                source: HashSource::ShuffleAgg,
+            },
+        }));
+        node.output_columns = vec![group_column];
+        node.children.push(aggregate);
+        let node = attach_arena(node, Arc::new(arena));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
+            panic!("expected Redistribute");
+        };
+
+        assert_eq!(redistribute.partition_exprs.len(), 1);
+        let ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column,
+        } = &redistribute.partition_exprs[0].kind
+        else {
+            panic!("expected partition ColumnRef");
+        };
+        assert_eq!(*column_id, ColumnId::new_for_test(7));
+        assert_eq!(qualifier.as_deref(), Some("a"));
+        assert_eq!(column, "k");
     }
 
     #[test]

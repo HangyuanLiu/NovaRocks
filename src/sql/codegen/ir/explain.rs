@@ -5,7 +5,6 @@ use arrow::datatypes::DataType;
 use crate::runtime::profile_correlate::{ActualMetrics, DistributedProfileSummary};
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::catalog::{ScanSource, TableDef};
-use crate::sql::codegen::scalar_materialize::materialize;
 use crate::sql::column_id::ColumnId;
 use crate::sql::explain::{
     ExplainLevel, PlanNodeExplainStage, format_expr, format_project_item, format_scan_dict_suffix,
@@ -13,12 +12,12 @@ use crate::sql::explain::{
 };
 use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
-use crate::sql::optimizer::physical_tree::JoinExecutionDistribution;
-use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
-use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::optimizer::statistics::{
+    DEFAULT_CPU_COST_WEIGHT, DEFAULT_MEMORY_COST_WEIGHT, DEFAULT_NETWORK_COST_WEIGHT,
+};
 use crate::sql::planner::plan::{
-    DistributedChangeEventExpandNode, DistributedExchangeNode, ExchangeFlavor,
-    PhysicalHashAggregateNode, PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode,
+    DistributedChangeEventExpandNode, ExchangeFlavor, PhysicalHashAggregateNode,
+    PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode,
     PhysicalTopNNode, PlanAssertOneRowNode as DistributedAssertOneRowNode,
     PlanDecodeNode as DistributedDecodeNode, PlanFilterNode as DistributedFilterNode,
     PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
@@ -29,7 +28,9 @@ use crate::sql::planner::plan::{
     ScanVariantColumn,
 };
 use crate::sql::planner::{
-    DistributedPlan, DistributedPlanKind, DistributedPlanNode, PlanFragment, PlanNodeStats,
+    DistributedNode, DistributedPayload, DistributedPlan, ExchangeReceiver, JoinExecutionMode,
+    PhysicalPlanStats, PlanFragment, PlannerBroadcastDecision, PlannerConfidence,
+    PlannerCostEstimate, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
 };
 use crate::thrift::partitions;
 
@@ -108,14 +109,7 @@ fn explain_distributed_plan_inner(
             }
         }
 
-        format_distributed_node(
-            &fragment.root,
-            dp.scalar_arena.as_ref(),
-            level,
-            0,
-            actuals,
-            &mut out,
-        );
+        format_distributed_node(&fragment.root, level, 0, actuals, &mut out);
     }
 
     out
@@ -149,11 +143,11 @@ fn format_output_exprs(exprs: Option<&[TypedExpr]>) -> String {
 }
 
 fn format_distributed_shared_plan_node_header(
-    kind: &DistributedPlanKind,
+    kind: &PhysicalPlanKind,
     stage: PlanNodeExplainStage,
 ) -> Option<String> {
     match kind {
-        DistributedPlanKind::Scan(node) => {
+        PhysicalPlanKind::Scan(node) => {
             let alias = node
                 .alias
                 .as_deref()
@@ -165,8 +159,8 @@ fn format_distributed_shared_plan_node_header(
                 node.database, node.table.name, alias, dict
             ))
         }
-        DistributedPlanKind::Filter(_) => Some("FILTER".to_string()),
-        DistributedPlanKind::Project(node) => {
+        PhysicalPlanKind::Filter(_) => Some("FILTER".to_string()),
+        PhysicalPlanKind::Project(node) => {
             let items = node
                 .items
                 .iter()
@@ -174,16 +168,16 @@ fn format_distributed_shared_plan_node_header(
                 .collect::<Vec<_>>();
             Some(format!("PROJECT [{}]", items.join(", ")))
         }
-        DistributedPlanKind::Sort(node) => {
+        PhysicalPlanKind::Sort(node) => {
             let items = format_sort_items(&node.items);
             Some(format!("SORT BY [{}]", items.join(", ")))
         }
-        DistributedPlanKind::Window(node) => {
+        PhysicalPlanKind::Window(node) => {
             let fns = format_window_exprs(&node.window_exprs, stage);
             Some(format!("WINDOW [{}]", fns.join("; ")))
         }
-        DistributedPlanKind::Values(node) => Some(format!("VALUES ({} rows)", node.rows.len())),
-        DistributedPlanKind::Decode(node) => {
+        PhysicalPlanKind::Values(node) => Some(format!("VALUES ({} rows)", node.rows.len())),
+        PhysicalPlanKind::Decode(node) => {
             let pairs = node
                 .mappings
                 .iter()
@@ -191,11 +185,11 @@ fn format_distributed_shared_plan_node_header(
                 .collect::<Vec<_>>();
             Some(format!("DECODE [{}]", pairs.join(", ")))
         }
-        DistributedPlanKind::Repeat(node) => Some(format!(
+        PhysicalPlanKind::Repeat(node) => Some(format!(
             "REPEAT ({} grouping sets)",
             node.grouping_ids.len()
         )),
-        DistributedPlanKind::ChangeEventExpand(node) => {
+        PhysicalPlanKind::ChangeEventExpand(node) => {
             let branches = node
                 .events
                 .iter()
@@ -207,11 +201,11 @@ fn format_distributed_shared_plan_node_header(
                 branches.join(",")
             ))
         }
-        DistributedPlanKind::GenerateSeries(node) => Some(format!(
+        PhysicalPlanKind::GenerateSeries(node) => Some(format!(
             "GENERATE_SERIES({}, {}, {})",
             node.start, node.end, node.step
         )),
-        DistributedPlanKind::TableFunction(node) => {
+        PhysicalPlanKind::TableFunction(node) => {
             let join_type = if node.is_left_join { "LEFT" } else { "CROSS" };
             Some(format!(
                 "TABLE_FUNCTION [{} {}]",
@@ -219,7 +213,7 @@ fn format_distributed_shared_plan_node_header(
                 node.function_name.to_uppercase()
             ))
         }
-        DistributedPlanKind::AssertOneRow(_) => Some(match stage {
+        PhysicalPlanKind::AssertOneRow(_) => Some(match stage {
             PlanNodeExplainStage::Logical => "ASSERT ONE ROW".to_string(),
             PlanNodeExplainStage::Distributed => "ASSERT NUM ROWS (<= 1)".to_string(),
         }),
@@ -228,11 +222,11 @@ fn format_distributed_shared_plan_node_header(
 }
 
 fn format_distributed_shared_plan_node_detail_lines(
-    kind: &DistributedPlanKind,
+    kind: &PhysicalPlanKind,
     _stage: PlanNodeExplainStage,
 ) -> Vec<String> {
     match kind {
-        DistributedPlanKind::Filter(node) => {
+        PhysicalPlanKind::Filter(node) => {
             vec![format!("predicate: {}", format_expr(&node.predicate))]
         }
         _ => vec![],
@@ -240,8 +234,7 @@ fn format_distributed_shared_plan_node_detail_lines(
 }
 
 fn format_distributed_node(
-    node: &DistributedPlanNode,
-    arena: &ScalarArena,
+    node: &DistributedNode,
     level: ExplainLevel,
     indent: usize,
     actuals: Option<&HashMap<i32, ActualMetrics>>,
@@ -255,94 +248,76 @@ fn format_distributed_node(
         actual_suffix(node, actuals)
     );
 
-    match &node.kind {
-        DistributedPlanKind::Scan(scan) => {
-            format_scan_node(
-                node,
-                scan,
-                arena,
-                level,
-                &pad,
-                &costs_suffix,
-                &stats_suffix,
-                out,
-            );
+    match &node.payload {
+        DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) => {
+            format_scan_node(node, scan, level, &pad, &costs_suffix, &stats_suffix, out);
         }
-        DistributedPlanKind::Project(project) => {
+        DistributedPayload::Physical(PhysicalPlanKind::Project(project)) => {
             format_project_node(node, project, &pad, &costs_suffix, &stats_suffix, out);
-            push_probe_rf_lines(&node.probe_runtime_filters, arena, level, &pad, out);
-            format_children(node, arena, level, indent, actuals, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::Filter(filter) => {
+        DistributedPayload::Physical(PhysicalPlanKind::Filter(filter)) => {
             format_filter_node(node, filter, &pad, &costs_suffix, &stats_suffix, out);
-            push_probe_rf_lines(&node.probe_runtime_filters, arena, level, &pad, out);
-            format_children(node, arena, level, indent, actuals, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::HashJoin(join) => {
-            format_hash_join_node(
-                node,
-                join,
-                arena,
-                level,
-                &pad,
-                &costs_suffix,
-                &stats_suffix,
-                out,
-            );
-            format_children(node, arena, level, indent, actuals, out);
+        DistributedPayload::Physical(PhysicalPlanKind::HashJoin(join)) => {
+            format_hash_join_node(node, join, level, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::NestLoopJoin(join) => {
+        DistributedPayload::Physical(PhysicalPlanKind::NestLoopJoin(join)) => {
             format_nest_loop_join_node(node, join, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, arena, level, indent, actuals, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::HashAggregate(agg) => {
+        DistributedPayload::Physical(PhysicalPlanKind::HashAggregate(agg)) => {
             format_hash_aggregate_node(node, agg, &pad, &costs_suffix, &stats_suffix, out);
-            push_probe_rf_lines(&node.probe_runtime_filters, arena, level, &pad, out);
-            format_children(node, arena, level, indent, actuals, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::Sort(sort) => {
+        DistributedPayload::Physical(PhysicalPlanKind::Sort(sort)) => {
             format_sort_node(node, sort, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, arena, level, indent, actuals, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::TopN(topn) => {
+        DistributedPayload::Physical(PhysicalPlanKind::TopN(topn)) => {
             format_topn_node(node, topn, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, arena, level, indent, actuals, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::Exchange(exchange) => {
+        DistributedPayload::Exchange(exchange) => {
             format_exchange_node(node, exchange, &pad, &costs_suffix, &stats_suffix, out);
         }
-        DistributedPlanKind::Values(values) => {
+        DistributedPayload::Physical(PhysicalPlanKind::Values(values)) => {
             format_values_node(node, values, &pad, &costs_suffix, &stats_suffix, out);
-            push_probe_rf_lines(&node.probe_runtime_filters, arena, level, &pad, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
         }
-        DistributedPlanKind::AssertOneRow(assert) => {
+        DistributedPayload::Physical(PhysicalPlanKind::AssertOneRow(assert)) => {
             format_assert_one_row_node(node, assert, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, arena, level, indent, actuals, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::Decode(decode) => {
+        DistributedPayload::Physical(PhysicalPlanKind::Decode(decode)) => {
             format_decode_node(node, decode, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, arena, level, indent, actuals, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::Repeat(repeat) => {
+        DistributedPayload::Physical(PhysicalPlanKind::Repeat(repeat)) => {
             format_repeat_node(node, repeat, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, arena, level, indent, actuals, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::ChangeEventExpand(expand) => {
+        DistributedPayload::Physical(PhysicalPlanKind::ChangeEventExpand(expand)) => {
             format_change_event_expand_node(node, expand, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, arena, level, indent, actuals, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::SetOp(set_op) => {
+        DistributedPayload::Physical(PhysicalPlanKind::SetOp(set_op)) => {
             format_set_op_node(node, set_op, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, arena, level, indent, actuals, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::Window(window) => {
+        DistributedPayload::Physical(PhysicalPlanKind::Window(window)) => {
             format_window_node(node, window, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, arena, level, indent, actuals, out);
+            format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanKind::GenerateSeries(generate) => {
+        DistributedPayload::Physical(PhysicalPlanKind::GenerateSeries(generate)) => {
             format_generate_series_node(node, generate, &pad, &costs_suffix, &stats_suffix, out);
         }
-        DistributedPlanKind::TableFunction(table_function) => {
+        DistributedPayload::Physical(PhysicalPlanKind::TableFunction(table_function)) => {
             format_table_function_node(
                 node,
                 table_function,
@@ -351,41 +326,89 @@ fn format_distributed_node(
                 &stats_suffix,
                 out,
             );
-            format_children(node, arena, level, indent, actuals, out);
+            format_children(node, level, indent, actuals, out);
+        }
+        DistributedPayload::Physical(
+            PhysicalPlanKind::Limit(_)
+            | PhysicalPlanKind::CTEAnchor(_)
+            | PhysicalPlanKind::CTEProduce(_)
+            | PhysicalPlanKind::CTEConsume(_)
+            | PhysicalPlanKind::Redistribute(_),
+        ) => {
+            out.push(format!(
+                "{pad}{}UNLOWERABLE PHYSICAL {}{costs_suffix}{stats_suffix}",
+                node_prefix(node),
+                physical_kind_name(&node.payload)
+            ));
         }
     }
 }
 
 fn format_children(
-    node: &DistributedPlanNode,
-    arena: &ScalarArena,
+    node: &DistributedNode,
     level: ExplainLevel,
     indent: usize,
     actuals: Option<&HashMap<i32, ActualMetrics>>,
     out: &mut Vec<String>,
 ) {
     for child in &node.children {
-        format_distributed_node(child, arena, level, indent + 1, actuals, out);
+        format_distributed_node(child, level, indent + 1, actuals, out);
     }
 }
 
-fn node_prefix(node: &DistributedPlanNode) -> String {
+fn node_prefix(node: &DistributedNode) -> String {
     format!("{}:", node.node_id)
 }
 
+fn physical_payload(node: &DistributedNode) -> Option<&PhysicalPlanKind> {
+    match &node.payload {
+        DistributedPayload::Physical(kind) => Some(kind),
+        DistributedPayload::Exchange(_) => None,
+    }
+}
+
+fn physical_kind_name(payload: &DistributedPayload) -> &'static str {
+    match payload {
+        DistributedPayload::Physical(PhysicalPlanKind::Scan(_)) => "Scan",
+        DistributedPayload::Physical(PhysicalPlanKind::Filter(_)) => "Filter",
+        DistributedPayload::Physical(PhysicalPlanKind::Project(_)) => "Project",
+        DistributedPayload::Physical(PhysicalPlanKind::Sort(_)) => "Sort",
+        DistributedPayload::Physical(PhysicalPlanKind::Limit(_)) => "Limit",
+        DistributedPayload::Physical(PhysicalPlanKind::Values(_)) => "Values",
+        DistributedPayload::Physical(PhysicalPlanKind::Decode(_)) => "Decode",
+        DistributedPayload::Physical(PhysicalPlanKind::Repeat(_)) => "Repeat",
+        DistributedPayload::Physical(PhysicalPlanKind::Window(_)) => "Window",
+        DistributedPayload::Physical(PhysicalPlanKind::GenerateSeries(_)) => "GenerateSeries",
+        DistributedPayload::Physical(PhysicalPlanKind::TableFunction(_)) => "TableFunction",
+        DistributedPayload::Physical(PhysicalPlanKind::AssertOneRow(_)) => "AssertOneRow",
+        DistributedPayload::Physical(PhysicalPlanKind::TopN(_)) => "TopN",
+        DistributedPayload::Physical(PhysicalPlanKind::HashAggregate(_)) => "HashAggregate",
+        DistributedPayload::Physical(PhysicalPlanKind::HashJoin(_)) => "HashJoin",
+        DistributedPayload::Physical(PhysicalPlanKind::NestLoopJoin(_)) => "NestLoopJoin",
+        DistributedPayload::Physical(PhysicalPlanKind::SetOp(_)) => "SetOp",
+        DistributedPayload::Physical(PhysicalPlanKind::ChangeEventExpand(_)) => "ChangeEventExpand",
+        DistributedPayload::Physical(PhysicalPlanKind::CTEAnchor(_)) => "CTEAnchor",
+        DistributedPayload::Physical(PhysicalPlanKind::CTEProduce(_)) => "CTEProduce",
+        DistributedPayload::Physical(PhysicalPlanKind::CTEConsume(_)) => "CTEConsume",
+        DistributedPayload::Physical(PhysicalPlanKind::Redistribute(_)) => "Redistribute",
+        DistributedPayload::Exchange(_) => "Exchange",
+    }
+}
+
 fn format_scan_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     scan: &DistributedScanNode,
-    arena: &ScalarArena,
     level: ExplainLevel,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let header =
-        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-            .expect("Scan is a shared explain node");
+    let header = format_distributed_shared_plan_node_header(
+        physical_payload(node).expect("Scan is a physical explain node"),
+        PlanNodeExplainStage::Distributed,
+    )
+    .expect("Scan is a shared explain node");
     out.push(format!(
         "{pad}{}{header}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -429,7 +452,7 @@ fn format_scan_node(
             .collect::<Vec<_>>();
         out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
     }
-    push_probe_rf_lines(&node.probe_runtime_filters, arena, level, pad, out);
+    push_probe_rf_lines(&node.probe_runtime_filters, level, pad, out);
 }
 
 fn format_scan_predicate(expr: &TypedExpr, scan: &DistributedScanNode) -> String {
@@ -531,16 +554,18 @@ fn rewrite_scan_column_display(
 }
 
 fn format_project_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     _project: &DistributedProjectNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let header =
-        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-            .expect("Project is a shared explain node");
+    let header = format_distributed_shared_plan_node_header(
+        physical_payload(node).expect("Project is a physical explain node"),
+        PlanNodeExplainStage::Distributed,
+    )
+    .expect("Project is a shared explain node");
     out.push(format!(
         "{pad}{}{header}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -548,22 +573,24 @@ fn format_project_node(
 }
 
 fn format_filter_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     _filter: &DistributedFilterNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let header =
-        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-            .expect("Filter is a shared explain node");
+    let header = format_distributed_shared_plan_node_header(
+        physical_payload(node).expect("Filter is a physical explain node"),
+        PlanNodeExplainStage::Distributed,
+    )
+    .expect("Filter is a shared explain node");
     out.push(format!(
         "{pad}{}{header}{costs_suffix}{stats_suffix}",
         node_prefix(node)
     ));
     for line in format_distributed_shared_plan_node_detail_lines(
-        &node.kind,
+        physical_payload(node).expect("Filter is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     ) {
         out.push(format!("{pad}  {line}"));
@@ -571,16 +598,15 @@ fn format_filter_node(
 }
 
 fn format_hash_join_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     join: &PhysicalHashJoinNode,
-    arena: &ScalarArena,
     level: ExplainLevel,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let dist = join_distribution_label(node.execution_join_distribution, &join.distribution);
+    let dist = join_distribution_label(join.execution_mode, &join.distribution);
     let join_str = join_kind_label(join.join_type);
     let eq = join
         .eq_conditions
@@ -604,11 +630,11 @@ fn format_hash_join_node(
     if let Some(ref other) = join.other_condition {
         out.push(format!("{pad}  other: {}", format_expr(other)));
     }
-    push_build_rf_lines(&node.build_runtime_filters, arena, level, pad, out);
+    push_build_rf_lines(&node.build_runtime_filters, level, pad, out);
 }
 
 fn format_nest_loop_join_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     join: &PhysicalNestLoopJoinNode,
     pad: &str,
     costs_suffix: &str,
@@ -626,7 +652,7 @@ fn format_nest_loop_join_node(
 }
 
 fn format_hash_aggregate_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     agg: &PhysicalHashAggregateNode,
     pad: &str,
     costs_suffix: &str,
@@ -671,16 +697,18 @@ fn format_hash_aggregate_node(
 }
 
 fn format_sort_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     sort: &DistributedSortNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body =
-        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-            .expect("Sort is a shared explain node");
+    let body = format_distributed_shared_plan_node_header(
+        physical_payload(node).expect("Sort is a physical explain node"),
+        PlanNodeExplainStage::Distributed,
+    )
+    .expect("Sort is a shared explain node");
     let mut suffix = String::new();
     if let Some(limit) = sort.partition_limit {
         let topn_type = match sort.topn_type {
@@ -698,7 +726,7 @@ fn format_sort_node(
 }
 
 fn format_topn_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     topn: &PhysicalTopNNode,
     pad: &str,
     costs_suffix: &str,
@@ -726,8 +754,8 @@ fn format_topn_node(
 }
 
 fn format_exchange_node(
-    node: &DistributedPlanNode,
-    exchange: &DistributedExchangeNode,
+    node: &DistributedNode,
+    exchange: &ExchangeReceiver,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
@@ -741,16 +769,18 @@ fn format_exchange_node(
 }
 
 fn format_values_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     _values: &DistributedValuesNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body =
-        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-            .expect("Values is a shared explain node");
+    let body = format_distributed_shared_plan_node_header(
+        physical_payload(node).expect("Values is a physical explain node"),
+        PlanNodeExplainStage::Distributed,
+    )
+    .expect("Values is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -758,16 +788,18 @@ fn format_values_node(
 }
 
 fn format_assert_one_row_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     _assert: &DistributedAssertOneRowNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body =
-        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-            .expect("AssertOneRow is a shared explain node");
+    let body = format_distributed_shared_plan_node_header(
+        physical_payload(node).expect("AssertOneRow is a physical explain node"),
+        PlanNodeExplainStage::Distributed,
+    )
+    .expect("AssertOneRow is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node)
@@ -775,16 +807,18 @@ fn format_assert_one_row_node(
 }
 
 fn format_decode_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     _decode: &DistributedDecodeNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body =
-        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-            .expect("Decode is a shared explain node");
+    let body = format_distributed_shared_plan_node_header(
+        physical_payload(node).expect("Decode is a physical explain node"),
+        PlanNodeExplainStage::Distributed,
+    )
+    .expect("Decode is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -792,16 +826,18 @@ fn format_decode_node(
 }
 
 fn format_repeat_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     _repeat: &DistributedRepeatNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body =
-        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-            .expect("Repeat is a shared explain node");
+    let body = format_distributed_shared_plan_node_header(
+        physical_payload(node).expect("Repeat is a physical explain node"),
+        PlanNodeExplainStage::Distributed,
+    )
+    .expect("Repeat is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -809,16 +845,18 @@ fn format_repeat_node(
 }
 
 fn format_change_event_expand_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     _expand: &DistributedChangeEventExpandNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body =
-        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-            .expect("ChangeEventExpand is a shared explain node");
+    let body = format_distributed_shared_plan_node_header(
+        physical_payload(node).expect("ChangeEventExpand is a physical explain node"),
+        PlanNodeExplainStage::Distributed,
+    )
+    .expect("ChangeEventExpand is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -830,14 +868,14 @@ struct ColumnDisplayLookup {
     by_id: HashMap<ColumnId, (Option<String>, String)>,
 }
 
-fn column_display_lookup(node: &DistributedPlanNode) -> ColumnDisplayLookup {
+fn column_display_lookup(node: &DistributedNode) -> ColumnDisplayLookup {
     let mut lookup = ColumnDisplayLookup::default();
     collect_column_displays(node, &mut lookup);
     lookup
 }
 
-fn collect_column_displays(node: &DistributedPlanNode, lookup: &mut ColumnDisplayLookup) {
-    if let DistributedPlanKind::Scan(scan) = &node.kind {
+fn collect_column_displays(node: &DistributedNode, lookup: &mut ColumnDisplayLookup) {
+    if let DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) = &node.payload {
         for column in &scan.columns {
             let display = (scan.alias.clone(), column.name.clone());
             lookup
@@ -867,7 +905,7 @@ fn format_group_expr(expr: &TypedExpr, lookup: &ColumnDisplayLookup) -> String {
 }
 
 fn format_set_op_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     set_op: &PhysicalSetOpNode,
     pad: &str,
     costs_suffix: &str,
@@ -877,9 +915,9 @@ fn format_set_op_node(
     let label = match set_op.kind {
         SetOpKind::UnionAll => "UNION ALL",
         SetOpKind::UnionDistinct => {
-            // PIR-4 M3e expands UNION DISTINCT before distributed explain.
             unreachable!(
-                "UnionDistinct is expanded to gather+distinct-agg in build_distributed_plan; see PIR-4 M3e"
+                "{}",
+                crate::sql::planner::union_distinct_must_be_rewritten_error()
             )
         }
         SetOpKind::Intersect => "INTERSECT",
@@ -892,16 +930,18 @@ fn format_set_op_node(
 }
 
 fn format_window_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     _window: &DistributedWindowNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let header =
-        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-            .expect("Window is a shared explain node");
+    let header = format_distributed_shared_plan_node_header(
+        physical_payload(node).expect("Window is a physical explain node"),
+        PlanNodeExplainStage::Distributed,
+    )
+    .expect("Window is a shared explain node");
     out.push(format!(
         "{pad}{}{header}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -909,16 +949,18 @@ fn format_window_node(
 }
 
 fn format_generate_series_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     _generate: &DistributedGenerateSeriesNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body =
-        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-            .expect("GenerateSeries is a shared explain node");
+    let body = format_distributed_shared_plan_node_header(
+        physical_payload(node).expect("GenerateSeries is a physical explain node"),
+        PlanNodeExplainStage::Distributed,
+    )
+    .expect("GenerateSeries is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -926,23 +968,25 @@ fn format_generate_series_node(
 }
 
 fn format_table_function_node(
-    node: &DistributedPlanNode,
+    node: &DistributedNode,
     _table_function: &DistributedTableFunctionNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body =
-        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-            .expect("TableFunction is a shared explain node");
+    let body = format_distributed_shared_plan_node_header(
+        physical_payload(node).expect("TableFunction is a physical explain node"),
+        PlanNodeExplainStage::Distributed,
+    )
+    .expect("TableFunction is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node),
     ));
 }
 
-fn exchange_label(exchange: &DistributedExchangeNode) -> String {
+fn exchange_label(exchange: &ExchangeReceiver) -> String {
     match exchange.flavor {
         ExchangeFlavor::TopNSplit { .. } => "MERGING-EXCHANGE".to_string(),
         ExchangeFlavor::CteMulticast { .. } => "EXCHANGE".to_string(),
@@ -976,13 +1020,13 @@ fn join_kind_label(join_type: JoinKind) -> &'static str {
 }
 
 fn join_distribution_label(
-    execution_distribution: Option<JoinExecutionDistribution>,
+    execution_mode: Option<JoinExecutionMode>,
     fallback: &JoinDistribution,
 ) -> &'static str {
-    match execution_distribution {
-        Some(JoinExecutionDistribution::Broadcast) => "BROADCAST",
-        Some(JoinExecutionDistribution::Partitioned) => "PARTITIONED",
-        Some(JoinExecutionDistribution::Colocate) => "COLOCATE",
+    match execution_mode {
+        Some(JoinExecutionMode::Broadcast) => "BROADCAST",
+        Some(JoinExecutionMode::Partitioned) => "PARTITIONED",
+        Some(JoinExecutionMode::Colocate) => "COLOCATE",
         None => match fallback {
             JoinDistribution::Broadcast => "BROADCAST",
             JoinDistribution::Shuffle => "PARTITIONED",
@@ -992,10 +1036,7 @@ fn join_distribution_label(
     }
 }
 
-fn actual_suffix(
-    node: &DistributedPlanNode,
-    actuals: Option<&HashMap<i32, ActualMetrics>>,
-) -> String {
+fn actual_suffix(node: &DistributedNode, actuals: Option<&HashMap<i32, ActualMetrics>>) -> String {
     match actuals.and_then(|actuals| actuals.get(&node.node_id)) {
         Some(metrics) => {
             let total_time_ns = metrics.total_time_ns.max(0);
@@ -1098,7 +1139,7 @@ fn is_detailed(level: ExplainLevel) -> bool {
     )
 }
 
-fn costs_suffix(stats: &PlanNodeStats, level: ExplainLevel) -> String {
+fn costs_suffix(stats: &PhysicalPlanStats, level: ExplainLevel) -> String {
     if matches!(level, ExplainLevel::Costs) {
         let row_part = format!("rows={:.0}", stats.output_row_count);
         let cost_part = stats
@@ -1119,7 +1160,7 @@ fn costs_suffix(stats: &PlanNodeStats, level: ExplainLevel) -> String {
 }
 
 fn bcast_verbose_suffix(
-    decision: &Option<crate::sql::optimizer::cost::BroadcastDecision>,
+    decision: &Option<PlannerBroadcastDecision>,
     level: ExplainLevel,
 ) -> String {
     let d = match decision {
@@ -1134,12 +1175,7 @@ fn bcast_verbose_suffix(
     format!(" bcast_verdict={verdict}{forced}")
 }
 
-fn bcast_costs_suffix(
-    decision: &Option<crate::sql::optimizer::cost::BroadcastDecision>,
-    level: ExplainLevel,
-) -> String {
-    use crate::sql::optimizer::cost::BroadcastRejectReason;
-
+fn bcast_costs_suffix(decision: &Option<PlannerBroadcastDecision>, level: ExplainLevel) -> String {
     let d = match decision {
         Some(d) => d,
         None => return String::new(),
@@ -1156,38 +1192,27 @@ fn bcast_costs_suffix(
         fmt_bytes_f64(d.per_node_budget_bytes),
         d.risk_multiplier,
     );
-    let reject = match d.reject_reason {
-        Some(BroadcastRejectReason::PerNodeMemory) => format!(
-            " bcast_reject=\"risk_adj_build {} > node_budget {}\"",
-            fmt_bytes_f64(d.hash_table_bytes * d.risk_multiplier),
-            fmt_bytes_f64(d.per_node_budget_bytes),
-        ),
-        Some(BroadcastRejectReason::ClusterNetwork) => format!(
-            " bcast_reject=\"risk_adj_fanout {} > network_budget {}\"",
-            fmt_bytes_f64(d.risk_adj_fanout_bytes),
-            fmt_bytes_f64(d.cluster_network_budget_bytes),
-        ),
-        Some(BroadcastRejectReason::UninformativeSize) => {
-            " bcast_reject=\"build size unknown (fallback default stats) -> partitioned\""
-                .to_string()
-        }
+    let reject = match d.reject_reason.as_deref() {
+        Some(reason) => format!(" bcast_reject=\"{reason}\""),
         None => String::new(),
     };
     format!("{breakdown}{reject}")
 }
 
-fn format_cost_estimate(cost: &crate::sql::optimizer::statistics::CostEstimate) -> String {
-    let options = crate::sql::optimizer::cost::CostOptions::default();
+fn format_cost_estimate(cost: &PlannerCostEstimate) -> String {
+    let total = cost.cpu_cost * DEFAULT_CPU_COST_WEIGHT
+        + cost.memory_cost * DEFAULT_MEMORY_COST_WEIGHT
+        + cost.network_cost * DEFAULT_NETWORK_COST_WEIGHT;
     format!(
         "cost={{cpu={} memory={} network={} total={}}}",
         fmt_f64(cost.cpu_cost),
         fmt_f64(cost.memory_cost),
         fmt_f64(cost.network_cost),
-        fmt_f64(cost.total_with_options(&options)),
+        fmt_f64(total),
     )
 }
 
-fn stats_suffix(stats: &PlanNodeStats, level: ExplainLevel) -> String {
+fn stats_suffix(stats: &PhysicalPlanStats, level: ExplainLevel) -> String {
     if is_detailed(level) {
         let trailer = format_stats_trailer(
             stats,
@@ -1199,7 +1224,7 @@ fn stats_suffix(stats: &PlanNodeStats, level: ExplainLevel) -> String {
     }
 }
 
-fn format_stats_trailer(stats: &PlanNodeStats, show_conf: bool) -> String {
+fn format_stats_trailer(stats: &PhysicalPlanStats, show_conf: bool) -> String {
     let rows = stats.output_row_count;
     let rows_str = if rows.is_nan() || rows <= 0.0 {
         "?".to_string()
@@ -1210,10 +1235,9 @@ fn format_stats_trailer(stats: &PlanNodeStats, show_conf: bool) -> String {
     };
     let conf = if show_conf {
         match stats.row_count_confidence {
-            crate::sql::optimizer::statistics::Confidence::Estimated => " conf=estimated",
-            crate::sql::optimizer::statistics::Confidence::Fallback => " conf=fallback",
-            crate::sql::optimizer::statistics::Confidence::Exact
-            | crate::sql::optimizer::statistics::Confidence::Measured => "",
+            PlannerConfidence::Estimated => " conf=estimated",
+            PlannerConfidence::Fallback => " conf=fallback",
+            PlannerConfidence::Exact | PlannerConfidence::Measured => "",
         }
     } else {
         ""
@@ -1221,7 +1245,7 @@ fn format_stats_trailer(stats: &PlanNodeStats, show_conf: bool) -> String {
     format!("stats={{rows={rows_str}{conf}}}")
 }
 
-fn format_column_stats_costs(stats: &PlanNodeStats) -> String {
+fn format_column_stats_costs(stats: &PhysicalPlanStats) -> String {
     if stats.column_statistics.is_empty() {
         return String::new();
     }
@@ -1231,7 +1255,7 @@ fn format_column_stats_costs(stats: &PlanNodeStats) -> String {
         .into_iter()
         .map(|column_id| {
             let c = &stats.column_statistics[&column_id];
-            let ndv = if let Some(ndv) = c.ndv_value().filter(|ndv| ndv.is_finite()) {
+            let ndv = if let Some(ndv) = c.ndv.filter(|ndv| ndv.is_finite()) {
                 fmt_f64(ndv.round())
             } else {
                 "?".to_string()
@@ -1269,8 +1293,7 @@ fn fmt_f64(v: f64) -> String {
 }
 
 fn push_build_rf_lines(
-    filters: &[RuntimeFilterDesc],
-    arena: &ScalarArena,
+    filters: &[WiredRuntimeFilterBuild],
     level: ExplainLevel,
     pad: &str,
     out: &mut Vec<String>,
@@ -1283,14 +1306,13 @@ fn push_build_rf_lines(
         out.push(format!(
             "{pad}  - filter_id = {}, build_expr = ({})",
             rf.filter_id,
-            format_expr(&materialize(arena, rf.build_expr)),
+            format_expr(&rf.build_expr),
         ));
     }
 }
 
 fn push_probe_rf_lines(
-    filters: &[RuntimeFilterProbe],
-    arena: &ScalarArena,
+    filters: &[WiredRuntimeFilterProbe],
     level: ExplainLevel,
     pad: &str,
     out: &mut Vec<String>,
@@ -1303,7 +1325,7 @@ fn push_probe_rf_lines(
         out.push(format!(
             "{pad}    - filter_id = {}, probe_expr = ({})",
             rf.filter_id,
-            format_expr(&materialize(arena, rf.probe_expr)),
+            format_expr(&rf.probe_expr),
         ));
     }
 }
@@ -1581,26 +1603,87 @@ mod tests {
     use crate::runtime::profile_correlate::{ActualMetrics, DistributedProfileSummary};
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
-    use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
+    use crate::sql::codegen::ir::explain_distributed_plan;
     use crate::sql::column_id::ColumnId;
     use crate::sql::explain::{ExplainLevel, PlanNodeExplainStage};
     use crate::sql::optimizer::operator::{
-        AggMode, AggregateOutputLayout, Operator, PhysicalDistributionOp, PhysicalHashAggregateOp,
-        ProjectOp, ScanOp,
+        AggMode, AggregateOutputLayout, JoinDistribution, Operator, PhysicalDistributionOp,
+        PhysicalHashAggregateOp, ProjectOp, ScanOp,
     };
     use crate::sql::optimizer::options::OptimizerOptions;
     use crate::sql::optimizer::physical_tree::{
-        OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
+        JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::{self, test_support};
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, Statistics};
+    use crate::sql::optimizer::statistics::{
+        ColumnStatistic, Confidence, CostEstimate, Statistics,
+    };
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
     };
-    use crate::sql::planner::plan::{AggregateCall, DistributedExchangeNode, ExchangeFlavor};
-    use crate::sql::planner::{DistributedPlanKind, DistributedPlanNode, PlanNodeStats};
+    use crate::sql::planner::plan::{AggregateCall, ExchangeFlavor};
+    use crate::sql::planner::{
+        DistributedNode, DistributedPayload, DistributedPlan, ExchangeReceiver, PhysicalPlanStats,
+        PlannerBroadcastDecision, PlannerConfidence,
+    };
+
+    fn build_distributed_plan(plan: &OptimizerPhysicalNode) -> Result<DistributedPlan, String> {
+        let mut plan = plan.clone();
+        prepare_bridge2_test_props(&mut plan);
+        let physical =
+            crate::sql::planner::optimizer_bridge::physical::optimizer_physical_to_plan(&plan)?;
+        crate::sql::planner::build_distributed_plan(&physical)
+    }
+
+    fn prepare_bridge2_test_props(node: &mut OptimizerPhysicalNode) {
+        for child in &mut node.children {
+            prepare_bridge2_test_props(child);
+        }
+        if node.explain_stats.cost_estimate.is_none() {
+            node.explain_stats.cost_estimate = Some(CostEstimate {
+                cpu_cost: 1.0,
+                memory_cost: 2.0,
+                network_cost: 3.0,
+            });
+        }
+        if let Operator::PhysicalHashJoin(join) = &node.op {
+            node.execution_props.join_distribution =
+                join_execution_distribution_for_test(join.distribution.clone());
+            if node.explain_stats.broadcast_decision.is_none()
+                && matches!(join.distribution, JoinDistribution::Broadcast)
+            {
+                node.explain_stats.broadcast_decision = Some(test_broadcast_decision());
+            }
+        }
+    }
+
+    fn join_execution_distribution_for_test(
+        distribution: JoinDistribution,
+    ) -> Option<JoinExecutionDistribution> {
+        match distribution {
+            JoinDistribution::Broadcast => Some(JoinExecutionDistribution::Broadcast),
+            JoinDistribution::Shuffle => Some(JoinExecutionDistribution::Partitioned),
+            JoinDistribution::Colocate => Some(JoinExecutionDistribution::Colocate),
+            JoinDistribution::Unknown => None,
+        }
+    }
+
+    fn test_broadcast_decision() -> crate::sql::optimizer::cost::BroadcastDecision {
+        crate::sql::optimizer::cost::BroadcastDecision {
+            feasible: true,
+            forced: false,
+            build_bytes: 16.0 * 1024.0 * 1024.0,
+            hash_table_bytes: 53_300_000.0,
+            effective_backend_count: 10.0,
+            risk_adj_fanout_bytes: 144.0 * 1024.0 * 1024.0,
+            per_node_budget_bytes: 256.0 * 1024.0 * 1024.0,
+            cluster_network_budget_bytes: 2560.0 * 1024.0 * 1024.0,
+            risk_multiplier: 1.0,
+            reject_reason: None,
+        }
+    }
 
     #[test]
     fn normal_scan_project_agg_renders_node_id_prefixes() {
@@ -1625,16 +1708,22 @@ mod tests {
             .expect("root fragment")
             .root;
 
+        let DistributedPayload::Physical(root_kind) = &root.payload else {
+            panic!("root should be physical");
+        };
         assert_eq!(
             format_distributed_shared_plan_node_header(
-                &root.kind,
+                root_kind,
                 PlanNodeExplainStage::Distributed
             ),
             Some("PROJECT [t.k AS k]".to_string())
         );
+        let DistributedPayload::Physical(scan_kind) = &root.children[0].payload else {
+            panic!("child should be physical");
+        };
         assert_eq!(
             format_distributed_shared_plan_node_header(
-                &root.children[0].kind,
+                scan_kind,
                 PlanNodeExplainStage::Distributed
             ),
             Some("SCAN test_db.t (alias=t)".to_string())
@@ -1662,18 +1751,23 @@ mod tests {
 
     #[test]
     fn distributed_explain_accepts_exchange_only_in_distributed_kind() {
-        let node = DistributedPlanNode {
+        let node = DistributedNode {
             node_id: 7,
             fragment_id: 1,
             tuple_ids: vec![],
             nullable_tuple_ids: vec![],
             limit: -1,
-            execution_join_distribution: None,
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
             children: vec![],
-            stats: PlanNodeStats::from_statistics(&Statistics::default()),
-            kind: DistributedPlanKind::Exchange(DistributedExchangeNode {
+            stats: PhysicalPlanStats {
+                output_row_count: 0.0,
+                row_count_confidence: PlannerConfidence::Fallback,
+                column_statistics: HashMap::new(),
+                cost_estimate: None,
+                broadcast_decision: None,
+            },
+            payload: DistributedPayload::Exchange(ExchangeReceiver {
                 partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
                 partition_exprs: vec![],
                 source_fragment_id: 0,
@@ -1683,7 +1777,7 @@ mod tests {
             }),
         };
 
-        assert_eq!(node.kind.variant_name(), "Exchange");
+        assert_eq!(super::physical_kind_name(&node.payload), "Exchange");
     }
 
     #[test]
@@ -1744,7 +1838,7 @@ mod tests {
         );
         assert!(
             costs.contains("colstats={col#1[min=0 max=1000 ndv=1000 null_frac=0]}"),
-            "Costs must render colstats copied into PlanNodeStats:\n{costs}"
+            "Costs must render colstats copied into PhysicalPlanStats:\n{costs}"
         );
     }
 
@@ -1799,12 +1893,8 @@ mod tests {
         );
     }
 
-    fn decision(
-        feasible: bool,
-        forced: bool,
-        reject: Option<crate::sql::optimizer::cost::BroadcastRejectReason>,
-    ) -> crate::sql::optimizer::cost::BroadcastDecision {
-        crate::sql::optimizer::cost::BroadcastDecision {
+    fn decision(feasible: bool, forced: bool, reject: Option<&str>) -> PlannerBroadcastDecision {
+        PlannerBroadcastDecision {
             feasible,
             forced,
             build_bytes: 16.0 * 1024.0 * 1024.0,
@@ -1814,7 +1904,7 @@ mod tests {
             per_node_budget_bytes: 256.0 * 1024.0 * 1024.0,
             cluster_network_budget_bytes: 2560.0 * 1024.0 * 1024.0,
             risk_multiplier: 1.0,
-            reject_reason: reject,
+            reject_reason: reject.map(str::to_string),
         }
     }
 
@@ -1822,15 +1912,15 @@ mod tests {
     fn verbose_shows_verdict_token_normal_and_costs_do_not() {
         let d = decision(true, false, None);
         assert_eq!(
-            super::bcast_verbose_suffix(&Some(d), ExplainLevel::Verbose),
+            super::bcast_verbose_suffix(&Some(d.clone()), ExplainLevel::Verbose),
             " bcast_verdict=feasible"
         );
         assert_eq!(
-            super::bcast_verbose_suffix(&Some(d), ExplainLevel::Analyze),
+            super::bcast_verbose_suffix(&Some(d.clone()), ExplainLevel::Analyze),
             " bcast_verdict=feasible"
         );
         assert_eq!(
-            super::bcast_verbose_suffix(&Some(d), ExplainLevel::Normal),
+            super::bcast_verbose_suffix(&Some(d.clone()), ExplainLevel::Normal),
             ""
         );
         assert_eq!(
@@ -1844,7 +1934,7 @@ mod tests {
         let d = decision(
             false,
             true,
-            Some(crate::sql::optimizer::cost::BroadcastRejectReason::PerNodeMemory),
+            Some("risk_adj_build 203.3MB > node_budget 256MB"),
         );
         let s = super::bcast_verbose_suffix(&Some(d), ExplainLevel::Verbose);
         assert!(s.contains("bcast_verdict=infeasible"));
@@ -1854,9 +1944,12 @@ mod tests {
     #[test]
     fn costs_shows_breakdown_verbose_does_not() {
         let d = decision(true, false, None);
-        assert!(super::bcast_costs_suffix(&Some(d), ExplainLevel::Costs).contains("bcast={build="));
+        assert!(
+            super::bcast_costs_suffix(&Some(d.clone()), ExplainLevel::Costs)
+                .contains("bcast={build=")
+        );
         assert_eq!(
-            super::bcast_costs_suffix(&Some(d), ExplainLevel::Verbose),
+            super::bcast_costs_suffix(&Some(d.clone()), ExplainLevel::Verbose),
             ""
         );
         assert_eq!(
@@ -1870,7 +1963,7 @@ mod tests {
         let d = decision(
             false,
             false,
-            Some(crate::sql::optimizer::cost::BroadcastRejectReason::PerNodeMemory),
+            Some("risk_adj_build 203.3MB > node_budget 256MB"),
         );
         let s = super::bcast_costs_suffix(&Some(d), ExplainLevel::Costs);
         assert!(s.contains("bcast_reject=\"risk_adj_build"));
@@ -1881,7 +1974,7 @@ mod tests {
         let network = decision(
             false,
             false,
-            Some(crate::sql::optimizer::cost::BroadcastRejectReason::ClusterNetwork),
+            Some("risk_adj_fanout 144MB > network_budget 2.5GB"),
         );
         let network_text = super::bcast_costs_suffix(&Some(network), ExplainLevel::Costs);
         assert!(network_text.contains("bcast_reject=\"risk_adj_fanout"));
@@ -1890,7 +1983,7 @@ mod tests {
         let unknown = decision(
             false,
             false,
-            Some(crate::sql::optimizer::cost::BroadcastRejectReason::UninformativeSize),
+            Some("build size unknown (fallback default stats) -> partitioned"),
         );
         let unknown_text = super::bcast_costs_suffix(&Some(unknown), ExplainLevel::Costs);
         assert!(unknown_text.contains("build size unknown"));
@@ -1898,11 +1991,7 @@ mod tests {
 
     #[test]
     fn costs_byte_formatting_keeps_huge_and_nonfinite_values_visible() {
-        let mut huge = decision(
-            false,
-            false,
-            Some(crate::sql::optimizer::cost::BroadcastRejectReason::PerNodeMemory),
-        );
+        let mut huge = decision(false, false, Some("risk_adj_build huge > node_budget inf"));
         huge.hash_table_bytes = 1.0e300;
         huge.risk_multiplier = 4.0;
         huge.per_node_budget_bytes = f64::INFINITY;
