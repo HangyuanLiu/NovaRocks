@@ -23,7 +23,10 @@ if [[ ${#existing_targets[@]} -eq 0 ]]; then
 fi
 
 pattern='(^|[^[:alnum:]_])(classify_scan_paths|ScanPathScheme|resolve_object_store_operator_and_path|resolve_opendal_paths|build_object_store_operator|build_oss_operator|normalize_oss_path|oss_config_for_path|opendal::services::Fs::default)([^[:alnum:]_]|$)'
-mapfile -t hits < <(rg -n --no-heading "$pattern" "${existing_targets[@]}" || true)
+hits=()
+while IFS= read -r hit; do
+  hits+=("$hit")
+done < <(rg -n --no-heading "$pattern" "${existing_targets[@]}" || true)
 
 is_test_line() {
   local file="$1"
@@ -70,6 +73,7 @@ is_test_line() {
 }
 
 blocked=()
+allowed_iceberg_local_fs_hits=0
 for hit in "${hits[@]}"; do
   IFS=: read -r file line text <<<"$hit"
 
@@ -86,7 +90,10 @@ for hit in "${hits[@]}"; do
   if [[ "$file" == "src/engine/iceberg_writer.rs" ]]; then
     case "$text" in
       *"let builder = opendal::services::Fs::default().root(\"/\");"*)
-        continue
+        allowed_iceberg_local_fs_hits=$((allowed_iceberg_local_fs_hits + 1))
+        if [[ $allowed_iceberg_local_fs_hits -eq 1 ]]; then
+          continue
+        fi
         ;;
     esac
   fi
