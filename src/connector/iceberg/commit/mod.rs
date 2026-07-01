@@ -30,6 +30,7 @@ mod equality_delete_writer;
 pub mod expire_snapshots;
 mod fast_append;
 mod helpers;
+pub(crate) mod mv_provenance;
 mod mv_refresh_ref;
 mod overwrite;
 mod overwrite_partitions;
