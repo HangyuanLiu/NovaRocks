@@ -2747,293 +2747,30 @@ pub(crate) fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String>
 // Query plan build + execute (delegates to crate::sql::*)
 // ---------------------------------------------------------------------------
 
-use crate::sql::codegen::{MultiFragmentBuildResult, PlanBuildResult};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DirectExecutionReason {
-    RuntimeLocalTerminalSink,
-    RuntimeLocalIcebergRegistry,
-    UnitTestNoExchangeBackend,
-}
-
-fn direct_execution_reason(
+fn ensure_mainline_distributed_execution(
     has_terminal_sink: bool,
     has_iceberg_catalogs: bool,
     exchange_port: u16,
-) -> Option<DirectExecutionReason> {
+) -> Result<(), String> {
     if has_terminal_sink {
-        return Some(DirectExecutionReason::RuntimeLocalTerminalSink);
+        return Err(
+            "terminal sink execution requires mainline DistributedPlan sink support; direct execution fallback was removed"
+                .to_string(),
+        );
     }
     if has_iceberg_catalogs {
-        return Some(DirectExecutionReason::RuntimeLocalIcebergRegistry);
+        return Err(
+            "local Iceberg registry execution requires mainline DistributedPlan write support; direct execution fallback was removed"
+                .to_string(),
+        );
     }
     if exchange_port == 0 {
-        return Some(DirectExecutionReason::UnitTestNoExchangeBackend);
-    }
-    None
-}
-
-/// Convert the one-fragment result required by explicit direct-execution
-/// exceptions. This is not an ordinary query fast path.
-fn single_fragment_plan(
-    build_result: MultiFragmentBuildResult,
-) -> Result<Box<PlanBuildResult>, Box<MultiFragmentBuildResult>> {
-    if build_result.fragment_results.len() != 1 {
-        return Err(Box::new(build_result));
-    }
-    let fragment = build_result.fragment_results.into_iter().next().unwrap();
-    Ok(Box::new(PlanBuildResult {
-        plan: fragment.plan,
-        desc_tbl: fragment.desc_tbl,
-        exec_params: fragment.exec_params,
-        output_columns: fragment.output_columns,
-        boundary_schemas: fragment.boundary_schemas,
-        query_global_dicts: fragment.query_global_dicts,
-        query_global_dict_exprs: fragment.query_global_dict_exprs,
-    }))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execute_query_direct_for_explicit_exception(
-    mut physical: crate::sql::optimizer::OptimizerPhysicalNode,
-    codegen_catalog: &dyn crate::sql::catalog::CatalogProvider,
-    connectors: &crate::connector::ConnectorRegistry,
-    current_database: &str,
-    query_opts: Option<StandaloneQueryOptions>,
-    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
-    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-    reason: DirectExecutionReason,
-) -> Result<QueryResult, String> {
-    physical = collapse_distribution_enforcers_for_single_fragment(
-        physical,
-        matches!(reason, DirectExecutionReason::RuntimeLocalTerminalSink),
-    );
-    let build_result = if let Some(mv_refresh_ctx) = mv_refresh_ctx {
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
-            &physical,
-            codegen_catalog,
-            connectors,
-            current_database,
-            Some(mv_refresh_ctx),
-        )?
-    } else {
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
-            &physical,
-            codegen_catalog,
-            connectors,
-            current_database,
-        )?
-    };
-    let plan = single_fragment_plan(build_result).map_err(|_| {
-        format!("direct execution exception {reason:?} produced a multi-fragment plan")
-    })?;
-    execute_plan(*plan, query_opts, terminal_sink, iceberg_catalogs, None)
-}
-
-fn collapse_distribution_enforcers_for_single_fragment(
-    node: crate::sql::optimizer::OptimizerPhysicalNode,
-    inline_ctes: bool,
-) -> crate::sql::optimizer::OptimizerPhysicalNode {
-    let mut scalar_arena = node.execution_props.scalar_arena.as_deref().cloned();
-    let mut cte_bindings = Vec::new();
-    let mut collapsed = collapse_distribution_enforcers_for_single_fragment_inner(
-        node,
-        inline_ctes,
-        &mut scalar_arena,
-        &mut cte_bindings,
-    );
-    if let Some(scalar_arena) = scalar_arena {
-        crate::sql::optimizer::physical_tree::attach_scalar_arena(
-            &mut collapsed,
-            std::sync::Arc::new(scalar_arena),
+        return Err(
+            "distributed execution requires an exchange backend; tests must install a loopback exchange backend instead of direct fallback"
+                .to_string(),
         );
     }
-    collapsed
-}
-
-#[derive(Clone)]
-struct DirectLocalCteBinding {
-    cte_id: crate::sql::analysis::cte::CteId,
-    plan: crate::sql::optimizer::OptimizerPhysicalNode,
-    output_columns: Vec<crate::sql::analysis::OutputColumn>,
-}
-
-fn collapse_distribution_enforcers_for_single_fragment_inner(
-    mut node: crate::sql::optimizer::OptimizerPhysicalNode,
-    inline_ctes: bool,
-    scalar_arena: &mut Option<crate::sql::optimizer::scalar::ScalarArena>,
-    cte_bindings: &mut Vec<DirectLocalCteBinding>,
-) -> crate::sql::optimizer::OptimizerPhysicalNode {
-    use crate::sql::optimizer::operator::{JoinDistribution, Operator};
-    use crate::sql::optimizer::physical_tree::JoinExecutionDistribution;
-
-    if inline_ctes && matches!(&node.op, Operator::PhysicalCTEAnchor(_)) && node.children.len() == 2
-    {
-        let mut children = std::mem::take(&mut node.children).into_iter();
-        let produce = children.next().expect("cte produce child");
-        let consume = children.next().expect("cte consume child");
-        let original_produce = produce.clone();
-        let original_consume = consume.clone();
-        if let Operator::PhysicalCTEProduce(produce_op) = &produce.op
-            && produce.children.len() == 1
-        {
-            let produce_template = produce.clone();
-            let mut produce_children = produce.children.into_iter();
-            let produce_child = produce_children.next().expect("cte produce single child");
-            let produce_child = collapse_distribution_enforcers_for_single_fragment_inner(
-                produce_child,
-                inline_ctes,
-                scalar_arena,
-                cte_bindings,
-            );
-            let output_columns = if produce_op.output_columns.is_empty() {
-                produce_child.output_columns.clone()
-            } else {
-                produce_op.output_columns.clone()
-            };
-            if let Some(plan) = project_direct_local_columns(
-                produce_child,
-                &output_columns,
-                None,
-                &produce_template,
-                scalar_arena,
-            ) {
-                cte_bindings.push(DirectLocalCteBinding {
-                    cte_id: produce_op.cte_id,
-                    plan,
-                    output_columns,
-                });
-                let result = collapse_distribution_enforcers_for_single_fragment_inner(
-                    consume,
-                    inline_ctes,
-                    scalar_arena,
-                    cte_bindings,
-                );
-                cte_bindings.pop();
-                return result;
-            }
-        }
-        node.children = vec![original_produce, original_consume];
-    }
-
-    if inline_ctes
-        && let Operator::PhysicalCTEConsume(consume_op) = &node.op
-        && node.children.is_empty()
-        && let Some(binding) = cte_bindings
-            .iter()
-            .rev()
-            .find(|binding| binding.cte_id == consume_op.cte_id)
-    {
-        if let Some(plan) = project_direct_local_columns(
-            binding.plan.clone(),
-            &consume_op.output_columns,
-            Some(consume_op.alias.clone()),
-            &node,
-            scalar_arena,
-        ) {
-            return plan;
-        }
-    }
-
-    if inline_ctes
-        && let Operator::PhysicalCTEProduce(_) = &node.op
-        && node.children.len() == 1
-    {
-        let child = node.children.into_iter().next().expect("single child");
-        return collapse_distribution_enforcers_for_single_fragment_inner(
-            child,
-            inline_ctes,
-            scalar_arena,
-            cte_bindings,
-        );
-    }
-
-    node.children = node
-        .children
-        .into_iter()
-        .map(|child| {
-            collapse_distribution_enforcers_for_single_fragment_inner(
-                child,
-                inline_ctes,
-                scalar_arena,
-                cte_bindings,
-            )
-        })
-        .collect();
-
-    if let Operator::PhysicalHashJoin(join) = &mut node.op {
-        join.distribution = JoinDistribution::Broadcast;
-        node.execution_props.join_distribution = Some(JoinExecutionDistribution::Broadcast);
-        for runtime_filter in &mut node.build_runtime_filters {
-            runtime_filter.distribution = JoinDistribution::Broadcast;
-        }
-    }
-
-    if matches!(&node.op, Operator::PhysicalDistribution(_)) && node.children.len() == 1 {
-        return node.children.into_iter().next().expect("single child");
-    }
-
-    node
-}
-
-fn project_direct_local_columns(
-    mut child: crate::sql::optimizer::OptimizerPhysicalNode,
-    target_columns: &[crate::sql::analysis::OutputColumn],
-    output_qualifier: Option<String>,
-    template: &crate::sql::optimizer::OptimizerPhysicalNode,
-    scalar_arena: &mut Option<crate::sql::optimizer::scalar::ScalarArena>,
-) -> Option<crate::sql::optimizer::OptimizerPhysicalNode> {
-    use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
-    use crate::sql::optimizer::scalar::ScalarNode;
-
-    if child.output_columns.len() != target_columns.len() {
-        return None;
-    }
-    if child
-        .output_columns
-        .iter()
-        .zip(target_columns)
-        .all(|(source, target)| source.column_id == target.column_id)
-    {
-        child.output_columns = target_columns.to_vec();
-        return Some(child);
-    }
-
-    let arena = scalar_arena.as_mut()?;
-    let mut items = Vec::with_capacity(target_columns.len());
-    for (source, target) in child.output_columns.iter().zip(target_columns) {
-        let expr = arena.intern(
-            ScalarNode::ColumnRef(source.column_id),
-            source.data_type.clone(),
-            source.nullable,
-        );
-        arena.remember_project_output_display(
-            target.column_id,
-            output_qualifier.clone(),
-            target.name.clone(),
-        );
-        items.push(ScalarProjectItem {
-            expr,
-            output_name: target.name.clone(),
-            output_column_id: target.column_id,
-            expr_display: None,
-        });
-    }
-
-    Some(crate::sql::optimizer::OptimizerPhysicalNode {
-        op: Operator::PhysicalProject(ProjectOp {
-            items,
-            output_qualifier,
-        }),
-        children: vec![child],
-        stats: template.stats.clone(),
-        explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-        output_columns: target_columns.to_vec(),
-        execution_props: template.execution_props.clone(),
-        build_runtime_filters: template.build_runtime_filters.clone(),
-        probe_runtime_filters: template.probe_runtime_filters.clone(),
-    })
+    Ok(())
 }
 
 /// Live BE count for broadcast fanout (1 FE + N BE distributed baseline).
@@ -3751,15 +3488,12 @@ pub(crate) fn execute_query_with_catalog_provider(
     )
 }
 
-/// Extended `execute_query` entry that accepts an optional custom terminal
-/// sink factory and an optional Iceberg catalog registry. Used by IVM-A1
-/// refresh paths: the merge sink intercepts pipeline output (no result
-/// rows are produced), while refresh/codegen uses the registry to build the
-/// typed `ICEBERG_DELTA_SCAN_NODE` payload before lower_plan runs.
+/// Extended `execute_query` entry used while refresh call sites are moving to
+/// the mainline distributed execution path. `terminal_sink` and
+/// `iceberg_catalogs` remain in the signature during that transition, but
+/// non-`None` values are rejected at the mainline execution boundary until
+/// `DistributedPlan` has native sink and write support.
 ///
-/// `terminal_sink = None` falls back to the default `ResultSinkFactory`.
-/// `iceberg_catalogs = None` matches the legacy behaviour for non-IVM
-/// callers.
 /// `execute_query_with_options(..., mv_refresh_ctx = Some(ctx))` runs the
 /// IMV rewrite pipeline before optimization and also passes the refresh
 /// context into codegen. Pre-expanded MV refresh SQL that only needs the
@@ -4044,23 +3778,11 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         mv_candidates,
     )?;
 
-    if let Some(reason) = direct_execution_reason(
+    ensure_mainline_distributed_execution(
         terminal_sink.is_some(),
         iceberg_catalogs.is_some(),
         exchange_port,
-    ) {
-        return execute_query_direct_for_explicit_exception(
-            physical,
-            codegen_catalog,
-            connectors,
-            current_database,
-            query_opts,
-            terminal_sink,
-            iceberg_catalogs,
-            mv_refresh_ctx,
-            reason,
-        );
-    }
+    )?;
 
     let build_result = if let Some(mv_refresh_ctx) = mv_refresh_ctx {
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
@@ -4122,23 +3844,11 @@ pub(crate) fn execute_logical_plan_with_options(
         None,
         Vec::new(),
     )?;
-    if let Some(reason) = direct_execution_reason(
+    ensure_mainline_distributed_execution(
         terminal_sink.is_some(),
         iceberg_catalogs.is_some(),
         exchange_port,
-    ) {
-        return execute_query_direct_for_explicit_exception(
-            physical,
-            codegen_catalog,
-            connectors,
-            current_database,
-            query_opts,
-            terminal_sink,
-            iceberg_catalogs,
-            mv_refresh_ctx,
-            reason,
-        );
-    }
+    )?;
 
     let build_result = if let Some(mv_refresh_ctx) = mv_refresh_ctx {
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
@@ -4385,125 +4095,6 @@ fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
             }
         }
     }
-}
-
-fn lower_plan_build_result(
-    result: PlanBuildResult,
-    arena: &mut crate::exec::expr::ExprArena,
-    query_opts: Option<&StandaloneQueryOptions>,
-    _iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
-) -> Result<crate::exec::node::ExecNode, String> {
-    use crate::lower::thrift::layout::{build_tuple_slot_order, reorder_tuple_slots};
-    use crate::lower::thrift::lower_plan;
-
-    let desc_tbl = result.desc_tbl;
-    let plan = result.plan;
-    let exec_params = result.exec_params;
-    let query_global_dicts = result.query_global_dicts;
-    let query_global_dict_exprs = result.query_global_dict_exprs;
-
-    let mut tuple_slots = build_tuple_slot_order(Some(&desc_tbl));
-    reorder_tuple_slots(&mut tuple_slots, Some(&desc_tbl));
-    let layout_hints = tuple_slots.clone();
-
-    let connectors = crate::connector::ConnectorRegistry::default();
-    let thrift_query_opts =
-        crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(query_opts);
-    let lowered = lower_plan(
-        &plan,
-        arena,
-        &tuple_slots,
-        Some(&desc_tbl),
-        query_global_dicts.as_deref(),
-        query_global_dict_exprs.as_ref(),
-        Some(&exec_params),
-        thrift_query_opts.as_ref(),
-        None,
-        &connectors,
-        &layout_hints,
-        None,
-        None,
-    )?;
-    Ok(lowered.node)
-}
-
-fn execute_plan(
-    result: PlanBuildResult,
-    query_opts: Option<StandaloneQueryOptions>,
-    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
-    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
-    profiler: Option<crate::runtime::profile::Profiler>,
-) -> Result<QueryResult, String> {
-    use crate::exec::expr::ExprArena;
-    use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
-    use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
-    use crate::exec::pipeline::executor::execute_plan_with_pipeline;
-    use crate::runtime::runtime_state::RuntimeState;
-
-    let output_columns = result.output_columns.clone();
-    let mut arena = ExprArena::default();
-    let root = lower_plan_build_result(result, &mut arena, query_opts.as_ref(), iceberg_catalogs)?;
-    let mut exec_plan = ExecPlan { arena, root };
-    push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
-
-    // Default to the result-capturing sink unless the caller supplied a
-    // custom terminal sink. When a custom sink is in use, output chunks are
-    // intercepted by the sink so the returned `QueryResult` only carries the
-    // column metadata.
-    let handle = ResultSinkHandle::new();
-    let sink: Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory> =
-        match terminal_sink {
-            Some(custom_sink) => custom_sink,
-            None => Box::new(ResultSinkFactory::new(handle.clone())),
-        };
-
-    // Unified pipeline DOP: a per-session `SET pipeline_dop = N` override is
-    // honored; otherwise auto = cores/2 via the shared exec_env helper (no hardcoded min(4) cap).
-    let session_dop = query_opts
-        .as_ref()
-        .and_then(|opts| opts.pipeline_dop)
-        .unwrap_or(0);
-    let runtime_query_opts =
-        crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
-            query_opts.as_ref(),
-        );
-    let pipeline_dop = crate::runtime::exec_env::calc_pipeline_dop(session_dop) as usize;
-    execute_plan_with_pipeline(
-        exec_plan,
-        false,
-        std::time::Duration::from_millis(10),
-        sink,
-        None,
-        profiler,
-        pipeline_dop as _,
-        std::sync::Arc::new(RuntimeState::new(
-            runtime_query_opts,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )),
-        None,
-        None,
-        None,
-    )?;
-
-    Ok(QueryResult {
-        columns: output_columns
-            .iter()
-            .map(|c| QueryResultColumn {
-                name: c.name.clone(),
-                data_type: c.data_type.clone(),
-                nullable: c.nullable,
-                logical_type: None,
-            })
-            .collect(),
-        chunks: handle.take_chunks(),
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -5060,7 +4651,6 @@ mod tests {
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
     use crate::connector::starrocks::table::config::StarRocksTableConfig;
     use crate::meta::MetaStoreProvider;
-    use crate::sql::planner::plan::*;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
     };
@@ -5518,319 +5108,6 @@ path = "{metadata_path}"
             local.get("db", "parted").is_err(),
             "EXPLAIN analysis must not require global InMemoryCatalog registration"
         );
-    }
-
-    #[test]
-    fn single_fragment_collapse_removes_distribution_enforcers() {
-        use crate::sql::analysis::JoinKind;
-        use crate::sql::optimizer::operator::{
-            JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp, ValuesOp,
-        };
-        use crate::sql::optimizer::physical_tree::{
-            JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps,
-        };
-        use crate::sql::optimizer::property::DistributionSpec;
-        use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
-        use crate::sql::optimizer::statistics::Statistics;
-
-        fn stats() -> Statistics {
-            Statistics {
-                output_row_count: 0.0,
-                column_statistics: Default::default(),
-                ..Default::default()
-            }
-        }
-
-        fn values_node() -> OptimizerPhysicalNode {
-            OptimizerPhysicalNode {
-                op: Operator::PhysicalValues(ValuesOp {
-                    rows: Vec::new(),
-                    columns: Vec::new(),
-                }),
-                children: Vec::new(),
-                stats: stats(),
-                explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(
-                ),
-                output_columns: Vec::new(),
-                execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(
-                ),
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
-            }
-        }
-
-        fn distributed_values_node() -> OptimizerPhysicalNode {
-            OptimizerPhysicalNode {
-                op: Operator::PhysicalDistribution(PhysicalDistributionOp {
-                    spec: DistributionSpec::Gather,
-                }),
-                children: vec![values_node()],
-                stats: stats(),
-                explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(
-                ),
-                output_columns: Vec::new(),
-                execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(
-                ),
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
-            }
-        }
-
-        let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-        let mut rf = RuntimeFilterDesc::placeholder(&mut scalar_arena, 7);
-        rf.distribution = JoinDistribution::Shuffle;
-
-        let plan = OptimizerPhysicalNode {
-            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
-                join_type: JoinKind::Inner,
-                eq_conditions: Vec::new(),
-                other_condition: None,
-                distribution: JoinDistribution::Shuffle,
-            }),
-            children: vec![distributed_values_node(), distributed_values_node()],
-            stats: stats(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: Vec::new(),
-            execution_props: PlanExecutionProps {
-                join_distribution: Some(JoinExecutionDistribution::Partitioned),
-                scalar_arena: Some(std::sync::Arc::new(scalar_arena)),
-                ..PlanExecutionProps::default()
-            },
-            build_runtime_filters: vec![rf],
-            probe_runtime_filters: Vec::new(),
-        };
-
-        let collapsed = super::collapse_distribution_enforcers_for_single_fragment(plan, false);
-
-        assert!(matches!(
-            &collapsed.op,
-            Operator::PhysicalHashJoin(join)
-                if matches!(&join.distribution, JoinDistribution::Broadcast)
-        ));
-        assert_eq!(
-            collapsed.execution_props.join_distribution,
-            Some(JoinExecutionDistribution::Broadcast)
-        );
-        assert_eq!(collapsed.build_runtime_filters.len(), 1);
-        assert!(matches!(
-            collapsed.build_runtime_filters[0].distribution,
-            JoinDistribution::Broadcast
-        ));
-        assert!(matches!(
-            &collapsed.children[0].op,
-            Operator::PhysicalValues(_)
-        ));
-        assert!(matches!(
-            &collapsed.children[1].op,
-            Operator::PhysicalValues(_)
-        ));
-    }
-
-    #[test]
-    fn single_fragment_collapse_inlines_cte_anchors() {
-        use crate::sql::analysis::OutputColumn;
-        use crate::sql::column_id::ColumnId;
-        use crate::sql::optimizer::operator::{
-            CTEAnchorOp, CTEConsumeOp, CTEProduceOp, Operator, ValuesOp,
-        };
-        use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
-        use crate::sql::optimizer::statistics::Statistics;
-        use arrow::datatypes::DataType;
-
-        fn stats() -> Statistics {
-            Statistics {
-                output_row_count: 0.0,
-                column_statistics: Default::default(),
-                ..Default::default()
-            }
-        }
-
-        fn col(id: u32, name: &str) -> OutputColumn {
-            OutputColumn {
-                column_id: ColumnId::new_for_test(id),
-                name: name.to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                is_internal: false,
-            }
-        }
-
-        fn contains_cte(node: &OptimizerPhysicalNode) -> bool {
-            matches!(
-                node.op,
-                Operator::PhysicalCTEAnchor(_)
-                    | Operator::PhysicalCTEProduce(_)
-                    | Operator::PhysicalCTEConsume(_)
-            ) || node.children.iter().any(contains_cte)
-        }
-
-        let produced = col(1, "id");
-        let consumed = col(2, "id");
-        let values = OptimizerPhysicalNode {
-            op: Operator::PhysicalValues(ValuesOp {
-                rows: Vec::new(),
-                columns: vec![produced.clone()],
-            }),
-            children: Vec::new(),
-            stats: stats(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: vec![produced.clone()],
-            execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-        };
-        let produce = OptimizerPhysicalNode {
-            op: Operator::PhysicalCTEProduce(CTEProduceOp {
-                cte_id: 7,
-                output_columns: vec![produced.clone()],
-            }),
-            children: vec![values],
-            stats: stats(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: vec![produced],
-            execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-        };
-        let consume = OptimizerPhysicalNode {
-            op: Operator::PhysicalCTEConsume(CTEConsumeOp {
-                cte_id: 7,
-                alias: "c".to_string(),
-                output_columns: vec![consumed.clone()],
-                producer_column_ids: vec![ColumnId::new_for_test(1)],
-            }),
-            children: Vec::new(),
-            stats: stats(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: vec![consumed.clone()],
-            execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-        };
-        let plan = OptimizerPhysicalNode {
-            op: Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id: 7 }),
-            children: vec![produce, consume],
-            stats: stats(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: vec![consumed.clone()],
-            execution_props: PlanExecutionProps {
-                scalar_arena: Some(std::sync::Arc::new(
-                    crate::sql::optimizer::scalar::ScalarArena::new(),
-                )),
-                ..PlanExecutionProps::default()
-            },
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-        };
-
-        let collapsed = super::collapse_distribution_enforcers_for_single_fragment(plan, true);
-
-        assert!(!contains_cte(&collapsed));
-        assert_eq!(collapsed.output_columns.len(), 1);
-        assert_eq!(collapsed.output_columns[0].column_id, consumed.column_id);
-        assert_eq!(collapsed.output_columns[0].name, consumed.name);
-        assert!(matches!(&collapsed.op, Operator::PhysicalProject(_)));
-        assert!(matches!(
-            &collapsed.children[0].op,
-            Operator::PhysicalValues(_)
-        ));
-    }
-
-    #[test]
-    fn single_fragment_collapse_preserves_cte_when_inline_disabled() {
-        use crate::sql::analysis::OutputColumn;
-        use crate::sql::column_id::ColumnId;
-        use crate::sql::optimizer::operator::{
-            CTEAnchorOp, CTEConsumeOp, CTEProduceOp, Operator, ValuesOp,
-        };
-        use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
-        use crate::sql::optimizer::statistics::Statistics;
-        use arrow::datatypes::DataType;
-
-        fn stats() -> Statistics {
-            Statistics {
-                output_row_count: 0.0,
-                column_statistics: Default::default(),
-                ..Default::default()
-            }
-        }
-
-        let column = OutputColumn {
-            column_id: ColumnId::new_for_test(1),
-            name: "id".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
-            is_internal: false,
-        };
-        let values = OptimizerPhysicalNode {
-            op: Operator::PhysicalValues(ValuesOp {
-                rows: Vec::new(),
-                columns: vec![column.clone()],
-            }),
-            children: Vec::new(),
-            stats: stats(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: vec![column.clone()],
-            execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-        };
-        let produce = OptimizerPhysicalNode {
-            op: Operator::PhysicalCTEProduce(CTEProduceOp {
-                cte_id: 7,
-                output_columns: vec![column.clone()],
-            }),
-            children: vec![values],
-            stats: stats(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: vec![column.clone()],
-            execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-        };
-        let consume = OptimizerPhysicalNode {
-            op: Operator::PhysicalCTEConsume(CTEConsumeOp {
-                cte_id: 7,
-                alias: "c".to_string(),
-                output_columns: vec![column.clone()],
-                producer_column_ids: vec![column.column_id],
-            }),
-            children: Vec::new(),
-            stats: stats(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: vec![column.clone()],
-            execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-        };
-        let plan = OptimizerPhysicalNode {
-            op: Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id: 7 }),
-            children: vec![produce, consume],
-            stats: stats(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: vec![column],
-            execution_props: PlanExecutionProps {
-                scalar_arena: Some(std::sync::Arc::new(
-                    crate::sql::optimizer::scalar::ScalarArena::new(),
-                )),
-                ..PlanExecutionProps::default()
-            },
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-        };
-
-        let collapsed = super::collapse_distribution_enforcers_for_single_fragment(plan, false);
-
-        assert!(matches!(&collapsed.op, Operator::PhysicalCTEAnchor(_)));
-        assert_eq!(collapsed.children.len(), 2);
-        assert!(matches!(
-            &collapsed.children[0].op,
-            Operator::PhysicalCTEProduce(_)
-        ));
-        assert!(matches!(
-            &collapsed.children[1].op,
-            Operator::PhysicalCTEConsume(_)
-        ));
     }
 
     #[test]
@@ -6508,6 +5785,55 @@ enable_path_style_access = true
         *query
     }
 
+    #[test]
+    fn query_without_exchange_backend_fails_instead_of_direct_exec() {
+        let query = parse_query_for_engine_test("select 1");
+        let catalog = super::InMemoryCatalog::default();
+        let connectors = crate::connector::ConnectorRegistry::default();
+
+        let err = super::execute_query_with_options(
+            &query,
+            &catalog,
+            &connectors,
+            "default",
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("exchange_port=0 must not execute through direct fallback");
+
+        assert!(
+            err.contains("distributed execution requires an exchange backend"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn query_with_loopback_exchange_backend_uses_distributed_path() {
+        let backend = super::install_all_in_one_loopback_backend_for_test()
+            .expect("install loopback backend");
+        let query = parse_query_for_engine_test("select 1");
+        let catalog = super::InMemoryCatalog::default();
+        let connectors = crate::connector::ConnectorRegistry::default();
+
+        let result = super::execute_query_with_options(
+            &query,
+            &catalog,
+            &connectors,
+            "default",
+            backend.exchange_port,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("query should execute through mainline coordinator");
+
+        assert_eq!(result.row_count(), 1);
+    }
+
     fn dummy_mv_refresh_context_for_validator_test()
     -> crate::engine::mv::refresh_context::IcebergMvRefreshContext {
         use iceberg::spec::{
@@ -6698,12 +6024,14 @@ enable_path_style_access = true
             "unexpected rewrite error: {rewrite_err}"
         );
 
+        let backend = super::install_all_in_one_loopback_backend_for_test()
+            .expect("install loopback backend");
         let result = super::execute_preexpanded_mv_refresh_query_with_options(
             &query,
             &catalog,
             &connectors,
             "default",
-            0,
+            backend.exchange_port,
             None,
             None,
             None,
