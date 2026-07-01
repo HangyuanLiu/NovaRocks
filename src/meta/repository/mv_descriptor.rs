@@ -45,7 +45,15 @@ impl MvDescriptorV1 {
     }
 
     pub fn from_json(s: &str) -> Result<Self, String> {
-        serde_json::from_str(s).map_err(|err| format!("failed to parse MV descriptor JSON: {err}"))
+        let descriptor: Self = serde_json::from_str(s)
+            .map_err(|err| format!("failed to parse MV descriptor JSON: {err}"))?;
+        if descriptor.descriptor_version != MV_DESCRIPTOR_VERSION {
+            return Err(format!(
+                "unsupported MV descriptor version: expected {}, got {}",
+                MV_DESCRIPTOR_VERSION, descriptor.descriptor_version
+            ));
+        }
+        Ok(descriptor)
     }
 }
 
@@ -86,7 +94,7 @@ mod tests {
 
     fn sample() -> MvDescriptorV1 {
         MvDescriptorV1 {
-            descriptor_version: 1,
+            descriptor_version: MV_DESCRIPTOR_VERSION,
             package_id: "pkg-1".to_string(),
             logical_sql: "SELECT id FROM ice.sales.orders".to_string(),
             dialect: "starrocks".to_string(),
@@ -101,7 +109,13 @@ mod tests {
                 object_type: "table".to_string(),
                 storage_engine: "iceberg".to_string(),
             }],
-            schema_contract: None,
+            schema_contract: Some(serde_json::json!({
+                "z": 3,
+                "a": {
+                    "z": 2,
+                    "a": 1
+                }
+            })),
             refresh_contract: None,
             created_at_ms: 123,
         }
@@ -118,6 +132,18 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_json_rejects_unsupported_version() {
+        let mut descriptor = sample();
+        descriptor.descriptor_version = MV_DESCRIPTOR_VERSION + 1;
+        let json = descriptor.to_canonical_json().unwrap();
+
+        let err = MvDescriptorV1::from_json(&json).unwrap_err();
+
+        assert!(err.contains("unsupported MV descriptor version"));
+        assert!(err.contains(&(MV_DESCRIPTOR_VERSION + 1).to_string()));
+    }
+
+    #[test]
     fn canonical_json_is_key_sorted_and_hash_stable() {
         let descriptor = sample();
 
@@ -125,11 +151,11 @@ mod tests {
 
         assert_eq!(
             canonical,
-            "{\"base_dependencies\":[{\"catalog\":\"ice\",\"name\":\"orders\",\"namespace\":\"sales\",\"object_type\":\"table\",\"storage_engine\":\"iceberg\"}],\"created_at_ms\":123,\"descriptor_version\":1,\"dialect\":\"starrocks\",\"hidden_columns\":[\"__nova_base_row_id\"],\"logical_sql\":\"SELECT id FROM ice.sales.orders\",\"package_id\":\"pkg-1\",\"public_view\":\"analytics.mv_orders\",\"refresh_contract\":null,\"schema_contract\":null,\"storage_table\":\"analytics.__nr_mv_mv_orders\",\"visible_columns\":[\"id\"]}"
+            "{\"base_dependencies\":[{\"catalog\":\"ice\",\"name\":\"orders\",\"namespace\":\"sales\",\"object_type\":\"table\",\"storage_engine\":\"iceberg\"}],\"created_at_ms\":123,\"descriptor_version\":1,\"dialect\":\"starrocks\",\"hidden_columns\":[\"__nova_base_row_id\"],\"logical_sql\":\"SELECT id FROM ice.sales.orders\",\"package_id\":\"pkg-1\",\"public_view\":\"analytics.mv_orders\",\"refresh_contract\":null,\"schema_contract\":{\"a\":{\"a\":1,\"z\":2},\"z\":3},\"storage_table\":\"analytics.__nr_mv_mv_orders\",\"visible_columns\":[\"id\"]}"
         );
         assert_eq!(
             descriptor.content_hash().unwrap(),
-            "92ce01b9be3f3960c536d9fd7540a2f665ef7133f82f60abade0379e6995e50c"
+            "05707bad24830c2246f225b7bf59e3d8b2a8b79ebbb53eb938cd4fc9087f2802"
         );
     }
 }
