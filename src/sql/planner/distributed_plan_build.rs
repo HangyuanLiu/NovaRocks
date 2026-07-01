@@ -2,11 +2,15 @@
 
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
-use crate::sql::codegen::helpers::split_and_conjuncts_typed;
+use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
 use crate::sql::codegen::{FragmentEdge, FragmentId};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::property::OrderingSpec;
 use crate::sql::planner::distributed_fragment::{DataPartition, DataSink};
 use crate::sql::planner::distributed_node::{DistributedNode, DistributedPayload};
+use crate::sql::planner::optimizer_bridge::property::{
+    ordering_spec_from_sort_items, window_ordering_spec,
+};
 use crate::sql::planner::plan::{PhysicalPlanKind, PhysicalPlanNode};
 
 #[derive(Clone, Debug)]
@@ -192,6 +196,60 @@ impl DistributedPlanBuilderV2 {
                     PhysicalPlanKind::Repeat(payload),
                 ))
             }
+            PhysicalPlanKind::Window(window) => {
+                expect_child_count(node, 1)?;
+                let child = self.visit(&node.children[0], fragment_id)?;
+                let groups = group_win_exprs_by_sig(&window.window_exprs);
+                if groups.is_empty() {
+                    return Err(
+                        "build_distributed_plan_v2: PhysicalWindow has no window expressions"
+                            .to_string(),
+                    );
+                }
+
+                let mut first_node_id = None;
+                let mut tuple_ids = child.tuple_ids.clone();
+                let mut current_ordering = distributed_node_ordering(&child);
+                for group_indices in &groups {
+                    let Some(first_idx) = group_indices.first().copied() else {
+                        continue;
+                    };
+                    let first_win = &window.window_exprs[first_idx];
+                    if groups.len() > 1 {
+                        let required_ordering =
+                            window_ordering_spec(&first_win.partition_by, &first_win.order_by);
+                        let has_sort_keys =
+                            !first_win.partition_by.is_empty() || !first_win.order_by.is_empty();
+                        let ordering_is_representable =
+                            !matches!(required_ordering, OrderingSpec::Any);
+                        let needs_sort = has_sort_keys
+                            && (!ordering_is_representable
+                                || !current_ordering.satisfies(&required_ordering));
+                        if needs_sort {
+                            let sort_node_id = self.alloc_node();
+                            first_node_id.get_or_insert(sort_node_id);
+                            current_ordering = required_ordering;
+                        }
+                    }
+                    let analytic_node_id = self.alloc_node();
+                    first_node_id.get_or_insert(analytic_node_id);
+                    let _ = self.alloc_tuple();
+                    let output_tuple_id = self.alloc_tuple();
+                    tuple_ids.push(output_tuple_id);
+                }
+
+                let node_id = first_node_id.ok_or_else(|| {
+                    "build_distributed_plan_v2: PhysicalWindow produced no thrift node".to_string()
+                })?;
+                Ok(self.make_node_with_payload(
+                    node,
+                    fragment_id,
+                    node_id,
+                    tuple_ids,
+                    vec![child],
+                    PhysicalPlanKind::Window(window.clone()),
+                ))
+            }
             PhysicalPlanKind::ChangeEventExpand(_) => {
                 expect_child_count(node, 1)?;
                 let child = self.visit(&node.children[0], fragment_id)?;
@@ -265,6 +323,51 @@ impl DistributedPlanBuilderV2 {
     }
 }
 
+fn distributed_node_ordering(node: &DistributedNode) -> OrderingSpec {
+    match &node.payload {
+        DistributedPayload::Physical(PhysicalPlanKind::Sort(sort)) => {
+            ordering_spec_from_sort_items(&sort.items)
+        }
+        DistributedPayload::Physical(PhysicalPlanKind::TopN(topn)) => {
+            ordering_spec_from_sort_items(&topn.items)
+        }
+        DistributedPayload::Physical(PhysicalPlanKind::AssertOneRow(_)) => node
+            .children
+            .first()
+            .map(distributed_node_ordering)
+            .unwrap_or(OrderingSpec::Any),
+        DistributedPayload::Physical(PhysicalPlanKind::Window(window)) => {
+            let mut current_ordering = node
+                .children
+                .first()
+                .map(distributed_node_ordering)
+                .unwrap_or(OrderingSpec::Any);
+            let groups = group_win_exprs_by_sig(&window.window_exprs);
+            for group_indices in &groups {
+                let Some(first_idx) = group_indices.first().copied() else {
+                    continue;
+                };
+                let first_win = &window.window_exprs[first_idx];
+                if groups.len() > 1 {
+                    let required_ordering =
+                        window_ordering_spec(&first_win.partition_by, &first_win.order_by);
+                    let has_sort_keys =
+                        !first_win.partition_by.is_empty() || !first_win.order_by.is_empty();
+                    let ordering_is_representable = !matches!(required_ordering, OrderingSpec::Any);
+                    let needs_sort = has_sort_keys
+                        && (!ordering_is_representable
+                            || !current_ordering.satisfies(&required_ordering));
+                    if needs_sort {
+                        current_ordering = required_ordering;
+                    }
+                }
+            }
+            current_ordering
+        }
+        _ => OrderingSpec::Any,
+    }
+}
+
 fn expect_child_count(node: &PhysicalPlanNode, expected: usize) -> Result<(), String> {
     if node.children.len() == expected {
         return Ok(());
@@ -313,7 +416,7 @@ mod tests {
 
     use super::build_distributed_plan_v2;
     use crate::sql::analysis::{
-        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
@@ -324,8 +427,8 @@ mod tests {
         DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
         PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode, PlanAssertOneRowNode,
         PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
-        PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, RedistributeMode,
-        RedistributeNode,
+        PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
+        RedistributeMode, RedistributeNode, WindowExpr,
     };
     use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
 
@@ -900,6 +1003,132 @@ mod tests {
     }
 
     #[test]
+    fn build_distributed_plan_v2_window_single_group_allocates_analytic_ids() {
+        let scan = scan_node(1, "k");
+        let rn = output_col(2, "rn", DataType::Int64, false);
+        let output_columns = vec![output_col(1, "k", DataType::Int64, false), rn.clone()];
+        let window = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Window(PlanWindowNode {
+                window_exprs: vec![window_expr(rn, vec![], vec![])],
+                output_columns: output_columns.clone(),
+            }),
+            children: vec![scan],
+            output_columns,
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&window).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Window(_))
+        ));
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![1, 3]);
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].node_id, 1);
+        assert_eq!(root.children[0].tuple_ids, vec![1]);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_window_multi_group_allocates_sort_when_ordering_changes() {
+        let scan = scan_node_with_columns(vec![
+            output_col(1, "k", DataType::Int64, false),
+            output_col(2, "v", DataType::Int64, true),
+        ]);
+        let rn_by_k = output_col(3, "rn_by_k", DataType::Int64, false);
+        let rn_by_v = output_col(4, "rn_by_v", DataType::Int64, false);
+        let output_columns = vec![
+            output_col(1, "k", DataType::Int64, false),
+            output_col(2, "v", DataType::Int64, true),
+            rn_by_k.clone(),
+            rn_by_v.clone(),
+        ];
+        let window = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Window(PlanWindowNode {
+                window_exprs: vec![
+                    window_expr(
+                        rn_by_k,
+                        vec![],
+                        vec![sort_item(column_ref_expr(1, "k", DataType::Int64, false))],
+                    ),
+                    window_expr(
+                        rn_by_v,
+                        vec![],
+                        vec![sort_item(column_ref_expr(2, "v", DataType::Int64, true))],
+                    ),
+                ],
+                output_columns: output_columns.clone(),
+            }),
+            children: vec![scan],
+            output_columns,
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let project_columns = vec![output_col(5, "rn_alias", DataType::Int64, false)];
+        let project = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Project(PlanProjectNode {
+                items: vec![ProjectItem {
+                    expr: column_ref_expr(4, "rn_by_v", DataType::Int64, false),
+                    output_name: "rn_alias".to_string(),
+                    output_column_id: ColumnId::new_for_test(5),
+                }],
+                output_qualifier: None,
+            }),
+            children: vec![window],
+            output_columns: project_columns,
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&project).expect("build_distributed_plan_v2");
+
+        let root = &dp.fragments[0].root;
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Project(_))
+        ));
+        assert_eq!(root.node_id, 6);
+        assert_eq!(root.tuple_ids, vec![6]);
+        assert_eq!(root.children.len(), 1);
+        let window = &root.children[0];
+        assert!(matches!(
+            &window.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Window(_))
+        ));
+        assert_eq!(window.node_id, 2);
+        assert_eq!(window.tuple_ids, vec![1, 3, 5]);
+        assert_eq!(window.children.len(), 1);
+        assert_eq!(window.children[0].node_id, 1);
+        assert_eq!(window.children[0].tuple_ids, vec![1]);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_window_rejects_empty_window_exprs() {
+        let scan = scan_node(1, "k");
+        let window = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Window(PlanWindowNode {
+                window_exprs: vec![],
+                output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let err =
+            build_distributed_plan_v2(&window).expect_err("empty Window expressions are invalid");
+
+        assert!(
+            err.contains("PhysicalWindow has no window expressions"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn build_distributed_plan_v2_rejects_unsupported_redistribute_root() {
         let scan = scan_node(1, "k");
         let redistribute = PhysicalPlanNode {
@@ -975,6 +1204,10 @@ mod tests {
 
     fn scan_node(column_id: u32, column_name: &str) -> PhysicalPlanNode {
         let scan_columns = vec![output_col(column_id, column_name, DataType::Int64, false)];
+        scan_node_with_columns(scan_columns)
+    }
+
+    fn scan_node_with_columns(scan_columns: Vec<OutputColumn>) -> PhysicalPlanNode {
         PhysicalPlanNode {
             kind: PhysicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
@@ -991,6 +1224,33 @@ mod tests {
             output_columns: scan_columns,
             stats: stats(),
             probe_runtime_filters: vec![],
+        }
+    }
+
+    fn window_expr(
+        output_column: OutputColumn,
+        partition_by: Vec<TypedExpr>,
+        order_by: Vec<SortItem>,
+    ) -> WindowExpr {
+        WindowExpr {
+            name: "row_number".to_string(),
+            args: vec![],
+            distinct: false,
+            partition_by,
+            order_by,
+            window_frame: None,
+            result_type: output_column.data_type,
+            output_name: output_column.name,
+            output_column_id: output_column.column_id,
+            ignore_nulls: false,
+        }
+    }
+
+    fn sort_item(expr: TypedExpr) -> SortItem {
+        SortItem {
+            expr,
+            asc: true,
+            nulls_first: false,
         }
     }
 
