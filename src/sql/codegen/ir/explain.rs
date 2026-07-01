@@ -8,8 +8,8 @@ use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::codegen::scalar_materialize::materialize;
 use crate::sql::column_id::ColumnId;
 use crate::sql::explain::{
-    ExplainLevel, PlanNodeExplainStage, format_expr, format_project_item, format_sort_items,
-    format_window_exprs,
+    ExplainLevel, PlanNodeExplainStage, format_expr, format_project_item, format_scan_dict_suffix,
+    format_sort_items, format_window_exprs,
 };
 use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
@@ -159,9 +159,10 @@ fn format_distributed_shared_plan_node_header(
                 .as_deref()
                 .map(|a| format!(" (alias={a})"))
                 .unwrap_or_default();
+            let dict = format_scan_dict_suffix(&node.dict_columns);
             Some(format!(
-                "SCAN {}.{}{}",
-                node.database, node.table.name, alias
+                "SCAN {}.{}{}{}",
+                node.database, node.table.name, alias, dict
             ))
         }
         DistributedPlanKind::Filter(_) => Some("FILTER".to_string()),
@@ -1645,6 +1646,15 @@ mod tests {
     }
 
     #[test]
+    fn distributed_explain_scan_shows_dict_encoded_columns() {
+        let dp = build_distributed_plan(&dict_scan_plan()).expect("build DistributedPlan");
+        let text = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+
+        assert!(text.contains("SCAN test_db.t"), "{text}");
+        assert!(text.contains("dict=[s]"), "{text}");
+    }
+
+    #[test]
     fn distributed_explain_accepts_exchange_only_in_distributed_kind() {
         let node = DistributedPlanNode {
             node_id: 7,
@@ -2180,6 +2190,63 @@ mod tests {
             vec![],
             vec![k, v],
         )
+    }
+
+    fn dict_scan_plan() -> OptimizerPhysicalNode {
+        let s = output_col(1, "s", DataType::Utf8, true);
+        let dict_s = output_col(2, "__nr_dict_t_s", DataType::Int32, true);
+        physical_node(
+            Operator::PhysicalScan(ScanOp {
+                database: "test_db".to_string(),
+                table: table_def(),
+                alias: None,
+                stats_ref: None,
+                columns: vec![s.clone(), dict_s.clone()],
+                predicates: vec![],
+                required_columns: Some(vec!["s".to_string(), "__nr_dict_t_s".to_string()]),
+                dict_columns: vec![crate::sql::common::ScanDictionaryColumn {
+                    source_column: "s".to_string(),
+                    dict_column: "__nr_dict_t_s".to_string(),
+                    dictionary: sample_dict_snapshot(),
+                }],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            vec![s, dict_s],
+        )
+    }
+
+    fn sample_dict_snapshot() -> Arc<crate::sql::common::DictionarySnapshot> {
+        use crate::engine::dictionary::model::{
+            DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue,
+            DictionaryWatermark,
+        };
+
+        Arc::new(DictionarySnapshot {
+            dictionary_id: 1,
+            owner: DictionaryOwner::StarRocksTable {
+                database: "test_db".to_string(),
+                table: "t".to_string(),
+                db_id: 1,
+                table_id: 2,
+            },
+            column_id: Some(10),
+            column_name: "s".to_string(),
+            data_type: DataType::Utf8,
+            version: 1,
+            watermark: DictionaryWatermark::Iceberg {
+                snapshot_id: None,
+                schema_id: 0,
+            },
+            values: vec![DictionaryValue {
+                id: 1,
+                bytes: b"a".to_vec(),
+            }],
+            null_id: 0,
+            state: DictionaryState::Active,
+            order_preserving: true,
+        })
     }
 
     fn alias_collision_scan_plan() -> OptimizerPhysicalNode {

@@ -726,6 +726,72 @@ mod tests {
     }
 
     #[test]
+    fn decode_output_preserves_utf8_type_for_dict_column() {
+        // Invariant guard (SQL type gate): after the dict rewrite groups by the
+        // Int32 dict slot, the Decode node must restore the ORIGINAL Utf8 type
+        // on its output column, so the user-visible type is unchanged.
+        let scan = LogicalPlanNode::new(
+            LogicalPlanKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_table(),
+                alias: None,
+                columns: vec![s_output_column()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            None,
+        );
+        let aggregate = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![s_column_ref()],
+                aggregates: vec![AggregateCall {
+                    name: "count".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: ColumnId::new_for_test(1001),
+                }],
+                output_columns: vec![
+                    s_output_column(),
+                    OutputColumn {
+                        column_id: ColumnId::new_for_test(1001),
+                        name: "cnt".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                ],
+                already_pushed: false,
+            }),
+            vec![scan],
+            None,
+        );
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        install_provider(&mut ctx, true);
+        let rewritten = run_pipeline_rewrite(aggregate, &mut ctx);
+
+        let LogicalPlanKind::Decode(decode) = &rewritten.kind else {
+            panic!("expected decode root, got {rewritten:?}");
+        };
+        let decoded_s = decode
+            .output_columns
+            .iter()
+            .find(|c| c.name == "s")
+            .expect("Decode must expose the restored string column 's'");
+        assert_eq!(
+            decoded_s.data_type,
+            DataType::Utf8,
+            "Decode must restore the logical Utf8 type; got {:?}",
+            decoded_s.data_type
+        );
+    }
+
+    #[test]
     fn sort_non_order_preserving_decodes_before_sort() {
         let scan = LogicalPlanNode::new(
             LogicalPlanKind::Scan(LogicalScanNode {
