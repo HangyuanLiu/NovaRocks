@@ -453,6 +453,13 @@ pub(crate) fn create_iceberg_mv(
             .map_err(|e| format!("create iceberg MV dependency metadata failed: {e}"))?;
         txn.commit()
             .map_err(|e| format!("commit iceberg MV repository metadata failed: {e}"))?;
+        // W2: push the freshly-persisted schema contract into the MV target
+        // table descriptor. sync_iceberg_mv_descriptor_for_target reloads the definition
+        // from the metadata store (contract present) and rewrites the descriptor
+        // properties; the descriptor written by create_table above carried
+        // schema_contract=None because the contract needs the created table's
+        // field-ids, so this second property update is required.
+        sync_iceberg_mv_descriptor_for_target(state, &target)?;
         Ok::<(), String>(())
     })();
     if let Err(err) = post_create {
@@ -1159,7 +1166,12 @@ fn stored_refresh_policy_descriptor_json(
     })
 }
 
-pub(crate) fn sync_iceberg_mv_descriptor_refresh_contract(
+/// Read-modify-write the Iceberg MV target table's descriptor properties:
+/// reload the current descriptor, overwrite `refresh_contract` from the given
+/// refresh-policy inputs, carry `definition.schema_contract` (if present)
+/// into the descriptor's `schema_contract` field, and write the descriptor
+/// back to the target table.
+pub(crate) fn sync_iceberg_mv_descriptor(
     state: &Arc<StandaloneState>,
     definition: &StoredMvDefinition,
     refresh_policy: &StoredMvRefreshPolicy,
@@ -1201,6 +1213,11 @@ pub(crate) fn sync_iceberg_mv_descriptor_refresh_contract(
         refresh_paused,
         refresh_interval_ms,
     ));
+    // W2: the descriptor is the authoritative home for the schema contract.
+    // Carry the definition's contract into the descriptor whenever we sync.
+    if let Some(contract) = &definition.schema_contract {
+        descriptor.set_schema_contract(contract)?;
+    }
     let descriptor_properties = descriptor.to_storage_properties()?;
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let tx = iceberg::transaction::Transaction::new(&loaded.table);
@@ -1225,7 +1242,7 @@ fn sync_iceberg_mv_descriptor_for_target(
     target: &IcebergMvTarget,
 ) -> Result<(), String> {
     let definition = load_iceberg_mv_definition_by_target(state, target)?;
-    sync_iceberg_mv_descriptor_refresh_contract(
+    sync_iceberg_mv_descriptor(
         state,
         &definition,
         &definition.refresh_policy,
@@ -19004,6 +19021,41 @@ mod tests {
             descriptor.hidden_columns,
             vec![ICEBERG_MV_APPLY_KEY_COLUMN.to_string()]
         );
+        assert_eq!(
+            descriptor.base_dependencies,
+            vec![DescriptorDependency {
+                catalog: "ice".to_string(),
+                namespace: "sales".to_string(),
+                name: "orders".to_string(),
+                object_type: "table".to_string(),
+                storage_engine: "iceberg".to_string(),
+            }]
+        );
+        // W2: CREATE now pushes the freshly-persisted schema contract into the
+        // MV table descriptor after the metadata transaction commits (see
+        // sync_iceberg_mv_descriptor_for_target). Previously this field stayed
+        // `None` on the descriptor written at create_table time, because the
+        // contract needs the created target table's field-ids.
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let stored_definition = load_iceberg_mv_definition_by_target(&env.state, &target)
+            .expect("load stored mv definition");
+        assert_eq!(
+            descriptor.schema_contract_typed().expect("typed contract"),
+            stored_definition.schema_contract
+        );
+        assert!(descriptor.schema_contract_typed().unwrap().is_some());
+        assert_eq!(
+            descriptor.refresh_contract,
+            Some(serde_json::json!({
+                "policy": "DEFERRED_MANUAL",
+                "interval_ms": null,
+                "paused": false,
+            }))
+        );
         assert!(descriptor.created_at_ms > 0);
 
         let legacy_alias_name = ["__nr", "_mv_", "mv_orders"].concat();
@@ -19099,6 +19151,51 @@ mod tests {
         assert_eq!(mv.public_name, "mv_orders");
         assert_eq!(mv.descriptor.package_id, "analytics.mv_orders");
         assert_eq!(mv.descriptor.base_dependencies[0].name.as_str(), "orders");
+    }
+
+    #[test]
+    fn create_writes_schema_contract_into_descriptor() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        // Discover the MV descriptor straight off the MV table, the same way
+        // `discover_iceberg_mvs_recovers_single_table_descriptor_from_lake`
+        // does above.
+        let discovered = crate::engine::mv::iceberg_discovery::discover_iceberg_mvs(
+            &env.state,
+            "ice",
+            "analytics",
+        )
+        .expect("discover iceberg mvs");
+        assert_eq!(discovered.len(), 1);
+        let descriptor = &discovered[0].descriptor;
+
+        // Load the MV definition from the metadata store directly, to compare
+        // against what the descriptor carries.
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let stored_definition = load_iceberg_mv_definition_by_target(&env.state, &target)
+            .expect("load stored mv definition");
+
+        let descriptor_contract = descriptor
+            .schema_contract_typed()
+            .expect("parse typed schema contract from descriptor");
+
+        // The descriptor now carries the schema contract (not just `None`,
+        // and not merely "some arbitrary JSON") and it is byte-for-byte the
+        // same contract the CREATE path persisted into the metadata store.
+        assert!(descriptor_contract.is_some());
+        assert_eq!(descriptor_contract, stored_definition.schema_contract);
     }
 
     #[test]
