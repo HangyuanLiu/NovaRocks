@@ -82,12 +82,20 @@ pub(crate) fn resolve_format_tablet_access(
 ) -> Result<StarRocksFormatTabletAccess, String> {
     let access = resolve_with_profile(tablet_root_path, object_store_profile)?;
     let root_relative_path = access.single_relative_path()?.to_string();
-    let root_location = tablet_root_path.trim().trim_end_matches('/').to_string();
+    let root_location = normalize_root_location(tablet_root_path);
     Ok(StarRocksFormatTabletAccess {
         root_location,
         root_relative_path,
         access,
     })
+}
+
+fn normalize_root_location(path: &str) -> String {
+    let path = path.trim();
+    if path == "/" {
+        return "/".to_string();
+    }
+    path.trim_end_matches('/').to_string()
 }
 
 fn join_path(base: &str, rel_path: &str) -> String {
@@ -166,5 +174,19 @@ mod tests {
                 .operator_relative_path("meta/1.meta")
                 .ends_with("meta/1.meta")
         );
+    }
+
+    #[test]
+    fn local_root_tablet_access_preserves_display_root() {
+        let access = resolve_format_tablet_access("/", None).expect("resolve local root");
+
+        assert_eq!(access.join_relative_path("meta/1.meta"), "/meta/1.meta");
+    }
+
+    #[test]
+    fn local_root_tablet_access_preserves_empty_display_root() {
+        let access = resolve_format_tablet_access("/", None).expect("resolve local root");
+
+        assert_eq!(access.join_relative_path(""), "/");
     }
 }
