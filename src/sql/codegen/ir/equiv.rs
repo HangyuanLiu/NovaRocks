@@ -382,15 +382,15 @@ mod tests {
     }
 
     #[test]
-    fn union_distinct_two_scans_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure_with_large_stack(
+    fn union_distinct_two_scans_rejects_residual_distinct_before_ir_build() {
+        assert_distributed_plan_error_contains(
             "union_distinct_two_scans",
             union_plan(
                 false,
                 aliased_scan_plan("l", 1, 2),
                 aliased_scan_plan("r", 3, 4),
             ),
-            2,
+            "UNION DISTINCT must be rewritten by UnionDistinctToAggregate before distributed build",
         );
     }
 
@@ -633,22 +633,6 @@ mod tests {
         let connectors = ConnectorRegistry::new();
         let distributed = build_distributed_plan(case_name, plan, &connectors);
         assert_multi_fragment_ir_structure(case_name, &distributed, expected_fragment_count);
-    }
-
-    fn assert_distributed_plan_ir_structure_with_large_stack(
-        case_name: &'static str,
-        plan: OptimizerPhysicalNode,
-        expected_fragment_count: usize,
-    ) {
-        std::thread::Builder::new()
-            .name(format!("{case_name}_ir_structure"))
-            .stack_size(64 * 1024 * 1024)
-            .spawn(move || {
-                assert_distributed_plan_ir_structure(case_name, plan, expected_fragment_count)
-            })
-            .expect("spawn IR structure test thread")
-            .join()
-            .expect("IR structure test thread panicked");
     }
 
     fn build_distributed_plan(

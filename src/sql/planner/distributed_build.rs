@@ -18,8 +18,8 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::cost::{CostInput, broadcast_decision, compute_cost_estimate};
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::operator::{
-    AggregateOutputLayout, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, LimitOp, Operator,
-    PhysicalDistributionOp, TopNOp, TopNPhase, UnionOp,
+    CTEAnchorOp, CTEConsumeOp, CTEProduceOp, LimitOp, Operator, PhysicalDistributionOp, TopNOp,
+    TopNPhase,
 };
 use crate::sql::optimizer::options::{OptimizerOptions, current_session_optimizer_settings};
 use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
@@ -612,15 +612,18 @@ impl<'a> DistributedPlanBuilder<'a> {
                 })
             }
             Operator::PhysicalUnion(op) => {
-                if op.all {
-                    return self.visit_set_op(
-                        node,
-                        SetOpKind::UnionAll,
-                        &op.output_columns,
-                        &op.child_output_columns,
+                if !op.all {
+                    return Err(
+                        "UNION DISTINCT must be rewritten by UnionDistinctToAggregate before distributed build"
+                            .to_string(),
                     );
                 }
-                self.visit_union_distinct(op, node)
+                self.visit_set_op(
+                    node,
+                    SetOpKind::UnionAll,
+                    &op.output_columns,
+                    &op.child_output_columns,
+                )
             }
             Operator::PhysicalIntersect(op) => self.visit_set_op(
                 node,
@@ -1089,107 +1092,6 @@ impl<'a> DistributedPlanBuilder<'a> {
             }),
         })
     }
-
-    fn visit_union_distinct(
-        &mut self,
-        op: &UnionOp,
-        node: &OptimizerPhysicalNode,
-    ) -> Result<DistributedPlanNode, String> {
-        let output_columns = if node.output_columns.is_empty() {
-            op.output_columns.clone()
-        } else {
-            node.output_columns.clone()
-        };
-        let union_all_node = OptimizerPhysicalNode {
-            op: Operator::PhysicalUnion(UnionOp {
-                all: true,
-                output_columns: op.output_columns.clone(),
-                child_output_columns: op.child_output_columns.clone(),
-            }),
-            children: node.children.clone(),
-            stats: node.stats.clone(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: output_columns.clone(),
-            execution_props: node.execution_props.clone(),
-            build_runtime_filters: node.build_runtime_filters.clone(),
-            probe_runtime_filters: node.probe_runtime_filters.clone(),
-        };
-        let gathered_union = OptimizerPhysicalNode {
-            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
-                spec: DistributionSpec::Gather,
-            }),
-            children: vec![union_all_node],
-            stats: node.stats.clone(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: output_columns.clone(),
-            execution_props: node.execution_props.clone(),
-            build_runtime_filters: node.build_runtime_filters.clone(),
-            probe_runtime_filters: node.probe_runtime_filters.clone(),
-        };
-        let gathered = self.visit_distribution(
-            &PhysicalDistributionOp {
-                spec: DistributionSpec::Gather,
-            },
-            &gathered_union,
-        )?;
-        self.emit_distinct_on_top(
-            gathered,
-            if op.output_columns.is_empty() {
-                &output_columns
-            } else {
-                &op.output_columns
-            },
-            node,
-        )
-    }
-
-    fn emit_distinct_on_top(
-        &mut self,
-        child: DistributedPlanNode,
-        output_columns: &[crate::sql::analysis::OutputColumn],
-        node: &OptimizerPhysicalNode,
-    ) -> Result<DistributedPlanNode, String> {
-        if output_columns.is_empty() {
-            return Err("UNION DISTINCT requires at least one output column".to_string());
-        }
-
-        let fragment_id = self.current_fragment_id()?;
-        let agg_tuple_id = self.alloc_tuple();
-        let agg_node_id = self.alloc_node();
-        let group_by = output_columns
-            .iter()
-            .map(|column| TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: column.column_id,
-                    qualifier: None,
-                    column: column.name.clone(),
-                },
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
-            })
-            .collect();
-
-        Ok(DistributedPlanNode {
-            node_id: agg_node_id,
-            fragment_id,
-            tuple_ids: vec![agg_tuple_id],
-            nullable_tuple_ids: vec![],
-            limit: -1,
-            execution_join_distribution: node.execution_props.join_distribution,
-            build_runtime_filters: node.build_runtime_filters.clone(),
-            probe_runtime_filters: node.probe_runtime_filters.clone(),
-            children: vec![child],
-            stats: PlanNodeStats::from_statistics(&node.stats),
-            kind: DistributedPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
-                mode: crate::sql::optimizer::operator::AggMode::Single,
-                group_by,
-                aggregates: Vec::new(),
-                is_merge: Vec::new(),
-                output_layout: AggregateOutputLayout::new(output_columns.to_vec(), Vec::new()),
-                output_columns: output_columns.to_vec(),
-            })),
-        })
-    }
 }
 
 fn distributed_node_ordering(node: &DistributedPlanNode) -> OrderingSpec {
@@ -1647,18 +1549,15 @@ mod tests {
     }
 
     #[test]
-    fn build_distributed_plan_union_distinct_synthetic_aggregate_has_no_union_cost() {
+    fn build_distributed_plan_rejects_residual_physical_union_distinct() {
         let physical = union_distinct_plan(vec![
             scan_plan_with_row_count(10.0),
             scan_plan_with_row_count(20.0),
         ]);
-        let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
-        let root = root_plan_node(&dp);
-
-        assert!(matches!(root.kind, DistributedPlanKind::HashAggregate(_)));
+        let err = build_distributed_plan(&physical).expect_err("residual UNION DISTINCT");
         assert!(
-            root.stats.cost_estimate.is_none(),
-            "synthetic distinct aggregate should not display PhysicalUnion cost"
+            err.contains("UNION DISTINCT must be rewritten by UnionDistinctToAggregate"),
+            "unexpected error: {err}"
         );
     }
 

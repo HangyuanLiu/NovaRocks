@@ -2047,10 +2047,11 @@ mod tests {
     }
 
     #[test]
-    fn union_distinct_always_decodes() {
-        // UNION DISTINCT must decode every input regardless of snapshot
-        // compatibility, because set-distinct semantics hash on the
-        // string value.
+    fn union_distinct_to_aggregate_decodes_group_keys() {
+        // UNION DISTINCT is normalized to Aggregate over UNION ALL.
+        // The dictionary rewrite should keep the aggregate grouped on
+        // the dict slot, then decode the aggregate output back to the
+        // user-facing string column.
         let scan_t1 = LogicalPlanNode::new(
             LogicalPlanKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
@@ -2081,10 +2082,14 @@ mod tests {
             vec![],
             None,
         );
+        let mut union_output = named_output_column("name");
+        // Match the first input's test ColumnId so the normalized
+        // aggregate key can materialize as the rewritten dict slot.
+        union_output.column_id = ColumnId::new_for_test(1);
         let union = LogicalPlanNode::new(
             LogicalPlanKind::Union(LogicalUnionNode {
                 all: false,
-                output_columns: vec![],
+                output_columns: vec![union_output],
             }),
             vec![scan_t1, scan_t2],
             None,
@@ -2094,17 +2099,34 @@ mod tests {
             snapshot: named_snapshot("name", true),
         }));
         let rewritten = run_pipeline_rewrite(union, &mut ctx);
-        let LogicalPlanKind::Union(union) = &rewritten.kind else {
-            panic!("expected union root, got {rewritten:?}");
+        let LogicalPlanKind::Decode(decode) = &rewritten.kind else {
+            panic!("expected decode root, got {rewritten:?}");
         };
-        assert!(!union.all);
-        for input in &rewritten.children {
-            assert!(
-                matches!(&input.kind, LogicalPlanKind::Decode(_)),
-                "UNION DISTINCT input must be wrapped in Decode, got {:?}",
-                input
-            );
-        }
+        assert_eq!(decode.mappings.len(), 1);
+        assert_eq!(decode.mappings[0].dict_column, "__nr_dict_t1_name");
+        assert_eq!(decode.mappings[0].string_column, "name");
+
+        let aggregate_plan = rewritten.unary_input();
+        let LogicalPlanKind::Aggregate(aggregate) = &aggregate_plan.kind else {
+            panic!("expected aggregate under decode, got {aggregate_plan:?}");
+        };
+        assert_eq!(aggregate.group_by.len(), 1);
+        assert_eq!(aggregate.output_columns.len(), 1);
+        assert_eq!(aggregate.output_columns[0].name, "__nr_dict_t1_name");
+        let ExprKind::ColumnRef { column, .. } = &aggregate.group_by[0].kind else {
+            panic!("expected aggregate group key to be a column ref");
+        };
+        assert_eq!(column, "__nr_dict_t1_name");
+        assert_eq!(aggregate.group_by[0].data_type, DataType::Int32);
+
+        let union_plan = aggregate_plan.unary_input();
+        let LogicalPlanKind::Union(union) = &union_plan.kind else {
+            panic!("expected union under aggregate, got {union_plan:?}");
+        };
+        assert!(
+            union.all,
+            "UNION DISTINCT must normalize to UNION ALL under Aggregate"
+        );
     }
 
     #[test]
