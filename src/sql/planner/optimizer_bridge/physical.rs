@@ -334,7 +334,7 @@ fn validate_set_op_shape(
             "Bridge 2a invalid {operator} shape: expected at least 1 child, got 0"
         ));
     }
-    if !child_output_columns.is_empty() && child_output_columns.len() != got {
+    if child_output_columns.len() != got {
         return Err(format!(
             "Bridge 2a invalid {operator} shape: child_output_columns metadata expected {got} entries, got {}",
             child_output_columns.len()
@@ -713,6 +713,22 @@ mod tests {
         let err = optimizer_physical_to_plan(&node).expect_err("set-op metadata must match");
         assert!(err.contains("PhysicalUnion"));
         assert!(err.contains("child_output_columns metadata expected 2 entries, got 1"));
+    }
+
+    #[test]
+    fn set_op_empty_child_output_metadata_is_rejected() {
+        let mut node = base_node(Operator::PhysicalUnion(UnionOp {
+            all: true,
+            output_columns: vec![output_column(1, "u")],
+            child_output_columns: vec![],
+        }));
+        node.children.push(raw_values_node());
+        node.children.push(raw_values_node());
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let err = optimizer_physical_to_plan(&node).expect_err("set-op metadata is required");
+        assert!(err.contains("PhysicalUnion"));
+        assert!(err.contains("child_output_columns metadata expected 2 entries, got 0"));
     }
 
     fn hash_join_with_runtime_filter(
