@@ -178,6 +178,34 @@ impl BridgeCtx<'_> {
                 grouping_fn_ids: op.grouping_fn_ids.clone(),
                 virtual_tuple_id: None,
             })),
+            Operator::PhysicalChangeEventExpand(op) => {
+                let events = op
+                    .events
+                    .iter()
+                    .map(|event| DistributedChangeEventSpec {
+                        predicate: event
+                            .predicate
+                            .map(|predicate| materialize(self.scalars, predicate)),
+                        branch_kind: event.branch_kind,
+                        assignments: event
+                            .assignments
+                            .iter()
+                            .map(|assignment| DistributedChangeEventOutputExpr {
+                                output_column_id: assignment.output_column_id,
+                                expr: assignment.expr.map(|expr| materialize(self.scalars, expr)),
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                Ok(PhysicalPlanKind::ChangeEventExpand(
+                    DistributedChangeEventExpandNode {
+                        events,
+                        output_columns: op.output_columns.clone(),
+                        change_op_column_id: op.change_op_column_id,
+                        data_route_column_id: op.data_route_column_id,
+                    },
+                ))
+            }
             Operator::PhysicalWindow(op) => Ok(PhysicalPlanKind::Window(PlanWindowNode {
                 window_exprs: materialize_window_exprs(
                     self.scalars,
@@ -277,6 +305,7 @@ fn validate_shape(node: &OptimizerPhysicalNode) -> Result<(), String> {
         | Operator::PhysicalAssertOneRow(_)
         | Operator::PhysicalDecode(_)
         | Operator::PhysicalRepeat(_)
+        | Operator::PhysicalChangeEventExpand(_)
         | Operator::PhysicalWindow(_)
         | Operator::PhysicalTableFunction(_)
         | Operator::PhysicalCTEProduce(_)
@@ -355,6 +384,7 @@ fn operator_name(op: &Operator) -> &'static str {
         Operator::PhysicalCTEProduce(_) => "PhysicalCTEProduce",
         Operator::PhysicalCTEConsume(_) => "PhysicalCTEConsume",
         Operator::PhysicalRepeat(_) => "PhysicalRepeat",
+        Operator::PhysicalChangeEventExpand(_) => "PhysicalChangeEventExpand",
         Operator::PhysicalUnion(_) => "PhysicalUnion",
         Operator::PhysicalIntersect(_) => "PhysicalIntersect",
         Operator::PhysicalExcept(_) => "PhysicalExcept",
@@ -493,8 +523,9 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::common::{JoinKind, OutputColumn};
+    use crate::sql::common::{ChangeStreamBranchKind, JoinKind, OutputColumn};
     use crate::sql::optimizer::operator::{
+        AggregateStateMergeOp, ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec,
         JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinEqCondition,
         PhysicalHashJoinOp, UnionOp, ValuesOp,
     };
@@ -665,6 +696,76 @@ mod tests {
             physical.children[0].kind,
             PhysicalPlanKind::Values(_)
         ));
+    }
+
+    #[test]
+    fn bridge_converts_change_event_expand() {
+        let mut arena = ScalarArena::new();
+        let predicate = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_expr(1, "matched"),
+        );
+        let assignment =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &int_expr(42));
+        let mut node = base_node(Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
+            events: vec![ChangeEventSpec {
+                predicate: Some(predicate),
+                branch_kind: ChangeStreamBranchKind::FreshData,
+                assignments: vec![ChangeEventOutputExpr {
+                    output_column_id: ColumnId::new_for_test(2),
+                    expr: Some(assignment),
+                }],
+            }],
+            output_columns: vec![output_column(2, "payload")],
+            change_op_column_id: ColumnId::new_for_test(3),
+            data_route_column_id: Some(ColumnId::new_for_test(4)),
+        }));
+        node.children.push(raw_values_node());
+        let node = attach_arena(node, Arc::new(arena));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let PhysicalPlanKind::ChangeEventExpand(expand) = physical.kind else {
+            panic!("expected ChangeEventExpand");
+        };
+        assert_eq!(physical.children.len(), 1);
+        assert!(matches!(
+            physical.children[0].kind,
+            PhysicalPlanKind::Values(_)
+        ));
+        assert_eq!(expand.events.len(), 1);
+        assert_eq!(
+            expand.events[0].branch_kind,
+            ChangeStreamBranchKind::FreshData
+        );
+        assert_eq!(expand.events[0].assignments.len(), 1);
+        assert_eq!(
+            expand.events[0].assignments[0].output_column_id,
+            ColumnId::new_for_test(2)
+        );
+        assert!(matches!(
+            expand.events[0].assignments[0]
+                .expr
+                .as_ref()
+                .expect("assignment should materialize")
+                .kind,
+            ExprKind::Literal(LiteralValue::Int(42))
+        ));
+        assert_column_ref(
+            expand.events[0]
+                .predicate
+                .as_ref()
+                .expect("predicate should materialize"),
+            1,
+            "matched",
+        );
+        assert_eq!(expand.output_columns.len(), 1);
+        assert_eq!(
+            expand.output_columns[0].column_id,
+            ColumnId::new_for_test(2)
+        );
+        assert_eq!(expand.output_columns[0].name, "payload");
+        assert_eq!(expand.change_op_column_id, ColumnId::new_for_test(3));
+        assert_eq!(expand.data_route_column_id, Some(ColumnId::new_for_test(4)));
     }
 
     #[test]
