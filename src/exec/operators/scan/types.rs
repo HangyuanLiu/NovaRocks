@@ -31,6 +31,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::runtime_filter_hub::AcquireProgress;
 use crate::runtime::runtime_filter_hub::RuntimeFilterProbe;
 use crate::runtime::runtime_state::RuntimeState;
 use std::collections::VecDeque;
@@ -231,20 +232,14 @@ impl ScanRuntimeFilterProbe {
     }
 
     pub(super) fn dependency_or_timeout(&self) -> Option<DependencyHandle> {
-        self.probe.dependency_or_timeout(true)
+        match self.poll_acquire() {
+            AcquireProgress::Pending(dep) => Some(dep),
+            AcquireProgress::Resolved(_) => None,
+        }
     }
 
-    #[allow(dead_code)]
-    pub(super) fn dependency(&self) -> DependencyHandle {
-        self.probe.dependency()
-    }
-
-    pub(super) fn snapshot(&self) -> crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot {
-        self.probe.snapshot()
-    }
-
-    pub(super) fn handle(&self) -> crate::runtime::runtime_filter_hub::RuntimeFilterHandle {
-        self.probe.handle()
+    pub(super) fn poll_acquire(&self) -> crate::runtime::runtime_filter_hub::AcquireProgress {
+        self.probe.poll_acquire(true)
     }
 
     pub(super) fn mark_ready(&self) -> Option<std::time::Duration> {
