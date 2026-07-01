@@ -7,6 +7,7 @@ use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::operator::TopNPhase;
 use crate::sql::optimizer::property::OrderingSpec;
 use crate::sql::planner::distributed_fragment::{DataPartition, DataSink, PartitionKind};
 use crate::sql::planner::distributed_node::{
@@ -314,6 +315,8 @@ impl DistributedPlanBuilderV2 {
             PhysicalPlanKind::Redistribute(redistribute) => {
                 self.visit_redistribute(node, redistribute)
             }
+            PhysicalPlanKind::Limit(limit) => self.visit_limit(node, limit),
+            PhysicalPlanKind::TopN(topn) => self.visit_topn(node, topn),
             PhysicalPlanKind::CTEAnchor(anchor) => self.visit_cte_anchor(node, anchor),
             PhysicalPlanKind::CTEProduce(_) => Err(
                 "PhysicalCTEProduce emits no DistributedPlan node outside CTEAnchor".to_string(),
@@ -373,14 +376,118 @@ impl DistributedPlanBuilderV2 {
         redistribute: &RedistributeNode,
     ) -> Result<DistributedNode, String> {
         expect_child_count(node, 1)?;
-        let parent_fragment_id = self.current_fragment_id()?;
         let child_plan = &node.children[0];
         let output_partition =
             data_partition_for_redistribute_mode(&redistribute.mode, &redistribute.output_columns)?;
         let stream_kind = stream_kind_for_redistribute_mode(&redistribute.mode);
+
+        self.emit_stream_exchange(
+            child_plan,
+            output_partition,
+            stream_kind,
+            ExchangeFlavor::Distribution,
+            -1,
+            Vec::new(),
+            None,
+            node.stats.clone(),
+        )
+    }
+
+    fn visit_limit(
+        &mut self,
+        node: &PhysicalPlanNode,
+        limit: &crate::sql::planner::plan::PlanLimitNode,
+    ) -> Result<DistributedNode, String> {
+        expect_child_count(node, 1)?;
+        let child_plan = &node.children[0];
+        let offset = limit.offset.unwrap_or(0);
+        if offset > 0 && !limit_child_can_apply_offset_locally(child_plan) {
+            return self.emit_stream_exchange(
+                child_plan,
+                DataPartition::unpartitioned(),
+                FragmentStreamKind::Gather,
+                ExchangeFlavor::LimitOffset {
+                    limit: limit.limit,
+                    offset: limit.offset,
+                },
+                limit.limit.unwrap_or(-1),
+                Vec::new(),
+                None,
+                synthetic_exchange_stats(&node.stats),
+            );
+        }
+
+        let mut child = self.visit(child_plan)?;
+        child.limit = limit.limit.unwrap_or(-1);
+        child.stats = limit_stats_with_child_cost(&node.stats, &child.stats);
+        match &mut child.payload {
+            DistributedPayload::Physical(PhysicalPlanKind::Sort(sort)) => {
+                sort.offset = limit.offset;
+            }
+            DistributedPayload::Physical(PhysicalPlanKind::TopN(topn)) => {
+                topn.limit = limit.limit;
+                topn.offset = limit.offset;
+            }
+            _ if offset > 0 => {
+                return Err(
+                    "LIMIT/OFFSET without a local SORT/TOPN child is not supported".to_string(),
+                );
+            }
+            _ => {}
+        }
+        Ok(child)
+    }
+
+    fn visit_topn(
+        &mut self,
+        node: &PhysicalPlanNode,
+        topn: &crate::sql::planner::plan::PhysicalTopNNode,
+    ) -> Result<DistributedNode, String> {
+        expect_child_count(node, 1)?;
+        let child_plan = &node.children[0];
+        match (topn.phase, topn.is_split) {
+            (TopNPhase::Final, true) => self.emit_stream_exchange(
+                child_plan,
+                DataPartition::unpartitioned(),
+                FragmentStreamKind::Gather,
+                ExchangeFlavor::TopNSplit {
+                    items: topn.items.clone(),
+                    limit: topn.limit,
+                    offset: topn.offset,
+                },
+                topn.limit.unwrap_or(-1),
+                Vec::new(),
+                None,
+                synthetic_exchange_stats(&node.stats),
+            ),
+            (TopNPhase::Final, false) | (TopNPhase::Partial, _) => {
+                let child = self.visit(child_plan)?;
+                let node_id = self.alloc_node();
+                let tuple_ids = child.tuple_ids.clone();
+                let fragment_id = self.current_fragment_id()?;
+                let mut topn_node =
+                    self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]);
+                topn_node.limit = topn.limit.unwrap_or(-1);
+                Ok(topn_node)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_stream_exchange(
+        &mut self,
+        child_plan: &PhysicalPlanNode,
+        output_partition: DataPartition,
+        stream_kind: FragmentStreamKind,
+        flavor: ExchangeFlavor,
+        limit: i64,
+        exchange_output_columns: Vec<OutputColumn>,
+        output_qualifier: Option<String>,
+        exchange_stats: crate::sql::planner::PhysicalPlanStats,
+    ) -> Result<DistributedNode, String> {
+        let parent_fragment_id = self.current_fragment_id()?;
         let partition_type = partition_type_for_data_partition(&output_partition);
         let partition_exprs = output_partition.exprs.clone();
-
         let child_fragment_id = self.alloc_fragment_id();
         self.fragment_stack.push(child_fragment_id);
         let child_result = self.visit(child_plan);
@@ -415,18 +522,18 @@ impl DistributedPlanBuilderV2 {
             fragment_id: parent_fragment_id,
             tuple_ids: child.tuple_ids.clone(),
             nullable_tuple_ids: Vec::new(),
-            limit: -1,
+            limit,
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
-            stats: node.stats.clone(),
+            stats: exchange_stats,
             payload: DistributedPayload::Exchange(ExchangeReceiver {
                 partition_type,
                 partition_exprs,
                 source_fragment_id: child_fragment_id,
-                output_columns: Vec::new(),
-                output_qualifier: None,
-                flavor: ExchangeFlavor::Distribution,
+                output_columns: exchange_output_columns,
+                output_qualifier,
+                flavor,
             }),
         })
     }
@@ -709,6 +816,26 @@ fn synthetic_exchange_stats(
     }
 }
 
+fn limit_stats_with_child_cost(
+    limit_stats: &crate::sql::planner::PhysicalPlanStats,
+    child_stats: &crate::sql::planner::PhysicalPlanStats,
+) -> crate::sql::planner::PhysicalPlanStats {
+    crate::sql::planner::PhysicalPlanStats {
+        output_row_count: limit_stats.output_row_count,
+        row_count_confidence: limit_stats.row_count_confidence,
+        column_statistics: limit_stats.column_statistics.clone(),
+        cost_estimate: child_stats.cost_estimate.clone(),
+        broadcast_decision: child_stats.broadcast_decision.clone(),
+    }
+}
+
+fn limit_child_can_apply_offset_locally(child: &PhysicalPlanNode) -> bool {
+    matches!(
+        child.kind,
+        PhysicalPlanKind::Sort(_) | PhysicalPlanKind::TopN(_)
+    )
+}
+
 fn collect_cte_exchange_nodes(node: &DistributedNode) -> Vec<(CteId, i32, Vec<ColumnId>)> {
     let mut nodes = Vec::new();
     collect_cte_exchange_nodes_inner(node, &mut nodes);
@@ -786,7 +913,9 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::codegen::{FragmentEdgeKind, FragmentStreamKind};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{AggMode, AggregateOutputLayout, JoinDistribution};
+    use crate::sql::optimizer::operator::{
+        AggMode, AggregateOutputLayout, JoinDistribution, TopNPhase,
+    };
     use crate::sql::optimizer::property::HashSource;
     use crate::sql::planner::distributed_fragment::{DataSink, PartitionKind};
     use crate::sql::planner::distributed_node::DistributedPayload;
@@ -794,10 +923,10 @@ mod tests {
         DistributedChangeEventExpandNode, ExchangeFlavor, LogicalCTEAnchorNode,
         LogicalCTEConsumeNode, LogicalCTEProduceNode, PhysicalHashAggregateNode,
         PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode,
-        PlanAssertOneRowNode, PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode,
-        PlanLimitNode, PlanProjectNode, PlanRepeatNode, PlanScanNode, PlanSortNode,
-        PlanTableFunctionNode, PlanValuesNode, PlanWindowNode, RedistributeMode, RedistributeNode,
-        WindowExpr,
+        PhysicalTopNNode, PlanAssertOneRowNode, PlanDecodeNode, PlanFilterNode,
+        PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode, PlanRepeatNode, PlanScanNode,
+        PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode, RedistributeMode,
+        RedistributeNode, WindowExpr,
     };
     use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate};
     use crate::thrift::partitions::TPartitionType;
@@ -2018,26 +2147,286 @@ mod tests {
     }
 
     #[test]
-    fn build_distributed_plan_v2_rejects_unsupported_limit_root() {
+    fn build_distributed_plan_v2_limit_offset_over_scan_creates_gather_exchange() {
         let scan = scan_node(1, "k");
         let limit = PhysicalPlanNode {
             kind: PhysicalPlanKind::Limit(PlanLimitNode {
-                limit: Some(10),
-                offset: None,
+                limit: Some(5),
+                offset: Some(2),
             }),
             children: vec![scan],
             output_columns: vec![output_col(1, "k", DataType::Int64, false)],
-            stats: stats(),
+            stats: stats_with_row_count_and_cost(5.0),
             probe_runtime_filters: vec![],
         };
 
-        let err = build_distributed_plan_v2(&limit).expect_err("Limit is not supported in M3b");
+        let dp = build_distributed_plan_v2(&limit).expect("build_distributed_plan_v2");
 
+        assert_eq!(dp.fragments.len(), 2);
+        assert_eq!(dp.edges.len(), 1);
+
+        let root_fragment = dp
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+            .expect("root fragment");
+        let exchange = &root_fragment.root;
+        let receiver = match &exchange.payload {
+            DistributedPayload::Exchange(receiver) => receiver,
+            other => panic!("expected LimitOffset Exchange root, got {other:?}"),
+        };
+        assert_eq!(exchange.limit, 5);
+        assert_eq!(exchange.stats.output_row_count, 5.0);
         assert!(
-            err.contains("PhysicalPlanKind::Limit"),
-            "unexpected error: {err}"
+            exchange.stats.cost_estimate.is_none(),
+            "synthetic LimitOffset Exchange must not inherit Limit cost"
         );
-        assert!(err.contains("does not handle"), "unexpected error: {err}");
+        assert!(
+            exchange.stats.broadcast_decision.is_none(),
+            "synthetic LimitOffset Exchange must not inherit Limit broadcast decision"
+        );
+        assert_eq!(receiver.partition_type, TPartitionType::UNPARTITIONED);
+        assert!(receiver.partition_exprs.is_empty());
+        assert!(receiver.output_columns.is_empty());
+        assert_eq!(receiver.output_qualifier, None);
+        match &receiver.flavor {
+            ExchangeFlavor::LimitOffset { limit, offset } => {
+                assert_eq!(*limit, Some(5));
+                assert_eq!(*offset, Some(2));
+            }
+            other => panic!("expected LimitOffset exchange flavor, got {other:?}"),
+        }
+
+        let edge = &dp.edges[0];
+        assert_eq!(edge.source_fragment_id, receiver.source_fragment_id);
+        assert_eq!(edge.target_fragment_id, dp.root_fragment_id);
+        assert_eq!(edge.target_exchange_node_id, exchange.node_id);
+        assert_eq!(edge.stream_kind, FragmentStreamKind::Gather);
+        assert!(matches!(edge.edge_kind, FragmentEdgeKind::Stream));
+        assert_eq!(edge.output_partition.type_, TPartitionType::UNPARTITIONED);
+        assert!(edge.output_slot_ids.is_empty());
+
+        let child_fragment = dp
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == receiver.source_fragment_id)
+            .expect("child fragment");
+        assert!(matches!(child_fragment.sink, DataSink::Noop));
+        assert!(matches!(
+            child_fragment.output_partition.kind,
+            PartitionKind::Unpartitioned
+        ));
+        assert!(matches!(
+            &child_fragment.root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
+        ));
+        assert_eq!(exchange.tuple_ids, child_fragment.root.tuple_ids);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_topn_final_split_creates_topn_exchange() {
+        let scan = scan_node(1, "k");
+        let sort_key = sort_item(column_ref_expr(1, "k", DataType::Int64, false));
+        let topn = PhysicalPlanNode {
+            kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
+                items: vec![sort_key.clone()],
+                limit: Some(10),
+                offset: Some(3),
+                phase: TopNPhase::Final,
+                is_split: true,
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats_with_row_count_and_cost(10.0),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&topn).expect("build_distributed_plan_v2");
+
+        assert_eq!(dp.fragments.len(), 2);
+        assert_eq!(dp.edges.len(), 1);
+
+        let root_fragment = dp
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+            .expect("root fragment");
+        let exchange = &root_fragment.root;
+        let receiver = match &exchange.payload {
+            DistributedPayload::Exchange(receiver) => receiver,
+            other => panic!("expected TopNSplit Exchange root, got {other:?}"),
+        };
+        assert_eq!(exchange.limit, 10);
+        assert_eq!(exchange.stats.output_row_count, 10.0);
+        assert!(
+            exchange.stats.cost_estimate.is_none(),
+            "synthetic TopNSplit Exchange must not inherit TopN cost"
+        );
+        assert!(
+            exchange.stats.broadcast_decision.is_none(),
+            "synthetic TopNSplit Exchange must not inherit TopN broadcast decision"
+        );
+        assert_eq!(receiver.partition_type, TPartitionType::UNPARTITIONED);
+        assert!(receiver.partition_exprs.is_empty());
+        assert!(receiver.output_columns.is_empty());
+        assert_eq!(receiver.output_qualifier, None);
+        match &receiver.flavor {
+            ExchangeFlavor::TopNSplit {
+                items,
+                limit,
+                offset,
+            } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].asc, sort_key.asc);
+                assert_eq!(items[0].nulls_first, sort_key.nulls_first);
+                assert_column_ref(&items[0].expr, 1, "k");
+                assert_eq!(*limit, Some(10));
+                assert_eq!(*offset, Some(3));
+            }
+            other => panic!("expected TopNSplit exchange flavor, got {other:?}"),
+        }
+
+        let edge = &dp.edges[0];
+        assert_eq!(edge.source_fragment_id, receiver.source_fragment_id);
+        assert_eq!(edge.target_fragment_id, dp.root_fragment_id);
+        assert_eq!(edge.target_exchange_node_id, exchange.node_id);
+        assert_eq!(edge.stream_kind, FragmentStreamKind::Gather);
+        assert!(matches!(edge.edge_kind, FragmentEdgeKind::Stream));
+        assert_eq!(edge.output_partition.type_, TPartitionType::UNPARTITIONED);
+
+        let child_fragment = dp
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == receiver.source_fragment_id)
+            .expect("child fragment");
+        assert!(matches!(child_fragment.sink, DataSink::Noop));
+        assert_eq!(
+            child_fragment.output_columns[0].column_id,
+            ColumnId::new_for_test(1)
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_limit_over_sort_collapses_into_local_sort() {
+        let scan = scan_node(1, "k");
+        let sort_stats = stats_with_cost();
+        let sort = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Sort(PlanSortNode {
+                items: vec![sort_item(column_ref_expr(1, "k", DataType::Int64, false))],
+                analytic_partition_by: vec![],
+                output_columns: scan.output_columns.clone(),
+                offset: None,
+                partition_limit: None,
+                topn_type: None,
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: sort_stats.clone(),
+            probe_runtime_filters: vec![],
+        };
+        let limit = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Limit(PlanLimitNode {
+                limit: Some(7),
+                offset: Some(4),
+            }),
+            children: vec![sort],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats_with_row_count(7.0),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&limit).expect("build_distributed_plan_v2");
+
+        assert_eq!(dp.fragments.len(), 1);
+        assert!(dp.edges.is_empty());
+        let root = &dp.fragments[0].root;
+        let sort = match &root.payload {
+            DistributedPayload::Physical(PhysicalPlanKind::Sort(sort)) => sort,
+            other => panic!("expected Sort root, got {other:?}"),
+        };
+        assert_eq!(root.limit, 7);
+        assert_eq!(sort.offset, Some(4));
+        assert_eq!(root.stats.output_row_count, 7.0);
+        assert_eq!(root.stats.cost_estimate, sort_stats.cost_estimate);
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![1]);
+        assert_eq!(root.children.len(), 1);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_limit_over_topn_collapses_into_local_topn() {
+        let scan = scan_node(1, "k");
+        let topn_stats = stats_with_cost();
+        let topn = PhysicalPlanNode {
+            kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
+                items: vec![sort_item(column_ref_expr(1, "k", DataType::Int64, false))],
+                limit: Some(100),
+                offset: None,
+                phase: TopNPhase::Final,
+                is_split: false,
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: topn_stats.clone(),
+            probe_runtime_filters: vec![],
+        };
+        let limit = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Limit(PlanLimitNode {
+                limit: Some(7),
+                offset: Some(4),
+            }),
+            children: vec![topn],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats_with_row_count(7.0),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&limit).expect("build_distributed_plan_v2");
+
+        assert_eq!(dp.fragments.len(), 1);
+        assert!(dp.edges.is_empty());
+        let root = &dp.fragments[0].root;
+        let topn = match &root.payload {
+            DistributedPayload::Physical(PhysicalPlanKind::TopN(topn)) => topn,
+            other => panic!("expected TopN root, got {other:?}"),
+        };
+        assert_eq!(root.limit, 7);
+        assert_eq!(topn.limit, Some(7));
+        assert_eq!(topn.offset, Some(4));
+        assert_eq!(root.stats.output_row_count, 7.0);
+        assert_eq!(root.stats.cost_estimate, topn_stats.cost_estimate);
+    }
+
+    #[test]
+    fn build_distributed_plan_v2_topn_non_split_stays_in_fragment() {
+        let scan = scan_node(1, "k");
+        let topn = PhysicalPlanNode {
+            kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
+                items: vec![sort_item(column_ref_expr(1, "k", DataType::Int64, false))],
+                limit: Some(3),
+                offset: Some(1),
+                phase: TopNPhase::Final,
+                is_split: false,
+            }),
+            children: vec![scan],
+            output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+            stats: stats_with_row_count(3.0),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan_v2(&topn).expect("build_distributed_plan_v2");
+
+        assert_eq!(dp.fragments.len(), 1);
+        assert!(dp.edges.is_empty());
+        let root = &dp.fragments[0].root;
+        assert_eq!(root.limit, 3);
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![1]);
+        assert_eq!(root.stats.output_row_count, 3.0);
+        assert!(matches!(
+            &root.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::TopN(_))
+        ));
     }
 
     #[test]
@@ -2079,11 +2468,28 @@ mod tests {
     }
 
     fn stats_with_cost() -> PhysicalPlanStats {
+        stats_with_row_count_and_cost(0.0)
+    }
+
+    fn stats_with_row_count_and_cost(output_row_count: f64) -> PhysicalPlanStats {
         PhysicalPlanStats {
+            output_row_count,
             cost_estimate: Some(PlannerCostEstimate {
                 cpu_cost: 1.0,
                 memory_cost: 2.0,
                 network_cost: 3.0,
+            }),
+            broadcast_decision: Some(crate::sql::planner::PlannerBroadcastDecision {
+                feasible: true,
+                forced: false,
+                build_bytes: 10.0,
+                hash_table_bytes: 20.0,
+                effective_backend_count: 3.0,
+                risk_adj_fanout_bytes: 30.0,
+                per_node_budget_bytes: 40.0,
+                cluster_network_budget_bytes: 50.0,
+                risk_multiplier: 1.0,
+                reject_reason: None,
             }),
             ..stats()
         }
