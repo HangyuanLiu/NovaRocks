@@ -628,6 +628,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![oc],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -664,6 +665,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![loc, roc],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -691,6 +693,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![loc, roc],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -718,6 +721,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![loc, roc],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -745,6 +749,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![loc, roc],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -772,6 +777,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![loc, roc],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -828,6 +834,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![probe_oc, build_key_oc, payload_oc],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -861,6 +868,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![loc.clone()], // exchange preserves column 1
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -883,6 +891,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![loc, roc],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -912,6 +921,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![loc.clone()],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -932,6 +942,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![loc, roc],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -960,6 +971,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![preserved_oc.clone(), outer_build_oc],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -979,6 +991,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![preserved_oc, top_build_oc],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -1005,6 +1018,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![loc.clone()], // project passes column 1 through
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -1024,6 +1038,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![loc, roc],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],

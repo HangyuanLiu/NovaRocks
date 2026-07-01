@@ -854,7 +854,7 @@ mod tests {
         use crate::sql::column_id::ColumnId;
         use crate::sql::optimizer::operator::{Operator, ValuesOp};
         use crate::sql::optimizer::physical_tree::{
-            OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
+            OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
         };
         use crate::sql::optimizer::scalar::ScalarArena;
         use crate::sql::optimizer::statistics::Statistics;
@@ -877,6 +877,7 @@ mod tests {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: OptimizerExplainStats::default(),
             output_columns: vec![output_column],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),

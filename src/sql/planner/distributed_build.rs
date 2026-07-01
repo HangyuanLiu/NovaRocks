@@ -366,6 +366,8 @@ impl<'a> DistributedPlanBuilder<'a> {
                             .other_condition
                             .map(|condition| materialize(self.scalars, condition)),
                         distribution: op.distribution.clone(),
+                        execution_mode: None,
+                        build_runtime_filters: Vec::new(),
                     })),
                 })
             }
@@ -1095,6 +1097,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             }),
             children: node.children.clone(),
             stats: node.stats.clone(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns.clone(),
             execution_props: node.execution_props.clone(),
             build_runtime_filters: node.build_runtime_filters.clone(),
@@ -1106,6 +1109,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             }),
             children: vec![union_all_node],
             stats: node.stats.clone(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns.clone(),
             execution_props: node.execution_props.clone(),
             build_runtime_filters: node.build_runtime_filters.clone(),
@@ -2131,6 +2135,7 @@ mod tests {
             op,
             children,
             stats: stats(row_count),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],

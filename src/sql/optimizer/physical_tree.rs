@@ -3,10 +3,11 @@
 use std::sync::Arc;
 
 use crate::sql::common::OutputColumn;
+use crate::sql::optimizer::cost::BroadcastDecision;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::property::PhysicalPropertySet;
 use crate::sql::optimizer::scalar::ScalarArena;
-use crate::sql::optimizer::statistics::Statistics;
+use crate::sql::optimizer::statistics::{CostEstimate, Statistics};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinExecutionDistribution {
@@ -37,12 +38,19 @@ impl Default for PlanExecutionProps {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OptimizerExplainStats {
+    pub cost_estimate: Option<CostEstimate>,
+    pub broadcast_decision: Option<BroadcastDecision>,
+}
+
 /// A node in the optimizer physical operator tree produced by `extract_best`.
 #[derive(Clone, Debug)]
 pub(crate) struct OptimizerPhysicalNode {
     pub op: Operator,
     pub children: Vec<OptimizerPhysicalNode>,
     pub stats: Statistics,
+    pub explain_stats: OptimizerExplainStats,
     pub output_columns: Vec<OutputColumn>,
     pub execution_props: PlanExecutionProps,
     /// OQ-5: build-side runtime filters produced here (hash joins only).
@@ -75,6 +83,7 @@ mod rf_field_tests {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -99,6 +108,7 @@ mod rf_field_tests {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![],
             execution_props: PlanExecutionProps {
                 output_property: crate::sql::optimizer::property::PhysicalPropertySet::broadcast(),

@@ -5587,6 +5587,8 @@ mod tests {
             }],
             other_condition: None,
             distribution: JoinDistribution::Broadcast,
+            execution_mode: None,
+            build_runtime_filters: Vec::new(),
         };
 
         let (plan_node, scope, tuple_ids) = {
@@ -5634,6 +5636,8 @@ mod tests {
             }],
             other_condition: None,
             distribution: JoinDistribution::Broadcast,
+            execution_mode: None,
+            build_runtime_filters: Vec::new(),
         };
 
         let plan_node = {
@@ -5670,6 +5674,8 @@ mod tests {
             }],
             other_condition: None,
             distribution: JoinDistribution::Broadcast,
+            execution_mode: None,
+            build_runtime_filters: Vec::new(),
         };
 
         let plan_node = {
@@ -6275,6 +6281,7 @@ mod tests {
             op,
             children,
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],

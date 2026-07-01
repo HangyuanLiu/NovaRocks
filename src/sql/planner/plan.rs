@@ -295,6 +295,8 @@ pub(crate) struct PhysicalHashJoinNode {
     pub eq_conditions: Vec<PhysicalHashJoinEqCondition>,
     pub other_condition: Option<TypedExpr>,
     pub distribution: JoinDistribution,
+    pub execution_mode: Option<crate::sql::planner::JoinExecutionMode>,
+    pub build_runtime_filters: Vec<crate::sql::planner::RuntimeFilterBuildIntent>,
 }
 
 #[allow(dead_code)]
@@ -507,7 +509,8 @@ pub(crate) struct PhysicalPlanNode {
     pub kind: PhysicalPlanKind,
     pub children: Vec<PhysicalPlanNode>,
     pub output_columns: Vec<OutputColumn>,
-    pub stats: crate::sql::planner::PlanNodeStats,
+    pub stats: crate::sql::planner::PhysicalPlanStats,
+    pub probe_runtime_filters: Vec<crate::sql::planner::RuntimeFilterProbeIntent>,
 }
 
 #[allow(dead_code)]
@@ -517,6 +520,7 @@ pub(crate) enum PhysicalPlanKind {
     Filter(PlanFilterNode),
     Project(PlanProjectNode),
     Sort(PlanSortNode),
+    Limit(PlanLimitNode),
     Values(PlanValuesNode),
     Decode(PlanDecodeNode),
     Repeat(PlanRepeatNode),
@@ -529,6 +533,9 @@ pub(crate) enum PhysicalPlanKind {
     HashJoin(Box<PhysicalHashJoinNode>),
     NestLoopJoin(PhysicalNestLoopJoinNode),
     SetOp(PhysicalSetOpNode),
+    CTEAnchor(LogicalCTEAnchorNode),
+    CTEProduce(LogicalCTEProduceNode),
+    CTEConsume(LogicalCTEConsumeNode),
     Redistribute(RedistributeNode),
 }
 
@@ -540,6 +547,7 @@ impl PhysicalPlanKind {
             "Filter",
             "Project",
             "Sort",
+            "Limit",
             "Values",
             "Decode",
             "Repeat",
@@ -552,6 +560,9 @@ impl PhysicalPlanKind {
             "HashJoin",
             "NestLoopJoin",
             "SetOp",
+            "CTEAnchor",
+            "CTEProduce",
+            "CTEConsume",
             "Redistribute",
         ]
     }

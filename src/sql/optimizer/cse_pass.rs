@@ -11,11 +11,16 @@ use arrow::datatypes::DataType;
 
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::common::OutputColumn;
+use crate::sql::optimizer::cost::{
+    CostInput, CostOptions, broadcast_decision, compute_cost_estimate,
+};
 use crate::sql::optimizer::operator::{Operator, ScalarProjectItem};
 use crate::sql::optimizer::options::OptimizerOptions;
-use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
+use crate::sql::optimizer::physical_tree::{OptimizerExplainStats, OptimizerPhysicalNode};
+use crate::sql::optimizer::property::PhysicalPropertySet;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::scalar_expr;
+use crate::sql::optimizer::statistics::Statistics;
 
 /// Stable rule name for `SET disable_optimizer_rules`.
 pub(crate) const CSE_RULE: &str = "CommonSubexpressionReuse";
@@ -32,7 +37,7 @@ pub(crate) fn rewrite(
     }
     let max_existing = max_existing_column_id(root);
     factory.reserve_until(max_existing.saturating_add(1));
-    rewrite_node(root, scalars, factory);
+    rewrite_node(root, scalars, factory, &options.cost_options);
 }
 
 fn max_existing_column_id(node: &OptimizerPhysicalNode) -> u32 {
@@ -65,22 +70,25 @@ fn rewrite_node(
     node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
+    cost_options: &CostOptions,
 ) {
     for child in &mut node.children {
-        rewrite_node(child, scalars, factory);
+        rewrite_node(child, scalars, factory, cost_options);
     }
     match &node.op {
-        Operator::PhysicalProject(_) => rewrite_project(node, scalars, factory),
-        Operator::PhysicalFilter(_) => rewrite_filter(node, scalars, factory),
-        Operator::PhysicalHashAggregate(_) => rewrite_aggregate(node, scalars, factory),
-        Operator::PhysicalHashJoin(_) | Operator::PhysicalNestLoopJoin(_) => {
-            rewrite_join(node, scalars, factory)
+        Operator::PhysicalProject(_) => rewrite_project(node, scalars, factory, cost_options),
+        Operator::PhysicalFilter(_) => rewrite_filter(node, scalars, factory, cost_options),
+        Operator::PhysicalHashAggregate(_) => {
+            rewrite_aggregate(node, scalars, factory, cost_options)
         }
-        Operator::PhysicalSort(_) => rewrite_sort(node, scalars, factory),
-        Operator::PhysicalTopN(_) => rewrite_topn(node, scalars, factory),
-        Operator::PhysicalWindow(_) => rewrite_window(node, scalars, factory),
+        Operator::PhysicalHashJoin(_) | Operator::PhysicalNestLoopJoin(_) => {
+            rewrite_join(node, scalars, factory, cost_options)
+        }
+        Operator::PhysicalSort(_) => rewrite_sort(node, scalars, factory, cost_options),
+        Operator::PhysicalTopN(_) => rewrite_topn(node, scalars, factory, cost_options),
+        Operator::PhysicalWindow(_) => rewrite_window(node, scalars, factory, cost_options),
         Operator::PhysicalChangeEventExpand(_) => {
-            rewrite_change_event_expand(node, scalars, factory)
+            rewrite_change_event_expand(node, scalars, factory, cost_options)
         }
         _ => {}
     }
@@ -769,10 +777,72 @@ fn prelude_binds_to_outputs(
         .all(|(column_id, _, _)| available.contains(&column_id))
 }
 
+fn synthetic_project_explain_stats(
+    op: &Operator,
+    stats: &Statistics,
+    child: &OptimizerPhysicalNode,
+    output_property: &PhysicalPropertySet,
+    scalars: &ScalarArena,
+    cost_options: &CostOptions,
+) -> OptimizerExplainStats {
+    let child_stats = [&child.stats];
+    let child_outputs = [&child.execution_props.output_property];
+    let cost_input = CostInput {
+        op,
+        own_stats: stats,
+        child_stats: &child_stats,
+        child_outputs: &child_outputs,
+        required_output: output_property,
+        alt_kind: &crate::sql::optimizer::derive::PropertyAlternativeKind::Default,
+        scalars: Some(scalars),
+        options: cost_options,
+    };
+    OptimizerExplainStats {
+        cost_estimate: Some(compute_cost_estimate(&cost_input).sanitized()),
+        broadcast_decision: None,
+    }
+}
+
+fn rewritten_node_explain_stats(
+    node: &OptimizerPhysicalNode,
+    scalars: &ScalarArena,
+    cost_options: &CostOptions,
+) -> OptimizerExplainStats {
+    let child_stats = node
+        .children
+        .iter()
+        .map(|child| &child.stats)
+        .collect::<Vec<_>>();
+    let child_outputs = node
+        .children
+        .iter()
+        .map(|child| &child.execution_props.output_property)
+        .collect::<Vec<_>>();
+    let cost_input = CostInput {
+        op: &node.op,
+        own_stats: &node.stats,
+        child_stats: &child_stats,
+        child_outputs: &child_outputs,
+        required_output: &node.execution_props.output_property,
+        alt_kind: &crate::sql::optimizer::derive::PropertyAlternativeKind::Default,
+        scalars: Some(scalars),
+        options: cost_options,
+    };
+    OptimizerExplainStats {
+        cost_estimate: Some(compute_cost_estimate(&cost_input).sanitized()),
+        broadcast_decision: if matches!(node.op, Operator::PhysicalHashJoin(_)) {
+            broadcast_decision(&cost_input)
+        } else {
+            None
+        },
+    }
+}
+
 fn wrap_project_around_child(
     child: &mut OptimizerPhysicalNode,
     prelude: Vec<ScalarProjectItem>,
     scalars: &mut ScalarArena,
+    cost_options: &CostOptions,
 ) {
     let original = child.clone();
     let available = available_output_ids(&original);
@@ -813,15 +883,27 @@ fn wrap_project_around_child(
             .iter()
             .map(|item| output_column_for_project_item(scalars, item)),
     );
+    let op = Operator::PhysicalProject(crate::sql::optimizer::operator::ProjectOp {
+        items,
+        output_qualifier: None,
+    });
+    let stats = original.stats.clone();
+    let execution_props = original.execution_props.clone();
+    let explain_stats = synthetic_project_explain_stats(
+        &op,
+        &stats,
+        &original,
+        &execution_props.output_property,
+        scalars,
+        cost_options,
+    );
 
     *child = OptimizerPhysicalNode {
-        op: Operator::PhysicalProject(crate::sql::optimizer::operator::ProjectOp {
-            items,
-            output_qualifier: None,
-        }),
-        stats: original.stats.clone(),
+        op,
+        stats,
+        explain_stats,
         output_columns,
-        execution_props: original.execution_props.clone(),
+        execution_props,
         children: vec![original],
         build_runtime_filters: vec![],
         probe_runtime_filters: vec![],
@@ -832,6 +914,7 @@ fn insert_or_reuse_project_below(
     child: &mut OptimizerPhysicalNode,
     prelude: Vec<ScalarProjectItem>,
     scalars: &mut ScalarArena,
+    cost_options: &CostOptions,
 ) {
     if prelude.is_empty() {
         return;
@@ -851,11 +934,19 @@ fn insert_or_reuse_project_below(
                     .map(|item| output_column_for_project_item(scalars, item)),
             );
             project.items.extend(prelude);
-            return;
         }
+        child.explain_stats = synthetic_project_explain_stats(
+            &child.op,
+            &child.stats,
+            &child.children[0],
+            &child.execution_props.output_property,
+            scalars,
+            cost_options,
+        );
+        return;
     }
 
-    wrap_project_around_child(child, prelude, scalars);
+    wrap_project_around_child(child, prelude, scalars, cost_options);
 }
 
 fn output_column_set(node: &OptimizerPhysicalNode) -> HashSet<ColumnId> {
@@ -879,6 +970,7 @@ fn rewrite_project(
     node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
+    cost_options: &CostOptions,
 ) {
     let Operator::PhysicalProject(project) = &node.op else {
         return;
@@ -960,26 +1052,40 @@ fn rewrite_project(
         is_internal: true,
     }));
     child_project_items.extend(prelude);
+    let op = Operator::PhysicalProject(crate::sql::optimizer::operator::ProjectOp {
+        items: child_project_items,
+        output_qualifier: None,
+    });
+    let stats = child.stats.clone();
+    let execution_props = child.execution_props.clone();
+    let explain_stats = synthetic_project_explain_stats(
+        &op,
+        &stats,
+        &child,
+        &execution_props.output_property,
+        scalars,
+        cost_options,
+    );
 
     let cse_project = OptimizerPhysicalNode {
-        op: Operator::PhysicalProject(crate::sql::optimizer::operator::ProjectOp {
-            items: child_project_items,
-            output_qualifier: None,
-        }),
-        stats: child.stats.clone(),
+        op,
+        stats,
+        explain_stats,
         output_columns: child_project_output_columns,
-        execution_props: child.execution_props.clone(),
+        execution_props,
         children: vec![child],
         build_runtime_filters: vec![],
         probe_runtime_filters: vec![],
     };
     node.children.push(cse_project);
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_filter(
     node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
+    cost_options: &CostOptions,
 ) {
     let Operator::PhysicalFilter(filter) = &node.op else {
         return;
@@ -998,13 +1104,15 @@ fn rewrite_filter(
         unreachable!("checked filter operator above");
     };
     filter.predicate = substitute(scalars, filter.predicate, &subst);
-    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_aggregate(
     node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
+    cost_options: &CostOptions,
 ) {
     if node.children.len() != 1 {
         return;
@@ -1044,13 +1152,15 @@ fn rewrite_aggregate(
             key.expr = substitute(scalars, key.expr, &subst);
         }
     }
-    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_join(
     node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
+    cost_options: &CostOptions,
 ) {
     if node.children.len() != 2 {
         return;
@@ -1087,12 +1197,12 @@ fn rewrite_join(
     if !left_commons.is_empty() {
         let (prelude, side_subst) = build_commons(scalars, factory, &left_commons);
         subst.extend(side_subst);
-        insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+        insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
     }
     if !right_commons.is_empty() {
         let (prelude, side_subst) = build_commons(scalars, factory, &right_commons);
         subst.extend(side_subst);
-        insert_or_reuse_project_below(&mut node.children[1], prelude, scalars);
+        insert_or_reuse_project_below(&mut node.children[1], prelude, scalars, cost_options);
     }
     let new_condition = substitute(scalars, condition, &subst);
     match &mut node.op {
@@ -1100,12 +1210,14 @@ fn rewrite_join(
         Operator::PhysicalNestLoopJoin(join) => join.condition = Some(new_condition),
         _ => unreachable!("checked join operator above"),
     }
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_sort(
     node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
+    cost_options: &CostOptions,
 ) {
     if node.children.len() != 1 {
         return;
@@ -1130,13 +1242,15 @@ fn rewrite_sort(
     for expr in &mut sort.analytic_partition_exprs {
         *expr = substitute(scalars, *expr, &subst);
     }
-    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_topn(
     node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
+    cost_options: &CostOptions,
 ) {
     if node.children.len() != 1 {
         return;
@@ -1157,13 +1271,15 @@ fn rewrite_topn(
     for key in &mut topn.items {
         key.expr = substitute(scalars, key.expr, &subst);
     }
-    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_window(
     node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
+    cost_options: &CostOptions,
 ) {
     if node.children.len() != 1 {
         return;
@@ -1197,13 +1313,15 @@ fn rewrite_window(
             key.expr = substitute(scalars, key.expr, &subst);
         }
     }
-    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
 }
 
 fn rewrite_change_event_expand(
     node: &mut OptimizerPhysicalNode,
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
+    cost_options: &CostOptions,
 ) {
     if node.children.len() != 1 {
         return;
@@ -1240,7 +1358,7 @@ fn rewrite_change_event_expand(
             }
         }
     }
-    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
 }
 
 #[cfg(test)]
@@ -1257,12 +1375,14 @@ mod tests {
         PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp, ScalarAggregateSpec,
         ScalarProjectItem, ScalarWindowSpec, SortOp, TopNOp, TopNPhase, ValuesOp, WindowOp,
     };
-    use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+    use crate::sql::optimizer::physical_tree::{
+        OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
+    };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::{
         HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey,
     };
-    use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::optimizer::statistics::{CostEstimate, Statistics};
 
     use super::pick_commons;
 
@@ -1388,6 +1508,7 @@ mod tests {
             }),
             children: vec![],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: columns,
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -1685,6 +1806,7 @@ mod tests {
                 output_row_count: 42.0,
                 ..Statistics::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![
                 output_column(101, "a"),
                 output_column(102, "b"),
@@ -1710,13 +1832,19 @@ mod tests {
                 output_row_count: 7.0,
                 ..Statistics::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(110, "x"), output_column(111, "y")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(project) = &node.op else {
             panic!("expected physical project");
@@ -1781,6 +1909,7 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(10, "stale")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -1820,6 +1949,7 @@ mod tests {
             }),
             children: vec![values],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(1, "a"), output_column(2, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -1862,6 +1992,7 @@ mod tests {
             }),
             children: vec![values],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(1, "a"), output_column(2, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -1877,6 +2008,7 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(3, "x"), output_column(4, "y")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -1943,6 +2075,7 @@ mod tests {
             }),
             children: vec![],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![
                 output_column(101, "a"),
                 output_column(102, "b"),
@@ -1963,6 +2096,7 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![
                 output_column(110, "x"),
                 output_column(111, "y"),
@@ -1973,7 +2107,12 @@ mod tests {
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         assert_eq!(
             node.children[0]
@@ -2003,6 +2142,7 @@ mod tests {
                 output_row_count: 42.0,
                 ..Statistics::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -2014,13 +2154,19 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::insert_or_reuse_project_below(&mut parent.children[0], prelude, &mut arena);
+        super::insert_or_reuse_project_below(
+            &mut parent.children[0],
+            prelude,
+            &mut arena,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(project) = &parent.children[0].op else {
             panic!("expected inserted physical project");
@@ -2059,7 +2205,11 @@ mod tests {
                 columns: vec![output_column(101, "a"), output_column(102, "b")],
             }),
             children: vec![],
-            stats: Statistics::default(),
+            stats: Statistics {
+                output_row_count: 128.0,
+                ..Statistics::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -2071,6 +2221,7 @@ mod tests {
             }),
             children: vec![values],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![
                 output_column(101, "a"),
                 output_column(102, "b"),
@@ -2081,7 +2232,12 @@ mod tests {
             probe_runtime_filters: vec![],
         };
 
-        super::insert_or_reuse_project_below(&mut stale_filter, prelude, &mut arena);
+        super::insert_or_reuse_project_below(
+            &mut stale_filter,
+            prelude,
+            &mut arena,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(project) = &stale_filter.op else {
             panic!("expected inserted physical project");
@@ -2126,14 +2282,23 @@ mod tests {
                 grouping_fn_ids: vec![("__grouping_fn_0".to_string(), ColumnId(109))],
             }),
             children: vec![values],
-            stats: Statistics::default(),
+            stats: Statistics {
+                output_row_count: 128.0,
+                ..Statistics::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::insert_or_reuse_project_below(&mut repeat, prelude, &mut arena);
+        super::insert_or_reuse_project_below(
+            &mut repeat,
+            prelude,
+            &mut arena,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(project) = &repeat.op else {
             panic!("expected inserted project above repeat");
@@ -2190,6 +2355,7 @@ mod tests {
             }),
             children: vec![],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -2202,13 +2368,19 @@ mod tests {
             }),
             children: vec![values],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(201, "x"), output_column(202, "y")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::insert_or_reuse_project_below(&mut child_project, prelude, &mut arena);
+        super::insert_or_reuse_project_below(
+            &mut child_project,
+            prelude,
+            &mut arena,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(outer_project) = &child_project.op else {
             panic!("expected outer wrapper project");
@@ -2257,6 +2429,7 @@ mod tests {
             }),
             children: vec![],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -2269,13 +2442,19 @@ mod tests {
             }),
             children: vec![values],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::insert_or_reuse_project_below(&mut child_project, prelude, &mut arena);
+        super::insert_or_reuse_project_below(
+            &mut child_project,
+            prelude,
+            &mut arena,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(project) = &child_project.op else {
             panic!("expected reused physical project");
@@ -2299,6 +2478,15 @@ mod tests {
                 .map(|column| (column.name.as_str(), column.is_internal))
                 .collect::<Vec<_>>(),
             vec![("a", false), ("b", false), ("__cse_0", true)]
+        );
+        let estimate = child_project
+            .explain_stats
+            .cost_estimate
+            .as_ref()
+            .expect("reused CSE project should refresh explain self cost");
+        assert!(
+            estimate.cpu_cost > 0.0 || estimate.memory_cost > 0.0,
+            "reused CSE project explain cost should be non-zero, got {estimate:?}"
         );
         let cse_expr = project
             .items
@@ -2326,13 +2514,22 @@ mod tests {
         let lower = gt(&mut arena, a_plus_b, ten);
         let upper = lt(&mut arena, a_plus_b, twenty);
         let predicate = and(&mut arena, lower, upper);
+        let stale_filter_estimate = CostEstimate {
+            cpu_cost: 1.0,
+            memory_cost: 2.0,
+            network_cost: 3.0,
+        };
         let child = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![output_column(101, "a"), output_column(102, "b")],
             }),
             children: vec![],
-            stats: Statistics::default(),
+            stats: Statistics {
+                output_row_count: 128.0,
+                ..Statistics::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -2341,14 +2538,26 @@ mod tests {
         let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalFilter(FilterOp { predicate }),
             children: vec![child],
-            stats: Statistics::default(),
+            stats: Statistics {
+                output_row_count: 64.0,
+                ..Statistics::default()
+            },
+            explain_stats: OptimizerExplainStats {
+                cost_estimate: Some(stale_filter_estimate.clone()),
+                broadcast_decision: None,
+            },
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project");
@@ -2390,6 +2599,84 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
+        let estimate = node
+            .explain_stats
+            .cost_estimate
+            .as_ref()
+            .expect("rewritten filter should refresh explain self cost");
+        assert!(
+            estimate.cpu_cost != stale_filter_estimate.cpu_cost
+                || estimate.memory_cost != stale_filter_estimate.memory_cost
+                || estimate.network_cost != stale_filter_estimate.network_cost,
+            "rewritten filter explain cost should not keep stale estimate {estimate:?}"
+        );
+        assert!(
+            estimate.cpu_cost > 0.0 || estimate.memory_cost > 0.0,
+            "rewritten filter explain cost should be non-zero, got {estimate:?}"
+        );
+    }
+
+    #[test]
+    fn cse_inserted_project_freezes_explain_self_cost() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_plus_b = add(&mut arena, a, b);
+        let ten = int_lit(&mut arena, 10);
+        let twenty = int_lit(&mut arena, 20);
+        let lower = gt(&mut arena, a_plus_b, ten);
+        let upper = lt(&mut arena, a_plus_b, twenty);
+        let predicate = and(&mut arena, lower, upper);
+        let child = OptimizerPhysicalNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![output_column(101, "a"), output_column(102, "b")],
+            }),
+            children: vec![],
+            stats: Statistics {
+                output_row_count: 128.0,
+                ..Statistics::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let mut node = OptimizerPhysicalNode {
+            op: Operator::PhysicalFilter(FilterOp { predicate }),
+            children: vec![child],
+            stats: Statistics {
+                output_row_count: 64.0,
+                ..Statistics::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::options::OptimizerOptions::default_settings(),
+        );
+
+        let Operator::PhysicalProject(_) = &node.children[0].op else {
+            panic!("expected inserted CSE project");
+        };
+        let estimate = node.children[0]
+            .explain_stats
+            .cost_estimate
+            .as_ref()
+            .expect("CSE project should freeze explain self cost");
+        assert!(
+            estimate.cpu_cost > 0.0 || estimate.memory_cost > 0.0,
+            "CSE project explain cost should be non-zero, got {estimate:?}"
+        );
     }
 
     #[test]
@@ -2413,6 +2700,7 @@ mod tests {
             }),
             children: vec![],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -2425,6 +2713,7 @@ mod tests {
             }),
             children: vec![values],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(201, "x"), output_column(202, "y")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -2434,13 +2723,19 @@ mod tests {
             op: Operator::PhysicalFilter(FilterOp { predicate }),
             children: vec![project],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(201, "x"), output_column(202, "y")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(outer_project) = &node.children[0].op else {
             panic!("expected outer CSE project");
@@ -2540,13 +2835,19 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project below aggregate");
@@ -2595,6 +2896,7 @@ mod tests {
             }),
             children: vec![values],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -2606,6 +2908,7 @@ mod tests {
             }),
             children: vec![repeat],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -2643,13 +2946,19 @@ mod tests {
             }),
             children: vec![distribution],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project below aggregate");
@@ -2712,13 +3021,19 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
         let Operator::PhysicalHashAggregate(aggregate) = &node.op else {
@@ -2772,6 +3087,7 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![
                 output_column(201, "ordered_a"),
                 output_column(202, "ordered_b"),
@@ -2781,7 +3097,12 @@ mod tests {
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project below aggregate");
@@ -2822,13 +3143,19 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project below sort");
@@ -2870,13 +3197,19 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project below topn");
@@ -2922,6 +3255,7 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![
                 output_column(101, "a"),
                 output_column(102, "b"),
@@ -2932,7 +3266,12 @@ mod tests {
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project below window");
@@ -2983,13 +3322,19 @@ mod tests {
             }),
             children: vec![left, right],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "left_a"), output_column(201, "right_b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         let Operator::PhysicalProject(left_project) = &node.children[0].op else {
             panic!("expected CSE project on left child");
@@ -3053,6 +3398,7 @@ mod tests {
             }),
             children: vec![left, right],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![
                 output_column(101, "left_a"),
                 output_column(201, "right_b"),
@@ -3063,7 +3409,12 @@ mod tests {
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
         let Operator::PhysicalProject(right_project) = &node.children[1].op else {
@@ -3116,13 +3467,19 @@ mod tests {
             }),
             children: vec![left, right],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "left_a"), output_column(201, "right_b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
         assert!(matches!(node.children[1].op, Operator::PhysicalValues(_)));
@@ -3153,13 +3510,19 @@ mod tests {
             }),
             children: vec![left, right],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "shared")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
         assert!(matches!(node.children[1].op, Operator::PhysicalValues(_)));
@@ -3215,13 +3578,19 @@ mod tests {
             }),
             children: vec![left, right],
             stats: Statistics::default(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "left_a"), output_column(201, "right_b")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
 
-        super::rewrite_node(&mut node, &mut arena, &mut factory);
+        super::rewrite_node(
+            &mut node,
+            &mut arena,
+            &mut factory,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
 
         assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
         assert!(matches!(node.children[1].op, Operator::PhysicalValues(_)));

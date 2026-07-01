@@ -2377,6 +2377,7 @@ mod tests {
                 output_row_count: 3.0,
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],

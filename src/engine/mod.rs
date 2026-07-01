@@ -3030,6 +3030,7 @@ fn project_direct_local_columns(
         }),
         children: vec![child],
         stats: template.stats.clone(),
+        explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
         output_columns: target_columns.to_vec(),
         execution_props: template.execution_props.clone(),
         build_runtime_filters: template.build_runtime_filters.clone(),
@@ -5602,6 +5603,8 @@ path = "{metadata_path}"
                 }),
                 children: Vec::new(),
                 stats: stats(),
+                explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(
+                ),
                 output_columns: Vec::new(),
                 execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(
                 ),
@@ -5617,6 +5620,8 @@ path = "{metadata_path}"
                 }),
                 children: vec![values_node()],
                 stats: stats(),
+                explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(
+                ),
                 output_columns: Vec::new(),
                 execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(
                 ),
@@ -5638,6 +5643,7 @@ path = "{metadata_path}"
             }),
             children: vec![distributed_values_node(), distributed_values_node()],
             stats: stats(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: Vec::new(),
             execution_props: PlanExecutionProps {
                 join_distribution: Some(JoinExecutionDistribution::Partitioned),
@@ -5721,6 +5727,7 @@ path = "{metadata_path}"
             }),
             children: Vec::new(),
             stats: stats(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![produced.clone()],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
@@ -5733,6 +5740,7 @@ path = "{metadata_path}"
             }),
             children: vec![values],
             stats: stats(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![produced],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
@@ -5747,6 +5755,7 @@ path = "{metadata_path}"
             }),
             children: Vec::new(),
             stats: stats(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![consumed.clone()],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
@@ -5756,6 +5765,7 @@ path = "{metadata_path}"
             op: Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id: 7 }),
             children: vec![produce, consume],
             stats: stats(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![consumed.clone()],
             execution_props: PlanExecutionProps {
                 scalar_arena: Some(std::sync::Arc::new(
@@ -5813,6 +5823,7 @@ path = "{metadata_path}"
             }),
             children: Vec::new(),
             stats: stats(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![column.clone()],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
@@ -5825,6 +5836,7 @@ path = "{metadata_path}"
             }),
             children: vec![values],
             stats: stats(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![column.clone()],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
@@ -5839,6 +5851,7 @@ path = "{metadata_path}"
             }),
             children: Vec::new(),
             stats: stats(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![column.clone()],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
@@ -5848,6 +5861,7 @@ path = "{metadata_path}"
             op: Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id: 7 }),
             children: vec![produce, consume],
             stats: stats(),
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![column],
             execution_props: PlanExecutionProps {
                 scalar_arena: Some(std::sync::Arc::new(
@@ -10337,6 +10351,7 @@ path = "meta/operations.sqlite"
                 column_statistics: Default::default(),
                 ..Default::default()
             },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),

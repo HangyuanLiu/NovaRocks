@@ -14125,6 +14125,7 @@ fn add_imv_data_route_project(
         }),
         children: vec![child],
         stats,
+        explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
         output_columns,
         execution_props: PlanExecutionProps {
             output_property: output_property.clone(),

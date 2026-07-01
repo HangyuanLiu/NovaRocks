@@ -7,7 +7,9 @@ use std::collections::HashMap;
 
 use super::memo::{GroupId, Memo};
 use super::operator::{JoinDistribution, Operator, PhysicalDistributionOp, ProjectOp, SortOp};
-use super::physical_tree::{JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps};
+use super::physical_tree::{
+    JoinExecutionDistribution, OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
+};
 use super::property::{OrderingSpec, PhysicalPropertySet};
 use super::search::{EnforcerKind, Winner};
 use crate::sql::common::OutputColumn;
@@ -120,6 +122,10 @@ pub(crate) fn extract_best(
         op,
         children,
         stats: group_stats.clone(),
+        explain_stats: OptimizerExplainStats {
+            cost_estimate: Some(winner.operator_cost_estimate.clone()),
+            broadcast_decision: winner.operator_broadcast_decision,
+        },
         output_columns: output_columns.clone(),
         execution_props: PlanExecutionProps {
             output_property: inner_output_property.clone(),
@@ -156,6 +162,10 @@ pub(crate) fn extract_best(
             op: enforcer_op,
             children: vec![inner_node],
             stats: group_stats,
+            explain_stats: OptimizerExplainStats {
+                cost_estimate: winner.enforcer_cost_estimate.clone(),
+                broadcast_decision: None,
+            },
             output_columns,
             execution_props: PlanExecutionProps {
                 output_property: required.clone(),
@@ -885,6 +895,45 @@ mod tests {
         assert_eq!(
             plan.children[0].execution_props.output_property,
             pre_enforcer_output
+        );
+    }
+
+    #[test]
+    fn extract_freezes_inner_and_enforcer_explain_stats_from_winner() {
+        let (mut memo, root, mut winners, required, _) = make_enforced_limit_winner_for_test();
+        let winner = winners
+            .get_mut(&(root, required.clone()))
+            .expect("fixture should record root winner");
+        winner.operator_cost_estimate = crate::sql::optimizer::statistics::CostEstimate {
+            cpu_cost: 11.0,
+            memory_cost: 2.0,
+            network_cost: 0.0,
+        };
+        winner.enforcer_cost_estimate = Some(crate::sql::optimizer::statistics::CostEstimate {
+            cpu_cost: 0.0,
+            memory_cost: 0.0,
+            network_cost: 7.0,
+        });
+
+        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+
+        assert_eq!(
+            plan.explain_stats
+                .cost_estimate
+                .as_ref()
+                .expect("enforcer explain cost")
+                .network_cost,
+            7.0
+        );
+        assert!(plan.explain_stats.broadcast_decision.is_none());
+        assert_eq!(
+            plan.children[0]
+                .explain_stats
+                .cost_estimate
+                .as_ref()
+                .expect("inner explain cost")
+                .cpu_cost,
+            11.0
         );
     }
 
