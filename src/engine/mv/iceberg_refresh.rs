@@ -11,6 +11,7 @@ use iceberg::TableIdent;
 use iceberg::spec::DataFile;
 #[cfg(test)]
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::transaction::ApplyTransactionAction;
 use serde::{Deserialize, Serialize};
 
 use crate::common::engine_error::EngineError;
@@ -73,7 +74,7 @@ use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvDependencyObjectType,
     MvDependencyStorageEngine, MvRefreshFinalizeRequest, MvRefreshState,
     RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
-    ReplaceMvPartitionStatesRequest, StoredMvDefinition, StoredMvRefresh,
+    ReplaceMvPartitionStatesRequest, StoredMvDefinition, StoredMvRefresh, StoredMvRefreshPolicy,
     UpdateMvPartitionContractRequest,
 };
 use crate::meta::repository::mv_contract::MvPartitionContract;
@@ -1292,6 +1293,90 @@ fn refresh_policy_descriptor_json(
             })
         }
     }
+}
+
+fn stored_refresh_policy_descriptor_json(
+    policy: &StoredMvRefreshPolicy,
+    paused: bool,
+    interval_ms: Option<i64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "policy": policy.as_sql_str(),
+        "interval_ms": interval_ms,
+        "paused": paused,
+    })
+}
+
+pub(crate) fn sync_iceberg_mv_descriptor_refresh_contract(
+    state: &Arc<StandaloneState>,
+    definition: &StoredMvDefinition,
+    refresh_policy: &StoredMvRefreshPolicy,
+    refresh_paused: bool,
+    refresh_interval_ms: Option<i64>,
+) -> Result<(), String> {
+    if definition.storage_engine != StarRocksMvStorageEngine::Iceberg.as_sql_str() {
+        return Ok(());
+    }
+    let catalog_name = definition
+        .target_catalog
+        .as_deref()
+        .ok_or_else(|| "Iceberg MV descriptor sync missing target catalog".to_string())?;
+    let namespace = definition
+        .target_namespace
+        .as_deref()
+        .ok_or_else(|| "Iceberg MV descriptor sync missing target namespace".to_string())?;
+    let storage_table = definition
+        .target_table
+        .as_deref()
+        .ok_or_else(|| "Iceberg MV descriptor sync missing target table".to_string())?;
+    let entry = {
+        let catalogs = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        catalogs.get(catalog_name)?
+    };
+    entry.invalidate_table_cache(namespace, storage_table);
+    let loaded =
+        crate::connector::iceberg::catalog::registry::load_table(&entry, namespace, storage_table)?;
+    let mut descriptor =
+        MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())?;
+    descriptor.refresh_contract = Some(stored_refresh_policy_descriptor_json(
+        refresh_policy,
+        refresh_paused,
+        refresh_interval_ms,
+    ));
+    let descriptor_properties = descriptor.to_storage_properties()?;
+    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
+    let tx = iceberg::transaction::Transaction::new(&loaded.table);
+    let mut action = tx.update_table_properties();
+    for (key, value) in descriptor_properties {
+        action = action.set(key, value);
+    }
+    let tx = action
+        .apply(tx)
+        .map_err(|e| format!("apply MV descriptor property update failed: {e}"))?;
+    crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
+        tx.commit(catalog.as_ref()).await
+    })
+    .map_err(|e| format!("sync MV descriptor properties runtime failed: {e}"))?
+    .map_err(|e| format!("sync MV descriptor properties failed: {e}"))?;
+    entry.invalidate_table_cache(namespace, storage_table);
+    Ok(())
+}
+
+fn sync_iceberg_mv_descriptor_for_target(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+) -> Result<(), String> {
+    let definition = load_iceberg_mv_definition_by_target(state, target)?;
+    sync_iceberg_mv_descriptor_refresh_contract(
+        state,
+        &definition,
+        &definition.refresh_policy,
+        definition.refresh_paused,
+        definition.refresh_interval_ms,
+    )
 }
 
 /// Peel any top-level `BranchScoped` wrapper, returning the per-row inner
@@ -3250,6 +3335,8 @@ pub(crate) fn repartition_iceberg_mv(
             repartition_restore,
         );
         result.map_err(IcebergMvRefreshExecutionError::into_message)?;
+        sync_iceberg_mv_descriptor_for_target(state, &target)
+            .map_err(|e| format!("sync Iceberg MV descriptor after repartition failed: {e}"))?;
         register_iceberg_mv_target_in_catalog(state, &target)?;
         return Ok(StatementResult::Ok);
     }
@@ -3282,6 +3369,8 @@ pub(crate) fn repartition_iceberg_mv(
         Some(repartition_restore),
     );
     result.map_err(IcebergMvRefreshExecutionError::into_message)?;
+    sync_iceberg_mv_descriptor_for_target(state, &target)
+        .map_err(|e| format!("sync Iceberg MV descriptor after repartition failed: {e}"))?;
     register_iceberg_mv_target_in_catalog(state, &target)?;
     Ok(StatementResult::Ok)
 }
@@ -18683,6 +18772,68 @@ mod tests {
     }
 
     #[test]
+    fn alter_iceberg_mv_refresh_metadata_updates_descriptor_refresh_contract() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+
+        let set_refresh = parse_alter_mv(
+            "ALTER MATERIALIZED VIEW mv_orders SET REFRESH ASYNC EVERY INTERVAL 2 HOURS",
+        );
+        crate::engine::mv_flow::alter_mv(&env.state, Some("ice"), &env.current_db, &set_refresh)
+            .expect("alter refresh policy");
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let loaded = crate::connector::iceberg::catalog::load_table(
+            &entry,
+            "analytics",
+            "__nr_mv_mv_orders",
+        )
+        .expect("load storage table after alter");
+        let descriptor =
+            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
+                .expect("descriptor after alter");
+        assert_eq!(
+            descriptor.refresh_contract,
+            Some(serde_json::json!({
+                "policy": "ASYNC_INTERVAL",
+                "interval_ms": 7_200_000,
+                "paused": false,
+            }))
+        );
+
+        let pause = parse_alter_mv("ALTER MATERIALIZED VIEW mv_orders PAUSE REFRESH");
+        crate::engine::mv_flow::alter_mv(&env.state, Some("ice"), &env.current_db, &pause)
+            .expect("pause refresh");
+        let loaded = crate::connector::iceberg::catalog::load_table(
+            &entry,
+            "analytics",
+            "__nr_mv_mv_orders",
+        )
+        .expect("load storage table after pause");
+        let descriptor =
+            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
+                .expect("descriptor after pause");
+        assert_eq!(
+            descriptor.refresh_contract,
+            Some(serde_json::json!({
+                "policy": "ASYNC_INTERVAL",
+                "interval_ms": 7_200_000,
+                "paused": true,
+            }))
+        );
+    }
+
+    #[test]
     fn create_iceberg_mv_creates_partitioned_target_from_partition_by() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
@@ -18807,6 +18958,19 @@ mod tests {
         assert_eq!(
             spec.fields()[0].transform,
             iceberg::spec::Transform::Truncate(2)
+        );
+        let descriptor =
+            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
+                .expect("descriptor after repartition");
+        assert_eq!(descriptor.public_view, "analytics.mv_orders");
+        assert_eq!(descriptor.storage_table, "analytics.__nr_mv_mv_orders");
+        assert_eq!(
+            descriptor.refresh_contract,
+            Some(serde_json::json!({
+                "policy": "DEFERRED_MANUAL",
+                "interval_ms": null,
+                "paused": false,
+            }))
         );
 
         let definition =
