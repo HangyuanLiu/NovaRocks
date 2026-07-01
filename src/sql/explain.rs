@@ -268,9 +268,20 @@ pub(crate) fn format_shared_plan_node_header(
                 .as_deref()
                 .map(|a| format!(" (alias={a})"))
                 .unwrap_or_default();
+            let dict = if node.dict_columns.is_empty() {
+                String::new()
+            } else {
+                let mut cols: Vec<&str> = node
+                    .dict_columns
+                    .iter()
+                    .map(|d| d.source_column.as_str())
+                    .collect();
+                cols.sort_unstable();
+                format!(" dict=[{}]", cols.join(", "))
+            };
             Some(format!(
-                "SCAN {}.{}{}",
-                node.database, node.table.name, alias
+                "SCAN {}.{}{}{}",
+                node.database, node.table.name, alias, dict
             ))
         }
         LogicalPlanKind::Filter(_) => Some("FILTER".to_string()),
@@ -650,6 +661,84 @@ mod tests {
             data_type: DataType::Int64,
             nullable: false,
         }
+    }
+
+    #[test]
+    fn logical_explain_prints_aggregate_state_merge_evidence() {
+        let plan = LogicalPlanNode::new(
+            LogicalPlanKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+                group_key_names: vec!["region".to_string()],
+                aggregate_state_names: vec!["c".to_string()],
+                change_op_column: "__change_op".to_string(),
+                output_columns: vec![],
+            }),
+            vec![empty_values_for_test(), empty_values_for_test()],
+            None,
+        );
+
+        let text = explain_plan(&plan, ExplainLevel::Normal).join("\n");
+
+        assert!(text.contains("AggregateStateMerge"), "{text}");
+        assert!(text.contains("keys=[region]"), "{text}");
+        assert!(text.contains("states=[c]"), "{text}");
+    }
+
+    fn dict_snapshot_for_test() -> std::sync::Arc<crate::sql::common::DictionarySnapshot> {
+        use crate::engine::dictionary::model::{
+            DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue,
+            DictionaryWatermark,
+        };
+        std::sync::Arc::new(DictionarySnapshot {
+            dictionary_id: 1,
+            owner: DictionaryOwner::StarRocksTable {
+                database: "db".to_string(),
+                table: "t".to_string(),
+                db_id: 1,
+                table_id: 2,
+            },
+            column_id: Some(10),
+            column_name: "s".to_string(),
+            data_type: DataType::Utf8,
+            version: 1,
+            watermark: DictionaryWatermark::Iceberg {
+                snapshot_id: None,
+                schema_id: 0,
+            },
+            values: vec![DictionaryValue {
+                id: 1,
+                bytes: b"a".to_vec(),
+            }],
+            null_id: 0,
+            state: DictionaryState::Active,
+            order_preserving: true,
+        })
+    }
+
+    #[test]
+    fn logical_explain_scan_shows_dict_encoded_columns() {
+        use crate::sql::common::ScanDictionaryColumn;
+        let scan = LogicalPlanNode::new(
+            LogicalPlanKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: test_table_def(),
+                alias: None,
+                columns: vec![output_column(1, "s", DataType::Utf8, false)],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![ScanDictionaryColumn {
+                    source_column: "s".to_string(),
+                    dict_column: "__nr_dict_t_s".to_string(),
+                    dictionary: dict_snapshot_for_test(),
+                }],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            None,
+        );
+        let text = explain_plan(&scan, ExplainLevel::Normal).join("\n");
+        assert!(text.contains("SCAN db.t"), "{text}");
+        assert!(text.contains("dict=[s]"), "{text}");
     }
 
     #[test]
