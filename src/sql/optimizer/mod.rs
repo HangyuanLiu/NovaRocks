@@ -17,6 +17,7 @@ pub(crate) mod options;
 pub(crate) mod pattern;
 pub(crate) mod physical_tree;
 pub(crate) mod property;
+pub(crate) mod representation;
 pub(crate) mod rewrite;
 pub(crate) mod rule;
 pub(crate) mod runtime_filter_pass;
