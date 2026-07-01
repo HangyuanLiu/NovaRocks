@@ -1079,6 +1079,7 @@ impl IcebergMvRefreshContext {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn bind_target_state_file_positions(
     mut source: ScanSource,
     matched_positions: &[crate::engine::mv::iceberg_target_apply::TargetRowPositionSet],
