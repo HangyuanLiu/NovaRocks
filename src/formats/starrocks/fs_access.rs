@@ -25,7 +25,7 @@ use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::fs_access::{
     StarRocksFsAccess, resolve_runtime_path, resolve_with_profile,
 };
-use crate::fs::access::FsScheme;
+use crate::fs::access::{FsAccessResolver, FsScheme};
 
 #[derive(Clone, Debug)]
 pub(crate) struct StarRocksFormatPathAccess {
@@ -88,6 +88,30 @@ pub(crate) fn resolve_format_tablet_access(
         root_relative_path,
         access,
     })
+}
+
+pub(crate) fn operator_relative_path_for_tablet_root(
+    tablet_root_path: &str,
+    rel_path: &str,
+) -> Result<String, String> {
+    let location = FsAccessResolver::new().parse_location(tablet_root_path)?;
+    let rel = rel_path.trim_start_matches('/');
+    match location.scheme() {
+        FsScheme::Local => Ok(rel.to_string()),
+        FsScheme::ObjectStore => {
+            let root = location.path().trim_matches('/');
+            if root.is_empty() {
+                Ok(rel.to_string())
+            } else if rel.is_empty() {
+                Ok(root.to_string())
+            } else {
+                Ok(format!("{root}/{rel}"))
+            }
+        }
+        FsScheme::Hdfs => Err(format!(
+            "StarRocks formats do not support hdfs tablet path yet: {tablet_root_path}"
+        )),
+    }
 }
 
 fn normalize_root_location(path: &str) -> String {
@@ -221,5 +245,44 @@ mod tests {
             access.operator_relative_path("meta/0000000000000000_0000000000000001.meta"),
             "warehouse/db_1/table_2/100/meta/0000000000000000_0000000000000001.meta"
         );
+    }
+
+    #[test]
+    fn parse_only_local_tablet_root_returns_input_relative_path() {
+        let rel = operator_relative_path_for_tablet_root("/tmp/tablet", "/data/seg.dat")
+            .expect("resolve local operator-relative path");
+
+        assert_eq!(rel, "data/seg.dat");
+    }
+
+    #[test]
+    fn parse_only_object_store_tablet_root_does_not_require_profile() {
+        let rel = operator_relative_path_for_tablet_root(
+            "s3://bucket/warehouse/db_1/table_2/100",
+            "data/seg.dat",
+        )
+        .expect("resolve object-store operator-relative path");
+
+        assert_eq!(rel, "warehouse/db_1/table_2/100/data/seg.dat");
+    }
+
+    #[test]
+    fn parse_only_object_store_tablet_root_empty_relative_path_returns_root() {
+        let rel =
+            operator_relative_path_for_tablet_root("s3://bucket/warehouse/db_1/table_2/100", "")
+                .expect("resolve object-store root operator-relative path");
+
+        assert_eq!(rel, "warehouse/db_1/table_2/100");
+    }
+
+    #[test]
+    fn parse_only_hdfs_tablet_root_is_unsupported() {
+        let err = operator_relative_path_for_tablet_root(
+            "hdfs://nn:9000/warehouse/db_1/table_2/100",
+            "data/seg.dat",
+        )
+        .expect_err("hdfs tablet root is unsupported");
+
+        assert!(err.contains("hdfs tablet path yet"), "err={err}");
     }
 }

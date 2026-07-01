@@ -30,7 +30,8 @@ use prost::Message;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::formats::starrocks::cache::{segment_footer_cache_get, segment_footer_cache_put};
 use crate::formats::starrocks::fs_access::{
-    StarRocksFormatTabletAccess, resolve_format_tablet_access,
+    StarRocksFormatTabletAccess, operator_relative_path_for_tablet_root,
+    resolve_format_tablet_access,
 };
 use crate::formats::starrocks::range_read::{ensure_exact_range_read_len, expected_range_len};
 use crate::formats::starrocks::segment::{StarRocksSegmentFooter, decode_segment_footer};
@@ -294,7 +295,7 @@ pub(crate) fn tablet_operator_relative_path(
     tablet_root_path: &str,
     rel_path: &str,
 ) -> Result<String, String> {
-    Ok(resolve_format_tablet_access(tablet_root_path, None)?.operator_relative_path(rel_path))
+    operator_relative_path_for_tablet_root(tablet_root_path, rel_path)
 }
 
 fn parse_standalone_snapshot(
@@ -1095,12 +1096,12 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn tablet_operator_relative_path_rejects_object_store_without_profile() {
-        let err =
+    fn tablet_operator_relative_path_resolves_object_store_without_profile() {
+        let rel =
             tablet_operator_relative_path("s3://bucket/warehouse/db_1/table_2/100", "data/seg.dat")
-                .expect_err("object-store tablet root must require a profile");
+                .expect("object-store tablet root path must not require a profile");
 
-        assert!(err.contains("missing object-store profile"), "err={err}");
+        assert_eq!(rel, "warehouse/db_1/table_2/100/data/seg.dat");
     }
 
     #[test]
