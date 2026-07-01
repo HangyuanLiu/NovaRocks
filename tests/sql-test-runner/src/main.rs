@@ -800,6 +800,11 @@ fn run_imv_stateless_rebuild_check(
     epsilon: Option<f64>,
     log: &mut String,
 ) -> Result<(), String> {
+    // When no case db is active, `fqn` is the bare MV name and both the SELECT
+    // and the `table => '<mv>'` procedure argument resolve their namespace from
+    // the session's current database. A case mounting this directive must have
+    // established the catalog/db (e.g. via SET CATALOG / USE) on the shared
+    // session before this step, as the iceberg-ivm cases do.
     let fqn = match db {
         Some(d) if !d.is_empty() => format!("{d}.{}", directive.mv),
         _ => directive.mv.clone(),
