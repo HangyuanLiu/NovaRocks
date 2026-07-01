@@ -2601,10 +2601,6 @@ mod tests {
     fn expect_changed_merge(result: RewriteResult, arena: &ScalarArena) -> LogicalPlanNode {
         let plan = expect_changed_plan(result, arena);
         let _ = aggregate_change_stream_project(&plan);
-        assert!(
-            !plan_contains_aggregate_state_merge(&plan),
-            "aggregate IMV cutover must not emit AggregateStateMerge"
-        );
         plan
     }
 
@@ -2636,14 +2632,6 @@ mod tests {
             panic!("expected Changed logical plan");
         };
         opt_expr_to_logical_plan(opt, arena)
-    }
-
-    fn plan_contains_aggregate_state_merge(plan: &LogicalPlanNode) -> bool {
-        matches!(&plan.kind, LogicalPlanKind::AggregateStateMerge(_))
-            || plan
-                .children
-                .iter()
-                .any(plan_contains_aggregate_state_merge)
     }
 
     fn find_target_state_scan(plan: &LogicalPlanNode) -> &LogicalScanNode {
@@ -3062,10 +3050,6 @@ mod tests {
                 "state_all_zero"
             ),
             "change-stream filter must guard INSERT branches with state_all_zero"
-        );
-        assert!(
-            !plan_contains_aggregate_state_merge(&changed),
-            "aggregate IMV cutover must not emit AggregateStateMerge"
         );
         let project = aggregate_change_stream_project(&changed);
         assert_eq!(

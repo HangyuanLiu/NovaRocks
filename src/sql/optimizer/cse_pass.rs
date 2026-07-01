@@ -749,11 +749,6 @@ fn available_output_ids(node: &OptimizerPhysicalNode) -> HashSet<ColumnId> {
             .get(1)
             .map(available_output_ids)
             .unwrap_or_default(),
-        Operator::PhysicalAggregateStateMerge(merge) => merge
-            .output_columns
-            .iter()
-            .map(|column| column.column_id)
-            .collect(),
         _ => node
             .output_columns
             .iter()

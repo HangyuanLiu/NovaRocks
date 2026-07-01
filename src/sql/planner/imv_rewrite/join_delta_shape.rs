@@ -219,9 +219,7 @@ fn subtree_has_reserved_action_output(plan: &LogicalPlanNode) -> bool {
                 || subtree_has_reserved_action_output(plan.unary_input())
         }
         LogicalPlanKind::Aggregate(_) => subtree_has_reserved_action_output(plan.unary_input()),
-        LogicalPlanKind::AggregateStateMerge(_) | LogicalPlanKind::Join(_) => {
-            plan.children.iter().any(subtree_has_reserved_action_output)
-        }
+        LogicalPlanKind::Join(_) => plan.children.iter().any(subtree_has_reserved_action_output),
         LogicalPlanKind::Union(node) => {
             node.output_columns
                 .iter()
@@ -244,7 +242,6 @@ fn subtree_has_delta_marker_or_scan(plan: &LogicalPlanNode) -> bool {
         LogicalPlanKind::Filter(_)
         | LogicalPlanKind::Project(_)
         | LogicalPlanKind::Aggregate(_)
-        | LogicalPlanKind::AggregateStateMerge(_)
         | LogicalPlanKind::Join(_)
         | LogicalPlanKind::Union(_)
         | LogicalPlanKind::ImvVersion(_) => {

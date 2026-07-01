@@ -42,7 +42,6 @@ pub(crate) fn all_implementation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(implement::GenerateSeriesToPhysical),
         Box::new(implement::TableFunctionToPhysical),
         Box::new(implement::DecodeToPhysical),
-        Box::new(implement::AggregateStateMergeToPhysical),
         Box::new(split_distinct_agg::SplitDistinctAgg),
     ]
 }

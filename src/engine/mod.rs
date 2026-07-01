@@ -2787,7 +2787,6 @@ fn single_fragment_plan(
         desc_tbl: fragment.desc_tbl,
         exec_params: fragment.exec_params,
         output_columns: fragment.output_columns,
-        direct_exec: fragment.direct_exec,
         boundary_schemas: fragment.boundary_schemas,
         query_global_dicts: fragment.query_global_dicts,
         query_global_dict_exprs: fragment.query_global_dict_exprs,
@@ -4392,64 +4391,10 @@ fn lower_plan_build_result(
     result: PlanBuildResult,
     arena: &mut crate::exec::expr::ExprArena,
     query_opts: Option<&StandaloneQueryOptions>,
-    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    _iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
 ) -> Result<crate::exec::node::ExecNode, String> {
     use crate::lower::thrift::layout::{build_tuple_slot_order, reorder_tuple_slots};
     use crate::lower::thrift::lower_plan;
-
-    if let Some(direct) = result.direct_exec {
-        match *direct {
-            crate::sql::codegen::DirectExecPlan::AggregateStateMerge {
-                old_input,
-                delta_input,
-                layout,
-                branch_id,
-                pruning_limits,
-            } => {
-                let old_input = *old_input;
-                let delta_input = *delta_input;
-                let old_input =
-                    lower_plan_build_result(old_input, arena, query_opts, iceberg_catalogs)?;
-                let delta_input =
-                    lower_plan_build_result(delta_input, arena, query_opts, iceberg_catalogs)?;
-                return Ok(crate::exec::node::ExecNode {
-                    kind: crate::exec::node::ExecNodeKind::AggregateStateMerge(
-                        crate::exec::operators::aggregate_state_merge::AggregateStateMergePlan {
-                            old_input: Box::new(old_input),
-                            delta_input: Box::new(delta_input),
-                            layout,
-                            branch_id,
-                            pruning_limits,
-                        },
-                    ),
-                });
-            }
-            crate::sql::codegen::DirectExecPlan::AggregateStatePhysicalize { input, layout } => {
-                let input = lower_plan_build_result(*input, arena, query_opts, iceberg_catalogs)?;
-                return Ok(crate::exec::node::ExecNode {
-                    kind: crate::exec::node::ExecNodeKind::AggregateStatePhysicalize(
-                        crate::exec::operators::aggregate_state_merge::AggregateStatePhysicalizePlan {
-                            input: Box::new(input),
-                            layout,
-                        },
-                    ),
-                });
-            }
-            crate::sql::codegen::DirectExecPlan::UnionAll { inputs } => {
-                let inputs = inputs
-                    .into_iter()
-                    .map(|input| {
-                        lower_plan_build_result(input, arena, query_opts, iceberg_catalogs)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                return Ok(crate::exec::node::ExecNode {
-                    kind: crate::exec::node::ExecNodeKind::UnionAll(
-                        crate::exec::node::union_all::UnionAllNode { inputs, node_id: 0 },
-                    ),
-                });
-            }
-        }
-    }
 
     let desc_tbl = result.desc_tbl;
     let plan = result.plan;

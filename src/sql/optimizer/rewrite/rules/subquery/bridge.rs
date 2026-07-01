@@ -15,13 +15,12 @@ use crate::sql::planner::optimizer_bridge::scalar::{
     materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::planner::plan::{
-    LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalApplyNode,
-    LogicalAssertOneRowNode, LogicalCTEAnchorNode, LogicalCTEConsumeNode, LogicalCTEProduceNode,
-    LogicalDecodeNode, LogicalExceptNode, LogicalFilterNode, LogicalGenerateSeriesNode,
-    LogicalImvDeltaNode, LogicalImvVersionNode, LogicalIntersectNode, LogicalJoinNode,
-    LogicalLimitNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode, LogicalRepeatNode,
-    LogicalScanNode, LogicalSortNode, LogicalTableFunctionNode, LogicalUnionNode,
-    LogicalValuesNode, LogicalWindowNode,
+    LogicalAggregateNode, LogicalApplyNode, LogicalAssertOneRowNode, LogicalCTEAnchorNode,
+    LogicalCTEConsumeNode, LogicalCTEProduceNode, LogicalDecodeNode, LogicalExceptNode,
+    LogicalFilterNode, LogicalGenerateSeriesNode, LogicalImvDeltaNode, LogicalImvVersionNode,
+    LogicalIntersectNode, LogicalJoinNode, LogicalLimitNode, LogicalPlanKind, LogicalPlanNode,
+    LogicalProjectNode, LogicalRepeatNode, LogicalScanNode, LogicalSortNode,
+    LogicalTableFunctionNode, LogicalUnionNode, LogicalValuesNode, LogicalWindowNode,
 };
 
 /// Materialise an `OptExpr` subtree into a `LogicalPlanNode`, converting all
@@ -204,15 +203,6 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             mappings: op.mappings.clone(),
             output_columns: op.output_columns.clone(),
         }),
-
-        Operator::LogicalAggregateStateMerge(op) => {
-            LogicalPlanKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
-                group_key_names: op.group_key_names.clone(),
-                aggregate_state_names: op.aggregate_state_names.clone(),
-                change_op_column: op.change_op_column.clone(),
-                output_columns: op.output_columns.clone(),
-            })
-        }
 
         Operator::LogicalImvDelta(op) => LogicalPlanKind::ImvDelta(LogicalImvDeltaNode {
             is_root: op.is_root,

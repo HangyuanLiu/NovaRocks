@@ -88,7 +88,6 @@ pub(crate) fn compute_cost(
         | Operator::LogicalCTEProduce(_)
         | Operator::LogicalCTEConsume(_)
         | Operator::LogicalDecode(_)
-        | Operator::LogicalAggregateStateMerge(_)
         | Operator::LogicalAssertOneRow(_)
         // Apply and IMV markers are eliminated before costing; unreachable here.
         | Operator::LogicalApply(_)
@@ -207,8 +206,7 @@ pub(crate) fn compute_cost(
         | Operator::PhysicalTableFunction(_)
         | Operator::PhysicalCTEProduce(_)
         | Operator::PhysicalCTEConsume(_)
-        | Operator::PhysicalDecode(_)
-        | Operator::PhysicalAggregateStateMerge(_) => own_stats.output_row_count * 0.01,
+        | Operator::PhysicalDecode(_) => own_stats.output_row_count * 0.01,
     }
 }
 

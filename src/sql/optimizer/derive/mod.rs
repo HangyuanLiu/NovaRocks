@@ -164,7 +164,6 @@ pub(crate) fn derive_output(
         Operator::PhysicalFilter(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalProject(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalDecode(o) => o.derive_output(scalars, children_outputs),
-        Operator::PhysicalAggregateStateMerge(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalLimit(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalAssertOneRow(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalCTEProduce(o) => o.derive_output(scalars, children_outputs),
@@ -227,9 +226,6 @@ pub(crate) fn derive_required(
         Operator::PhysicalFilter(o) => o.derive_required(scalars, parent_required, num_children),
         Operator::PhysicalProject(o) => o.derive_required(scalars, parent_required, num_children),
         Operator::PhysicalDecode(o) => o.derive_required(scalars, parent_required, num_children),
-        Operator::PhysicalAggregateStateMerge(o) => {
-            o.derive_required(scalars, parent_required, num_children)
-        }
         Operator::PhysicalLimit(o) => o.derive_required(scalars, parent_required, num_children),
         Operator::PhysicalAssertOneRow(o) => {
             o.derive_required(scalars, parent_required, num_children)
@@ -474,7 +470,6 @@ mod tests {
 // Sub-modules — populated by Tasks 3–13
 // ---------------------------------------------------------------------------
 
-pub(crate) mod aggregate_state_merge;
 pub(crate) mod assert_one_row;
 pub(crate) mod cte;
 pub(crate) mod enforcer;

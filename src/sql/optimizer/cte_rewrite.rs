@@ -306,7 +306,6 @@ fn opt_expr_output_columns(
         Operator::LogicalCTEProduce(node) => Ok(node.output_columns.clone()),
         Operator::LogicalCTEConsume(node) => Ok(node.output_columns.clone()),
         Operator::LogicalDecode(node) => Ok(node.output_columns.clone()),
-        Operator::LogicalAggregateStateMerge(node) => Ok(node.output_columns.clone()),
         Operator::LogicalApply(node) => {
             let mut columns = opt_expr_output_columns(expr.left(), scalars)?;
             columns.push(node.output_column.clone());

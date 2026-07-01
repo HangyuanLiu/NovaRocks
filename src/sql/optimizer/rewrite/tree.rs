@@ -477,7 +477,6 @@ mod tests {
                 | Operator::LogicalCTEProduce(_)
                 | Operator::LogicalCTEConsume(_)
                 | Operator::LogicalDecode(_)
-                | Operator::LogicalAggregateStateMerge(_)
                 | Operator::LogicalAssertOneRow(_)
                 // Pre-memo logical-only variants (eliminated before memo entry).
                 | Operator::LogicalApply(_)
@@ -508,7 +507,6 @@ mod tests {
                 | Operator::PhysicalGenerateSeries(_)
                 | Operator::PhysicalTableFunction(_)
                 | Operator::PhysicalDecode(_)
-                | Operator::PhysicalAggregateStateMerge(_)
                 | Operator::PhysicalAssertOneRow(_) => {}
             }
         }

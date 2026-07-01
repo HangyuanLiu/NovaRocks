@@ -110,7 +110,7 @@ fn target_locator_join_input(
     plan: &LogicalPlanNode,
     ctx: &RewriteContext,
 ) -> Result<Option<LocatorJoinInput>, String> {
-    if subtree_has_aggregate_state_merge(plan) || subtree_has_target_locator_join(plan) {
+    if subtree_has_target_locator_join(plan) {
         return Ok(None);
     }
     let Some(output) = effective_output_columns(plan) else {
@@ -505,11 +505,6 @@ fn reserved_locator_output_name(columns: &[OutputColumn]) -> Option<&str> {
             None
         }
     })
-}
-
-fn subtree_has_aggregate_state_merge(plan: &LogicalPlanNode) -> bool {
-    matches!(plan.kind, LogicalPlanKind::AggregateStateMerge(_))
-        || plan.children.iter().any(subtree_has_aggregate_state_merge)
 }
 
 fn subtree_has_target_locator_join(plan: &LogicalPlanNode) -> bool {

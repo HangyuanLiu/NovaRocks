@@ -158,7 +158,6 @@ fn rewrite_node(
         | Operator::LogicalWindow(_)
         | Operator::LogicalTableFunction(_)
         | Operator::LogicalRepeat(_)
-        | Operator::LogicalAggregateStateMerge(_)
         | Operator::LogicalApply(_)
         | Operator::LogicalAssertOneRow(_)
         // TODO(post-Task-9): multi-consumer CTEs with matching dict
@@ -1605,7 +1604,6 @@ fn plan_output_columns(plan: &OptExpr, arena: &ScalarArena) -> Vec<OutputColumn>
         Operator::LogicalCTEProduce(node) => node.output_columns.clone(),
         Operator::LogicalCTEConsume(node) => node.output_columns.clone(),
         Operator::LogicalDecode(node) => node.output_columns.clone(),
-        Operator::LogicalAggregateStateMerge(node) => node.output_columns.clone(),
         Operator::LogicalFilter(_) => plan_output_columns(plan.unary_input(), arena),
         Operator::LogicalProject(node) => node
             .items

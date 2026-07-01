@@ -1,11 +1,16 @@
 //! Target-row location helpers for Iceberg MV incremental apply.
 //!
-//! `resolve_target_positions_via_framework` is the W1 framework-backed locator:
-//! it scans the target through NovaRocks and emits `_file`/`_pos` plus the
-//! apply key. The direct `locate_target_rows_*` iceberg-rust scan path remains
-//! temporarily for aggregate and merge-sink callers until their W3/W4/W5
-//! migrations land; join coalesce is already cut over as the W1 proof path.
+//! The production apply path locates old target rows *in-plan*: the refresh
+//! framework scans the target, emits `_file`/`_pos` plus the apply key, and
+//! joins on the apply key (the W1/W3/W4/W5 cutover). The direct iceberg-rust
+//! scan locators below (`locate_target_rows_*`,
+//! `resolve_target_positions_via_framework`) are therefore no longer on any
+//! production path. They are retained only as `#[cfg(test)]` differential
+//! oracles: unit tests cross-check the new in-plan locator against this
+//! original direct-scan implementation. Gating them out of non-test builds
+//! keeps direct iceberg-rust reads out of the release binary.
 
+#[cfg(test)]
 use crate::engine::mv::partition::TargetPartitionFilter;
 
 pub(crate) const ICEBERG_MV_APPLY_KEY_COLUMN: &str = "__nova_base_row_id";
@@ -102,10 +107,6 @@ pub(crate) fn iceberg_mv_physical_select_sql(select_sql: &str) -> Result<String,
     Ok(stmt.to_string())
 }
 
-pub(crate) fn find_apply_key_field_id(table: &iceberg::table::Table) -> Result<i32, String> {
-    find_apply_key_field_id_by_column(table, ICEBERG_MV_APPLY_KEY_COLUMN)
-}
-
 pub(crate) fn find_apply_key_field_id_by_column(
     table: &iceberg::table::Table,
     apply_key_column: &str,
@@ -153,38 +154,7 @@ fn row_lineage_property_enabled(props: &std::collections::HashMap<String, String
         .unwrap_or(false)
 }
 
-pub(crate) fn extract_apply_key_values_from_chunks(
-    chunks: &[crate::exec::chunk::Chunk],
-) -> Result<Vec<i64>, String> {
-    use arrow::array::Array;
-
-    let mut out = Vec::new();
-    for chunk in chunks {
-        let schema = chunk.batch.schema();
-        let idx = schema.index_of(ICEBERG_MV_APPLY_KEY_COLUMN).map_err(|e| {
-            format!(
-                "iceberg MV projected changes missing apply-key column {ICEBERG_MV_APPLY_KEY_COLUMN}: {e}"
-            )
-        })?;
-        let casted =
-            arrow::compute::cast(chunk.batch.column(idx), &arrow::datatypes::DataType::Int64)
-                .map_err(|e| format!("cast {ICEBERG_MV_APPLY_KEY_COLUMN} to BIGINT failed: {e}"))?;
-        let values = casted
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .ok_or_else(|| format!("{ICEBERG_MV_APPLY_KEY_COLUMN} is not BIGINT after cast"))?;
-        for row in 0..values.len() {
-            if values.is_null(row) {
-                return Err(format!(
-                    "iceberg MV projected changes contain NULL {ICEBERG_MV_APPLY_KEY_COLUMN}"
-                ));
-            }
-            out.push(values.value(row));
-        }
-    }
-    Ok(out)
-}
-
+#[cfg(test)]
 pub(crate) fn load_target_apply_locator_inputs(
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_table: &iceberg::table::Table,
@@ -222,6 +192,7 @@ pub(crate) fn load_target_apply_locator_inputs(
     Ok((existing_deletes_by_file, referenced_data_file_partitions))
 }
 
+#[cfg(test)]
 pub(crate) async fn locate_target_rows_by_apply_key(
     target_table: &iceberg::table::Table,
     base_row_ids: &[i64],
@@ -240,6 +211,7 @@ pub(crate) async fn locate_target_rows_by_apply_key(
     .delete_groups)
 }
 
+#[cfg(test)]
 pub(crate) async fn locate_target_rows_by_apply_key_with_matches(
     target_table: &iceberg::table::Table,
     base_row_ids: &[i64],
@@ -258,6 +230,7 @@ pub(crate) async fn locate_target_rows_by_apply_key_with_matches(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn locate_target_rows_by_string_apply_key(
     target_table: &iceberg::table::Table,
     apply_key_column: &str,
@@ -278,6 +251,7 @@ pub(crate) async fn locate_target_rows_by_string_apply_key(
     .delete_groups)
 }
 
+#[cfg(test)]
 pub(crate) async fn locate_target_rows_by_string_apply_key_with_matches(
     target_table: &iceberg::table::Table,
     apply_key_column: &str,
@@ -297,18 +271,21 @@ pub(crate) async fn locate_target_rows_by_string_apply_key_with_matches(
     .await
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BranchApplyKey {
     pub branch_id: i32,
     pub base_row_id: i64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BranchStringApplyKey {
     pub branch_id: i32,
     pub key: String,
 }
 
+#[cfg(test)]
 pub(crate) async fn locate_target_rows_by_branch_apply_key(
     target_table: &iceberg::table::Table,
     requested_keys: &[BranchApplyKey],
@@ -327,6 +304,7 @@ pub(crate) async fn locate_target_rows_by_branch_apply_key(
     .delete_groups)
 }
 
+#[cfg(test)]
 pub(crate) async fn locate_target_rows_by_branch_apply_key_with_matches(
     target_table: &iceberg::table::Table,
     requested_keys: &[BranchApplyKey],
@@ -345,6 +323,7 @@ pub(crate) async fn locate_target_rows_by_branch_apply_key_with_matches(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn locate_target_rows_by_branch_string_apply_key(
     target_table: &iceberg::table::Table,
     apply_key_column: &str,
@@ -365,6 +344,7 @@ pub(crate) async fn locate_target_rows_by_branch_string_apply_key(
     .delete_groups)
 }
 
+#[cfg(test)]
 pub(crate) async fn locate_target_rows_by_branch_string_apply_key_with_matches(
     target_table: &iceberg::table::Table,
     apply_key_column: &str,
@@ -384,6 +364,7 @@ pub(crate) async fn locate_target_rows_by_branch_string_apply_key_with_matches(
     .await
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) enum ApplyKeyRequest<'a> {
     Int64(&'a [i64]),
@@ -392,6 +373,7 @@ pub(crate) enum ApplyKeyRequest<'a> {
     BranchUtf8(&'a [BranchStringApplyKey]),
 }
 
+#[cfg(test)]
 impl ApplyKeyRequest<'_> {
     fn is_empty(&self) -> bool {
         match self {
@@ -403,6 +385,7 @@ impl ApplyKeyRequest<'_> {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum ApplyKeyValue {
     Int64(i64),
@@ -411,17 +394,20 @@ enum ApplyKeyValue {
     BranchUtf8(BranchStringApplyKey),
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TargetRowPositionSet {
     pub(crate) referenced_data_file: String,
     pub(crate) positions: Vec<i64>,
 }
 
+#[cfg(test)]
 pub(crate) struct TargetApplyLocatorResult {
     pub(crate) delete_groups: Vec<crate::connector::iceberg::commit::PositionDeleteGroup>,
     pub(crate) matched_positions: Vec<TargetRowPositionSet>,
 }
 
+#[cfg(test)]
 impl std::fmt::Display for ApplyKeyValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -441,6 +427,7 @@ impl std::fmt::Display for ApplyKeyValue {
     }
 }
 
+#[cfg(test)]
 fn requested_apply_key_values(
     requested_keys: ApplyKeyRequest<'_>,
 ) -> std::collections::HashSet<ApplyKeyValue> {
@@ -468,6 +455,7 @@ fn requested_apply_key_values(
     }
 }
 
+#[cfg(test)]
 fn record_visible_apply_key_match(
     matches: &mut std::collections::HashMap<ApplyKeyValue, (String, i64)>,
     requested: &std::collections::HashSet<ApplyKeyValue>,
@@ -489,6 +477,7 @@ fn record_visible_apply_key_match(
     Ok(())
 }
 
+#[cfg(test)]
 fn ensure_all_requested_apply_keys_matched(
     requested: &std::collections::HashSet<ApplyKeyValue>,
     matches: &std::collections::HashMap<ApplyKeyValue, (String, i64)>,
@@ -503,6 +492,7 @@ fn ensure_all_requested_apply_keys_matched(
     Ok(())
 }
 
+#[cfg(test)]
 fn process_apply_key_locator_batch(
     batch: &arrow::record_batch::RecordBatch,
     apply_key_column: &str,
@@ -601,6 +591,7 @@ fn process_apply_key_locator_batch(
     Ok(())
 }
 
+#[cfg(test)]
 fn process_branch_i64_apply_key_locator_batch(
     batch: &arrow::record_batch::RecordBatch,
     requested: &std::collections::HashSet<ApplyKeyValue>,
@@ -683,6 +674,7 @@ fn process_branch_i64_apply_key_locator_batch(
     Ok(())
 }
 
+#[cfg(test)]
 fn process_branch_utf8_apply_key_locator_batch(
     batch: &arrow::record_batch::RecordBatch,
     apply_key_column: &str,
@@ -764,6 +756,7 @@ fn process_branch_utf8_apply_key_locator_batch(
     Ok(())
 }
 
+#[cfg(test)]
 fn build_position_delete_groups_from_apply_key_matches(
     matches: std::collections::HashMap<ApplyKeyValue, (String, i64)>,
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
@@ -775,6 +768,7 @@ fn build_position_delete_groups_from_apply_key_matches(
     .delete_groups)
 }
 
+#[cfg(test)]
 fn build_target_apply_locator_result_from_apply_key_matches(
     matches: std::collections::HashMap<ApplyKeyValue, (String, i64)>,
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
@@ -813,6 +807,7 @@ fn build_target_apply_locator_result_from_apply_key_matches(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_target_positions_via_framework(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     target_table: &iceberg::table::Table,
@@ -892,6 +887,7 @@ pub(crate) fn resolve_target_positions_via_framework(
     )
 }
 
+#[cfg(test)]
 fn register_scoped_framework_locator_table_for_query(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     target_table: &iceberg::table::Table,
@@ -932,6 +928,7 @@ fn register_scoped_framework_locator_table_for_query(
     )
 }
 
+#[cfg(test)]
 fn try_register_scoped_framework_locator_table(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     namespace: &str,
@@ -967,6 +964,7 @@ fn try_register_scoped_framework_locator_table(
     }))
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 struct FrameworkLocatorTableFingerprint {
     columns: Vec<crate::engine::ColumnDef>,
@@ -974,6 +972,7 @@ struct FrameworkLocatorTableFingerprint {
     source_debug: String,
 }
 
+#[cfg(test)]
 impl FrameworkLocatorTableFingerprint {
     fn from_table_def(table_def: &crate::sql::catalog::TableDef) -> Self {
         Self {
@@ -993,6 +992,7 @@ impl FrameworkLocatorTableFingerprint {
     }
 }
 
+#[cfg(test)]
 struct ScopedFrameworkLocatorTable {
     state: std::sync::Arc<crate::engine::StandaloneState>,
     namespace: String,
@@ -1001,6 +1001,7 @@ struct ScopedFrameworkLocatorTable {
     active: bool,
 }
 
+#[cfg(test)]
 impl ScopedFrameworkLocatorTable {
     fn cleanup(mut self) -> Result<(), String> {
         self.cleanup_active()
@@ -1050,6 +1051,7 @@ impl ScopedFrameworkLocatorTable {
     }
 }
 
+#[cfg(test)]
 impl Drop for ScopedFrameworkLocatorTable {
     fn drop(&mut self) {
         if self.active {
@@ -1058,6 +1060,7 @@ impl Drop for ScopedFrameworkLocatorTable {
     }
 }
 
+#[cfg(test)]
 fn next_framework_locator_synthetic_table_name(
     target_table_name: &str,
     target_table: &iceberg::table::Table,
@@ -1075,6 +1078,7 @@ fn next_framework_locator_synthetic_table_name(
     format!("__nova_mv_locator_{target}_{snapshot}_{nonce}")
 }
 
+#[cfg(test)]
 fn framework_locator_identifier_token(identifier: &str) -> String {
     let mut out = String::with_capacity(identifier.len().max(1));
     for ch in identifier.chars() {
@@ -1091,6 +1095,7 @@ fn framework_locator_identifier_token(identifier: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn build_locator_visible_target_table_def(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     target_table: &iceberg::table::Table,
@@ -1128,6 +1133,7 @@ fn build_locator_visible_target_table_def(
     expose_physical_apply_key_for_locator_registration(table_def, target_table, apply_key_column)
 }
 
+#[cfg(test)]
 fn filter_locator_data_files_by_partition(
     target_table: &iceberg::table::Table,
     files: Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats>,
@@ -1154,6 +1160,7 @@ fn filter_locator_data_files_by_partition(
         .collect()
 }
 
+#[cfg(test)]
 fn locator_data_file_matches_partition_filter(
     target_metadata: &iceberg::spec::TableMetadata,
     file: &crate::connector::iceberg::catalog::registry::DataFileWithStats,
@@ -1200,6 +1207,7 @@ fn locator_data_file_matches_partition_filter(
     Ok(partition_filter.matches(&key))
 }
 
+#[cfg(test)]
 fn framework_locator_catalog_entry(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     target_catalog_name: &str,
@@ -1226,6 +1234,7 @@ fn framework_locator_catalog_entry(
     }
 }
 
+#[cfg(test)]
 fn framework_locator_local_warehouse_uri(
     target_table: &iceberg::table::Table,
 ) -> Result<String, String> {
@@ -1246,6 +1255,7 @@ fn framework_locator_local_warehouse_uri(
         .to_string())
 }
 
+#[cfg(test)]
 fn framework_locator_loaded_table(
     target_table: &iceberg::table::Table,
     object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
@@ -1344,6 +1354,7 @@ fn iceberg_column_def_for_locator(
     })
 }
 
+#[cfg(test)]
 fn framework_locator_select_sql(
     target_namespace: &str,
     target_table_name: &str,
@@ -1381,6 +1392,7 @@ fn framework_locator_select_sql(
     ))
 }
 
+#[cfg(test)]
 fn framework_locator_in_list(requested_keys: ApplyKeyRequest<'_>) -> Result<String, String> {
     match requested_keys {
         ApplyKeyRequest::Int64(keys) => Ok(join_i64_in_list(keys.iter().copied())),
@@ -1394,6 +1406,7 @@ fn framework_locator_in_list(requested_keys: ApplyKeyRequest<'_>) -> Result<Stri
     }
 }
 
+#[cfg(test)]
 fn framework_locator_branch_id_in_list(requested_keys: ApplyKeyRequest<'_>) -> Option<String> {
     match requested_keys {
         ApplyKeyRequest::BranchInt64(keys) => {
@@ -1406,6 +1419,7 @@ fn framework_locator_branch_id_in_list(requested_keys: ApplyKeyRequest<'_>) -> O
     }
 }
 
+#[cfg(test)]
 fn join_i64_in_list(values: impl Iterator<Item = i64>) -> String {
     values
         .collect::<std::collections::BTreeSet<_>>()
@@ -1415,6 +1429,7 @@ fn join_i64_in_list(values: impl Iterator<Item = i64>) -> String {
         .join(", ")
 }
 
+#[cfg(test)]
 fn join_i32_in_list(values: impl Iterator<Item = i32>) -> String {
     values
         .collect::<std::collections::BTreeSet<_>>()
@@ -1424,6 +1439,7 @@ fn join_i32_in_list(values: impl Iterator<Item = i32>) -> String {
         .join(", ")
 }
 
+#[cfg(test)]
 fn join_string_in_list<'a>(values: impl Iterator<Item = &'a str>) -> String {
     values
         .collect::<std::collections::BTreeSet<_>>()
@@ -1433,14 +1449,17 @@ fn join_string_in_list<'a>(values: impl Iterator<Item = &'a str>) -> String {
         .join(", ")
 }
 
+#[cfg(test)]
 fn quote_sql_identifier(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
 }
 
+#[cfg(test)]
 fn quote_sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+#[cfg(test)]
 async fn locate_target_rows_by_apply_key_impl(
     target_table: &iceberg::table::Table,
     apply_key_column: &str,
@@ -1606,6 +1625,7 @@ async fn locate_target_rows_by_apply_key_impl(
     )
 }
 
+#[cfg(test)]
 pub(crate) async fn locate_target_rows_by_apply_key_string(
     target_table: &iceberg::table::Table,
     join_row_keys: &[String],

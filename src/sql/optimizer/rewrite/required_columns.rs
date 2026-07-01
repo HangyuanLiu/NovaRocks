@@ -69,9 +69,6 @@ pub(crate) fn tag_required_columns(
             tag_change_event_expand(expr, arena, parent_needed)
         }
         Operator::LogicalDecode(_) => tag_decode(expr, arena, parent_needed),
-        Operator::LogicalAggregateStateMerge(_) => {
-            tag_aggregate_state_merge(expr, arena, parent_needed)
-        }
         Operator::LogicalTableFunction(_) => tag_table_function(expr, arena, parent_needed),
         Operator::LogicalAssertOneRow(_) => tag_assert_one_row(expr, arena, parent_needed),
         _ => {
@@ -103,25 +100,6 @@ fn tag_passthrough(
             .map(|child| tag_required_columns(child, arena, parent_needed.clone()))
             .collect(),
         required_output_columns: parent_needed,
-    }
-}
-
-fn tag_aggregate_state_merge(
-    expr: OptExpr,
-    arena: &ScalarArena,
-    _parent_needed: Option<HashSet<ColumnId>>,
-) -> OptExpr {
-    debug_assert!(matches!(expr.op, Operator::LogicalAggregateStateMerge(_)));
-    let mut children = expr.children;
-    let delta_input = children.pop().unwrap();
-    let old_input = children.pop().unwrap();
-    OptExpr {
-        op: expr.op,
-        children: vec![
-            tag_required_columns(old_input, arena, None),
-            tag_required_columns(delta_input, arena, None),
-        ],
-        required_output_columns: expr.required_output_columns,
     }
 }
 

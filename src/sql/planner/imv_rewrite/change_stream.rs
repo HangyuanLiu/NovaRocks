@@ -489,10 +489,6 @@ fn node_output_contains_column(plan: &LogicalPlanNode, column_id: ColumnId, name
             .output_columns
             .iter()
             .any(|column| column.column_id == column_id && column.name.eq_ignore_ascii_case(name)),
-        LogicalPlanKind::AggregateStateMerge(merge) => merge
-            .output_columns
-            .iter()
-            .any(|column| column.column_id == column_id && column.name.eq_ignore_ascii_case(name)),
         LogicalPlanKind::Union(union) => union
             .output_columns
             .iter()

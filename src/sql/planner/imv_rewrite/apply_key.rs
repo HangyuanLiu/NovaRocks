@@ -238,7 +238,6 @@ fn plan_kind_from_kind(kind: &LogicalPlanKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
 
     use arrow::datatypes::DataType;
 
@@ -251,7 +250,6 @@ mod tests {
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
     use crate::sql::planner::optimizer_bridge::plan::{
@@ -450,51 +448,6 @@ mod tests {
         assert!(
             err.contains("expected root Project"),
             "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn does_not_inject_apply_key_below_non_apply_key_root() {
-        let rule = InjectApplyKeyProjectRule::new();
-        let ctx = build_ctx();
-        let k = OutputColumn {
-            column_id: ColumnId(1),
-            name: "k".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        };
-        let old_input = LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
-                rows: Vec::new(),
-                columns: vec![k.clone()],
-            }),
-            vec![],
-            None,
-        );
-        let delta_input = project_root(delta_scan_with_row_id(ColumnId(101)), ColumnId(101));
-        let plan = LogicalPlanNode::new(
-            LogicalPlanKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
-                group_key_names: vec!["k".to_string()],
-                aggregate_state_names: Vec::new(),
-                change_op_column: ImvActionColumn::NAME.to_string(),
-                output_columns: vec![k],
-            }),
-            vec![old_input, delta_input],
-            None,
-        );
-
-        let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
-        drop(arena_rc);
-
-        assert!(
-            !rule.matches(&expr, &ctx),
-            "AggregateStateMerge root should not get an apply-key wrapper"
-        );
-        assert!(
-            !rule.matches(expr.child(1), &ctx),
-            "root-only rule must not fire on descendant Projects"
         );
     }
 }

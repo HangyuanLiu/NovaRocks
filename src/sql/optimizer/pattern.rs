@@ -30,7 +30,6 @@ pub(crate) enum OpKind {
     CTEProduce,
     CTEConsume,
     Decode,
-    AggregateStateMerge,
     AssertOneRow,
     Apply,
 }
@@ -65,7 +64,6 @@ pub(crate) fn op_kind(op: &Operator) -> Option<OpKind> {
         Operator::LogicalCTEProduce(_) => Some(OpKind::CTEProduce),
         Operator::LogicalCTEConsume(_) => Some(OpKind::CTEConsume),
         Operator::LogicalDecode(_) => Some(OpKind::Decode),
-        Operator::LogicalAggregateStateMerge(_) => Some(OpKind::AggregateStateMerge),
         Operator::LogicalAssertOneRow(_) => Some(OpKind::AssertOneRow),
         Operator::LogicalApply(_) => Some(OpKind::Apply),
         Operator::LogicalJoin(_) => Some(OpKind::Join),
@@ -102,10 +100,10 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{ApplyKind, ImvVersionRef, JoinKind, LiteralValue, OutputColumn};
     use crate::sql::optimizer::operator::{
-        AggregateOutputLayout, AggregateStateMergeOp, ApplyOp, AssertOneRowOp, CTEAnchorOp,
-        CTEConsumeOp, CTEProduceOp, DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp,
-        ImvVersionOp, IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp,
-        RepeatOp, ScanOp, SortOp, TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
+        AggregateOutputLayout, ApplyOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
+        DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp,
+        LimitOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScanOp, SortOp,
+        TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
 
@@ -257,15 +255,6 @@ mod tests {
                     output_columns: vec![],
                 }),
                 OpKind::Decode,
-            ),
-            (
-                Operator::LogicalAggregateStateMerge(AggregateStateMergeOp {
-                    group_key_names: vec![],
-                    aggregate_state_names: vec![],
-                    change_op_column: "__op".to_string(),
-                    output_columns: vec![],
-                }),
-                OpKind::AggregateStateMerge,
             ),
             (
                 Operator::LogicalAssertOneRow(AssertOneRowOp {

@@ -106,8 +106,7 @@ impl BridgeCtx<'_> {
                 )))
             }
             Operator::PhysicalHashJoin(op) => {
-                let execution_mode =
-                    join_execution_mode(node.execution_props.join_distribution);
+                let execution_mode = join_execution_mode(node.execution_props.join_distribution);
                 let rf_execution_mode = if node.build_runtime_filters.is_empty() {
                     None
                 } else {
@@ -210,16 +209,16 @@ impl BridgeCtx<'_> {
                 output_columns: op.output_columns.clone(),
                 child_output_columns: op.child_output_columns.clone(),
             })),
-            Operator::PhysicalGenerateSeries(op) => Ok(PhysicalPlanKind::GenerateSeries(
-                PlanGenerateSeriesNode {
+            Operator::PhysicalGenerateSeries(op) => {
+                Ok(PhysicalPlanKind::GenerateSeries(PlanGenerateSeriesNode {
                     start: op.start,
                     end: op.end,
                     step: op.step,
                     column_name: op.column_name.clone(),
                     alias: op.alias.clone(),
                     output_column_id: op.output_column_id,
-                },
-            )),
+                }))
+            }
             Operator::PhysicalTableFunction(op) => {
                 Ok(PhysicalPlanKind::TableFunction(PlanTableFunctionNode {
                     function_name: op.function_name.clone(),
@@ -229,33 +228,31 @@ impl BridgeCtx<'_> {
                     is_left_join: op.is_left_join,
                 }))
             }
-            Operator::PhysicalCTEAnchor(op) => Ok(PhysicalPlanKind::CTEAnchor(
-                LogicalCTEAnchorNode { cte_id: op.cte_id },
-            )),
-            Operator::PhysicalCTEProduce(op) => Ok(PhysicalPlanKind::CTEProduce(
-                LogicalCTEProduceNode {
+            Operator::PhysicalCTEAnchor(op) => {
+                Ok(PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode {
+                    cte_id: op.cte_id,
+                }))
+            }
+            Operator::PhysicalCTEProduce(op) => {
+                Ok(PhysicalPlanKind::CTEProduce(LogicalCTEProduceNode {
                     cte_id: op.cte_id,
                     output_columns: op.output_columns.clone(),
-                },
-            )),
-            Operator::PhysicalCTEConsume(op) => Ok(PhysicalPlanKind::CTEConsume(
-                LogicalCTEConsumeNode {
+                }))
+            }
+            Operator::PhysicalCTEConsume(op) => {
+                Ok(PhysicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
                     cte_id: op.cte_id,
                     alias: op.alias.clone(),
                     output_columns: op.output_columns.clone(),
                     producer_column_ids: op.producer_column_ids.clone(),
-                },
-            )),
+                }))
+            }
             Operator::PhysicalDistribution(op) => {
                 Ok(PhysicalPlanKind::Redistribute(RedistributeNode {
                     mode: redistribute_mode(op)?,
                     output_columns: node.output_columns.clone(),
                 }))
             }
-            Operator::PhysicalAggregateStateMerge(_) => Err(
-                "Bridge 2a does not model PhysicalAggregateStateMerge; PIR-7 must either retire it through IMV relationization or define explicit planner IR"
-                    .to_string(),
-            ),
             op if op.is_logical() => Err(format!(
                 "Bridge 2a expected a physical operator, got logical operator {op:?}"
             )),
@@ -283,10 +280,7 @@ fn validate_shape(node: &OptimizerPhysicalNode) -> Result<(), String> {
         | Operator::PhysicalWindow(_)
         | Operator::PhysicalTableFunction(_)
         | Operator::PhysicalCTEProduce(_)
-        | Operator::PhysicalDistribution(_)
-        | Operator::PhysicalAggregateStateMerge(_) => {
-            expect_arity(node, operator_name(&node.op), 1)
-        }
+        | Operator::PhysicalDistribution(_) => expect_arity(node, operator_name(&node.op), 1),
 
         Operator::PhysicalHashJoin(_)
         | Operator::PhysicalNestLoopJoin(_)
@@ -368,7 +362,6 @@ fn operator_name(op: &Operator) -> &'static str {
         Operator::PhysicalGenerateSeries(_) => "PhysicalGenerateSeries",
         Operator::PhysicalTableFunction(_) => "PhysicalTableFunction",
         Operator::PhysicalDecode(_) => "PhysicalDecode",
-        Operator::PhysicalAggregateStateMerge(_) => "PhysicalAggregateStateMerge",
         Operator::PhysicalAssertOneRow(_) => "PhysicalAssertOneRow",
         _ => "LogicalOperator",
     }
@@ -502,8 +495,8 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{JoinKind, OutputColumn};
     use crate::sql::optimizer::operator::{
-        AggregateStateMergeOp, JoinDistribution, Operator, PhysicalDistributionOp,
-        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, UnionOp, ValuesOp,
+        JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinEqCondition,
+        PhysicalHashJoinOp, UnionOp, ValuesOp,
     };
     use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
     use crate::sql::optimizer::property::{DistributionSpec, HashSource, PhysicalPropertySet};
@@ -895,22 +888,5 @@ mod tests {
 
         let err = optimizer_physical_to_plan(&node).expect_err("logical op should be rejected");
         assert!(err.contains("Bridge 2a expected a physical operator"));
-    }
-
-    #[test]
-    fn bridge_rejects_aggregate_state_merge_with_pir7_message() {
-        let mut node = base_node(Operator::PhysicalAggregateStateMerge(
-            AggregateStateMergeOp {
-                group_key_names: vec![],
-                aggregate_state_names: vec![],
-                change_op_column: "op".to_string(),
-                output_columns: vec![],
-            },
-        ));
-        node.children.push(raw_values_node());
-        let node = attach_arena(node, Arc::new(ScalarArena::new()));
-
-        let err = optimizer_physical_to_plan(&node).expect_err("IMV direct-exec op is PIR-7");
-        assert!(err.contains("PIR-7"));
     }
 }

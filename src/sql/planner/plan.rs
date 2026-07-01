@@ -62,7 +62,6 @@ pub(crate) enum LogicalPlanKind {
     CTEAnchor(LogicalCTEAnchorNode),
     CTEProduce(LogicalCTEProduceNode),
     CTEConsume(LogicalCTEConsumeNode),
-    AggregateStateMerge(LogicalAggregateStateMergeNode),
     Apply(LogicalApplyNode),
     ImvDelta(LogicalImvDeltaNode),
     ImvVersion(LogicalImvVersionNode),
@@ -91,7 +90,6 @@ impl LogicalPlanKind {
             LogicalPlanKind::CTEAnchor(_) => "CTEAnchor",
             LogicalPlanKind::CTEProduce(_) => "CTEProduce",
             LogicalPlanKind::CTEConsume(_) => "CTEConsume",
-            LogicalPlanKind::AggregateStateMerge(_) => "AggregateStateMerge",
             LogicalPlanKind::Apply(_) => "Apply",
             LogicalPlanKind::ImvDelta(_) => "ImvDelta",
             LogicalPlanKind::ImvVersion(_) => "ImvVersion",
@@ -121,7 +119,6 @@ impl LogicalPlanKind {
             "CTEAnchor",
             "CTEProduce",
             "CTEConsume",
-            "AggregateStateMerge",
             "Apply",
             "ImvDelta",
             "ImvVersion",
@@ -355,15 +352,6 @@ pub(crate) struct DistributedChangeEventOutputExpr {
 }
 
 pub(crate) type LogicalDecodeNode = PlanDecodeNode;
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalAggregateStateMergeNode {
-    pub(crate) group_key_names: Vec<String>,
-    pub(crate) aggregate_state_names: Vec<String>,
-    pub(crate) change_op_column: String,
-    pub(crate) output_columns: Vec<OutputColumn>,
-}
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -780,49 +768,6 @@ mod plan_tests {
         };
         assert_eq!(node.output_columns.len(), 1);
         assert_eq!(node.output_columns[0].name, "z");
-    }
-
-    #[test]
-    fn logical_aggregate_state_merge_node_keeps_inputs_in_children() {
-        use crate::sql::analysis::OutputColumn;
-        use crate::sql::column_id::ColumnId;
-
-        let old_input = empty_values_for_test();
-        let delta_input = empty_values_for_test();
-        let plan = LogicalPlanNode::new(
-            LogicalPlanKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
-                group_key_names: vec!["region".to_string()],
-                aggregate_state_names: vec!["c".to_string(), "s".to_string()],
-                change_op_column: "__change_op".to_string(),
-                output_columns: vec![
-                    OutputColumn {
-                        column_id: ColumnId::new_for_test(1),
-                        name: "region".to_string(),
-                        data_type: arrow::datatypes::DataType::Utf8,
-                        nullable: true,
-                        is_internal: false,
-                    },
-                    OutputColumn {
-                        column_id: ColumnId::new_for_test(2),
-                        name: "c".to_string(),
-                        data_type: arrow::datatypes::DataType::Int64,
-                        nullable: true,
-                        is_internal: false,
-                    },
-                ],
-            }),
-            vec![old_input, delta_input],
-            None,
-        );
-
-        let LogicalPlanKind::AggregateStateMerge(node) = plan.kind else {
-            panic!("expected aggregate state merge");
-        };
-        assert_eq!(plan.children.len(), 2);
-        assert_eq!(node.group_key_names, vec!["region"]);
-        assert_eq!(node.aggregate_state_names, vec!["c", "s"]);
-        assert_eq!(node.change_op_column, "__change_op");
-        assert_eq!(node.output_columns.len(), 2);
     }
 
     #[test]
