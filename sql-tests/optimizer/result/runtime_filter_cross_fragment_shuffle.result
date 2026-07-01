@@ -1,0 +1,50 @@
+-- query 10
+cnt
+4
+
+-- query 11
+Explain String
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+9:PROJECT [count(*) AS cnt] stats={rows=1}
+  8:HASH AGGREGATE (GLOBAL) stats={rows=1}
+    aggregations: count()
+    7:GATHER stats={rows=1}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: UNPARTITIONED
+6:HASH AGGREGATE (LOCAL) stats={rows=1}
+  aggregations: count()
+  5:HASH JOIN (PARTITIONED, INNER, eq: [p.k = b.k]) stats={rows=4}
+    build runtime filters:
+    - filter_id = 0, build_expr = (b.k)
+    2:HASH EXCHANGE stats={rows=4}
+    4:HASH EXCHANGE stats={rows=4}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: HASH_PARTITIONED (k)
+3:SCAN db_sqlt_2118c35864f0435b.rf_shuffle_build (alias=b) stats={rows=4}
+     TABLE: db_sqlt_2118c35864f0435b.rf_shuffle_build
+     columns: k
+     min-max stats
+     predicates: b.k IS NOT NULL
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 2
+    PARTITION: HASH_PARTITIONED (k)
+1:SCAN db_sqlt_2118c35864f0435b.rf_shuffle_probe (alias=p) stats={rows=4}
+     TABLE: db_sqlt_2118c35864f0435b.rf_shuffle_probe
+     columns: k
+     min-max stats
+     predicates: p.k IS NOT NULL
+    probe runtime filters:
+    - filter_id = 0, probe_expr = (p.k)
