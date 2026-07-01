@@ -1,0 +1,77 @@
+-- query 19
+scenario	row_count	t1_sum	t2_sum
+bilateral_probe	1350	191925	191925
+
+-- query 21
+scenario	row_count	t1_sum	t2_sum
+bilateral_probe	1350	191925	191925
+
+-- query 22
+Explain String
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+13:PROJECT ['bilateral_probe' AS scenario, count(*) AS row_count, coalesce(sum(t1.v), 0) AS t1_sum, coalesce(sum(t2.v), 0) AS t2_sum] stats={rows=1}
+  12:HASH AGGREGATE (GLOBAL) stats={rows=1}
+    aggregations: count(), sum(t1.v), sum(t2.v)
+    11:GATHER stats={rows=1}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    PARTITION: UNPARTITIONED
+10:HASH AGGREGATE (LOCAL) stats={rows=1}
+  aggregations: count(), sum(t1.v), sum(t2.v)
+  9:HASH JOIN (PARTITIONED, INNER, eq: [t2.k = t3.k]) stats={rows=151}
+    build runtime filters:
+    - filter_id = 1, build_expr = (t3.k)
+    6:HASH EXCHANGE stats={rows=300}
+    8:HASH EXCHANGE stats={rows=151}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 8
+    PARTITION: HASH_PARTITIONED (k)
+7:SCAN db_sqlt_86a41c39f84a4228.rf_dist_bi_t3 (alias=t3) stats={rows=151}
+     TABLE: db_sqlt_86a41c39f84a4228.rf_dist_bi_t3
+     columns: k, v
+     min-max stats
+     predicates: CAST(t3.v AS Int64) <= 150
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: HASH_PARTITIONED (k)
+5:HASH JOIN (PARTITIONED, INNER, eq: [t1.k = t2.k]) stats={rows=300}
+  build runtime filters:
+  - filter_id = 0, build_expr = (t2.k)
+  2:HASH EXCHANGE stats={rows=300}
+  4:HASH EXCHANGE stats={rows=300}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: HASH_PARTITIONED (k)
+3:SCAN db_sqlt_86a41c39f84a4228.rf_dist_bi_t2 (alias=t2) stats={rows=300}
+     TABLE: db_sqlt_86a41c39f84a4228.rf_dist_bi_t2
+     columns: k, v
+     min-max stats
+    probe runtime filters:
+    - filter_id = 1, probe_expr = (t2.k)
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 2
+    PARTITION: HASH_PARTITIONED (k)
+1:SCAN db_sqlt_86a41c39f84a4228.rf_dist_bi_t1 (alias=t1) stats={rows=300}
+     TABLE: db_sqlt_86a41c39f84a4228.rf_dist_bi_t1
+     columns: k, v
+     min-max stats
+    probe runtime filters:
+    - filter_id = 0, probe_expr = (t1.k)
+    - filter_id = 1, probe_expr = (t1.k)
