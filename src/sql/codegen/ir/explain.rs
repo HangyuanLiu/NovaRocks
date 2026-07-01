@@ -876,6 +876,12 @@ fn format_set_op_node(
 ) {
     let label = match set_op.kind {
         SetOpKind::UnionAll => "UNION ALL",
+        SetOpKind::UnionDistinct => {
+            // PIR-4 M3e expands UNION DISTINCT before distributed explain.
+            unreachable!(
+                "UnionDistinct is expanded to gather+distinct-agg in build_distributed_plan; see PIR-4 M3e"
+            )
+        }
         SetOpKind::Intersect => "INTERSECT",
         SetOpKind::Except => "EXCEPT",
     };

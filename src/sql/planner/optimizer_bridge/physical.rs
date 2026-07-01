@@ -215,14 +215,15 @@ impl BridgeCtx<'_> {
                 output_columns: op.output_columns.clone(),
             })),
             Operator::PhysicalUnion(op) => {
-                if !op.all {
-                    return Err(
-                        "Bridge 2a cannot model UNION DISTINCT without fragment rewrites"
-                            .to_string(),
-                    );
-                }
+                // PIR-4 M1 only carries the UNION DISTINCT semantic marker through Bridge 2a.
+                // The optimizer rewrite to aggregate is the real fix; builder-side expansion is M3e.
+                let kind = if op.all {
+                    PlanSetOpKind::UnionAll
+                } else {
+                    PlanSetOpKind::UnionDistinct
+                };
                 Ok(PhysicalPlanKind::SetOp(PhysicalSetOpNode {
-                    kind: PlanSetOpKind::UnionAll,
+                    kind,
                     output_columns: op.output_columns.clone(),
                     child_output_columns: op.child_output_columns.clone(),
                 }))
@@ -563,6 +564,17 @@ mod tests {
         }
     }
 
+    fn assert_output_columns_eq(actual: &[OutputColumn], expected: &[OutputColumn]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert_eq!(actual.column_id, expected.column_id);
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.data_type, expected.data_type);
+            assert_eq!(actual.nullable, expected.nullable);
+            assert_eq!(actual.is_internal, expected.is_internal);
+        }
+    }
+
     fn col_expr(id: u32, name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -860,6 +872,45 @@ mod tests {
         let err = optimizer_physical_to_plan(&node).expect_err("set-op metadata is required");
         assert!(err.contains("PhysicalUnion"));
         assert!(err.contains("child_output_columns metadata expected 2 entries, got 0"));
+    }
+
+    #[test]
+    fn bridge_translates_union_distinct_to_setop_marker() {
+        let output_columns = vec![output_column(1, "u")];
+        let child_output_columns = vec![vec![output_column(2, "c0")], vec![output_column(3, "c1")]];
+        let mut node = base_node(Operator::PhysicalUnion(UnionOp {
+            all: false,
+            output_columns: output_columns.clone(),
+            child_output_columns: child_output_columns.clone(),
+        }));
+        node.children.push(raw_values_node());
+        node.children.push(raw_values_node());
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let PhysicalPlanKind::SetOp(set_op) = physical.kind else {
+            panic!("expected SetOp");
+        };
+        assert_eq!(set_op.kind, PlanSetOpKind::UnionDistinct);
+        assert_output_columns_eq(&set_op.output_columns, &output_columns);
+        assert_eq!(
+            set_op.child_output_columns.len(),
+            child_output_columns.len()
+        );
+        for (actual, expected) in set_op
+            .child_output_columns
+            .iter()
+            .zip(child_output_columns.iter())
+        {
+            assert_output_columns_eq(actual, expected);
+        }
+        assert_eq!(physical.children.len(), 2);
+        assert!(
+            physical
+                .children
+                .iter()
+                .all(|child| matches!(child.kind, PhysicalPlanKind::Values(_)))
+        );
     }
 
     fn hash_join_with_runtime_filter(

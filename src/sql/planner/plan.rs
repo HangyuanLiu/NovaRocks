@@ -315,6 +315,7 @@ pub(crate) struct PhysicalNestLoopJoinNode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlanSetOpKind {
     UnionAll,
+    UnionDistinct,
     Intersect,
     Except,
 }

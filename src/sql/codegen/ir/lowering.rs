@@ -1859,6 +1859,12 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         node: &crate::sql::planner::DistributedPlanNode,
         set_op: &super::kind::PhysicalSetOpNode,
     ) -> Result<LoweredDistributedNode, String> {
+        if matches!(set_op.kind, super::kind::SetOpKind::UnionDistinct) {
+            return Err(
+                "UnionDistinct is expanded to gather+distinct-agg in build_distributed_plan; see PIR-4 M3e"
+                    .to_string(),
+            );
+        }
         if node.children.is_empty() {
             return Err("DistributedPlan SetOp has no inputs".to_string());
         }
@@ -4628,6 +4634,9 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         plan_node.node_id = set_op_node_id;
         plan_node.node_type = match kind {
             super::kind::SetOpKind::UnionAll => plan_nodes::TPlanNodeType::UNION_NODE,
+            super::kind::SetOpKind::UnionDistinct => unreachable!(
+                "UnionDistinct is expanded to gather+distinct-agg in build_distributed_plan; see PIR-4 M3e"
+            ),
             super::kind::SetOpKind::Intersect => plan_nodes::TPlanNodeType::INTERSECT_NODE,
             super::kind::SetOpKind::Except => plan_nodes::TPlanNodeType::EXCEPT_NODE,
         };
@@ -4639,6 +4648,9 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             super::kind::SetOpKind::UnionAll => {
                 plan_node.union_node = Some(tnode);
             }
+            super::kind::SetOpKind::UnionDistinct => unreachable!(
+                "UnionDistinct is expanded to gather+distinct-agg in build_distributed_plan; see PIR-4 M3e"
+            ),
             super::kind::SetOpKind::Intersect => {
                 plan_node.intersect_node = Some(plan_nodes::TIntersectNode {
                     tuple_id: tnode.tuple_id,
@@ -5162,7 +5174,7 @@ mod tests {
     use crate::sql::codegen::ir::kind::{
         DistributedExchangeNode, DistributedValuesNode, ExchangeFlavor,
         PhysicalHashAggregateNode as DistributedHashAggregateNode, PhysicalHashJoinEqCondition,
-        PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
+        PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode, SetOpKind,
     };
     use crate::sql::codegen::ir::{
         DataPartition, DataSink, DistributedPlan, DistributedPlanKind, DistributedPlanNode,
@@ -6010,6 +6022,66 @@ mod tests {
         assert_lowering_err(
             &disconnected_noop,
             "disconnected non-root fragment id=0 has no outgoing edge toward root fragment id=1",
+        );
+    }
+
+    #[test]
+    fn lower_set_op_node_rejects_union_distinct_before_lowering_children() {
+        let output_columns = vec![output_col(1, "u", DataType::Int64, false)];
+        let malformed_child = DistributedPlanNode {
+            node_id: 11,
+            fragment_id: 0,
+            tuple_ids: vec![11],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            execution_join_distribution: None,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+            children: vec![],
+            stats: PlanNodeStats::from_statistics(&Statistics::default()),
+            kind: DistributedPlanKind::SetOp(PhysicalSetOpNode {
+                kind: SetOpKind::UnionAll,
+                output_columns: output_columns.clone(),
+                child_output_columns: vec![],
+            }),
+        };
+        let root = DistributedPlanNode {
+            node_id: 10,
+            fragment_id: 0,
+            tuple_ids: vec![10],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            execution_join_distribution: None,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+            children: vec![malformed_child],
+            stats: PlanNodeStats::from_statistics(&Statistics::default()),
+            kind: DistributedPlanKind::SetOp(PhysicalSetOpNode {
+                kind: SetOpKind::UnionDistinct,
+                output_columns: output_columns.clone(),
+                child_output_columns: vec![output_columns.clone()],
+            }),
+        };
+        let dp = DistributedPlan {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root,
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns,
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+            scalar_arena: Arc::new(ScalarArena::new()),
+        };
+
+        assert_lowering_err(
+            &dp,
+            "UnionDistinct is expanded to gather+distinct-agg in build_distributed_plan; see PIR-4 M3e",
         );
     }
 
