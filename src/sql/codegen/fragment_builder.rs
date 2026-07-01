@@ -5355,7 +5355,7 @@ mod tests {
     }
 
     #[test]
-    fn union_distinct_gathers_before_codegen_distinct_aggregate() {
+    fn residual_union_distinct_is_rejected_before_fragment_codegen() {
         let union_output = output_col_for_test(9351, "u", DataType::Int32, true);
         let union_left = output_col_for_test(9352, "u", DataType::Int32, true);
         let union_right = output_col_for_test(9353, "u", DataType::Int32, true);
@@ -5372,44 +5372,18 @@ mod tests {
             vec![union_output],
         );
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let err = match PlanFragmentBuilder::build_via_distributed_plan(
             &plan,
             &DummyCatalog,
             &crate::connector::ConnectorRegistry::new(),
             "default",
-        )
-        .expect("build");
-
-        assert_eq!(
-            build.edges.len(),
-            1,
-            "UNION DISTINCT must gather branch output before global dedup"
-        );
-        assert!(matches!(
-            build.edges[0].edge_kind,
-            crate::sql::codegen::FragmentEdgeKind::Stream
-        ));
-        assert_eq!(
-            build.edges[0].output_partition.type_,
-            crate::thrift::partitions::TPartitionType::UNPARTITIONED
-        );
-
-        let root = build
-            .fragment_results
-            .iter()
-            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
-            .expect("root fragment");
+        ) {
+            Ok(_) => panic!("residual UNION DISTINCT should be rejected"),
+            Err(err) => err,
+        };
         assert!(
-            root.plan
-                .nodes
-                .iter()
-                .any(|node| node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE)
-        );
-        assert!(
-            root.plan
-                .nodes
-                .iter()
-                .any(|node| node.node_type == plan_nodes::TPlanNodeType::AGGREGATION_NODE)
+            err.contains("UNION DISTINCT must be rewritten by UnionDistinctToAggregate"),
+            "unexpected error: {err}"
         );
     }
 
