@@ -206,6 +206,7 @@ struct RuntimeFilterEntry {
     dep: DependencyHandle,
     handle: RuntimeFilterHandle,
     complete: AtomicBool,
+    release_reason: Mutex<Option<RuntimeFilterUnavailableReason>>,
     membership_seen: Mutex<HashSet<i32>>,
 }
 
@@ -215,7 +216,6 @@ struct RuntimeFilterProbeInner {
     wait_timeout: Option<Duration>,
     wait_start: Mutex<Option<Instant>>,
     timeout_armed: AtomicBool,
-    release_reason: Mutex<Option<RuntimeFilterUnavailableReason>>,
 }
 
 enum RuntimeFilterUpdate {
@@ -427,7 +427,6 @@ impl RuntimeFilterHub {
                 wait_timeout,
                 wait_start: Mutex::new(None),
                 timeout_armed: AtomicBool::new(false),
-                release_reason: Mutex::new(None),
             }),
         }
     }
@@ -662,6 +661,7 @@ impl RuntimeFilterHub {
             dep,
             handle: RuntimeFilterHandle::new(),
             complete: AtomicBool::new(false),
+            release_reason: Mutex::new(None),
             membership_seen: Mutex::new(HashSet::new()),
         });
         guard.insert(node_id, Arc::clone(&entry));
@@ -829,6 +829,7 @@ impl RuntimeFilterProbe {
         }
         let reason = self
             .inner
+            .entry
             .release_reason
             .lock()
             .expect("runtime filter release reason lock")
@@ -840,6 +841,7 @@ impl RuntimeFilterProbe {
         let reason = {
             let mut guard = self
                 .inner
+                .entry
                 .release_reason
                 .lock()
                 .expect("runtime filter release reason lock");
@@ -1086,6 +1088,59 @@ mod tests {
                 assert_eq!(reason, RuntimeFilterUnavailableReason::NoWaitConfigured);
             }
             other => panic!("expected frozen no-wait unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_acquire_no_wait_reason_is_shared_across_probes() {
+        let hub = registered_hub_with_timeouts(None, None);
+        let first_probe = hub.register_probe(42);
+        let second_probe = hub.register_probe(42);
+
+        match first_probe.poll_acquire(true) {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Unavailable(reason)) => {
+                assert_eq!(reason, RuntimeFilterUnavailableReason::NoWaitConfigured);
+            }
+            other => panic!("expected first probe no-wait unavailable, got {other:?}"),
+        }
+
+        match second_probe.poll_acquire(true) {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Unavailable(reason)) => {
+                assert_eq!(reason, RuntimeFilterUnavailableReason::NoWaitConfigured);
+            }
+            other => panic!("expected second probe shared no-wait reason, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_acquire_timeout_is_unavailable_and_frozen() {
+        let hub = registered_hub_with_timeouts(
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_millis(1)),
+        );
+        let probe = hub.register_probe(42);
+
+        let dep = match probe.poll_acquire(true) {
+            AcquireProgress::Pending(dep) => dep,
+            other => panic!("expected pending before timeout, got {other:?}"),
+        };
+
+        wait_until_ready(&dep, Duration::from_millis(200));
+
+        match probe.poll_acquire(true) {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Unavailable(reason)) => {
+                assert_eq!(reason, RuntimeFilterUnavailableReason::Timeout);
+            }
+            other => panic!("expected timeout unavailable, got {other:?}"),
+        }
+
+        hub.publish_filters(&[], &[test_membership_filter(7)]);
+
+        match probe.poll_acquire(true) {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Unavailable(reason)) => {
+                assert_eq!(reason, RuntimeFilterUnavailableReason::Timeout);
+            }
+            other => panic!("expected frozen timeout unavailable, got {other:?}"),
         }
     }
 
