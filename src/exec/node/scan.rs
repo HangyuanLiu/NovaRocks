@@ -29,7 +29,7 @@ use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, Runt
 use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::warn;
 use crate::runtime::profile::RuntimeProfile;
-use crate::runtime::runtime_filter_hub::{RuntimeFilterHandle, RuntimeFilterSnapshot};
+use crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot;
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {
@@ -185,9 +185,7 @@ enum RuntimeFilterContextInner {
     Static {
         in_filters: Vec<RuntimeInFilter>,
         membership_filters: Vec<RuntimeMembershipFilter>,
-    },
-    Handle {
-        handle: RuntimeFilterHandle,
+        min_max_filters: Vec<(i32, Arc<RuntimeMinMaxFilter>)>,
     },
 }
 
@@ -200,13 +198,26 @@ impl RuntimeFilterContext {
             inner: RuntimeFilterContextInner::Static {
                 in_filters,
                 membership_filters,
+                min_max_filters: Vec::new(),
             },
         }
     }
 
-    pub(crate) fn from_handle(handle: RuntimeFilterHandle) -> Self {
+    pub(crate) fn from_snapshot(snapshot: RuntimeFilterSnapshot) -> Self {
         Self {
-            inner: RuntimeFilterContextInner::Handle { handle },
+            inner: RuntimeFilterContextInner::Static {
+                in_filters: snapshot
+                    .in_filters()
+                    .iter()
+                    .map(|filter| filter.as_ref().clone())
+                    .collect(),
+                membership_filters: snapshot
+                    .membership_filters()
+                    .iter()
+                    .map(|filter| filter.as_ref().clone())
+                    .collect(),
+                min_max_filters: snapshot.min_max_filters().to_vec(),
+            },
         }
     }
 
@@ -215,10 +226,15 @@ impl RuntimeFilterContext {
             RuntimeFilterContextInner::Static {
                 in_filters,
                 membership_filters,
+                min_max_filters,
             } => {
-                RuntimeFilterSnapshot::from_filters(in_filters.clone(), membership_filters.clone())
+                let mut snapshot = RuntimeFilterSnapshot::from_filters(
+                    in_filters.clone(),
+                    membership_filters.clone(),
+                );
+                snapshot.min_max_filters = min_max_filters.clone();
+                snapshot
             }
-            RuntimeFilterContextInner::Handle { handle } => handle.snapshot(),
         }
     }
 
@@ -229,10 +245,9 @@ impl RuntimeFilterContext {
 
     pub(crate) fn min_max_filters(&self) -> Vec<(i32, Arc<RuntimeMinMaxFilter>)> {
         match &self.inner {
-            RuntimeFilterContextInner::Static { .. } => Vec::new(),
-            RuntimeFilterContextInner::Handle { handle } => {
-                handle.snapshot().min_max_filters.clone()
-            }
+            RuntimeFilterContextInner::Static {
+                min_max_filters, ..
+            } => min_max_filters.clone(),
         }
     }
 }
@@ -577,5 +592,31 @@ impl std::fmt::Debug for ScanNode {
         f.debug_struct("ScanNode")
             .field("node_id", &self.node_id)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::RuntimeFilterContext;
+    use crate::exec::runtime_filter::{RuntimeFilterType, RuntimeMinMaxFilter};
+    use crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot;
+
+    #[test]
+    fn runtime_filter_context_from_snapshot_preserves_min_max_filters() {
+        let mut snapshot = RuntimeFilterSnapshot::from_filters(Vec::new(), Vec::new());
+        snapshot.min_max_filters.push((
+            7,
+            Arc::new(
+                RuntimeMinMaxFilter::empty_range(RuntimeFilterType::Int32)
+                    .expect("empty min/max filter"),
+            ),
+        ));
+
+        let ctx = RuntimeFilterContext::from_snapshot(snapshot);
+
+        assert_eq!(ctx.snapshot().min_max_filters().len(), 1);
+        assert_eq!(ctx.min_max_filters().len(), 1);
     }
 }
