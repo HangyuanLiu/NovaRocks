@@ -18,10 +18,14 @@ pub(crate) use distributed_build::build_distributed_plan;
 pub(crate) use distributed_fragment::{
     DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment,
 };
+#[allow(unused_imports)]
+pub(crate) use distributed_node::{DistributedNode, DistributedPayload, ExchangeReceiver};
 pub(crate) use distributed_node::{DistributedPlanKind, DistributedPlanNode, PlanNodeStats};
 pub(crate) use runtime_filter::{
     JoinExecutionMode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };
+#[allow(unused_imports)]
+pub(crate) use runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
 pub(crate) use stats::{
     PhysicalPlanStats, PlannerBroadcastDecision, PlannerColumnStatistic, PlannerConfidence,
     PlannerCostEstimate,
