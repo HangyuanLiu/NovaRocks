@@ -42,6 +42,11 @@ impl ImvStatelessLevel {
 pub struct ImvStatelessDirective {
     pub mv: String,
     pub level: ImvStatelessLevel,
+    /// Catalog that hosts the `system.novarocks_imv_stateless_rebuild`
+    /// procedure and the target MV. Defaults to `ice` when unset, so
+    /// REST-catalog cases can omit it; per-case hadoop catalogs (e.g.
+    /// `mv_ice_${uuid0}`) must set it explicitly.
+    pub catalog: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]

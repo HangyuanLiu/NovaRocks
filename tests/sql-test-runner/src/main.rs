@@ -762,8 +762,9 @@ fn execute_required_query(
 }
 
 /// Parse the `AvailableLevel` value out of the first row/column of the
-/// `CALL ice.system.novarocks_imv_stateless_rebuild(...)` result. Matching is
-/// case-insensitive since the value crosses a wire boundary from the server.
+/// `CALL <catalog>.system.novarocks_imv_stateless_rebuild(...)` result.
+/// Matching is case-insensitive since the value crosses a wire boundary from
+/// the server.
 fn parse_available_stateless_level(
     exec: &crate::types::QueryExecution,
 ) -> Result<ImvStatelessLevel, String> {
@@ -810,8 +811,9 @@ fn run_imv_stateless_rebuild_check(
     );
     let before = execute_required_query(session, query_timeout, &select)?;
 
+    let catalog = directive.catalog.as_deref().unwrap_or("ice");
     let call = format!(
-        "CALL ice.system.novarocks_imv_stateless_rebuild(table => '{fqn}', level => '{}')",
+        "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => '{fqn}', level => '{}')",
         directive.level.as_sql()
     );
     let _ = writeln!(log, "    @imv_stateless_rebuild: {call}");

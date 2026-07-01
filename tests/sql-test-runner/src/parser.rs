@@ -69,19 +69,23 @@ fn parse_imv_stateless_rebuild(raw: &str) -> anyhow::Result<ImvStatelessDirectiv
         .ok_or_else(|| anyhow::anyhow!("@imv_stateless_rebuild requires an MV name"))?
         .to_string();
     let mut level = ImvStatelessLevel::Package;
+    let mut catalog = None;
     for part in parts {
-        let Some(value) = part.strip_prefix("level=") else {
+        if let Some(value) = part.strip_prefix("level=") {
+            level = match value {
+                "baseline" => ImvStatelessLevel::Baseline,
+                "package" => ImvStatelessLevel::Package,
+                "provenance" => ImvStatelessLevel::Provenance,
+                "full" => ImvStatelessLevel::Full,
+                other => anyhow::bail!("unknown @imv_stateless_rebuild level `{other}`"),
+            };
+        } else if let Some(value) = part.strip_prefix("catalog=") {
+            catalog = Some(value.to_string());
+        } else {
             anyhow::bail!("unknown @imv_stateless_rebuild option `{part}`");
-        };
-        level = match value {
-            "baseline" => ImvStatelessLevel::Baseline,
-            "package" => ImvStatelessLevel::Package,
-            "provenance" => ImvStatelessLevel::Provenance,
-            "full" => ImvStatelessLevel::Full,
-            other => anyhow::bail!("unknown @imv_stateless_rebuild level `{other}`"),
-        };
+        }
     }
-    Ok(ImvStatelessDirective { mv, level })
+    Ok(ImvStatelessDirective { mv, level, catalog })
 }
 
 fn detect_case_sequential(lines: &[String], file_meta_lines: &[String], meta_re: &Regex) -> bool {
@@ -766,6 +770,18 @@ mod opt5_directive_tests {
         let directive = meta.imv_stateless_rebuild.as_ref().expect("directive");
         assert_eq!(directive.mv, "orders_mv");
         assert_eq!(directive.level, ImvStatelessLevel::Baseline);
+    }
+
+    #[test]
+    fn parse_meta_collects_imv_stateless_rebuild_with_catalog_and_level() {
+        let re = meta_re();
+        let lines =
+            vec!["-- @imv_stateless_rebuild=orders_mv,catalog=mv_ice_x,level=package".to_string()];
+        let meta = parse_meta(&lines, &re).expect("parse");
+        let d = meta.imv_stateless_rebuild.as_ref().expect("directive");
+        assert_eq!(d.mv, "orders_mv");
+        assert_eq!(d.level, ImvStatelessLevel::Package);
+        assert_eq!(d.catalog.as_deref(), Some("mv_ice_x"));
     }
 
     #[test]
