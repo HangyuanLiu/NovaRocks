@@ -12869,6 +12869,7 @@ fn build_join_incremental_refresh_logical_plan(
                 outcome.plan,
                 &descriptor,
                 &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_rewrite_context(&ctx.rewrite),
+                &mut factory,
                 locator_columns.net,
                 locator_columns.file,
                 locator_columns.pos,
@@ -16408,6 +16409,72 @@ mod tests {
     }
 
     #[test]
+    fn join_coalesce_builder_factory_metadata_survives_rewritten_plan_reserve() {
+        let desc = join_coalesce_factory_test_descriptor();
+        let branch_union = join_coalesce_factory_test_branch_union(&desc);
+        let locator =
+            crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                target_table_uuid: "target-uuid".to_string(),
+                target_snapshot_id: Some(77),
+            };
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        factory.reserve_until(109);
+        let locator_columns =
+            allocate_join_coalesce_locator_column_ids(&mut factory, &branch_union)
+                .expect("allocate locator column ids");
+
+        let plan =
+            crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+                branch_union,
+                &desc,
+                &locator,
+                &mut factory,
+                locator_columns.net,
+                locator_columns.file,
+                locator_columns.pos,
+                locator_columns.row_id,
+                locator_columns.last_updated_sequence_number,
+            )
+            .expect("join coalesce plan");
+        reserve_factory_for_logical_plan(&mut factory, &plan)
+            .expect("reserve rewritten plan outputs");
+
+        let watched_columns =
+            collect_join_coalesce_factory_watch_columns(&plan, ColumnId(locator_columns.net));
+        let watched_names = watched_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<BTreeSet<_>>();
+        for expected in [
+            "net",
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            "__pending_insert_count",
+            "__pending_delete_count",
+            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        ] {
+            assert!(
+                watched_names.contains(expected),
+                "missing watched column {expected}; watched={watched_columns:?}"
+            );
+        }
+        for column in watched_columns {
+            let metadata = factory.get(column.column_id);
+            assert!(
+                !metadata.name.starts_with("__reserved_col_"),
+                "column {} leaked reserved metadata {:?}",
+                column.name,
+                metadata
+            );
+            assert_eq!(metadata.name, column.name);
+            assert_eq!(metadata.data_type, column.data_type);
+            assert_eq!(metadata.nullable, column.nullable);
+        }
+    }
+
+    #[test]
     fn refresh_contract_selects_fan_in_aggregate_for_a_family() {
         let env = open_test_state_with_hadoop_iceberg_catalog("ice_fan_in", "sales");
         create_aggregate_fact_table(&env.state, "ice_fan_in", "sales", "t1");
@@ -17407,6 +17474,238 @@ mod tests {
             data_type: ty,
             nullable,
             is_internal: false,
+        }
+    }
+
+    fn join_coalesce_factory_test_descriptor()
+    -> crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor {
+        use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
+            JoinRefreshBranchDescriptor, JoinRefreshBranchSide, JoinRefreshDescriptor,
+            JoinRefreshJoinKeyPair, JoinRefreshMode, JoinRefreshMvIdentity,
+            JoinRefreshOutputMapping, JoinRefreshOutputSource,
+        };
+
+        let payload = join_coalesce_factory_test_column(1, "id", DataType::Int32, false, false);
+        let payload_output =
+            join_coalesce_factory_test_column(80, "id", DataType::Int32, false, false);
+        let action = join_coalesce_factory_test_column(
+            4,
+            crate::exec::change_op::CHANGE_OP_COLUMN,
+            DataType::Int8,
+            false,
+            true,
+        );
+        let action_output = join_coalesce_factory_test_column(
+            91,
+            crate::exec::change_op::CHANGE_OP_COLUMN,
+            DataType::Int8,
+            false,
+            true,
+        );
+        let join_apply_key = join_coalesce_factory_test_column(
+            5,
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            DataType::Utf8,
+            false,
+            true,
+        );
+        let join_apply_key_output = join_coalesce_factory_test_column(
+            90,
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            DataType::Utf8,
+            false,
+            true,
+        );
+
+        JoinRefreshDescriptor {
+            mode: JoinRefreshMode::Coalesce,
+            mv_identity: JoinRefreshMvIdentity {
+                catalog: "ice".to_string(),
+                database: "sales".to_string(),
+                name: "mv_join".to_string(),
+            },
+            left_base_fqn: "ice.sales.left_orders".to_string(),
+            right_base_fqn: "ice.sales.right_orders".to_string(),
+            left_row_id_column: join_coalesce_factory_test_column(
+                2,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+                true,
+            ),
+            right_row_id_column: join_coalesce_factory_test_column(
+                3,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+                true,
+            ),
+            action_column: action.clone(),
+            join_apply_key_column: join_apply_key.clone(),
+            payload_columns: vec![payload.clone()],
+            join_key_pairs: vec![JoinRefreshJoinKeyPair {
+                left_column: join_coalesce_factory_test_column(
+                    6,
+                    "left_id",
+                    DataType::Int32,
+                    false,
+                    false,
+                ),
+                right_column: join_coalesce_factory_test_column(
+                    7,
+                    "right_id",
+                    DataType::Int32,
+                    false,
+                    false,
+                ),
+            }],
+            output_mappings: vec![
+                JoinRefreshOutputMapping {
+                    mv_output_column: payload_output,
+                    source: JoinRefreshOutputSource::Payload(payload.column_id),
+                },
+                JoinRefreshOutputMapping {
+                    mv_output_column: join_apply_key_output,
+                    source: JoinRefreshOutputSource::JoinApplyKey(join_apply_key.column_id),
+                },
+                JoinRefreshOutputMapping {
+                    mv_output_column: action_output,
+                    source: JoinRefreshOutputSource::Action(action.column_id),
+                },
+            ],
+            branches: vec![
+                JoinRefreshBranchDescriptor {
+                    side: JoinRefreshBranchSide::LeftDeltaRightSnapshot,
+                    action_column_id: action.column_id,
+                },
+                JoinRefreshBranchDescriptor {
+                    side: JoinRefreshBranchSide::LeftSnapshotRightDelta,
+                    action_column_id: action.column_id,
+                },
+            ],
+            needs_target_locator: true,
+        }
+    }
+
+    fn join_coalesce_factory_test_branch_union(
+        desc: &crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor,
+    ) -> crate::sql::planner::plan::LogicalPlanNode {
+        let mut output_columns = desc.payload_columns.clone();
+        output_columns.push(desc.action_column.clone());
+        output_columns.push(desc.join_apply_key_column.clone());
+        let branch = crate::sql::planner::plan::LogicalPlanNode::new(
+            crate::sql::planner::plan::LogicalPlanKind::Values(
+                crate::sql::planner::plan::LogicalValuesNode {
+                    rows: Vec::new(),
+                    columns: output_columns.clone(),
+                },
+            ),
+            Vec::new(),
+            None,
+        );
+        crate::sql::planner::plan::LogicalPlanNode::new(
+            crate::sql::planner::plan::LogicalPlanKind::Union(
+                crate::sql::planner::plan::LogicalUnionNode {
+                    all: true,
+                    output_columns,
+                },
+            ),
+            vec![branch.clone(), branch],
+            None,
+        )
+    }
+
+    fn collect_join_coalesce_factory_watch_columns(
+        plan: &crate::sql::planner::plan::LogicalPlanNode,
+        min_id: ColumnId,
+    ) -> Vec<OutputColumn> {
+        let mut columns = Vec::new();
+        collect_join_coalesce_factory_watch_columns_inner(plan, min_id, &mut columns);
+        columns
+    }
+
+    fn collect_join_coalesce_factory_watch_columns_inner(
+        plan: &crate::sql::planner::plan::LogicalPlanNode,
+        min_id: ColumnId,
+        columns: &mut Vec<OutputColumn>,
+    ) {
+        match &plan.kind {
+            crate::sql::planner::plan::LogicalPlanKind::Project(project) => {
+                columns.extend(project.items.iter().filter_map(|item| {
+                    is_join_coalesce_factory_locator_output(&item.output_name).then(|| {
+                        OutputColumn {
+                            column_id: item.output_column_id,
+                            name: item.output_name.clone(),
+                            data_type: item.expr.data_type.clone(),
+                            nullable: item.expr.nullable,
+                            is_internal: true,
+                        }
+                    })
+                }));
+            }
+            crate::sql::planner::plan::LogicalPlanKind::Aggregate(aggregate) => {
+                columns.extend(
+                    aggregate
+                        .output_columns
+                        .iter()
+                        .filter(|column| {
+                            column.column_id >= min_id
+                                && is_join_coalesce_factory_internal_output(&column.name)
+                        })
+                        .cloned(),
+                );
+            }
+            crate::sql::planner::plan::LogicalPlanKind::Scan(scan) => {
+                columns.extend(
+                    scan.columns
+                        .iter()
+                        .filter(|column| {
+                            column.column_id >= min_id
+                                && column.name == ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+                        })
+                        .cloned(),
+                );
+            }
+            _ => {}
+        }
+        for child in &plan.children {
+            collect_join_coalesce_factory_watch_columns_inner(child, min_id, columns);
+        }
+    }
+
+    fn is_join_coalesce_factory_internal_output(name: &str) -> bool {
+        matches!(
+            name,
+            "net"
+                | ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+                | "__pending_insert_count"
+                | "__pending_delete_count"
+        )
+    }
+
+    fn is_join_coalesce_factory_locator_output(name: &str) -> bool {
+        matches!(
+            name,
+            crate::exec::row_position::ICEBERG_FILE_PATH_COL
+                | crate::exec::row_position::ICEBERG_ROW_POS_COL
+                | crate::exec::row_position::ICEBERG_ROW_ID_COL
+                | crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+        )
+    }
+
+    fn join_coalesce_factory_test_column(
+        id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        is_internal: bool,
+    ) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId(id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal,
         }
     }
 

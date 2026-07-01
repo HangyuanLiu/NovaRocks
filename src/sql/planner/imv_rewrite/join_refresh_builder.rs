@@ -6,7 +6,7 @@ use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };
 use crate::sql::catalog::{ColumnDef, IcebergMvTargetLocatorScan, ScanSource, TableDef};
-use crate::sql::column_id::ColumnId;
+use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
     JoinRefreshDescriptor, JoinRefreshMode, JoinRefreshOutputMapping, JoinRefreshOutputSource,
 };
@@ -120,6 +120,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
     branch_union: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
     locator: &JoinRefreshTargetLocatorBinding,
+    column_ref_factory: &mut ColumnRefFactory,
     net_column_id: u32,
     locator_file_column_id: u32,
     locator_pos_column_id: u32,
@@ -176,34 +177,35 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ),
     ];
     validate_generated_column_ids(&input_columns, desc, &explicit_generated_ids)?;
-    let mut allocator = LocalColumnIdAllocator::new(
-        existing_coalesce_column_ids(&input_columns, desc)
-            .into_iter()
-            .chain(explicit_generated_ids.iter().map(|(_, id)| *id)),
-    );
     let net_column = output_column(ColumnId(net_column_id), "net", DataType::Int64, false, true);
-    let key_shape_apply_key = output_column(
-        allocator.allocate(),
+    let key_shape_apply_key = output_column_from_factory(
+        column_ref_factory,
         &apply_key_output.name,
         apply_key_output.data_type.clone(),
         apply_key_output.nullable,
         apply_key_output.is_internal,
     );
-    let pending_insert_count = output_column(
-        allocator.allocate(),
+    let pending_insert_count = output_column_from_factory(
+        column_ref_factory,
         "__pending_insert_count",
         DataType::Int64,
         false,
         true,
     );
-    let pending_delete_count = output_column(
-        allocator.allocate(),
+    let pending_delete_count = output_column_from_factory(
+        column_ref_factory,
         "__pending_delete_count",
         DataType::Int64,
         false,
         true,
     );
-    let locator_apply_key_id = allocator.allocate();
+    let locator_apply_key = output_column_from_factory(
+        column_ref_factory,
+        &apply_key_input.name,
+        apply_key_input.data_type.clone(),
+        apply_key_input.nullable,
+        false,
+    );
     let aggregate = build_payload_coalesce_aggregate(
         branch_union,
         &payload_inputs,
@@ -226,7 +228,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         locator,
         &apply_key_input,
         &net_column,
-        locator_apply_key_id,
+        locator_apply_key.column_id,
         ColumnId(locator_file_column_id),
         ColumnId(locator_pos_column_id),
         ColumnId(locator_row_id_column_id),
@@ -866,32 +868,15 @@ fn output_column(
     }
 }
 
-struct LocalColumnIdAllocator {
-    used: BTreeSet<ColumnId>,
-    next: u32,
-}
-
-impl LocalColumnIdAllocator {
-    fn new(used: impl IntoIterator<Item = ColumnId>) -> Self {
-        let used = used.into_iter().collect::<BTreeSet<_>>();
-        let next = used
-            .iter()
-            .map(|id| id.0)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        Self { used, next }
-    }
-
-    fn allocate(&mut self) -> ColumnId {
-        loop {
-            let id = ColumnId(self.next);
-            self.next = self.next.saturating_add(1);
-            if id != ColumnId::UNSET && self.used.insert(id) {
-                return id;
-            }
-        }
-    }
+fn output_column_from_factory(
+    factory: &mut ColumnRefFactory,
+    name: &str,
+    data_type: DataType,
+    nullable: bool,
+    is_internal: bool,
+) -> OutputColumn {
+    let column_id = factory.create(None, name.to_string(), data_type.clone(), nullable);
+    output_column(column_id, name, data_type, nullable, is_internal)
 }
 
 fn binary(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
@@ -1302,11 +1287,13 @@ mod tests {
     fn coalesce_plan_contains_aggregate_and_target_locator_join() {
         let desc = test_coalesce_descriptor();
         let branch_union = test_branch_union(&desc);
+        let mut factory = test_coalesce_factory();
 
         let plan = super::build_join_delta_coalesce_plan_with_locator(
             branch_union,
             &desc,
             &test_locator_binding(),
+            &mut factory,
             100,
             101,
             102,
@@ -1326,14 +1313,49 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_plan_query_rewrite_keeps_aggregate_args_in_child_scope() {
+    fn coalesce_plan_registers_factory_metadata_for_internal_columns() {
         let desc = test_coalesce_descriptor();
         let branch_union = test_branch_union(&desc);
+        let mut factory = test_coalesce_factory();
 
         let plan = super::build_join_delta_coalesce_plan_with_locator(
             branch_union,
             &desc,
             &test_locator_binding(),
+            &mut factory,
+            100,
+            101,
+            102,
+            103,
+            104,
+        )
+        .expect("coalesce plan");
+
+        let generated_columns = collect_generated_coalesce_columns(&plan);
+        assert_eq!(
+            generated_columns.len(),
+            4,
+            "expected key-shape apply key, two pending counts, and locator apply key"
+        );
+        for column in generated_columns {
+            let metadata = factory.get(column.column_id);
+            assert_eq!(metadata.name, column.name);
+            assert_eq!(metadata.data_type, column.data_type);
+            assert_eq!(metadata.nullable, column.nullable);
+        }
+    }
+
+    #[test]
+    fn coalesce_plan_query_rewrite_keeps_aggregate_args_in_child_scope() {
+        let desc = test_coalesce_descriptor();
+        let branch_union = test_branch_union(&desc);
+        let mut factory = test_coalesce_factory();
+
+        let plan = super::build_join_delta_coalesce_plan_with_locator(
+            branch_union,
+            &desc,
+            &test_locator_binding(),
+            &mut factory,
             100,
             101,
             102,
@@ -1351,11 +1373,13 @@ mod tests {
     fn coalesce_plan_lowers_after_physical_optimization() {
         let desc = test_coalesce_descriptor();
         let branch_union = test_branch_union(&desc);
+        let mut factory = test_coalesce_factory();
 
         let plan = super::build_join_delta_coalesce_plan_with_locator(
             branch_union,
             &desc,
             &test_locator_binding(),
+            &mut factory,
             100,
             101,
             102,
@@ -1387,11 +1411,13 @@ mod tests {
     fn coalesce_plan_rejects_descriptor_without_locator() {
         let mut desc = test_coalesce_descriptor();
         desc.needs_target_locator = false;
+        let mut factory = test_coalesce_factory();
 
         let err = super::build_join_delta_coalesce_plan_with_locator(
             test_branch_union(&desc),
             &desc,
             &test_locator_binding(),
+            &mut factory,
             100,
             101,
             102,
@@ -1406,10 +1432,12 @@ mod tests {
     #[test]
     fn coalesce_plan_rejects_generated_column_id_collision() {
         let desc = test_coalesce_descriptor();
+        let mut factory = test_coalesce_factory();
         let err = super::build_join_delta_coalesce_plan_with_locator(
             test_branch_union(&desc),
             &desc,
             &test_locator_binding(),
+            &mut factory,
             80,
             101,
             102,
@@ -1424,10 +1452,12 @@ mod tests {
     #[test]
     fn coalesce_plan_rejects_duplicate_generated_column_ids() {
         let desc = test_coalesce_descriptor();
+        let mut factory = test_coalesce_factory();
         let err = super::build_join_delta_coalesce_plan_with_locator(
             test_branch_union(&desc),
             &desc,
             &test_locator_binding(),
+            &mut factory,
             100,
             100,
             102,
@@ -1447,11 +1477,13 @@ mod tests {
         ] {
             let mut desc = test_coalesce_descriptor();
             desc.output_mappings[0].mv_output_column.name = reserved.to_string();
+            let mut factory = test_coalesce_factory();
 
             let err = super::build_join_delta_coalesce_plan_with_locator(
                 test_branch_union(&desc),
                 &desc,
                 &test_locator_binding(),
+                &mut factory,
                 100,
                 101,
                 102,
@@ -1596,6 +1628,57 @@ mod tests {
             return Some(locator);
         }
         plan.children.iter().find_map(find_target_locator_scan)
+    }
+
+    fn collect_generated_coalesce_columns(plan: &LogicalPlanNode) -> Vec<OutputColumn> {
+        let mut columns = Vec::new();
+        collect_generated_coalesce_columns_inner(plan, &mut columns);
+        columns
+    }
+
+    fn collect_generated_coalesce_columns_inner(
+        plan: &LogicalPlanNode,
+        columns: &mut Vec<OutputColumn>,
+    ) {
+        match &plan.kind {
+            LogicalPlanKind::Aggregate(aggregate) => {
+                columns.extend(
+                    aggregate
+                        .output_columns
+                        .iter()
+                        .filter(|column| is_generated_coalesce_column(column))
+                        .cloned(),
+                );
+            }
+            LogicalPlanKind::Scan(scan) => {
+                columns.extend(
+                    scan.columns
+                        .iter()
+                        .filter(|column| is_generated_coalesce_column(column))
+                        .cloned(),
+                );
+            }
+            _ => {}
+        }
+        for child in &plan.children {
+            collect_generated_coalesce_columns_inner(child, columns);
+        }
+    }
+
+    fn is_generated_coalesce_column(column: &OutputColumn) -> bool {
+        column.column_id.0 > 104
+            && matches!(
+                column.name.as_str(),
+                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+                    | "__pending_insert_count"
+                    | "__pending_delete_count"
+            )
+    }
+
+    fn test_coalesce_factory() -> crate::sql::column_id::ColumnRefFactory {
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        factory.reserve_until(109);
+        factory
     }
 
     fn test_locator_binding() -> super::JoinRefreshTargetLocatorBinding {
