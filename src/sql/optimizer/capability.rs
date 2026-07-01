@@ -59,7 +59,7 @@ pub(crate) fn propagate_representation(
                 property.insert(set.remapped_to_output(
                     item.output_column_id,
                     &item.output_name,
-                    set.logical_column.nullable,
+                    arena.nullable(item.expr),
                 ));
             }
             property
@@ -84,7 +84,10 @@ pub(crate) fn propagate_representation(
             };
             let mut property = RepresentationProperty::default();
 
-            // Group-by keys, index-aligned with output_layout.group_key_columns.
+            // Invariant: group_by[i] is index-aligned with
+            // output_layout.group_key_columns[i] (the aggregate builders
+            // construct them in lockstep); a length mismatch safely drops via
+            // `.get(index)`.
             for (index, key) in agg.group_by.iter().enumerate() {
                 let Some(out_col) = agg.output_layout.group_key_columns.get(index) else {
                     continue;

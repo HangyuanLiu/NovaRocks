@@ -87,6 +87,9 @@ pub(crate) struct ColumnRepresentationSet {
 
 impl ColumnRepresentationSet {
     /// The dictionary representation carried by this column, if any.
+    ///
+    /// A set carries at most one `DictInt32` representation today, so returning
+    /// the first match is unambiguous.
     pub(crate) fn dictionary_representation(&self) -> Option<&DictInt32Representation> {
         self.representations
             .iter()
@@ -211,6 +214,9 @@ pub(crate) fn test_dictionary_snapshot(order_preserving: bool) -> Arc<Dictionary
     })
 }
 
+/// A dictionary-backed representation set fixture. The column names/types
+/// (`city` / `Utf8` / `city_dict` / `Int32`) are arbitrary test values; only
+/// the column-id wiring and `order_preserving` flag are meaningful to callers.
 #[cfg(test)]
 pub(crate) fn test_dict_representation_set(
     logical_column_id: ColumnId,
@@ -245,10 +251,7 @@ mod tests {
 
     use super::*;
     use crate::sql::catalog::{ScanSource, TableDef};
-    use crate::sql::common::{
-        DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue, DictionaryWatermark,
-        OutputColumn, ScanDictionaryColumn,
-    };
+    use crate::sql::common::{DictionarySnapshot, OutputColumn, ScanDictionaryColumn};
     use crate::sql::optimizer::operator::ScanOp;
 
     #[test]
@@ -436,29 +439,7 @@ mod tests {
     }
 
     fn test_snapshot() -> Arc<DictionarySnapshot> {
-        Arc::new(DictionarySnapshot {
-            dictionary_id: 7,
-            owner: DictionaryOwner::StarRocksTable {
-                database: "db".to_string(),
-                table: "tbl".to_string(),
-                db_id: 11,
-                table_id: 13,
-            },
-            column_id: Some(17),
-            column_name: "city".to_string(),
-            data_type: DataType::Utf8,
-            version: 19,
-            watermark: DictionaryWatermark::Iceberg {
-                snapshot_id: Some(23),
-                schema_id: 29,
-            },
-            values: vec![DictionaryValue {
-                id: 1,
-                bytes: b"beijing".to_vec(),
-            }],
-            null_id: -1,
-            state: DictionaryState::Active,
-            order_preserving: true,
-        })
+        // Single source of truth: an order-preserving snapshot fixture.
+        super::test_dictionary_snapshot(true)
     }
 }
