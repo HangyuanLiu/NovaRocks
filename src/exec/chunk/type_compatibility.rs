@@ -211,6 +211,12 @@ fn retag_data(
         (Decimal128(..), Decimal256(..)) | (Decimal256(..), Decimal128(..)) => {
             Err(retag_mismatch(path, target, &source, DecimalWidthCross))
         }
+        (Timestamp(source_unit, _), Timestamp(target_unit, _)) if source_unit == target_unit => {
+            finish_retag(data, target, Vec::new(), path, &source)
+        }
+        (Timestamp(_, _), Timestamp(_, _)) => {
+            Err(retag_mismatch(path, target, &source, ScalarMismatch))
+        }
         (Utf8, Binary) | (Binary, Utf8) => finish_retag(data, target, Vec::new(), path, &source),
         (List(_), List(tf)) => {
             path.push(NestedStep::ListItem);
@@ -322,7 +328,7 @@ mod tests {
     use super::{NestedStep, check_exact, nested_path_label, retag_column};
     use arrow::array::{
         Array, ArrayRef, BinaryArray, Decimal128Array, Int32Array, Int64Array, ListArray,
-        StringArray, StructArray,
+        StringArray, StructArray, TimestampMicrosecondArray,
     };
     use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
@@ -569,6 +575,21 @@ mod tests {
         let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
         assert_eq!(b.value(0), b"ab");
         assert_eq!(b.value(1), b"cd");
+    }
+
+    #[test]
+    fn retag_column_timestamp_same_unit_keeps_values() {
+        let arr =
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(1_234_i64), None])) as ArrayRef;
+        let target = DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()));
+        let out = retag_column(&arr, &target).expect("retag");
+        assert_eq!(out.data_type(), &target);
+        let ts = out
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("timestamp micros");
+        assert_eq!(ts.value(0), 1_234);
+        assert!(ts.is_null(1));
     }
 
     #[test]

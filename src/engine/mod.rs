@@ -16,7 +16,6 @@ use crate::engine::query_options::StandaloneQueryOptions;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
-use crate::thrift::internal_service::TQueryOptions;
 
 use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, normalize_identifier};
 use crate::connector::{
@@ -3686,14 +3685,16 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
 
 pub(crate) fn execute_planned_iceberg_change_stream_write(
     build_result: crate::sql::codegen::MultiFragmentBuildResult,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
         dispatcher,
         scheduler,
-        query_opts,
+        crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
+            query_opts.as_ref(),
+        ),
     )
     .execute_with_write_outcome()
 }
@@ -3705,7 +3706,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     current_database: &str,
     physical_plan: &crate::sql::optimizer::OptimizerPhysicalNode,
     dag: &mut crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec,
-    query_opts: Option<TQueryOptions>,
+    query_opts: Option<StandaloneQueryOptions>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
     let planned = build_physical_plan_as_iceberg_change_stream_write(
@@ -3905,7 +3906,6 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         return Err("IMV rewrite validator requires MV refresh context".to_string());
     }
 
-    let output_columns = crate::sql::planner::plan_output_columns(&logical)?;
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
     let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
         &logical,
@@ -3922,6 +3922,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         None,
         Vec::new(),
     )?;
+    let output_columns = physical_plan.output_columns.clone();
     Ok(PlannedIcebergChangeStreamRefreshQuery {
         physical_plan,
         output_columns,
@@ -3934,7 +3935,6 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
     factory: crate::sql::column_id::ColumnRefFactory,
     connectors: &crate::connector::ConnectorRegistry,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
-    let output_columns = crate::sql::planner::plan_output_columns(&logical)?;
     let change_stream =
         crate::sql::planner::imv_rewrite::change_stream::build_change_stream_descriptor(&logical);
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
@@ -3953,6 +3953,7 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
         None,
         Vec::new(),
     )?;
+    let output_columns = physical_plan.output_columns.clone();
     Ok(PlannedIcebergChangeStreamRefreshQuery {
         physical_plan,
         output_columns,

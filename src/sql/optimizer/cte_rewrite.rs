@@ -91,9 +91,11 @@ fn replace_cte_consume(
 ) -> Result<OptExpr, String> {
     match &expr.op {
         Operator::LogicalCTEConsume(node) if node.cte_id == cte_id => {
-            adapt_opt_expr_output_with_qualifier(
+            node.validate_mapping()?;
+            adapt_cte_replacement_output_with_qualifier(
                 replacement.clone(),
                 &node.output_columns,
+                &node.producer_column_ids,
                 Some(&node.alias),
                 scalars,
             )
@@ -147,6 +149,73 @@ fn adapt_opt_expr_output_with_qualifier(
         .iter()
         .zip(target_output_columns.iter())
     {
+        if source.data_type != target.data_type {
+            return Err(format!(
+                "output type mismatch while adapting subquery/CTE column '{}': child={:?}, target={:?}",
+                target.name, source.data_type, target.data_type
+            ));
+        }
+        if source.nullable && !target.nullable {
+            return Err(format!(
+                "output nullability mismatch while adapting subquery/CTE column '{}': child={}, target={}",
+                target.name, source.nullable, target.nullable
+            ));
+        }
+        scalars.remember_source_column_display(source.column_id, None, source.name.clone());
+        let expr = scalars.intern(
+            ScalarNode::ColumnRef(source.column_id),
+            source.data_type.clone(),
+            target.nullable,
+        );
+        let expr_display = Some(ColumnDisplay {
+            qualifier: None,
+            column: source.name.clone(),
+        });
+        scalars.remember_project_output_display(target.column_id, None, target.name.clone());
+        items.push(ScalarProjectItem {
+            expr,
+            output_name: target.name.clone(),
+            output_column_id: target.column_id,
+            expr_display,
+        });
+    }
+
+    Ok(OptExpr::new(
+        Operator::LogicalProject(ProjectOp {
+            items,
+            output_qualifier: output_qualifier.map(str::to_string),
+        }),
+        vec![input],
+    ))
+}
+
+fn adapt_cte_replacement_output_with_qualifier(
+    input: OptExpr,
+    target_output_columns: &[OutputColumn],
+    producer_column_ids: &[crate::sql::column_id::ColumnId],
+    output_qualifier: Option<&str>,
+    scalars: &mut ScalarArena,
+) -> Result<OptExpr, String> {
+    if target_output_columns.len() != producer_column_ids.len() {
+        return Err(format!(
+            "CTE output/producers arity mismatch while adapting inline replacement: output has {}, producers has {}",
+            target_output_columns.len(),
+            producer_column_ids.len()
+        ));
+    }
+
+    let source_output_columns = opt_expr_output_columns(&input, scalars)?;
+    let mut items = Vec::with_capacity(target_output_columns.len());
+    for (target, producer_column_id) in target_output_columns.iter().zip(producer_column_ids) {
+        let source = source_output_columns
+            .iter()
+            .find(|source| source.column_id == *producer_column_id)
+            .ok_or_else(|| {
+                format!(
+                    "CTE inline replacement missing producer column {} for output '{}'",
+                    producer_column_id.0, target.name
+                )
+            })?;
         if source.data_type != target.data_type {
             return Err(format!(
                 "output type mismatch while adapting subquery/CTE column '{}': child={:?}, target={:?}",
@@ -305,10 +374,10 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        CTEAnchorOp, CTEConsumeOp, CTEProduceOp, Operator, ScanOp, UnionOp,
+        CTEAnchorOp, CTEConsumeOp, CTEProduceOp, Operator, ScanOp, UnionOp, ValuesOp,
     };
     use crate::sql::optimizer::opt_expr::OptExpr;
-    use crate::sql::optimizer::scalar::{self, ScalarArena};
+    use crate::sql::optimizer::scalar::ScalarArena;
     use arrow::datatypes::DataType;
 
     fn scan_plan() -> OptExpr {
@@ -380,8 +449,8 @@ mod tests {
         cte_id: CteId,
         alias: &str,
         output_columns: Vec<OutputColumn>,
+        producer_column_ids: Vec<ColumnId>,
     ) -> OptExpr {
-        let producer_column_ids = output_columns.iter().map(|c| c.column_id).collect();
         OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
             cte_id: cte_id,
             alias: alias.to_string(),
@@ -484,7 +553,12 @@ mod tests {
         let plan = cte_anchor(
             1,
             cte_produce(1, scan_plan()),
-            consume_plan_with_output_columns(1, "x", consume_output_columns.clone()),
+            consume_plan_with_output_columns(
+                1,
+                "x",
+                consume_output_columns.clone(),
+                vec![output_columns()[0].column_id],
+            ),
         );
 
         let ctx = collect_cte_counts(&plan);
@@ -522,6 +596,81 @@ mod tests {
         assert_eq!(column_id, output_columns()[0].column_id);
         assert!(qualifier.is_none());
         assert_eq!(column, output_columns()[0].name);
+    }
+
+    #[test]
+    fn test_inline_single_use_cte_projects_consumer_mapping_when_producer_keeps_extra_columns() {
+        let producer_sort_column = OutputColumn {
+            column_id: ColumnId::new_for_test(10),
+            name: "sort_key".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            is_internal: false,
+        };
+        let producer_join_column = OutputColumn {
+            column_id: ColumnId::new_for_test(11),
+            name: "join_key".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            is_internal: false,
+        };
+        let consumer_join_column = OutputColumn {
+            column_id: ColumnId::new_for_test(42),
+            name: "join_key".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            is_internal: false,
+        };
+        let produce_input = OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![producer_sort_column.clone(), producer_join_column.clone()],
+        }));
+        let produce = OptExpr::new(
+            Operator::LogicalCTEProduce(CTEProduceOp {
+                cte_id: 1,
+                output_columns: vec![producer_sort_column, producer_join_column.clone()],
+            }),
+            vec![produce_input],
+        );
+        let consume = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
+            cte_id: 1,
+            alias: "w1".to_string(),
+            output_columns: vec![consumer_join_column.clone()],
+            producer_column_ids: vec![producer_join_column.column_id],
+        }));
+        let plan = cte_anchor(1, produce, consume);
+
+        let ctx = collect_cte_counts(&plan);
+        let mut arena = scalar_arena();
+        let rewritten =
+            inline_single_use_ctes(plan, &ctx, &mut arena).expect("inline should succeed");
+
+        let Operator::LogicalProject(project) = &rewritten.op else {
+            panic!("expected Project adapter");
+        };
+        assert_eq!(project.items.len(), 1);
+        assert_eq!(
+            project.items[0].output_column_id,
+            consumer_join_column.column_id
+        );
+
+        let materialized = crate::sql::planner::optimizer_bridge::scalar::materialize(
+            &arena,
+            project.items[0].expr,
+        );
+        let ExprKind::ColumnRef { column_id, .. } = materialized.kind else {
+            panic!("expected producer ColumnRef");
+        };
+        assert_eq!(column_id, producer_join_column.column_id);
+
+        let output = opt_output_columns(&rewritten, &arena)
+            .expect("rewritten output columns should be derivable");
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].column_id, consumer_join_column.column_id);
+        assert_eq!(output[0].name, consumer_join_column.name);
+        assert_eq!(output[0].data_type, consumer_join_column.data_type);
+        assert_eq!(output[0].nullable, consumer_join_column.nullable);
+        assert_eq!(output[0].is_internal, consumer_join_column.is_internal);
     }
 
     #[test]

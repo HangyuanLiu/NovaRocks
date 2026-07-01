@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
-use crate::sql::column_id::ColumnRefFactory;
+use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
+use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::scalar::ScalarArena;
@@ -16,7 +17,7 @@ use crate::sql::planner::imv_rewrite::pipeline::build_imv_pipeline;
 use crate::sql::planner::optimizer_bridge::plan::{
     opt_expr_to_logical_plan, try_logical_plan_to_opt_expr,
 };
-use crate::sql::planner::plan::LogicalPlanNode;
+use crate::sql::planner::plan::{AggregateCall, LogicalPlanKind, LogicalPlanNode, WindowExpr};
 
 pub(crate) struct ImvRewriteInput {
     pub plan: LogicalPlanNode,
@@ -42,6 +43,7 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         column_ref_factory,
     } = input;
 
+    reserve_existing_plan_column_ids(&column_ref_factory, &plan);
     let mut ctx_rw = RewriteContext::for_mv_refresh(disabled_rules);
     ctx_rw.set_column_ref_factory(Rc::clone(&column_ref_factory));
     ctx_rw.set_extension::<ImvExtension>(ImvExtension {
@@ -80,6 +82,277 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
     })
 }
 
+fn reserve_existing_plan_column_ids(
+    column_ref_factory: &Rc<RefCell<ColumnRefFactory>>,
+    plan: &LogicalPlanNode,
+) {
+    let mut max_id = 0u32;
+    collect_plan_column_ids(plan, &mut max_id);
+    if max_id > 0 {
+        column_ref_factory
+            .borrow_mut()
+            .reserve_until(max_id.saturating_add(1));
+    }
+}
+
+fn collect_plan_column_ids(plan: &LogicalPlanNode, max_id: &mut u32) {
+    if let Some(required) = &plan.required_output_columns {
+        for column_id in required {
+            collect_column_id(*column_id, max_id);
+        }
+    }
+    match &plan.kind {
+        LogicalPlanKind::Scan(scan) => {
+            collect_output_columns(&scan.columns, max_id);
+            for predicate in &scan.predicates {
+                collect_expr_column_ids(predicate, max_id);
+            }
+            for variant in &scan.variant_columns {
+                collect_column_id(variant.source_column_id, max_id);
+                collect_column_id(variant.synthetic_column_id, max_id);
+            }
+        }
+        LogicalPlanKind::Filter(filter) => collect_expr_column_ids(&filter.predicate, max_id),
+        LogicalPlanKind::Project(project) => {
+            for item in &project.items {
+                collect_column_id(item.output_column_id, max_id);
+                collect_expr_column_ids(&item.expr, max_id);
+            }
+        }
+        LogicalPlanKind::Sort(sort) => {
+            collect_sort_items(&sort.items, max_id);
+            for expr in &sort.analytic_partition_by {
+                collect_expr_column_ids(expr, max_id);
+            }
+            collect_output_columns(&sort.output_columns, max_id);
+        }
+        LogicalPlanKind::Values(values) => {
+            collect_output_columns(&values.columns, max_id);
+            for row in &values.rows {
+                for expr in row {
+                    collect_expr_column_ids(expr, max_id);
+                }
+            }
+        }
+        LogicalPlanKind::Decode(decode) => {
+            collect_output_columns(&decode.output_columns, max_id);
+            for mapping in &decode.mappings {
+                collect_column_id(mapping.source_column_id, max_id);
+                collect_column_id(mapping.output_column_id, max_id);
+            }
+        }
+        LogicalPlanKind::Repeat(repeat) => {
+            for ids in &repeat.repeat_column_ref_ids {
+                for column_id in ids {
+                    collect_column_id(*column_id, max_id);
+                }
+            }
+            for column_id in &repeat.all_rollup_column_ids {
+                collect_column_id(*column_id, max_id);
+            }
+            for ids in &repeat.grouping_fn_arg_ids {
+                for column_id in ids {
+                    collect_column_id(*column_id, max_id);
+                }
+            }
+            for (_, column_id) in &repeat.grouping_fn_ids {
+                collect_column_id(*column_id, max_id);
+            }
+        }
+        LogicalPlanKind::Window(window) => {
+            for expr in &window.window_exprs {
+                collect_window_expr_column_ids(expr, max_id);
+            }
+            collect_output_columns(&window.output_columns, max_id);
+        }
+        LogicalPlanKind::GenerateSeries(generate) => {
+            collect_column_id(generate.output_column_id, max_id);
+        }
+        LogicalPlanKind::TableFunction(table_function) => {
+            for arg in &table_function.args {
+                collect_expr_column_ids(arg, max_id);
+            }
+            collect_output_columns(&table_function.output_columns, max_id);
+        }
+        LogicalPlanKind::Aggregate(aggregate) => {
+            for expr in &aggregate.group_by {
+                collect_expr_column_ids(expr, max_id);
+            }
+            for call in &aggregate.aggregates {
+                collect_aggregate_call_column_ids(call, max_id);
+            }
+            collect_output_columns(&aggregate.output_columns, max_id);
+        }
+        LogicalPlanKind::Join(join) => {
+            if let Some(condition) = &join.condition {
+                collect_expr_column_ids(condition, max_id);
+            }
+        }
+        LogicalPlanKind::Union(union) => collect_output_columns(&union.output_columns, max_id),
+        LogicalPlanKind::Intersect(intersect) => {
+            collect_output_columns(&intersect.output_columns, max_id)
+        }
+        LogicalPlanKind::Except(except) => collect_output_columns(&except.output_columns, max_id),
+        LogicalPlanKind::CTEProduce(produce) => {
+            collect_output_columns(&produce.output_columns, max_id)
+        }
+        LogicalPlanKind::CTEConsume(consume) => {
+            collect_output_columns(&consume.output_columns, max_id)
+        }
+        LogicalPlanKind::AggregateStateMerge(merge) => {
+            collect_output_columns(&merge.output_columns, max_id)
+        }
+        LogicalPlanKind::Apply(apply) => {
+            collect_expr_column_ids(&apply.subquery_expr, max_id);
+            collect_output_column(&apply.output_column, max_id);
+            collect_column_id(apply.inner_output_column_id, max_id);
+            for column_id in &apply.correlation_column_ids {
+                collect_column_id(*column_id, max_id);
+            }
+            for expr in &apply.correlation_conjuncts {
+                collect_expr_column_ids(expr, max_id);
+            }
+            if let Some(predicate) = &apply.residual_predicate {
+                collect_expr_column_ids(predicate, max_id);
+            }
+            for column_id in &apply.uncorrelated_outer_predicate_columns {
+                collect_column_id(*column_id, max_id);
+            }
+        }
+        LogicalPlanKind::ImvDelta(delta) => {
+            if let Some(action_column) = delta.action_column {
+                collect_column_id(action_column, max_id);
+            }
+        }
+        LogicalPlanKind::Limit(_)
+        | LogicalPlanKind::AssertOneRow(_)
+        | LogicalPlanKind::CTEAnchor(_)
+        | LogicalPlanKind::ImvVersion(_) => {}
+    }
+    for child in &plan.children {
+        collect_plan_column_ids(child, max_id);
+    }
+}
+
+fn collect_output_columns(columns: &[OutputColumn], max_id: &mut u32) {
+    for column in columns {
+        collect_output_column(column, max_id);
+    }
+}
+
+fn collect_output_column(column: &OutputColumn, max_id: &mut u32) {
+    collect_column_id(column.column_id, max_id);
+}
+
+fn collect_aggregate_call_column_ids(call: &AggregateCall, max_id: &mut u32) {
+    collect_column_id(call.output_column_id, max_id);
+    for arg in &call.args {
+        collect_expr_column_ids(arg, max_id);
+    }
+    collect_sort_items(&call.order_by, max_id);
+}
+
+fn collect_window_expr_column_ids(window: &WindowExpr, max_id: &mut u32) {
+    collect_column_id(window.output_column_id, max_id);
+    for arg in &window.args {
+        collect_expr_column_ids(arg, max_id);
+    }
+    for expr in &window.partition_by {
+        collect_expr_column_ids(expr, max_id);
+    }
+    collect_sort_items(&window.order_by, max_id);
+}
+
+fn collect_sort_items(items: &[SortItem], max_id: &mut u32) {
+    for item in items {
+        collect_expr_column_ids(&item.expr, max_id);
+    }
+}
+
+fn collect_expr_column_ids(expr: &TypedExpr, max_id: &mut u32) {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => collect_column_id(*column_id, max_id),
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_expr_column_ids(left, max_id);
+            collect_expr_column_ids(right, max_id);
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. }
+        | ExprKind::Nested(expr)
+        | ExprKind::Lambda { body: expr, .. }
+        | ExprKind::LambdaFunction { body: expr, .. } => collect_expr_column_ids(expr, max_id),
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_expr_column_ids(arg, max_id);
+            }
+        }
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            for arg in args {
+                collect_expr_column_ids(arg, max_id);
+            }
+            collect_sort_items(order_by, max_id);
+        }
+        ExprKind::InList { expr, list, .. } => {
+            collect_expr_column_ids(expr, max_id);
+            for item in list {
+                collect_expr_column_ids(item, max_id);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_column_ids(expr, max_id);
+            collect_expr_column_ids(low, max_id);
+            collect_expr_column_ids(high, max_id);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_expr_column_ids(expr, max_id);
+            collect_expr_column_ids(pattern, max_id);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_column_ids(operand, max_id);
+            }
+            for (when_expr, then_expr) in when_then {
+                collect_expr_column_ids(when_expr, max_id);
+                collect_expr_column_ids(then_expr, max_id);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_expr_column_ids(else_expr, max_id);
+            }
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_expr_column_ids(arg, max_id);
+            }
+            for expr in partition_by {
+                collect_expr_column_ids(expr, max_id);
+            }
+            collect_sort_items(order_by, max_id);
+        }
+        ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => {}
+    }
+}
+
+fn collect_column_id(column_id: ColumnId, max_id: &mut u32) {
+    if column_id != ColumnId::UNSET {
+        *max_id = (*max_id).max(column_id.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,10 +388,8 @@ mod tests {
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::imv_rewrite::annotation::ImvPartitionAnnotation;
     use crate::sql::planner::imv_rewrite::change_stream::AggregateChangeStreamShape;
-    use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
-        JoinRefreshBranchSide, JoinRefreshMode, JoinRefreshOutputSource,
-    };
     use crate::sql::planner::imv_rewrite::marker::{ImvVersionRef, plan_contains_imv_marker};
+    use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind,
@@ -1432,7 +1703,7 @@ mod tests {
         })
         .expect("plain Iceberg scan should pass through IMV rewrite");
 
-        assert_eq!(factory.borrow().peek_next_id(), 1);
+        assert_eq!(factory.borrow().peek_next_id(), 2);
         assert!(matches!(outcome.plan.kind, LogicalPlanKind::Scan(_)));
     }
 
@@ -2334,77 +2605,18 @@ mod tests {
             panic!("expected join delta UnionAll under signed aggregate");
         };
         assert_join_delta_union_shape(union_plan, signed_action_id);
-        let union_columns = match &union_plan.kind {
-            LogicalPlanKind::Union(union) => &union.output_columns,
-            _ => unreachable!(),
-        };
-        let join_apply_key_from_plan = union_columns
-            .iter()
-            .find(|column| {
-                column
-                    .name
-                    .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
-            })
-            .expect("join delta UnionAll must produce join apply-key before descriptor recording");
-
-        let descriptor = outcome
-            .annotation
-            .change_stream
-            .join_refresh
-            .as_ref()
-            .expect("join delta rewrite must record join refresh descriptor");
-        assert_eq!(descriptor.mode, JoinRefreshMode::Coalesce);
-        assert_eq!(descriptor.mv_identity.catalog, "tgt");
-        assert_eq!(descriptor.mv_identity.database, "db");
-        assert_eq!(descriptor.mv_identity.name, "mv");
-        assert_eq!(descriptor.left_base_fqn, "ice.db.l");
-        assert_eq!(descriptor.right_base_fqn, "ice.db.r");
-        assert_eq!(descriptor.join_key_pairs.len(), 1);
-        assert_eq!(descriptor.join_key_pairs[0].left_column.name, "k");
-        assert_eq!(descriptor.join_key_pairs[0].right_column.name, "k");
-        assert_eq!(
-            descriptor.join_apply_key_column.column_id, join_apply_key_from_plan.column_id,
-            "descriptor join apply-key source must be produced by the plan"
+        assert!(
+            outcome.annotation.change_stream.has_aggregate(),
+            "join aggregate refresh must use aggregate change-stream semantics"
         );
-        assert_eq!(descriptor.branches.len(), 2);
-        assert!(descriptor.branches.iter().any(|branch| {
-            branch.side == JoinRefreshBranchSide::LeftDeltaRightSnapshot
-                && branch.action_column_id == descriptor.action_column.column_id
-        }));
-        assert!(descriptor.branches.iter().any(|branch| {
-            branch.side == JoinRefreshBranchSide::LeftSnapshotRightDelta
-                && branch.action_column_id == descriptor.action_column.column_id
-        }));
-        assert!(descriptor.output_mappings.iter().any(|mapping| {
-            matches!(
-                mapping.source,
-                JoinRefreshOutputSource::Action(column_id)
-                    if column_id == descriptor.action_column.column_id
-            )
-        }));
-        assert!(descriptor.output_mappings.iter().any(|mapping| {
-            matches!(
-                mapping.source,
-                JoinRefreshOutputSource::JoinApplyKey(column_id)
-                    if column_id == descriptor.join_apply_key_column.column_id
-            )
-        }));
-        for payload in &descriptor.payload_columns {
-            assert!(descriptor.output_mappings.iter().any(|mapping| {
-                matches!(
-                    mapping.source,
-                    JoinRefreshOutputSource::Payload(column_id)
-                        if column_id == payload.column_id
-                )
-            }));
-        }
-        descriptor
-            .validate()
-            .expect("recorded join refresh descriptor must validate");
+        assert!(
+            outcome.annotation.change_stream.join_refresh.is_none(),
+            "aggregate-over-join refresh must not record a pure join-refresh descriptor"
+        );
     }
 
     #[test]
-    fn join_refresh_descriptor_uses_visible_lineage_payload_columns() {
+    fn join_aggregate_refresh_does_not_record_join_payload_descriptor() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             mv_ctx: join_aggregate_mv_ctx(),
@@ -2414,23 +2626,8 @@ mod tests {
         })
         .expect("join aggregate IMV pipeline must rewrite and validate");
 
-        let descriptor = outcome
-            .annotation
-            .change_stream
-            .join_refresh
-            .as_ref()
-            .expect("join delta rewrite must record join refresh descriptor");
-        let payload_ids = descriptor
-            .payload_columns
-            .iter()
-            .map(|column| column.column_id)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            payload_ids,
-            vec![ColumnId(1), ColumnId(11)],
-            "descriptor payload must follow target-visible output lineage, not the full join union output"
-        );
+        assert!(outcome.annotation.change_stream.has_aggregate());
+        assert!(outcome.annotation.change_stream.join_refresh.is_none());
     }
 
     #[test]
@@ -2466,6 +2663,42 @@ mod tests {
                         .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
             }),
             "coalesce input must expose the recorded join apply-key column"
+        );
+        assert!(
+            !output_columns.iter().any(ImvRowIdColumn::matches),
+            "raw base _row_id columns are join-key inputs, not change-stream outputs: {output_columns:?}"
+        );
+
+        let union_plan = find_union_plan(&outcome.plan).expect("pure join refresh must keep union");
+        let LogicalPlanKind::Union(union) = &union_plan.kind else {
+            panic!("expected pure join refresh union");
+        };
+        for branch in &union_plan.children {
+            let LogicalPlanKind::Project(project) = &branch.kind else {
+                panic!("expected normalized branch Project");
+            };
+            assert_eq!(
+                project.items.len(),
+                union.output_columns.len(),
+                "branch Project output count must match pruned Union output count"
+            );
+            assert!(
+                project.items.iter().all(|item| {
+                    item.output_column_id != descriptor.left_row_id_column.column_id
+                        && item.output_column_id != descriptor.right_row_id_column.column_id
+                        && !item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
+                }),
+                "branch Project must not expose raw base row-id outputs after join apply-key injection: {:?}",
+                project.items
+            );
+        }
+
+        let physical = optimize_logical_for_test(outcome.plan.clone());
+        assert_physical_project_refs_resolve_to_child_outputs(&physical);
+        assert!(
+            !physical.output_columns.iter().any(ImvRowIdColumn::matches),
+            "physical root must not advertise raw base _row_id columns as change-stream outputs: {:?}",
+            physical.output_columns
         );
     }
 
@@ -2766,7 +2999,7 @@ mod tests {
     }
 
     #[test]
-    fn imv_pipeline_rejects_join_descriptor_recording_without_join_contract() {
+    fn imv_pipeline_uses_aggregate_change_stream_without_join_contract() {
         let ctx = join_aggregate_mv_ctx_customized(|contract| {
             contract.join = None;
             contract.branch = Some(BranchUnionContract {
@@ -2779,19 +3012,17 @@ mod tests {
             });
         });
 
-        let err = run_imv_rewrite(ImvRewriteInput {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             mv_ctx: ctx,
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
         })
-        .expect_err("join delta descriptor recording must fail closed without join contract");
+        .expect("aggregate change stream should not require join refresh descriptor");
 
-        assert!(
-            err.contains("schema_contract.join"),
-            "unexpected error: {err}"
-        );
+        assert!(outcome.annotation.change_stream.has_aggregate());
+        assert!(outcome.annotation.change_stream.join_refresh.is_none());
     }
 
     #[test]

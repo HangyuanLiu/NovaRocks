@@ -756,7 +756,9 @@ fn require_join_refresh_branch_protocol_columns(
 }
 
 fn is_join_refresh_protocol_column(column: &crate::sql::analysis::OutputColumn) -> bool {
-    is_join_refresh_action_column(column) || is_join_refresh_apply_key_column(column)
+    is_join_refresh_action_column(column)
+        || is_join_refresh_apply_key_column(column)
+        || is_join_refresh_row_id_column(column)
 }
 
 fn is_join_refresh_action_column(column: &crate::sql::analysis::OutputColumn) -> bool {
@@ -770,6 +772,12 @@ fn is_join_refresh_apply_key_column(column: &crate::sql::analysis::OutputColumn)
     column.name.eq_ignore_ascii_case(
         crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
     )
+}
+
+fn is_join_refresh_row_id_column(column: &crate::sql::analysis::OutputColumn) -> bool {
+    column
+        .name
+        .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
 }
 
 fn tag_intersect(
@@ -1666,12 +1674,19 @@ mod tests {
         );
         join_apply_key.data_type = DataType::Utf8;
         join_apply_key.is_internal = true;
+        let mut row_id = make_output_column(
+            ColumnId::new_for_test(19),
+            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        );
+        row_id.data_type = DataType::Int64;
+        row_id.is_internal = true;
         let output_columns = vec![
             make_output_column(ColumnId::new_for_test(1), "id"),
             make_output_column(ColumnId::new_for_test(2), "region"),
             make_output_column(ColumnId::new_for_test(3), "amount"),
             make_output_column(ColumnId::new_for_test(9), "category"),
             action,
+            row_id,
             join_apply_key,
         ];
         let left_columns = output_columns.clone();
@@ -1693,14 +1708,14 @@ mod tests {
 
         assert_eq!(
             required_columns(&tagged),
-            &needed_set(&[1, 2, 3, 9, 14, 15]),
-            "join refresh UNION must keep action and join row key in its own required set"
+            &needed_set(&[1, 2, 3, 9, 14, 15, 19]),
+            "join refresh UNION must keep internal protocol and row-lineage columns in its own required set"
         );
         for child in &tagged.children {
             assert_eq!(
                 required_columns(child),
-                &needed_set(&[1, 2, 3, 9, 14, 15]),
-                "join refresh UNION must pass protocol columns to each branch by position"
+                &needed_set(&[1, 2, 3, 9, 14, 15, 19]),
+                "join refresh UNION must pass protocol and row-lineage columns to each branch by position"
             );
         }
     }
@@ -1720,12 +1735,25 @@ mod tests {
         );
         join_apply_key.data_type = DataType::Utf8;
         join_apply_key.is_internal = false;
+        let mut row_id = make_output_column(
+            ColumnId::new_for_test(19),
+            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        );
+        row_id.data_type = DataType::Int64;
+        row_id.is_internal = true;
+        let mut branch_row_id = make_output_column(
+            ColumnId::new_for_test(91),
+            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        );
+        branch_row_id.data_type = DataType::Int64;
+        branch_row_id.is_internal = true;
         let output_columns = vec![
             make_output_column(ColumnId::new_for_test(1), "id"),
             make_output_column(ColumnId::new_for_test(2), "region"),
             make_output_column(ColumnId::new_for_test(3), "amount"),
             make_output_column(ColumnId::new_for_test(9), "category"),
             action.clone(),
+            row_id,
             join_apply_key.clone(),
         ];
         let branch_columns = vec![
@@ -1735,6 +1763,7 @@ mod tests {
             make_output_column(ColumnId::new_for_test(90), "_file"),
             make_output_column(ColumnId::new_for_test(9), "category"),
             action.clone(),
+            branch_row_id,
             join_apply_key.clone(),
         ];
         let branch_union_columns = vec![
@@ -1744,6 +1773,7 @@ mod tests {
             branch_columns[4].clone(),
             branch_columns[5].clone(),
             branch_columns[6].clone(),
+            branch_columns[7].clone(),
         ];
         let union = OptExpr::new(
             Operator::LogicalUnion(UnionOp {
@@ -1762,13 +1792,17 @@ mod tests {
 
         assert_eq!(
             required_columns(&tagged),
-            &needed_set(&[1, 2, 3, 9, 14, 20]),
-            "join refresh UNION must keep action and join row key"
+            &needed_set(&[1, 2, 3, 9, 14, 19, 20]),
+            "join refresh UNION must keep action, row lineage, and join row key"
         );
         for child in &tagged.children {
             assert!(
                 required_columns(child).contains(&ColumnId::new_for_test(20)),
                 "branch project must keep join row key even when its wide output position differs from the UNION output"
+            );
+            assert!(
+                required_columns(child).contains(&ColumnId::new_for_test(91)),
+                "branch project must keep row-lineage even when its wide output position differs from the UNION output"
             );
             assert!(
                 !required_columns(child).contains(&ColumnId::new_for_test(90)),

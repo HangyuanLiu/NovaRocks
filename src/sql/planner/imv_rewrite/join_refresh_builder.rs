@@ -824,6 +824,8 @@ fn is_reserved_coalesce_payload_output_name(name: &str) -> bool {
             | "__nr_join_delta_target_locator"
             | crate::exec::row_position::ICEBERG_FILE_PATH_COL
             | crate::exec::row_position::ICEBERG_ROW_POS_COL
+            | crate::exec::row_position::ICEBERG_ROW_ID_COL
+            | crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
     )
 }
 

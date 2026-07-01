@@ -19,6 +19,7 @@ use crate::connector::iceberg::commit::{
     CleanupAttempt, CommitOutcome, CommitServiceError, IcebergCommitCollector, WrittenFile,
 };
 use crate::engine::StandaloneState;
+use crate::engine::query_options::StandaloneQueryOptions;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec,
 };
@@ -28,11 +29,9 @@ use crate::sql::codegen::iceberg_change_stream_write::{
     ChangeStreamWriteBranchKind, IcebergChangeStreamWriteDagSpec,
 };
 use crate::sql::optimizer::OptimizerPhysicalNode;
-use crate::thrift::internal_service::TQueryOptions;
-use crate::thrift::types;
 
-pub(crate) fn writer_fragment_id_from_finst_id(finst: &types::TUniqueId) -> i32 {
-    (finst.lo >> 16) as i32
+pub(crate) fn writer_fragment_id_from_finst_lo(finst_lo: i64) -> i32 {
+    (finst_lo >> 16) as i32
 }
 
 #[derive(Clone, Debug)]
@@ -81,11 +80,8 @@ impl ChangeStreamWriterCommitPlan {
         Ok(Self::new(branch_by_writer_fragment))
     }
 
-    fn branch_for_finst(
-        &self,
-        finst: &types::TUniqueId,
-    ) -> Result<ChangeStreamWriteBranchKind, String> {
-        let fragment_id = writer_fragment_id_from_finst_id(finst);
+    fn branch_for_finst_lo(&self, finst_lo: i64) -> Result<ChangeStreamWriteBranchKind, String> {
+        let fragment_id = writer_fragment_id_from_finst_lo(finst_lo);
         self.branch_by_writer_fragment
             .get(&fragment_id)
             .copied()
@@ -182,7 +178,7 @@ pub(crate) fn route_change_stream_writer_reports(
             writer_files.push(file);
         }
         let branch = plan
-            .branch_for_finst(&writer.writer_key.fragment_instance_id)
+            .branch_for_finst_lo(writer.writer_key.fragment_instance_id.lo)
             .map_err(|message| {
                 ChangeStreamWriterRoutingError::new(
                     message,
@@ -206,7 +202,7 @@ pub(crate) struct ChangeStreamPhysicalBuildInput {
     pub(crate) current_database: String,
     pub(crate) physical_plan: OptimizerPhysicalNode,
     pub(crate) dag: IcebergChangeStreamWriteDagSpec,
-    pub(crate) query_opts: Option<TQueryOptions>,
+    pub(crate) query_opts: Option<StandaloneQueryOptions>,
     pub(crate) mv_refresh_ctx:
         Option<Arc<crate::engine::mv::refresh_context::IcebergMvRefreshContext>>,
 }
@@ -309,6 +305,7 @@ mod tests {
     };
     use crate::runtime::sink_commit_wire::writer_report_to_sink_commit_info;
     use crate::runtime::write_coordinator::{WriteCommitInput, WriterCommitInput, WriterKey};
+    use crate::thrift::types;
 
     fn test_unpartitioned_metadata() -> TableMetadata {
         let schema = Schema::builder()
@@ -428,7 +425,7 @@ mod tests {
     #[test]
     fn finst_id_decodes_writer_fragment_id() {
         let finst = types::TUniqueId::new(7, (42_i64 << 16) | 3);
-        assert_eq!(writer_fragment_id_from_finst_id(&finst), 42);
+        assert_eq!(writer_fragment_id_from_finst_lo(finst.lo), 42);
     }
 
     #[test]

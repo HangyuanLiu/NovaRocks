@@ -21,7 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use arrow::datatypes::{Field, Schema};
+use arrow::array::ArrayRef;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
@@ -716,7 +717,8 @@ fn align_fetch_chunk_to_output_columns(
     let mut fields = Vec::with_capacity(output_columns.len());
     let mut arrays = Vec::with_capacity(output_columns.len());
     for (idx, output) in output_columns.iter().enumerate() {
-        let array = chunk.batch.column(idx).clone();
+        let array =
+            align_typed_root_array(idx, chunk.batch.column(idx).clone(), &output.data_type)?;
         if let Err(mismatch) = crate::exec::chunk::type_compatibility::check_exact(
             &output.data_type,
             array.data_type(),
@@ -750,6 +752,35 @@ fn align_fetch_chunk_to_output_columns(
         )
         .map(Arc::new)?;
     Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+}
+
+fn align_typed_root_array(
+    idx: usize,
+    array: ArrayRef,
+    output_type: &DataType,
+) -> Result<ArrayRef, String> {
+    if crate::exec::chunk::type_compatibility::check_exact(output_type, array.data_type()).is_ok() {
+        return Ok(array);
+    }
+    if !same_unit_timestamp_metadata_mismatch(output_type, array.data_type()) {
+        return Ok(array);
+    }
+    crate::exec::chunk::type_compatibility::retag_column(&array, output_type).map_err(|mismatch| {
+        format!(
+            "typed root result column {idx} timestamp metadata retag failed: output={:?} chunk={:?} ({:?})",
+            output_type,
+            array.data_type(),
+            mismatch.kind
+        )
+    })
+}
+
+fn same_unit_timestamp_metadata_mismatch(expected: &DataType, actual: &DataType) -> bool {
+    matches!(
+        (expected, actual),
+        (DataType::Timestamp(expected_unit, _), DataType::Timestamp(actual_unit, _))
+            if expected_unit == actual_unit
+    )
 }
 
 /// An `UNPARTITIONED` data partition (the common default).
@@ -1795,8 +1826,9 @@ mod tests {
     use crate::thrift::{status, status_code};
     use arrow::array::{
         Array, ArrayRef, BinaryArray, Decimal128Array, FixedSizeBinaryArray, Int32Array,
+        TimestampMicrosecondArray,
     };
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
 
     #[test]
@@ -1868,6 +1900,43 @@ mod tests {
         );
         assert!(err.contains("Decimal128(20, 2)"), "{err}");
         assert!(err.contains("Decimal128(38, 2)"), "{err}");
+    }
+
+    #[test]
+    fn typed_root_alignment_retags_same_unit_timestamp_timezone_metadata() {
+        let timestamp =
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(1_234_i64), None])) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "wire_ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![timestamp]).expect("typed batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(12)])
+                .expect("chunk schema");
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+
+        let target_type = DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()));
+        let columns = vec![crate::sql::codegen::OutputColumn {
+            name: "ts".to_string(),
+            data_type: target_type.clone(),
+            nullable: true,
+        }];
+
+        let chunks =
+            align_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("align chunks");
+        let batch = &chunks[0].batch;
+        assert_eq!(batch.schema().field(0).name(), "ts");
+        assert_eq!(batch.schema().field(0).data_type(), &target_type);
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("timestamp micros");
+        assert_eq!(values.value(0), 1_234);
+        assert!(values.is_null(1));
     }
 
     #[test]

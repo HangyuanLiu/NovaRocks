@@ -2327,6 +2327,15 @@ mod tests {
         (ctx, ext, layout)
     }
 
+    fn expected_row_lineage_metadata_names() -> Vec<&'static str> {
+        vec![
+            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        ]
+    }
+
     #[test]
     fn aggregate_change_stream_columns_are_registered_in_factory() {
         let (ctx, ext, layout) = aggregate_rewrite_test_context_with_factory();
@@ -2899,16 +2908,13 @@ mod tests {
                 .columns
                 .iter()
                 .rev()
-                .take(2)
+                .take(4)
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
                 .collect::<Vec<_>>(),
-            vec![
-                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-                crate::exec::row_position::ICEBERG_ROW_POS_COL
-            ]
+            expected_row_lineage_metadata_names()
         );
         assert_eq!(
             old_scan
@@ -2917,10 +2923,7 @@ mod tests {
                 .iter()
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-                crate::exec::row_position::ICEBERG_ROW_POS_COL
-            ]
+            expected_row_lineage_metadata_names()
         );
 
         let delta_input = find_signed_delta_project(&changed);
@@ -3462,16 +3465,13 @@ mod tests {
                 .items
                 .iter()
                 .rev()
-                .take(2)
+                .take(4)
                 .map(|item| item.output_name.as_str())
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
                 .collect::<Vec<_>>(),
-            vec![
-                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-                crate::exec::row_position::ICEBERG_ROW_POS_COL
-            ]
+            expected_row_lineage_metadata_names()
         );
         for item in &project.items {
             let source = find_output_column_by_name(old_scan.columns.as_slice(), &item.output_name)
