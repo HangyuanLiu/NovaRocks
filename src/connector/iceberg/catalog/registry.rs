@@ -130,6 +130,15 @@ impl IcebergCatalogRegistry {
         Ok(self.catalogs.contains_key(&key))
     }
 
+    /// Return the normalized names of every registered catalog, sorted for
+    /// deterministic iteration. Used by lake-native IMV cache rebuild to walk
+    /// all live Iceberg catalogs (see `engine::mv::lake_rebuild`).
+    pub(crate) fn catalog_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.catalogs.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     pub(crate) fn drop_catalog(&mut self, catalog_name: &str) -> Result<(), String> {
         let key = normalize_identifier(catalog_name)?;
         self.catalogs

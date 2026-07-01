@@ -2408,6 +2408,12 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
 fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
     restore_starrocks_table(state)?;
     restore_iceberg_catalogs(state)?;
+    // W4 statelessness: rediscover lake-native Iceberg MV packages that are
+    // present on the lake but missing from a fresh `[metadata]` (SQLite) cache,
+    // and persist their rebuilt definitions. Runs after catalogs/namespaces are
+    // re-registered (so the registry can be enumerated) and before refresh
+    // recovery (so W3b recovery sees the rediscovered target tables).
+    crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(state)?;
     crate::engine::mv::iceberg_refresh::recover_iceberg_mv_refreshes(state)?;
     crate::engine::mv::iceberg_refresh::restore_iceberg_mv_targets(state)?;
     Ok(())

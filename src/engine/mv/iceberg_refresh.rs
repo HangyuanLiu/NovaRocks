@@ -19490,6 +19490,163 @@ mod tests {
         assert_eq!(mv.descriptor.base_dependencies[0].name.as_str(), "orders");
     }
 
+    /// Delete an MV's SQLite definition WITHOUT dropping its lake storage table.
+    /// `drop_by_target` removes the target lookup, definition record,
+    /// dependency edges, and partition states from SQLite but never touches the
+    /// Iceberg table — exactly the "SQLite forgot, lake remembers" state the W4
+    /// rebuild must recover from.
+    fn drop_mv_definition_from_sqlite_only(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) {
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let mut txn = provider
+            .begin_write("test: drop mv definition from sqlite only")
+            .expect("open write txn");
+        let dropped = state
+            .mv_repo
+            .drop_by_target(txn.as_mut(), catalog, namespace, table)
+            .expect("drop mv definition");
+        assert!(dropped, "expected an existing mv definition to drop");
+        txn.commit().expect("commit drop");
+    }
+
+    fn list_mv_dependency_names(
+        state: &Arc<StandaloneState>,
+        mv_id: i64,
+    ) -> Vec<(Option<String>, String, String)> {
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let read = provider.begin_read().expect("open read txn");
+        state
+            .mv_repo
+            .list_dependencies_by_downstream(read.as_ref(), mv_id)
+            .expect("list dependencies")
+            .into_iter()
+            .map(|dep| {
+                (
+                    dep.upstream.catalog,
+                    dep.upstream.database_or_namespace,
+                    dep.upstream.name,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rebuild_imv_cache_from_lake_reappears_after_sqlite_definition_dropped() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+
+        // Capture the created definition + its dependencies as the golden.
+        let before =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+                .expect("mv definition present after create");
+        let before_deps = list_mv_dependency_names(&env.state, before.mv_id);
+
+        // Forget the MV in SQLite but keep its lake storage table + descriptor.
+        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
+        assert!(
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+                .is_none(),
+            "definition should be gone from SQLite after drop"
+        );
+
+        // Rebuild purely from the lake.
+        crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(&env.state)
+            .expect("rebuild imv cache from lake");
+
+        // The definition reappears with matching select_sql / target / schema
+        // contract / watermark, and its base dependencies are restored.
+        let after = find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+            .expect("mv definition reappears after rebuild");
+        assert_eq!(after.select_sql, before.select_sql);
+        assert_eq!(after.storage_engine, before.storage_engine);
+        assert_eq!(after.target_catalog, before.target_catalog);
+        assert_eq!(after.target_namespace, before.target_namespace);
+        assert_eq!(after.target_table, before.target_table);
+        assert_eq!(after.schema_contract, before.schema_contract);
+        assert_eq!(after.partition_spec, before.partition_spec);
+        assert_eq!(after.last_refresh_snapshots, before.last_refresh_snapshots);
+        assert_eq!(
+            after.last_refresh_table_uuids,
+            before.last_refresh_table_uuids
+        );
+        let after_deps = list_mv_dependency_names(&env.state, after.mv_id);
+        assert_eq!(after_deps, before_deps);
+        assert_eq!(
+            after_deps,
+            vec![(
+                Some("ice".to_string()),
+                "sales".to_string(),
+                "orders".to_string()
+            )]
+        );
+
+        // Idempotent: a second rebuild is a no-op (the MV is now a cache hit).
+        crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(&env.state)
+            .expect("second rebuild is a no-op");
+        let after_again =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+                .expect("mv definition still present after idempotent rebuild");
+        assert_eq!(after_again.select_sql, after.select_sql);
+        assert_eq!(
+            list_mv_dependency_names(&env.state, after_again.mv_id),
+            after_deps
+        );
+    }
+
+    #[test]
+    fn rebuild_imv_cache_from_lake_recovers_refresh_watermark_from_provenance() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "alfa")]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        // A completed refresh stamps provenance onto the storage table's current
+        // snapshot and records the watermark in SQLite.
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("refresh iceberg mv");
+
+        let before =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+                .expect("mv definition present after refresh");
+        assert!(
+            !before.last_refresh_snapshots.is_empty(),
+            "refresh should have recorded a watermark: {before:?}"
+        );
+
+        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
+        crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(&env.state)
+            .expect("rebuild imv cache from lake");
+
+        // The rebuilt definition recovers the refresh watermark from the storage
+        // table's current-snapshot provenance, so incremental refresh has its
+        // baseline back without a full re-refresh.
+        let after = find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+            .expect("mv definition reappears after rebuild");
+        assert_eq!(after.last_refresh_snapshots, before.last_refresh_snapshots);
+        assert_eq!(
+            after.last_refresh_table_uuids,
+            before.last_refresh_table_uuids
+        );
+    }
+
     #[test]
     fn create_writes_schema_contract_into_descriptor() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
