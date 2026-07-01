@@ -227,6 +227,14 @@ mod tests {
             MvDescriptorV1::from_json(&get(MV_DESCRIPTOR_INLINE_PROP).unwrap()).unwrap(),
             descriptor
         );
+
+        let props_map = props
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            MvDescriptorV1::from_storage_properties(&props_map).unwrap(),
+            descriptor
+        );
     }
 
     #[test]
