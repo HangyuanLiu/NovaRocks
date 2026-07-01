@@ -3,6 +3,11 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 pub const MV_DESCRIPTOR_VERSION: u16 = 1;
+pub const MV_DESCRIPTOR_PACKAGE_ID_PROP: &str = "novarocks.mv.descriptor.package-id";
+pub const MV_DESCRIPTOR_HASH_PROP: &str = "novarocks.mv.descriptor.hash";
+pub const MV_DESCRIPTOR_INLINE_PROP: &str = "novarocks.mv.descriptor.inline";
+// W2 adds `novarocks.mv.descriptor.location` for externalized descriptor payloads.
+pub const MV_DESCRIPTOR_INLINE_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DescriptorDependency {
@@ -53,6 +58,48 @@ impl MvDescriptorV1 {
                 MV_DESCRIPTOR_VERSION, descriptor.descriptor_version
             ));
         }
+        Ok(descriptor)
+    }
+
+    pub fn to_storage_properties(&self) -> Result<Vec<(String, String)>, String> {
+        let inline = self.to_canonical_json()?;
+        let inline_bytes = inline.len();
+        if inline_bytes > MV_DESCRIPTOR_INLINE_MAX_BYTES {
+            return Err(format!(
+                "MV descriptor inline payload is {inline_bytes} bytes, exceeds W1 cap of {} bytes; W2 externalized descriptor storage must be used for larger descriptors",
+                MV_DESCRIPTOR_INLINE_MAX_BYTES
+            ));
+        }
+
+        Ok(vec![
+            (
+                MV_DESCRIPTOR_PACKAGE_ID_PROP.to_string(),
+                self.package_id.clone(),
+            ),
+            (MV_DESCRIPTOR_HASH_PROP.to_string(), self.content_hash()?),
+            (MV_DESCRIPTOR_INLINE_PROP.to_string(), inline),
+        ])
+    }
+
+    pub fn from_storage_properties(
+        props: &std::collections::HashMap<String, String>,
+    ) -> Result<Self, String> {
+        let inline = props.get(MV_DESCRIPTOR_INLINE_PROP).ok_or_else(|| {
+            format!(
+                "storage table is missing required MV descriptor inline property `{MV_DESCRIPTOR_INLINE_PROP}`"
+            )
+        })?;
+        let descriptor = Self::from_json(inline)?;
+
+        if let Some(stored_hash) = props.get(MV_DESCRIPTOR_HASH_PROP) {
+            let actual_hash = descriptor.content_hash()?;
+            if stored_hash != &actual_hash {
+                return Err(format!(
+                    "MV descriptor hash mismatch: storage property has {stored_hash}, descriptor content hash is {actual_hash}"
+                ));
+            }
+        }
+
         Ok(descriptor)
     }
 }
@@ -157,5 +204,60 @@ mod tests {
             descriptor.content_hash().unwrap(),
             "05707bad24830c2246f225b7bf59e3d8b2a8b79ebbb53eb938cd4fc9087f2802"
         );
+    }
+
+    #[test]
+    fn descriptor_properties_carry_pkg_hash_inline() {
+        let descriptor = sample();
+
+        let props = descriptor.to_storage_properties().unwrap();
+        let get = |key: &str| {
+            props
+                .iter()
+                .find(|(prop_key, _)| prop_key == key)
+                .map(|(_, value)| value.clone())
+        };
+
+        assert_eq!(get(MV_DESCRIPTOR_PACKAGE_ID_PROP).as_deref(), Some("pkg-1"));
+        assert_eq!(
+            get(MV_DESCRIPTOR_HASH_PROP),
+            Some(descriptor.content_hash().unwrap())
+        );
+        assert_eq!(
+            MvDescriptorV1::from_json(&get(MV_DESCRIPTOR_INLINE_PROP).unwrap()).unwrap(),
+            descriptor
+        );
+    }
+
+    #[test]
+    fn descriptor_properties_reject_hash_mismatch() {
+        let descriptor = sample();
+        let props = descriptor.to_storage_properties().unwrap();
+        let mut props = props
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        props.insert(
+            MV_DESCRIPTOR_HASH_PROP.to_string(),
+            "not-the-hash".to_string(),
+        );
+
+        let err = MvDescriptorV1::from_storage_properties(&props).unwrap_err();
+
+        assert!(err.contains("hash mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn descriptor_properties_fail_fast_when_inline_exceeds_w1_cap() {
+        let mut descriptor = sample();
+        descriptor.logical_sql = "x".repeat(MV_DESCRIPTOR_INLINE_MAX_BYTES + 1);
+
+        let err = descriptor.to_storage_properties().unwrap_err();
+
+        assert!(err.contains("exceeds W1 cap"), "got: {err}");
+        assert!(
+            err.contains(&MV_DESCRIPTOR_INLINE_MAX_BYTES.to_string()),
+            "got: {err}"
+        );
+        assert!(err.contains("externalized descriptor"), "got: {err}");
     }
 }
