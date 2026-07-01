@@ -1,4 +1,4 @@
-s	c
-NULL	2
-a	2
-b	1
+s	is_null	c
+NULL	true	2
+a	false	2
+b	false	1
