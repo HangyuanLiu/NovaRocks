@@ -8,8 +8,8 @@ use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::codegen::scalar_materialize::materialize;
 use crate::sql::column_id::ColumnId;
 use crate::sql::explain::{
-    ExplainLevel, PlanNodeExplainStage, format_expr, format_shared_plan_node_detail_lines,
-    format_shared_plan_node_header, format_sort_items,
+    ExplainLevel, PlanNodeExplainStage, format_expr, format_project_item, format_sort_items,
+    format_window_exprs,
 };
 use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
@@ -17,18 +17,20 @@ use crate::sql::optimizer::physical_tree::JoinExecutionDistribution;
 use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::plan::{
-    DistributedExchangeNode, DistributedHashAggregateNode, DistributedHashJoinNode,
-    DistributedNestLoopJoinNode, DistributedSetOpNode, DistributedTopNNode, ExchangeFlavor,
+    DistributedExchangeNode, ExchangeFlavor, PhysicalHashAggregateNode, PhysicalHashJoinNode,
+    PhysicalNestLoopJoinNode, PhysicalSetOpNode, PhysicalTopNNode,
     PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanDecodeNode as DistributedDecodeNode,
     PlanFilterNode as DistributedFilterNode,
-    PlanGenerateSeriesNode as DistributedGenerateSeriesNode, PlanNodeKind,
+    PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
     PlanProjectNode as DistributedProjectNode, PlanRepeatNode as DistributedRepeatNode,
     PlanScanNode as DistributedScanNode, PlanSetOpKind as SetOpKind,
     PlanSortNode as DistributedSortNode, PlanTableFunctionNode as DistributedTableFunctionNode,
     PlanValuesNode as DistributedValuesNode, PlanWindowNode as DistributedWindowNode,
     ScanVariantColumn,
 };
-use crate::sql::planner::{DistributedPlan, DistributedPlanNode, PlanFragment, PlanNodeStats};
+use crate::sql::planner::{
+    DistributedPlan, DistributedPlanKind, DistributedPlanNode, PlanFragment, PlanNodeStats,
+};
 use crate::thrift::partitions;
 
 pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
@@ -146,6 +148,84 @@ fn format_output_exprs(exprs: Option<&[TypedExpr]>) -> String {
     }
 }
 
+fn format_distributed_shared_plan_node_header(
+    kind: &DistributedPlanKind,
+    stage: PlanNodeExplainStage,
+) -> Option<String> {
+    match kind {
+        DistributedPlanKind::Scan(node) => {
+            let alias = node
+                .alias
+                .as_deref()
+                .map(|a| format!(" (alias={a})"))
+                .unwrap_or_default();
+            Some(format!(
+                "SCAN {}.{}{}",
+                node.database, node.table.name, alias
+            ))
+        }
+        DistributedPlanKind::Filter(_) => Some("FILTER".to_string()),
+        DistributedPlanKind::Project(node) => {
+            let items = node
+                .items
+                .iter()
+                .map(format_project_item)
+                .collect::<Vec<_>>();
+            Some(format!("PROJECT [{}]", items.join(", ")))
+        }
+        DistributedPlanKind::Sort(node) => {
+            let items = format_sort_items(&node.items);
+            Some(format!("SORT BY [{}]", items.join(", ")))
+        }
+        DistributedPlanKind::Window(node) => {
+            let fns = format_window_exprs(&node.window_exprs, stage);
+            Some(format!("WINDOW [{}]", fns.join("; ")))
+        }
+        DistributedPlanKind::Values(node) => Some(format!("VALUES ({} rows)", node.rows.len())),
+        DistributedPlanKind::Decode(node) => {
+            let pairs = node
+                .mappings
+                .iter()
+                .map(|m| format!("{}->{}", m.dict_column, m.string_column))
+                .collect::<Vec<_>>();
+            Some(format!("DECODE [{}]", pairs.join(", ")))
+        }
+        DistributedPlanKind::Repeat(node) => Some(format!(
+            "REPEAT ({} grouping sets)",
+            node.grouping_ids.len()
+        )),
+        DistributedPlanKind::GenerateSeries(node) => Some(format!(
+            "GENERATE_SERIES({}, {}, {})",
+            node.start, node.end, node.step
+        )),
+        DistributedPlanKind::TableFunction(node) => {
+            let join_type = if node.is_left_join { "LEFT" } else { "CROSS" };
+            Some(format!(
+                "TABLE_FUNCTION [{} {}]",
+                join_type,
+                node.function_name.to_uppercase()
+            ))
+        }
+        DistributedPlanKind::AssertOneRow(_) => Some(match stage {
+            PlanNodeExplainStage::Logical => "ASSERT ONE ROW".to_string(),
+            PlanNodeExplainStage::Distributed => "ASSERT NUM ROWS (<= 1)".to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn format_distributed_shared_plan_node_detail_lines(
+    kind: &DistributedPlanKind,
+    _stage: PlanNodeExplainStage,
+) -> Vec<String> {
+    match kind {
+        DistributedPlanKind::Filter(node) => {
+            vec![format!("predicate: {}", format_expr(&node.predicate))]
+        }
+        _ => vec![],
+    }
+}
+
 fn format_distributed_node(
     node: &DistributedPlanNode,
     arena: &ScalarArena,
@@ -163,7 +243,7 @@ fn format_distributed_node(
     );
 
     match &node.kind {
-        PlanNodeKind::Scan(scan) => {
+        DistributedPlanKind::Scan(scan) => {
             format_scan_node(
                 node,
                 scan,
@@ -175,17 +255,17 @@ fn format_distributed_node(
                 out,
             );
         }
-        PlanNodeKind::Project(project) => {
+        DistributedPlanKind::Project(project) => {
             format_project_node(node, project, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, arena, level, &pad, out);
             format_children(node, arena, level, indent, actuals, out);
         }
-        PlanNodeKind::Filter(filter) => {
+        DistributedPlanKind::Filter(filter) => {
             format_filter_node(node, filter, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, arena, level, &pad, out);
             format_children(node, arena, level, indent, actuals, out);
         }
-        PlanNodeKind::HashJoin(join) => {
+        DistributedPlanKind::HashJoin(join) => {
             format_hash_join_node(
                 node,
                 join,
@@ -198,54 +278,54 @@ fn format_distributed_node(
             );
             format_children(node, arena, level, indent, actuals, out);
         }
-        PlanNodeKind::NestLoopJoin(join) => {
+        DistributedPlanKind::NestLoopJoin(join) => {
             format_nest_loop_join_node(node, join, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, arena, level, indent, actuals, out);
         }
-        PlanNodeKind::HashAggregate(agg) => {
+        DistributedPlanKind::HashAggregate(agg) => {
             format_hash_aggregate_node(node, agg, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, arena, level, &pad, out);
             format_children(node, arena, level, indent, actuals, out);
         }
-        PlanNodeKind::Sort(sort) => {
+        DistributedPlanKind::Sort(sort) => {
             format_sort_node(node, sort, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, arena, level, indent, actuals, out);
         }
-        PlanNodeKind::TopN(topn) => {
+        DistributedPlanKind::TopN(topn) => {
             format_topn_node(node, topn, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, arena, level, indent, actuals, out);
         }
-        PlanNodeKind::Exchange(exchange) => {
+        DistributedPlanKind::Exchange(exchange) => {
             format_exchange_node(node, exchange, &pad, &costs_suffix, &stats_suffix, out);
         }
-        PlanNodeKind::Values(values) => {
+        DistributedPlanKind::Values(values) => {
             format_values_node(node, values, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, arena, level, &pad, out);
         }
-        PlanNodeKind::AssertOneRow(assert) => {
+        DistributedPlanKind::AssertOneRow(assert) => {
             format_assert_one_row_node(node, assert, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, arena, level, indent, actuals, out);
         }
-        PlanNodeKind::Decode(decode) => {
+        DistributedPlanKind::Decode(decode) => {
             format_decode_node(node, decode, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, arena, level, indent, actuals, out);
         }
-        PlanNodeKind::Repeat(repeat) => {
+        DistributedPlanKind::Repeat(repeat) => {
             format_repeat_node(node, repeat, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, arena, level, indent, actuals, out);
         }
-        PlanNodeKind::SetOp(set_op) => {
+        DistributedPlanKind::SetOp(set_op) => {
             format_set_op_node(node, set_op, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, arena, level, indent, actuals, out);
         }
-        PlanNodeKind::Window(window) => {
+        DistributedPlanKind::Window(window) => {
             format_window_node(node, window, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, arena, level, indent, actuals, out);
         }
-        PlanNodeKind::GenerateSeries(generate) => {
+        DistributedPlanKind::GenerateSeries(generate) => {
             format_generate_series_node(node, generate, &pad, &costs_suffix, &stats_suffix, out);
         }
-        PlanNodeKind::TableFunction(table_function) => {
+        DistributedPlanKind::TableFunction(table_function) => {
             format_table_function_node(
                 node,
                 table_function,
@@ -255,24 +335,6 @@ fn format_distributed_node(
                 out,
             );
             format_children(node, arena, level, indent, actuals, out);
-        }
-        PlanNodeKind::Limit(_)
-        | PlanNodeKind::Aggregate(_)
-        | PlanNodeKind::Join(_)
-        | PlanNodeKind::Union(_)
-        | PlanNodeKind::Intersect(_)
-        | PlanNodeKind::Except(_)
-        | PlanNodeKind::CTEAnchor(_)
-        | PlanNodeKind::CTEProduce(_)
-        | PlanNodeKind::CTEConsume(_)
-        | PlanNodeKind::AggregateStateMerge(_)
-        | PlanNodeKind::Apply(_)
-        | PlanNodeKind::ImvDelta(_)
-        | PlanNodeKind::ImvVersion(_) => {
-            panic!(
-                "logical plan node {} leaked into distributed explain",
-                node.kind.variant_name()
-            );
         }
     }
 }
@@ -304,8 +366,9 @@ fn format_scan_node(
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let header = format_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-        .expect("Scan is a shared explain node");
+    let header =
+        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
+            .expect("Scan is a shared explain node");
     out.push(format!(
         "{pad}{}{header}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -458,8 +521,9 @@ fn format_project_node(
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let header = format_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-        .expect("Project is a shared explain node");
+    let header =
+        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
+            .expect("Project is a shared explain node");
     out.push(format!(
         "{pad}{}{header}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -474,21 +538,24 @@ fn format_filter_node(
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let header = format_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-        .expect("Filter is a shared explain node");
+    let header =
+        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
+            .expect("Filter is a shared explain node");
     out.push(format!(
         "{pad}{}{header}{costs_suffix}{stats_suffix}",
         node_prefix(node)
     ));
-    for line in format_shared_plan_node_detail_lines(&node.kind, PlanNodeExplainStage::Distributed)
-    {
+    for line in format_distributed_shared_plan_node_detail_lines(
+        &node.kind,
+        PlanNodeExplainStage::Distributed,
+    ) {
         out.push(format!("{pad}  {line}"));
     }
 }
 
 fn format_hash_join_node(
     node: &DistributedPlanNode,
-    join: &DistributedHashJoinNode,
+    join: &PhysicalHashJoinNode,
     arena: &ScalarArena,
     level: ExplainLevel,
     pad: &str,
@@ -525,7 +592,7 @@ fn format_hash_join_node(
 
 fn format_nest_loop_join_node(
     node: &DistributedPlanNode,
-    join: &DistributedNestLoopJoinNode,
+    join: &PhysicalNestLoopJoinNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
@@ -543,7 +610,7 @@ fn format_nest_loop_join_node(
 
 fn format_hash_aggregate_node(
     node: &DistributedPlanNode,
-    agg: &DistributedHashAggregateNode,
+    agg: &PhysicalHashAggregateNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
@@ -594,8 +661,9 @@ fn format_sort_node(
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body = format_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-        .expect("Sort is a shared explain node");
+    let body =
+        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
+            .expect("Sort is a shared explain node");
     let mut suffix = String::new();
     if let Some(limit) = sort.partition_limit {
         let topn_type = match sort.topn_type {
@@ -614,7 +682,7 @@ fn format_sort_node(
 
 fn format_topn_node(
     node: &DistributedPlanNode,
-    topn: &DistributedTopNNode,
+    topn: &PhysicalTopNNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
@@ -663,8 +731,9 @@ fn format_values_node(
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body = format_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-        .expect("Values is a shared explain node");
+    let body =
+        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
+            .expect("Values is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -679,8 +748,9 @@ fn format_assert_one_row_node(
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body = format_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-        .expect("AssertOneRow is a shared explain node");
+    let body =
+        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
+            .expect("AssertOneRow is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node)
@@ -695,8 +765,9 @@ fn format_decode_node(
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body = format_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-        .expect("Decode is a shared explain node");
+    let body =
+        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
+            .expect("Decode is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -711,8 +782,9 @@ fn format_repeat_node(
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body = format_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-        .expect("Repeat is a shared explain node");
+    let body =
+        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
+            .expect("Repeat is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -731,7 +803,7 @@ fn column_display_lookup(node: &DistributedPlanNode) -> ColumnDisplayLookup {
 }
 
 fn collect_column_displays(node: &DistributedPlanNode, lookup: &mut ColumnDisplayLookup) {
-    if let PlanNodeKind::Scan(scan) = &node.kind {
+    if let DistributedPlanKind::Scan(scan) = &node.kind {
         for column in &scan.columns {
             let display = (scan.alias.clone(), column.name.clone());
             lookup
@@ -762,7 +834,7 @@ fn format_group_expr(expr: &TypedExpr, lookup: &ColumnDisplayLookup) -> String {
 
 fn format_set_op_node(
     node: &DistributedPlanNode,
-    set_op: &DistributedSetOpNode,
+    set_op: &PhysicalSetOpNode,
     pad: &str,
     costs_suffix: &str,
     stats_suffix: &str,
@@ -787,8 +859,9 @@ fn format_window_node(
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let header = format_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-        .expect("Window is a shared explain node");
+    let header =
+        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
+            .expect("Window is a shared explain node");
     out.push(format!(
         "{pad}{}{header}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -803,8 +876,9 @@ fn format_generate_series_node(
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body = format_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-        .expect("GenerateSeries is a shared explain node");
+    let body =
+        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
+            .expect("GenerateSeries is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -819,8 +893,9 @@ fn format_table_function_node(
     stats_suffix: &str,
     out: &mut Vec<String>,
 ) {
-    let body = format_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
-        .expect("TableFunction is a shared explain node");
+    let body =
+        format_distributed_shared_plan_node_header(&node.kind, PlanNodeExplainStage::Distributed)
+            .expect("TableFunction is a shared explain node");
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node),
@@ -1458,14 +1533,17 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use super::{explain_distributed_plan_analyze, explain_fragment_order};
+    use super::{
+        explain_distributed_plan_analyze, explain_fragment_order,
+        format_distributed_shared_plan_node_header,
+    };
     use crate::exec::node::sort::SortTopNType;
     use crate::runtime::profile_correlate::{ActualMetrics, DistributedProfileSummary};
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::explain::{ExplainLevel, PlanNodeExplainStage, format_shared_plan_node_header};
+    use crate::sql::explain::{ExplainLevel, PlanNodeExplainStage};
     use crate::sql::optimizer::operator::{
         AggMode, Operator, PhysicalDistributionOp, PhysicalHashAggregateOp, ProjectOp, ScanOp,
     };
@@ -1480,7 +1558,8 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
     };
-    use crate::sql::planner::plan::AggregateCall;
+    use crate::sql::planner::plan::{AggregateCall, DistributedExchangeNode, ExchangeFlavor};
+    use crate::sql::planner::{DistributedPlanKind, DistributedPlanNode, PlanNodeStats};
 
     #[test]
     fn normal_scan_project_agg_renders_node_id_prefixes() {
@@ -1506,11 +1585,14 @@ mod tests {
             .root;
 
         assert_eq!(
-            format_shared_plan_node_header(&root.kind, PlanNodeExplainStage::Distributed),
+            format_distributed_shared_plan_node_header(
+                &root.kind,
+                PlanNodeExplainStage::Distributed
+            ),
             Some("PROJECT [t.k AS k]".to_string())
         );
         assert_eq!(
-            format_shared_plan_node_header(
+            format_distributed_shared_plan_node_header(
                 &root.children[0].kind,
                 PlanNodeExplainStage::Distributed
             ),
@@ -1526,6 +1608,32 @@ mod tests {
             text.contains("1:SCAN test_db.t (alias=t)"),
             "missing shared SCAN header in distributed explain:\n{text}"
         );
+    }
+
+    #[test]
+    fn distributed_explain_accepts_exchange_only_in_distributed_kind() {
+        let node = DistributedPlanNode {
+            node_id: 7,
+            fragment_id: 1,
+            tuple_ids: vec![],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            execution_join_distribution: None,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+            children: vec![],
+            stats: PlanNodeStats::from_statistics(&Statistics::default()),
+            kind: DistributedPlanKind::Exchange(DistributedExchangeNode {
+                partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                partition_exprs: vec![],
+                source_fragment_id: 0,
+                output_columns: vec![],
+                output_qualifier: None,
+                flavor: ExchangeFlavor::Distribution,
+            }),
+        };
+
+        assert_eq!(node.kind.variant_name(), "Exchange");
     }
 
     #[test]

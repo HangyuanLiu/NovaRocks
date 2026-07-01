@@ -11,8 +11,8 @@ use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
     JoinRefreshDescriptor, JoinRefreshMode, JoinRefreshOutputMapping, JoinRefreshOutputSource,
 };
 use crate::sql::planner::plan::{
-    AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,
-    LogicalProjectNode, LogicalScanNode, PlanNodeKind,
+    AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind,
+    LogicalPlanNode, LogicalProjectNode, LogicalScanNode,
 };
 
 pub(crate) fn build_join_apply_key_project(
@@ -84,7 +84,7 @@ fn build_join_apply_key_project_with_action(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(LogicalPlanNode::new(
-        PlanNodeKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(LogicalProjectNode {
             items,
             output_qualifier: None,
         }),
@@ -267,7 +267,7 @@ fn build_payload_coalesce_aggregate(
         .chain([apply_key_input.clone(), net_column.clone()])
         .collect::<Vec<_>>();
     LogicalPlanNode::new(
-        PlanNodeKind::Aggregate(LogicalAggregateNode {
+        LogicalPlanKind::Aggregate(LogicalAggregateNode {
             group_by,
             aggregates: vec![AggregateCall {
                 name: "sum".to_string(),
@@ -361,7 +361,7 @@ fn build_payload_coalesce_assert_filter(
         "join delta per-payload net change exceeds 1",
     );
     LogicalPlanNode::new(
-        PlanNodeKind::Filter(LogicalFilterNode {
+        LogicalPlanKind::Filter(LogicalFilterNode {
             predicate: binary(net_ne_zero, BinOp::And, payload_assert),
         }),
         vec![aggregate],
@@ -378,7 +378,7 @@ fn build_key_shape_assert_join(
     pending_delete_count: &OutputColumn,
 ) -> LogicalPlanNode {
     let key_shape = LogicalPlanNode::new(
-        PlanNodeKind::Aggregate(LogicalAggregateNode {
+        LogicalPlanKind::Aggregate(LogicalAggregateNode {
             group_by: vec![column_ref(apply_key_output)],
             aggregates: vec![
                 AggregateCall {
@@ -425,7 +425,7 @@ fn build_key_shape_assert_join(
         "join delta multiple pending payloads for key",
     );
     let checked_key_shape = LogicalPlanNode::new(
-        PlanNodeKind::Filter(LogicalFilterNode {
+        LogicalPlanKind::Filter(LogicalFilterNode {
             predicate: shape_guard,
         }),
         vec![key_shape],
@@ -437,7 +437,7 @@ fn build_key_shape_assert_join(
         column_ref(key_shape_apply_key),
     );
     LogicalPlanNode::new(
-        PlanNodeKind::Join(LogicalJoinNode {
+        LogicalPlanKind::Join(LogicalJoinNode {
             join_type: JoinKind::Inner,
             condition: Some(join_condition),
         }),
@@ -502,7 +502,7 @@ fn build_locator_join_shell(
         },
     );
     Ok(LogicalPlanNode::new(
-        PlanNodeKind::Join(LogicalJoinNode {
+        LogicalPlanKind::Join(LogicalJoinNode {
             join_type: JoinKind::LeftOuter,
             condition: Some(binary(delete_only, BinOp::And, apply_key_eq)),
         }),
@@ -596,7 +596,7 @@ fn build_target_locator_scan(
         ),
     ];
     LogicalPlanNode::new(
-        PlanNodeKind::Scan(LogicalScanNode {
+        LogicalPlanKind::Scan(LogicalScanNode {
             database: desc.mv_identity.database.clone(),
             table: TableDef {
                 name: desc.mv_identity.name.clone(),
@@ -650,7 +650,7 @@ fn build_locator_assert_filter(
         )),
     );
     LogicalPlanNode::new(
-        PlanNodeKind::Filter(LogicalFilterNode {
+        LogicalPlanKind::Filter(LogicalFilterNode {
             predicate: assert_true_call(
                 binary(insert_or_noop, BinOp::Or, locator_present),
                 "join delta DELETE row missing target locator",
@@ -727,7 +727,7 @@ fn build_final_coalesce_project(
         output_column_id: locator_last_updated_seq_column_id,
     });
     Ok(LogicalPlanNode::new(
-        PlanNodeKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(LogicalProjectNode {
             items,
             output_qualifier: None,
         }),
@@ -1172,7 +1172,7 @@ mod tests {
         logical_plan_to_opt_expr, opt_expr_to_logical_plan,
     };
     use crate::sql::planner::plan::{
-        LogicalPlanNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,
+        LogicalPlanKind, LogicalPlanNode, LogicalUnionNode, LogicalValuesNode,
     };
 
     #[test]
@@ -1207,7 +1207,7 @@ mod tests {
             super::build_join_apply_key_project(input, &desc, "left-uuid", "right-uuid", 90, 91)
                 .expect("apply-key project");
 
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project");
         };
         assert_eq!(project.items.len(), 3);
@@ -1287,7 +1287,7 @@ mod tests {
         )
         .expect("apply-key project with constant insert action");
 
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project");
         };
         assert_eq!(project.items.len(), 3);
@@ -1466,12 +1466,12 @@ mod tests {
     }
 
     fn contains_aggregate(plan: &LogicalPlanNode) -> bool {
-        matches!(&plan.kind, PlanNodeKind::Aggregate(_))
+        matches!(&plan.kind, LogicalPlanKind::Aggregate(_))
             || plan.children.iter().any(contains_aggregate)
     }
 
     fn contains_target_locator_join(plan: &LogicalPlanNode) -> bool {
-        matches!(&plan.kind, PlanNodeKind::Join(join) if join.join_type == JoinKind::LeftOuter)
+        matches!(&plan.kind, LogicalPlanKind::Join(join) if join.join_type == JoinKind::LeftOuter)
             || plan.children.iter().any(contains_target_locator_join)
     }
 
@@ -1484,17 +1484,17 @@ mod tests {
     fn plan_exprs(plan: &LogicalPlanNode) -> Vec<&crate::sql::analysis::TypedExpr> {
         let mut exprs = Vec::new();
         match &plan.kind {
-            PlanNodeKind::Project(project) => {
+            LogicalPlanKind::Project(project) => {
                 exprs.extend(project.items.iter().map(|item| &item.expr));
             }
-            PlanNodeKind::Filter(filter) => exprs.push(&filter.predicate),
-            PlanNodeKind::Aggregate(aggregate) => {
+            LogicalPlanKind::Filter(filter) => exprs.push(&filter.predicate),
+            LogicalPlanKind::Aggregate(aggregate) => {
                 exprs.extend(aggregate.group_by.iter());
                 for call in &aggregate.aggregates {
                     exprs.extend(call.args.iter());
                 }
             }
-            PlanNodeKind::Join(join) => {
+            LogicalPlanKind::Join(join) => {
                 if let Some(condition) = &join.condition {
                     exprs.push(condition);
                 }
@@ -1542,7 +1542,7 @@ mod tests {
     }
 
     fn assert_final_coalesce_output(plan: &LogicalPlanNode) {
-        let PlanNodeKind::Project(project) = &plan.kind else {
+        let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected final Project");
         };
         let output = project
@@ -1582,7 +1582,7 @@ mod tests {
     fn find_target_locator_scan(
         plan: &LogicalPlanNode,
     ) -> Option<&crate::sql::catalog::IcebergMvTargetLocatorScan> {
-        if let PlanNodeKind::Scan(scan) = &plan.kind
+        if let LogicalPlanKind::Scan(scan) = &plan.kind
             && let crate::sql::catalog::ScanSource::IcebergMvTargetLocator(locator) =
                 &scan.table.source
         {
@@ -1634,7 +1634,7 @@ mod tests {
     }
 
     fn assert_aggregate_args_resolve_to_child_outputs(plan: &LogicalPlanNode) {
-        if let PlanNodeKind::Aggregate(aggregate) = &plan.kind {
+        if let LogicalPlanKind::Aggregate(aggregate) = &plan.kind {
             let child_output_ids = crate::sql::planner::plan_output_columns(plan.unary_input())
                 .expect("aggregate child output columns")
                 .into_iter()
@@ -1753,7 +1753,7 @@ mod tests {
         output_columns.push(desc.join_apply_key_column.clone());
         let branch = test_values_plan(output_columns.clone());
         LogicalPlanNode::new(
-            PlanNodeKind::Union(LogicalUnionNode {
+            LogicalPlanKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns,
             }),
@@ -1807,7 +1807,7 @@ mod tests {
 
     fn test_values_plan(columns: Vec<OutputColumn>) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: Vec::new(),
                 columns,
             }),

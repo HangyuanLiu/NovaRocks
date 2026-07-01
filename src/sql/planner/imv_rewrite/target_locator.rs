@@ -28,7 +28,7 @@ use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{
-    LogicalJoinNode, LogicalPlanNode, LogicalProjectNode, LogicalScanNode, PlanNodeKind,
+    LogicalJoinNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode, LogicalScanNode,
 };
 
 pub(crate) struct InjectTargetLocatorJoinRule {
@@ -80,13 +80,13 @@ impl LogicalRewriteRule for InjectTargetLocatorJoinRule {
 }
 
 pub(crate) fn is_target_locator_join(plan: &LogicalPlanNode) -> bool {
-    let PlanNodeKind::Join(join) = &plan.kind else {
+    let LogicalPlanKind::Join(join) = &plan.kind else {
         return false;
     };
     join.join_type == JoinKind::LeftOuter
         && matches!(
             &plan.right().kind,
-            PlanNodeKind::Scan(scan)
+            LogicalPlanKind::Scan(scan)
                 if matches!(scan.table.source, ScanSource::IcebergMvTargetLocator(_))
         )
 }
@@ -235,7 +235,7 @@ fn build_target_locator_join(
         right_last_updated_seq_id,
     );
     let join = LogicalPlanNode::new(
-        PlanNodeKind::Join(LogicalJoinNode {
+        LogicalPlanKind::Join(LogicalJoinNode {
             join_type: JoinKind::LeftOuter,
             condition: Some(target_locator_join_condition(
                 &input,
@@ -274,7 +274,7 @@ fn build_target_locator_join(
         DataType::Int64,
     ));
     Ok(LogicalPlanNode::new(
-        PlanNodeKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(LogicalProjectNode {
             items,
             output_qualifier: None,
         }),
@@ -386,7 +386,7 @@ fn build_target_locator_scan(
     ));
 
     LogicalPlanNode::new(
-        PlanNodeKind::Scan(LogicalScanNode {
+        LogicalPlanKind::Scan(LogicalScanNode {
             database: target.namespace.clone(),
             table: TableDef {
                 name: target.table.clone(),
@@ -472,7 +472,7 @@ fn target_locator_join_condition(
 
 fn effective_output_columns(plan: &LogicalPlanNode) -> Option<Vec<OutputColumn>> {
     match &plan.kind {
-        PlanNodeKind::Project(project) => Some(
+        LogicalPlanKind::Project(project) => Some(
             project
                 .items
                 .iter()
@@ -485,8 +485,8 @@ fn effective_output_columns(plan: &LogicalPlanNode) -> Option<Vec<OutputColumn>>
                 })
                 .collect(),
         ),
-        PlanNodeKind::Union(union) => Some(union.output_columns.clone()),
-        PlanNodeKind::Filter(_) => effective_output_columns(plan.unary_input()),
+        LogicalPlanKind::Union(union) => Some(union.output_columns.clone()),
+        LogicalPlanKind::Filter(_) => effective_output_columns(plan.unary_input()),
         _ => None,
     }
 }
@@ -508,7 +508,7 @@ fn reserved_locator_output_name(columns: &[OutputColumn]) -> Option<&str> {
 }
 
 fn subtree_has_aggregate_state_merge(plan: &LogicalPlanNode) -> bool {
-    matches!(plan.kind, PlanNodeKind::AggregateStateMerge(_))
+    matches!(plan.kind, LogicalPlanKind::AggregateStateMerge(_))
         || plan.children.iter().any(subtree_has_aggregate_state_merge)
 }
 

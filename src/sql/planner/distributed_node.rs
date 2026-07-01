@@ -4,7 +4,62 @@ use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::cost::BroadcastDecision;
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, CostEstimate, Statistics};
-pub(crate) use crate::sql::planner::plan::PlanNodeKind;
+use crate::sql::planner::plan::{
+    DistributedExchangeNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
+    PhysicalNestLoopJoinNode, PhysicalSetOpNode, PhysicalTopNNode, PlanAssertOneRowNode,
+    PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
+    PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
+};
+
+/// Migration-only lowering kind for the existing DistributedPlan node tree.
+///
+/// PIR-4/PIR-5 must decide whether this remains a thin fragment overlay or is
+/// collapsed into planner physical plan plus fragment annotations. It must not
+/// be used as a replacement public logical/physical taxonomy.
+#[derive(Clone, Debug)]
+pub(crate) enum DistributedPlanKind {
+    Scan(PlanScanNode),
+    Filter(PlanFilterNode),
+    Project(PlanProjectNode),
+    Sort(PlanSortNode),
+    Values(PlanValuesNode),
+    Decode(PlanDecodeNode),
+    Repeat(PlanRepeatNode),
+    Window(PlanWindowNode),
+    GenerateSeries(PlanGenerateSeriesNode),
+    TableFunction(PlanTableFunctionNode),
+    AssertOneRow(PlanAssertOneRowNode),
+    TopN(PhysicalTopNNode),
+    Exchange(DistributedExchangeNode),
+    HashAggregate(Box<PhysicalHashAggregateNode>),
+    HashJoin(Box<PhysicalHashJoinNode>),
+    NestLoopJoin(PhysicalNestLoopJoinNode),
+    SetOp(PhysicalSetOpNode),
+}
+
+impl DistributedPlanKind {
+    pub(crate) fn variant_name(&self) -> &'static str {
+        match self {
+            DistributedPlanKind::Scan(_) => "Scan",
+            DistributedPlanKind::Filter(_) => "Filter",
+            DistributedPlanKind::Project(_) => "Project",
+            DistributedPlanKind::Sort(_) => "Sort",
+            DistributedPlanKind::Values(_) => "Values",
+            DistributedPlanKind::Decode(_) => "Decode",
+            DistributedPlanKind::Repeat(_) => "Repeat",
+            DistributedPlanKind::Window(_) => "Window",
+            DistributedPlanKind::GenerateSeries(_) => "GenerateSeries",
+            DistributedPlanKind::TableFunction(_) => "TableFunction",
+            DistributedPlanKind::AssertOneRow(_) => "AssertOneRow",
+            DistributedPlanKind::TopN(_) => "TopN",
+            DistributedPlanKind::Exchange(_) => "Exchange",
+            DistributedPlanKind::HashAggregate(_) => "HashAggregate",
+            DistributedPlanKind::HashJoin(_) => "HashJoin",
+            DistributedPlanKind::NestLoopJoin(_) => "NestLoopJoin",
+            DistributedPlanKind::SetOp(_) => "SetOp",
+        }
+    }
+}
 
 /// Self-contained copy of the estimated stats this node carries, so EXPLAIN /
 /// ANALYZE never reaches back into `OptimizerPhysicalNode`.
@@ -63,14 +118,14 @@ pub(crate) struct DistributedPlanNode {
     pub probe_runtime_filters: Vec<crate::sql::optimizer::runtime_filter_pass::RuntimeFilterProbe>,
     pub children: Vec<DistributedPlanNode>,
     pub stats: PlanNodeStats,
-    pub kind: PlanNodeKind,
+    pub kind: DistributedPlanKind,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, Statistics};
-    use crate::sql::planner::plan::PlanValuesNode as DistributedValuesNode;
+    use crate::sql::planner::plan::PlanValuesNode;
 
     #[test]
     fn plan_node_stats_copies_statistics() {
@@ -123,19 +178,19 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: PlanNodeStats::from_statistics(&Statistics::default()),
-            kind: PlanNodeKind::Values(DistributedValuesNode {
+            kind: DistributedPlanKind::Values(PlanValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
         };
 
-        assert!(matches!(node.kind, PlanNodeKind::Values(_)));
+        assert!(matches!(node.kind, DistributedPlanKind::Values(_)));
         assert!(node.children.is_empty());
     }
 
     #[test]
-    fn distributed_plan_node_uses_unified_kind() {
-        fn accepts_unified_kind(_: &crate::sql::planner::plan::PlanNodeKind) {}
+    fn distributed_plan_node_uses_migration_only_kind() {
+        fn accepts_distributed_kind(_: &DistributedPlanKind) {}
 
         let node = DistributedPlanNode {
             node_id: 1,
@@ -148,12 +203,12 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: PlanNodeStats::from_statistics(&Statistics::default()),
-            kind: PlanNodeKind::Values(DistributedValuesNode {
+            kind: DistributedPlanKind::Values(PlanValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
         };
 
-        accepts_unified_kind(&node.kind);
+        accepts_distributed_kind(&node.kind);
     }
 }

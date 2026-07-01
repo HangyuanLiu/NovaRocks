@@ -8,7 +8,7 @@ pub(crate) mod lowering;
 pub(crate) mod equiv;
 
 #[cfg(test)]
-pub(crate) use crate::sql::planner::plan::PlanNodeKind;
+pub(crate) use crate::sql::planner::DistributedPlanKind;
 #[cfg(test)]
 pub(crate) use crate::sql::planner::{
     DataPartition, DataSink, DistributedPlan, DistributedPlanNode, PartitionKind, PlanFragment,

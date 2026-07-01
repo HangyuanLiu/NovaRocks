@@ -248,7 +248,7 @@ fn build_candidate(
 /// the plan. Mirrors query-stats collector scan-source coverage.
 fn collect_iceberg_fqns(plan: &LogicalPlanNode, out: &mut Vec<String>) {
     match &plan.kind {
-        crate::sql::planner::plan::PlanNodeKind::Scan(s) => {
+        crate::sql::planner::plan::LogicalPlanKind::Scan(s) => {
             if let ScanSource::IcebergDataFiles { table, .. } = &s.table.source {
                 let fqn = format!("{}.{}.{}", table.catalog, table.namespace, table.table);
                 if !out.contains(&fqn) {
@@ -256,8 +256,8 @@ fn collect_iceberg_fqns(plan: &LogicalPlanNode, out: &mut Vec<String>) {
                 }
             }
         }
-        crate::sql::planner::plan::PlanNodeKind::ImvDelta(_)
-        | crate::sql::planner::plan::PlanNodeKind::ImvVersion(_) => {
+        crate::sql::planner::plan::LogicalPlanKind::ImvDelta(_)
+        | crate::sql::planner::plan::LogicalPlanKind::ImvVersion(_) => {
             // IMV markers never appear on the standalone query path; ignore.
         }
         _ => {}

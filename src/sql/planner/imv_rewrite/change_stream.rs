@@ -19,7 +19,7 @@ use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor;
 use crate::sql::planner::imv_rewrite::opt_expr_to_plan;
 use crate::sql::planner::plan::{
-    LogicalAggregateNode, LogicalPlanNode, LogicalProjectNode, LogicalScanNode, PlanNodeKind,
+    LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode, LogicalScanNode,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -51,7 +51,7 @@ impl ImvChangeStreamDescriptor {
             return true;
         }
         self.aggregate.is_some()
-            && matches!(&plan.kind, PlanNodeKind::Join(_))
+            && matches!(&plan.kind, LogicalPlanKind::Join(_))
             && contains_target_state_scan(plan)
             && contains_signed_state_aggregate(plan)
     }
@@ -248,9 +248,9 @@ fn build_union_change_stream_root_descriptor(
     plan: &LogicalPlanNode,
 ) -> Option<AggregateChangeStreamDescriptor> {
     let matched = match &plan.kind {
-        PlanNodeKind::Union(_) => change_stream_union_output_column(plan)
+        LogicalPlanKind::Union(_) => change_stream_union_output_column(plan)
             .filter(|_| contains_target_state_scan(plan) && contains_signed_state_aggregate(plan)),
-        PlanNodeKind::CTEAnchor(_) if plan.children.len() == 2 => {
+        LogicalPlanKind::CTEAnchor(_) if plan.children.len() == 2 => {
             change_stream_union_output_column(plan.child(1)).filter(|_| {
                 contains_target_state_scan(plan.child(0))
                     && contains_signed_state_aggregate(plan.child(0))
@@ -288,7 +288,7 @@ fn build_relational_change_stream_root_descriptor(
     plan: &LogicalPlanNode,
 ) -> Option<AggregateChangeStreamDescriptor> {
     let matched = match &plan.kind {
-        PlanNodeKind::Project(project) => {
+        LogicalPlanKind::Project(project) => {
             change_stream_project_output_column(project).filter(|_| {
                 project_filter_contains_state_all_zero(plan)
                     && contains_join_kind(plan, JoinKind::LeftOuter)
@@ -315,7 +315,7 @@ fn build_relational_change_stream_root_descriptor(
 }
 
 fn change_stream_union_output_column(plan: &LogicalPlanNode) -> Option<OutputColumn> {
-    let PlanNodeKind::Union(union) = &plan.kind else {
+    let LogicalPlanKind::Union(union) = &plan.kind else {
         return None;
     };
     union
@@ -340,13 +340,13 @@ fn change_stream_project_output_column(project: &LogicalProjectNode) -> Option<O
 }
 
 fn project_filter_contains_state_all_zero(plan: &LogicalPlanNode) -> bool {
-    let PlanNodeKind::Project(_) = &plan.kind else {
+    let LogicalPlanKind::Project(_) = &plan.kind else {
         return false;
     };
     let Some(filter_plan) = plan.children.first() else {
         return false;
     };
-    let PlanNodeKind::Filter(filter) = &filter_plan.kind else {
+    let LogicalPlanKind::Filter(filter) = &filter_plan.kind else {
         return false;
     };
     expr_contains_function(&filter.predicate, "state_all_zero")
@@ -428,7 +428,7 @@ fn expr_contains_function(expr: &TypedExpr, name: &str) -> bool {
 fn contains_join_kind(plan: &LogicalPlanNode, join_type: JoinKind) -> bool {
     matches!(
         &plan.kind,
-        PlanNodeKind::Join(join) if join.join_type == join_type
+        LogicalPlanKind::Join(join) if join.join_type == join_type
     ) || plan
         .children
         .iter()
@@ -436,7 +436,7 @@ fn contains_join_kind(plan: &LogicalPlanNode, join_type: JoinKind) -> bool {
 }
 
 fn contains_branch_marker_values(plan: &LogicalPlanNode) -> bool {
-    matches!(&plan.kind, PlanNodeKind::Values(values)
+    matches!(&plan.kind, LogicalPlanKind::Values(values)
         if values.columns.iter().any(|column| {
             column.name.eq_ignore_ascii_case("__imv_change_branch")
         })
@@ -446,7 +446,7 @@ fn contains_branch_marker_values(plan: &LogicalPlanNode) -> bool {
 fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
     matches!(
         &plan.kind,
-        PlanNodeKind::Scan(LogicalScanNode {
+        LogicalPlanKind::Scan(LogicalScanNode {
             table: TableDef {
                 source: ScanSource::IcebergMvTargetState(_),
                 ..
@@ -459,7 +459,7 @@ fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
 fn contains_signed_state_aggregate(plan: &LogicalPlanNode) -> bool {
     matches!(
         &plan.kind,
-        PlanNodeKind::Aggregate(LogicalAggregateNode { aggregates, .. })
+        LogicalPlanKind::Aggregate(LogicalAggregateNode { aggregates, .. })
             if aggregates.iter().any(|call| call.name.ends_with("_state_signed"))
     ) || plan.children.iter().any(contains_signed_state_aggregate)
 }
@@ -474,26 +474,26 @@ fn plan_contains_output_column(plan: &LogicalPlanNode, column_id: ColumnId, name
 
 fn node_output_contains_column(plan: &LogicalPlanNode, column_id: ColumnId, name: &str) -> bool {
     match &plan.kind {
-        PlanNodeKind::Scan(scan) => scan
+        LogicalPlanKind::Scan(scan) => scan
             .columns
             .iter()
             .any(|column| column.column_id == column_id && column.name.eq_ignore_ascii_case(name)),
-        PlanNodeKind::Project(project) => project.items.iter().any(|item| {
+        LogicalPlanKind::Project(project) => project.items.iter().any(|item| {
             item.output_column_id == column_id && item.output_name.eq_ignore_ascii_case(name)
         }),
-        PlanNodeKind::Aggregate(aggregate) => aggregate
+        LogicalPlanKind::Aggregate(aggregate) => aggregate
             .output_columns
             .iter()
             .any(|column| column.column_id == column_id && column.name.eq_ignore_ascii_case(name)),
-        PlanNodeKind::AggregateStateMerge(merge) => merge
+        LogicalPlanKind::AggregateStateMerge(merge) => merge
             .output_columns
             .iter()
             .any(|column| column.column_id == column_id && column.name.eq_ignore_ascii_case(name)),
-        PlanNodeKind::Union(union) => union
+        LogicalPlanKind::Union(union) => union
             .output_columns
             .iter()
             .any(|column| column.column_id == column_id && column.name.eq_ignore_ascii_case(name)),
-        PlanNodeKind::Values(values) => values
+        LogicalPlanKind::Values(values) => values
             .columns
             .iter()
             .any(|column| column.column_id == column_id && column.name.eq_ignore_ascii_case(name)),
@@ -516,8 +516,8 @@ mod tests {
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::imv_rewrite::target_state::build_target_state_scan_source;
     use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,
-        LogicalProjectNode, LogicalScanNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,
+        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind,
+        LogicalPlanNode, LogicalProjectNode, LogicalScanNode, LogicalUnionNode, LogicalValuesNode,
     };
 
     fn output_column(id: u32, name: &str, data_type: DataType, is_internal: bool) -> OutputColumn {
@@ -532,7 +532,7 @@ mod tests {
 
     fn empty_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: Vec::new(),
                 columns: Vec::new(),
             }),
@@ -550,7 +550,7 @@ mod tests {
             logical_type: None,
         }];
         LogicalPlanNode::new(
-            PlanNodeKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "mv_target".to_string(),
@@ -590,7 +590,7 @@ mod tests {
 
     fn signed_state_aggregate(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Aggregate(LogicalAggregateNode {
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: Vec::new(),
                 aggregates: vec![AggregateCall {
                     name: "sum_state_signed".to_string(),
@@ -614,7 +614,7 @@ mod tests {
 
     fn branch_marker_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            PlanNodeKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(LogicalValuesNode {
                 rows: Vec::new(),
                 columns: vec![output_column(
                     30,
@@ -632,7 +632,7 @@ mod tests {
     fn build_descriptor_recognizes_union_change_stream() {
         let action = output_column(1, ImvActionColumn::NAME, DataType::Int8, true);
         let plan = LogicalPlanNode::new(
-            PlanNodeKind::Union(LogicalUnionNode {
+            LogicalPlanKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![action.clone()],
             }),
@@ -658,7 +658,7 @@ mod tests {
     fn descriptor_describes_only_matching_change_stream_root() {
         let action = output_column(1, ImvActionColumn::NAME, DataType::Int8, true);
         let union = LogicalPlanNode::new(
-            PlanNodeKind::Union(LogicalUnionNode {
+            LogicalPlanKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![action],
             }),
@@ -669,7 +669,7 @@ mod tests {
         assert!(descriptor.describes_aggregate_root(&union));
 
         let wrapped = LogicalPlanNode::new(
-            PlanNodeKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(LogicalFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
                     data_type: DataType::Boolean,
@@ -704,7 +704,7 @@ mod tests {
             ..Default::default()
         };
         let aggregate_merge_join = LogicalPlanNode::new(
-            PlanNodeKind::Join(LogicalJoinNode {
+            LogicalPlanKind::Join(LogicalJoinNode {
                 join_type: JoinKind::LeftOuter,
                 condition: None,
             }),
@@ -717,7 +717,7 @@ mod tests {
         assert!(descriptor.covers_aggregate_validation_root(&aggregate_merge_join));
 
         let plain_outer_join = LogicalPlanNode::new(
-            PlanNodeKind::Join(LogicalJoinNode {
+            LogicalPlanKind::Join(LogicalJoinNode {
                 join_type: JoinKind::LeftOuter,
                 condition: None,
             }),
@@ -731,7 +731,7 @@ mod tests {
     fn build_descriptor_recognizes_relational_change_stream() {
         let action_id = ColumnId::new_for_test(1);
         let target_and_signed = LogicalPlanNode::new(
-            PlanNodeKind::Join(LogicalJoinNode {
+            LogicalPlanKind::Join(LogicalJoinNode {
                 join_type: JoinKind::LeftOuter,
                 condition: None,
             }),
@@ -742,7 +742,7 @@ mod tests {
             None,
         );
         let expanded = LogicalPlanNode::new(
-            PlanNodeKind::Join(LogicalJoinNode {
+            LogicalPlanKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Cross,
                 condition: None,
             }),
@@ -750,7 +750,7 @@ mod tests {
             None,
         );
         let filtered = LogicalPlanNode::new(
-            PlanNodeKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(LogicalFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::FunctionCall {
                         name: "state_all_zero".to_string(),
@@ -765,7 +765,7 @@ mod tests {
             None,
         );
         let plan = LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
@@ -799,7 +799,7 @@ mod tests {
     fn descriptor_validation_rejects_stale_action_column_id() {
         let action = output_column(1, ImvActionColumn::NAME, DataType::Int8, true);
         let plan = LogicalPlanNode::new(
-            PlanNodeKind::Union(LogicalUnionNode {
+            LogicalPlanKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![action],
             }),

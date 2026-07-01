@@ -173,7 +173,7 @@ mod tests {
             },
         };
         LogicalPlanNode::new(
-            PlanNodeKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(LogicalScanNode {
                 database: "default".to_string(),
                 table: table,
                 alias: None,
@@ -212,10 +212,10 @@ mod tests {
     fn extract_scan(plan: &LogicalPlanNode) -> &LogicalScanNode {
         // Walk down through Project/Filter/Aggregate to reach the Scan leaf.
         match &plan.kind {
-            PlanNodeKind::Scan(s) => s,
-            PlanNodeKind::Project(_) | PlanNodeKind::Filter(_) | PlanNodeKind::Aggregate(_) => {
-                extract_scan(plan.unary_input())
-            }
+            LogicalPlanKind::Scan(s) => s,
+            LogicalPlanKind::Project(_)
+            | LogicalPlanKind::Filter(_)
+            | LogicalPlanKind::Aggregate(_) => extract_scan(plan.unary_input()),
             _ => panic!("unexpected plan node, expected to find Scan"),
         }
     }
@@ -234,7 +234,7 @@ mod tests {
         let plan = make_scan(&[(id_a, "a"), (id_b, "b"), (id_c, "c")]);
         let result = run_pipeline(plan);
 
-        let PlanNodeKind::Scan(s) = &result.kind else {
+        let LogicalPlanKind::Scan(s) = &result.kind else {
             panic!("expected Scan at root");
         };
         // Phase-1 tags all columns when there is no parent restriction; Phase-2
@@ -265,7 +265,7 @@ mod tests {
 
         let scan = make_scan(&[(id_a, "a"), (id_b, "b"), (id_c, "c")]);
         let project = LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: col_ref(id_a, "a"),
                     output_name: "a".to_string(),
@@ -302,7 +302,7 @@ mod tests {
 
         let scan = make_scan(&[(id_a, "a"), (id_b, "b"), (id_c, "c")]);
         let filter = LogicalPlanNode::new(
-            PlanNodeKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(LogicalFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
                         left: Box::new(col_ref(id_b, "b")),
@@ -321,7 +321,7 @@ mod tests {
             None,
         );
         let project = LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: col_ref(id_a, "a"),
                     output_name: "a".to_string(),
@@ -375,7 +375,7 @@ mod tests {
 
         let scan = make_scan(&[(id_a, "a"), (id_b, "b"), (id_c, "c")]);
         let agg = LogicalPlanNode::new(
-            PlanNodeKind::Aggregate(LogicalAggregateNode {
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_ref(id_b, "b")],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
@@ -411,7 +411,7 @@ mod tests {
         // a non-None parent_needed to tag_aggregate. tag_aggregate then passes
         // child_needed = ALL group-by ∪ ALL agg args = {b@2, c@3} to the Scan.
         let proj = LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     output_column_id: ColumnId::new_for_test(901),
                     output_name: "b".to_string(),

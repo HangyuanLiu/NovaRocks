@@ -1,8 +1,8 @@
 #[cfg(test)]
-pub(crate) use crate::sql::planner::plan::DistributedHashJoinEqCondition;
+pub(crate) use crate::sql::planner::plan::PhysicalHashJoinEqCondition;
 pub(crate) use crate::sql::planner::plan::{
-    DistributedExchangeNode, DistributedHashAggregateNode, DistributedHashJoinNode,
-    DistributedNestLoopJoinNode, DistributedSetOpNode, DistributedTopNNode, ExchangeFlavor,
+    DistributedExchangeNode, ExchangeFlavor, PhysicalHashAggregateNode, PhysicalHashJoinNode,
+    PhysicalNestLoopJoinNode, PhysicalSetOpNode, PhysicalTopNNode,
     PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanDecodeNode as DistributedDecodeNode,
     PlanFilterNode as DistributedFilterNode,
     PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
