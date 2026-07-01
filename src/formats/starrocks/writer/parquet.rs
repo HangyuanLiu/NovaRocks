@@ -71,8 +71,8 @@ pub fn write_parquet_file(path: &str, batch: &RecordBatch) -> Result<u64, String
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .build();
-    let access =
-        resolve_format_path(path).map_err(|e| map_hdfs_error(path, "write_parquet_file", e))?;
+    reject_hdfs_path(path, "write_parquet_file")?;
+    let access = resolve_format_path(path)?;
 
     match access.scheme() {
         FsScheme::Local => {
@@ -122,8 +122,8 @@ pub fn write_parquet_file(path: &str, batch: &RecordBatch) -> Result<u64, String
 }
 
 pub fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>, String> {
-    let access =
-        resolve_format_path(path).map_err(|e| map_hdfs_error(path, "read_parquet_file", e))?;
+    reject_hdfs_path(path, "read_parquet_file")?;
+    let access = resolve_format_path(path)?;
     match access.scheme() {
         FsScheme::Local => {
             let file = fs::File::open(path).map_err(|e| format!("open parquet failed: {}", e))?;
@@ -158,12 +158,17 @@ pub fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>, String> {
     }
 }
 
-fn map_hdfs_error(path: &str, function_name: &str, err: String) -> String {
-    if err == format!("StarRocks formats do not support hdfs path yet: {path}") {
-        format!("{function_name} does not support hdfs path yet: {path}")
-    } else {
-        err
+fn reject_hdfs_path(path: &str, function_name: &str) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("hdfs"))
+    {
+        return Err(format!(
+            "{function_name} does not support hdfs path yet: {path}"
+        ));
     }
+    Ok(())
 }
 
 fn align_batch_to_output_schema(
@@ -344,6 +349,24 @@ mod tests {
         assert!(
             write_err.contains("missing S3 config for StarRocks object-store path="),
             "{write_err}"
+        );
+    }
+
+    #[test]
+    fn parquet_helpers_reject_malformed_hdfs_with_function_specific_errors() {
+        let path = "hdfs://nn:9000";
+
+        let batch = sample_batch();
+        let write_err = write_parquet_file(path, &batch).expect_err("hdfs parquet write must fail");
+        assert!(
+            write_err.contains("write_parquet_file does not support hdfs path yet"),
+            "{write_err}"
+        );
+
+        let read_err = read_parquet_file(path).expect_err("hdfs parquet read must fail");
+        assert!(
+            read_err.contains("read_parquet_file does not support hdfs path yet"),
+            "{read_err}"
         );
     }
 }
