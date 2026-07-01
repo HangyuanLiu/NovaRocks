@@ -532,6 +532,15 @@ fn list_metadata_file_names_local(meta_root: &str) -> Result<Vec<String>, String
                 meta_root, e
             )
         })?;
+        let file_type = entry.file_type().map_err(|e| {
+            format!(
+                "inspect local meta directory entry failed: path={}, error={}",
+                meta_root, e
+            )
+        })?;
+        if file_type.is_dir() {
+            continue;
+        }
         if let Some(name) = entry.file_name().to_str() {
             names.push(name.to_string());
         }
@@ -782,6 +791,71 @@ mod tests {
         assert_eq!(
             parse_bundle_version_from_meta_file_name("0000000000000000_0000000000000002.meta"),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn local_bundle_discovery_ignores_directory_named_like_bundle_metadata_file() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let meta_dir = temp_dir.path().join(META_DIR);
+        let dir_name = format!("{BUNDLE_TABLET_ID:016x}_{:016x}.meta", 2_i64);
+        fs::create_dir_all(meta_dir.join(dir_name)).expect("create fake metadata dir");
+
+        let latest =
+            discover_latest_bundle_version(temp_dir.path().to_str().expect("temp path to str"))
+                .expect("discover latest bundle version");
+
+        assert_eq!(latest, None);
+    }
+
+    #[test]
+    fn local_tablet_discovery_ignores_directory_named_like_tablet_metadata_file() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let tablet_id = 30031_i64;
+        let meta_dir = temp_dir.path().join(META_DIR);
+        let dir_name = format!("{tablet_id:016x}_{:016x}.meta", 2_i64);
+        fs::create_dir_all(meta_dir.join(dir_name)).expect("create fake metadata dir");
+
+        let latest = discover_latest_tablet_metadata_version_at_most(
+            temp_dir.path().to_str().expect("temp path to str"),
+            tablet_id,
+            2,
+        )
+        .expect("discover latest tablet metadata version");
+
+        assert_eq!(latest, None);
+    }
+
+    #[test]
+    fn local_discovery_returns_none_when_meta_directory_is_missing() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+
+        let latest_bundle =
+            discover_latest_bundle_version(temp_dir.path().to_str().expect("temp path to str"))
+                .expect("discover latest bundle version");
+        let latest_tablet = discover_latest_tablet_metadata_version_at_most(
+            temp_dir.path().to_str().expect("temp path to str"),
+            30041_i64,
+            2,
+        )
+        .expect("discover latest tablet metadata version");
+
+        assert_eq!(latest_bundle, None);
+        assert_eq!(latest_tablet, None);
+    }
+
+    #[test]
+    fn local_discovery_rejects_meta_path_that_is_not_a_directory() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        fs::write(temp_dir.path().join(META_DIR), b"not a directory").expect("write meta file");
+
+        let err =
+            discover_latest_bundle_version(temp_dir.path().to_str().expect("temp path to str"))
+                .expect_err("meta file must be rejected");
+
+        assert!(
+            err.contains("meta path is not a directory:"),
+            "unexpected error: {err}"
         );
     }
 
