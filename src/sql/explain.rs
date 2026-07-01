@@ -6,7 +6,9 @@ use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr, UnOp,
 };
 use crate::sql::catalog::ScanSource;
-use crate::sql::planner::plan::{ApplyKind, LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::plan::{
+    ApplyKind, LogicalPlanKind, LogicalPlanNode, ScanDictionaryColumn,
+};
 
 /// Detail level for EXPLAIN output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,17 +270,7 @@ pub(crate) fn format_shared_plan_node_header(
                 .as_deref()
                 .map(|a| format!(" (alias={a})"))
                 .unwrap_or_default();
-            let dict = if node.dict_columns.is_empty() {
-                String::new()
-            } else {
-                let mut cols: Vec<&str> = node
-                    .dict_columns
-                    .iter()
-                    .map(|d| d.source_column.as_str())
-                    .collect();
-                cols.sort_unstable();
-                format!(" dict=[{}]", cols.join(", "))
-            };
+            let dict = format_scan_dict_suffix(&node.dict_columns);
             Some(format!(
                 "SCAN {}.{}{}{}",
                 node.database, node.table.name, alias, dict
@@ -332,6 +324,19 @@ pub(crate) fn format_shared_plan_node_header(
         }),
         _ => None,
     }
+}
+
+pub(crate) fn format_scan_dict_suffix(dict_columns: &[ScanDictionaryColumn]) -> String {
+    if dict_columns.is_empty() {
+        return String::new();
+    }
+
+    let mut cols: Vec<&str> = dict_columns
+        .iter()
+        .map(|d| d.source_column.as_str())
+        .collect();
+    cols.sort_unstable();
+    format!(" dict=[{}]", cols.join(", "))
 }
 
 pub(crate) fn format_shared_plan_node_detail_lines(
