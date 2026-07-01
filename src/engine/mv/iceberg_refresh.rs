@@ -83,6 +83,19 @@ use crate::sql::parser::ast::{
     DropMaterializedViewStmt, ObjectName, RefreshMaterializedViewStmt,
 };
 
+pub(crate) const FULL_REFRESH_DISABLED_MESSAGE: &str = "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
+     its previous behavior (drop target + delete definition + recreate empty target) \
+     was misleading and non-atomic. To recover from a broken contract or corrupted \
+     target, run DROP MATERIALIZED VIEW <name>; CREATE MATERIALIZED VIEW <name> ...; \
+     REFRESH MATERIALIZED VIEW <name>; manually.";
+
+fn explain_refresh_full_guard(full: bool) -> Result<(), String> {
+    if full {
+        return Err(FULL_REFRESH_DISABLED_MESSAGE.to_string());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IcebergMvTarget {
     pub(crate) catalog: String,
@@ -3097,15 +3110,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
         //
         // Until that redesign lands, fail fast and require the operator to
         // do the recovery by hand — no silent high-risk side effects.
-        return Err(
-            "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
-             its previous behavior (drop target + delete definition + recreate empty target) \
-             was misleading and non-atomic. To recover from a broken contract or corrupted \
-             target, run DROP MATERIALIZED VIEW <name>; CREATE MATERIALIZED VIEW <name> ...; \
-             REFRESH MATERIALIZED VIEW <name>; manually."
-                .to_string()
-                .into(),
-        );
+        return Err(FULL_REFRESH_DISABLED_MESSAGE.to_string().into());
     }
     recover_iceberg_mv_refreshes(state)?;
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
@@ -5027,13 +5032,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
     let iceberg_target = resolve_refresh_target(current_catalog, current_database, &stmt.name)
         .map_err(RefreshError::user)?;
     if stmt.full {
-        return Err(RefreshError::user(
-            "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
-             its previous behavior (drop target + delete definition + recreate empty target) \
-             was misleading and non-atomic. To recover from a broken contract or corrupted \
-             target, run DROP MATERIALIZED VIEW <name>; CREATE MATERIALIZED VIEW <name> ...; \
-             REFRESH MATERIALIZED VIEW <name>; manually.",
-        ));
+        return Err(RefreshError::user(FULL_REFRESH_DISABLED_MESSAGE));
     }
 
     recover_iceberg_mv_refreshes(state).map_err(RefreshError::pre_commit)?;
@@ -11712,9 +11711,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
     stmt: &RefreshMaterializedViewStmt,
     level: crate::sql::explain::ExplainLevel,
 ) -> Result<Vec<String>, String> {
-    if stmt.full {
-        return Err("EXPLAIN REFRESH MATERIALIZED VIEW FULL is not supported".to_string());
-    }
+    explain_refresh_full_guard(stmt.full)?;
 
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
@@ -15270,6 +15267,20 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc as StdArc;
     use tempfile::TempDir;
+
+    #[test]
+    fn explain_refresh_full_guard_rejects_full_with_disabled_message() {
+        let err = super::explain_refresh_full_guard(true).unwrap_err();
+        assert!(
+            err.contains(concat!("currently disabled", " pending redesign")),
+            "EXPLAIN REFRESH FULL must align with the exec-side disabled message, got: {err}"
+        );
+        assert!(
+            !err.contains("not supported"),
+            "stale 'not supported' wording must be gone: {err}"
+        );
+        assert!(super::explain_refresh_full_guard(false).is_ok());
+    }
 
     #[test]
     fn imv_refresh_no_longer_uses_terminal_merge_sink_factory() {

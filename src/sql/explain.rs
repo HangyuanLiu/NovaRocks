@@ -239,6 +239,13 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
 
 fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
     match source {
+        ScanSource::IcebergDeltaTable {
+            from_snapshot_id,
+            to_snapshot_id,
+            ..
+        } => Some(format!(
+            "IcebergDeltaTable from_snapshot_id={from_snapshot_id} to_snapshot_id={to_snapshot_id}"
+        )),
         ScanSource::IcebergVersionTable { snapshot_id, .. } => {
             Some(format!("IcebergVersionTable snapshot_id={snapshot_id}"))
         }
@@ -248,6 +255,15 @@ fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
             scan.group_key_names.join(","),
             scan.aggregate_state_names.join(","),
             scan.constraint_summary()
+        )),
+        ScanSource::IcebergMvTargetLocator(scan) => Some(format!(
+            "IcebergMvTargetLocator target={} apply_key={}{}",
+            scan.fqn(),
+            scan.apply_key_column,
+            scan.branch_id_column
+                .as_deref()
+                .map(|column| format!(" branch_id={column}"))
+                .unwrap_or_default()
         )),
         _ => None,
     }
@@ -597,7 +613,10 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
-    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::catalog::{
+        ColumnDef, IcebergMvTargetLocatorScan, IcebergSchemaDef, IcebergTableInfo, ScanSource,
+        TableDef,
+    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{
         ApplyKind, LogicalApplyNode, LogicalAssertOneRowNode, LogicalFilterNode, LogicalPlanKind,
@@ -646,6 +665,44 @@ mod tests {
                 table_id: 2,
             },
         }
+    }
+
+    fn iceberg_table_info() -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+            table_uuid: Some("uuid-orders".to_string()),
+            current_snapshot_id: Some(200),
+            schema_id: 1,
+            location: "file:///tmp/ice/db/orders".to_string(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
+        }
+    }
+
+    fn scan_plan_with_source(table_name: &str, source: ScanSource) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: TableDef {
+                    name: table_name.to_string(),
+                    columns: vec![column_def("k", DataType::Int64, false)],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source,
+                },
+                alias: None,
+                columns: vec![output_column(1, "k", DataType::Int64, false)],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            None,
+        )
     }
 
     fn column_expr(id: u32, qualifier: Option<&str>, name: &str) -> TypedExpr {
@@ -724,6 +781,50 @@ mod tests {
         let text = explain_plan(&scan, ExplainLevel::Normal).join("\n");
         assert!(text.contains("SCAN db.t"), "{text}");
         assert!(text.contains("dict=[s]"), "{text}");
+    }
+
+    #[test]
+    fn logical_explain_verbose_prints_refresh_scan_sources() {
+        let delta_plan = scan_plan_with_source(
+            "orders",
+            ScanSource::IcebergDeltaTable {
+                table: iceberg_table_info(),
+                from_snapshot_id: 101,
+                to_snapshot_id: 200,
+            },
+        );
+
+        let delta_normal = explain_plan(&delta_plan, ExplainLevel::Normal).join("\n");
+        assert!(!delta_normal.contains("source:"), "{delta_normal}");
+        let delta_verbose = explain_plan(&delta_plan, ExplainLevel::Verbose).join("\n");
+        assert!(
+            delta_verbose
+                .contains("source: IcebergDeltaTable from_snapshot_id=101 to_snapshot_id=200"),
+            "{delta_verbose}"
+        );
+
+        let locator_plan = scan_plan_with_source(
+            "pf_mv",
+            ScanSource::IcebergMvTargetLocator(IcebergMvTargetLocatorScan {
+                catalog: "ice".to_string(),
+                database: "db".to_string(),
+                table: "pf_mv".to_string(),
+                target_table_uuid: "uuid-pf-mv".to_string(),
+                target_snapshot_id: Some(99),
+                apply_key_column: "__nova_base_row_id".to_string(),
+                branch_id_column: Some("__branch_id".to_string()),
+            }),
+        );
+
+        let locator_normal = explain_plan(&locator_plan, ExplainLevel::Normal).join("\n");
+        assert!(!locator_normal.contains("source:"), "{locator_normal}");
+        let locator_verbose = explain_plan(&locator_plan, ExplainLevel::Verbose).join("\n");
+        assert!(
+            locator_verbose.contains(
+                "source: IcebergMvTargetLocator target=ice.db.pf_mv apply_key=__nova_base_row_id branch_id=__branch_id"
+            ),
+            "{locator_verbose}"
+        );
     }
 
     #[test]
