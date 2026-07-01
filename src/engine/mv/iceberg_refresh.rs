@@ -454,7 +454,8 @@ pub(crate) fn create_iceberg_mv(
         txn.commit()
             .map_err(|e| format!("commit iceberg MV repository metadata failed: {e}"))?;
         // W2: push the freshly-persisted schema contract into the MV target
-        // table descriptor. sync_iceberg_mv_descriptor_for_target reloads the definition
+        // table descriptor. sync_iceberg_mv_descriptor_for_target reloads the
+        // definition
         // from the metadata store (contract present) and rewrites the descriptor
         // properties; the descriptor written by create_table above carried
         // schema_contract=None because the contract needs the created table's
@@ -3331,6 +3332,30 @@ fn refresh_iceberg_mv_with_planned_partitions(
             target.catalog, target.namespace, target.table
         )
     })?;
+    // W2: verify the lake descriptor carries the same schema contract the store
+    // has — the descriptor is the authoritative home at refresh time.
+    {
+        let entry = {
+            let catalogs = state
+                .iceberg_catalogs
+                .read()
+                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+            catalogs.get(&target.catalog)?
+        };
+        entry.invalidate_table_cache(&target.namespace, &target.table);
+        let loaded = crate::connector::iceberg::catalog::registry::load_table(
+            &entry,
+            &target.namespace,
+            &target.table,
+        )?;
+        let descriptor =
+            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())?;
+        let descriptor_contract = descriptor.schema_contract_typed()?;
+        crate::engine::mv::schema_contract::ensure_descriptor_schema_contract_matches(
+            descriptor_contract.as_ref(),
+            dispatch_schema_contract,
+        )?;
+    }
     let caps = RefreshCapabilities::from_schema_contract(dispatch_schema_contract)?;
     match (caps.has_agg_state, &caps.snapshot_policy, &caps.identity) {
         // Aggregate shapes: single-base, fan-in (AllBasesRequired, non-branch),
