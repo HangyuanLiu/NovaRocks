@@ -960,11 +960,12 @@ mod tests {
             ])
             .build()
             .expect("schema");
+        let location = "file:///novarocks-test/table".to_string();
         let metadata = TableMetadataBuilder::new(
             schema,
             PartitionSpec::unpartition_spec().into_unbound(),
             SortOrder::unsorted_order(),
-            "file:///novarocks-test/table".to_string(),
+            location.clone(),
             format_version,
             properties,
         )
@@ -973,7 +974,7 @@ mod tests {
         .expect("metadata")
         .metadata;
         let table = Table::builder()
-            .file_io(iceberg::io::FileIO::new_with_fs())
+            .file_io(crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None))
             .metadata(metadata)
             .identifier(TableIdent::new(
                 NamespaceIdent::new("db".to_string()),

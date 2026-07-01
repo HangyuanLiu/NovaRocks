@@ -463,36 +463,12 @@ pub async fn read_deletion_vector_puffin_with_range_reader(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
-    use iceberg::io::{FileIO, LocalFsStorageFactory};
+    use iceberg::io::FileIO;
 
-    struct TestFsFileIOBuilder {
-        root: Option<String>,
-    }
-
-    trait TestFileIOBuilderExt {
-        fn new_fs_io() -> TestFsFileIOBuilder;
-    }
-
-    impl TestFileIOBuilderExt for iceberg::io::FileIOBuilder {
-        fn new_fs_io() -> TestFsFileIOBuilder {
-            TestFsFileIOBuilder { root: None }
-        }
-    }
-
-    impl TestFsFileIOBuilder {
-        fn with_root(mut self, root: &str) -> Self {
-            self.root = Some(root.to_string());
-            self
-        }
-
-        fn build(self) -> FileIO {
-            let _ = self.root;
-            iceberg::io::FileIOBuilder::new(Arc::new(LocalFsStorageFactory)).build()
-        }
+    fn local_file_io(location: &str) -> FileIO {
+        crate::connector::iceberg::fs_io::build_file_io_for_location(location, None)
     }
 
     fn bitmap_with(values: &[u32]) -> RoaringBitmap {
@@ -591,10 +567,8 @@ mod tests {
     #[tokio::test]
     async fn single_blob_puffin_round_trips_metadata_and_payload() {
         let dir = tempfile::tempdir().unwrap();
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io()
-            .with_root(dir.path().to_str().unwrap())
-            .build();
         let path = format!("{}/dv.puffin", dir.path().to_str().unwrap());
+        let file_io = local_file_io(&path);
         let referenced_data_file = "file:///warehouse/t/data/data-1.parquet";
         let mut dv = DeletionVector::new();
         dv.insert(3).unwrap();
@@ -633,10 +607,8 @@ mod tests {
     #[tokio::test]
     async fn single_blob_puffin_round_trips_through_range_reader() {
         let dir = tempfile::tempdir().unwrap();
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io()
-            .with_root(dir.path().to_str().unwrap())
-            .build();
         let path = format!("{}/dv-range.puffin", dir.path().to_str().unwrap());
+        let file_io = local_file_io(&path);
         let referenced_data_file = "file:///warehouse/t/data/data-1.parquet";
         let mut dv = DeletionVector::new();
         dv.insert(2).unwrap();
@@ -662,10 +634,8 @@ mod tests {
     #[tokio::test]
     async fn multi_blob_puffin_round_trips_two_dvs() {
         let dir = tempfile::tempdir().unwrap();
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io()
-            .with_root(dir.path().to_str().unwrap())
-            .build();
         let path = format!("{}/multi-dv.puffin", dir.path().to_str().unwrap());
+        let file_io = local_file_io(&path);
         let mut first = DeletionVector::new();
         first.insert(1).unwrap();
         first.insert(9).unwrap();
@@ -749,10 +719,8 @@ mod tests {
     #[tokio::test]
     async fn multi_blob_puffin_rejects_empty_input() {
         let dir = tempfile::tempdir().unwrap();
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io()
-            .with_root(dir.path().to_str().unwrap())
-            .build();
         let path = format!("{}/empty.puffin", dir.path().to_str().unwrap());
+        let file_io = local_file_io(&path);
         let err = write_multi_deletion_vector_puffin(&file_io, &path, &[])
             .await
             .unwrap_err()

@@ -1088,7 +1088,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_listing_scheme_returns_explicit_error() {
-        let err = list_files_for_location("memory://warehouse/table", None)
+        let err = list_files_for_location("unsupported://warehouse/table", None)
             .await
             .expect_err("unsupported scheme should fail");
 

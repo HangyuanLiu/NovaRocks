@@ -1327,10 +1327,8 @@ mod tests {
         OpendalRangeReaderFactory::from_operator(op).expect("factory")
     }
 
-    fn make_local_file_io() -> iceberg::io::FileIO {
-        use iceberg::io::LocalFsStorageFactory;
-        use std::sync::Arc;
-        iceberg::io::FileIOBuilder::new(Arc::new(LocalFsStorageFactory)).build()
+    fn make_local_file_io(location: &str) -> iceberg::io::FileIO {
+        crate::connector::iceberg::fs_io::build_file_io_for_location(location, None)
     }
 
     async fn write_puffin_dv_file(
@@ -1340,7 +1338,7 @@ mod tests {
         positions: &[u64],
     ) -> crate::connector::iceberg::commit::WrittenPuffinDv {
         let path = format!("{}/{}", dir.display(), name);
-        let file_io = make_local_file_io();
+        let file_io = make_local_file_io(&path);
         let mut dv = DeletionVector::new();
         for p in positions {
             dv.insert(*p).unwrap();

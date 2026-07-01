@@ -134,7 +134,7 @@ mod tests {
     /// The file lives under a temp directory on the local filesystem so it
     /// can be re-opened via `FileIO`.
     async fn write_puffin_file(path: &str, sketches: &[(i32, &ThetaSketchHandle, i64)]) -> FileIO {
-        let file_io = FileIO::new_with_fs();
+        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(path, None);
         let output = file_io.new_output(path).expect("new output");
         let mut writer = PuffinWriter::new(&output, Map::new(), false)
             .await
@@ -194,8 +194,9 @@ mod tests {
 
     #[tokio::test]
     async fn returns_empty_on_missing_puffin_file() {
-        let file_io = FileIO::new_with_fs();
-        let map = StatsLoader::load_ndv_inner("file:///definitely/missing.puffin", &file_io).await;
+        let missing = "file:///definitely/missing.puffin";
+        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(missing, None);
+        let map = StatsLoader::load_ndv_inner(missing, &file_io).await;
         assert!(map.is_err());
     }
 
@@ -204,7 +205,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("mixed.puffin");
         let path_str = format!("file://{}", path.display());
-        let file_io = FileIO::new_with_fs();
+        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(&path_str, None);
 
         let output = file_io.new_output(&path_str).expect("new output");
         let mut writer = PuffinWriter::new(&output, Map::new(), false)

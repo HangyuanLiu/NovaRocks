@@ -583,7 +583,6 @@ mod tests {
 
     #[test]
     fn build_read_snapshot_at_returns_error_for_unknown_snapshot_id() {
-        use iceberg::io::FileIO;
         use iceberg::spec::{
             FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
             TableMetadataBuilder, Type,
@@ -613,7 +612,10 @@ mod tests {
         .unwrap()
         .metadata;
 
-        let file_io = FileIO::new_with_fs();
+        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(
+            "file:///novarocks-test/table",
+            None,
+        );
         let ident = TableIdent::new(NamespaceIdent::new("db".to_string()), "table".to_string());
 
         let table = Table::builder()

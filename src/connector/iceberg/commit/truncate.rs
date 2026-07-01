@@ -516,12 +516,14 @@ mod tests {
     /// the module-level deferral note).
     #[tokio::test]
     async fn write_truncate_deletes_manifest_produces_deletes_typed_manifest() {
-        use iceberg::io::FileIO;
         use iceberg::spec::{
             ManifestContentType, NestedField, PartitionSpec, PrimitiveType, Schema, SchemaRef, Type,
         };
         use std::sync::Arc;
-        let file_io = FileIO::new_with_fs();
+        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(
+            "file:///tmp/novarocks-truncate-test",
+            None,
+        );
         let schema: SchemaRef = Arc::new(
             Schema::builder()
                 .with_fields(vec![
