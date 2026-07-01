@@ -74,7 +74,7 @@ use super::constants::{
     LOGICAL_TYPE_VARCHAR,
 };
 use super::indexed_column::decode_indexed_binary_values;
-use super::io::{TabletRoot, build_operator, read_range_bytes, read_segment_bytes};
+use super::io::{build_operator, read_range_bytes, read_segment_bytes};
 use super::page::{DecodedDataPageValues, DecodedPageValuePayload};
 use super::schema_map::{
     decimal_output_meta_from_arrow_type, expected_logical_type_from_schema_type,
@@ -206,8 +206,7 @@ pub(super) fn build_dup_record_batch(
 
     let mut per_output_segment_arrays = vec![Vec::<ArrayRef>::new(); output_schema.fields().len()];
     let mut total_output_rows = 0usize;
-    let root = TabletRoot::parse(tablet_root_path)?;
-    let op = build_operator(&root, object_store_profile)?;
+    let op = build_operator(tablet_root_path, object_store_profile)?;
     let rt = data_runtime()?;
 
     for (segment_index, segment) in plan.segments.iter().enumerate() {

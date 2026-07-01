@@ -120,6 +120,18 @@ fn join_path(base: &str, rel_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
+
+    fn sample_s3_config() -> S3StoreConfig {
+        S3StoreConfig {
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            bucket: "bucket-a".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            region: None,
+            enable_path_style_access: Some(true),
+        }
+    }
 
     #[test]
     fn join_relative_path_appends_to_object_store_root() {
@@ -188,5 +200,26 @@ mod tests {
         let access = resolve_format_tablet_access("/", None).expect("resolve local root");
 
         assert_eq!(access.join_relative_path(""), "/");
+    }
+
+    #[test]
+    fn object_store_tablet_access_resolves_display_and_operator_paths() {
+        let profile = ObjectStoreProfile::from_s3_store_config(&sample_s3_config())
+            .expect("build object-store profile");
+        let access = resolve_format_tablet_access(
+            "s3://bucket-a/warehouse/db_1/table_2/100",
+            Some(&profile),
+        )
+        .expect("resolve object-store tablet root");
+
+        assert_eq!(access.scheme(), FsScheme::ObjectStore);
+        assert_eq!(
+            access.join_relative_path("meta/0000000000000000_0000000000000001.meta"),
+            "s3://bucket-a/warehouse/db_1/table_2/100/meta/0000000000000000_0000000000000001.meta"
+        );
+        assert_eq!(
+            access.operator_relative_path("meta/0000000000000000_0000000000000001.meta"),
+            "warehouse/db_1/table_2/100/meta/0000000000000000_0000000000000001.meta"
+        );
     }
 }
