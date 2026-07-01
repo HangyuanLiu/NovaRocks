@@ -18649,6 +18649,40 @@ mod tests {
     }
 
     #[test]
+    fn discover_iceberg_mvs_recovers_storage_descriptor_from_lake() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+
+        let discovered = crate::engine::mv::iceberg_discovery::discover_iceberg_mvs(
+            &env.state,
+            "ice",
+            "analytics",
+        )
+        .expect("discover iceberg mvs");
+        assert_eq!(discovered.len(), 1);
+        let mv = &discovered[0];
+        assert_eq!(mv.catalog, "ice");
+        assert_eq!(mv.namespace, "analytics");
+        assert_eq!(mv.public_name, "mv_orders");
+        assert_eq!(mv.storage_table, "__nr_mv_mv_orders");
+        assert_eq!(
+            mv.source,
+            crate::engine::mv::iceberg_discovery::IcebergMvDiscoverySource::StorageTable
+        );
+        assert_eq!(mv.descriptor.public_view, "analytics.mv_orders");
+        assert_eq!(mv.descriptor.storage_table, "analytics.__nr_mv_mv_orders");
+        assert_eq!(mv.descriptor.base_dependencies[0].name.as_str(), "orders");
+    }
+
+    #[test]
     fn create_iceberg_mv_creates_partitioned_target_from_partition_by() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
