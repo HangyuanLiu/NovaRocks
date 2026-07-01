@@ -869,7 +869,7 @@ mod tests {
         let consumer_b = ColumnId::new_for_test(2);
         let producer_a = ColumnId::new_for_test(11);
         let output_columns = vec![int_col(consumer_a, "a"), int_col(consumer_b, "b")];
-        let mut plan = PhysicalPlanNode {
+        let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalCTEConsume(CTEConsumeOp {
                 cte_id: 9,
                 alias: "cte9".to_string(),

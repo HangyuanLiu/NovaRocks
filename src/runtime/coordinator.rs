@@ -2489,6 +2489,7 @@ mod tests {
             output_partition: unpartitioned_partition(),
             stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: Vec::new(),
         }
     }
 
@@ -2511,6 +2512,7 @@ mod tests {
                 branch_id,
                 branch_kind,
             },
+            output_slot_ids: Vec::new(),
         }
     }
 

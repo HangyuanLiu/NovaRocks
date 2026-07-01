@@ -1638,6 +1638,7 @@ mod tests {
                     Some(receive_producer_column_ids.clone())
                 }
                 super::FragmentEdgeKind::Stream => None,
+                super::FragmentEdgeKind::IcebergChangeStreamRouter { .. } => None,
             })
             .collect::<Vec<_>>();
         receive_lists.sort();
