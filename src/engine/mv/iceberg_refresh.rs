@@ -69,12 +69,16 @@ use crate::meta::repository::iceberg_operation::{
     StoredIcebergOperation,
 };
 use crate::meta::repository::mv::{
-    BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
-    MvRefreshState, RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
+    BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvDependencyObjectType,
+    MvDependencyStorageEngine, MvRefreshFinalizeRequest, MvRefreshState,
+    RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
     ReplaceMvPartitionStatesRequest, StoredMvDefinition, StoredMvRefresh,
     UpdateMvPartitionContractRequest,
 };
 use crate::meta::repository::mv_contract::MvPartitionContract;
+use crate::meta::repository::mv_descriptor::{
+    DescriptorDependency, MV_DESCRIPTOR_VERSION, MvDescriptorV1,
+};
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
@@ -165,7 +169,8 @@ pub(crate) fn create_iceberg_mv(
             "materialized view name must not start with reserved prefix `{NR_MV_STORAGE_PREFIX}`"
         ));
     }
-    target.table = nr_mv_storage_name(&target.table);
+    let public_name = target.table.clone();
+    target.table = nr_mv_storage_name(&public_name);
     let entry = {
         let catalogs = state
             .iceberg_catalogs
@@ -222,6 +227,7 @@ pub(crate) fn create_iceberg_mv(
         )
     })?;
     let base_refs = resolved_dependencies.base_refs;
+    let resolved_dependency_requests = resolved_dependencies.dependencies;
     // Drive CREATE off the synthesized capability property + identity instead
     // of the legacy flat shape classifier. The contract was already derived
     // from this same property (`derive_imv_refresh_contract`), so a successful
@@ -320,6 +326,35 @@ pub(crate) fn create_iceberg_mv(
         &canonical_select_query,
         &analysis,
     )?;
+    let mut descriptor_hidden_columns = Vec::new();
+    if identity_needs_physical_apply_key_column(&property.identity) {
+        descriptor_hidden_columns.push(apply_key_column_name.to_string());
+    }
+    if identity_needs_branch_id_column(&property.identity) {
+        descriptor_hidden_columns.push(ICEBERG_MV_BRANCH_ID_COLUMN.to_string());
+    }
+    descriptor_hidden_columns.extend(aggregate_state_hidden_columns.iter().cloned());
+    let descriptor = MvDescriptorV1 {
+        descriptor_version: MV_DESCRIPTOR_VERSION,
+        package_id: format!("{}.{}", target.namespace, public_name),
+        logical_sql: canonical_select_query.to_string(),
+        dialect: "starrocks".to_string(),
+        public_view: format!("{}.{}", target.namespace, public_name),
+        storage_table: format!("{}.{}", target.namespace, target.table),
+        visible_columns: analysis
+            .output_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
+        hidden_columns: descriptor_hidden_columns,
+        base_dependencies: resolved_dependency_requests
+            .iter()
+            .map(descriptor_dependency_from_request)
+            .collect(),
+        schema_contract: None,
+        refresh_contract: Some(refresh_policy_descriptor_json(&stmt.refresh_policy, false)),
+        created_at_ms,
+    };
     let mut target_properties = vec![
         ("format-version".to_string(), "3".to_string()),
         ("write.row-lineage".to_string(), "true".to_string()),
@@ -342,6 +377,7 @@ pub(crate) fn create_iceberg_mv(
             aggregate_state_hidden_columns.join(","),
         ));
     }
+    target_properties.extend(descriptor.to_storage_properties()?);
     crate::connector::iceberg::catalog::registry::create_table(
         &entry,
         &target.namespace,
@@ -420,7 +456,7 @@ pub(crate) fn create_iceberg_mv(
             .replace_dependencies_for_mv(
                 txn.as_mut(),
                 mv_definition.mv_id,
-                resolved_dependencies.dependencies.clone(),
+                resolved_dependency_requests.clone(),
             )
             .map_err(|e| format!("create iceberg MV dependency metadata failed: {e}"))?;
         txn.commit()
@@ -1067,6 +1103,55 @@ fn create_apply_key_contract_source(
             crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
         }
         other => unreachable!("unknown Iceberg MV apply-key column {other}"),
+    }
+}
+
+fn descriptor_dependency_from_request(
+    request: &crate::meta::repository::mv::CreateMvDependencyRequest,
+) -> DescriptorDependency {
+    let upstream = &request.upstream;
+    DescriptorDependency {
+        catalog: upstream.catalog.clone().unwrap_or_default(),
+        namespace: upstream.database_or_namespace.clone(),
+        name: upstream.name.clone(),
+        object_type: match upstream.object_type {
+            MvDependencyObjectType::Table => "table",
+            MvDependencyObjectType::MaterializedView => "materialized_view",
+        }
+        .to_string(),
+        storage_engine: match upstream.storage_engine {
+            MvDependencyStorageEngine::StarRocks => "starrocks",
+            MvDependencyStorageEngine::Iceberg => "iceberg",
+            MvDependencyStorageEngine::ExternalTable => "external_table",
+        }
+        .to_string(),
+    }
+}
+
+fn refresh_policy_descriptor_json(
+    policy: &crate::sql::parser::ast::MaterializedViewRefreshPolicy,
+    paused: bool,
+) -> serde_json::Value {
+    match policy {
+        crate::sql::parser::ast::MaterializedViewRefreshPolicy::Manual => serde_json::json!({
+            "policy": "DEFERRED_MANUAL",
+            "interval_ms": null,
+            "paused": paused,
+        }),
+        crate::sql::parser::ast::MaterializedViewRefreshPolicy::AsyncOnChange => {
+            serde_json::json!({
+                "policy": "ASYNC_ON_CHANGE",
+                "interval_ms": null,
+                "paused": paused,
+            })
+        }
+        crate::sql::parser::ast::MaterializedViewRefreshPolicy::AsyncInterval { interval_ms } => {
+            serde_json::json!({
+                "policy": "ASYNC_INTERVAL",
+                "interval_ms": interval_ms,
+                "paused": paused,
+            })
+        }
     }
 }
 
@@ -18353,6 +18438,73 @@ mod tests {
                 .target_field_id,
             3
         );
+    }
+
+    #[test]
+    fn create_iceberg_mv_writes_descriptor_property_on_storage_table() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let loaded = crate::connector::iceberg::catalog::load_table(
+            &entry,
+            "analytics",
+            "__nr_mv_mv_orders",
+        )
+        .expect("load target table");
+        let descriptor =
+            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
+                .expect("descriptor properties");
+
+        assert_eq!(descriptor.descriptor_version, MV_DESCRIPTOR_VERSION);
+        assert_eq!(descriptor.package_id, "analytics.mv_orders");
+        assert_eq!(
+            descriptor.logical_sql,
+            "SELECT id, name FROM ice.sales.orders"
+        );
+        assert_eq!(descriptor.dialect, "starrocks");
+        assert_eq!(descriptor.public_view, "analytics.mv_orders");
+        assert_eq!(descriptor.storage_table, "analytics.__nr_mv_mv_orders");
+        assert_eq!(
+            descriptor.visible_columns,
+            vec!["id".to_string(), "name".to_string()]
+        );
+        assert_eq!(
+            descriptor.hidden_columns,
+            vec![ICEBERG_MV_APPLY_KEY_COLUMN.to_string()]
+        );
+        assert_eq!(
+            descriptor.base_dependencies,
+            vec![DescriptorDependency {
+                catalog: "ice".to_string(),
+                namespace: "sales".to_string(),
+                name: "orders".to_string(),
+                object_type: "table".to_string(),
+                storage_engine: "iceberg".to_string(),
+            }]
+        );
+        assert_eq!(descriptor.schema_contract, None);
+        assert_eq!(
+            descriptor.refresh_contract,
+            Some(serde_json::json!({
+                "policy": "DEFERRED_MANUAL",
+                "interval_ms": null,
+                "paused": false,
+            }))
+        );
+        assert!(descriptor.created_at_ms > 0);
     }
 
     #[test]
