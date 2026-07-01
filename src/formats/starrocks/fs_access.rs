@@ -91,8 +91,15 @@ pub(crate) fn resolve_format_tablet_access(
 }
 
 fn join_path(base: &str, rel_path: &str) -> String {
-    let base = base.trim_end_matches('/');
     let rel_path = rel_path.trim_start_matches('/');
+    if base == "/" {
+        if rel_path.is_empty() {
+            return "/".to_string();
+        }
+        return format!("/{rel_path}");
+    }
+
+    let base = base.trim_end_matches('/');
     if rel_path.is_empty() {
         return base.to_string();
     }
@@ -130,6 +137,16 @@ mod tests {
     #[test]
     fn join_relative_path_returns_relative_path_when_root_is_empty() {
         assert_eq!(join_path("", "/meta/1.meta"), "meta/1.meta");
+    }
+
+    #[test]
+    fn join_relative_path_preserves_local_root() {
+        assert_eq!(join_path("/", "meta/1.meta"), "/meta/1.meta");
+    }
+
+    #[test]
+    fn join_relative_path_preserves_empty_relative_path_at_local_root() {
+        assert_eq!(join_path("/", ""), "/");
     }
 
     #[test]
