@@ -8,6 +8,7 @@
 mod distributed_build;
 mod distributed_fragment;
 mod distributed_node;
+mod distributed_plan_build;
 pub(crate) mod imv_rewrite;
 pub(crate) mod optimizer_bridge;
 pub(crate) mod plan;
@@ -21,6 +22,9 @@ pub(crate) use distributed_fragment::{
 #[allow(unused_imports)]
 pub(crate) use distributed_node::{DistributedNode, DistributedPayload, ExchangeReceiver};
 pub(crate) use distributed_node::{DistributedPlanKind, DistributedPlanNode, PlanNodeStats};
+// Temporary PIR-4 M3 migration API; M4 will switch production and rename this path.
+#[allow(unused_imports)]
+pub(crate) use distributed_plan_build::build_distributed_plan_v2;
 pub(crate) use runtime_filter::{
     JoinExecutionMode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };
