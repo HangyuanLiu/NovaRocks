@@ -27,6 +27,12 @@ pub(crate) struct StarRocksFsAccess {
     handle: FsAccessHandle,
 }
 
+pub(crate) fn tablet_root_scheme(tablet_root_path: &str) -> Result<FsScheme, String> {
+    FsAccessResolver::new()
+        .parse_location(tablet_root_path)
+        .map(|location| location.scheme())
+}
+
 impl StarRocksFsAccess {
     pub(crate) fn scheme(&self) -> FsScheme {
         self.handle.scheme()
@@ -68,6 +74,152 @@ pub(crate) fn resolve_tablet_root(
     resolve_with_object_store_config(tablet_root_path, object_store_config.as_ref())
 }
 
+pub(crate) fn resolve_runtime_path(path: &str) -> Result<StarRocksFsAccess, String> {
+    let resolver = FsAccessResolver::new();
+    let location = resolver.parse_location(path)?;
+    match location.scheme() {
+        FsScheme::Local => resolve_with_object_store_config(path, None),
+        FsScheme::ObjectStore => {
+            let config = crate::runtime::starlet_shard_registry::infer_s3_config_for_path(path)
+                .ok_or_else(|| missing_runtime_s3_config_error(path))?
+                .to_object_store_config();
+            resolve_with_object_store_config(path, Some(&config))
+        }
+        FsScheme::Hdfs => Err(format!(
+            "StarRocks formats do not support hdfs path yet: {path}"
+        )),
+    }
+}
+
+pub(crate) fn common_runtime_s3_config_for_paths<'a, I>(
+    paths: I,
+) -> Result<Option<crate::runtime::starlet_shard_registry::S3StoreConfig>, String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let paths = paths.into_iter().map(str::to_string).collect::<Vec<_>>();
+    let first = paths
+        .first()
+        .ok_or_else(|| "StarRocks runtime paths are empty".to_string())?;
+    let resolver = FsAccessResolver::new();
+    let locations = resolver.parse_locations(paths.iter().map(String::as_str))?;
+    let first_scheme = locations
+        .first()
+        .expect("non-empty runtime paths must produce locations")
+        .scheme();
+    if locations
+        .iter()
+        .any(|location| location.scheme() != first_scheme)
+    {
+        return Err("mixed StarRocks runtime path schemes are not allowed".to_string());
+    }
+
+    match first_scheme {
+        FsScheme::Local => Ok(None),
+        FsScheme::Hdfs => Err(format!(
+            "StarRocks lake does not support hdfs tablet path yet: {first}"
+        )),
+        FsScheme::ObjectStore => {
+            let mut selected: Option<crate::runtime::starlet_shard_registry::S3StoreConfig> = None;
+            for path in &paths {
+                let s3_config =
+                    crate::runtime::starlet_shard_registry::infer_s3_config_for_path(path)
+                        .ok_or_else(|| {
+                            format!("missing S3 config for StarRocks object-store path={path}")
+                        })?;
+                match selected.as_ref() {
+                    None => selected = Some(s3_config),
+                    Some(prev) if prev == &s3_config => {}
+                    Some(prev) => {
+                        return Err(format!(
+                            "inconsistent S3 config across StarRocks runtime paths: \
+                             current_endpoint={} current_bucket={} previous_endpoint={} previous_bucket={}",
+                            s3_config.endpoint, s3_config.bucket, prev.endpoint, prev.bucket
+                        ));
+                    }
+                }
+            }
+            Ok(selected)
+        }
+    }
+}
+
+pub(crate) fn resolve_runtime_paths<'a, I>(paths: I) -> Result<StarRocksFsAccess, String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let paths = paths
+        .into_iter()
+        .map(|path| path.to_string())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Err("StarRocks runtime paths are empty".to_string());
+    }
+
+    let resolver = FsAccessResolver::new();
+    let locations = resolver.parse_locations(paths.iter().map(String::as_str))?;
+    let first = locations
+        .first()
+        .expect("non-empty runtime paths must produce locations");
+    let scheme = first.scheme();
+    if locations.iter().any(|location| location.scheme() != scheme) {
+        return Err("mixed StarRocks runtime path schemes are not allowed".to_string());
+    }
+
+    match scheme {
+        FsScheme::Local => resolve_with_object_store_config_many(&paths, None),
+        FsScheme::ObjectStore => {
+            let mut previous_config: Option<S3StoreConfig> = None;
+            for path in &paths {
+                let current_config =
+                    crate::runtime::starlet_shard_registry::infer_s3_config_for_path(path)
+                        .ok_or_else(|| missing_runtime_s3_config_error(path))?;
+                if let Some(previous_config) = previous_config.as_ref() {
+                    if previous_config != &current_config {
+                        return Err(format!(
+                            "inconsistent S3 config across StarRocks runtime paths: \
+                             previous endpoint={} bucket={}, previous region={} path_style={}, \
+                             current endpoint={} bucket={}, current region={} path_style={}; \
+                             profile fields differ",
+                            previous_config.endpoint,
+                            previous_config.bucket,
+                            display_region(previous_config),
+                            display_path_style(previous_config),
+                            current_config.endpoint,
+                            current_config.bucket,
+                            display_region(&current_config),
+                            display_path_style(&current_config)
+                        ));
+                    }
+                } else {
+                    previous_config = Some(current_config.clone());
+                }
+            }
+
+            let config = previous_config
+                .expect("object-store runtime paths must infer at least one S3 config")
+                .to_object_store_config();
+            resolve_with_object_store_config_many(&paths, Some(&config))
+        }
+        FsScheme::Hdfs => Err(format!(
+            "StarRocks formats do not support hdfs path yet: {}",
+            paths[0]
+        )),
+    }
+}
+
+fn display_region(config: &S3StoreConfig) -> &str {
+    config.region.as_deref().unwrap_or("<none>")
+}
+
+fn display_path_style(config: &S3StoreConfig) -> &'static str {
+    match config.enable_path_style_access {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "<unset>",
+    }
+}
+
 pub(crate) fn resolve_with_profile(
     path: &str,
     profile: Option<&ObjectStoreProfile>,
@@ -107,6 +259,13 @@ pub(crate) fn object_store_profile_for_tablet_root(
     }
 }
 
+fn missing_runtime_s3_config_error(path: &str) -> String {
+    format!(
+        "missing S3 config for StarRocks object-store path={path}; \
+         register tablet runtime or provide shard credentials"
+    )
+}
+
 fn resolve_with_object_store_config(
     path: &str,
     object_store_config: Option<&ObjectStoreConfig>,
@@ -138,6 +297,15 @@ fn resolve_with_object_store_config(
     }
 
     let handle = resolver.resolve_location(path, object_store_config)?;
+    Ok(StarRocksFsAccess { handle })
+}
+
+fn resolve_with_object_store_config_many(
+    paths: &[String],
+    object_store_config: Option<&ObjectStoreConfig>,
+) -> Result<StarRocksFsAccess, String> {
+    let handle = FsAccessResolver::new()
+        .resolve_locations(paths.iter().map(String::as_str), object_store_config)?;
     Ok(StarRocksFsAccess { handle })
 }
 
@@ -195,6 +363,37 @@ fn classify_tablet_root<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::starrocks::lake::context::{
+        TabletWriteContext, lock_runtime_test_state, register_tablet_runtime,
+    };
+    use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
+
+    fn sample_s3_config() -> S3StoreConfig {
+        S3StoreConfig {
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            bucket: "bucket-a".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            region: None,
+            enable_path_style_access: Some(true),
+        }
+    }
+
+    fn runtime_context(
+        tablet_id: i64,
+        tablet_root_path: &str,
+        s3_config: S3StoreConfig,
+    ) -> TabletWriteContext {
+        TabletWriteContext {
+            db_id: 1,
+            table_id: 2,
+            tablet_id,
+            tablet_root_path: tablet_root_path.to_string(),
+            tablet_schema: TabletSchemaPb::default(),
+            s3_config: Some(s3_config),
+            partial_update: Default::default(),
+        }
+    }
 
     #[test]
     fn local_tablet_root_rejects_s3_config() {
@@ -220,6 +419,14 @@ mod tests {
     }
 
     #[test]
+    fn tablet_root_scheme_classifies_object_store_without_s3_config() {
+        let scheme = tablet_root_scheme("s3://bucket-a/warehouse/tablet-1")
+            .expect("classify object-store tablet root");
+
+        assert_eq!(scheme, FsScheme::ObjectStore);
+    }
+
+    #[test]
     fn object_store_tablet_root_resolves_relative_path() {
         let access =
             resolve_tablet_root("s3://bucket-a/warehouse/tablet-1", Some(&test_s3_config()))
@@ -236,6 +443,19 @@ mod tests {
         );
         let _operator = access.operator();
         let _factory = access.reader_factory().expect("range reader factory");
+    }
+
+    #[test]
+    fn single_relative_path_rejects_multiple_resolved_paths() {
+        let handle = FsAccessResolver::new()
+            .resolve_locations(["/tmp/tablet-1", "/tmp/tablet-2"], None)
+            .expect("resolve multiple local paths");
+        let access = StarRocksFsAccess { handle };
+
+        let err = access
+            .single_relative_path()
+            .expect_err("multiple resolved paths must be rejected");
+        assert!(err.contains("expected exactly one StarRocks fs path, got 2"));
     }
 
     #[test]
@@ -373,6 +593,264 @@ mod tests {
             err.contains("path=hdfs://nn:9000/starrocks/tablet-1"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn runtime_path_resolves_local_without_s3_config() {
+        let path = std::env::temp_dir()
+            .join("novarocks-fs-access-runtime")
+            .join("1.meta");
+        let path = path.to_string_lossy().to_string();
+
+        let access = resolve_runtime_path(&path).expect("resolve local runtime path");
+
+        assert_eq!(access.scheme(), FsScheme::Local);
+        assert!(
+            access
+                .single_relative_path()
+                .expect("relative path")
+                .ends_with("1.meta")
+        );
+    }
+
+    #[test]
+    fn runtime_path_rejects_unknown_object_store_credentials() {
+        let _guard = lock_runtime_test_state();
+
+        let err = resolve_runtime_path("s3://missing-bucket/warehouse/tablet-1/1.meta")
+            .expect_err("unknown object-store path must require runtime credentials");
+
+        assert!(err.contains("missing S3 config"), "{err}");
+    }
+
+    #[test]
+    fn runtime_path_resolves_object_store_from_registered_runtime() {
+        let _guard = lock_runtime_test_state();
+        let ctx = runtime_context(
+            91_001,
+            "s3://bucket-a/warehouse/tablet-1",
+            sample_s3_config(),
+        );
+        register_tablet_runtime(&ctx).expect("register tablet runtime");
+
+        let access = resolve_runtime_path("s3://bucket-a/warehouse/tablet-1/1.meta")
+            .expect("resolve registered object-store runtime path");
+
+        assert_eq!(access.scheme(), FsScheme::ObjectStore);
+        assert_eq!(
+            access.single_relative_path().expect("relative path"),
+            "warehouse/tablet-1/1.meta"
+        );
+    }
+
+    #[test]
+    fn runtime_paths_resolve_object_store_from_consistent_registered_runtime() {
+        let _guard = lock_runtime_test_state();
+        let ctx = runtime_context(
+            91_002,
+            "s3://bucket-a/warehouse/tablet-1",
+            sample_s3_config(),
+        );
+        register_tablet_runtime(&ctx).expect("register tablet runtime");
+
+        let access = resolve_runtime_paths([
+            "s3://bucket-a/warehouse/tablet-1/1.meta",
+            "s3://bucket-a/warehouse/tablet-1/2.dat",
+        ])
+        .expect("resolve registered object-store runtime paths");
+
+        let relative_paths = access
+            .paths()
+            .iter()
+            .map(|path| path.operator_relative_path())
+            .collect::<Vec<_>>();
+        assert_eq!(access.scheme(), FsScheme::ObjectStore);
+        assert_eq!(
+            relative_paths,
+            vec!["warehouse/tablet-1/1.meta", "warehouse/tablet-1/2.dat"]
+        );
+    }
+
+    #[test]
+    fn runtime_paths_reject_inconsistent_registered_runtime_configs() {
+        let _guard = lock_runtime_test_state();
+        let mut first_config = sample_s3_config();
+        first_config.region = Some("us-east-1".to_string());
+        first_config.enable_path_style_access = Some(true);
+        let mut second_config = sample_s3_config();
+        second_config.region = Some("us-west-2".to_string());
+        second_config.enable_path_style_access = Some(false);
+        register_tablet_runtime(&runtime_context(
+            91_003,
+            "s3://bucket-a/warehouse/tablet-1",
+            first_config,
+        ))
+        .expect("register first tablet runtime");
+        register_tablet_runtime(&runtime_context(
+            91_004,
+            "s3://bucket-a/warehouse/tablet-2",
+            second_config,
+        ))
+        .expect("register second tablet runtime");
+
+        let err = resolve_runtime_paths([
+            "s3://bucket-a/warehouse/tablet-1/1.meta",
+            "s3://bucket-a/warehouse/tablet-2/1.meta",
+        ])
+        .expect_err("inconsistent runtime S3 configs must fail");
+
+        assert!(
+            err.contains("inconsistent S3 config across StarRocks runtime paths"),
+            "{err}"
+        );
+        assert!(
+            err.contains("previous endpoint=http://127.0.0.1:9000 bucket=bucket-a"),
+            "{err}"
+        );
+        assert!(
+            err.contains("current endpoint=http://127.0.0.1:9000 bucket=bucket-a"),
+            "{err}"
+        );
+        assert!(
+            err.contains("previous region=us-east-1 path_style=true"),
+            "{err}"
+        );
+        assert!(
+            err.contains("current region=us-west-2 path_style=false"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn runtime_paths_reject_empty_inputs() {
+        let err = resolve_runtime_paths([]).expect_err("empty runtime paths must fail");
+
+        assert!(err.contains("StarRocks runtime paths are empty"), "{err}");
+    }
+
+    #[test]
+    fn runtime_paths_reject_mixed_schemes() {
+        let local_path = std::env::temp_dir()
+            .join("novarocks-fs-access-runtime")
+            .join("1.meta");
+        let local_path = local_path.to_string_lossy().to_string();
+        let paths = [
+            local_path.as_str(),
+            "s3://bucket-a/warehouse/tablet-1/1.meta",
+        ];
+
+        let err = resolve_runtime_paths(paths).expect_err("mixed runtime schemes must fail");
+
+        assert!(err.contains("mixed"), "{err}");
+    }
+
+    #[test]
+    fn runtime_path_rejects_hdfs() {
+        let err = resolve_runtime_path("hdfs://nn:9000/starrocks/tablet-1/1.meta")
+            .expect_err("hdfs runtime path must fail");
+
+        assert!(
+            err.contains("StarRocks formats do not support hdfs path yet"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn common_runtime_s3_config_local_paths_return_none() {
+        let first = std::env::temp_dir()
+            .join("novarocks-fs-access-common")
+            .join("1.meta");
+        let second = std::env::temp_dir()
+            .join("novarocks-fs-access-common")
+            .join("2.dat");
+        let paths = [
+            first.to_string_lossy().to_string(),
+            second.to_string_lossy().to_string(),
+        ];
+
+        let selected = common_runtime_s3_config_for_paths(paths.iter().map(String::as_str))
+            .expect("local paths should not require S3 config");
+
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn common_runtime_s3_config_rejects_mixed_local_and_object_store_paths() {
+        let local = std::env::temp_dir()
+            .join("novarocks-fs-access-common")
+            .join("1.meta");
+        let local = local.to_string_lossy().to_string();
+        let paths = [local.as_str(), "s3://bucket-a/warehouse/tablet-1/1.meta"];
+
+        let err =
+            common_runtime_s3_config_for_paths(paths).expect_err("mixed runtime schemes must fail");
+
+        assert!(
+            err.contains("mixed StarRocks runtime path schemes are not allowed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn common_runtime_s3_config_returns_registered_object_store_config() {
+        let _guard = lock_runtime_test_state();
+        let expected = sample_s3_config();
+        register_tablet_runtime(&runtime_context(
+            91_005,
+            "s3://bucket-a/warehouse/tablet-1",
+            expected.clone(),
+        ))
+        .expect("register tablet runtime");
+
+        let selected = common_runtime_s3_config_for_paths([
+            "s3://bucket-a/warehouse/tablet-1/1.meta",
+            "s3://bucket-a/warehouse/tablet-1/2.dat",
+        ])
+        .expect("resolve registered object-store runtime paths");
+
+        assert_eq!(selected, Some(expected));
+    }
+
+    #[test]
+    fn common_runtime_s3_config_rejects_inconsistent_registered_configs() {
+        let _guard = lock_runtime_test_state();
+        let first_config = sample_s3_config();
+        let mut second_config = sample_s3_config();
+        second_config.endpoint = "http://127.0.0.2:9000".to_string();
+        second_config.bucket = "bucket-b".to_string();
+        register_tablet_runtime(&runtime_context(
+            91_006,
+            "s3://bucket-a/warehouse/tablet-1",
+            first_config,
+        ))
+        .expect("register first tablet runtime");
+        register_tablet_runtime(&runtime_context(
+            91_007,
+            "s3://bucket-b/warehouse/tablet-2",
+            second_config,
+        ))
+        .expect("register second tablet runtime");
+
+        let err = common_runtime_s3_config_for_paths([
+            "s3://bucket-a/warehouse/tablet-1/1.meta",
+            "s3://bucket-b/warehouse/tablet-2/1.meta",
+        ])
+        .expect_err("inconsistent runtime S3 configs must fail");
+
+        assert!(
+            err.contains("inconsistent S3 config across StarRocks runtime paths"),
+            "{err}"
+        );
+        assert!(
+            err.contains("current_endpoint=http://127.0.0.2:9000"),
+            "{err}"
+        );
+        assert!(err.contains("current_bucket=bucket-b"), "{err}");
+        assert!(
+            err.contains("previous_endpoint=http://127.0.0.1:9000"),
+            "{err}"
+        );
+        assert!(err.contains("previous_bucket=bucket-a"), "{err}");
     }
 
     fn test_s3_config() -> S3StoreConfig {

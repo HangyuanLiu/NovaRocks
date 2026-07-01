@@ -18,13 +18,15 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::fs::path::{ScanPathScheme, classify_scan_paths};
+use crate::formats::starrocks::fs_access::resolve_format_path;
+use crate::fs::access::FsScheme;
 use opendal::ErrorKind;
 
 pub fn write_bytes(path: &str, bytes: Vec<u8>) -> Result<(), String> {
-    let scheme = classify_scan_paths([path])?;
-    match scheme {
-        ScanPathScheme::Local => {
+    reject_hdfs_path(path, "write_bytes")?;
+    let access = resolve_format_path(path)?;
+    match access.scheme() {
+        FsScheme::Local => {
             let path_buf = PathBuf::from(path);
             if let Some(parent) = path_buf.parent() {
                 fs::create_dir_all(parent)
@@ -32,14 +34,13 @@ pub fn write_bytes(path: &str, bytes: Vec<u8>) -> Result<(), String> {
             }
             fs::write(path_buf, bytes).map_err(|e| format!("write file failed: {}", e))
         }
-        ScanPathScheme::Oss => {
-            let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
-            let (op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, &cfg)?;
-            let write_result = crate::fs::oss::oss_block_on(op.write(&rel, bytes))?;
+        FsScheme::ObjectStore => {
+            let rel = access.single_relative_path()?.to_string();
+            let write_result = crate::fs::oss::oss_block_on(access.operator().write(&rel, bytes))?;
             write_result.map_err(|e| format!("write object failed: {}", e))?;
             Ok(())
         }
-        ScanPathScheme::Hdfs => Err(format!(
+        FsScheme::Hdfs => Err(format!(
             "write_bytes does not support hdfs path yet: {}",
             path
         )),
@@ -48,17 +49,17 @@ pub fn write_bytes(path: &str, bytes: Vec<u8>) -> Result<(), String> {
 
 #[allow(dead_code)]
 pub fn read_bytes(path: &str) -> Result<Vec<u8>, String> {
-    let scheme = classify_scan_paths([path])?;
-    match scheme {
-        ScanPathScheme::Local => fs::read(path).map_err(|e| format!("read file failed: {}", e)),
-        ScanPathScheme::Oss => {
-            let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
-            let (op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, &cfg)?;
-            let read_result = crate::fs::oss::oss_block_on(op.read(&rel))?;
+    reject_hdfs_path(path, "read_bytes")?;
+    let access = resolve_format_path(path)?;
+    match access.scheme() {
+        FsScheme::Local => fs::read(path).map_err(|e| format!("read file failed: {}", e)),
+        FsScheme::ObjectStore => {
+            let rel = access.single_relative_path()?.to_string();
+            let read_result = crate::fs::oss::oss_block_on(access.operator().read(&rel))?;
             let bytes = read_result.map_err(|e| format!("read object failed: {}", e))?;
             Ok(bytes.to_vec())
         }
-        ScanPathScheme::Hdfs => Err(format!(
+        FsScheme::Hdfs => Err(format!(
             "read_bytes does not support hdfs path yet: {}",
             path
         )),
@@ -66,9 +67,10 @@ pub fn read_bytes(path: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn read_bytes_if_exists(path: &str) -> Result<Option<Vec<u8>>, String> {
-    let scheme = classify_scan_paths([path])?;
-    match scheme {
-        ScanPathScheme::Local => {
+    reject_hdfs_path(path, "read_bytes_if_exists")?;
+    let access = resolve_format_path(path)?;
+    match access.scheme() {
+        FsScheme::Local => {
             let path_buf = PathBuf::from(path);
             if !path_buf.exists() {
                 return Ok(None);
@@ -77,16 +79,15 @@ pub fn read_bytes_if_exists(path: &str) -> Result<Option<Vec<u8>>, String> {
                 .map(Some)
                 .map_err(|e| format!("read file failed: {}", e))
         }
-        ScanPathScheme::Oss => {
-            let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
-            let (op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, &cfg)?;
-            match crate::fs::oss::oss_block_on(op.read(&rel))? {
+        FsScheme::ObjectStore => {
+            let rel = access.single_relative_path()?.to_string();
+            match crate::fs::oss::oss_block_on(access.operator().read(&rel))? {
                 Ok(bytes) => Ok(Some(bytes.to_vec())),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(format!("read object failed: {}", e)),
             }
         }
-        ScanPathScheme::Hdfs => Err(format!(
+        FsScheme::Hdfs => Err(format!(
             "read_bytes_if_exists does not support hdfs path yet: {}",
             path
         )),
@@ -94,27 +95,107 @@ pub fn read_bytes_if_exists(path: &str) -> Result<Option<Vec<u8>>, String> {
 }
 
 pub fn delete_path_if_exists(path: &str) -> Result<(), String> {
-    let scheme = classify_scan_paths([path])?;
-    match scheme {
-        ScanPathScheme::Local => {
+    reject_hdfs_path(path, "delete_path_if_exists")?;
+    let access = resolve_format_path(path)?;
+    match access.scheme() {
+        FsScheme::Local => {
             let path_buf = PathBuf::from(path);
             if !path_buf.exists() {
                 return Ok(());
             }
             fs::remove_file(path_buf).map_err(|e| format!("delete file failed: {}", e))
         }
-        ScanPathScheme::Oss => {
-            let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
-            let (op, rel) = crate::fs::path::resolve_object_store_operator_and_path(path, &cfg)?;
-            match crate::fs::oss::oss_block_on(op.delete(&rel))? {
+        FsScheme::ObjectStore => {
+            let rel = access.single_relative_path()?.to_string();
+            match crate::fs::oss::oss_block_on(access.operator().delete(&rel))? {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(format!("delete object failed: {}", e)),
             }
         }
-        ScanPathScheme::Hdfs => Err(format!(
+        FsScheme::Hdfs => Err(format!(
             "delete_path_if_exists does not support hdfs path yet: {}",
             path
         )),
+    }
+}
+
+fn reject_hdfs_path(path: &str, function_name: &str) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("hdfs"))
+    {
+        return Err(format!(
+            "{function_name} does not support hdfs path yet: {path}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_helpers_round_trip_local_path() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let path = temp_dir
+            .path()
+            .join("nested")
+            .join("payload.bin")
+            .to_string_lossy()
+            .to_string();
+
+        assert_eq!(
+            read_bytes_if_exists(&path).expect("read missing file"),
+            None
+        );
+
+        write_bytes(&path, b"hello writer io".to_vec()).expect("write bytes");
+
+        assert_eq!(read_bytes(&path).expect("read bytes"), b"hello writer io");
+        assert_eq!(
+            read_bytes_if_exists(&path).expect("read existing bytes"),
+            Some(b"hello writer io".to_vec())
+        );
+
+        delete_path_if_exists(&path).expect("delete bytes");
+        assert_eq!(
+            read_bytes_if_exists(&path).expect("read deleted file"),
+            None
+        );
+        delete_path_if_exists(&path).expect("delete missing file");
+    }
+
+    #[test]
+    fn byte_helpers_use_format_path_resolver_for_object_store_credentials() {
+        let _guard = crate::connector::starrocks::lake::context::lock_runtime_test_state();
+        let path = "s3://missing-bucket/warehouse/tablet-1/1.meta";
+
+        let err = read_bytes_if_exists(path).expect_err("missing runtime S3 config must fail");
+
+        assert!(
+            err.contains("missing S3 config for StarRocks object-store path="),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn byte_helpers_reject_malformed_hdfs_with_function_specific_errors() {
+        let path = "hdfs://nn:9000";
+
+        let write_err = write_bytes(path, b"payload".to_vec()).expect_err("hdfs write must fail");
+        assert!(
+            write_err.contains("write_bytes does not support hdfs path yet"),
+            "{write_err}"
+        );
+
+        let read_if_exists_err =
+            read_bytes_if_exists(path).expect_err("hdfs read-if-exists must fail");
+        assert!(
+            read_if_exists_err.contains("read_bytes_if_exists does not support hdfs path yet"),
+            "{read_if_exists_err}"
+        );
     }
 }

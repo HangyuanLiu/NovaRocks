@@ -29,6 +29,10 @@ use prost::Message;
 
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::formats::starrocks::cache::{segment_footer_cache_get, segment_footer_cache_put};
+use crate::formats::starrocks::fs_access::{
+    StarRocksFormatTabletAccess, operator_relative_path_for_tablet_root,
+    resolve_format_tablet_access,
+};
 use crate::formats::starrocks::range_read::{ensure_exact_range_read_len, expected_range_len};
 use crate::formats::starrocks::segment::{StarRocksSegmentFooter, decode_segment_footer};
 use crate::runtime::global_async_runtime::data_runtime;
@@ -139,39 +143,37 @@ pub fn load_tablet_snapshot(
         ));
     }
 
-    let root = TabletRoot::parse(tablet_root_path)?;
-    let op = build_operator(&root, object_store_profile)?;
+    let access = resolve_format_tablet_access(tablet_root_path, object_store_profile)?;
     let rt = data_runtime()?;
-    load_tablet_snapshot_from_root(tablet_id, version, &root, rt.as_ref(), &op)
+    load_tablet_snapshot_from_root(tablet_id, version, &access, rt.as_ref())
 }
 
 fn load_tablet_snapshot_from_root(
     tablet_id: i64,
     version: i64,
-    root: &TabletRoot,
+    access: &StarRocksFormatTabletAccess,
     rt: &tokio::runtime::Runtime,
-    op: &Operator,
 ) -> Result<StarRocksTabletSnapshot, String> {
-    load_tablet_snapshot_at_version(tablet_id, version, root, rt, op)
+    load_tablet_snapshot_at_version(tablet_id, version, access, rt)
 }
 
 fn load_tablet_snapshot_at_version(
     tablet_id: i64,
     version: i64,
-    root: &TabletRoot,
+    access: &StarRocksFormatTabletAccess,
     rt: &tokio::runtime::Runtime,
-    op: &Operator,
 ) -> Result<StarRocksTabletSnapshot, String> {
+    let op = access.operator();
     let standalone_metadata_rel = metadata_rel_path(tablet_id, version)?;
     for candidate_rel in metadata_rel_path_candidates(tablet_id, &standalone_metadata_rel) {
-        let candidate_operator_rel = root.operator_relative_path(&candidate_rel);
-        if object_exists(rt, op, &candidate_operator_rel)? {
-            let metadata_bytes = read_all_bytes(rt, op, &candidate_operator_rel)?;
-            let metadata_path = root.join_relative_path(&candidate_rel);
+        let candidate_operator_rel = access.operator_relative_path(&candidate_rel);
+        if object_exists(rt, &op, &candidate_operator_rel)? {
+            let metadata_bytes = read_all_bytes(rt, &op, &candidate_operator_rel)?;
+            let metadata_path = access.join_relative_path(&candidate_rel);
             return parse_standalone_snapshot(
                 tablet_id,
                 version,
-                root,
+                access,
                 &metadata_path,
                 &metadata_bytes,
             );
@@ -181,14 +183,14 @@ fn load_tablet_snapshot_at_version(
     if version == INITIAL_VERSION && tablet_id != 0 {
         let initial_metadata_rel = metadata_rel_path(0, INITIAL_VERSION)?;
         for candidate_rel in metadata_rel_path_candidates(tablet_id, &initial_metadata_rel) {
-            let candidate_operator_rel = root.operator_relative_path(&candidate_rel);
-            if object_exists(rt, op, &candidate_operator_rel)? {
-                let metadata_bytes = read_all_bytes(rt, op, &candidate_operator_rel)?;
-                let metadata_path = root.join_relative_path(&candidate_rel);
+            let candidate_operator_rel = access.operator_relative_path(&candidate_rel);
+            if object_exists(rt, &op, &candidate_operator_rel)? {
+                let metadata_bytes = read_all_bytes(rt, &op, &candidate_operator_rel)?;
+                let metadata_path = access.join_relative_path(&candidate_rel);
                 return parse_initial_snapshot(
                     tablet_id,
                     version,
-                    root,
+                    access,
                     &metadata_path,
                     &metadata_bytes,
                 );
@@ -198,14 +200,14 @@ fn load_tablet_snapshot_at_version(
 
     let bundle_metadata_rel = metadata_rel_path(0, version)?;
     for candidate_rel in metadata_rel_path_candidates(tablet_id, &bundle_metadata_rel) {
-        let candidate_operator_rel = root.operator_relative_path(&candidate_rel);
-        if object_exists(rt, op, &candidate_operator_rel)? {
-            let metadata_bytes = read_all_bytes(rt, op, &candidate_operator_rel)?;
-            let metadata_path = root.join_relative_path(&candidate_rel);
+        let candidate_operator_rel = access.operator_relative_path(&candidate_rel);
+        if object_exists(rt, &op, &candidate_operator_rel)? {
+            let metadata_bytes = read_all_bytes(rt, &op, &candidate_operator_rel)?;
+            let metadata_path = access.join_relative_path(&candidate_rel);
             return parse_bundle_snapshot(
                 tablet_id,
                 version,
-                root,
+                access,
                 &metadata_path,
                 &metadata_bytes,
             );
@@ -227,8 +229,8 @@ pub fn load_bundle_segment_footers(
         return Ok(footers);
     }
 
-    let root = TabletRoot::parse(tablet_root_path)?;
-    let op = build_operator(&root, object_store_profile)?;
+    let access = resolve_format_tablet_access(tablet_root_path, object_store_profile)?;
+    let op = access.operator();
     let rt = data_runtime()?;
 
     let mut footers = Vec::with_capacity(snapshot.segment_files.len());
@@ -293,13 +295,13 @@ pub(crate) fn tablet_operator_relative_path(
     tablet_root_path: &str,
     rel_path: &str,
 ) -> Result<String, String> {
-    Ok(TabletRoot::parse(tablet_root_path)?.operator_relative_path(rel_path))
+    operator_relative_path_for_tablet_root(tablet_root_path, rel_path)
 }
 
 fn parse_standalone_snapshot(
     tablet_id: i64,
     version: i64,
-    root: &TabletRoot,
+    access: &StarRocksFormatTabletAccess,
     metadata_path: &str,
     metadata_bytes: &[u8],
 ) -> Result<StarRocksTabletSnapshot, String> {
@@ -309,13 +311,13 @@ fn parse_standalone_snapshot(
             metadata_path, e
         )
     })?;
-    build_standalone_snapshot(tablet_id, version, root, metadata_path, metadata)
+    build_standalone_snapshot(tablet_id, version, access, metadata_path, metadata)
 }
 
 fn parse_initial_snapshot(
     tablet_id: i64,
     version: i64,
-    root: &TabletRoot,
+    access: &StarRocksFormatTabletAccess,
     metadata_path: &str,
     metadata_bytes: &[u8],
 ) -> Result<StarRocksTabletSnapshot, String> {
@@ -326,13 +328,13 @@ fn parse_initial_snapshot(
         )
     })?;
     metadata.id = Some(tablet_id);
-    build_standalone_snapshot(tablet_id, version, root, metadata_path, metadata)
+    build_standalone_snapshot(tablet_id, version, access, metadata_path, metadata)
 }
 
 fn build_standalone_snapshot(
     tablet_id: i64,
     version: i64,
-    root: &TabletRoot,
+    access: &StarRocksFormatTabletAccess,
     metadata_path: &str,
     metadata: TabletMetadataPb,
 ) -> Result<StarRocksTabletSnapshot, String> {
@@ -360,9 +362,9 @@ fn build_standalone_snapshot(
             metadata_path,
         )?;
     }
-    let (segment_files, delete_predicates) = collect_segment_files(root, &metadata)?;
+    let (segment_files, delete_predicates) = collect_segment_files(access, &metadata)?;
     let total_num_rows = collect_total_num_rows(&metadata, tablet_id, metadata_path)?;
-    let delvec_meta = collect_delvec_meta(root, &metadata)?;
+    let delvec_meta = collect_delvec_meta(access, &metadata)?;
     let mut historical_schemas = metadata
         .historical_schemas
         .clone()
@@ -391,7 +393,7 @@ fn build_standalone_snapshot(
 fn parse_bundle_snapshot(
     tablet_id: i64,
     version: i64,
-    root: &TabletRoot,
+    access: &StarRocksFormatTabletAccess,
     metadata_path: &str,
     metadata_bytes: &[u8],
 ) -> Result<StarRocksTabletSnapshot, String> {
@@ -411,9 +413,9 @@ fn parse_bundle_snapshot(
             tablet_id, metadata_path
         )
     })?;
-    let (segment_files, delete_predicates) = collect_segment_files(root, &metadata)?;
+    let (segment_files, delete_predicates) = collect_segment_files(access, &metadata)?;
     let total_num_rows = collect_total_num_rows(&metadata, tablet_id, metadata_path)?;
-    let delvec_meta = collect_delvec_meta(root, &metadata)?;
+    let delvec_meta = collect_delvec_meta(access, &metadata)?;
     let mut historical_schemas = metadata
         .historical_schemas
         .clone()
@@ -647,7 +649,7 @@ fn collect_total_num_rows(
 }
 
 fn collect_segment_files(
-    root: &TabletRoot,
+    access: &StarRocksFormatTabletAccess,
     metadata: &TabletMetadataPb,
 ) -> Result<(Vec<StarRocksSegmentFile>, Vec<StarRocksDeletePredicateRaw>), String> {
     let mut files = Vec::new();
@@ -729,8 +731,8 @@ fn collect_segment_files(
             let rel_path = format!("{DATA_DIR}/{name}");
             files.push(StarRocksSegmentFile {
                 name,
-                relative_path: root.operator_relative_path(&rel_path),
-                path: root.join_relative_path(&rel_path),
+                relative_path: access.operator_relative_path(&rel_path),
+                path: access.join_relative_path(&rel_path),
                 rowset_version,
                 schema_id: rowset_schema_id,
                 segment_id,
@@ -870,7 +872,7 @@ pub(crate) fn collect_delete_predicates(
 }
 
 fn collect_delvec_meta(
-    root: &TabletRoot,
+    access: &StarRocksFormatTabletAccess,
     metadata: &TabletMetadataPb,
 ) -> Result<StarRocksDelvecMetaRaw, String> {
     let mut out = StarRocksDelvecMetaRaw::default();
@@ -891,7 +893,7 @@ fn collect_delvec_meta(
             .filter(|v| !v.is_empty())
             .ok_or_else(|| format!("delvec file name is missing for version {}", version))?;
         let rel_path = format!("{DATA_DIR}/{}", name.trim_start_matches('/'));
-        let rel = root.operator_relative_path(&rel_path);
+        let rel = access.operator_relative_path(&rel_path);
         if out
             .version_to_file_rel_path
             .insert(*version, rel.clone())
@@ -1083,145 +1085,6 @@ fn read_range_bytes(
     ))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-/// Parsed tablet root location for metadata/segment object access.
-enum TabletRoot {
-    Local {
-        root_dir: String,
-    },
-    ObjectStore {
-        scheme: String,
-        bucket: String,
-        root_path: String,
-    },
-}
-
-impl TabletRoot {
-    fn parse(tablet_root_path: &str) -> Result<Self, String> {
-        let raw = tablet_root_path.trim().trim_end_matches('/');
-        if raw.is_empty() {
-            return Err("tablet_root_path is empty".to_string());
-        }
-
-        if let Some(rest) = raw
-            .strip_prefix("s3://")
-            .or_else(|| raw.strip_prefix("oss://"))
-        {
-            let scheme = if raw.starts_with("s3://") {
-                "s3".to_string()
-            } else {
-                "oss".to_string()
-            };
-            let (bucket, root_path) = split_bucket_and_root(rest)?;
-            return Ok(Self::ObjectStore {
-                scheme,
-                bucket,
-                root_path,
-            });
-        }
-
-        if raw.contains("://") {
-            return Err(format!(
-                "unsupported tablet_root_path scheme for native metadata loader: {raw}"
-            ));
-        }
-        Ok(Self::Local {
-            root_dir: raw.to_string(),
-        })
-    }
-
-    fn join_relative_path(&self, rel_path: &str) -> String {
-        let rel = rel_path.trim_start_matches('/');
-        match self {
-            Self::Local { root_dir } => {
-                if rel.is_empty() {
-                    root_dir.clone()
-                } else {
-                    format!("{}/{}", root_dir.trim_end_matches('/'), rel)
-                }
-            }
-            Self::ObjectStore {
-                scheme,
-                bucket,
-                root_path,
-            } => {
-                let root = root_path.trim_matches('/');
-                if root.is_empty() {
-                    format!("{scheme}://{bucket}/{rel}")
-                } else {
-                    format!("{scheme}://{bucket}/{root}/{rel}")
-                }
-            }
-        }
-    }
-
-    fn operator_relative_path(&self, rel_path: &str) -> String {
-        let rel = rel_path.trim_start_matches('/');
-        match self {
-            Self::Local { .. } => rel.to_string(),
-            Self::ObjectStore { root_path, .. } => {
-                let root = root_path.trim_matches('/');
-                if root.is_empty() {
-                    rel.to_string()
-                } else if rel.is_empty() {
-                    root.to_string()
-                } else {
-                    format!("{root}/{rel}")
-                }
-            }
-        }
-    }
-}
-
-fn split_bucket_and_root(value: &str) -> Result<(String, String), String> {
-    let trimmed = value.trim_matches('/');
-    let (bucket, root_path) = match trimmed.split_once('/') {
-        Some((bucket, path)) => (bucket, path),
-        None => (trimmed, ""),
-    };
-    if bucket.trim().is_empty() {
-        return Err(format!("missing bucket in tablet_root_path: {value}"));
-    }
-    Ok((bucket.to_string(), root_path.trim_matches('/').to_string()))
-}
-
-fn build_operator(
-    root: &TabletRoot,
-    object_store_profile: Option<&ObjectStoreProfile>,
-) -> Result<Operator, String> {
-    match root {
-        TabletRoot::Local { root_dir } => {
-            let builder = opendal::services::Fs::default().root(root_dir);
-            let operator_builder = Operator::new(builder)
-                .map_err(|e| format!("init local metadata operator failed: {}", e))?;
-            Ok(operator_builder.finish())
-        }
-        TabletRoot::ObjectStore {
-            scheme: _,
-            bucket,
-            root_path,
-        } => {
-            let profile = object_store_profile.ok_or_else(|| {
-                format!(
-                    "missing object store profile for metadata loader: path={}://{}/{}",
-                    "s3", bucket, root_path
-                )
-            })?;
-            build_s3_operator(bucket, root_path, profile)
-        }
-    }
-}
-
-fn build_s3_operator(
-    bucket: &str,
-    _root_path: &str,
-    object_store_profile: &ObjectStoreProfile,
-) -> Result<Operator, String> {
-    let cfg = object_store_profile.to_object_store_config();
-    crate::fs::object_store::build_object_store_operator(bucket, &cfg)
-        .map_err(|e| format!("init object store metadata operator failed: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1232,24 +1095,29 @@ mod tests {
     use prost::Message;
     use tempfile::TempDir;
 
-    #[test]
-    fn object_store_root_maps_display_and_operator_relative_paths() {
-        let root = TabletRoot::parse("s3://bucket/warehouse/db_1/table_2/100")
-            .expect("parse object-store tablet root");
+    fn expected_local_operator_relative_path(
+        tablet_root: &std::path::Path,
+        rel_path: &str,
+    ) -> String {
+        let tablet_name = tablet_root
+            .file_name()
+            .expect("tablet root must have a final component")
+            .to_string_lossy();
+        let rel_path = rel_path.trim_start_matches('/');
+        if rel_path.is_empty() {
+            tablet_name.to_string()
+        } else {
+            format!("{tablet_name}/{rel_path}")
+        }
+    }
 
-        assert_eq!(
-            root.join_relative_path("meta/0000000000000000_0000000000000001.meta"),
-            "s3://bucket/warehouse/db_1/table_2/100/meta/0000000000000000_0000000000000001.meta"
-        );
-        assert_eq!(
-            root.operator_relative_path("meta/0000000000000000_0000000000000001.meta"),
-            "warehouse/db_1/table_2/100/meta/0000000000000000_0000000000000001.meta"
-        );
-        assert_eq!(
+    #[test]
+    fn tablet_operator_relative_path_resolves_object_store_without_profile() {
+        let rel =
             tablet_operator_relative_path("s3://bucket/warehouse/db_1/table_2/100", "data/seg.dat")
-                .expect("operator relative path"),
-            "warehouse/db_1/table_2/100/data/seg.dat"
-        );
+                .expect("object-store tablet root path must not require a profile");
+
+        assert_eq!(rel, "warehouse/db_1/table_2/100/data/seg.dat");
     }
 
     #[test]
@@ -1327,7 +1195,10 @@ mod tests {
         assert_eq!(snapshot.rowset_count, 1);
         assert_eq!(snapshot.segment_files.len(), 2);
         assert_eq!(snapshot.segment_files[0].name, "a.dat");
-        assert_eq!(snapshot.segment_files[0].relative_path, "data/a.dat");
+        assert_eq!(
+            snapshot.segment_files[0].relative_path,
+            expected_local_operator_relative_path(temp_dir.path(), "data/a.dat")
+        );
         assert_eq!(snapshot.segment_files[0].segment_id, Some(7));
         assert_eq!(snapshot.segment_files[0].bundle_file_offset, Some(10));
         assert_eq!(snapshot.segment_files[0].segment_size, Some(64));
@@ -1379,7 +1250,10 @@ mod tests {
         assert_eq!(snapshot.total_num_rows, 7);
         assert_eq!(snapshot.rowset_count, 1);
         assert_eq!(snapshot.segment_files.len(), 1);
-        assert_eq!(snapshot.segment_files[0].relative_path, "data/seg0.dat");
+        assert_eq!(
+            snapshot.segment_files[0].relative_path,
+            expected_local_operator_relative_path(temp_dir.path(), "data/seg0.dat")
+        );
         assert_eq!(snapshot.segment_files[0].bundle_file_offset, None);
         assert_eq!(snapshot.segment_files[0].segment_size, None);
     }
@@ -1909,7 +1783,8 @@ mod tests {
 
     #[test]
     fn collect_segment_files_uses_rowset_index_for_visibility_version() {
-        let root = TabletRoot::parse("/tmp/starrocks_tablet").expect("parse local root");
+        let access = resolve_format_tablet_access("/tmp/starrocks_tablet", None)
+            .expect("resolve local root");
         let metadata = TabletMetadataPb {
             rowsets: vec![
                 RowsetMetadataPb {
@@ -1952,7 +1827,7 @@ mod tests {
         };
 
         let (segments, delete_predicates) =
-            collect_segment_files(&root, &metadata).expect("collect segment files");
+            collect_segment_files(&access, &metadata).expect("collect segment files");
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].rowset_version, 0);
         assert_eq!(segments[0].segment_id, Some(1));
@@ -1997,14 +1872,19 @@ mod tests {
             ..Default::default()
         };
 
-        let root = TabletRoot::parse("/tmp/starrocks_tablet").expect("parse local root");
-        let delvec_meta = collect_delvec_meta(&root, &metadata).expect("collect delvec meta");
+        let access = resolve_format_tablet_access("/tmp/starrocks_tablet", None)
+            .expect("resolve local root");
+        let delvec_meta = collect_delvec_meta(&access, &metadata).expect("collect delvec meta");
+        let delvec_rel_path = delvec_meta
+            .version_to_file_rel_path
+            .get(&8)
+            .expect("delvec file relative path");
         assert_eq!(
-            delvec_meta
-                .version_to_file_rel_path
-                .get(&8)
-                .map(String::as_str),
-            Some("data/delvec_8")
+            delvec_rel_path,
+            &expected_local_operator_relative_path(
+                std::path::Path::new("/tmp/starrocks_tablet"),
+                "data/delvec_8"
+            )
         );
         let page = delvec_meta
             .segment_delvec_pages
@@ -2019,7 +1899,8 @@ mod tests {
 
     #[test]
     fn reject_delete_predicate_with_missing_column_name() {
-        let root = TabletRoot::parse("/tmp/starrocks_tablet").expect("parse local root");
+        let access = resolve_format_tablet_access("/tmp/starrocks_tablet", None)
+            .expect("resolve local root");
         let metadata = TabletMetadataPb {
             rowsets: vec![RowsetMetadataPb {
                 id: Some(3),
@@ -2040,7 +1921,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = collect_segment_files(&root, &metadata)
+        let err = collect_segment_files(&access, &metadata)
             .expect_err("missing delete predicate column name should fail");
         assert!(err.contains("column_name is missing"), "err={err}");
     }

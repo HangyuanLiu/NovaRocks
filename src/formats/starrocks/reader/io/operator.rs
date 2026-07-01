@@ -16,47 +16,16 @@
 // under the License.
 //! OpenDAL operator builder for native reader.
 //!
-//! Current limitations:
-//! - Supports S3-compatible and local filesystem tablet roots.
-
 use opendal::Operator;
 
 use crate::connector::starrocks::ObjectStoreProfile;
-
-use super::tablet_root::TabletRoot;
+use crate::formats::starrocks::fs_access::resolve_format_tablet_access;
 
 /// Build an object operator for native segment reads.
 pub(crate) fn build_operator(
-    root: &TabletRoot,
+    tablet_root_path: &str,
     object_store_profile: Option<&ObjectStoreProfile>,
 ) -> Result<Operator, String> {
-    match root {
-        TabletRoot::S3 { bucket, root } => {
-            let profile = object_store_profile.ok_or_else(|| {
-                format!(
-                    "missing object store profile for native data loader: root=s3://{}/{}",
-                    bucket, root
-                )
-            })?;
-            build_s3_operator(bucket, root, profile)
-        }
-        TabletRoot::Local { root } => build_local_operator(root),
-    }
-}
-
-fn build_local_operator(root: &str) -> Result<Operator, String> {
-    let builder = opendal::services::Fs::default().root(root);
-    let operator_builder = Operator::new(builder)
-        .map_err(|e| format!("init local native data operator failed: {e}"))?;
-    Ok(operator_builder.finish())
-}
-
-fn build_s3_operator(
-    bucket: &str,
-    _root: &str,
-    object_store_profile: &ObjectStoreProfile,
-) -> Result<Operator, String> {
-    let cfg = object_store_profile.to_object_store_config();
-    crate::fs::object_store::build_object_store_operator(bucket, &cfg)
-        .map_err(|e| format!("init object store native data operator failed: {e}"))
+    resolve_format_tablet_access(tablet_root_path, object_store_profile)
+        .map(|access| access.operator())
 }
