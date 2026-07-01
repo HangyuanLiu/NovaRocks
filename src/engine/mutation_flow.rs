@@ -3642,6 +3642,57 @@ mod tests {
         node
     }
 
+    fn merge_mor_expand_child_plan_for_test(
+        include_insert_qty: bool,
+    ) -> crate::sql::optimizer::OptimizerPhysicalNode {
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
+        use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+        use crate::sql::optimizer::statistics::Statistics;
+
+        let mut output_columns = vec![
+            optimizer_output_column("__nr_file", 1, DataType::Utf8, true, true),
+            optimizer_output_column("__nr_pos", 2, DataType::Int64, true, true),
+            optimizer_output_column("__nr_row_id", 3, DataType::Int64, true, true),
+            optimizer_output_column("__nr_merge_assert_key", 4, DataType::Int64, false, true),
+            optimizer_output_column("__nr_merge_action", 5, DataType::Int64, false, true),
+            optimizer_output_column("id", 6, DataType::Int64, true, false),
+            optimizer_output_column("qty", 7, DataType::Int64, true, false),
+            optimizer_output_column("__nr_new_qty", 8, DataType::Int64, true, true),
+            optimizer_output_column("__nr_ins_id", 9, DataType::Int64, true, true),
+        ];
+        if include_insert_qty {
+            output_columns.push(optimizer_output_column(
+                "__nr_ins_qty",
+                10,
+                DataType::Int64,
+                true,
+                true,
+            ));
+        }
+
+        let mut node = OptimizerPhysicalNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: Vec::new(),
+                columns: output_columns.clone(),
+            }),
+            children: Vec::new(),
+            stats: Statistics {
+                output_row_count: 5.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns,
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        crate::sql::optimizer::physical_tree::attach_scalar_arena(
+            &mut node,
+            Arc::new(crate::sql::optimizer::scalar::ScalarArena::new()),
+        );
+        node
+    }
+
     fn output_column_by_name_for_test<'a>(
         columns: &'a [crate::sql::analysis::OutputColumn],
         name: &str,
@@ -3676,6 +3727,79 @@ mod tests {
                 crate::sql::column_id::ColumnId::new_for_test(expected)
             )
         );
+    }
+
+    fn assert_assignment_is_int_literal(
+        arena: &crate::sql::optimizer::scalar::ScalarArena,
+        expr: crate::sql::optimizer::scalar::ScalarId,
+        expected: i64,
+    ) {
+        assert_eq!(
+            arena.node(expr),
+            &crate::sql::optimizer::scalar::ScalarNode::Literal(
+                crate::sql::optimizer::scalar::HashableLiteral(
+                    crate::sql::analysis::LiteralValue::Int(expected)
+                )
+            )
+        );
+    }
+
+    fn assert_no_assignment_for_output(
+        event: &crate::sql::optimizer::operator::ChangeEventSpec,
+        output_column_id: crate::sql::column_id::ColumnId,
+    ) {
+        assert!(
+            event
+                .assignments
+                .iter()
+                .all(|assignment| assignment.output_column_id != output_column_id),
+            "unexpected assignment for output {output_column_id:?}"
+        );
+    }
+
+    fn assert_event_predicate_matches_action(
+        arena: &crate::sql::optimizer::scalar::ScalarArena,
+        event: &crate::sql::optimizer::operator::ChangeEventSpec,
+        expected_action: i32,
+    ) {
+        use crate::sql::common::BinOp;
+        use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
+
+        let predicate = event.predicate.expect("action predicate");
+        let ScalarNode::BinaryOp { op, left, right } = arena.node(predicate) else {
+            panic!("expected action equality predicate");
+        };
+        assert_eq!(*op, BinOp::Eq);
+
+        let mut saw_action_column = false;
+        let mut saw_action_literal = false;
+        for child in [*left, *right] {
+            match arena.node(child) {
+                ScalarNode::ColumnRef(id)
+                    if *id == crate::sql::column_id::ColumnId::new_for_test(5) =>
+                {
+                    saw_action_column = true;
+                }
+                ScalarNode::Literal(HashableLiteral(crate::sql::analysis::LiteralValue::Int(
+                    value,
+                ))) if *value == i64::from(expected_action) => {
+                    saw_action_literal = true;
+                }
+                other => panic!("unexpected action predicate child: {other:?}"),
+            }
+        }
+        assert!(saw_action_column, "predicate must read __nr_merge_action");
+        assert!(saw_action_literal, "predicate must compare expected action");
+    }
+
+    fn branch_kinds_for_test(
+        expand: &crate::sql::optimizer::operator::ChangeEventExpandOp,
+    ) -> Vec<crate::sql::common::change_stream::ChangeStreamBranchKind> {
+        expand
+            .events
+            .iter()
+            .map(|event| event.branch_kind)
+            .collect()
     }
 
     #[test]
@@ -3821,6 +3945,317 @@ mod tests {
         assert_eq!(
             arena.node(seq_expr),
             &ScalarNode::Literal(HashableLiteral(crate::sql::analysis::LiteralValue::Int(77)))
+        );
+    }
+
+    #[test]
+    fn merge_mor_change_event_expand_matched_update_shape() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::Operator;
+        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+
+        let target_columns = vec![non_null_col("id"), col("qty")];
+        let plan = build_merge_mor_change_event_expand_plan(
+            merge_mor_expand_child_plan_for_test(true),
+            &target_columns,
+            101,
+            true,
+            false,
+            false,
+        )
+        .expect("MOR MERGE matched UPDATE expand plan");
+        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
+            panic!("expected PhysicalChangeEventExpand");
+        };
+        let Operator::PhysicalDistribution(distribution) = &plan.children[0].op else {
+            panic!("expected pre-expand PhysicalDistribution");
+        };
+        assert_eq!(
+            distribution.spec,
+            DistributionSpec::HashPartitioned {
+                cols: vec![crate::sql::column_id::ColumnId::new_for_test(4)],
+                source: HashSource::ShuffleAgg,
+            }
+        );
+
+        assert_eq!(expand.events.len(), 2);
+        assert_eq!(
+            branch_kinds_for_test(expand),
+            vec![
+                ChangeStreamBranchKind::DeleteDv,
+                ChangeStreamBranchKind::ReuseData,
+            ]
+        );
+
+        let file = output_column_by_name_for_test(&expand.output_columns, "_file");
+        let pos = output_column_by_name_for_test(&expand.output_columns, "_pos");
+        let id = output_column_by_name_for_test(&expand.output_columns, "id");
+        let qty = output_column_by_name_for_test(&expand.output_columns, "qty");
+        let row_id = output_column_by_name_for_test(&expand.output_columns, "_row_id");
+        let seq =
+            output_column_by_name_for_test(&expand.output_columns, "_last_updated_sequence_number");
+        let change_op = output_column_by_name_for_test(&expand.output_columns, "__change_op");
+        let route = output_column_by_name_for_test(&expand.output_columns, "__change_data_route");
+        assert!(file.is_internal);
+        assert!(pos.is_internal);
+        assert!(!id.is_internal);
+        assert!(!qty.is_internal);
+        assert!(row_id.is_internal);
+        assert!(seq.is_internal);
+        assert!(change_op.is_internal);
+        assert!(route.is_internal);
+        assert_eq!(expand.change_op_column_id, change_op.column_id);
+        assert_eq!(expand.data_route_column_id, Some(route.column_id));
+
+        let arena = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("scalar arena");
+        let delete = &expand.events[0];
+        assert_event_predicate_matches_action(arena, delete, MERGE_ACTION_MATCHED_UPDATE);
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(delete, file.column_id),
+            1,
+        );
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(delete, pos.column_id),
+            2,
+        );
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(delete, id.column_id), 6);
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(delete, qty.column_id),
+            7,
+        );
+
+        let reuse = &expand.events[1];
+        assert_event_predicate_matches_action(arena, reuse, MERGE_ACTION_MATCHED_UPDATE);
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(reuse, id.column_id), 6);
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(reuse, qty.column_id), 8);
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(reuse, row_id.column_id),
+            3,
+        );
+        assert_assignment_is_int_literal(
+            arena,
+            assignment_expr_for_output(reuse, seq.column_id),
+            101,
+        );
+    }
+
+    #[test]
+    fn merge_mor_change_event_expand_matched_delete_shape() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::Operator;
+
+        let target_columns = vec![non_null_col("id"), col("qty")];
+        let plan = build_merge_mor_change_event_expand_plan(
+            merge_mor_expand_child_plan_for_test(true),
+            &target_columns,
+            101,
+            false,
+            true,
+            false,
+        )
+        .expect("MOR MERGE matched DELETE expand plan");
+        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
+            panic!("expected PhysicalChangeEventExpand");
+        };
+        assert_eq!(
+            branch_kinds_for_test(expand),
+            vec![ChangeStreamBranchKind::DeleteDv]
+        );
+
+        let arena = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("scalar arena");
+        let delete = &expand.events[0];
+        assert_event_predicate_matches_action(arena, delete, MERGE_ACTION_MATCHED_DELETE);
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(
+                delete,
+                output_column_by_name_for_test(&expand.output_columns, "_file").column_id,
+            ),
+            1,
+        );
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(
+                delete,
+                output_column_by_name_for_test(&expand.output_columns, "_pos").column_id,
+            ),
+            2,
+        );
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(
+                delete,
+                output_column_by_name_for_test(&expand.output_columns, "id").column_id,
+            ),
+            6,
+        );
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(
+                delete,
+                output_column_by_name_for_test(&expand.output_columns, "qty").column_id,
+            ),
+            7,
+        );
+    }
+
+    #[test]
+    fn merge_mor_change_event_expand_fresh_only_omitted_insert_column_outputs_null() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::Operator;
+
+        let target_columns = vec![non_null_col("id"), col("qty")];
+        let plan = build_merge_mor_change_event_expand_plan(
+            merge_mor_expand_child_plan_for_test(false),
+            &target_columns,
+            101,
+            false,
+            false,
+            true,
+        )
+        .expect("MOR MERGE fresh-only expand plan");
+        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
+            panic!("expected PhysicalChangeEventExpand");
+        };
+        assert_eq!(
+            branch_kinds_for_test(expand),
+            vec![ChangeStreamBranchKind::FreshData]
+        );
+
+        let arena = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("scalar arena");
+        let fresh = &expand.events[0];
+        assert_event_predicate_matches_action(arena, fresh, MERGE_ACTION_NOT_MATCHED_INSERT);
+        let id = output_column_by_name_for_test(&expand.output_columns, "id");
+        let qty = output_column_by_name_for_test(&expand.output_columns, "qty");
+        assert_assignment_is_column_ref(arena, assignment_expr_for_output(fresh, id.column_id), 9);
+        // Omitted INSERT target columns intentionally have no event assignment;
+        // ChangeEventExpand fills unassigned output slots with NULL.
+        assert_no_assignment_for_output(fresh, qty.column_id);
+    }
+
+    #[test]
+    fn merge_mor_change_event_expand_mixed_update_and_insert_shape() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::Operator;
+
+        let target_columns = vec![non_null_col("id"), col("qty")];
+        let plan = build_merge_mor_change_event_expand_plan(
+            merge_mor_expand_child_plan_for_test(true),
+            &target_columns,
+            101,
+            true,
+            false,
+            true,
+        )
+        .expect("MOR MERGE update+insert expand plan");
+        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
+            panic!("expected PhysicalChangeEventExpand");
+        };
+        assert_eq!(
+            branch_kinds_for_test(expand),
+            vec![
+                ChangeStreamBranchKind::DeleteDv,
+                ChangeStreamBranchKind::ReuseData,
+                ChangeStreamBranchKind::FreshData,
+            ]
+        );
+
+        let arena = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("scalar arena");
+        assert_event_predicate_matches_action(
+            arena,
+            &expand.events[0],
+            MERGE_ACTION_MATCHED_UPDATE,
+        );
+        assert_event_predicate_matches_action(
+            arena,
+            &expand.events[1],
+            MERGE_ACTION_MATCHED_UPDATE,
+        );
+        assert_event_predicate_matches_action(
+            arena,
+            &expand.events[2],
+            MERGE_ACTION_NOT_MATCHED_INSERT,
+        );
+
+        let fresh = &expand.events[2];
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(
+                fresh,
+                output_column_by_name_for_test(&expand.output_columns, "id").column_id,
+            ),
+            9,
+        );
+        assert_assignment_is_column_ref(
+            arena,
+            assignment_expr_for_output(
+                fresh,
+                output_column_by_name_for_test(&expand.output_columns, "qty").column_id,
+            ),
+            10,
+        );
+    }
+
+    #[test]
+    fn merge_mor_change_event_expand_mixed_delete_and_insert_shape() {
+        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+        use crate::sql::optimizer::operator::Operator;
+
+        let target_columns = vec![non_null_col("id"), col("qty")];
+        let plan = build_merge_mor_change_event_expand_plan(
+            merge_mor_expand_child_plan_for_test(true),
+            &target_columns,
+            101,
+            false,
+            true,
+            true,
+        )
+        .expect("MOR MERGE delete+insert expand plan");
+        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
+            panic!("expected PhysicalChangeEventExpand");
+        };
+        assert_eq!(
+            branch_kinds_for_test(expand),
+            vec![
+                ChangeStreamBranchKind::DeleteDv,
+                ChangeStreamBranchKind::FreshData,
+            ]
+        );
+
+        let arena = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .expect("scalar arena");
+        assert_event_predicate_matches_action(
+            arena,
+            &expand.events[0],
+            MERGE_ACTION_MATCHED_DELETE,
+        );
+        assert_event_predicate_matches_action(
+            arena,
+            &expand.events[1],
+            MERGE_ACTION_NOT_MATCHED_INSERT,
         );
     }
 
