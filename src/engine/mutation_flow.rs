@@ -4486,6 +4486,48 @@ mod tests {
     }
 
     #[test]
+    fn mor_update_change_stream_uses_keyed_assert_not_host_duplicate_validation() {
+        let source = include_str!("mutation_flow.rs");
+        let update_builder = source
+            .split("fn build_update_mor_change_stream_write_plan")
+            .nth(1)
+            .expect("UPDATE MOR change-stream builder")
+            .split("fn update_assignment_projection_sql")
+            .next()
+            .expect("UPDATE MOR change-stream builder body");
+
+        assert!(
+            update_builder.contains("pre_expand_keyed_assert"),
+            "MOR UPDATE must request keyed AssertNumRows before ChangeEventExpand"
+        );
+        assert!(
+            !update_builder.contains("validate_unique_target_row_ids"),
+            "MOR UPDATE change-stream path must not fail through host-side duplicate validation"
+        );
+    }
+
+    #[test]
+    fn mor_merge_change_stream_uses_keyed_assert_not_host_duplicate_validation() {
+        let source = include_str!("mutation_flow.rs");
+        let merge_builder = source
+            .split("fn build_merge_mor_change_stream_write_plan")
+            .nth(1)
+            .expect("MERGE MOR change-stream builder")
+            .split("fn execute_merge_match_query")
+            .next()
+            .expect("MERGE MOR builder body");
+
+        assert!(
+            merge_builder.contains("pre_expand_keyed_assert"),
+            "MOR MERGE matched branches must request keyed AssertNumRows before ChangeEventExpand"
+        );
+        assert!(
+            !merge_builder.contains("validate_unique_target_row_ids"),
+            "MOR MERGE change-stream path must not fail through host-side duplicate validation"
+        );
+    }
+
+    #[test]
     fn merge_folds_all_branches_into_one_runner() {
         let src = include_str!("mutation_flow.rs");
         let body = src
@@ -4679,7 +4721,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_row_ids_are_rejected() {
+    fn cow_host_duplicate_row_ids_are_rejected_before_rewrite() {
         let err = validate_unique_target_row_ids(&[7, 8, 7]).expect_err("duplicate");
         assert!(err.contains("_row_id=7"), "{err}");
     }

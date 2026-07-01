@@ -1105,6 +1105,128 @@ mod tests {
         assert!(execution.commit_plan.is_empty());
     }
 
+    fn empty_writer_commit_for_test() -> crate::runtime::write_coordinator::WriteCommitInput {
+        crate::runtime::write_coordinator::WriteCommitInput {
+            write_id: crate::thrift::types::TUniqueId::new(1, 2),
+            writers: Vec::new(),
+        }
+    }
+
+    fn empty_writer_result_for_test() -> CoordinatedQueryResult {
+        CoordinatedQueryResult {
+            query_result: crate::runtime::query_result::QueryResult::empty(),
+            write_commit: Some(empty_writer_commit_for_test()),
+            write_abort: None,
+            fragment_profiles: Vec::new(),
+        }
+    }
+
+    fn commit_plan_for_branches(
+        branches: &[(i32, ChangeStreamWriteBranchKind)],
+    ) -> crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan {
+        crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::new(
+            branches.iter().copied().collect(),
+        )
+    }
+
+    #[test]
+    fn update_mor_zero_rows_accepts_eos_without_branch_writer_reports() {
+        let output_columns = producer_output_columns();
+        let dag = build_dml_change_stream_dag_from_sink_specs(
+            DmlChangeStreamBranchSet::UpdateMor,
+            &output_columns,
+            sink_specs_for_partitioned_target(),
+        )
+        .expect("update MOR change-stream DAG");
+        assert_eq!(
+            branch_kinds(&dag),
+            vec![
+                ChangeStreamWriteBranchKind::DeleteDv,
+                ChangeStreamWriteBranchKind::ReuseData,
+            ]
+        );
+
+        let execution = dml_change_stream_write_execution(
+            empty_writer_result_for_test(),
+            commit_plan_for_branches(&[
+                (10, ChangeStreamWriteBranchKind::DeleteDv),
+                (11, ChangeStreamWriteBranchKind::ReuseData),
+            ]),
+        )
+        .expect("zero-row UPDATE should complete with query-level EOS");
+
+        assert_eq!(
+            execution.result.write_commit.expect("commit").writers.len(),
+            0
+        );
+    }
+
+    #[test]
+    fn merge_matched_update_zero_rows_accepts_eos_without_branch_writer_reports() {
+        let output_columns = producer_output_columns();
+        let dag = build_dml_change_stream_dag_from_sink_specs(
+            DmlChangeStreamBranchSet::Merge {
+                matched_update: true,
+                matched_delete: false,
+                not_matched_insert: false,
+            },
+            &output_columns,
+            sink_specs_for_partitioned_target(),
+        )
+        .expect("matched update DAG");
+        assert_eq!(
+            branch_kinds(&dag),
+            vec![
+                ChangeStreamWriteBranchKind::DeleteDv,
+                ChangeStreamWriteBranchKind::ReuseData,
+            ]
+        );
+
+        let execution = dml_change_stream_write_execution(
+            empty_writer_result_for_test(),
+            commit_plan_for_branches(&[
+                (10, ChangeStreamWriteBranchKind::DeleteDv),
+                (11, ChangeStreamWriteBranchKind::ReuseData),
+            ]),
+        )
+        .expect("zero-row MERGE matched UPDATE should complete with query-level EOS");
+
+        assert_eq!(
+            execution.result.write_commit.expect("commit").writers.len(),
+            0
+        );
+    }
+
+    #[test]
+    fn merge_empty_not_matched_insert_commits_no_writer_files() {
+        let output_columns = producer_output_columns();
+        let dag = build_dml_change_stream_dag_from_sink_specs(
+            DmlChangeStreamBranchSet::Merge {
+                matched_update: false,
+                matched_delete: false,
+                not_matched_insert: true,
+            },
+            &output_columns,
+            sink_specs_for_partitioned_target(),
+        )
+        .expect("not matched insert DAG");
+        assert_eq!(
+            branch_kinds(&dag),
+            vec![ChangeStreamWriteBranchKind::FreshData]
+        );
+
+        let execution = dml_change_stream_write_execution(
+            empty_writer_result_for_test(),
+            commit_plan_for_branches(&[(12, ChangeStreamWriteBranchKind::FreshData)]),
+        )
+        .expect("empty MERGE not-matched INSERT should not require writer files");
+
+        assert_eq!(
+            execution.result.write_commit.expect("commit").writers.len(),
+            0
+        );
+    }
+
     #[test]
     fn pre_expand_keyed_assert_inserts_assert_num_rows_before_expand() {
         let mut build_result = keyed_assert_build_result(vec![
