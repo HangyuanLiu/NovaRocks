@@ -7885,6 +7885,152 @@ fn finalize_iceberg_mv_refresh_with_partition_contract(
     )
 }
 
+/// W4/M6: advance the MV's *lake* watermark with a data-free Iceberg snapshot
+/// on a net-zero-output refresh, so the storage table's current-snapshot
+/// provenance keeps up with the SQLite watermark.
+///
+/// This is called from the net-zero-output refresh short-circuits — where the
+/// base watermark ADVANCED but the MV produced zero net rows, so no
+/// data-carrying snapshot is committed. Without this, the SQLite watermark
+/// advances while the lake watermark (current-snapshot `MvProvenanceV1`) stays
+/// stale; a cluster rebuild (`rebuild_imv_cache_from_lake`) then recovers the
+/// OLD watermark and the MV redundantly re-scans the net-zero delta.
+///
+/// The commit is a crate `Transaction::fast_append` with NO data files (the
+/// repo's `FastAppendCommit` wrapper deliberately no-ops empty input, so the
+/// crate transaction is used directly). The empty append preserves every
+/// existing data file — the MV's materialized rows are untouched — and only
+/// moves the current-snapshot provenance forward. Commit runs the crate
+/// transaction's built-in CAS/retry loop against `main`, mirroring how the
+/// data-carrying commit paths publish.
+///
+/// Guarded by `new_base_snapshots` being strictly ahead of the lake watermark:
+/// this keeps the helper idempotent and a no-op if the lake already carries the
+/// finalized watermark (e.g. a redundant/retried call). The provenance is
+/// stamped `technique = MetadataOnly`; the row count carries the MV's unchanged
+/// `last_refresh_rows`.
+///
+/// Returns `Ok(Some(new_snapshot_id))` when a data-free snapshot was committed
+/// (the caller records it as the MV's target snapshot so
+/// `validate_target_snapshot` still matches on the next refresh), or `Ok(None)`
+/// when no advance was needed (the lake watermark already matches, or the MV
+/// has no current target snapshot to append onto yet).
+#[allow(clippy::too_many_arguments)]
+fn advance_lake_watermark_via_data_free_snapshot(
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    mv_definition: &StoredMvDefinition,
+    refresh_id: i64,
+    new_base_snapshots: &BTreeMap<String, i64>,
+    new_base_table_uuids: &BTreeMap<String, String>,
+) -> Result<Option<i64>, String> {
+    let loaded = reload_iceberg_mv_target_table(target_entry, target)?;
+    // No current snapshot means the MV has never materialized data; there is no
+    // lake watermark to keep consistent and no snapshot to fast-append onto.
+    let Some(current_snapshot) = loaded.metadata().current_snapshot() else {
+        return Ok(None);
+    };
+
+    // Read the lake watermark (per-base `to_snapshot`) from the current
+    // snapshot's provenance. An absent provenance record is treated as "no lake
+    // watermark yet" — conservatively advance so the lake starts carrying it.
+    let lake_watermark: BTreeMap<String, i64> =
+        match MvProvenanceV1::from_snapshot_summary(current_snapshot)? {
+            Some(prov) => prov
+                .bases
+                .iter()
+                .map(|base| (base.table_fqn.clone(), base.to_snapshot))
+                .collect(),
+            None => BTreeMap::new(),
+        };
+
+    // The finalized watermark is "ahead" iff any base's finalized snapshot does
+    // not already equal the lake's recorded `to_snapshot`. When they match
+    // exactly the lake already carries this watermark and there is nothing to do.
+    let watermark_is_ahead = new_base_snapshots
+        .iter()
+        .any(|(fqn, snapshot)| lake_watermark.get(fqn) != Some(snapshot));
+    if !watermark_is_ahead {
+        return Ok(None);
+    }
+
+    // Build the advanced provenance. Reuse the W3a provenance builder so the
+    // summary is a superset marker (three narrow marker keys + full record).
+    // A metadata-only refresh intent carries no staging marker, so mint a fresh
+    // marker token — the data-free snapshot commits straight to `main` and is
+    // not matched by staging->publish CAS, so only the provenance content
+    // (technique + watermark) is load-bearing.
+    let marker = MvRefreshSnapshotMarker {
+        refresh_id,
+        mv_id: mv_definition.mv_id,
+        token: uuid::Uuid::new_v4().simple().to_string(),
+    };
+    let provenance_props = build_mv_refresh_provenance(
+        &marker,
+        RefreshTechnique::MetadataOnly,
+        build_mv_refresh_provenance_bases(
+            new_base_snapshots,
+            new_base_table_uuids,
+            &mv_definition.last_refresh_snapshots,
+        ),
+        mv_definition_fingerprint(&mv_definition.select_sql),
+        // Net-zero output: the materialized row count is unchanged. Carry the
+        // MV's last recorded row count so the provenance `rows` stays truthful.
+        mv_definition.last_refresh_rows.unwrap_or(0),
+    )
+    .to_summary_properties()?;
+    let snapshot_properties: std::collections::HashMap<String, String> =
+        provenance_props.into_iter().collect();
+
+    let ident = iceberg_mv_table_ident(target)?;
+    let iceberg_catalog = Arc::clone(iceberg_catalog);
+    let new_snapshot_id = data_block_on(async move {
+        let table = iceberg_catalog
+            .load_table(&ident)
+            .await
+            .map_err(|e| format!("load mv target for data-free watermark append failed: {e}"))?;
+        let tx = iceberg::transaction::Transaction::new(&table);
+        // Data-free fast append: NO add_data_files, only the provenance summary.
+        // This advances the current snapshot while preserving existing data
+        // files. The crate transaction's commit runs the CAS/retry loop against
+        // `main` internally.
+        let action = tx
+            .fast_append()
+            .set_snapshot_properties(snapshot_properties)
+            .set_commit_uuid(uuid::Uuid::new_v4());
+        let tx = action
+            .apply(tx)
+            .map_err(|e| format!("apply data-free watermark append failed: {e}"))?;
+        let committed = tx
+            .commit(iceberg_catalog.as_ref())
+            .await
+            .map_err(|e| format!("commit data-free watermark append failed: {e}"))?;
+        committed
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id())
+            .ok_or_else(|| "data-free watermark append produced no current snapshot".to_string())
+    })??;
+
+    // Invalidate the cache so subsequent reads (the finalize's downstream
+    // consumers and the next refresh's `validate_target_snapshot`) observe the
+    // freshly-committed snapshot.
+    target_entry.invalidate_table_cache(&target.namespace, &target.table);
+
+    tracing::info!(
+        mv_id = mv_definition.mv_id,
+        refresh_id,
+        new_snapshot_id,
+        base_snapshots = ?new_base_snapshots,
+        "iceberg mv {}.{}.{}: advanced lake watermark via data-free snapshot",
+        target.catalog,
+        target.namespace,
+        target.table
+    );
+    Ok(Some(new_snapshot_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_iceberg_mv_refresh_with_metadata_update(
     state: &Arc<StandaloneState>,
@@ -15318,7 +15464,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
     }
     let is_empty_delta = !has_insert_changes && !has_delete_changes;
 
-    // 2. Empty delta: advance lineage without committing an empty Iceberg
+    // 2. Empty delta: advance lineage without committing a data-carrying Iceberg
     // snapshot. This must run before any staging-branch work.
     if is_empty_delta {
         tracing::info!(
@@ -15329,9 +15475,24 @@ fn incremental_refresh_iceberg_mv_with_changes(
             target.namespace,
             target.table
         );
-        let target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
         let refresh_id =
             begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
+        // W4/M6: the base watermark advanced but the delta is empty, so no data
+        // snapshot is committed. Advance the lake watermark with a data-free
+        // snapshot so the storage table's current-snapshot provenance keeps up
+        // with the SQLite watermark; use its id as the recorded target snapshot
+        // when committed.
+        let target_snapshot_id = advance_lake_watermark_via_data_free_snapshot(
+            target,
+            target_entry,
+            iceberg_catalog,
+            mv_definition,
+            refresh_id,
+            &snapshots,
+            &table_uuids,
+        )?
+        .map(Ok)
+        .unwrap_or_else(|| recorded_target_snapshot_id(target, mv_definition))?;
         finalize_iceberg_mv_refresh_with_partition_state(
             state,
             refresh_id,
@@ -15606,9 +15767,24 @@ fn incremental_refresh_iceberg_mv_with_changes(
         );
         drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
         abort_iceberg_mv_refresh(state, refresh_id)?;
-        let target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
         let metadata_refresh_id =
             begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
+        // W4/M6: the base watermark advanced but the MV output is net-zero, so
+        // no data snapshot is committed above. Advance the lake watermark with a
+        // data-free snapshot so the storage table's current-snapshot provenance
+        // keeps up with the SQLite watermark; use its id as the recorded target
+        // snapshot when committed.
+        let target_snapshot_id = advance_lake_watermark_via_data_free_snapshot(
+            target,
+            target_entry,
+            iceberg_catalog,
+            mv_definition,
+            metadata_refresh_id,
+            &snapshots,
+            &table_uuids,
+        )?
+        .map(Ok)
+        .unwrap_or_else(|| recorded_target_snapshot_id(target, mv_definition))?;
         finalize_iceberg_mv_refresh_with_partition_state(
             state,
             metadata_refresh_id,
@@ -19488,6 +19664,94 @@ mod tests {
         assert_eq!(mv.public_name, "mv_orders");
         assert_eq!(mv.descriptor.package_id, "analytics.mv_orders");
         assert_eq!(mv.descriptor.base_dependencies[0].name.as_str(), "orders");
+    }
+
+    /// Read the [`MvProvenanceV1`] carried by a storage table's current snapshot
+    /// summary, reloading the table fresh from the catalog. Returns `None` when
+    /// there is no current snapshot or the snapshot carries no provenance.
+    fn read_target_current_snapshot_provenance(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Option<MvProvenanceV1> {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        entry.invalidate_table_cache(namespace, table);
+        let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
+            .expect("load target table for provenance read");
+        let current = loaded.table.metadata().current_snapshot()?;
+        MvProvenanceV1::from_snapshot_summary(current).expect("parse provenance from summary")
+    }
+
+    /// Current-snapshot id of a storage table (reloaded fresh from the catalog).
+    fn read_target_current_snapshot_id(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Option<i64> {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        entry.invalidate_table_cache(namespace, table);
+        let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
+            .expect("load target table for snapshot id read");
+        loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id())
+    }
+
+    /// Count live data-file entries reachable from a storage table's current
+    /// snapshot. A data-free watermark append adds an empty manifest, so this
+    /// count is invariant across a net-zero refresh — a direct proxy for "the
+    /// MV's materialized data is unchanged" that avoids a full `SELECT *` round
+    /// trip through the pipeline.
+    fn live_target_data_file_count(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> usize {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        entry.invalidate_table_cache(namespace, table);
+        let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
+            .expect("load target table for data-file count");
+        let table = loaded.table;
+        data_block_on(async {
+            let Some(current) = table.metadata().current_snapshot() else {
+                return 0usize;
+            };
+            let manifest_list = current
+                .load_manifest_list(table.file_io(), table.metadata())
+                .await
+                .expect("load manifest list");
+            let mut count = 0usize;
+            for entry in manifest_list.entries() {
+                let manifest = entry
+                    .load_manifest(table.file_io())
+                    .await
+                    .expect("load manifest");
+                for manifest_entry in manifest.entries() {
+                    if manifest_entry.is_alive()
+                        && manifest_entry.data_file().content_type()
+                            == iceberg::spec::DataContentType::Data
+                    {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        })
+        .expect("count live target data files")
     }
 
     /// Delete an MV's SQLite definition WITHOUT dropping its lake storage table.
@@ -23730,6 +23994,169 @@ mod tests {
             .list_unfinished_branch_staged_iceberg_refreshes(read.as_ref())
             .expect("branch staged scan");
         assert!(unfinished.is_empty());
+    }
+
+    /// M6: a refresh that advances the base watermark but yields zero net MV
+    /// rows (the inserted rows are filtered out by the MV's WHERE) must still
+    /// advance the MV's *lake* watermark — i.e. the storage table's current
+    /// snapshot must carry provenance whose `to_snapshot` equals the new base
+    /// snapshot. Otherwise, after a cluster rebuild (drop SQLite + rebuild from
+    /// lake) the recovered watermark would be stale and the MV would redundantly
+    /// re-scan the net-zero delta.
+    ///
+    /// This is a freshness/redundant-rescan refinement: the MV data itself is
+    /// correct with or without the fix. The test asserts (1) the storage table's
+    /// current snapshot advanced, (2) its provenance is a MetadataOnly technique
+    /// whose watermark equals the new base snapshot, (3) the materialized data is
+    /// unchanged (live data-file count invariant + SQLite row count unchanged),
+    /// and (4) a lake rebuild recovers the ADVANCED watermark.
+    #[test]
+    fn net_zero_output_refresh_advances_lake_watermark_via_data_free_snapshot() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        // Base starts with one row the MV keeps (id=200 > 100).
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(200, "keep")]);
+        create_mv_with_select_only(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "mv_orders",
+            "SELECT id, name FROM ice.sales.orders WHERE id > 100",
+        );
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first refresh materializes the kept row");
+
+        // State after the materializing refresh: this is the pre-net-zero
+        // baseline for both the lake watermark and the materialized data.
+        let after_first =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+                .expect("mv definition present after first refresh");
+        let base_snapshot_after_first = *after_first
+            .last_refresh_snapshots
+            .get("ice.sales.orders")
+            .expect("base watermark recorded after first refresh");
+        let target_snapshot_before_net_zero =
+            read_target_current_snapshot_id(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+                .expect("target has a current snapshot after first refresh");
+        let provenance_before_net_zero = read_target_current_snapshot_provenance(
+            &env.state,
+            "ice",
+            "analytics",
+            "__nr_mv_mv_orders",
+        )
+        .expect("target snapshot carries provenance after first refresh");
+        assert_eq!(
+            provenance_before_net_zero
+                .bases
+                .iter()
+                .find(|base| base.table_fqn == "ice.sales.orders")
+                .map(|base| base.to_snapshot),
+            Some(base_snapshot_after_first),
+            "lake watermark should match SQLite watermark after the first refresh"
+        );
+        let data_files_before =
+            live_target_data_file_count(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
+        assert_eq!(
+            data_files_before, 1,
+            "the kept row should have produced exactly one materialized data file"
+        );
+
+        // Advance the base with rows the MV FILTERS OUT (id=1,2 are <= 100), so
+        // the base watermark advances but the MV output is net-zero. This inserts
+        // real data files (base advances) that the WHERE removes, exercising the
+        // post-execution empty-delta short-circuit.
+        insert_into_iceberg_table(
+            &env.state,
+            "ice",
+            "sales",
+            "orders",
+            &[(1, "miss"), (2, "miss")],
+        );
+        let base_snapshot_after_net_zero_insert =
+            read_target_current_snapshot_id(&env.state, "ice", "sales", "orders")
+                .expect("base has a current snapshot after net-zero insert");
+        assert_ne!(
+            base_snapshot_after_net_zero_insert, base_snapshot_after_first,
+            "the net-zero insert must have produced a new base snapshot"
+        );
+
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("net-zero-output incremental refresh");
+
+        // (1) SQLite watermark advanced to the new base snapshot.
+        let after_net_zero =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+                .expect("mv definition present after net-zero refresh");
+        assert_eq!(
+            after_net_zero
+                .last_refresh_snapshots
+                .get("ice.sales.orders"),
+            Some(&base_snapshot_after_net_zero_insert),
+            "SQLite watermark should advance to the new base snapshot"
+        );
+
+        // (2) The storage table's current snapshot ADVANCED, and its provenance
+        // carries the MetadataOnly technique with the advanced base watermark.
+        let target_snapshot_after_net_zero =
+            read_target_current_snapshot_id(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+                .expect("target has a current snapshot after net-zero refresh");
+        assert_ne!(
+            target_snapshot_after_net_zero, target_snapshot_before_net_zero,
+            "the storage table's current snapshot must advance via a data-free snapshot"
+        );
+        let provenance_after_net_zero = read_target_current_snapshot_provenance(
+            &env.state,
+            "ice",
+            "analytics",
+            "__nr_mv_mv_orders",
+        )
+        .expect("advanced target snapshot carries provenance");
+        assert_eq!(
+            provenance_after_net_zero.technique,
+            RefreshTechnique::MetadataOnly,
+            "net-zero watermark advance should be stamped as MetadataOnly"
+        );
+        assert_eq!(
+            provenance_after_net_zero
+                .bases
+                .iter()
+                .find(|base| base.table_fqn == "ice.sales.orders")
+                .map(|base| base.to_snapshot),
+            Some(base_snapshot_after_net_zero_insert),
+            "lake watermark (current-snapshot provenance) must advance to the new base snapshot"
+        );
+
+        // (3) The materialized data is unchanged: no data files added or removed,
+        // and SQLite's recorded row count is unchanged.
+        let data_files_after =
+            live_target_data_file_count(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
+        assert_eq!(
+            data_files_after, data_files_before,
+            "a data-free watermark snapshot must not add or remove materialized data files"
+        );
+        assert_eq!(
+            after_net_zero.last_refresh_rows, after_first.last_refresh_rows,
+            "net-zero refresh must not change the MV's recorded row count"
+        );
+
+        // (4) Statelessness tie-in: drop the SQLite definition and rebuild purely
+        // from the lake. The rebuilt watermark must be the ADVANCED one (read from
+        // the data-free snapshot's provenance), not the pre-net-zero watermark.
+        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
+        crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(&env.state)
+            .expect("rebuild imv cache from lake");
+        let rebuilt =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+                .expect("mv definition reappears after rebuild");
+        assert_eq!(
+            rebuilt.last_refresh_snapshots.get("ice.sales.orders"),
+            Some(&base_snapshot_after_net_zero_insert),
+            "rebuilt watermark must be the advanced one, proving the lake carries it"
+        );
+        assert_eq!(
+            rebuilt.last_refresh_snapshots, after_net_zero.last_refresh_snapshots,
+            "rebuilt watermark must round-trip the SQLite watermark exactly"
+        );
     }
 
     #[test]
