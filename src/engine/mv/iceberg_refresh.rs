@@ -90,6 +90,18 @@ pub(crate) struct IcebergMvTarget {
     pub(crate) table: String,
 }
 
+pub(crate) const NR_MV_STORAGE_PREFIX: &str = "__nr_mv_";
+
+pub(crate) fn nr_mv_storage_name(user_name: &str) -> String {
+    format!("{NR_MV_STORAGE_PREFIX}{user_name}")
+}
+
+pub(crate) fn nr_mv_public_name(storage_name: &str) -> Option<String> {
+    storage_name
+        .strip_prefix(NR_MV_STORAGE_PREFIX)
+        .map(str::to_string)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum IcebergMvRefreshExecutionError {
     PreCommit(String),
@@ -147,7 +159,13 @@ pub(crate) fn create_iceberg_mv(
     current_database: &str,
     stmt: &CreateMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    let target = resolve_iceberg_mv_target(state, current_catalog, current_database, stmt)?;
+    let mut target = resolve_iceberg_mv_target(state, current_catalog, current_database, stmt)?;
+    if target.table.starts_with(NR_MV_STORAGE_PREFIX) {
+        return Err(format!(
+            "materialized view name must not start with reserved prefix `{NR_MV_STORAGE_PREFIX}`"
+        ));
+    }
+    target.table = nr_mv_storage_name(&target.table);
     let entry = {
         let catalogs = state
             .iceberg_catalogs
@@ -18285,9 +18303,12 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-                .expect("load target table");
+        let loaded = crate::connector::iceberg::catalog::load_table(
+            &entry,
+            "analytics",
+            "__nr_mv_mv_orders",
+        )
+        .expect("load target table");
         assert_eq!(
             loaded.table.metadata().format_version(),
             iceberg::spec::FormatVersion::V3
@@ -18323,7 +18344,7 @@ mod tests {
         assert_eq!(apply_key_field.id, 3);
         assert!(apply_key_field.required);
         assert_eq!(
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
                 .expect("mv definition")
                 .schema_contract
                 .expect("schema contract")
@@ -18353,9 +18374,12 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-                .expect("load target table");
+        let loaded = crate::connector::iceberg::catalog::load_table(
+            &entry,
+            "analytics",
+            "__nr_mv_mv_orders",
+        )
+        .expect("load target table");
         let spec = loaded.table.metadata().default_partition_spec();
         assert_eq!(spec.spec_id(), 0);
         let fields = spec.fields();
@@ -18366,8 +18390,9 @@ mod tests {
         assert_eq!(fields[1].name, "name_truncate_8");
         assert_eq!(fields[1].source_id, 2);
         assert_eq!(fields[1].transform, iceberg::spec::Transform::Truncate(8));
-        let definition = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
-            .expect("mv definition");
+        let definition =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+                .expect("mv definition");
         let stored_partition = definition.partition_spec.expect("stored partition spec");
         assert_eq!(stored_partition.target_spec_id, 0);
         assert_eq!(stored_partition.fields.len(), 2);
@@ -20690,22 +20715,22 @@ mod tests {
         crate::engine::mv_flow::create_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect("create iceberg mv through ddl");
 
-        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
             .expect("mv relationship");
         assert_eq!(mv.select_sql, "SELECT id, name FROM ice.sales.orders");
         assert_eq!(mv.target_catalog.as_deref(), Some("ice"));
         assert_eq!(mv.target_namespace.as_deref(), Some("analytics"));
-        assert_eq!(mv.target_table.as_deref(), Some("mv_orders"));
+        assert_eq!(mv.target_table.as_deref(), Some("__nr_mv_mv_orders"));
 
         let entry = {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+        crate::connector::iceberg::catalog::load_table(&entry, "analytics", "__nr_mv_mv_orders")
             .expect("target table");
         let catalog = env.state.catalog.read().expect("standalone catalog");
         catalog
-            .get("analytics", "mv_orders")
+            .get("analytics", "__nr_mv_mv_orders")
             .expect("registered target");
     }
 
@@ -20960,6 +20985,33 @@ mod tests {
     }
 
     #[test]
+    fn storage_and_public_name_mapping_round_trips() {
+        assert_eq!(nr_mv_storage_name("mv_orders"), "__nr_mv_mv_orders");
+        assert_eq!(
+            nr_mv_public_name("__nr_mv_mv_orders"),
+            Some("mv_orders".to_string())
+        );
+        assert_eq!(nr_mv_public_name("orders"), None);
+    }
+
+    #[test]
+    fn reserved_prefix_is_rejected_for_user_mv_name() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW __nr_mv_x
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id FROM ice.sales.orders",
+        );
+
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("reserved prefix must be rejected");
+
+        assert!(err.contains("__nr_mv_"), "got: {err}");
+    }
+
+    #[test]
     fn create_iceberg_mv_resolves_unqualified_base_in_current_catalog() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "analytics", "orders");
@@ -20974,7 +21026,7 @@ mod tests {
         create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect("create iceberg mv");
 
-        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
             .expect("mv relationship");
         assert_eq!(mv.base_table_refs.len(), 1);
         assert_eq!(mv.base_table_refs[0], "ice.analytics.orders");
@@ -21056,7 +21108,7 @@ mod tests {
     fn create_iceberg_mv_rejects_existing_target_table() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
-        create_base_table(&env.state, "ice", "analytics", "mv_orders");
+        create_base_table(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
         let stmt = parse_create_mv(
             "CREATE MATERIALIZED VIEW mv_orders
              DISTRIBUTED BY HASH(id) BUCKETS 1
@@ -21068,7 +21120,7 @@ mod tests {
             .expect_err("existing target should fail");
         assert_eq!(
             err,
-            "Iceberg MV target table ice.analytics.mv_orders already exists"
+            "Iceberg MV target table ice.analytics.__nr_mv_mv_orders already exists"
         );
     }
 
@@ -21099,8 +21151,12 @@ mod tests {
             catalogs.get("ice").expect("catalog")
         };
         assert!(
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-                .is_err(),
+            crate::connector::iceberg::catalog::load_table(
+                &entry,
+                "analytics",
+                "__nr_mv_mv_orders",
+            )
+            .is_err(),
             "target table should never have been created"
         );
     }
@@ -21109,13 +21165,13 @@ mod tests {
     fn create_iceberg_mv_if_not_exists_does_not_adopt_existing_target() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
-        create_base_table(&env.state, "ice", "analytics", "mv_orders");
+        create_base_table(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
         register_iceberg_mv_target_in_catalog(
             &env.state,
             &IcebergMvTarget {
                 catalog: "ice".to_string(),
                 namespace: "analytics".to_string(),
-                table: "mv_orders".to_string(),
+                table: "__nr_mv_mv_orders".to_string(),
             },
         )
         .expect("register existing target");
@@ -21131,7 +21187,7 @@ mod tests {
                 .expect_err("existing target should fail even with IF NOT EXISTS");
         assert_eq!(
             err,
-            "Iceberg MV target table ice.analytics.mv_orders already exists"
+            "Iceberg MV target table ice.analytics.__nr_mv_mv_orders already exists"
         );
     }
 
