@@ -16,6 +16,20 @@ pub struct SuiteConfig {
     pub cleanup_sql: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImvStatelessLevel {
+    Baseline,
+    Package,
+    Provenance,
+    Full,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImvStatelessDirective {
+    pub mv: String,
+    pub level: ImvStatelessLevel,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct QueryMeta {
     pub order_sensitive: Option<bool>,
@@ -52,6 +66,11 @@ pub struct QueryMeta {
     /// tables. Value is the MV name (qualified by the step/case db like
     /// wait_alter_*).
     pub imv_equivalence_check: Option<String>,
+    /// After the step SQL executes (verify mode), assert that the named MV
+    /// can be rebuilt statelessly at the requested fidelity level (default
+    /// `Package`) — i.e. its lake-native metadata is sufficient to reproduce
+    /// current contents without relying on in-process incremental state.
+    pub imv_stateless_rebuild: Option<ImvStatelessDirective>,
 }
 
 #[derive(Debug, Clone)]
