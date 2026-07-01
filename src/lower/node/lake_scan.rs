@@ -735,7 +735,7 @@ pub(crate) fn build_lake_properties(
     );
 
     let selected_s3 = crate::connector::starrocks::fs_access::common_runtime_s3_config_for_paths(
-        tablet_path_map.values().map(String::as_str),
+        tablet_paths.values().map(String::as_str),
     )?;
     if let Some(s3) = selected_s3 {
         for (k, v) in s3.to_aws_s3_properties() {
