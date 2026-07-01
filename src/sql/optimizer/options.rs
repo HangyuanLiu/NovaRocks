@@ -54,6 +54,11 @@ pub(crate) struct SessionOptimizerSettings {
     /// `optimize()` when the session has not explicitly SET a backend count.
     /// `None` means no snapshot available (fall back to profile default).
     pub effective_backend_count: Option<f64>,
+    /// Session override for `enable_global_runtime_filter_cross_exchange`
+    /// (None = built-in default, which is true). Setting false disables
+    /// placing probe runtime filters across shuffle exchanges, for bisecting
+    /// cross-fragment RF behavior.
+    pub allow_cross_exchange_rf: Option<bool>,
 }
 
 impl SessionOptimizerSettings {
@@ -185,8 +190,9 @@ impl OptimizerOptions {
         if let Some(v) = settings.rf_probe_min_selectivity {
             opts.rf_probe_min_selectivity = v;
         }
-        // `allow_cross_exchange_rf` has no session override; the default is safe
-        // because placement rejects partial partitioned RF.
+        if let Some(v) = settings.allow_cross_exchange_rf {
+            opts.allow_cross_exchange_rf = v;
+        }
         if let Some(v) = settings.enable_dp_join_reorder {
             opts.reorder.enable_dp = v;
         }
@@ -491,6 +497,17 @@ mod tests {
         let o = OptimizerOptions::from_session(&SessionOptimizerSettings::default());
         assert!(o.reorder.enable_dp);
         assert_eq!(o.reorder.max_reorder_node_use_dp, 10);
+    }
+
+    #[test]
+    fn session_can_disable_cross_exchange_rf() {
+        let mut settings = SessionOptimizerSettings::default();
+        let opts = OptimizerOptions::from_session(&settings);
+        assert!(opts.allow_cross_exchange_rf);
+
+        settings.allow_cross_exchange_rf = Some(false);
+        let opts = OptimizerOptions::from_session(&settings);
+        assert!(!opts.allow_cross_exchange_rf);
     }
 
     #[test]

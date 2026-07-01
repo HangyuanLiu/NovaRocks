@@ -1066,6 +1066,9 @@ async fn execute_statement_text(
             "cbo_enable_greedy_join_reorder" => {
                 shim.optimizer_settings.enable_greedy_join_reorder = Some(enabled)
             }
+            "enable_global_runtime_filter_cross_exchange" => {
+                shim.optimizer_settings.allow_cross_exchange_rf = Some(enabled)
+            }
             _ => return Ok(StatementResult::Ok),
         }
         return Ok(StatementResult::Ok);
