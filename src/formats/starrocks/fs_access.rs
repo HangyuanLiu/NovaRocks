@@ -52,16 +52,17 @@ impl StarRocksFormatPathAccess {
 pub(crate) struct StarRocksFormatTabletAccess {
     root_location: String,
     root_relative_path: String,
-    access: StarRocksFsAccess,
+    scheme: FsScheme,
+    operator: Operator,
 }
 
 impl StarRocksFormatTabletAccess {
     pub(crate) fn scheme(&self) -> FsScheme {
-        self.access.scheme()
+        self.scheme
     }
 
     pub(crate) fn operator(&self) -> Operator {
-        self.access.operator()
+        self.operator.clone()
     }
 
     pub(crate) fn join_relative_path(&self, rel_path: &str) -> String {
@@ -82,6 +83,21 @@ pub(crate) fn resolve_format_tablet_access(
     tablet_root_path: &str,
     object_store_profile: Option<&ObjectStoreProfile>,
 ) -> Result<StarRocksFormatTabletAccess, String> {
+    if is_literal_local_root(tablet_root_path) {
+        if object_store_profile.is_some() {
+            return Err(format!(
+                "StarRocks local path must not include object-store profile: path={tablet_root_path}"
+            ));
+        }
+        let operator = crate::fs::local::build_fs_operator("/").map_err(|e| e.to_string())?;
+        return Ok(StarRocksFormatTabletAccess {
+            root_location: "/".to_string(),
+            root_relative_path: String::new(),
+            scheme: FsScheme::Local,
+            operator,
+        });
+    }
+
     if let Some(bucket_root) = parse_bucket_root_object_store_tablet_path(tablet_root_path)? {
         // FsLocation requires a non-empty object-store path. Resolve a synthetic
         // path in the same bucket to build the operator while preserving the old
@@ -90,7 +106,8 @@ pub(crate) fn resolve_format_tablet_access(
         return Ok(StarRocksFormatTabletAccess {
             root_location: bucket_root.normalized_root,
             root_relative_path: String::new(),
-            access,
+            scheme: access.scheme(),
+            operator: access.operator(),
         });
     }
 
@@ -100,7 +117,8 @@ pub(crate) fn resolve_format_tablet_access(
     Ok(StarRocksFormatTabletAccess {
         root_location,
         root_relative_path,
-        access,
+        scheme: access.scheme(),
+        operator: access.operator(),
     })
 }
 
@@ -108,6 +126,10 @@ pub(crate) fn operator_relative_path_for_tablet_root(
     tablet_root_path: &str,
     rel_path: &str,
 ) -> Result<String, String> {
+    if is_literal_local_root(tablet_root_path) {
+        return Ok(rel_path.trim_start_matches('/').to_string());
+    }
+
     if parse_bucket_root_object_store_tablet_path(tablet_root_path)?.is_some() {
         return Ok(rel_path.trim_start_matches('/').to_string());
     }
@@ -133,6 +155,10 @@ pub(crate) fn operator_relative_path_for_tablet_root(
             "StarRocks formats do not support hdfs tablet path yet: {tablet_root_path}"
         )),
     }
+}
+
+fn is_literal_local_root(tablet_root_path: &str) -> bool {
+    tablet_root_path.trim() == "/"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +309,11 @@ mod tests {
         let access = resolve_format_tablet_access("/", None).expect("resolve local root");
 
         assert_eq!(access.join_relative_path("meta/1.meta"), "/meta/1.meta");
+        assert_eq!(access.join_relative_path("data/seg.dat"), "/data/seg.dat");
+        assert_eq!(
+            access.operator_relative_path("data/seg.dat"),
+            "data/seg.dat"
+        );
     }
 
     #[test]
@@ -340,6 +371,20 @@ mod tests {
             .operator_relative_path("data/seg.dat");
 
         assert_eq!(parse_only, resolved);
+        assert_eq!(parse_only, "data/seg.dat");
+    }
+
+    #[test]
+    fn local_root_tablet_access_rejects_object_store_profile() {
+        let profile = ObjectStoreProfile::from_s3_store_config(&sample_s3_config())
+            .expect("build object-store profile");
+        let err = resolve_format_tablet_access("/", Some(&profile))
+            .expect_err("local root must reject object-store profile");
+
+        assert!(
+            err.contains("local path must not include object-store profile"),
+            "err={err}"
+        );
     }
 
     #[test]
