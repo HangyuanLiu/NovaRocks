@@ -2,7 +2,7 @@
 //! Single / Local / Global / DistinctLocal / DistinctGlobal.
 
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::operator::{AggMode, AggregateOutputLayout, PhysicalHashAggregateOp};
+use crate::sql::optimizer::operator::{AggMode, PhysicalHashAggregateOp};
 use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 use crate::sql::optimizer::scalar::ScalarArena;
 
@@ -89,6 +89,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::AggregateOutputLayout;
     use crate::sql::optimizer::property::HashSource;
     use crate::sql::optimizer::scalar::ScalarId;
 

@@ -7,9 +7,9 @@ use crate::sql::codegen::scalar_materialize::{
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
-    AggregateOutputLayout, AggregateStateMergeOp, DecodeOp, GenerateSeriesOp, Operator,
-    PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp,
-    ProjectOp, RepeatOp, TableFunctionOp, WindowOp,
+    AggregateStateMergeOp, DecodeOp, GenerateSeriesOp, Operator, PhysicalDistributionOp,
+    PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp,
+    TableFunctionOp, WindowOp,
 };
 use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
 use crate::sql::optimizer::property::DistributionSpec;
@@ -608,7 +608,8 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::optimizer::operator::{
-        AggMode, CTEConsumeOp, PhysicalHashAggregateOp, ProjectOp, RepeatOp, ValuesOp,
+        AggMode, AggregateOutputLayout, CTEConsumeOp, PhysicalHashAggregateOp, ProjectOp, RepeatOp,
+        ValuesOp,
     };
     use crate::sql::optimizer::physical_tree::{PlanExecutionProps, attach_scalar_arena};
     use crate::sql::optimizer::scalar::ScalarArena;
@@ -820,7 +821,7 @@ mod tests {
             order_by: vec![],
             output_column_id: aggregate_output_id,
         }];
-        let mut aggregate = PhysicalPlanNode {
+        let mut aggregate = OptimizerPhysicalNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: intern_exprs(&mut scalars, &[column_ref(input_id, "a")]),
