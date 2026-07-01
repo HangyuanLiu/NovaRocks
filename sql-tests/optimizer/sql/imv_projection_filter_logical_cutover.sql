@@ -53,16 +53,17 @@ INSERT INTO imv_pf_cut_${uuid0}.ns_${uuid0}.orders VALUES (4, 7);
 -- @result_contains=LEFT OUTER JOIN
 -- @result_contains=predicate: v2 > 0
 -- @result_contains=__nova_base_row_id
+-- @result_not_contains=source:
 EXPLAIN REFRESH MATERIALIZED VIEW pf_mv_${uuid0};
 
 -- query 5
--- VERBOSE should include the same refresh plan shape. EXPLAIN VERBOSE REFRESH
--- currently renders the refresh plan without per-node stats.
+-- VERBOSE should include the same refresh plan shape plus refresh source detail.
 -- @skip_result_check=true
 -- @result_contains=LEFT OUTER JOIN
 -- @result_contains=predicate: v2 > 0
 -- @result_contains=__nova_base_row_id
--- @result_not_contains=stats={rows=
+-- @result_contains=source: IcebergDeltaTable
+-- @result_contains=source: IcebergMvTargetLocator
 EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW pf_mv_${uuid0};
 
 -- query 6
