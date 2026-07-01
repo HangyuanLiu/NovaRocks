@@ -5596,7 +5596,9 @@ mod tests {
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
     use crate::sql::planner::plan::{AggregateCall, PhysicalPlanKind};
-    use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::{
+        JoinExecutionMode, PhysicalPlanStats, PlannerConfidence, WiredRuntimeFilterBuild,
+    };
     use crate::thrift::plan_nodes::TPlanNodeType;
 
     fn build_distributed_plan(plan: &OptimizerPhysicalNode) -> Result<DistributedPlan, String> {
@@ -6115,6 +6117,61 @@ mod tests {
         let hash_join = plan_node.hash_join_node.expect("hash join node");
         assert_eq!(hash_join.eq_join_conjuncts.len(), 1);
         assert!(hash_join.other_join_conjuncts.is_none());
+    }
+
+    #[test]
+    fn right_semi_hash_join_lowers_runtime_filter_on_execution_build_side() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let (_, _, left_key, right_key, left_scope, right_scope) =
+            hash_join_test_inputs(&mut state);
+        state.fragment_stack.push(0);
+
+        let op = PhysicalHashJoinNode {
+            join_type: JoinKind::RightSemi,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: left_key.clone(),
+                right: right_key.clone(),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+            execution_mode: None,
+            build_runtime_filters: Vec::new(),
+        };
+        let runtime_filter = WiredRuntimeFilterBuild {
+            filter_id: 17,
+            build_expr: right_key,
+            probe_expr: left_key,
+            expr_order: 0,
+            execution_mode: JoinExecutionMode::Broadcast,
+            source_fragment_id: 0,
+            target_fragment_ids: vec![0],
+        };
+
+        let hash_join = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_hash_join(
+                10,
+                &[1],
+                &[2],
+                &op,
+                left_scope,
+                right_scope,
+                None,
+                &[runtime_filter],
+            )
+            .expect("lower right semi hash join")
+            .0
+            .hash_join_node
+            .expect("hash join payload")
+        };
+        let filters = hash_join
+            .build_runtime_filters
+            .expect("right semi RF should lower to thrift");
+
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].filter_id, Some(17));
     }
 
     fn cte_receive_distributed_plan_for_lowering_test(
