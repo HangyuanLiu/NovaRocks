@@ -532,6 +532,14 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::Optimi
                     if !options.is_enabled(rule.name()) {
                         continue;
                     }
+                    if should_skip_single_dedup_implementation(
+                        rule.name(),
+                        &expr.op,
+                        memo,
+                        group_id,
+                    ) {
+                        continue;
+                    }
                     if rule.matches(&expr.op) {
                         let application_key = (
                             group_id,
@@ -584,6 +592,38 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::Optimi
     }
 }
 
+fn should_skip_single_dedup_implementation(
+    rule_name: &str,
+    op: &Operator,
+    memo: &Memo,
+    group_id: usize,
+) -> bool {
+    rule_name == "AggToHashAgg"
+        && is_single_pure_group_dedup(op)
+        && memo.groups[group_id]
+            .logical_exprs
+            .iter()
+            .any(|expr| is_split_global_aggregate(&expr.op))
+}
+
+fn is_single_pure_group_dedup(op: &Operator) -> bool {
+    matches!(
+        op,
+        Operator::LogicalAggregate(agg)
+            if agg.stage == operator::AggStage::Single
+                && !agg.group_by.is_empty()
+                && agg.aggregates.is_empty()
+    )
+}
+
+fn is_split_global_aggregate(op: &Operator) -> bool {
+    matches!(
+        op,
+        Operator::LogicalAggregate(agg)
+            if agg.stage == operator::AggStage::Global && agg.is_split
+    )
+}
+
 /// Shallow equality check for operators (structural comparison via Debug format).
 ///
 /// This is conservative: two operators are equal only if their Debug
@@ -599,7 +639,9 @@ mod is_known_rule_name_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::sql::optimizer::memo::{MExpr, Memo};
-    use crate::sql::optimizer::operator::{LimitOp, Operator, ValuesOp};
+    use crate::sql::optimizer::operator::{
+        AggMode, AggregateOutputLayout, LimitOp, LogicalAggregateOp, Operator, ValuesOp,
+    };
     use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 
     #[test]
@@ -719,6 +761,43 @@ mod is_known_rule_name_tests {
         }
     }
 
+    fn pure_group_dedup_aggregate(memo: &mut Memo, child: usize) -> MExpr {
+        let key_id = crate::sql::column_id::ColumnId::new_for_test(9001);
+        let key = memo.scalars.intern(
+            crate::sql::optimizer::scalar::ScalarNode::ColumnRef(key_id),
+            arrow::datatypes::DataType::Int32,
+            false,
+        );
+        let output = crate::sql::analysis::OutputColumn {
+            column_id: key_id,
+            name: "k".to_string(),
+            data_type: arrow::datatypes::DataType::Int32,
+            nullable: false,
+            is_internal: false,
+        };
+        MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![key],
+                vec![],
+                AggregateOutputLayout::new(vec![output.clone()], vec![]),
+                vec![output],
+            )),
+            children: vec![child],
+        }
+    }
+
+    fn hash_aggregate_modes(memo: &Memo, group_id: usize) -> Vec<AggMode> {
+        memo.groups[group_id]
+            .physical_exprs
+            .iter()
+            .filter_map(|expr| match &expr.op {
+                Operator::PhysicalHashAggregate(op) => Some(op.mode),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn implement_applies_allocating_rule_once_per_logical_expression() {
         let mut memo = Memo::new();
@@ -758,6 +837,87 @@ mod is_known_rule_name_tests {
         assert_eq!(physical_children.len(), 2);
         assert!(physical_children.contains(&vec![child_a]));
         assert!(physical_children.contains(&vec![child_b]));
+    }
+
+    #[test]
+    fn implement_skips_single_pure_dedup_only_when_split_alternative_exists() {
+        let mut memo = Memo::new();
+        let child = logical_values_group(&mut memo);
+        let aggregate = pure_group_dedup_aggregate(&mut memo, child);
+        let root = memo.new_group(aggregate);
+        let options = options::OptimizerOptions::default_settings();
+
+        explore(
+            &mut memo,
+            &[Box::new(
+                cascades_rules::split_aggregate::SplitAggregateRule,
+            )],
+            &options,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("split aggregate exploration");
+        assert!(
+            memo.groups[root]
+                .logical_exprs
+                .iter()
+                .any(|expr| is_split_global_aggregate(&expr.op)),
+            "split aggregate rule should add a global split alternative"
+        );
+
+        implement(
+            &mut memo,
+            &[Box::new(cascades_rules::implement::AggToHashAgg)],
+            &options,
+        );
+
+        let modes = hash_aggregate_modes(&memo, root);
+        assert!(
+            !modes.contains(&AggMode::Single),
+            "single pure dedup should be suppressed when split is available"
+        );
+        assert!(
+            modes.contains(&AggMode::Global),
+            "split global aggregate should remain implementable"
+        );
+    }
+
+    #[test]
+    fn implement_keeps_single_pure_dedup_when_split_rule_disabled() {
+        let mut memo = Memo::new();
+        let child = logical_values_group(&mut memo);
+        let aggregate = pure_group_dedup_aggregate(&mut memo, child);
+        let root = memo.new_group(aggregate);
+        let mut options = options::OptimizerOptions::default_settings();
+        options.disable("SplitAggregateRule");
+
+        explore(
+            &mut memo,
+            &[Box::new(
+                cascades_rules::split_aggregate::SplitAggregateRule,
+            )],
+            &options,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("disabled split aggregate exploration");
+        assert!(
+            !memo.groups[root]
+                .logical_exprs
+                .iter()
+                .any(|expr| is_split_global_aggregate(&expr.op)),
+            "disabled SplitAggregateRule must not add a split alternative"
+        );
+
+        implement(
+            &mut memo,
+            &[Box::new(cascades_rules::implement::AggToHashAgg)],
+            &options,
+        );
+
+        let modes = hash_aggregate_modes(&memo, root);
+        assert!(
+            modes.contains(&AggMode::Single),
+            "single pure dedup remains the fallback when split is disabled"
+        );
     }
 
     #[test]
