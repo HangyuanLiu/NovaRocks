@@ -7037,13 +7037,11 @@ enable_path_style_access = true
                     .expect("load generic iceberg table metadata")
                     == false
             );
-            let storage_table =
-                crate::engine::mv::iceberg_refresh::nr_mv_storage_lookup_name("mv_orders");
             assert!(
                 engine
                     .inner
                     .mv_repo
-                    .find_by_target(read.as_ref(), "ice", "analytics", &storage_table)
+                    .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
                     .expect("find iceberg mv definition")
                     .is_some()
             );

@@ -245,8 +245,7 @@ fn build_candidate(
 }
 
 fn rewrite_candidate_public_name(target_table: &str) -> String {
-    crate::engine::mv::iceberg_refresh::nr_mv_public_name(target_table)
-        .unwrap_or_else(|| target_table.to_string())
+    target_table.to_string()
 }
 
 /// Recursively collect "cat.ns.tbl" FQNs of every Iceberg data-file scan in
@@ -381,8 +380,11 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_candidate_display_name_uses_public_mv_name() {
-        assert_eq!(rewrite_candidate_public_name("__nr_mv_agg_mv"), "agg_mv");
+    fn rewrite_candidate_display_name_uses_direct_mv_table_name() {
+        assert_eq!(
+            rewrite_candidate_public_name("__nr_mv_agg_mv"),
+            "__nr_mv_agg_mv"
+        );
         assert_eq!(rewrite_candidate_public_name("legacy_mv"), "legacy_mv");
     }
 }
