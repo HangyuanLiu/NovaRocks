@@ -285,6 +285,7 @@ fn run_rewrite_data_files_action(
 ) -> Result<MaintenanceActionOutcome, String> {
     validate_rewrite_data_files_request(request)?;
     let (catalog, table_ident, _) = build_action_catalog(state, request)?;
+    let resolved_table = table_ident.name().to_string();
     let table =
         block_on_iceberg(async { catalog.load_table(&table_ident).await })?.map_err(|e| {
             format!(
@@ -306,7 +307,7 @@ fn run_rewrite_data_files_action(
     let rewrite_target = WholeTableRewriteTarget {
         catalog: request.catalog.clone(),
         namespace: request.namespace.clone(),
-        table: request.table.clone(),
+        table: resolved_table,
         base_snapshot_id,
         job_id: None,
     };
@@ -407,17 +408,14 @@ pub(crate) fn enqueue_optimize_job(
     let Some(provider) = state.metadata_provider.as_ref() else {
         return Err("iceberg optimize requires metadata provider".to_string());
     };
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(catalog)?
-    };
-    entry.invalidate_table_cache(namespace, table);
-    let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)?;
+    let (iceberg_catalog, table_ident, _) =
+        resolve_maintenance_catalog(state, catalog, namespace, table)?;
+    let resolved_table = table_ident.name().to_string();
+    let loaded = block_on_iceberg(async move { iceberg_catalog.load_table(&table_ident).await })?
+        .map_err(|e| {
+        format!("load iceberg table {catalog}.{namespace}.{table} for optimize failed: {e}")
+    })?;
     let base_snapshot_id = loaded
-        .table
         .metadata()
         .current_snapshot()
         .map(|snapshot| snapshot.snapshot_id())
@@ -434,7 +432,7 @@ pub(crate) fn enqueue_optimize_job(
             CreateIcebergOptimizeJobRequest {
                 catalog: catalog.to_string(),
                 namespace: namespace.to_string(),
-                table: table.to_string(),
+                table: resolved_table,
                 base_snapshot_id,
                 now_ms: maintenance_now_ms(),
             },
@@ -498,6 +496,7 @@ pub(crate) fn resolve_maintenance_catalog(
     namespace: &str,
     table: &str,
 ) -> Result<MaintenanceCatalogTriple, String> {
+    let resolved_table = resolve_maintenance_table_name(state, catalog_name, namespace, table)?;
     let entry = {
         let registry = state
             .iceberg_catalogs
@@ -506,12 +505,12 @@ pub(crate) fn resolve_maintenance_catalog(
         registry.get(catalog_name)?
     };
     entry.invalidate_table_cache(namespace, table);
+    if resolved_table != table {
+        entry.invalidate_table_cache(namespace, &resolved_table);
+    }
     let object_store_config = entry.object_store_config().cloned();
     let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
-    let table_ident = TableIdent::new(
-        NamespaceIdent::new(namespace.to_string()),
-        table.to_string(),
-    );
+    let table_ident = TableIdent::new(NamespaceIdent::new(namespace.to_string()), resolved_table);
     Ok((catalog, table_ident, object_store_config))
 }
 
@@ -520,6 +519,24 @@ fn build_action_catalog(
     request: &MaintenanceActionRequest,
 ) -> Result<MaintenanceCatalogTriple, String> {
     resolve_maintenance_catalog(state, &request.catalog, &request.namespace, &request.table)
+}
+
+fn resolve_maintenance_table_name(
+    state: &Arc<StandaloneState>,
+    catalog_name: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<String, String> {
+    let backend = {
+        let connectors = state
+            .connectors
+            .read()
+            .expect("connector registry read lock");
+        connectors.catalog_backend("iceberg")?
+    };
+    backend
+        .current_schema_id_for_read(catalog_name, namespace, table)
+        .map(|(resolved_table, _schema_id)| resolved_table)
 }
 
 fn action_target(request: &MaintenanceActionRequest) -> String {

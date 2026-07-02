@@ -111,6 +111,18 @@ pub(crate) trait CatalogBackend: Send + Sync {
         table: &str,
     ) -> Result<ResolvedTable, String>;
 
+    /// Resolve a table for read/query planning. Backends may expose synthetic
+    /// read aliases here without changing strict catalog-plane `load_table`
+    /// semantics used by DDL and write paths.
+    fn load_table_for_read(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<ResolvedTable, String> {
+        self.load_table(catalog, namespace, table)
+    }
+
     fn current_schema_id(
         &self,
         _catalog: &str,
@@ -118,6 +130,22 @@ pub(crate) trait CatalogBackend: Send + Sync {
         _table: &str,
     ) -> Result<Option<i32>, String> {
         Ok(None)
+    }
+
+    /// Resolve the physical table name and schema id for read/query planning.
+    /// The returned table name may differ from the requested name for validated
+    /// read aliases, while strict catalog-plane operations keep using
+    /// `current_schema_id`.
+    fn current_schema_id_for_read(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<(String, Option<i32>), String> {
+        Ok((
+            table.to_string(),
+            self.current_schema_id(catalog, namespace, table)?,
+        ))
     }
 
     fn create_view(&self, _req: CreateViewRequest) -> Result<(), String> {

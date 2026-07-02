@@ -47,12 +47,14 @@ impl Catalog for IcebergCatalog {
 
     fn get_table_metadata(&self, namespace: &str, table: &str) -> Result<TableMetadata, String> {
         let id = TableIdentity::new(&self.name, namespace, table);
-        let current_schema_id = self
+        let (_resolved_table, current_schema_id) = self
             .backend
-            .current_schema_id(&self.name, namespace, table)?;
+            .current_schema_id_for_read(&self.name, namespace, table)?;
         self.cache
             .get_or_build_validated(&id, current_schema_id, || {
-                let resolved = self.backend.load_table(&self.name, namespace, table)?;
+                let resolved = self
+                    .backend
+                    .load_table_for_read(&self.name, namespace, table)?;
                 let td = self.source.build_schema_table_def(&resolved)?;
                 TableMetadata::from_table_def(id.clone(), &td)
             })

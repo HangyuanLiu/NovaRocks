@@ -36,7 +36,7 @@ use crate::connector::starrocks::table::mv_ddl::{
 };
 use crate::connector::starrocks::table::mv_refresh::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
-    query_result_to_chunks, run_mv_full_select_chunks, single_snapshot_map, single_table_uuid_map,
+    run_mv_full_select_chunks_with_catalog, single_snapshot_map, single_table_uuid_map,
 };
 use crate::connector::starrocks::table::mv_shape::UnionBranchKind;
 use crate::engine::mv::iceberg_target_apply::{
@@ -2678,7 +2678,12 @@ pub(crate) fn register_iceberg_mv_target_in_catalog(
         .write()
         .map_err(|e| format!("standalone catalog write lock: {e}"))?;
     catalog.create_database(&target.namespace)?;
-    catalog.register(&target.namespace, table_def)?;
+    catalog.register(&target.namespace, table_def.clone())?;
+    if let Some(public_name) = nr_mv_public_name(&target.table) {
+        let mut public_def = table_def;
+        public_def.name = public_name;
+        catalog.register(&target.namespace, public_def)?;
+    }
     Ok(())
 }
 
@@ -3194,6 +3199,7 @@ pub(crate) fn repartition_iceberg_mv(
             };
             match collect_repartition_rebuild_payload(
                 state,
+                current_catalog,
                 current_database,
                 &pinned_full_select_sql,
                 &pin,
@@ -8107,7 +8113,12 @@ fn first_refresh_iceberg_mv_with_physical_sql(
     let mv_definition = &*ctx.rewrite.mv_definition;
 
     // 1. Run SELECT and collect chunks.
-    let chunks = match run_mv_full_select_chunks(state, current_database, &physical_sql) {
+    let chunks = match run_mv_full_select_chunks_with_catalog(
+        state,
+        Some(&target.catalog),
+        current_database,
+        &physical_sql,
+    ) {
         Ok(chunks) => chunks,
         Err(err) => {
             abort_iceberg_mv_refresh(state, refresh_id)?;
@@ -8557,85 +8568,6 @@ fn build_aggregate_repartition_payload(
     Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
 }
 
-fn build_join_projection_repartition_payload(
-    state: &Arc<StandaloneState>,
-    ctx: &IcebergMvRefreshContext,
-    left_ref: &IcebergTableRef,
-    right_ref: &IcebergTableRef,
-) -> Result<RepartitionRebuildPayload, String> {
-    let JoinRefreshLogicalPlan { plan, factory, .. } =
-        build_join_full_refresh_logical_plan(state, ctx, left_ref, right_ref)?;
-    let catalog = build_iceberg_mv_planning_catalog(state, ctx)?;
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let catalogs_guard = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-    let result = crate::engine::execute_logical_plan_with_options(
-        plan,
-        factory,
-        &catalog,
-        &connectors_snapshot,
-        ctx.rewrite.current_database.as_str(),
-        state.exchange_port,
-        None,
-        None,
-        Some(&*catalogs_guard),
-        None,
-        None,
-    )?;
-    let chunks = query_result_to_chunks(result)?;
-    let chunks = strip_change_op_from_repartition_chunks(chunks)?;
-    Ok(RepartitionRebuildPayload::from_chunks(
-        chunks,
-        &ctx.rewrite.pin,
-    ))
-}
-
-fn strip_change_op_from_repartition_chunks(
-    chunks: Vec<crate::exec::chunk::Chunk>,
-) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
-    chunks
-        .into_iter()
-        .map(|chunk| {
-            let batch = strip_column_from_batch(
-                chunk.batch,
-                crate::exec::change_op::CHANGE_OP_COLUMN,
-                "join projection/filter repartition rebuild",
-            )?;
-            crate::engine::record_batch_to_chunk(batch)
-        })
-        .collect()
-}
-
-fn strip_column_from_batch(
-    batch: arrow::record_batch::RecordBatch,
-    column_name: &str,
-    context: &str,
-) -> Result<arrow::record_batch::RecordBatch, String> {
-    let schema = batch.schema();
-    let Ok(drop_index) = schema.index_of(column_name) else {
-        return Ok(batch);
-    };
-    let mut fields = schema
-        .fields()
-        .iter()
-        .map(|field| field.as_ref().clone())
-        .collect::<Vec<_>>();
-    let mut columns = batch.columns().to_vec();
-    fields.remove(drop_index);
-    columns.remove(drop_index);
-    arrow::record_batch::RecordBatch::try_new(
-        Arc::new(arrow::datatypes::Schema::new(fields)),
-        columns,
-    )
-    .map_err(|e| format!("{context}: strip column {column_name}: {e}"))
-}
-
 fn build_union_projection_repartition_payload(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -8657,7 +8589,12 @@ fn build_union_projection_repartition_payload(
         current_catalog,
         current_database,
     )?;
-    let chunks = run_mv_full_select_chunks(state, current_database, &pinned_full_select_sql)?;
+    let chunks = run_mv_full_select_chunks_with_catalog(
+        state,
+        current_catalog,
+        current_database,
+        &pinned_full_select_sql,
+    )?;
     Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
 }
 
@@ -9154,12 +9091,18 @@ struct RepartitionDefaultSpecRestore {
 
 fn collect_repartition_rebuild_payload(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     current_database: &str,
     pinned_full_select_sql: &str,
     pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
 ) -> Result<RepartitionRebuildPayload, String> {
     let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
-    let chunks = run_mv_full_select_chunks(state, current_database, &physical_sql)?;
+    let chunks = run_mv_full_select_chunks_with_catalog(
+        state,
+        current_catalog,
+        current_database,
+        &physical_sql,
+    )?;
     Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
 }
 
@@ -9409,7 +9352,12 @@ fn rebuild_iceberg_mv(
     partition_contract: Option<&crate::meta::repository::mv_contract::MvPartitionContract>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
-    let chunks = match run_mv_full_select_chunks(state, current_database, &physical_sql) {
+    let chunks = match run_mv_full_select_chunks_with_catalog(
+        state,
+        Some(&target.catalog),
+        current_database,
+        &physical_sql,
+    ) {
         Ok(chunks) => chunks,
         Err(err) => {
             abort_iceberg_mv_refresh(state, refresh_id)?;
@@ -10729,8 +10677,8 @@ fn repartition_iceberg_join_mv_overwrite(
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let mv_definition = &*ctx.rewrite.mv_definition;
-    let payload = match build_join_projection_repartition_payload(state, ctx, left_ref, right_ref) {
-        Ok(payload) => payload,
+    let ident = match iceberg_mv_table_ident(target) {
+        Ok(ident) => ident,
         Err(err) => {
             return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
                 state,
@@ -10744,19 +10692,214 @@ fn repartition_iceberg_join_mv_overwrite(
             .into());
         }
     };
-    commit_repartition_rebuild_payload(
+    let marker = match load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id) {
+        Ok(marker) => marker.to_summary_properties(),
+        Err(err) => {
+            return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
+                state,
+                refresh_id,
+                target_entry,
+                target,
+                repartition_restore.new_default_spec_id,
+                repartition_restore.old_default_spec_id,
+                err,
+            )
+            .into());
+        }
+    };
+    if let Err(err) = ensure_iceberg_mv_staging_branch(
+        iceberg_catalog,
+        target,
+        staging_branch,
+        expected_main_snapshot_id,
+    ) {
+        return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
+            state,
+            refresh_id,
+            target_entry,
+            target,
+            repartition_restore.new_default_spec_id,
+            repartition_restore.old_default_spec_id,
+            err,
+        )
+        .into());
+    }
+    let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
+        Ok(table) => table,
+        Err(err) => {
+            return Err(
+                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    Some(repartition_restore),
+                ),
+            );
+        }
+    };
+    let logical_plan = match build_join_full_refresh_logical_plan(state, ctx, left_ref, right_ref) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return Err(
+                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    Some(repartition_restore),
+                ),
+            );
+        }
+    };
+    let collector = new_iceberg_mv_commit_collector(
+        &target_table,
+        &ident,
+        staging_branch,
+        CommitOpKind::Overwrite,
+    );
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let JoinRefreshLogicalPlan {
+        plan,
+        factory,
+        change_stream: change_stream_override,
+    } = logical_plan;
+    let planned_query = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
+        plan,
+        factory,
+        &connectors_snapshot,
+    )
+    .map_err(|err| {
+        handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            refresh_id,
+            err,
+            Some(repartition_restore),
+        )
+    })?;
+    let target_backend = iceberg_mv_target_backend(target);
+    if let Err(err) = execute_imv_change_stream_write(
+        state,
+        &target_backend,
+        Arc::clone(iceberg_catalog),
+        target_table.clone(),
+        Arc::clone(&collector),
+        ImvRefreshPlannedChangeStream {
+            physical_plan: planned_query.physical_plan,
+            output_columns: planned_query.output_columns,
+            change_stream: change_stream_override.unwrap_or(planned_query.change_stream),
+            producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
+            mv_refresh_ctx: Some(ctx),
+        },
+        staging_branch,
+    ) {
+        return Err(
+            handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
+                Some(repartition_restore),
+            ),
+        );
+    }
+
+    let total_rows = collector.injected_or_appended_data_record_count();
+    let commit_outcome = match data_block_on(commit_iceberg_mv_with_populated_collector(
+        &target_table,
+        iceberg_catalog,
+        target_entry,
+        &ident,
+        Arc::clone(&collector),
+        staging_branch,
+        marker,
+    )) {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(err)) => {
+            return Err(
+                handle_iceberg_mv_commit_service_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    Some(repartition_restore),
+                ),
+            );
+        }
+        Err(err) => {
+            return Err(
+                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    Some(repartition_restore),
+                ),
+            );
+        }
+    };
+    let snapshots = ctx.rewrite.pin.to_snapshot_map();
+    let table_uuids = ctx.rewrite.pin.to_table_uuid_map();
+    record_iceberg_mv_staging_commit(
+        state,
+        refresh_id,
+        commit_outcome.new_snapshot_id,
+        total_rows,
+        table_uuids.clone(),
+    )?;
+    let published_snapshot_id = match publish_iceberg_mv_refresh(
         state,
         target,
         target_entry,
-        iceberg_catalog,
-        expected_main_snapshot_id,
         staging_branch,
+        expected_main_snapshot_id,
+        commit_outcome.new_snapshot_id,
         refresh_id,
-        mv_definition,
-        payload,
+        mv_definition.mv_id,
+    ) {
+        Ok(snapshot_id) => snapshot_id,
+        Err(err) => {
+            return Err(handle_iceberg_mv_publish_error_with_repartition_restore(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
+                Some(repartition_restore),
+            ));
+        }
+    };
+    record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
+    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
+    finalize_iceberg_mv_refresh_with_partition_contract(
+        state,
+        refresh_id,
+        total_rows,
+        snapshots,
+        table_uuids,
+        published_snapshot_id,
         partition_contract,
-        Some(repartition_restore),
-    )
+        IcebergMvPartitionStateFinalize::Clear,
+    )?;
+    Ok(StatementResult::Ok)
 }
 
 fn first_refresh_iceberg_join_mv(
@@ -11902,26 +12045,29 @@ mod join_delta_append_only_fast_path_tests {
     }
 
     #[test]
-    fn join_repartition_payload_uses_logical_full_refresh_plan() {
+    fn join_repartition_overwrite_uses_change_stream_write_path() {
         let source = std::fs::read_to_string(file!()).expect("read source");
-        let payload_body = source_between(
+        let repartition_body = source_between(
             &source,
-            "\nfn build_join_projection_repartition_payload(\n",
-            "\nfn strip_change_op_from_repartition_chunks(",
+            "\nfn repartition_iceberg_join_mv_overwrite(\n",
+            "\nfn first_refresh_iceberg_join_mv(",
         );
 
-        assert!(payload_body.contains("build_join_full_refresh_logical_plan("));
-        assert!(payload_body.contains("execute_logical_plan_with_options("));
+        assert!(repartition_body.contains("build_join_full_refresh_logical_plan("));
+        assert!(repartition_body.contains("plan_logical_for_iceberg_change_stream_refresh("));
+        assert!(repartition_body.contains("execute_imv_change_stream_write("));
+        assert!(repartition_body.contains("CommitOpKind::Overwrite"));
 
         let forbidden = [
             "rewrite_join_full_refresh_query(",
             "rewrite_join_full_refresh_apply_query(",
+            "execute_logical_plan_with_options(",
             "execute_query_with_options(",
         ];
         for token in forbidden {
             assert!(
-                !payload_body.contains(token),
-                "join repartition payload still references legacy SQL path: {token}"
+                !repartition_body.contains(token),
+                "join repartition overwrite still references legacy direct path: {token}"
             );
         }
     }
@@ -13943,8 +14089,25 @@ fn build_imv_refresh_catalog(
         )?;
         catalog.create_database(&base_ref.namespace)?;
         catalog
-            .register(&base_ref.namespace, table_def)
+            .register(&base_ref.namespace, table_def.clone())
             .map_err(|e| format!("register IMV refresh base table {}: {e}", base_ref.fqn()))?;
+        // Stored MV SQL names downstream MVs by their public name; the scan source
+        // must still carry the physical storage identity for IMV delta binding.
+        if let Some(public_name) = nr_mv_public_name(&base_ref.table) {
+            let mut public_def = table_def;
+            public_def.name = public_name.clone();
+            catalog
+                .register(&base_ref.namespace, public_def)
+                .map_err(|e| {
+                    format!(
+                        "register IMV refresh public base alias {}.{}.{} for {}: {e}",
+                        base_ref.catalog,
+                        base_ref.namespace,
+                        public_name,
+                        base_ref.fqn()
+                    )
+                })?;
+        }
     }
     Ok(catalog)
 }
@@ -16721,9 +16884,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_fact_region")
-                .expect("load aggregate mv target");
+        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_fact_region");
         let fields = loaded
             .table
             .metadata()
@@ -16767,9 +16928,7 @@ mod tests {
         let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_region")
             .expect("mv definition after aggregate incremental refresh");
         assert_eq!(mv.last_refresh_rows, Some(3));
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_fact_region")
-                .expect("reload aggregate mv target");
+        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_fact_region");
         let second_snapshot = loaded
             .table
             .metadata()
@@ -16825,12 +16984,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded = crate::connector::iceberg::catalog::load_table(
-            &entry,
-            "analytics",
-            "mv_fact_dim_region",
-        )
-        .expect("load join aggregate mv target");
+        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_fact_dim_region");
         let fields = loaded
             .table
             .metadata()
@@ -16874,12 +17028,7 @@ mod tests {
         let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_dim_region")
             .expect("mv definition after join aggregate incremental refresh");
         assert_eq!(mv.last_refresh_rows, Some(3));
-        let loaded = crate::connector::iceberg::catalog::load_table(
-            &entry,
-            "analytics",
-            "mv_fact_dim_region",
-        )
-        .expect("reload join aggregate mv target");
+        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_fact_dim_region");
         let second_snapshot = loaded
             .table
             .metadata()
@@ -17407,9 +17556,7 @@ mod tests {
             let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get(current_catalog).expect("catalog")
         };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, current_database, mv_name)
-                .expect("load UNION ALL projection/filter target");
+        let loaded = load_iceberg_mv_storage_table(&entry, current_database, mv_name);
         let mut rows = data_block_on(async {
             let scan = loaded
                 .table
@@ -17917,8 +18064,26 @@ mod tests {
         let read = provider.begin_read().expect("open read txn");
         state
             .mv_repo
-            .find_by_target(read.as_ref(), catalog, namespace, table)
+            .find_by_target(
+                read.as_ref(),
+                catalog,
+                namespace,
+                &nr_mv_storage_lookup_name(table),
+            )
             .expect("lookup mv definition")
+    }
+
+    fn load_iceberg_mv_storage_table(
+        entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+        namespace: &str,
+        table: &str,
+    ) -> crate::connector::iceberg::catalog::IcebergLoadedTable {
+        crate::connector::iceberg::catalog::load_table(
+            entry,
+            namespace,
+            &nr_mv_storage_lookup_name(table),
+        )
+        .expect("load iceberg MV storage table")
     }
 
     fn load_test_operation_for_refresh(
@@ -19048,6 +19213,31 @@ mod tests {
     }
 
     #[test]
+    fn iceberg_catalog_backend_resolves_mv_public_alias_for_read() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+
+        let backend = {
+            let connectors = env.state.connectors.read().expect("connector registry");
+            connectors
+                .catalog_backend("iceberg")
+                .expect("iceberg backend")
+        };
+        let resolved = backend
+            .load_table_for_read("ice", "analytics", "mv_orders")
+            .expect("resolve public MV alias");
+        assert_eq!(resolved.table, "__nr_mv_mv_orders");
+    }
+
+    #[test]
     fn discover_iceberg_mvs_recovers_storage_descriptor_from_lake() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
@@ -19422,9 +19612,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_sales_agg")
-                .expect("load repartitioned aggregate target");
+        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_sales_agg");
         let spec = loaded.table.metadata().default_partition_spec();
         assert_ne!(spec.spec_id(), 0);
         assert_eq!(spec.fields().len(), 1);
@@ -19510,12 +19698,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded = crate::connector::iceberg::catalog::load_table(
-            &entry,
-            "analytics",
-            "mv_orders_customers",
-        )
-        .expect("load repartitioned join target");
+        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_orders_customers");
         let spec = loaded.table.metadata().default_partition_spec();
         assert_ne!(spec.spec_id(), 0);
         assert_eq!(spec.fields().len(), 1);
@@ -19736,7 +19919,7 @@ mod tests {
         let err = crate::connector::iceberg::catalog::registry::replace_default_partition_spec_with_expected_default(
             &entry,
             "analytics",
-            "mv_orders",
+            "__nr_mv_mv_orders",
             fields,
             old_default_spec_id,
         )
@@ -19815,6 +19998,7 @@ mod tests {
                 .expect("rewrite select with pin");
         let payload = collect_repartition_rebuild_payload(
             &env.state,
+            Some("ice"),
             &env.current_db,
             &pinned_full_select_sql,
             &pin,
@@ -20378,9 +20562,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_fact_region")
-                .expect("load aggregate target table");
+        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_fact_region");
         assert_eq!(
             loaded
                 .table
@@ -20550,12 +20732,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded = crate::connector::iceberg::catalog::load_table(
-            &entry,
-            "analytics",
-            "mv_union_agg_join",
-        )
-        .expect("composed-branch CREATE must have created a target table");
+        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_union_agg_join");
         let field_names = loaded
             .table
             .metadata()
@@ -20663,9 +20840,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_union_orders")
-                .expect("load union target table");
+        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_union_orders");
         let fields = loaded
             .table
             .metadata()
@@ -21033,9 +21208,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get(catalog).expect("catalog")
         };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_union_orders")
-                .expect("load repartitioned UNION target");
+        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_union_orders");
         let spec = loaded.table.metadata().default_partition_spec();
         assert_ne!(spec.spec_id(), 0);
         assert_eq!(spec.fields().len(), 1);

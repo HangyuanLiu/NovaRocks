@@ -20,7 +20,9 @@ use crate::connector::starrocks::table::mv_refresh_strategy::{
 };
 #[cfg(test)]
 use crate::engine::mv_flow::analyze_visible_output_types;
-use crate::engine::mv_flow::{analyze_visible_query, execute_query_for_mv_refresh};
+use crate::engine::mv_flow::{
+    analyze_visible_query, execute_query_for_mv_refresh, execute_query_for_mv_refresh_with_catalog,
+};
 use crate::engine::{QueryResult, StandaloneState, StatementResult, record_batch_to_chunk};
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::chunk::Chunk;
@@ -957,12 +959,6 @@ pub(crate) struct MvRefreshContext {
     pub(crate) select_sql: String,
 }
 
-fn run_mv_select_and_chunks(ctx: MvRefreshContext) -> Result<Vec<Chunk>, String> {
-    let result: QueryResult =
-        execute_query_for_mv_refresh(&ctx.state, &ctx.database, &ctx.select_sql)?;
-    query_result_to_chunks(result)
-}
-
 fn run_projection_mv_select_and_chunks(
     ctx: MvRefreshContext,
     primary_key_columns: &[String],
@@ -1013,18 +1009,15 @@ fn hidden_primary_key_select_item(key: &str) -> Result<sqlparser::ast::SelectIte
     })
 }
 
-/// Run the MV SELECT against the base table and return the resulting chunks.
-/// Wrapper around `run_mv_select_and_chunks` for use by the iceberg refresh path.
-pub(crate) fn run_mv_full_select_chunks(
+pub(crate) fn run_mv_full_select_chunks_with_catalog(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     database: &str,
     select_sql: &str,
 ) -> Result<Vec<Chunk>, String> {
-    run_mv_select_and_chunks(MvRefreshContext {
-        state: Arc::clone(state),
-        database: database.to_string(),
-        select_sql: select_sql.to_string(),
-    })
+    let result =
+        execute_query_for_mv_refresh_with_catalog(state, current_catalog, database, select_sql)?;
+    query_result_to_chunks(result)
 }
 
 pub(crate) fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, String> {

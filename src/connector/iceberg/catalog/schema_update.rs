@@ -4047,6 +4047,18 @@ pub(crate) fn alter_table_properties(
             "ALTER TABLE TBLPROPERTIES only supports standalone iceberg catalogs".to_string(),
         );
     }
+    let target_table = {
+        let backend = {
+            let connectors = state
+                .connectors
+                .read()
+                .expect("connector registry read lock");
+            connectors.catalog_backend("iceberg")?
+        };
+        backend
+            .current_schema_id_for_read(&target.catalog, &target.namespace, &target.table)
+            .map(|(resolved_table, _schema_id)| resolved_table)?
+    };
 
     // 2. Denylist check — fail fast before any IO.
     let denied = collect_property_denylist_hits(&stmt.op);
@@ -4073,10 +4085,13 @@ pub(crate) fn alter_table_properties(
 
     // 4. Pre-commit cache invalidate.
     entry.invalidate_table_cache(&target.namespace, &target.table);
+    if target_table != target.table {
+        entry.invalidate_table_cache(&target.namespace, &target_table);
+    }
 
     let entry_for_retry = entry.clone();
     let namespace_for_retry = target.namespace.clone();
-    let table_for_retry = target.table.clone();
+    let table_for_retry = target_table;
     let op_for_retry = stmt.op.clone();
 
     let commit_result =
