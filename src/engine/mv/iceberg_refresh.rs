@@ -56,6 +56,7 @@ use crate::engine::mv::lifecycle::{
     MvTarget, RefreshError, RefreshMode, RefreshPlan,
 };
 use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
+use crate::engine::mv::recovery::{StagingDisposition, classify_staging_branch};
 use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
 use crate::engine::mv::refresh_contract::{ApplyKeyContract, ImvRefreshContract, RewriteEvidence};
 use crate::engine::mv::refresh_driver::{
@@ -6965,11 +6966,85 @@ fn record_iceberg_mv_operation_finalize_failure(
     Ok(())
 }
 
+/// Read the partition-spec id every live **data** manifest of `snapshot_id`
+/// was written under, returning `Some(spec_id)` only when they all agree.
+///
+/// NovaRocks' Iceberg writer stamps each data file (and thus its enclosing
+/// manifest) with the table's default partition-spec id *at write time*
+/// (`StagedWriteContext::from_parts` reads `default_partition_spec_id()`).
+/// Iceberg never records a per-snapshot default spec id, but the data
+/// manifests carried by a snapshot are a lake-side witness of the default
+/// spec that was in effect when that data was written. When the witness is
+/// unanimous it is an unambiguous reconstruction of the pre-repartition
+/// default spec; a data-free snapshot (no data manifests) or a snapshot whose
+/// live data manifests straddle multiple specs yields `None`, and the caller
+/// falls back to the recorded operation intent.
+///
+/// Delete manifests are ignored: they may target a different spec than the
+/// default and are irrelevant to the default-spec question.
+fn data_manifest_unanimous_partition_spec_id(
+    table: &iceberg::table::Table,
+    snapshot_id: i64,
+) -> Result<Option<i32>, String> {
+    use iceberg::spec::ManifestContentType;
+
+    let metadata = table.metadata();
+    let Some(snapshot) = metadata.snapshot_by_id(snapshot_id) else {
+        return Ok(None);
+    };
+    let file_io = table.file_io().clone();
+    let manifest_list = crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
+        snapshot.load_manifest_list(&file_io, metadata).await
+    })
+    .map_err(|e| {
+        format!(
+            "load manifest list for pre-repartition spec reconstruction (snapshot {snapshot_id}) failed: {e}"
+        )
+    })?
+    .map_err(|e| {
+        format!(
+            "load manifest list for pre-repartition spec reconstruction (snapshot {snapshot_id}) failed: {e}"
+        )
+    })?;
+    let mut witnessed: Option<i32> = None;
+    for manifest in manifest_list.entries() {
+        if manifest.content != ManifestContentType::Data {
+            continue;
+        }
+        match witnessed {
+            None => witnessed = Some(manifest.partition_spec_id),
+            Some(seen) if seen == manifest.partition_spec_id => {}
+            // Live data manifests straddle multiple specs: not an
+            // unambiguous witness of a single pre-repartition default spec.
+            Some(_) => return Ok(None),
+        }
+    }
+    Ok(witnessed)
+}
+
+/// Restore the target table's default partition spec after a repartition
+/// rollback, preferring a lake-reconstructed pre-repartition spec id.
+///
+/// The rollback target is the default spec that was in effect *before* the
+/// repartition set it to `intent.target_new_default_spec_id`. `reference_snapshot_id`
+/// is the lake witness for that pre-repartition state — the staging snapshot's
+/// parent on a Diverged rollback, or `main`'s (unmoved) current snapshot when
+/// the staging branch is already gone — whose data manifests were stamped with
+/// the old default spec id. When that witness is unanimous we restore to it;
+/// otherwise we fall back to `intent.old_partition_contract.target_spec_id`
+/// from the recorded operation intent (documented fallback for data-free or
+/// mixed-spec witnesses).
+///
+/// The recorded intent is still the source for *whether* a repartition needs
+/// restoring at all (`old_partition_contract` present) and the guard value
+/// (`target_new_default_spec_id`); only the restore-target spec id is now
+/// lake-first.
 fn restore_repartition_default_spec_from_intent(
     target: &IcebergMvTarget,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     table: &iceberg::table::Table,
     intent: &MvRepartitionOperationIntent,
+    reference_snapshot_id: Option<i64>,
 ) -> Result<(), String> {
     let Some(old_contract) = intent.old_partition_contract.as_ref() else {
         return Ok(());
@@ -6978,16 +7053,26 @@ fn restore_repartition_default_spec_from_intent(
     if current_default_spec_id != intent.target_new_default_spec_id {
         return Ok(());
     }
+    let restore_spec_id = match reference_snapshot_id {
+        Some(reference_snapshot_id) => {
+            data_manifest_unanimous_partition_spec_id(table, reference_snapshot_id)?
+                // Fallback: the witness snapshot carries no unanimous data-manifest
+                // spec (data-free or mixed-spec history), so the lake cannot prove the
+                // pre-repartition default. Use the recorded intent instead.
+                .unwrap_or(old_contract.target_spec_id)
+        }
+        // No lake witness available (e.g. staging branch already gone and main
+        // never moved onto a data snapshot): fall back to the recorded intent.
+        None => old_contract.target_spec_id,
+    };
     crate::connector::iceberg::catalog::registry::set_default_partition_spec_id(
         entry,
         &target.namespace,
         &target.table,
         intent.target_new_default_spec_id,
-        old_contract.target_spec_id,
+        restore_spec_id,
     )
-    .map_err(|e| {
-        format!("restore iceberg MV repartition default spec from recovery intent failed: {e}")
-    })
+    .map_err(|e| format!("restore iceberg MV repartition default spec on rollback failed: {e}"))
     .map(|_| ())
 }
 
@@ -6997,13 +7082,77 @@ fn restore_repartition_default_spec_from_recovery_intent(
     target: &IcebergMvTarget,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     table: &iceberg::table::Table,
+    reference_snapshot_id: Option<i64>,
 ) -> Result<(), String> {
     let Some(intent) = load_repartition_operation_intent_for_recovery(state, refresh)? else {
         return Ok(());
     };
-    restore_repartition_default_spec_from_intent(target, entry, table, &intent)
+    restore_repartition_default_spec_from_intent(
+        target,
+        entry,
+        table,
+        &intent,
+        reference_snapshot_id,
+    )
 }
 
+/// Walk `main`'s snapshot lineage from `current_snapshot()` back through parent
+/// links, returning the reachable snapshot ids with `result[0]` == main's
+/// current snapshot. Returns `[]` when the table has no current snapshot.
+///
+/// This is the lake-side `main_ancestors` input to
+/// [`crate::engine::mv::recovery::classify_staging_branch`]: the storage
+/// table's own parent chain is the source of truth for whether a staging
+/// snapshot was ever published, independent of any SQLite ledger state.
+fn main_ancestor_snapshot_ids(table: &iceberg::table::Table) -> Vec<i64> {
+    let metadata = table.metadata();
+    let mut ancestors = Vec::new();
+    let mut cursor = metadata.current_snapshot().map(|s| s.snapshot_id());
+    while let Some(snapshot_id) = cursor {
+        ancestors.push(snapshot_id);
+        cursor = metadata
+            .snapshot_by_id(snapshot_id)
+            .and_then(|snapshot| snapshot.parent_snapshot_id());
+    }
+    ancestors
+}
+
+/// Converge a single unfinished MV refresh against the MV table's lake
+/// state, using the staging-branch snapshot's lineage — NOT the SQLite
+/// ledger's `state`/`expected_main`/`staging` fields — as the reference.
+///
+/// The ledger row is treated only as a non-authoritative hint of *which*
+/// staging branch belongs to this refresh (via `refresh.staging_branch` and
+/// `refresh.marker`). Every convergence decision comes from the lake:
+///
+/// * If the staging branch still exists in `refs()`, we read its snapshot id,
+///   build `main`'s ancestor chain, and classify with
+///   [`crate::engine::mv::recovery::classify_staging_branch`]:
+///   - `PublishedCurrent` / `Superseded` — the staged snapshot is `main` or a
+///     `main` ancestor, so the publish landed: record the publish (idempotent),
+///     drop the staging branch, and finalize. `main` and the watermark are left
+///     as the lake already has them.
+///   - `Diverged` — the staged snapshot never became `main`: roll back by
+///     dropping the staging branch (its data becomes Iceberg-GC orphan) and
+///     abort the ledger row so the next refresh redoes the work.
+///   - `Err` — `main` is on the staged snapshot id but its marker does not
+///     match, i.e. an external writer moved `main` (sole-writer invariant
+///     violation). Under lake-native convergence the staged snapshot is a
+///     deterministic witness (published or diverged), so there is no unknown
+///     commit outcome to recover: this is a hard fail-loud error, not a
+///     commit-unknown state.
+/// * If the staging branch is already gone, there is no lineage to classify.
+///   We fall back to a lake check on `main`: when `main`'s current snapshot
+///   carries this refresh's marker the publish landed and we finalize;
+///   otherwise the refresh never landed and we abort (restoring any repartition
+///   default-spec first).
+///
+/// Repartition rollback restores the pre-repartition default spec by
+/// reconstructing it from the lake — the pre-repartition snapshot's data
+/// manifests witness the old default spec id — and only falls back to the
+/// recorded operation intent when the lake witness is unavailable. The
+/// partition-contract replay on finalize still reads its payload from the
+/// recorded intent.
 fn reconcile_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     refresh: StoredMvRefresh,
@@ -7012,159 +7161,158 @@ fn reconcile_iceberg_mv_refresh(
     _catalog: &Arc<dyn iceberg::Catalog>,
     table: &iceberg::table::Table,
 ) -> Result<(), String> {
-    let main = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+    if matches!(
+        refresh.state,
+        MvRefreshState::Finalized | MvRefreshState::Aborted
+    ) {
+        return Ok(());
+    }
+
     let staging_branch = refresh
         .staging_branch
         .as_deref()
         .ok_or_else(|| format!("mv refresh {} missing staging branch", refresh.refresh_id))?;
-    let staging = table
+    let staging_snapshot_id = table
         .metadata()
         .refs()
         .get(staging_branch)
         .map(|r| r.snapshot_id);
 
-    match refresh.state {
-        MvRefreshState::IntentCreated => {
-            if main == refresh.expected_main_snapshot_id {
-                match staging {
-                    None => {
-                        restore_repartition_default_spec_from_recovery_intent(
-                            state, &refresh, target, entry, table,
-                        )?;
-                        mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)?;
-                        Ok(())
-                    }
-                    Some(staging_snapshot_id)
-                        if snapshot_id_matches_refresh_marker(
-                            table,
-                            staging_snapshot_id,
-                            &refresh,
-                        )? =>
-                    {
-                        restore_repartition_default_spec_from_recovery_intent(
-                            state, &refresh, target, entry, table,
-                        )?;
-                        drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
-                        mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)?;
-                        Ok(())
-                    }
-                    _ => mark_iceberg_mv_refresh_recovery_commit_unknown(
+    match staging_snapshot_id {
+        Some(staging_snapshot_id) => {
+            let main_ancestors = main_ancestor_snapshot_ids(table);
+            let marker_matches =
+                snapshot_id_matches_refresh_marker(table, staging_snapshot_id, &refresh)?;
+            match classify_staging_branch(&main_ancestors, staging_snapshot_id, marker_matches) {
+                Ok(StagingDisposition::PublishedCurrent | StagingDisposition::Superseded) => {
+                    converge_published_iceberg_mv_staging_branch(
                         state,
                         &refresh,
-                        format!(
-                            "iceberg MV refresh {} intent recovery could not prove commit outcome",
-                            refresh.refresh_id
-                        ),
-                    ),
+                        target,
+                        entry,
+                        staging_branch,
+                        staging_snapshot_id,
+                    )
                 }
-            } else {
-                mark_iceberg_mv_refresh_recovery_commit_unknown(
+                Ok(StagingDisposition::Diverged) => rollback_iceberg_mv_staging_branch(
                     state,
                     &refresh,
-                    format!(
-                        "iceberg MV refresh {} intent recovery found main changed externally",
-                        refresh.refresh_id
-                    ),
-                )
-            }
-        }
-        MvRefreshState::StagingCommitted => {
-            if main == refresh.expected_main_snapshot_id
-                && staging.is_none()
-                && refresh.staging_snapshot_id.is_some()
-            {
-                restore_repartition_default_spec_from_recovery_intent(
-                    state, &refresh, target, entry, table,
-                )?;
-                mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)?;
-                return Ok(());
-            }
-            if main == refresh.expected_main_snapshot_id
-                && staging == refresh.staging_snapshot_id
-                && refresh
-                    .staging_snapshot_id
-                    .map(|snapshot_id| {
-                        snapshot_id_matches_refresh_marker(table, snapshot_id, &refresh)
-                    })
-                    .transpose()?
-                    == Some(true)
-            {
-                restore_repartition_default_spec_from_recovery_intent(
-                    state, &refresh, target, entry, table,
-                )?;
-                drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
-                mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)?;
-                return Ok(());
-            }
-            if main == refresh.staging_snapshot_id
-                && refresh
-                    .staging_snapshot_id
-                    .map(|snapshot_id| {
-                        snapshot_id_matches_refresh_marker(table, snapshot_id, &refresh)
-                    })
-                    .transpose()?
-                    == Some(true)
-            {
-                record_iceberg_mv_publish_commit(
-                    state,
-                    refresh.refresh_id,
-                    refresh.staging_snapshot_id.ok_or_else(|| {
-                        format!("mv refresh {} missing staging snapshot", refresh.refresh_id)
-                    })?,
-                )?;
-                if staging.is_some() {
-                    drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
-                }
-                finalize_recovered_iceberg_mv_refresh(state, &refresh)?;
-                return Ok(());
-            }
-            mark_iceberg_mv_refresh_recovery_commit_unknown(
-                state,
-                &refresh,
-                format!(
-                    "iceberg MV refresh {} staging recovery could not prove commit outcome",
-                    refresh.refresh_id
+                    target,
+                    entry,
+                    table,
+                    staging_branch,
+                    staging_snapshot_id,
                 ),
-            )?;
-            Ok(())
-        }
-        MvRefreshState::PublishCommitted => {
-            let published_snapshot_id =
-                recovered_published_snapshot_id(&refresh).ok_or_else(|| {
-                    format!(
-                        "mv refresh {} missing published snapshot",
-                        refresh.refresh_id
-                    )
-                })?;
-            if main == Some(published_snapshot_id)
-                && snapshot_id_matches_refresh_marker(table, published_snapshot_id, &refresh)?
-            {
-                if staging.is_some() {
-                    drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
-                }
-                finalize_recovered_iceberg_mv_refresh(state, &refresh)?;
-                return Ok(());
+                // The classifier's only `Err` is the sole-writer violation:
+                // `main` is on the staged snapshot id but its refresh marker
+                // does not match, meaning an external writer moved `main`.
+                // Under lake-native convergence the staged snapshot is a
+                // deterministic witness (on `main`'s lineage = published, off
+                // it = diverged), so there is no "unknown commit outcome" to
+                // recover — this is a hard fail-loud invariant breach, not a
+                // commit-unknown state.
+                Err(message) => Err(message),
             }
-            mark_iceberg_mv_refresh_recovery_commit_unknown(
-                state,
-                &refresh,
-                format!(
-                    "iceberg MV refresh {} publish recovery could not prove commit outcome",
-                    refresh.refresh_id
-                ),
-            )?;
-            Ok(())
         }
-        MvRefreshState::Finalized | MvRefreshState::Aborted => Ok(()),
-        _ => mark_iceberg_mv_refresh_recovery_commit_unknown(
-            state,
-            &refresh,
-            format!(
-                "iceberg MV refresh {} recovery found unsupported unfinished state {}",
-                refresh.refresh_id,
-                refresh.state.as_str()
-            ),
+        None => converge_iceberg_mv_refresh_without_staging_branch(
+            state, &refresh, target, entry, table,
         ),
+    }
+}
+
+/// Drive a refresh whose staged snapshot is `main` (or a `main` ancestor) to
+/// `Finalized`: record the publish from the lake-observed snapshot (only when
+/// the ledger has not already recorded it), drop the staging branch, then
+/// finalize.
+fn converge_published_iceberg_mv_staging_branch(
+    state: &Arc<StandaloneState>,
+    refresh: &StoredMvRefresh,
+    target: &IcebergMvTarget,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    staging_branch: &str,
+    staging_snapshot_id: i64,
+) -> Result<(), String> {
+    // The publish landing is a lake fact (the classifier proved the staged
+    // snapshot is on `main`'s lineage). The ledger row is only a derived cache
+    // of whether we already wrote the publish record: transition it forward
+    // when it is still StagingCommitted, and otherwise leave the settled
+    // PublishCommitted row alone — its bound operation may already have moved
+    // past the Committing state (e.g. a finalize retry), where re-recording the
+    // publish would be an illegal operation-state transition.
+    if refresh.state == MvRefreshState::StagingCommitted {
+        record_iceberg_mv_publish_commit(state, refresh.refresh_id, staging_snapshot_id)?;
+    }
+    drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+    finalize_recovered_iceberg_mv_refresh(state, refresh)
+}
+
+/// Roll back a diverged refresh: its staged snapshot never became `main`, so
+/// drop the staging branch (its data files become Iceberg-GC orphans), restore
+/// any repartition default-spec, and abort the ledger row so the next refresh
+/// redoes the work from scratch.
+///
+/// On a repartition rollback the pre-repartition default spec is reconstructed
+/// from the lake: the staged snapshot's parent is `main`'s snapshot from before
+/// the repartition, and its data manifests were stamped with the old default
+/// spec id (see `restore_repartition_default_spec_from_recovery_intent`).
+fn rollback_iceberg_mv_staging_branch(
+    state: &Arc<StandaloneState>,
+    refresh: &StoredMvRefresh,
+    target: &IcebergMvTarget,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    table: &iceberg::table::Table,
+    staging_branch: &str,
+    staging_snapshot_id: i64,
+) -> Result<(), String> {
+    // The staged snapshot's parent is the pre-repartition `main` snapshot; its
+    // data manifests witness the old default partition spec id.
+    let reference_snapshot_id = table
+        .metadata()
+        .snapshot_by_id(staging_snapshot_id)
+        .and_then(|snapshot| snapshot.parent_snapshot_id());
+    restore_repartition_default_spec_from_recovery_intent(
+        state,
+        refresh,
+        target,
+        entry,
+        table,
+        reference_snapshot_id,
+    )?;
+    drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+    mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)
+}
+
+/// Converge a refresh whose staging branch is already absent from `refs()`.
+/// With no branch there is no lineage to classify, so decide from `main`: if
+/// `main`'s current snapshot carries this refresh's marker the publish landed
+/// and we finalize; otherwise the refresh never landed and we abort (restoring
+/// any repartition default-spec first).
+fn converge_iceberg_mv_refresh_without_staging_branch(
+    state: &Arc<StandaloneState>,
+    refresh: &StoredMvRefresh,
+    target: &IcebergMvTarget,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    table: &iceberg::table::Table,
+) -> Result<(), String> {
+    let main = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+    let main_carries_refresh = match main {
+        Some(main_snapshot_id) => {
+            snapshot_id_matches_refresh_marker(table, main_snapshot_id, refresh)?
+        }
+        None => false,
+    };
+    if main_carries_refresh {
+        finalize_recovered_iceberg_mv_refresh(state, refresh)
+    } else {
+        // The refresh never landed and the staging branch is gone, so `main`
+        // was never moved by this refresh: `main`'s current snapshot is the
+        // pre-repartition state, and its data manifests witness the old default
+        // partition spec id. When `main` has no snapshot there is no lake
+        // witness and the restore falls back to the recorded intent.
+        restore_repartition_default_spec_from_recovery_intent(
+            state, refresh, target, entry, table, main,
+        )?;
+        mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)
     }
 }
 
@@ -24050,25 +24198,98 @@ mod tests {
         assert!(definition.refresh_in_progress);
     }
 
+    /// Lake-native recovery: when `main` was moved to some OTHER snapshot (here
+    /// by an external writer with no MV marker) while a refresh's staging
+    /// branch is still off `main`'s lineage, the staged snapshot never
+    /// published, so recovery classifies it `Diverged` and rolls it back —
+    /// dropping the staging branch and aborting the ledger row — while leaving
+    /// the (externally advanced) `main` untouched. Fail-loud is reserved for
+    /// the narrower case where `main`'s current snapshot IS the staged snapshot
+    /// id but its marker does not match (see
+    /// `classify_staging_branch`); a divergent `main` is a rollback, not a
+    /// commit-unknown.
     #[test]
-    fn recover_iceberg_mv_refresh_marks_unknown_when_main_changed_externally() {
+    fn recover_iceberg_mv_refresh_rolls_back_when_main_diverged_externally() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
         create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
         seed_active_staging_refresh(&env.state, "ice", "analytics", "mv_orders", false);
-        advance_target_main_without_refresh_marker(&env.state, "ice", "analytics", "mv_orders");
+        let external_main =
+            advance_target_main_without_refresh_marker(&env.state, "ice", "analytics", "mv_orders");
+
+        // Exactly one unfinished refresh was seeded; capture its id and staging
+        // branch to assert the rollback below.
+        let (refresh_id, staging_branch) = {
+            let provider = env.state.metadata_provider.as_ref().expect("provider");
+            let read = provider.begin_read().expect("read");
+            let unfinished = env
+                .state
+                .mv_repo
+                .list_unfinished_refreshes(read.as_ref())
+                .expect("unfinished");
+            assert_eq!(unfinished.len(), 1);
+            (
+                unfinished[0].refresh_id,
+                unfinished[0]
+                    .staging_branch
+                    .clone()
+                    .expect("staging branch"),
+            )
+        };
 
         recover_iceberg_mv_refreshes(&env.state).expect("recover");
 
         let provider = env.state.metadata_provider.as_ref().expect("provider");
         let read = provider.begin_read().expect("read");
+        let refresh = env
+            .state
+            .mv_repo
+            .load_refresh(read.as_ref(), refresh_id)
+            .expect("load refresh")
+            .expect("refresh");
+        assert_eq!(refresh.state, MvRefreshState::Aborted);
         let unfinished = env
             .state
             .mv_repo
             .list_unfinished_refreshes(read.as_ref())
             .expect("unfinished");
-        assert_eq!(unfinished.len(), 1);
-        assert_eq!(unfinished[0].state, MvRefreshState::CommitUnknown);
+        assert!(unfinished.is_empty());
+        let definition = env
+            .state
+            .mv_repo
+            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .expect("find mv")
+            .expect("mv definition");
+        assert_eq!(definition.active_refresh_id, None);
+        assert!(!definition.refresh_in_progress);
+        drop(read);
+
+        // The staging branch was rolled back; the externally-advanced `main`
+        // is left exactly as the lake had it.
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let reloaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("reload target");
+        assert_eq!(
+            reloaded
+                .table
+                .metadata()
+                .current_snapshot()
+                .map(|s| s.snapshot_id()),
+            Some(external_main),
+            "external main must be left untouched"
+        );
+        assert!(
+            !reloaded
+                .table
+                .metadata()
+                .refs()
+                .contains_key(&staging_branch),
+            "diverged staging branch should be dropped on rollback"
+        );
     }
 
     #[test]
