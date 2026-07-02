@@ -42,6 +42,7 @@ pub struct HeartbeatConfig {
     pub brpc_port: u16,
     pub http_port: u16,
     pub starlet_port: u16,
+    pub mem_limit_bytes: u64,
 }
 
 struct HeartbeatHandler {
@@ -89,6 +90,7 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        let mem_limit_bytes = self.config.mem_limit_bytes.min(i64::MAX as u64);
         let backend_info = TBackendInfo::new(
             self.config.be_port as i32,
             self.config.http_port as i32,
@@ -99,7 +101,7 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
             Some(self.config.starlet_port as i32),
             Some(reboot_time),
             Some(true),
-            None,
+            Some(mem_limit_bytes as i64),
             None,
         );
         disk_report::maybe_report_disks(
@@ -168,7 +170,11 @@ pub fn stop_heartbeat_server() {
 
 #[cfg(test)]
 mod tests {
-    use super::backend_host_for_fe;
+    use super::{HeartbeatConfig, HeartbeatHandler, backend_host_for_fe};
+    use crate::thrift::{
+        heartbeat_service::{HeartbeatServiceSyncHandler, TMasterInfo},
+        types,
+    };
 
     #[test]
     fn backend_host_for_fe_uses_advertise_host() {
@@ -180,5 +186,45 @@ mod tests {
     fn backend_host_for_fe_keeps_advertise_host_unchanged() {
         let backend_host = backend_host_for_fe("192.168.20.152");
         assert_eq!(backend_host, "192.168.20.152");
+    }
+
+    #[test]
+    fn heartbeat_reports_positive_backend_mem_limit() {
+        let handler = HeartbeatHandler::new(HeartbeatConfig {
+            host: "127.0.0.1".to_string(),
+            advertise_host: "127.0.0.1".to_string(),
+            heartbeat_port: 9050,
+            be_port: 9060,
+            brpc_port: 8060,
+            http_port: 8040,
+            starlet_port: 9070,
+            mem_limit_bytes: 64 * 1024 * 1024 * 1024,
+        });
+        let master_info = TMasterInfo::new(
+            types::TNetworkAddress::new("127.0.0.1".to_string(), 9030),
+            None::<types::TClusterId>,
+            1,
+            None::<String>,
+            None::<String>,
+            None::<types::TPort>,
+            None::<i64>,
+            None::<i64>,
+            None::<i64>,
+            None::<types::TRunMode>,
+            None::<Vec<String>>,
+            None::<Vec<String>>,
+            None::<bool>,
+            None::<bool>,
+            None::<types::TNodeType>,
+        );
+
+        let result = handler
+            .handle_heartbeat(master_info)
+            .expect("heartbeat must succeed");
+
+        assert!(
+            result.backend_info.mem_limit_bytes.unwrap_or_default() > 0,
+            "heartbeat must report a positive BE memory limit"
+        );
     }
 }
