@@ -27,12 +27,14 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
+use arrow::datatypes::DataType;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +110,15 @@ pub trait ProcessorOperator: Operator {
 
     fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String>;
 
+    /// Whether this operator can consume the given column in its current
+    /// physical encoding WITHOUT hydration. Default: false - the driver
+    /// hydrates every encoded column before `push_chunk`. C1-C4 override
+    /// this per slot to keep specific dictionary columns encoded on their
+    /// fast path.
+    fn accepts_encoded_column(&self, _slot_id: SlotId, _data_type: &DataType) -> bool {
+        false
+    }
+
     /// Dependency that must be ready before the operator can make progress.
     /// This is used for build-side readiness (join, runtime filters, etc.).
     fn precondition_dependency(&self) -> Option<DependencyHandle> {
@@ -122,5 +133,54 @@ pub trait ProcessorOperator: Operator {
     /// Observable for sink-side readiness (need_input becomes true).
     fn sink_observable(&self) -> Option<Arc<Observable>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Chunk, Operator, ProcessorOperator};
+    use crate::common::ids::SlotId;
+    use crate::runtime::runtime_state::RuntimeState;
+    use arrow::datatypes::DataType;
+
+    struct StubOp;
+
+    impl Operator for StubOp {
+        fn name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    impl ProcessorOperator for StubOp {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn processor_operator_rejects_physical_encodings_by_default() {
+        let op = StubOp;
+        let slot_id = SlotId::new(1);
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+
+        assert!(!op.accepts_encoded_column(slot_id, &dictionary_type));
+        assert!(!op.accepts_encoded_column(slot_id, &DataType::Utf8));
     }
 }
