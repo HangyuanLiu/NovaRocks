@@ -27,12 +27,14 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
+use arrow::datatypes::DataType;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +110,15 @@ pub trait ProcessorOperator: Operator {
 
     fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String>;
 
+    /// Whether this operator can consume the given column in its current
+    /// physical encoding WITHOUT hydration. Default: false - the driver
+    /// hydrates every encoded column before `push_chunk`. C1-C4 override
+    /// this per slot to keep specific dictionary columns encoded on their
+    /// fast path.
+    fn accepts_encoded_column(&self, _slot_id: SlotId, _data_type: &DataType) -> bool {
+        false
+    }
+
     /// Dependency that must be ready before the operator can make progress.
     /// This is used for build-side readiness (join, runtime filters, etc.).
     fn precondition_dependency(&self) -> Option<DependencyHandle> {
@@ -122,5 +133,219 @@ pub trait ProcessorOperator: Operator {
     /// Observable for sink-side readiness (need_input becomes true).
     fn sink_observable(&self) -> Option<Arc<Observable>> {
         None
+    }
+}
+
+/// Hydrate a chunk for delivery to `downstream`, keeping only the columns the
+/// operator declares it can consume encoded. Default operators accept nothing
+/// encoded, so this hydrates everything (C0 behavior).
+pub(crate) fn hydrate_for_downstream(
+    chunk: &Chunk,
+    downstream: &dyn ProcessorOperator,
+) -> Result<Chunk, String> {
+    crate::exec::chunk::hydrate_dictionary_columns_except(chunk, |slot_id, dt| {
+        downstream.accepts_encoded_column(slot_id, dt)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{Chunk, Operator, ProcessorOperator, hydrate_for_downstream};
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+    use crate::runtime::runtime_state::RuntimeState;
+    use arrow::array::{Array, ArrayRef, DictionaryArray, StringArray};
+    use arrow::datatypes::{DataType, Field, Int32Type};
+    use arrow::record_batch::RecordBatch;
+
+    struct StubOp;
+
+    impl Operator for StubOp {
+        fn name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    impl ProcessorOperator for StubOp {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct KeepSlot1Op;
+
+    impl Operator for KeepSlot1Op {
+        fn name(&self) -> &str {
+            "keep-slot-1"
+        }
+    }
+
+    impl ProcessorOperator for KeepSlot1Op {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
+            slot_id == SlotId::new(1)
+                && matches!(
+                    data_type,
+                    DataType::Dictionary(key_type, value_type)
+                        if key_type.as_ref() == &DataType::Int32
+                            && value_type.as_ref() == &DataType::Utf8
+                )
+        }
+    }
+
+    fn dict_utf8_with_nulls_and_empty() -> ArrayRef {
+        Arc::new(
+            vec![Some("PAID"), None, Some(""), Some("NEW")]
+                .into_iter()
+                .collect::<DictionaryArray<Int32Type>>(),
+        )
+    }
+
+    fn two_dictionary_column_chunk() -> Chunk {
+        let slot1 = SlotId::new(1);
+        let slot2 = SlotId::new(2);
+        let column1 = dict_utf8_with_nulls_and_empty();
+        let column2 = dict_utf8_with_nulls_and_empty();
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::new_with_field(
+                    slot1,
+                    Field::new("status_1", column1.data_type().clone(), true),
+                    None,
+                    None,
+                ),
+                ChunkSlotSchema::new_with_field(
+                    slot2,
+                    Field::new("status_2", column2.data_type().clone(), true),
+                    None,
+                    None,
+                ),
+            ])
+            .expect("chunk schema"),
+        );
+        let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), vec![column1, column2])
+            .expect("record batch");
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+    }
+
+    fn assert_utf8_values(column: &ArrayRef) {
+        let values = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string array");
+        assert_eq!(values.value(0), "PAID");
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), "");
+        assert_eq!(values.value(3), "NEW");
+    }
+
+    #[test]
+    fn processor_operator_rejects_physical_encodings_by_default() {
+        let op = StubOp;
+        let slot_id = SlotId::new(1);
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+
+        assert!(!op.accepts_encoded_column(slot_id, &dictionary_type));
+        assert!(!op.accepts_encoded_column(slot_id, &DataType::Utf8));
+    }
+
+    #[test]
+    fn hydrate_for_downstream_hydrates_all_dictionary_columns_by_default() {
+        let chunk = two_dictionary_column_chunk();
+        let op = StubOp;
+
+        let hydrated = hydrate_for_downstream(&chunk, &op).expect("hydrate for downstream");
+
+        assert_eq!(hydrated.columns()[0].data_type(), &DataType::Utf8);
+        assert_eq!(hydrated.columns()[1].data_type(), &DataType::Utf8);
+        assert_eq!(
+            hydrated
+                .chunk_schema()
+                .slot(SlotId::new(1))
+                .expect("slot 1")
+                .data_type(),
+            &DataType::Utf8
+        );
+        assert_eq!(
+            hydrated
+                .chunk_schema()
+                .slot(SlotId::new(2))
+                .expect("slot 2")
+                .data_type(),
+            &DataType::Utf8
+        );
+        assert_utf8_values(&hydrated.columns()[0]);
+        assert_utf8_values(&hydrated.columns()[1]);
+    }
+
+    #[test]
+    fn hydrate_for_downstream_keeps_only_declared_encoded_slots() {
+        let chunk = two_dictionary_column_chunk();
+        let op = KeepSlot1Op;
+
+        let hydrated = hydrate_for_downstream(&chunk, &op).expect("hydrate for downstream");
+
+        assert!(matches!(
+            hydrated.columns()[0].data_type(),
+            DataType::Dictionary(key_type, value_type)
+                if key_type.as_ref() == &DataType::Int32 && value_type.as_ref() == &DataType::Utf8
+        ));
+        assert!(matches!(
+            hydrated
+                .chunk_schema()
+                .slot(SlotId::new(1))
+                .expect("slot 1")
+                .data_type(),
+            DataType::Dictionary(key_type, value_type)
+                if key_type.as_ref() == &DataType::Int32 && value_type.as_ref() == &DataType::Utf8
+        ));
+        assert_eq!(hydrated.columns()[1].data_type(), &DataType::Utf8);
+        assert_eq!(
+            hydrated
+                .chunk_schema()
+                .slot(SlotId::new(2))
+                .expect("slot 2")
+                .data_type(),
+            &DataType::Utf8
+        );
+        assert_utf8_values(&hydrated.columns()[1]);
     }
 }
