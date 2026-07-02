@@ -233,15 +233,27 @@ fn scan_predicates_to_min_max_predicates(predicates: &[ScanPredicate]) -> Vec<Mi
         .collect()
 }
 
-fn runtime_filters_to_scan_predicates(
+#[derive(Clone, Debug, Default)]
+struct ScanPredicateCounters {
+    range: u128,
+    discrete_set: u128,
+    envelope_fallback: u128,
+    unsupported: u128,
+}
+
+fn runtime_filters_to_scan_predicates_with_counters(
     cfg: &ParquetScanConfig,
     runtime_filters: &RuntimeFilterContext,
+    counters: &mut ScanPredicateCounters,
 ) -> Result<Vec<ScanPredicate>, String> {
     let snapshot = runtime_filters.snapshot();
     if snapshot.is_empty() {
         return Ok(Vec::new());
     }
     if cfg.chunk_schema.slot_ids().is_empty() || cfg.columns.is_empty() {
+        counters.unsupported += snapshot.in_filters().len() as u128;
+        counters.unsupported += snapshot.membership_filters().len() as u128;
+        counters.unsupported += snapshot.min_max_filters().len() as u128;
         return Ok(Vec::new());
     }
 
@@ -266,6 +278,7 @@ fn runtime_filters_to_scan_predicates(
     let mut preds = Vec::new();
     for rf in snapshot.in_filters() {
         let Some(column) = slot_to_index.get(&rf.slot_id()) else {
+            counters.unsupported += 1;
             continue;
         };
         if let Some(values) = rf.scan_predicate_values(PARQUET_DISCRETE_SET_MAX_VALUES)? {
@@ -276,6 +289,7 @@ fn runtime_filters_to_scan_predicates(
             ) {
                 Ok(predicate) => {
                     preds.push(predicate);
+                    counters.discrete_set += 1;
                     continue;
                 }
                 Err(_) => {
@@ -291,8 +305,10 @@ fn runtime_filters_to_scan_predicates(
             )
         })?
         else {
+            counters.unsupported += 1;
             continue;
         };
+        counters.envelope_fallback += 1;
         preds.push(ScanPredicate::from_min_max_predicate(
             MinMaxPredicate::Ge {
                 column: column.clone(),
@@ -310,6 +326,7 @@ fn runtime_filters_to_scan_predicates(
     }
     for rf in snapshot.membership_filters() {
         let Some(column) = slot_to_index.get(&rf.slot_id()) else {
+            counters.unsupported += 1;
             continue;
         };
         let Some((min_value, max_value)) =
@@ -321,6 +338,7 @@ fn runtime_filters_to_scan_predicates(
                 )
             })?
         else {
+            counters.unsupported += 1;
             continue;
         };
         preds.push(ScanPredicate::from_min_max_predicate(
@@ -340,20 +358,39 @@ fn runtime_filters_to_scan_predicates(
     }
     for (filter_id, filter) in snapshot.min_max_filters() {
         let Some(column_name) = cfg.runtime_min_max_filter_columns.get(filter_id) else {
+            counters.unsupported += 1;
             continue;
         };
         let Some(idx) = find_column_index_by_name(&cfg.columns, column_name, cfg.case_sensitive)
         else {
+            counters.unsupported += 1;
             continue;
         };
-        for predicate in filter.to_min_max_predicates(&idx.to_string())? {
+        let min_max_predicates = filter.to_min_max_predicates(&idx.to_string())?;
+        if min_max_predicates.is_empty() {
+            counters.unsupported += 1;
+            continue;
+        }
+        for predicate in min_max_predicates {
             preds.push(ScanPredicate::from_min_max_predicate(
                 predicate,
                 ScanPredicateSource::RuntimeMinMax,
             ));
+            counters.range += 1;
         }
     }
     Ok(preds)
+}
+
+fn runtime_filters_to_scan_predicates(
+    cfg: &ParquetScanConfig,
+    runtime_filters: &RuntimeFilterContext,
+) -> Result<Vec<ScanPredicate>, String> {
+    runtime_filters_to_scan_predicates_with_counters(
+        cfg,
+        runtime_filters,
+        &mut ScanPredicateCounters::default(),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -622,6 +659,7 @@ struct ParquetScanIter {
 struct CurrentPruningPredicates {
     physical: Vec<ScanPredicate>,
     variant: Vec<VariantPathPruningPredicate>,
+    counters: ScanPredicateCounters,
 }
 
 impl ParquetScanIter {
@@ -751,21 +789,32 @@ impl ParquetScanIter {
             return Ok(CurrentPruningPredicates {
                 physical: Vec::new(),
                 variant: self.cfg.variant_path_predicates.clone(),
+                counters: ScanPredicateCounters::default(),
             });
         }
+        let mut counters = ScanPredicateCounters {
+            range: self.cfg.min_max_predicates.len() as u128,
+            ..Default::default()
+        };
         let mut predicates = CurrentPruningPredicates {
             physical: min_max_predicates_to_scan_predicates(
                 &self.cfg.min_max_predicates,
                 ScanPredicateSource::Static,
             ),
             variant: self.cfg.variant_path_predicates.clone(),
+            counters: ScanPredicateCounters::default(),
         };
         if let Some(filters) = self.runtime_filters.as_ref() {
-            let mut runtime_preds = runtime_filters_to_scan_predicates(&self.cfg, filters)?;
+            let mut runtime_preds = runtime_filters_to_scan_predicates_with_counters(
+                &self.cfg,
+                filters,
+                &mut counters,
+            )?;
             if !runtime_preds.is_empty() {
                 predicates.physical.append(&mut runtime_preds);
             }
         }
+        predicates.counters = counters;
         Ok(predicates)
     }
 
@@ -1202,6 +1251,28 @@ impl ParquetScanIter {
 
             let metadata = builder.metadata().clone();
             let predicates = self.current_pruning_predicates()?;
+            if let Some(profile) = self.profile.as_ref() {
+                profile.counter_add(
+                    "ParquetScanPredicatesRange",
+                    metrics::TUnit::UNIT,
+                    clamp_u128_to_i64(predicates.counters.range),
+                );
+                profile.counter_add(
+                    "ParquetScanPredicatesDiscreteSet",
+                    metrics::TUnit::UNIT,
+                    clamp_u128_to_i64(predicates.counters.discrete_set),
+                );
+                profile.counter_add(
+                    "ParquetScanPredicatesEnvelopeFallback",
+                    metrics::TUnit::UNIT,
+                    clamp_u128_to_i64(predicates.counters.envelope_fallback),
+                );
+                profile.counter_add(
+                    "ParquetScanPredicatesUnsupported",
+                    metrics::TUnit::UNIT,
+                    clamp_u128_to_i64(predicates.counters.unsupported),
+                );
+            }
             let bound_variant_predicates = bind_variant_path_pruning_predicates(
                 &metadata,
                 &self.cfg.variant_path_columns,
@@ -4376,6 +4447,39 @@ mod tests {
         assert!(
             values.contains(&(last_group_end - 1)),
             "last boundary key should be present"
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetScanPredicatesDiscreteSet")
+                .expect("discrete set counter"),
+            1
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetScanPredicatesEnvelopeFallback")
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn oversized_in_filter_records_envelope_fallback() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("rf_large_in.parquet");
+        write_runtime_filter_row_group_fixture(&file_path);
+
+        let runtime_filters = runtime_filter_ctx_for_keys((0..300).collect());
+        let profile = crate::runtime::profile::RuntimeProfile::new("rf_large_in_test");
+        let mut iter = open_runtime_filter_scan_iter(&file_path, runtime_filters, profile.clone());
+        for item in &mut iter {
+            item.expect("chunk");
+        }
+
+        assert_eq!(
+            profile
+                .counter_value("ParquetScanPredicatesEnvelopeFallback")
+                .expect("envelope fallback counter"),
+            1
         );
     }
 
