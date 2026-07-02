@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
-use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
@@ -28,11 +27,8 @@ use crate::sql::codegen::helpers::{
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
 use crate::sql::codegen::runtime_filter_lowering::{
-    RfProbeTarget, join_distribution_mode_from_execution, legacy_rf_distribution_to_execution,
-    remap_rf_expr_order, rf_build_expr_matches_join_build_expr,
-    rf_layout_for_execution_distribution, rf_pipeline_dop,
+    RfProbeTarget, remap_rf_expr_order, rf_build_expr_matches_join_build_expr, rf_pipeline_dop,
 };
-use crate::sql::codegen::scalar_materialize::materialize;
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
@@ -40,15 +36,15 @@ use crate::sql::codegen::{
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::operator::{
-    AggMode, AssertOneRowOp, DecodeOp, GenerateSeriesOp, RepeatOp, ScanDictionaryColumn, TopNPhase,
+    AggMode, AssertOneRowOp, DecodeOp, GenerateSeriesOp, JoinDistribution, RepeatOp,
+    ScanDictionaryColumn, TopNPhase,
 };
-use crate::sql::optimizer::physical_tree::JoinExecutionDistribution;
 use crate::sql::optimizer::property::OrderingSpec;
-use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
+use crate::sql::planner::{JoinExecutionMode, WiredRuntimeFilterBuild};
 use crate::thrift::exprs;
 use crate::thrift::partitions;
 use crate::thrift::plan_nodes;
@@ -68,7 +64,6 @@ pub(crate) fn lower_distributed_plan(
         mv_refresh_ctx,
         dp.root_fragment_id,
         &dp.fragments,
-        Arc::clone(&dp.scalar_arena),
     );
     state.lower_fragment_by_id(dp.root_fragment_id)?;
     state.fragment_stack.clear();
@@ -222,7 +217,7 @@ fn validate_distributed_plan(
 
 fn validate_node_fragment_ownership(
     fragment_id: FragmentId,
-    node: &crate::sql::planner::DistributedPlanNode,
+    node: &crate::sql::planner::DistributedNode,
 ) -> Result<(), String> {
     if node.fragment_id != fragment_id {
         return Err(format!(
@@ -396,7 +391,7 @@ fn validate_edge_target_node(
         )
         })?;
 
-    let crate::sql::planner::DistributedPlanKind::Exchange(exchange) = &target_node.kind else {
+    let crate::sql::planner::DistributedPayload::Exchange(exchange) = &target_node.payload else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -481,9 +476,9 @@ fn validate_edge_target_node(
 }
 
 fn find_node_by_id(
-    node: &crate::sql::planner::DistributedPlanNode,
+    node: &crate::sql::planner::DistributedNode,
     node_id: i32,
-) -> Option<&crate::sql::planner::DistributedPlanNode> {
+) -> Option<&crate::sql::planner::DistributedNode> {
     if node.node_id == node_id {
         return Some(node);
     }
@@ -710,7 +705,7 @@ fn target_exchange_for_edge<'a>(
                 edge.target_exchange_node_id, target_fragment.fragment_id
             )
         })?;
-    let crate::sql::planner::DistributedPlanKind::Exchange(exchange) = &target_node.kind else {
+    let crate::sql::planner::DistributedPayload::Exchange(exchange) = &target_node.payload else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -892,13 +887,12 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     ) -> &mut HashMap<FragmentId, Vec<crate::thrift::data::TGlobalDict>>;
     fn slot_to_global_dict(&self) -> &HashMap<i32, crate::thrift::data::TGlobalDict>;
     fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::thrift::data::TGlobalDict>;
-    fn rf_probe_targets(&mut self) -> &mut HashMap<i32, RfProbeTarget>;
+    fn rf_probe_targets(&mut self) -> &mut HashMap<i32, Vec<RfProbeTarget>>;
     fn rf_all_filters(
         &mut self,
     ) -> &mut HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>;
     fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>>;
     fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>>;
-    fn scalar_arena(&self) -> &ScalarArena;
     fn alloc_slot(&mut self) -> i32;
     fn slot_allocator(&self) -> expr_compiler::SlotAllocator;
     fn lowered_fragment_output(&self, _fragment_id: FragmentId) -> Option<&LoweredFragmentOutput> {
@@ -968,7 +962,7 @@ pub(crate) struct OwnedLoweringState<'a> {
     fragment_stack: Vec<FragmentId>,
     query_global_dicts_per_fragment: HashMap<FragmentId, Vec<crate::thrift::data::TGlobalDict>>,
     slot_to_global_dict: HashMap<i32, crate::thrift::data::TGlobalDict>,
-    rf_probe_targets: HashMap<i32, RfProbeTarget>,
+    rf_probe_targets: HashMap<i32, Vec<RfProbeTarget>>,
     rf_all_filters: HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>,
     rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
     rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
@@ -976,7 +970,6 @@ pub(crate) struct OwnedLoweringState<'a> {
     fragments_by_id: HashMap<FragmentId, crate::sql::planner::PlanFragment>,
     lowered_fragments: Vec<(crate::sql::planner::PlanFragment, LoweredDistributedNode)>,
     lowering_fragments: BTreeSet<FragmentId>,
-    scalar_arena: Arc<ScalarArena>,
 }
 
 impl<'a> OwnedLoweringState<'a> {
@@ -986,13 +979,7 @@ impl<'a> OwnedLoweringState<'a> {
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
         _root_fragment_id: FragmentId,
     ) -> Self {
-        Self::new_with_fragments(
-            connectors,
-            mv_refresh_ctx,
-            _root_fragment_id,
-            &[],
-            Arc::new(ScalarArena::new()),
-        )
+        Self::new_with_fragments(connectors, mv_refresh_ctx, _root_fragment_id, &[])
     }
 
     fn new_with_fragments(
@@ -1000,7 +987,6 @@ impl<'a> OwnedLoweringState<'a> {
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
         _root_fragment_id: FragmentId,
         fragments: &[crate::sql::planner::PlanFragment],
-        scalar_arena: Arc<ScalarArena>,
     ) -> Self {
         Self {
             connectors,
@@ -1023,7 +1009,6 @@ impl<'a> OwnedLoweringState<'a> {
                 .collect(),
             lowered_fragments: Vec::new(),
             lowering_fragments: BTreeSet::new(),
-            scalar_arena,
         }
     }
 
@@ -1138,7 +1123,7 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
         &mut self.slot_to_global_dict
     }
 
-    fn rf_probe_targets(&mut self) -> &mut HashMap<i32, RfProbeTarget> {
+    fn rf_probe_targets(&mut self) -> &mut HashMap<i32, Vec<RfProbeTarget>> {
         &mut self.rf_probe_targets
     }
 
@@ -1154,10 +1139,6 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
 
     fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>> {
         &mut self.rf_probe_side_filters
-    }
-
-    fn scalar_arena(&self) -> &ScalarArena {
-        &self.scalar_arena
     }
 
     fn alloc_slot(&mut self) -> i32 {
@@ -1278,62 +1259,74 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
     ) -> Result<LoweredDistributedNode, String> {
-        let mut lowered = match &node.kind {
-            crate::sql::planner::DistributedPlanKind::Scan(scan) => {
-                self.lower_scan_node(node, scan)?
-            }
-            crate::sql::planner::DistributedPlanKind::Project(project) => {
-                self.lower_project_node(node, project)?
-            }
-            crate::sql::planner::DistributedPlanKind::Filter(filter) => {
-                self.lower_filter_node(node, filter)?
-            }
-            crate::sql::planner::DistributedPlanKind::Sort(sort) => {
-                self.lower_sort_node(node, sort)?
-            }
-            crate::sql::planner::DistributedPlanKind::TopN(topn) => {
-                self.lower_topn_node(node, topn)?
-            }
-            crate::sql::planner::DistributedPlanKind::Exchange(exchange) => {
+        let mut lowered = match &node.payload {
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::Scan(scan),
+            ) => self.lower_scan_node(node, scan)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::Project(project),
+            ) => self.lower_project_node(node, project)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::Filter(filter),
+            ) => self.lower_filter_node(node, filter)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::Sort(sort),
+            ) => self.lower_sort_node(node, sort)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::TopN(topn),
+            ) => self.lower_topn_node(node, topn)?,
+            crate::sql::planner::DistributedPayload::Exchange(exchange) => {
                 self.lower_exchange_node(node, exchange)?
             }
-            crate::sql::planner::DistributedPlanKind::HashAggregate(agg) => {
-                self.lower_hash_aggregate_node(node, agg.as_ref())?
-            }
-            crate::sql::planner::DistributedPlanKind::HashJoin(hash_join) => {
-                self.lower_hash_join_node(node, hash_join.as_ref())?
-            }
-            crate::sql::planner::DistributedPlanKind::NestLoopJoin(nest_loop) => {
-                self.lower_nest_loop_join_node(node, nest_loop)?
-            }
-            crate::sql::planner::DistributedPlanKind::Values(values) => {
-                self.lower_values_node(node, values)?
-            }
-            crate::sql::planner::DistributedPlanKind::AssertOneRow(assert_one_row) => {
-                self.lower_assert_one_row_node(node, assert_one_row)?
-            }
-            crate::sql::planner::DistributedPlanKind::Decode(decode) => {
-                self.lower_decode_node(node, decode)?
-            }
-            crate::sql::planner::DistributedPlanKind::Repeat(repeat) => {
-                self.lower_repeat_node(node, repeat)?
-            }
-            crate::sql::planner::DistributedPlanKind::ChangeEventExpand(expand) => {
-                self.lower_change_event_expand_node(node, expand)?
-            }
-            crate::sql::planner::DistributedPlanKind::SetOp(set_op) => {
-                self.lower_set_op_node(node, set_op)?
-            }
-            crate::sql::planner::DistributedPlanKind::Window(window) => {
-                self.lower_window_node(node, window)?
-            }
-            crate::sql::planner::DistributedPlanKind::GenerateSeries(generate_series) => {
-                self.lower_generate_series_node(node, generate_series)?
-            }
-            crate::sql::planner::DistributedPlanKind::TableFunction(table_function) => {
-                self.lower_table_function_node(node, table_function)?
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::HashAggregate(agg),
+            ) => self.lower_hash_aggregate_node(node, agg.as_ref())?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::HashJoin(hash_join),
+            ) => self.lower_hash_join_node(node, hash_join.as_ref())?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::NestLoopJoin(nest_loop),
+            ) => self.lower_nest_loop_join_node(node, nest_loop)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::Values(values),
+            ) => self.lower_values_node(node, values)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::AssertOneRow(assert_one_row),
+            ) => self.lower_assert_one_row_node(node, assert_one_row)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::Decode(decode),
+            ) => self.lower_decode_node(node, decode)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::Repeat(repeat),
+            ) => self.lower_repeat_node(node, repeat)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::ChangeEventExpand(expand),
+            ) => self.lower_change_event_expand_node(node, expand)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::SetOp(set_op),
+            ) => self.lower_set_op_node(node, set_op)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::Window(window),
+            ) => self.lower_window_node(node, window)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::GenerateSeries(generate_series),
+            ) => self.lower_generate_series_node(node, generate_series)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::TableFunction(table_function),
+            ) => self.lower_table_function_node(node, table_function)?,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::Limit(_)
+                | crate::sql::planner::plan::PhysicalPlanKind::CTEAnchor(_)
+                | crate::sql::planner::plan::PhysicalPlanKind::CTEProduce(_)
+                | crate::sql::planner::plan::PhysicalPlanKind::CTEConsume(_)
+                | crate::sql::planner::plan::PhysicalPlanKind::Redistribute(_),
+            ) => {
+                return Err(format!(
+                    "lower_distributed_plan node_id={} received non-lowerable physical payload",
+                    node.node_id
+                ));
             }
         };
         if let Some(root) = lowered.plan_nodes.first_mut() {
@@ -1345,7 +1338,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_scan_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         scan: &super::kind::DistributedScanNode,
     ) -> Result<LoweredDistributedNode, String> {
         if !node.children.is_empty() {
@@ -1369,7 +1362,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_project_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         project: &super::kind::DistributedProjectNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1396,7 +1389,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_filter_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         filter: &super::kind::DistributedFilterNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1445,7 +1438,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_sort_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         sort: &super::kind::DistributedSortNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1477,7 +1470,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_topn_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         topn: &super::kind::PhysicalTopNNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1503,7 +1496,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_exchange_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         exchange: &super::kind::DistributedExchangeNode,
     ) -> Result<LoweredDistributedNode, String> {
         if !node.children.is_empty() {
@@ -1608,7 +1601,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_hash_aggregate_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         agg: &super::kind::PhysicalHashAggregateNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1635,7 +1628,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_hash_join_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         hash_join: &super::kind::PhysicalHashJoinNode,
     ) -> Result<LoweredDistributedNode, String> {
         let (left_node, right_node) = binary_children(node, "HashJoin")?;
@@ -1660,7 +1653,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             hash_join,
             left_scope,
             right_scope,
-            node.execution_join_distribution,
+            hash_join.execution_mode,
             &node.build_runtime_filters,
         )?;
         let mut plan_nodes = vec![join_plan_node];
@@ -1677,7 +1670,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_nest_loop_join_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         nest_loop: &super::kind::PhysicalNestLoopJoinNode,
     ) -> Result<LoweredDistributedNode, String> {
         let (left_node, right_node) = binary_children(node, "NestLoopJoin")?;
@@ -1717,7 +1710,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_values_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         values: &super::kind::DistributedValuesNode,
     ) -> Result<LoweredDistributedNode, String> {
         if !node.children.is_empty() {
@@ -1740,7 +1733,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_assert_one_row_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         assert_one_row: &super::kind::DistributedAssertOneRowNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1766,7 +1759,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_decode_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         decode: &super::kind::DistributedDecodeNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1793,7 +1786,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_repeat_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         repeat: &super::kind::DistributedRepeatNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1829,7 +1822,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_change_event_expand_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         expand: &super::kind::DistributedChangeEventExpandNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1856,9 +1849,12 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_set_op_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         set_op: &super::kind::PhysicalSetOpNode,
     ) -> Result<LoweredDistributedNode, String> {
+        if matches!(set_op.kind, super::kind::SetOpKind::UnionDistinct) {
+            return Err(crate::sql::planner::union_distinct_must_be_rewritten_error().to_string());
+        }
         if node.children.is_empty() {
             return Err("DistributedPlan SetOp has no inputs".to_string());
         }
@@ -1900,7 +1896,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_window_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         window: &super::kind::DistributedWindowNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1931,7 +1927,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_generate_series_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         generate_series: &super::kind::DistributedGenerateSeriesNode,
     ) -> Result<LoweredDistributedNode, String> {
         if !node.children.is_empty() {
@@ -1961,7 +1957,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_table_function_node(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         table_function: &super::kind::DistributedTableFunctionNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1988,7 +1984,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_stream_exchange_source(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         exchange: &super::kind::DistributedExchangeNode,
     ) -> Result<LoweredFragmentOutput, String> {
         if self
@@ -2072,8 +2068,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         op: &super::kind::PhysicalHashJoinNode,
         left_scope: ExprScope,
         right_scope: ExprScope,
-        execution_distribution: Option<JoinExecutionDistribution>,
-        build_runtime_filters: &[crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc],
+        execution_mode: Option<JoinExecutionMode>,
+        build_runtime_filters: &[WiredRuntimeFilterBuild],
     ) -> Result<(plan_nodes::TPlanNode, ExprScope, Vec<i32>), String> {
         let join_op = join_kind_to_op(op.join_type);
 
@@ -2158,7 +2154,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
 
         let distribution_mode =
-            join_distribution_mode_from_execution(execution_distribution, &op.distribution);
+            join_distribution_mode_from_planner_execution(execution_mode, &op.distribution);
         let mut join_plan_node = nodes::build_hash_join_node(
             join_node_id,
             left_tuple_ids,
@@ -2175,7 +2171,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             &right_scope,
             &surviving_eq_origin,
             &surviving_eq_build_exprs,
-            execution_distribution,
         )?;
         if !rf_descs.is_empty()
             && let Some(hj) = join_plan_node.hash_join_node.as_mut()
@@ -2316,7 +2311,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn record_probe_targets(
         &mut self,
-        node: &crate::sql::planner::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedNode,
         result: &LoweredDistributedNode,
     ) {
         if node.probe_runtime_filters.is_empty() {
@@ -2330,31 +2325,30 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             return;
         };
         for probe in &node.probe_runtime_filters {
-            let probe_expr = materialize(self.state.scalar_arena(), probe.probe_expr);
             let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &result.scope);
-            let Ok(probe_texpr) = compiler.compile_typed(&probe_expr) else {
+            let Ok(probe_texpr) = compiler.compile_typed(&probe.probe_expr) else {
                 continue;
             };
-            self.state.rf_probe_targets().insert(
-                probe.filter_id,
-                RfProbeTarget {
+            self.state
+                .rf_probe_targets()
+                .entry(probe.filter_id)
+                .or_default()
+                .push(RfProbeTarget {
                     thrift_node_id,
                     probe_texpr,
                     fragment_id,
-                },
-            );
+                });
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build_rf_descriptors(
         &mut self,
-        build_runtime_filters: &[crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc],
+        build_runtime_filters: &[WiredRuntimeFilterBuild],
         join_node_id: i32,
         build_scope: &ExprScope,
         surviving_eq_origin: &[usize],
         surviving_eq_build_exprs: &[TypedExpr],
-        execution_distribution: Option<JoinExecutionDistribution>,
     ) -> Result<Vec<crate::thrift::runtime_filter::TRuntimeFilterDescription>, String> {
         use crate::thrift::runtime_filter;
 
@@ -2381,8 +2375,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             else {
                 continue;
             };
-            let build_expr = materialize(self.state.scalar_arena(), rf.build_expr);
-            if !rf_build_expr_matches_join_build_expr(&build_expr, expected_build_expr) {
+            if !rf_build_expr_matches_join_build_expr(&rf.build_expr, expected_build_expr) {
                 tracing::debug!(
                     "skip runtime filter {filter_id}: build expr does not match join build key"
                 );
@@ -2390,7 +2383,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             }
 
             let build_texpr = match ExprCompiler::new(self.state.slot_allocator(), build_scope)
-                .compile_typed(&build_expr)
+                .compile_typed(&rf.build_expr)
             {
                 Ok(t) => t,
                 Err(err) => {
@@ -2401,16 +2394,19 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 }
             };
 
-            let probe_target = self.state.rf_probe_targets().get(&filter_id).cloned();
-            let has_remote_targets = probe_target
-                .as_ref()
-                .map(|t| t.fragment_id != join_fragment)
-                .unwrap_or(false);
+            let probe_targets = self
+                .state
+                .rf_probe_targets()
+                .get(&filter_id)
+                .cloned()
+                .unwrap_or_default();
+            let has_remote_targets = rf
+                .target_fragment_ids
+                .iter()
+                .any(|fragment_id| *fragment_id != join_fragment);
 
-            let effective_distribution = execution_distribution
-                .unwrap_or_else(|| legacy_rf_distribution_to_execution(&rf.distribution));
             let (build_join_mode, local_layout, global_layout) =
-                rf_layout_for_execution_distribution(effective_distribution);
+                rf_layout_for_join_execution_mode(rf.execution_mode);
 
             let layout = runtime_filter::TRuntimeFilterLayout::new(
                 filter_id,
@@ -2426,7 +2422,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             );
 
             let mut target_map = BTreeMap::new();
-            if let Some(target) = &probe_target {
+            for target in &probe_targets {
                 target_map.insert(target.thrift_node_id, target.probe_texpr.clone());
             }
 
@@ -2462,7 +2458,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 .entry(join_fragment)
                 .or_default()
                 .push(filter_id);
-            if let Some(target) = &probe_target {
+            for target in &probe_targets {
                 self.state
                     .rf_probe_side_filters()
                     .entry(target.fragment_id)
@@ -4628,6 +4624,10 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         plan_node.node_id = set_op_node_id;
         plan_node.node_type = match kind {
             super::kind::SetOpKind::UnionAll => plan_nodes::TPlanNodeType::UNION_NODE,
+            super::kind::SetOpKind::UnionDistinct => unreachable!(
+                "{}",
+                crate::sql::planner::union_distinct_must_be_rewritten_error()
+            ),
             super::kind::SetOpKind::Intersect => plan_nodes::TPlanNodeType::INTERSECT_NODE,
             super::kind::SetOpKind::Except => plan_nodes::TPlanNodeType::EXCEPT_NODE,
         };
@@ -4639,6 +4639,10 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             super::kind::SetOpKind::UnionAll => {
                 plan_node.union_node = Some(tnode);
             }
+            super::kind::SetOpKind::UnionDistinct => unreachable!(
+                "{}",
+                crate::sql::planner::union_distinct_must_be_rewritten_error()
+            ),
             super::kind::SetOpKind::Intersect => {
                 plan_node.intersect_node = Some(plan_nodes::TIntersectNode {
                     tuple_id: tnode.tuple_id,
@@ -4808,8 +4812,53 @@ fn change_event_branch_kind_to_thrift(
     }
 }
 
+fn join_distribution_mode_from_planner_execution(
+    execution_mode: Option<JoinExecutionMode>,
+    fallback: &JoinDistribution,
+) -> plan_nodes::TJoinDistributionMode {
+    match execution_mode {
+        Some(JoinExecutionMode::Broadcast) => plan_nodes::TJoinDistributionMode::BROADCAST,
+        Some(JoinExecutionMode::Partitioned) => plan_nodes::TJoinDistributionMode::PARTITIONED,
+        Some(JoinExecutionMode::Colocate) => plan_nodes::TJoinDistributionMode::COLOCATE,
+        None => match fallback {
+            JoinDistribution::Broadcast => plan_nodes::TJoinDistributionMode::BROADCAST,
+            JoinDistribution::Shuffle => plan_nodes::TJoinDistributionMode::PARTITIONED,
+            JoinDistribution::Colocate => plan_nodes::TJoinDistributionMode::COLOCATE,
+            JoinDistribution::Unknown => plan_nodes::TJoinDistributionMode::BROADCAST,
+        },
+    }
+}
+
+fn rf_layout_for_join_execution_mode(
+    execution_mode: JoinExecutionMode,
+) -> (
+    crate::thrift::runtime_filter::TRuntimeFilterBuildJoinMode,
+    crate::thrift::runtime_filter::TRuntimeFilterLayoutMode,
+    crate::thrift::runtime_filter::TRuntimeFilterLayoutMode,
+) {
+    use crate::thrift::runtime_filter::{TRuntimeFilterBuildJoinMode, TRuntimeFilterLayoutMode};
+
+    match execution_mode {
+        JoinExecutionMode::Broadcast => (
+            TRuntimeFilterBuildJoinMode::BORADCAST,
+            TRuntimeFilterLayoutMode::SINGLETON,
+            TRuntimeFilterLayoutMode::SINGLETON,
+        ),
+        JoinExecutionMode::Partitioned => (
+            TRuntimeFilterBuildJoinMode::PARTITIONED,
+            TRuntimeFilterLayoutMode::SINGLETON,
+            TRuntimeFilterLayoutMode::GLOBAL_SHUFFLE_1L,
+        ),
+        JoinExecutionMode::Colocate => (
+            TRuntimeFilterBuildJoinMode::COLOCATE,
+            TRuntimeFilterLayoutMode::SINGLETON,
+            TRuntimeFilterLayoutMode::GLOBAL_BUCKET_1L,
+        ),
+    }
+}
+
 fn first_tuple_id(
-    node: &crate::sql::planner::DistributedPlanNode,
+    node: &crate::sql::planner::DistributedNode,
     operator_name: &str,
 ) -> Result<i32, String> {
     node.tuple_ids.first().copied().ok_or_else(|| {
@@ -4821,12 +4870,12 @@ fn first_tuple_id(
 }
 
 fn binary_children<'a>(
-    node: &'a crate::sql::planner::DistributedPlanNode,
+    node: &'a crate::sql::planner::DistributedNode,
     operator_name: &str,
 ) -> Result<
     (
-        &'a crate::sql::planner::DistributedPlanNode,
-        &'a crate::sql::planner::DistributedPlanNode,
+        &'a crate::sql::planner::DistributedNode,
+        &'a crate::sql::planner::DistributedNode,
     ),
     String,
 > {
@@ -5162,11 +5211,11 @@ mod tests {
     use crate::sql::codegen::ir::kind::{
         DistributedExchangeNode, DistributedValuesNode, ExchangeFlavor,
         PhysicalHashAggregateNode as DistributedHashAggregateNode, PhysicalHashJoinEqCondition,
-        PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
+        PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode, SetOpKind,
     };
     use crate::sql::codegen::ir::{
-        DataPartition, DataSink, DistributedPlan, DistributedPlanKind, DistributedPlanNode,
-        PartitionKind, PlanFragment, PlanNodeStats, build_distributed_plan,
+        DataPartition, DataSink, DistributedNode, DistributedPayload, DistributedPlan,
+        PartitionKind, PlanFragment,
     };
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
@@ -5181,8 +5230,15 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
-    use crate::sql::planner::plan::AggregateCall;
+    use crate::sql::planner::plan::{AggregateCall, PhysicalPlanKind};
+    use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
     use crate::thrift::plan_nodes::TPlanNodeType;
+
+    fn build_distributed_plan(plan: &OptimizerPhysicalNode) -> Result<DistributedPlan, String> {
+        let physical =
+            crate::sql::planner::optimizer_bridge::physical::optimizer_physical_to_plan(plan)?;
+        crate::sql::planner::build_distributed_plan(&physical)
+    }
 
     #[test]
     fn aggregate_slot_contract_uses_intermediate_only_for_non_finalize() {
@@ -5990,7 +6046,8 @@ mod tests {
         );
 
         let mut mismatched_source = distributed_values_multi_fragment_plan();
-        let DistributedPlanKind::Exchange(exchange) = &mut mismatched_source.fragments[1].root.kind
+        let DistributedPayload::Exchange(exchange) =
+            &mut mismatched_source.fragments[1].root.payload
         else {
             panic!("root should be exchange");
         };
@@ -6010,6 +6067,63 @@ mod tests {
         assert_lowering_err(
             &disconnected_noop,
             "disconnected non-root fragment id=0 has no outgoing edge toward root fragment id=1",
+        );
+    }
+
+    #[test]
+    fn lower_set_op_node_rejects_union_distinct_before_lowering_children() {
+        let output_columns = vec![output_col(1, "u", DataType::Int64, false)];
+        let malformed_child = DistributedNode {
+            node_id: 11,
+            fragment_id: 0,
+            tuple_ids: vec![11],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+            children: vec![],
+            stats: distributed_stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::SetOp(PhysicalSetOpNode {
+                kind: SetOpKind::UnionAll,
+                output_columns: output_columns.clone(),
+                child_output_columns: vec![],
+            })),
+        };
+        let root = DistributedNode {
+            node_id: 10,
+            fragment_id: 0,
+            tuple_ids: vec![10],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+            children: vec![malformed_child],
+            stats: distributed_stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::SetOp(PhysicalSetOpNode {
+                kind: SetOpKind::UnionDistinct,
+                output_columns: output_columns.clone(),
+                child_output_columns: vec![output_columns.clone()],
+            })),
+        };
+        let dp = DistributedPlan {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root,
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns,
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        };
+
+        assert_lowering_err(
+            &dp,
+            crate::sql::planner::union_distinct_must_be_rewritten_error(),
         );
     }
 
@@ -6057,7 +6171,6 @@ mod tests {
             ],
             root_fragment_id: 1,
             edges: vec![fragment_edge(0, 1, 20)],
-            scalar_arena: Arc::new(ScalarArena::new()),
         }
     }
 
@@ -6107,7 +6220,6 @@ mod tests {
             ],
             root_fragment_id: 2,
             edges: vec![fragment_edge(0, 1, 30), fragment_edge(1, 2, 20)],
-            scalar_arena: Arc::new(ScalarArena::new()),
         }
     }
 
@@ -6137,22 +6249,23 @@ mod tests {
         fragment_id: u32,
         tuple_id: i32,
         columns: Vec<OutputColumn>,
-    ) -> DistributedPlanNode {
-        DistributedPlanNode {
+    ) -> DistributedNode {
+        DistributedNode {
             node_id,
             fragment_id,
             tuple_ids: vec![tuple_id],
             nullable_tuple_ids: vec![],
             limit: -1,
-            execution_join_distribution: None,
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
             children: vec![],
-            stats: PlanNodeStats::from_statistics(&Statistics::default()),
-            kind: DistributedPlanKind::Values(DistributedValuesNode {
-                rows: vec![],
-                columns,
-            }),
+            stats: distributed_stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                DistributedValuesNode {
+                    rows: vec![],
+                    columns,
+                },
+            )),
         }
     }
 
@@ -6161,19 +6274,18 @@ mod tests {
         fragment_id: u32,
         source_tuple_id: i32,
         source_fragment_id: u32,
-    ) -> DistributedPlanNode {
-        DistributedPlanNode {
+    ) -> DistributedNode {
+        DistributedNode {
             node_id,
             fragment_id,
             tuple_ids: vec![source_tuple_id],
             nullable_tuple_ids: vec![],
             limit: -1,
-            execution_join_distribution: None,
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
             children: vec![],
-            stats: PlanNodeStats::from_statistics(&Statistics::default()),
-            kind: DistributedPlanKind::Exchange(DistributedExchangeNode {
+            stats: distributed_stats(),
+            payload: DistributedPayload::Exchange(DistributedExchangeNode {
                 partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
                 partition_exprs: vec![],
                 source_fragment_id,
@@ -6181,6 +6293,16 @@ mod tests {
                 output_qualifier: None,
                 flavor: ExchangeFlavor::Distribution,
             }),
+        }
+    }
+
+    fn distributed_stats() -> PhysicalPlanStats {
+        PhysicalPlanStats {
+            output_row_count: 0.0,
+            row_count_confidence: PlannerConfidence::Fallback,
+            column_statistics: Default::default(),
+            cost_estimate: None,
+            broadcast_decision: None,
         }
     }
 

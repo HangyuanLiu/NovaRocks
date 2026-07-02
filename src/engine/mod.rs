@@ -2884,7 +2884,9 @@ fn explain_analyze_query(
         mv_candidates,
     )?;
 
-    let dp = build_distributed_plan(&physical)?;
+    let planner_physical =
+        crate::sql::planner::optimizer_bridge::physical::optimizer_physical_to_plan(&physical)?;
+    let dp = build_distributed_plan(&planner_physical)?;
     let build_result =
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
             &physical,
@@ -3048,7 +3050,9 @@ fn explain_query(
     if matches!(level, ExplainLevel::Costs) {
         lines.extend(query_stats.snapshot.display_rows());
     }
-    let dp = build_distributed_plan(&physical)?;
+    let planner_physical =
+        crate::sql::planner::optimizer_bridge::physical::optimizer_physical_to_plan(&physical)?;
+    let dp = build_distributed_plan(&planner_physical)?;
     lines.extend(explain_distributed_plan(&dp, level));
 
     build_string_query_result("Explain String", lines)

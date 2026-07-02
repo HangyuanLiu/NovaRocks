@@ -1,10 +1,7 @@
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::operator::JoinDistribution;
-use crate::sql::optimizer::physical_tree::JoinExecutionDistribution;
 use crate::thrift::exprs;
-use crate::thrift::plan_nodes;
 
 // ---------------------------------------------------------------------------
 // Scan/join ownership metadata (used by RF planning)
@@ -145,65 +142,4 @@ pub(in crate::sql::codegen) fn rf_build_expr_matches_join_build_expr(
     collect_rf_column_refs(candidate, &mut candidate_refs);
     collect_rf_column_refs(expected, &mut expected_refs);
     !expected_refs.is_empty() && candidate_refs == expected_refs
-}
-
-pub(in crate::sql::codegen) fn join_distribution_mode_from_execution(
-    execution_distribution: Option<JoinExecutionDistribution>,
-    fallback: &JoinDistribution,
-) -> plan_nodes::TJoinDistributionMode {
-    match execution_distribution {
-        Some(JoinExecutionDistribution::Broadcast) => plan_nodes::TJoinDistributionMode::BROADCAST,
-        Some(JoinExecutionDistribution::Partitioned) => {
-            plan_nodes::TJoinDistributionMode::PARTITIONED
-        }
-        Some(JoinExecutionDistribution::Colocate) => plan_nodes::TJoinDistributionMode::COLOCATE,
-        None => match fallback {
-            JoinDistribution::Broadcast => plan_nodes::TJoinDistributionMode::BROADCAST,
-            JoinDistribution::Shuffle => plan_nodes::TJoinDistributionMode::PARTITIONED,
-            JoinDistribution::Colocate => plan_nodes::TJoinDistributionMode::COLOCATE,
-            JoinDistribution::Unknown => plan_nodes::TJoinDistributionMode::BROADCAST,
-        },
-    }
-}
-
-pub(in crate::sql::codegen) fn legacy_rf_distribution_to_execution(
-    distribution: &JoinDistribution,
-) -> JoinExecutionDistribution {
-    match distribution {
-        JoinDistribution::Broadcast | JoinDistribution::Unknown => {
-            JoinExecutionDistribution::Broadcast
-        }
-        JoinDistribution::Shuffle => JoinExecutionDistribution::Partitioned,
-        JoinDistribution::Colocate => JoinExecutionDistribution::Colocate,
-    }
-}
-
-/// Map execution join distribution to the thrift RF
-/// `(build_join_mode, local_layout, global_layout)` triple.
-pub(in crate::sql::codegen) fn rf_layout_for_execution_distribution(
-    distribution: JoinExecutionDistribution,
-) -> (
-    crate::thrift::runtime_filter::TRuntimeFilterBuildJoinMode,
-    crate::thrift::runtime_filter::TRuntimeFilterLayoutMode,
-    crate::thrift::runtime_filter::TRuntimeFilterLayoutMode,
-) {
-    use crate::thrift::runtime_filter::{TRuntimeFilterBuildJoinMode, TRuntimeFilterLayoutMode};
-
-    match distribution {
-        JoinExecutionDistribution::Broadcast => (
-            TRuntimeFilterBuildJoinMode::BORADCAST,
-            TRuntimeFilterLayoutMode::SINGLETON,
-            TRuntimeFilterLayoutMode::SINGLETON,
-        ),
-        JoinExecutionDistribution::Partitioned => (
-            TRuntimeFilterBuildJoinMode::PARTITIONED,
-            TRuntimeFilterLayoutMode::SINGLETON,
-            TRuntimeFilterLayoutMode::GLOBAL_SHUFFLE_1L,
-        ),
-        JoinExecutionDistribution::Colocate => (
-            TRuntimeFilterBuildJoinMode::COLOCATE,
-            TRuntimeFilterLayoutMode::SINGLETON,
-            TRuntimeFilterLayoutMode::GLOBAL_BUCKET_1L,
-        ),
-    }
 }

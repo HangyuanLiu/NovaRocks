@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::sql::analysis::TypedExpr;
 use crate::sql::codegen::scalar_materialize::{
     materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
@@ -178,6 +179,34 @@ impl BridgeCtx<'_> {
                 grouping_fn_ids: op.grouping_fn_ids.clone(),
                 virtual_tuple_id: None,
             })),
+            Operator::PhysicalChangeEventExpand(op) => {
+                let events = op
+                    .events
+                    .iter()
+                    .map(|event| DistributedChangeEventSpec {
+                        predicate: event
+                            .predicate
+                            .map(|predicate| materialize(self.scalars, predicate)),
+                        branch_kind: event.branch_kind,
+                        assignments: event
+                            .assignments
+                            .iter()
+                            .map(|assignment| DistributedChangeEventOutputExpr {
+                                output_column_id: assignment.output_column_id,
+                                expr: assignment.expr.map(|expr| materialize(self.scalars, expr)),
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                Ok(PhysicalPlanKind::ChangeEventExpand(
+                    DistributedChangeEventExpandNode {
+                        events,
+                        output_columns: op.output_columns.clone(),
+                        change_op_column_id: op.change_op_column_id,
+                        data_route_column_id: op.data_route_column_id,
+                    },
+                ))
+            }
             Operator::PhysicalWindow(op) => Ok(PhysicalPlanKind::Window(PlanWindowNode {
                 window_exprs: materialize_window_exprs(
                     self.scalars,
@@ -187,14 +216,15 @@ impl BridgeCtx<'_> {
                 output_columns: op.output_columns.clone(),
             })),
             Operator::PhysicalUnion(op) => {
-                if !op.all {
-                    return Err(
-                        "Bridge 2a cannot model UNION DISTINCT without fragment rewrites"
-                            .to_string(),
-                    );
-                }
+                // PIR-4 M1 only carries the UNION DISTINCT semantic marker through Bridge 2a.
+                // The optimizer rewrite to aggregate is the real fix; builder-side expansion is M3e.
+                let kind = if op.all {
+                    PlanSetOpKind::UnionAll
+                } else {
+                    PlanSetOpKind::UnionDistinct
+                };
                 Ok(PhysicalPlanKind::SetOp(PhysicalSetOpNode {
-                    kind: PlanSetOpKind::UnionAll,
+                    kind,
                     output_columns: op.output_columns.clone(),
                     child_output_columns: op.child_output_columns.clone(),
                 }))
@@ -248,8 +278,15 @@ impl BridgeCtx<'_> {
                 }))
             }
             Operator::PhysicalDistribution(op) => {
+                let mode = redistribute_mode(op)?;
+                let child = node.children.first().ok_or_else(|| {
+                    "Bridge 2a invalid PhysicalDistribution shape: expected 1 children, got 0"
+                        .to_string()
+                })?;
+                let partition_exprs = redistribute_partition_exprs(self.scalars, &mode, child);
                 Ok(PhysicalPlanKind::Redistribute(RedistributeNode {
-                    mode: redistribute_mode(op)?,
+                    mode,
+                    partition_exprs,
                     output_columns: node.output_columns.clone(),
                 }))
             }
@@ -277,6 +314,7 @@ fn validate_shape(node: &OptimizerPhysicalNode) -> Result<(), String> {
         | Operator::PhysicalAssertOneRow(_)
         | Operator::PhysicalDecode(_)
         | Operator::PhysicalRepeat(_)
+        | Operator::PhysicalChangeEventExpand(_)
         | Operator::PhysicalWindow(_)
         | Operator::PhysicalTableFunction(_)
         | Operator::PhysicalCTEProduce(_)
@@ -355,6 +393,7 @@ fn operator_name(op: &Operator) -> &'static str {
         Operator::PhysicalCTEProduce(_) => "PhysicalCTEProduce",
         Operator::PhysicalCTEConsume(_) => "PhysicalCTEConsume",
         Operator::PhysicalRepeat(_) => "PhysicalRepeat",
+        Operator::PhysicalChangeEventExpand(_) => "PhysicalChangeEventExpand",
         Operator::PhysicalUnion(_) => "PhysicalUnion",
         Operator::PhysicalIntersect(_) => "PhysicalIntersect",
         Operator::PhysicalExcept(_) => "PhysicalExcept",
@@ -411,6 +450,36 @@ fn redistribute_mode(op: &PhysicalDistributionOp) -> Result<RedistributeMode, St
             "Bridge 2a cannot convert PhysicalDistribution with DistributionSpec::Any".to_string(),
         ),
     }
+}
+
+fn redistribute_partition_exprs(
+    scalars: &ScalarArena,
+    mode: &RedistributeMode,
+    child: &OptimizerPhysicalNode,
+) -> Vec<TypedExpr> {
+    let RedistributeMode::Hash { cols, .. } = mode else {
+        return Vec::new();
+    };
+    let Operator::PhysicalHashAggregate(aggregate) = &child.op else {
+        return Vec::new();
+    };
+
+    let mut exprs = Vec::with_capacity(cols.len());
+    for col_id in cols {
+        let Some(position) = aggregate
+            .output_layout
+            .group_key_columns
+            .iter()
+            .position(|column| column.column_id == *col_id)
+        else {
+            return Vec::new();
+        };
+        let Some(group_by) = aggregate.group_by.get(position) else {
+            return Vec::new();
+        };
+        exprs.push(materialize(scalars, *group_by));
+    }
+    exprs
 }
 
 fn planner_confidence(confidence: Confidence) -> PlannerConfidence {
@@ -493,10 +562,12 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::common::{JoinKind, OutputColumn};
+    use crate::sql::common::{ChangeStreamBranchKind, JoinKind, OutputColumn};
     use crate::sql::optimizer::operator::{
-        JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinEqCondition,
-        PhysicalHashJoinOp, UnionOp, ValuesOp,
+        AggMode, AggregateOutputLayout, ChangeEventExpandOp, ChangeEventOutputExpr,
+        ChangeEventSpec, JoinDistribution, Operator, PhysicalDistributionOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, UnionOp,
+        ValuesOp,
     };
     use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
     use crate::sql::optimizer::property::{DistributionSpec, HashSource, PhysicalPropertySet};
@@ -529,6 +600,17 @@ mod tests {
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
             is_internal: false,
+        }
+    }
+
+    fn assert_output_columns_eq(actual: &[OutputColumn], expected: &[OutputColumn]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert_eq!(actual.column_id, expected.column_id);
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.data_type, expected.data_type);
+            assert_eq!(actual.nullable, expected.nullable);
+            assert_eq!(actual.is_internal, expected.is_internal);
         }
     }
 
@@ -646,7 +728,10 @@ mod tests {
                 source: HashSource::ShuffleJoin,
             },
         }));
-        node.children.push(raw_values_node());
+        node.output_columns = vec![output_column(7, "parent_k")];
+        let mut child = raw_values_node();
+        child.output_columns = vec![output_column(7, "child_k")];
+        node.children.push(child);
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
         let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
@@ -660,11 +745,140 @@ mod tests {
                 source: HashSource::ShuffleJoin,
             }
         );
+        assert!(redistribute.partition_exprs.is_empty());
+        assert_output_columns_eq(
+            &redistribute.output_columns,
+            &[output_column(7, "parent_k")],
+        );
         assert_eq!(physical.children.len(), 1);
         assert!(matches!(
             physical.children[0].kind,
             PhysicalPlanKind::Values(_)
         ));
+    }
+
+    #[test]
+    fn physical_distribution_over_aggregate_carries_group_key_partition_expr() {
+        let mut arena = ScalarArena::new();
+        let group_expr = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId::new_for_test(7),
+                    qualifier: Some("a".to_string()),
+                    column: "k".to_string(),
+                },
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+            },
+        );
+        let group_column = output_column(7, "k");
+        let mut aggregate = base_node(Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::Local,
+            group_by: vec![group_expr],
+            aggregates: vec![],
+            output_layout: AggregateOutputLayout::new(vec![group_column.clone()], vec![]),
+            output_columns: vec![group_column.clone()],
+            is_merge: vec![],
+        }));
+        aggregate.children.push(raw_values_node());
+        let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
+            spec: DistributionSpec::HashPartitioned {
+                cols: vec![ColumnId::new_for_test(7)],
+                source: HashSource::ShuffleAgg,
+            },
+        }));
+        node.output_columns = vec![group_column];
+        node.children.push(aggregate);
+        let node = attach_arena(node, Arc::new(arena));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
+            panic!("expected Redistribute");
+        };
+
+        assert_eq!(redistribute.partition_exprs.len(), 1);
+        let ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column,
+        } = &redistribute.partition_exprs[0].kind
+        else {
+            panic!("expected partition ColumnRef");
+        };
+        assert_eq!(*column_id, ColumnId::new_for_test(7));
+        assert_eq!(qualifier.as_deref(), Some("a"));
+        assert_eq!(column, "k");
+    }
+
+    #[test]
+    fn bridge_converts_change_event_expand() {
+        let mut arena = ScalarArena::new();
+        let predicate = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_expr(1, "matched"),
+        );
+        let assignment =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &int_expr(42));
+        let mut node = base_node(Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
+            events: vec![ChangeEventSpec {
+                predicate: Some(predicate),
+                branch_kind: ChangeStreamBranchKind::FreshData,
+                assignments: vec![ChangeEventOutputExpr {
+                    output_column_id: ColumnId::new_for_test(2),
+                    expr: Some(assignment),
+                }],
+            }],
+            output_columns: vec![output_column(2, "payload")],
+            change_op_column_id: ColumnId::new_for_test(3),
+            data_route_column_id: Some(ColumnId::new_for_test(4)),
+        }));
+        node.children.push(raw_values_node());
+        let node = attach_arena(node, Arc::new(arena));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let PhysicalPlanKind::ChangeEventExpand(expand) = physical.kind else {
+            panic!("expected ChangeEventExpand");
+        };
+        assert_eq!(physical.children.len(), 1);
+        assert!(matches!(
+            physical.children[0].kind,
+            PhysicalPlanKind::Values(_)
+        ));
+        assert_eq!(expand.events.len(), 1);
+        assert_eq!(
+            expand.events[0].branch_kind,
+            ChangeStreamBranchKind::FreshData
+        );
+        assert_eq!(expand.events[0].assignments.len(), 1);
+        assert_eq!(
+            expand.events[0].assignments[0].output_column_id,
+            ColumnId::new_for_test(2)
+        );
+        assert!(matches!(
+            expand.events[0].assignments[0]
+                .expr
+                .as_ref()
+                .expect("assignment should materialize")
+                .kind,
+            ExprKind::Literal(LiteralValue::Int(42))
+        ));
+        assert_column_ref(
+            expand.events[0]
+                .predicate
+                .as_ref()
+                .expect("predicate should materialize"),
+            1,
+            "matched",
+        );
+        assert_eq!(expand.output_columns.len(), 1);
+        assert_eq!(
+            expand.output_columns[0].column_id,
+            ColumnId::new_for_test(2)
+        );
+        assert_eq!(expand.output_columns[0].name, "payload");
+        assert_eq!(expand.change_op_column_id, ColumnId::new_for_test(3));
+        assert_eq!(expand.data_route_column_id, Some(ColumnId::new_for_test(4)));
     }
 
     #[test]
@@ -759,6 +973,45 @@ mod tests {
         let err = optimizer_physical_to_plan(&node).expect_err("set-op metadata is required");
         assert!(err.contains("PhysicalUnion"));
         assert!(err.contains("child_output_columns metadata expected 2 entries, got 0"));
+    }
+
+    #[test]
+    fn bridge_translates_union_distinct_to_setop_marker() {
+        let output_columns = vec![output_column(1, "u")];
+        let child_output_columns = vec![vec![output_column(2, "c0")], vec![output_column(3, "c1")]];
+        let mut node = base_node(Operator::PhysicalUnion(UnionOp {
+            all: false,
+            output_columns: output_columns.clone(),
+            child_output_columns: child_output_columns.clone(),
+        }));
+        node.children.push(raw_values_node());
+        node.children.push(raw_values_node());
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let PhysicalPlanKind::SetOp(set_op) = physical.kind else {
+            panic!("expected SetOp");
+        };
+        assert_eq!(set_op.kind, PlanSetOpKind::UnionDistinct);
+        assert_output_columns_eq(&set_op.output_columns, &output_columns);
+        assert_eq!(
+            set_op.child_output_columns.len(),
+            child_output_columns.len()
+        );
+        for (actual, expected) in set_op
+            .child_output_columns
+            .iter()
+            .zip(child_output_columns.iter())
+        {
+            assert_output_columns_eq(actual, expected);
+        }
+        assert_eq!(physical.children.len(), 2);
+        assert!(
+            physical
+                .children
+                .iter()
+                .all(|child| matches!(child.kind, PhysicalPlanKind::Values(_)))
+        );
     }
 
     fn hash_join_with_runtime_filter(

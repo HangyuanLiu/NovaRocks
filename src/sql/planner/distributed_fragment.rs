@@ -2,10 +2,8 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
 use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::scalar::ScalarArena;
-use std::sync::Arc;
 
-use super::distributed_node::DistributedPlanNode;
+use super::distributed_node::DistributedNode;
 
 #[derive(Clone, Debug)]
 pub(crate) enum PartitionKind {
@@ -58,7 +56,7 @@ pub(crate) enum DataSink {
 #[derive(Clone, Debug)]
 pub(crate) struct PlanFragment {
     pub fragment_id: FragmentId,
-    pub root: DistributedPlanNode,
+    pub root: DistributedNode,
     pub data_partition: DataPartition,
     pub output_partition: DataPartition,
     pub sink: DataSink,
@@ -73,5 +71,4 @@ pub(crate) struct DistributedPlan {
     pub fragments: Vec<PlanFragment>,
     pub root_fragment_id: FragmentId,
     pub edges: Vec<crate::sql::codegen::FragmentEdge>,
-    pub scalar_arena: Arc<ScalarArena>,
 }

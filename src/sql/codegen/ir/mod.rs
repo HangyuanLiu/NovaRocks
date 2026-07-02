@@ -8,11 +8,9 @@ pub(crate) mod lowering;
 pub(crate) mod equiv;
 
 #[cfg(test)]
-pub(crate) use crate::sql::planner::DistributedPlanKind;
-#[cfg(test)]
 pub(crate) use crate::sql::planner::{
-    DataPartition, DataSink, DistributedPlan, DistributedPlanNode, PartitionKind, PlanFragment,
-    PlanNodeStats, build_distributed_plan,
+    DataPartition, DataSink, DistributedNode, DistributedPayload, DistributedPlan, PartitionKind,
+    PlanFragment,
 };
 pub(crate) use explain::{explain_distributed_plan, explain_distributed_plan_analyze};
 pub(crate) use lowering::lower_distributed_plan;
@@ -24,9 +22,9 @@ mod tests {
     #[test]
     fn bridge2_owner_modules_are_split_into_files() {
         for module_file in [
-            "distributed_build.rs",
             "distributed_fragment.rs",
             "distributed_node.rs",
+            "distributed_plan_build.rs",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("src/sql/planner")
