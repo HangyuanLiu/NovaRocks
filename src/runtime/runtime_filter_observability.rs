@@ -26,6 +26,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use crate::runtime::profile::RuntimeProfile;
+use crate::thrift::metrics;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct QueryKey {
     pub hi: i64,
@@ -87,6 +90,47 @@ impl RuntimeFilterLifecycleRegistry {
 
     pub fn remove_query(&self, query: QueryKey) {
         rw_write(&self.queries).remove(&query);
+    }
+
+    pub(crate) fn export_to_profile(&self, query: QueryKey, profile: &RuntimeProfile) {
+        let Some(snapshot) = self.snapshot(query) else {
+            return;
+        };
+        if snapshot.filters.is_empty() {
+            return;
+        }
+
+        let rf_profile = profile.child("RuntimeFilters");
+        let mut filters = snapshot.filters.iter().collect::<Vec<_>>();
+        filters.sort_by_key(|(filter_id, _)| **filter_id);
+        for (filter_id, record) in filters {
+            let filter_profile = rf_profile.child(format!("Filter{filter_id}"));
+            filter_profile.counter_set_unit("Planned", i64::from(record.planned));
+            if let Some(built) = record.built {
+                filter_profile.counter_set_unit("BuiltRows", built.rows);
+                filter_profile.counter_set_bytes("BuiltBytes", built.bytes);
+            }
+            filter_profile.counter_set_unit("SentPartials", record.sent_partials);
+            filter_profile.counter_set_bytes("SentBytes", record.sent_bytes);
+            filter_profile.counter_set_unit("MergedReceived", record.merged_received());
+            filter_profile.counter_set_unit("MergedExpected", record.merged_expected());
+            filter_profile.counter_set_unit("Delivered", i64::from(record.delivered));
+            if let Some(acquired) = record.acquired.as_ref() {
+                filter_profile.add_info_string("AcquireOutcome", acquired.outcome.clone());
+                filter_profile.counter_set(
+                    "AcquireLatency",
+                    metrics::TUnit::TIME_NS,
+                    acquired.latency_ns,
+                );
+            }
+            filter_profile.counter_set_unit("AppliedInputRows", record.applied_input_rows());
+            filter_profile.counter_set_unit("AppliedOutputRows", record.applied_output_rows());
+            filter_profile.counter_set_unit("AppliedEvals", record.applied_evals());
+            if !record.drop_reasons.is_empty() {
+                filter_profile
+                    .add_info_string("Dropped", format_drop_reasons(&record.drop_reasons));
+            }
+        }
     }
 
     fn query_entry(&self, query: QueryKey) -> Arc<QueryRfLifecycle> {
@@ -367,9 +411,21 @@ fn rw_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn format_drop_reasons(reasons: &[RfDropReason]) -> String {
+    reasons
+        .iter()
+        .map(|reason| match reason {
+            RfDropReason::SizeExceeded => "SizeExceeded",
+            RfDropReason::SendFailed => "SendFailed",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::profile::RuntimeProfile;
     use std::thread;
 
     #[test]
@@ -491,5 +547,47 @@ mod tests {
         assert_eq!(filter.applied_input_rows(), 16_000);
         assert_eq!(filter.applied_output_rows(), 8_000);
         assert_eq!(filter.applied_evals(), 8_000);
+    }
+
+    #[test]
+    fn export_builds_runtime_filters_subtree() {
+        let registry = RuntimeFilterLifecycleRegistry::new();
+        let q = QueryKey::from_hi_lo(1, 1);
+        let rec = registry.recorder(q);
+        rec.planned(7);
+        rec.built(7, 3, 128);
+        rec.sent_partial(7, 64);
+        rec.sent_partial(7, 64);
+        rec.merge_progress(7, 2, 2);
+        rec.delivered(7);
+        rec.acquired(7, "complete", 4_000);
+        rec.applied(7, 100, 60, 1);
+        rec.dropped(7, RfDropReason::SizeExceeded);
+
+        let profile = RuntimeProfile::new("Query");
+        registry.export_to_profile(q, &profile);
+
+        let child = profile.get_child("RuntimeFilters").expect("subtree");
+        let f = child.get_child("Filter7").expect("filter child");
+        assert_eq!(f.counter_value("Planned"), Some(1));
+        assert_eq!(f.counter_value("BuiltRows"), Some(3));
+        assert_eq!(f.counter_value("BuiltBytes"), Some(128));
+        assert_eq!(f.counter_value("SentPartials"), Some(2));
+        assert_eq!(f.counter_value("SentBytes"), Some(128));
+        assert_eq!(f.counter_value("MergedReceived"), Some(2));
+        assert_eq!(f.counter_value("MergedExpected"), Some(2));
+        assert_eq!(f.counter_value("Delivered"), Some(1));
+        assert_eq!(
+            f.get_info_string("AcquireOutcome").as_deref(),
+            Some("complete")
+        );
+        assert_eq!(f.counter_value("AcquireLatency"), Some(4_000));
+        assert_eq!(f.counter_value("AppliedInputRows"), Some(100));
+        assert_eq!(f.counter_value("AppliedOutputRows"), Some(60));
+        assert_eq!(f.counter_value("AppliedEvals"), Some(1));
+        assert_eq!(
+            f.get_info_string("Dropped").as_deref(),
+            Some("SizeExceeded")
+        );
     }
 }
