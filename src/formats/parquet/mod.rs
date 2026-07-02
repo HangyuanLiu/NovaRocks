@@ -341,6 +341,7 @@ fn runtime_filters_to_scan_predicates_with_counters(
             counters.unsupported += 1;
             continue;
         };
+        counters.range += 2;
         preds.push(ScanPredicate::from_min_max_predicate(
             MinMaxPredicate::Ge {
                 column: column.clone(),
@@ -4199,6 +4200,55 @@ mod tests {
             )),
         ));
         crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+    }
+
+    fn runtime_membership_filter_ctx_for_i32(
+        min: i32,
+        max: i32,
+    ) -> crate::exec::node::scan::RuntimeFilterContext {
+        use crate::exec::runtime_filter::{
+            RuntimeEmptyFilter, RuntimeFilterType, RuntimeMembershipFilter, RuntimeMinMaxFilter,
+            min_max::MinMaxValue,
+        };
+
+        let min_max = RuntimeMinMaxFilter::new(
+            RuntimeFilterType::Int32,
+            true,
+            MinMaxValue::Int32(min),
+            MinMaxValue::Int32(max),
+        );
+        let membership = RuntimeMembershipFilter::Empty(RuntimeEmptyFilter::new(
+            77,
+            SlotId::new(1),
+            RuntimeFilterType::Int32,
+            false,
+            0,
+            2,
+            min_max,
+        ));
+        let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
+            Vec::new(),
+            vec![membership],
+        );
+        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+    }
+
+    #[test]
+    fn runtime_membership_filter_min_max_records_range_predicates() {
+        let cfg = runtime_filter_row_group_scan_cfg();
+        let runtime_filters = runtime_membership_filter_ctx_for_i32(0, 99);
+        let mut counters = super::ScanPredicateCounters::default();
+
+        let predicates = super::runtime_filters_to_scan_predicates_with_counters(
+            &cfg,
+            &runtime_filters,
+            &mut counters,
+        )
+        .expect("runtime scan predicates");
+
+        assert_eq!(predicates.len(), 2);
+        assert_eq!(counters.range, 2);
+        assert_eq!(counters.unsupported, 0);
     }
 
     /// Opens a `ParquetScanIter` over the whole fixture file with the given

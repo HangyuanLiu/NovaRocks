@@ -678,8 +678,7 @@ impl RuntimeInFilterValues {
             }
             RuntimeInFilterValues::TimestampSecond(values)
             | RuntimeInFilterValues::TimestampMillisecond(values)
-            | RuntimeInFilterValues::TimestampMicrosecond(values)
-            | RuntimeInFilterValues::TimestampNanosecond(values) => {
+            | RuntimeInFilterValues::TimestampMicrosecond(values) => {
                 let map_unit = |v: &i64| -> Result<i64, String> {
                     timestamp_to_microseconds(*v, self.timestamp_unit()).ok_or_else(|| {
                         "runtime in-filter timestamp conversion overflow".to_string()
@@ -693,6 +692,14 @@ impl RuntimeInFilterValues {
                     (
                         MinMaxPredicateValue::DateTimeMicros(min),
                         MinMaxPredicateValue::DateTimeMicros(max),
+                    )
+                }))
+            }
+            RuntimeInFilterValues::TimestampNanosecond(values) => {
+                Ok(min_max_i64(values.iter().copied()).map(|(min, max)| {
+                    (
+                        MinMaxPredicateValue::DateTimeNanos(min),
+                        MinMaxPredicateValue::DateTimeNanos(max),
                     )
                 }))
             }
@@ -788,8 +795,7 @@ impl RuntimeInFilterValues {
             }),
             RuntimeInFilterValues::TimestampSecond(values)
             | RuntimeInFilterValues::TimestampMillisecond(values)
-            | RuntimeInFilterValues::TimestampMicrosecond(values)
-            | RuntimeInFilterValues::TimestampNanosecond(values) => {
+            | RuntimeInFilterValues::TimestampMicrosecond(values) => {
                 if values.is_empty() || values.len() > max_values {
                     return Ok(None);
                 }
@@ -802,6 +808,11 @@ impl RuntimeInFilterValues {
                     converted.push(MinMaxPredicateValue::DateTimeMicros(micros));
                 }
                 Ok(Some(converted))
+            }
+            RuntimeInFilterValues::TimestampNanosecond(values) => {
+                bounded_values(values, max_values, |value| {
+                    MinMaxPredicateValue::DateTimeNanos(*value)
+                })
             }
             RuntimeInFilterValues::Decimal128 {
                 values,
@@ -1246,6 +1257,49 @@ mod tests {
                 .scan_predicate_values(8)
                 .expect("scan predicate values")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_in_filter_timestamp_ns_discrete_values_keep_nanoseconds() {
+        let filter = RuntimeInFilter::new(
+            7,
+            SlotId::new(3),
+            RuntimeInFilterValues::TimestampNanosecond([1_000_000_000i64].into_iter().collect()),
+        );
+
+        let values = filter
+            .scan_predicate_values(8)
+            .expect("scan predicate values")
+            .expect("bounded set");
+
+        assert_eq!(
+            values,
+            vec![MinMaxPredicateValue::DateTimeNanos(1_000_000_000)]
+        );
+    }
+
+    #[test]
+    fn runtime_in_filter_timestamp_ns_envelope_values_keep_nanoseconds() {
+        let filter = RuntimeInFilter::new(
+            7,
+            SlotId::new(3),
+            RuntimeInFilterValues::TimestampNanosecond(
+                [2_000_000_000i64, 1_000_000_000i64].into_iter().collect(),
+            ),
+        );
+
+        let values = filter
+            .min_max_predicate_values()
+            .expect("min/max predicate values")
+            .expect("non-empty range");
+
+        assert_eq!(
+            values,
+            (
+                MinMaxPredicateValue::DateTimeNanos(1_000_000_000),
+                MinMaxPredicateValue::DateTimeNanos(2_000_000_000)
+            )
         );
     }
 }
