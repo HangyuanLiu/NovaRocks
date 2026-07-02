@@ -222,3 +222,77 @@ impl Default for Chunk {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Array, ArrayRef, DictionaryArray, LargeStringDictionaryBuilder};
+    use arrow::datatypes::{DataType, Field, Int32Type};
+
+    use super::{Chunk, ChunkSchema};
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::ChunkSlotSchema;
+
+    fn dict_utf8() -> ArrayRef {
+        Arc::new(
+            vec!["PAID", "NEW", "PAID"]
+                .into_iter()
+                .collect::<DictionaryArray<Int32Type>>(),
+        )
+    }
+
+    fn dict_large_utf8() -> ArrayRef {
+        let mut builder = LargeStringDictionaryBuilder::<Int32Type>::new();
+        builder.append_value("PAID");
+        builder.append_value("NEW");
+        builder.append_value("PAID");
+        Arc::new(builder.finish())
+    }
+
+    #[test]
+    fn chunk_string_slot_can_carry_dictionary_int32_string_column() {
+        for (slot_type, column) in [
+            (DataType::Utf8, dict_utf8()),
+            (DataType::LargeUtf8, dict_large_utf8()),
+        ] {
+            let dict_type = column.data_type().clone();
+            assert!(matches!(
+                dict_type,
+                DataType::Dictionary(ref key, ref value)
+                    if key.as_ref() == &DataType::Int32 && value.as_ref() == &slot_type
+            ));
+
+            let chunk_schema = Arc::new(
+                ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                    SlotId::new(3),
+                    Field::new("status", slot_type, false),
+                    None,
+                    None,
+                )])
+                .expect("chunk schema"),
+            );
+
+            let chunk =
+                Chunk::try_new_with_columns(chunk_schema, vec![column]).expect("dictionary chunk");
+
+            assert_eq!(chunk.len(), 3);
+            assert_eq!(chunk.columns()[0].data_type(), &dict_type);
+            assert_eq!(
+                chunk
+                    .chunk_schema()
+                    .slot(SlotId::new(3))
+                    .expect("slot schema")
+                    .data_type(),
+                &dict_type
+            );
+            assert_eq!(
+                chunk
+                    .column_by_slot_id(SlotId::new(3))
+                    .expect("column by slot")
+                    .data_type(),
+                &dict_type
+            );
+        }
+    }
+}
