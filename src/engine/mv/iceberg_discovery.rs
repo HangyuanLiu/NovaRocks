@@ -1,29 +1,22 @@
 //! Lake-native Iceberg MV package discovery.
 //!
-//! The lake carries enough structure to enumerate MV packages: MV target tables
-//! carry the inline descriptor.
+//! Discovery enumerates lake tables and uses the descriptor package-id marker
+//! before parsing the full descriptor.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, list_tables, load_table};
 use crate::engine::StandaloneState;
-use crate::meta::repository::mv_descriptor::{MV_DESCRIPTOR_INLINE_PROP, MvDescriptorV1};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IcebergMvDiscoverySource {
-    StorageTable,
-}
+use crate::meta::repository::mv_descriptor::{MV_DESCRIPTOR_PACKAGE_ID_PROP, MvDescriptorV1};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DiscoveredIcebergMv {
     pub(crate) catalog: String,
     pub(crate) namespace: String,
     pub(crate) public_name: String,
-    pub(crate) storage_table: String,
+    pub(crate) table: String,
     pub(crate) descriptor: MvDescriptorV1,
-    pub(crate) source: IcebergMvDiscoverySource,
 }
 
 pub(crate) fn discover_iceberg_mvs(
@@ -47,65 +40,40 @@ pub(crate) fn discover_iceberg_mvs_from_entry(
     namespace: &str,
 ) -> Result<Vec<DiscoveredIcebergMv>, String> {
     let mut discovered = Vec::new();
-    let mut seen_storage = BTreeSet::new();
-    discover_from_storage_tables(
-        entry,
-        catalog,
-        namespace,
-        &mut seen_storage,
-        &mut discovered,
-    )?;
+    for table in list_tables(entry, namespace)? {
+        let loaded = load_table(entry, namespace, &table)?;
+        let Some(descriptor) = descriptor_from_loaded_table(&loaded)? else {
+            continue;
+        };
+        let expected_package_id = format!("{namespace}.{table}");
+        if descriptor.package_id != expected_package_id {
+            return Err(format!(
+                "Iceberg MV descriptor package id mismatch for discovered table {catalog}.{namespace}.{table}: expected {expected_package_id}, got {}",
+                descriptor.package_id
+            ));
+        }
+        discovered.push(DiscoveredIcebergMv {
+            catalog: catalog.to_string(),
+            namespace: namespace.to_string(),
+            public_name: table.clone(),
+            table,
+            descriptor,
+        });
+    }
     discovered.sort_by(|left, right| {
         left.namespace
             .cmp(&right.namespace)
             .then(left.public_name.cmp(&right.public_name))
-            .then(left.storage_table.cmp(&right.storage_table))
+            .then(left.table.cmp(&right.table))
     });
     Ok(discovered)
-}
-
-fn discover_from_storage_tables(
-    entry: &IcebergCatalogEntry,
-    catalog: &str,
-    namespace: &str,
-    seen_storage: &mut BTreeSet<(String, String)>,
-    discovered: &mut Vec<DiscoveredIcebergMv>,
-) -> Result<(), String> {
-    let tables = list_tables(entry, namespace)?;
-    for storage_table in tables {
-        let key = (namespace.to_string(), storage_table.clone());
-        if seen_storage.contains(&key) {
-            continue;
-        }
-        let loaded = load_table(entry, namespace, &storage_table)?;
-        let Some(descriptor) = descriptor_from_loaded_table(&loaded)? else {
-            continue;
-        };
-        let expected_package_id = format!("{namespace}.{storage_table}");
-        if descriptor.package_id != expected_package_id {
-            return Err(format!(
-                "Iceberg MV descriptor package id mismatch for discovered table {catalog}.{namespace}.{storage_table}: expected {expected_package_id}, got {}",
-                descriptor.package_id
-            ));
-        }
-        seen_storage.insert(key);
-        discovered.push(DiscoveredIcebergMv {
-            catalog: catalog.to_string(),
-            namespace: namespace.to_string(),
-            public_name: storage_table.clone(),
-            storage_table,
-            descriptor,
-            source: IcebergMvDiscoverySource::StorageTable,
-        });
-    }
-    Ok(())
 }
 
 fn descriptor_from_loaded_table(
     loaded: &IcebergLoadedTable,
 ) -> Result<Option<MvDescriptorV1>, String> {
     let props = loaded.table.metadata().properties();
-    if !props.contains_key(MV_DESCRIPTOR_INLINE_PROP) {
+    if !props.contains_key(MV_DESCRIPTOR_PACKAGE_ID_PROP) {
         return Ok(None);
     }
     MvDescriptorV1::from_storage_properties(props).map(Some)

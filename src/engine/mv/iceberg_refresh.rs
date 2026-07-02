@@ -19041,8 +19041,9 @@ mod tests {
     }
 
     #[test]
-    fn discover_iceberg_mvs_recovers_storage_descriptor_from_lake() {
+    fn discover_iceberg_mvs_recovers_single_table_descriptor_from_lake() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "analytics", "plain_orders");
         create_base_table(&env.state, "ice", "sales", "orders");
         let stmt = parse_create_mv(
             "CREATE MATERIALIZED VIEW mv_orders
@@ -19060,15 +19061,18 @@ mod tests {
         )
         .expect("discover iceberg mvs");
         assert_eq!(discovered.len(), 1);
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|mv| mv.table.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mv_orders"]
+        );
         let mv = &discovered[0];
         assert_eq!(mv.catalog, "ice");
         assert_eq!(mv.namespace, "analytics");
+        assert_eq!(mv.table, "mv_orders");
         assert_eq!(mv.public_name, "mv_orders");
-        assert_eq!(mv.storage_table, "mv_orders");
-        assert_eq!(
-            mv.source,
-            crate::engine::mv::iceberg_discovery::IcebergMvDiscoverySource::StorageTable
-        );
         assert_eq!(mv.descriptor.package_id, "analytics.mv_orders");
         assert_eq!(mv.descriptor.base_dependencies[0].name.as_str(), "orders");
     }
