@@ -17,6 +17,7 @@ PLAN FRAGMENT 0
            predicates: CAST(a.k AS Int64) = 7 AND a.k IS NOT NULL
           probe runtime filters:
           - filter_id = 0, probe_expr = (a.k)
+          - filter_id = 1, probe_expr = (a.k)
       3:GATHER stats={rows=90000}
     6:GATHER stats={rows=90000}
 PLAN FRAGMENT 1
@@ -61,6 +62,7 @@ PLAN FRAGMENT 0
            predicates: CAST(a.k AS Int64) = 7 AND a.k IS NOT NULL
           probe runtime filters:
           - filter_id = 0, probe_expr = (a.k)
+          - filter_id = 1, probe_expr = (a.k)
       3:GATHER stats={rows=90000}
     6:GATHER stats={rows=90000}
 PLAN FRAGMENT 1

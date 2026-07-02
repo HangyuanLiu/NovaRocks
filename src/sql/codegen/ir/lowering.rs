@@ -2647,10 +2647,11 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 .get(&filter_id)
                 .cloned()
                 .unwrap_or_default();
-            let has_remote_targets = rf
-                .target_fragment_ids
-                .iter()
-                .any(|fragment_id| *fragment_id != join_fragment);
+            // A single build RF may drive probes in several fragments (M3
+            // bilateral placement across an equivalence class). If ANY probe
+            // target is in a different fragment than the build, the RF has a
+            // remote leg.
+            let has_remote_targets = probe_targets.iter().any(|t| t.fragment_id != join_fragment);
 
             let (build_join_mode, local_layout, global_layout) =
                 rf_layout_for_join_execution_mode(rf.execution_mode);
@@ -5614,6 +5615,69 @@ mod tests {
     ) -> Result<MultiFragmentBuildResult, String> {
         let dp = build_distributed_plan(plan)?;
         PlanFragmentBuilder::build(FragmentBuildRequest::result(&dp, catalog, connectors, None))
+    }
+
+    #[test]
+    fn rf_probe_targets_retain_multiple_targets_per_filter_id() {
+        use crate::sql::codegen::expr_compiler::int_literal_node;
+        use crate::sql::codegen::ir::lowering::LoweringStateAccess;
+        use crate::sql::codegen::runtime_filter_lowering::RfProbeTarget;
+        use crate::thrift::exprs;
+        use std::collections::BTreeMap;
+
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+
+        // The building join lives in fragment 0. One probe target is local
+        // (same fragment) and one is remote (fragment 1) — the M3 equivalence
+        // set can land probes in different fragments under one filter id.
+        let join_fragment = 0;
+        let filter_id = 7;
+        state
+            .rf_probe_targets()
+            .entry(filter_id)
+            .or_default()
+            .push(RfProbeTarget {
+                thrift_node_id: 100,
+                probe_texpr: exprs::TExpr::new(vec![int_literal_node(1)]),
+                fragment_id: join_fragment,
+            });
+        state
+            .rf_probe_targets()
+            .entry(filter_id)
+            .or_default()
+            .push(RfProbeTarget {
+                thrift_node_id: 200,
+                probe_texpr: exprs::TExpr::new(vec![int_literal_node(2)]),
+                fragment_id: 1,
+            });
+
+        let targets = state
+            .rf_probe_targets()
+            .get(&filter_id)
+            .cloned()
+            .expect("targets for filter id");
+        assert_eq!(
+            targets.len(),
+            2,
+            "both probe targets for one filter id must be retained, not overwritten"
+        );
+
+        // Reproduce the two production derivations that consume the Vec.
+        let has_remote_targets = targets.iter().any(|t| t.fragment_id != join_fragment);
+        assert!(
+            has_remote_targets,
+            "a cross-fragment probe target must set has_remote_targets"
+        );
+
+        let mut target_map = BTreeMap::new();
+        for target in &targets {
+            target_map.insert(target.thrift_node_id, target.probe_texpr.clone());
+        }
+        assert!(
+            target_map.contains_key(&100) && target_map.contains_key(&200),
+            "target_map must carry every probe target node for the filter id"
+        );
     }
 
     #[test]
