@@ -339,6 +339,97 @@ mod tests {
     }
 
     #[test]
+    fn hydrate_dictionary_columns_except_keeps_one_dictionary_slot_and_hydrates_another() {
+        let keep_slot_id = SlotId::new(1);
+        let hydrate_slot_id = SlotId::new(2);
+        let keep_column = dict_utf8_with_nulls_and_empty();
+        let hydrate_column = dict_utf8_with_nulls_and_empty();
+        let mut schema_metadata = std::collections::HashMap::new();
+        schema_metadata.insert("source".to_string(), "mixed-dict".to_string());
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new_with_schema_metadata(
+                vec![
+                    ChunkSlotSchema::new_with_field(
+                        keep_slot_id,
+                        Field::new("keep_status", keep_column.data_type().clone(), true),
+                        None,
+                        None,
+                    ),
+                    ChunkSlotSchema::new_with_field(
+                        hydrate_slot_id,
+                        Field::new("hydrate_status", hydrate_column.data_type().clone(), true),
+                        None,
+                        None,
+                    ),
+                ],
+                schema_metadata.clone(),
+            )
+            .expect("chunk schema"),
+        );
+        let batch = RecordBatch::try_new(
+            chunk_schema.arrow_schema_ref(),
+            vec![keep_column, hydrate_column],
+        )
+        .expect("record batch");
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+        assert_eq!(chunk.schema().metadata(), &schema_metadata);
+        assert_eq!(
+            chunk.chunk_schema().arrow_schema_ref().metadata(),
+            &schema_metadata
+        );
+
+        let hydrated = hydrate_dictionary_columns_except(&chunk, |slot, _dt| slot == keep_slot_id)
+            .expect("hydrate except kept slot");
+
+        assert!(matches!(
+            hydrated.columns()[0].data_type(),
+            DataType::Dictionary(key_type, value_type)
+                if key_type.as_ref() == &DataType::Int32 && value_type.as_ref() == &DataType::Utf8
+        ));
+        assert!(matches!(
+            hydrated.schema().fields()[0].data_type(),
+            DataType::Dictionary(key_type, value_type)
+                if key_type.as_ref() == &DataType::Int32 && value_type.as_ref() == &DataType::Utf8
+        ));
+        let kept_slot = hydrated
+            .chunk_schema()
+            .slot(keep_slot_id)
+            .expect("kept slot schema");
+        assert_eq!(kept_slot.slot_id(), keep_slot_id);
+        assert!(matches!(
+            kept_slot.data_type(),
+            DataType::Dictionary(key_type, value_type)
+                if key_type.as_ref() == &DataType::Int32 && value_type.as_ref() == &DataType::Utf8
+        ));
+
+        assert_eq!(hydrated.columns()[1].data_type(), &DataType::Utf8);
+        let hydrated_values = hydrated.columns()[1]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("hydrated string array");
+        assert_eq!(hydrated_values.value(0), "PAID");
+        assert!(hydrated_values.is_null(1));
+        assert_eq!(hydrated_values.value(2), "");
+        assert_eq!(hydrated_values.value(3), "NEW");
+        assert_eq!(hydrated.schema().fields()[1].data_type(), &DataType::Utf8);
+        let hydrated_slot = hydrated
+            .chunk_schema()
+            .slot(hydrate_slot_id)
+            .expect("hydrated slot schema");
+        assert_eq!(hydrated_slot.slot_id(), hydrate_slot_id);
+        assert_eq!(hydrated_slot.data_type(), &DataType::Utf8);
+        assert_eq!(
+            hydrated.chunk_schema().slot_ids(),
+            &[keep_slot_id, hydrate_slot_id]
+        );
+        assert_eq!(hydrated.schema().metadata(), &schema_metadata);
+        assert_eq!(
+            hydrated.chunk_schema().arrow_schema_ref().metadata(),
+            &schema_metadata
+        );
+    }
+
+    #[test]
     fn hydrate_dictionary_columns_except_preserves_schema_metadata_when_hydrating() {
         let slot_id = SlotId::new(23);
         let column = dict_utf8_with_nulls_and_empty();
