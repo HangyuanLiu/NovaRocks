@@ -817,7 +817,7 @@ impl AggregateStreamingSinkOperator {
         }
         for (idx, (expected_type, array)) in expected.iter().zip(arrays.iter()).enumerate() {
             let actual_type = array.data_type();
-            if !super::is_compatible_aggregate_data_type(expected_type, actual_type) {
+            if !super::is_compatible_aggregate_group_data_type(expected_type, actual_type) {
                 return Err(format!(
                     "group by type mismatch at {}: expected {:?}, got {:?}",
                     idx, expected_type, actual_type
