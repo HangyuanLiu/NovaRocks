@@ -492,6 +492,7 @@ mod tests {
             None::<i32>,
             None::<types::TNetworkAddress>,
             None::<bool>,
+            None::<bool>, // novarocks_generated_plan
         )
     }
 
