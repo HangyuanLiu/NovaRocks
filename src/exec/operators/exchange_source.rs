@@ -44,7 +44,9 @@ use crate::exec::runtime_filter::{
 };
 use crate::novarocks_logging::debug;
 use crate::runtime::exchange;
-use crate::runtime::runtime_filter_hub::{RuntimeFilterHub, RuntimeFilterProbe};
+use crate::runtime::runtime_filter_hub::{
+    AcquireProgress, AcquiredRuntimeFilters, RuntimeFilterHub, RuntimeFilterProbe,
+};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::thrift::metrics;
 
@@ -62,7 +64,9 @@ const JOIN_RUNTIME_FILTER_OUTPUT_ROWS: &str = "JoinRuntimeFilterOutputRows";
 const JOIN_RUNTIME_FILTER_EVALUATE: &str = "JoinRuntimeFilterEvaluate";
 const RUNTIME_FILTER_NUM: &str = "RuntimeFilterNum";
 const RUNTIME_IN_FILTER_NUM: &str = "RuntimeInFilterNum";
-const RUNTIME_FILTER_DEBUG_EVERY: u64 = 256;
+const RUNTIME_FILTER_PLANNED: &str = "RuntimeFilterPlanned";
+const RUNTIME_FILTER_COMPLETE: &str = "RuntimeFilterComplete";
+const RUNTIME_FILTER_UNAVAILABLE: &str = "RuntimeFilterUnavailable";
 
 /// Factory for exchange source operators that fetch and decode remote stream pages.
 pub struct ExchangeSourceFactory {
@@ -169,9 +173,8 @@ impl OperatorFactory for ExchangeSourceFactory {
             local_rf_deps: self.local_rf_deps(),
             runtime_filter_exprs: self.runtime_filter_exprs.clone(),
             runtime_filters_expected: self.runtime_filters_expected,
+            acquired: None,
             runtime_filters_loaded: false,
-            rf_debug_counter: 0,
-            rf_debug_last_version: 0,
             arena: Arc::clone(&self.arena),
             profiles: None,
             receiver_mem_tracker_ready: false,
@@ -196,9 +199,8 @@ struct ExchangeSourceOperator {
     local_rf_deps: Vec<crate::exec::pipeline::dependency::DependencyHandle>,
     runtime_filter_exprs: HashMap<i32, ExprId>,
     runtime_filters_expected: usize,
+    acquired: Option<AcquiredRuntimeFilters>,
     runtime_filters_loaded: bool,
-    rf_debug_counter: u64,
-    rf_debug_last_version: u64,
     arena: Arc<ExprArena>,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     receiver_mem_tracker_ready: bool,
@@ -210,15 +212,14 @@ struct ExchangeRuntimeFilterProbe {
 
 impl ExchangeRuntimeFilterProbe {
     fn dependency_or_timeout(&self) -> Option<crate::exec::pipeline::dependency::DependencyHandle> {
-        self.probe.dependency_or_timeout(false)
+        match self.poll_acquire() {
+            AcquireProgress::Pending(dep) => Some(dep),
+            AcquireProgress::Resolved(_) => None,
+        }
     }
 
-    fn dependency(&self) -> crate::exec::pipeline::dependency::DependencyHandle {
-        self.probe.dependency()
-    }
-
-    fn snapshot(&self) -> crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot {
-        self.probe.snapshot()
+    fn poll_acquire(&self) -> crate::runtime::runtime_filter_hub::AcquireProgress {
+        self.probe.poll_acquire(false)
     }
 
     fn mark_ready(&self) -> Option<Duration> {
@@ -460,6 +461,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
 impl ExchangeSourceOperator {
     fn load_runtime_filters_if_ready(&mut self) {
         let Some(rf) = self.runtime_filter_probe.as_ref() else {
+            self.acquired = None;
             self.runtime_filters_loaded = true;
             return;
         };
@@ -467,13 +469,14 @@ impl ExchangeSourceOperator {
             return;
         }
         if self.runtime_filters_expected == 0 {
+            self.acquired = None;
             self.runtime_filters_loaded = true;
             return;
         }
-        let dep = rf.dependency();
-        if !dep.is_ready() {
-            return;
-        }
+        let acquired = match rf.poll_acquire() {
+            AcquireProgress::Pending(_) => return,
+            AcquireProgress::Resolved(acquired) => acquired,
+        };
         if let Some(profile) = self.profiles.as_ref() {
             profile.common.add_timer(JOIN_RUNTIME_FILTER_TIME);
             profile.common.add_timer(JOIN_RUNTIME_FILTER_HASH_TIME);
@@ -493,28 +496,43 @@ impl ExchangeSourceOperator {
                 .common
                 .add_counter(RUNTIME_IN_FILTER_NUM, metrics::TUnit::UNIT);
         }
-        let snapshot = rf.snapshot();
-        if let Some(elapsed) = rf.mark_ready()
-            && let Some(profile) = self.profiles.as_ref()
-        {
-            let latency_ns = elapsed.as_nanos().min(i64::MAX as u128) as i64;
-            for filter in snapshot.in_filters() {
-                let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
-                profile
-                    .common
-                    .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
+        let (filter_num, in_filter_num) = match &acquired {
+            AcquiredRuntimeFilters::Complete(snapshot) => {
+                if let Some(elapsed) = rf.mark_ready()
+                    && let Some(profile) = self.profiles.as_ref()
+                {
+                    let latency_ns = elapsed.as_nanos().min(i64::MAX as u128) as i64;
+                    for filter in snapshot.in_filters() {
+                        let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
+                        profile
+                            .common
+                            .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
+                    }
+                    for filter in snapshot.membership_filters() {
+                        let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
+                        profile
+                            .common
+                            .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
+                    }
+                }
+                self.log_runtime_filters_loaded(
+                    snapshot.in_filters(),
+                    snapshot.membership_filters(),
+                );
+                (
+                    snapshot.membership_filters().len(),
+                    snapshot.in_filters().len(),
+                )
             }
-            for filter in snapshot.membership_filters() {
-                let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
-                profile
-                    .common
-                    .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
+            AcquiredRuntimeFilters::Unavailable(reason) => {
+                debug!(
+                    "exchange runtime filters unavailable: node_id={} expected={} reason={:?}",
+                    self.node.key.node_id, self.runtime_filters_expected, reason
+                );
+                (0, 0)
             }
-        }
-        self.log_runtime_filters_loaded(snapshot.in_filters(), snapshot.membership_filters());
+        };
         if let Some(profile) = self.profiles.as_ref() {
-            let filter_num = snapshot.membership_filters().len();
-            let in_filter_num = snapshot.in_filters().len();
             profile
                 .common
                 .counter_set(RUNTIME_FILTER_NUM, metrics::TUnit::UNIT, filter_num as i64);
@@ -523,7 +541,30 @@ impl ExchangeSourceOperator {
                 metrics::TUnit::UNIT,
                 in_filter_num as i64,
             );
+            profile
+                .common
+                .counter_set_unit(RUNTIME_FILTER_PLANNED, self.runtime_filters_expected as i64);
+            match &acquired {
+                AcquiredRuntimeFilters::Complete(snapshot) => {
+                    let complete =
+                        snapshot.in_filters().len() + snapshot.membership_filters().len();
+                    profile
+                        .common
+                        .counter_set_unit(RUNTIME_FILTER_COMPLETE, complete as i64);
+                    profile
+                        .common
+                        .counter_set_unit(RUNTIME_FILTER_UNAVAILABLE, 0);
+                }
+                AcquiredRuntimeFilters::Unavailable(_) => {
+                    profile.common.counter_set_unit(RUNTIME_FILTER_COMPLETE, 0);
+                    profile.common.counter_set_unit(
+                        RUNTIME_FILTER_UNAVAILABLE,
+                        self.runtime_filters_expected as i64,
+                    );
+                }
+            }
         }
+        self.acquired = Some(acquired);
         self.runtime_filters_loaded = true;
     }
 
@@ -572,34 +613,25 @@ impl ExchangeSourceOperator {
     }
 
     fn apply_runtime_filters(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
-        let expected_filters = self.runtime_filters_expected;
-        let Some(rf) = self.runtime_filter_probe.as_ref() else {
+        let Some(acquired) = self.acquired.as_ref() else {
             return Ok(Some(chunk));
         };
-        if expected_filters == 0 {
-            return Ok(Some(chunk));
-        }
-        let snapshot = rf.snapshot();
-        self.rf_debug_counter = self.rf_debug_counter.wrapping_add(1);
-        let version = rf.probe.handle().version();
-        if version != self.rf_debug_last_version
-            || self
-                .rf_debug_counter
-                .is_multiple_of(RUNTIME_FILTER_DEBUG_EVERY)
-        {
-            debug!(
-                "exchange runtime filter progress: node_id={} driver_id={} version={} in_filters={} membership_filters={} expected={} counter={}",
-                self.node.key.node_id,
-                self.driver_id,
-                version,
-                snapshot.in_filters().len(),
-                snapshot.membership_filters().len(),
-                expected_filters,
-                self.rf_debug_counter
-            );
-            self.rf_debug_last_version = version;
-        }
         let input_rows = chunk.len();
+        let AcquiredRuntimeFilters::Complete(snapshot) = acquired else {
+            if let Some(profile) = self.profiles.as_ref() {
+                profile.common.counter_add(
+                    JOIN_RUNTIME_FILTER_INPUT_ROWS,
+                    metrics::TUnit::UNIT,
+                    input_rows as i64,
+                );
+                profile.common.counter_add(
+                    JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
+                    metrics::TUnit::UNIT,
+                    input_rows as i64,
+                );
+            }
+            return Ok(Some(chunk));
+        };
         if snapshot.is_empty() {
             if let Some(profile) = self.profiles.as_ref() {
                 profile.common.counter_add(
@@ -672,5 +704,159 @@ impl ExchangeSourceOperator {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use arrow::array::{Array, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::node::RuntimeFilterProbeSpec;
+    use crate::exec::node::join::JoinRuntimeFilterSpec;
+    use crate::exec::runtime_filter::{
+        LocalRuntimeInFilterSet, RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeEmptyFilter,
+        RuntimeFilterType, RuntimeMembershipFilter, RuntimeMinMaxFilter,
+    };
+    use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
+
+    fn int32_chunk(values: Vec<i32>) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let array = Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("test batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn int32_values(chunk: &Chunk) -> Vec<i32> {
+        let array = chunk
+            .column_by_slot_id(SlotId::new(1))
+            .expect("slot column");
+        let ints = array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 array");
+        (0..ints.len()).map(|row| ints.value(row)).collect()
+    }
+
+    fn in_filter(filter_id: i32, values: Vec<i32>) -> Vec<RuntimeInFilter> {
+        let spec = JoinRuntimeFilterSpec {
+            filter_id,
+            expr_order: 0,
+            probe_slot_id: SlotId::new(1),
+            build_data_type: DataType::Int32,
+            merge_nodes: Vec::new(),
+            has_remote_targets: false,
+        };
+        let array = Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef;
+        let mut set =
+            LocalRuntimeInFilterSet::new(std::slice::from_ref(&spec), std::slice::from_ref(&array))
+                .expect("in filter set");
+        set.add_build_arrays(std::slice::from_ref(&array))
+            .expect("add build values");
+        set.into_filters()
+    }
+
+    fn complete_membership_filter(filter_id: i32) -> RuntimeMembershipFilter {
+        let min_max =
+            RuntimeMinMaxFilter::full_range(RuntimeFilterType::Int32).expect("min/max range");
+        RuntimeMembershipFilter::Empty(RuntimeEmptyFilter::new(
+            filter_id,
+            SlotId::new(1),
+            RuntimeFilterType::Int32,
+            false,
+            RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+            0,
+            min_max,
+        ))
+    }
+
+    #[test]
+    fn exchange_runtime_filters_use_frozen_snapshot_after_load() {
+        let hub =
+            RuntimeFilterHub::new(crate::exec::pipeline::dependency::DependencyManager::new());
+        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
+
+        let mut arena = ExprArena::default();
+        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        hub.register_probe_specs(
+            42,
+            &[RuntimeFilterProbeSpec {
+                filter_id: 7,
+                expr_id: expr,
+                slot_id: SlotId::new(1),
+                data_type: DataType::Int32,
+            }],
+        );
+        let probe = hub.register_probe(42);
+        hub.publish_filters(&[], &[complete_membership_filter(7)]);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let node = ExchangeSourceNode::new(
+            exchange::ExchangeKey {
+                finst_id_hi: 0,
+                finst_id_lo: 0,
+                node_id: 42,
+            },
+            1,
+            Duration::from_secs(60),
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema"),
+        );
+        let mut operator = ExchangeSourceOperator {
+            name: "exchange".to_string(),
+            node,
+            driver_id: 0,
+            receiver: None,
+            start: None,
+            finished: false,
+            logged_first_pull: false,
+            logged_first_none: false,
+            runtime_filter_probe: Some(ExchangeRuntimeFilterProbe { probe }),
+            local_rf_deps: Vec::new(),
+            runtime_filter_exprs: HashMap::from([(7, expr)]),
+            runtime_filters_expected: 1,
+            acquired: None,
+            runtime_filters_loaded: false,
+            arena: Arc::new(arena),
+            profiles: Some(crate::runtime::profile::OperatorProfiles::new(
+                crate::runtime::profile::RuntimeProfile::new("exchange"),
+            )),
+            receiver_mem_tracker_ready: false,
+        };
+        operator.load_runtime_filters_if_ready();
+        let profiles = operator.profiles.as_ref().expect("test profiles");
+        assert_eq!(
+            profiles.common.counter_value(RUNTIME_FILTER_PLANNED),
+            Some(1)
+        );
+        assert_eq!(
+            profiles.common.counter_value(RUNTIME_FILTER_COMPLETE),
+            Some(1)
+        );
+        assert_eq!(
+            profiles.common.counter_value(RUNTIME_FILTER_UNAVAILABLE),
+            Some(0)
+        );
+
+        let late_in_filters = in_filter(7, vec![2]);
+        hub.publish_filters(&late_in_filters, &[]);
+
+        let filtered = operator
+            .apply_runtime_filters(int32_chunk(vec![1, 2, 3]))
+            .expect("apply runtime filters")
+            .expect("frozen snapshot should not include the late in-filter");
+        assert_eq!(int32_values(&filtered), vec![1, 2, 3]);
     }
 }

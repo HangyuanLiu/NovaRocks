@@ -1,0 +1,13 @@
+-- query 8
+oid	customer_id
+1	2
+2	4
+3	8
+5	4
+
+-- query 10
+oid	customer_id
+1	2
+2	4
+3	8
+5	4

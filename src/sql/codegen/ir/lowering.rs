@@ -33,7 +33,8 @@ use crate::sql::codegen::iceberg_write_sink_wire::{
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
 use crate::sql::codegen::runtime_filter_lowering::{
-    RfProbeTarget, remap_rf_expr_order, rf_build_expr_matches_join_build_expr, rf_pipeline_dop,
+    RfProbeTarget, local_rf_waiting_sets, remap_rf_expr_order,
+    rf_build_expr_matches_join_build_expr, rf_pipeline_dop,
 };
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
@@ -76,7 +77,19 @@ pub(crate) fn lower_distributed_plan(
     state.fragment_stack.clear();
 
     let edges = lower_fragment_edges(dp, &mut state)?;
-    let lowered_fragments = std::mem::take(&mut state.lowered_fragments);
+    let rf_builds = state.rf_build_targets.clone();
+    let rf_probes: Vec<(i32, i32, FragmentId)> = state
+        .rf_probe_targets
+        .iter()
+        .flat_map(|(filter_id, targets)| {
+            targets
+                .iter()
+                .map(move |target| (*filter_id, target.thrift_node_id, target.fragment_id))
+        })
+        .collect();
+    let local_rf_waits = local_rf_waiting_sets(&rf_builds, &rf_probes);
+    let mut lowered_fragments = std::mem::take(&mut state.lowered_fragments);
+    apply_local_rf_waiting_sets(&mut lowered_fragments, &local_rf_waits);
 
     let mut prepared_fragments = Vec::with_capacity(lowered_fragments.len());
     for (fragment, lowered) in lowered_fragments {
@@ -168,6 +181,26 @@ pub(crate) fn lower_distributed_plan(
             })
         },
     })
+}
+
+fn apply_local_rf_waiting_sets(
+    lowered_fragments: &mut [(crate::sql::planner::PlanFragment, LoweredDistributedNode)],
+    local_rf_waits: &HashMap<i32, Vec<i32>>,
+) {
+    if local_rf_waits.is_empty() {
+        return;
+    }
+    for (_, lowered) in lowered_fragments {
+        for node in &mut lowered.plan_nodes {
+            let Some(build_node_ids) = local_rf_waits.get(&node.node_id) else {
+                continue;
+            };
+            if build_node_ids.is_empty() {
+                continue;
+            }
+            node.local_rf_waiting_set = Some(build_node_ids.iter().copied().collect());
+        }
+    }
 }
 
 fn validate_distributed_plan(
@@ -1068,6 +1101,7 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     fn rf_all_filters(
         &mut self,
     ) -> &mut HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>;
+    fn rf_build_targets(&mut self) -> &mut Vec<(i32, i32, FragmentId)>;
     fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>>;
     fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>>;
     fn alloc_slot(&mut self) -> i32;
@@ -1141,6 +1175,7 @@ pub(crate) struct OwnedLoweringState<'a> {
     slot_to_global_dict: HashMap<i32, crate::thrift::data::TGlobalDict>,
     rf_probe_targets: HashMap<i32, Vec<RfProbeTarget>>,
     rf_all_filters: HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>,
+    rf_build_targets: Vec<(i32, i32, FragmentId)>,
     rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
     rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
     lowered_fragment_outputs: HashMap<FragmentId, LoweredFragmentOutput>,
@@ -1176,6 +1211,7 @@ impl<'a> OwnedLoweringState<'a> {
             slot_to_global_dict: HashMap::new(),
             rf_probe_targets: HashMap::new(),
             rf_all_filters: HashMap::new(),
+            rf_build_targets: Vec::new(),
             rf_build_side_filters: HashMap::new(),
             rf_probe_side_filters: HashMap::new(),
             lowered_fragment_outputs: HashMap::new(),
@@ -1308,6 +1344,10 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
         &mut self,
     ) -> &mut HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription> {
         &mut self.rf_all_filters
+    }
+
+    fn rf_build_targets(&mut self) -> &mut Vec<(i32, i32, FragmentId)> {
+        &mut self.rf_build_targets
     }
 
     fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>> {
@@ -2660,6 +2700,9 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
             descs.push(desc.clone());
             self.state.rf_all_filters().insert(filter_id, desc);
+            self.state
+                .rf_build_targets()
+                .push((filter_id, join_node_id, join_fragment));
             self.state
                 .rf_build_side_filters()
                 .entry(join_fragment)
@@ -5553,7 +5596,9 @@ mod tests {
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
     use crate::sql::planner::plan::{AggregateCall, PhysicalPlanKind};
-    use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::{
+        JoinExecutionMode, PhysicalPlanStats, PlannerConfidence, WiredRuntimeFilterBuild,
+    };
     use crate::thrift::plan_nodes::TPlanNodeType;
 
     fn build_distributed_plan(plan: &OptimizerPhysicalNode) -> Result<DistributedPlan, String> {
@@ -6072,6 +6117,61 @@ mod tests {
         let hash_join = plan_node.hash_join_node.expect("hash join node");
         assert_eq!(hash_join.eq_join_conjuncts.len(), 1);
         assert!(hash_join.other_join_conjuncts.is_none());
+    }
+
+    #[test]
+    fn right_semi_hash_join_lowers_runtime_filter_on_execution_build_side() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let (_, _, left_key, right_key, left_scope, right_scope) =
+            hash_join_test_inputs(&mut state);
+        state.fragment_stack.push(0);
+
+        let op = PhysicalHashJoinNode {
+            join_type: JoinKind::RightSemi,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: left_key.clone(),
+                right: right_key.clone(),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+            execution_mode: None,
+            build_runtime_filters: Vec::new(),
+        };
+        let runtime_filter = WiredRuntimeFilterBuild {
+            filter_id: 17,
+            build_expr: right_key,
+            probe_expr: left_key,
+            expr_order: 0,
+            execution_mode: JoinExecutionMode::Broadcast,
+            source_fragment_id: 0,
+            target_fragment_ids: vec![0],
+        };
+
+        let hash_join = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_hash_join(
+                10,
+                &[1],
+                &[2],
+                &op,
+                left_scope,
+                right_scope,
+                None,
+                &[runtime_filter],
+            )
+            .expect("lower right semi hash join")
+            .0
+            .hash_join_node
+            .expect("hash join payload")
+        };
+        let filters = hash_join
+            .build_runtime_filters
+            .expect("right semi RF should lower to thrift");
+
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].filter_id, Some(17));
     }
 
     fn cte_receive_distributed_plan_for_lowering_test(

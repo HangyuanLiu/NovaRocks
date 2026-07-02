@@ -255,8 +255,7 @@ impl RuntimeFilterWorker {
                 ..Default::default()
             };
             let dest_port = prober.port() as u16;
-            if let Err(e) = exchange_sender::send_runtime_filter(prober.hostname(), dest_port, req)
-            {
+            if let Err(e) = send_final_runtime_filter(prober.hostname(), dest_port, req) {
                 warn!(
                     "send runtime filter failed: dest={} filter_id={} err={}",
                     prober.hostname(),
@@ -266,6 +265,24 @@ impl RuntimeFilterWorker {
             }
         }
     }
+}
+
+#[cfg(not(test))]
+fn send_final_runtime_filter(
+    hostname: &str,
+    port: u16,
+    req: PTransmitRuntimeFilterParams,
+) -> Result<(), String> {
+    exchange_sender::send_runtime_filter(hostname, port, req)
+}
+
+#[cfg(test)]
+fn send_final_runtime_filter(
+    hostname: &str,
+    port: u16,
+    req: PTransmitRuntimeFilterParams,
+) -> Result<(), String> {
+    tests::send_final_runtime_filter_for_test(hostname, port, req)
 }
 
 #[derive(Clone)]
@@ -362,5 +379,154 @@ fn encode_membership_filter(filter: &RuntimeMembershipFilter) -> Result<Vec<u8>,
         RuntimeMembershipFilter::Bloom(bloom) => encode_starrocks_bloom_filter(bloom),
         RuntimeMembershipFilter::Empty(empty) => encode_starrocks_empty_filter(empty),
         RuntimeMembershipFilter::Bitset(bitset) => encode_starrocks_bitset_filter(bitset),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use arrow::datatypes::DataType;
+
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::node::join::JoinRuntimeFilterSpec;
+    use crate::exec::pipeline::dependency::DependencyManager;
+    use crate::exec::runtime_filter::{
+        RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeEmptyFilter, RuntimeFilterType,
+        RuntimeMinMaxFilter,
+    };
+
+    type SendHook =
+        Box<dyn Fn(&str, u16, PTransmitRuntimeFilterParams) -> Result<(), String> + 'static>;
+
+    thread_local! {
+        static FINAL_SEND_HOOK: RefCell<Option<SendHook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn send_final_runtime_filter_for_test(
+        hostname: &str,
+        port: u16,
+        params: PTransmitRuntimeFilterParams,
+    ) -> Result<(), String> {
+        FINAL_SEND_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                return hook(hostname, port, params);
+            }
+            exchange_sender::send_runtime_filter(hostname, port, params)
+        })
+    }
+
+    struct FinalSendHookGuard {
+        previous: Option<SendHook>,
+    }
+
+    impl Drop for FinalSendHookGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            FINAL_SEND_HOOK.with(|hook| {
+                *hook.borrow_mut() = previous;
+            });
+        }
+    }
+
+    fn install_final_send_hook(hook: SendHook) -> FinalSendHookGuard {
+        let previous = FINAL_SEND_HOOK.with(|slot| slot.borrow_mut().replace(hook));
+        FinalSendHookGuard { previous }
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedFinalRuntimeFilterSend {
+        hostname: String,
+        port: u16,
+        params: PTransmitRuntimeFilterParams,
+    }
+
+    #[test]
+    fn receive_partial_does_not_broadcast_until_all_builders_arrive() {
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let sends_capture = Arc::clone(&sends);
+        let _hook_guard = install_final_send_hook(Box::new(move |hostname, port, params| {
+            sends_capture
+                .lock()
+                .expect("captured runtime filter sends lock")
+                .push(CapturedFinalRuntimeFilterSend {
+                    hostname: hostname.to_string(),
+                    port,
+                    params,
+                });
+            Ok(())
+        }));
+
+        let filter_id = 1;
+        let slot_id = SlotId::new(7);
+        let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+        hub.register_filter_specs(
+            100,
+            &[JoinRuntimeFilterSpec {
+                filter_id,
+                expr_order: 0,
+                probe_slot_id: slot_id,
+                build_data_type: DataType::Int32,
+                merge_nodes: Vec::new(),
+                has_remote_targets: true,
+            }],
+        );
+
+        let params = RuntimeFilterWorkerParams::new(
+            HashMap::from([(
+                filter_id,
+                vec![RuntimeFilterProberTarget::new("127.0.0.1", 18030)],
+            )]),
+            HashMap::from([(filter_id, 2)]),
+            None,
+        );
+        let worker = RuntimeFilterWorker::new(QueryId { hi: 123, lo: 456 }, params, hub);
+        let first = encoded_empty_membership_partial(filter_id, slot_id);
+        let second = encoded_empty_membership_partial(filter_id, slot_id);
+
+        worker
+            .receive_partial(filter_id, &first, 10, Some(DataType::Int32))
+            .expect("first partial");
+        assert!(
+            sends
+                .lock()
+                .expect("captured runtime filter sends lock")
+                .is_empty(),
+            "first of two build BE partials must not broadcast a final filter"
+        );
+
+        worker
+            .receive_partial(filter_id, &second, 11, Some(DataType::Int32))
+            .expect("second partial");
+        let sends = sends.lock().expect("captured runtime filter sends lock");
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].hostname, "127.0.0.1");
+        assert_eq!(sends[0].port, 18030);
+        assert_eq!(sends[0].params.is_partial, Some(false));
+        assert_eq!(sends[0].params.filter_id, Some(filter_id));
+        assert_eq!(
+            sends[0].params.query_id.as_ref().map(|id| (id.hi, id.lo)),
+            Some((123, 456))
+        );
+        assert!(sends[0].params.data.is_some());
+    }
+
+    fn encoded_empty_membership_partial(filter_id: i32, slot_id: SlotId) -> Vec<u8> {
+        let min_max =
+            RuntimeMinMaxFilter::full_range(RuntimeFilterType::Int32).expect("min/max range");
+        let filter = RuntimeEmptyFilter::new(
+            filter_id,
+            slot_id,
+            RuntimeFilterType::Int32,
+            false,
+            RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+            0,
+            min_max,
+        );
+        encode_starrocks_empty_filter(&filter).expect("encode empty filter")
     }
 }

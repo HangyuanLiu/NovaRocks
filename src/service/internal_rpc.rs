@@ -232,22 +232,35 @@ pub(crate) fn handle_transmit_runtime_filter(
         return response;
     }
 
-    let Some(hub) = query_context_manager().get_runtime_filter_hub(query_id) else {
-        response.status = Some(error_status(format!(
-            "runtime filter hub not found: query_id={}",
-            query_id
-        )));
-        return response;
-    };
-
-    if let Err(err) = hub.receive_remote_filter(filter_id, payload) {
+    if let Err(err) = receive_total_runtime_filter(query_id, filter_id, params.is_partial, payload)
+    {
         warn!(
-            "receive_remote_filter failed: query_id={} filter_id={} err={}",
+            "receive_total_runtime_filter failed: query_id={} filter_id={} err={}",
             query_id, filter_id, err
         );
         response.status = Some(error_status(err));
     }
     response
+}
+
+fn receive_total_runtime_filter(
+    query_id: QueryId,
+    filter_id: i32,
+    is_partial: Option<bool>,
+    payload: &[u8],
+) -> Result<(), String> {
+    // Complete-only contract (P0a section 5.4): the prober install path only handles
+    // TOTAL filters. Partial filters must be routed to the merge node above.
+    if is_partial.unwrap_or(false) {
+        return Err(
+            "runtime filter contract violation: partial filter reached prober install path"
+                .to_string(),
+        );
+    }
+    let Some(hub) = query_context_manager().get_runtime_filter_hub(query_id) else {
+        return Err(format!("runtime filter hub not found: query_id={query_id}"));
+    };
+    hub.receive_remote_filter(filter_id, payload)
 }
 
 pub(crate) fn handle_lookup(
@@ -347,7 +360,7 @@ mod tests {
 
     use super::{
         decode_column_ipc, encode_column_ipc, handle_lookup, handle_transmit_chunk,
-        handle_transmit_runtime_filter,
+        handle_transmit_runtime_filter, receive_total_runtime_filter,
     };
     use crate::cache::CacheOptions;
     use crate::common::ids::SlotId;
@@ -882,6 +895,53 @@ mod tests {
         let snapshot = probe.snapshot();
         assert_eq!(snapshot.in_filters().len(), 1);
         assert_eq!(snapshot.in_filters()[0].filter_id(), 7);
+    }
+
+    #[test]
+    fn prober_install_path_rejects_partial_filter() {
+        let query_id = QueryId { hi: 301, lo: 401 };
+        query_context_manager()
+            .ensure_context(
+                query_id,
+                false,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+            .expect("ensure query context");
+        let hub = Arc::new(crate::runtime::runtime_filter_hub::RuntimeFilterHub::new(
+            crate::exec::pipeline::dependency::DependencyManager::new(),
+        ));
+        hub.register_probe_specs(
+            88,
+            &[RuntimeFilterProbeSpec {
+                filter_id: 7,
+                expr_id: ExprId(0),
+                slot_id: SlotId::new(11),
+                data_type: arrow::datatypes::DataType::Int32,
+            }],
+        );
+        let probe = hub.register_probe(88);
+        query_context_manager()
+            .with_context_mut(query_id, |ctx| {
+                ctx.set_runtime_filter_hub(Arc::clone(&hub));
+                Ok(())
+            })
+            .expect("install runtime filter hub");
+
+        let filter =
+            RuntimeInFilter::empty(7, SlotId::new(11), &DataType::Int32).expect("empty in filter");
+        let payload = encode_starrocks_in_filter(&filter).expect("encode runtime filter");
+        let err = receive_total_runtime_filter(query_id, 7, Some(true), &payload)
+            .expect_err("partial must not be installed on the prober path");
+
+        assert!(
+            err.contains("partial filter reached prober install path"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            probe.snapshot().is_empty(),
+            "partial reaching the prober path must not update the probe handle"
+        );
     }
 
     #[test]

@@ -30,6 +30,33 @@ pub(in crate::sql::codegen) fn rf_pipeline_dop() -> i32 {
         .unwrap_or(4) as i32
 }
 
+/// For each probe target node, collect the build plan-node ids whose RF it
+/// consumes and that live in the same fragment. Cross-fragment RFs are remote
+/// waits and must not enter the local wait set.
+pub(in crate::sql::codegen) fn local_rf_waiting_sets(
+    builds: &[(i32, i32, FragmentId)],
+    probes: &[(i32, i32, FragmentId)],
+) -> std::collections::HashMap<i32, Vec<i32>> {
+    use std::collections::HashMap;
+
+    let mut by_probe_node: HashMap<i32, Vec<i32>> = HashMap::new();
+    for (probe_filter_id, probe_node_id, probe_fragment_id) in probes {
+        for (build_filter_id, build_node_id, build_fragment_id) in builds {
+            if probe_filter_id == build_filter_id && probe_fragment_id == build_fragment_id {
+                by_probe_node
+                    .entry(*probe_node_id)
+                    .or_default()
+                    .push(*build_node_id);
+            }
+        }
+    }
+    for build_nodes in by_probe_node.values_mut() {
+        build_nodes.sort_unstable();
+        build_nodes.dedup();
+    }
+    by_probe_node
+}
+
 /// Remap a runtime filter's `expr_order` from the join's PRE-demote
 /// `op.eq_conditions` index space to the POST-demote `eq_join_conjuncts`
 /// index space that BE lowering indexes (`src/lower/node/hash_join.rs`).
@@ -142,4 +169,23 @@ pub(in crate::sql::codegen) fn rf_build_expr_matches_join_build_expr(
     collect_rf_column_refs(candidate, &mut candidate_refs);
     collect_rf_column_refs(expected, &mut expected_refs);
     !expected_refs.is_empty() && candidate_refs == expected_refs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_rf_waiting_sets_include_only_same_fragment_builds() {
+        let builds = vec![(7, 300, 0), (7, 100, 0), (7, 100, 0), (8, 200, 1)];
+        let probes = vec![(7, 10, 0), (8, 20, 0)];
+
+        let sets = local_rf_waiting_sets(&builds, &probes);
+
+        assert_eq!(sets.get(&10).map(Vec::as_slice), Some(&[100, 300][..]));
+        assert!(
+            !sets.contains_key(&20),
+            "cross-fragment RF must not be a local wait"
+        );
+    }
 }
