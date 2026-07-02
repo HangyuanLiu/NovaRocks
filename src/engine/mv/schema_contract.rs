@@ -639,6 +639,28 @@ fn row_lineage_enabled(props: &std::collections::HashMap<String, String>) -> boo
         .unwrap_or(false)
 }
 
+/// Assert the lake descriptor's schema contract matches the store's contract.
+/// Fail-loud: the descriptor is the authoritative home (W2); a missing or
+/// drifted descriptor contract means a create/alter path failed to sync it.
+pub(crate) fn ensure_descriptor_schema_contract_matches(
+    descriptor_contract: Option<&MvSchemaContract>,
+    stored_contract: &MvSchemaContract,
+) -> Result<(), String> {
+    match descriptor_contract {
+        None => Err(
+            "MV descriptor is missing its schema_contract; expected a W2+ MV package \
+             (create/alter must sync the descriptor)"
+                .to_string(),
+        ),
+        Some(found) if found != stored_contract => Err(
+            "MV descriptor schema_contract drifted from the metadata store; \
+             a create/alter path failed to keep the descriptor in sync"
+                .to_string(),
+        ),
+        Some(_) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1419,5 +1441,30 @@ mod tests {
                 partition: None,
             },
         }
+    }
+
+    #[test]
+    fn descriptor_contract_matching_store_is_ok() {
+        let stored = minimal_base_row_id_contract();
+        let descriptor = minimal_base_row_id_contract();
+        assert!(ensure_descriptor_schema_contract_matches(Some(&descriptor), &stored).is_ok());
+    }
+
+    #[test]
+    fn descriptor_contract_missing_is_fail_loud() {
+        let stored = minimal_base_row_id_contract();
+        let err = ensure_descriptor_schema_contract_matches(None, &stored)
+            .expect_err("missing descriptor contract must fail");
+        assert!(err.contains("missing"), "err={err}");
+    }
+
+    #[test]
+    fn descriptor_contract_drift_is_fail_loud() {
+        let stored = minimal_base_row_id_contract();
+        let mut descriptor = minimal_base_row_id_contract();
+        descriptor.contract_version += 1;
+        let err = ensure_descriptor_schema_contract_matches(Some(&descriptor), &stored)
+            .expect_err("drifted descriptor contract must fail");
+        assert!(err.contains("drifted"), "err={err}");
     }
 }

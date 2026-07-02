@@ -1,8 +1,8 @@
 //! Test-only server half of the W0 IMV statelessness harness.
 //!
 //! `novarocks_imv_stateless_rebuild` is a probe that rediscovers an MV
-//! package's descriptor **purely from the lake** (Iceberg projection view
-//! marker + storage-table inline descriptor properties, never SQLite) and
+//! package's descriptor **purely from the lake** (MV table descriptor
+//! properties, never SQLite) and
 //! returns a one-row report describing the fidelity level the server can
 //! currently reconstruct plus the descriptor content hash.
 //!
@@ -23,7 +23,7 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::engine::mv::iceberg_discovery::{IcebergMvDiscoverySource, discover_iceberg_mvs};
+use crate::engine::mv::iceberg_discovery::discover_iceberg_mvs;
 use crate::engine::procedure::CallProcedureStmt;
 use crate::engine::{
     QueryResult, QueryResultColumn, StandaloneState, StatementResult, record_batch_to_chunk,
@@ -135,8 +135,8 @@ fn execute_request(
     req: &ImvStatelessRebuildRequest,
 ) -> Result<StatementResult, String> {
     // Discovering the MV package and reading its descriptor IS the lake
-    // rebuild: both walk the Iceberg projection view / storage table and never
-    // consult SQLite. If either fails, fail loud.
+    // rebuild: it walks the Iceberg MV table descriptor and never consults
+    // SQLite. If it fails, fail loud.
     let discovered = discover_iceberg_mvs(state, &req.catalog, &req.namespace)?;
     let mv = discovered
         .into_iter()
@@ -152,10 +152,7 @@ fn execute_request(
     // W1 landed the package descriptor, so the package level is reconstructable
     // today. W3a/W4 will raise this to provenance/full.
     let available = StatelessLevel::Package;
-    let rebuild_source = match mv.source {
-        IcebergMvDiscoverySource::ProjectionView => "lake-projection-view",
-        IcebergMvDiscoverySource::StorageTable => "lake-storage-table",
-    };
+    let rebuild_source = "lake-mv-table";
     // The procedure reports the level it CAN reconstruct; the sql-test runner
     // asserts `available >= required`, so `required_level` is not gated here.
     let _ = req.required_level;

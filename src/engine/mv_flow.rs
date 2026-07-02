@@ -565,7 +565,7 @@ pub(crate) fn alter_mv(
         .map_err(|e| format!("update MV refresh metadata failed: {e}"))?;
     txn.commit()
         .map_err(|e| format!("commit MV refresh metadata failed: {e}"))?;
-    crate::engine::mv::iceberg_refresh::sync_iceberg_mv_descriptor_refresh_contract(
+    crate::engine::mv::iceberg_refresh::sync_iceberg_mv_descriptor(
         state,
         &definition,
         &req.refresh_policy,
