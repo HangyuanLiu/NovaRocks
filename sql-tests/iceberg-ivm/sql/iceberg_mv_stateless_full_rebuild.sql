@@ -6,8 +6,8 @@
 --    (mirrors iceberg_backed_mv_basic_lifecycle.sql's setup).
 -- 2. Dedicated coverage for the W4 lake-native statelessness `full` level:
 --    `@imv_stateless_rebuild=...,level=full` drives the server to clear the
---    MV's SQLite definition and rebuild it purely from the lake (Iceberg
---    projection view marker + storage table descriptor properties), then
+--    MV's SQLite definition and rebuild it purely from the lake (Iceberg MV
+--    table descriptor properties), then
 --    re-runs the same SELECT and asserts it is unchanged.
 -- 3. The directive itself emits no output; the golden below is the SELECT's
 --    own result, which must be identical before and after the clear+rebuild
@@ -18,11 +18,13 @@
 CREATE EXTERNAL CATALOG mv_ice_stateless_${uuid0}
 PROPERTIES (
   "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_catalog_warehouse}/iceberg_stateless_${uuid0}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
+  "iceberg.catalog.type" = "rest",
+  "uri" = "${iceberg_rest_uri}",
+  "warehouse" = "${iceberg_rest_warehouse}",
   "aws.s3.access_key" = "${oss_ak}",
   "aws.s3.secret_key" = "${oss_sk}",
+  "aws.s3.endpoint" = "${oss_endpoint}",
+  "aws.s3.region" = "us-east-1",
   "aws.s3.enable_path_style_access" = "true"
 );
 CREATE DATABASE mv_ice_stateless_${uuid0}.ns_${uuid0};

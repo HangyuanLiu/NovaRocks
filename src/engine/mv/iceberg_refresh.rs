@@ -19666,7 +19666,7 @@ mod tests {
         assert_eq!(mv.descriptor.base_dependencies[0].name.as_str(), "orders");
     }
 
-    /// Read the [`MvProvenanceV1`] carried by a storage table's current snapshot
+    /// Read the [`MvProvenanceV1`] carried by an MV table's current snapshot
     /// summary, reloading the table fresh from the catalog. Returns `None` when
     /// there is no current snapshot or the snapshot carries no provenance.
     fn read_target_current_snapshot_provenance(
@@ -19686,7 +19686,7 @@ mod tests {
         MvProvenanceV1::from_snapshot_summary(current).expect("parse provenance from summary")
     }
 
-    /// Current-snapshot id of a storage table (reloaded fresh from the catalog).
+    /// Current-snapshot id of an MV table (reloaded fresh from the catalog).
     fn read_target_current_snapshot_id(
         state: &Arc<StandaloneState>,
         catalog: &str,
@@ -19707,7 +19707,7 @@ mod tests {
             .map(|s| s.snapshot_id())
     }
 
-    /// Count live data-file entries reachable from a storage table's current
+    /// Count live data-file entries reachable from an MV table's current
     /// snapshot. A data-free watermark append adds an empty manifest, so this
     /// count is invariant across a net-zero refresh — a direct proxy for "the
     /// MV's materialized data is unchanged" that avoids a full `SELECT *` round
@@ -19754,7 +19754,7 @@ mod tests {
         .expect("count live target data files")
     }
 
-    /// Delete an MV's SQLite definition WITHOUT dropping its lake storage table.
+    /// Delete an MV's SQLite definition WITHOUT dropping its lake MV table.
     /// `drop_by_target` removes the target lookup, definition record,
     /// dependency edges, and partition states from SQLite but never touches the
     /// Iceberg table — exactly the "SQLite forgot, lake remembers" state the W4
@@ -19812,16 +19812,14 @@ mod tests {
             .expect("create iceberg mv");
 
         // Capture the created definition + its dependencies as the golden.
-        let before =
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
-                .expect("mv definition present after create");
+        let before = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition present after create");
         let before_deps = list_mv_dependency_names(&env.state, before.mv_id);
 
-        // Forget the MV in SQLite but keep its lake storage table + descriptor.
-        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
+        // Forget the MV in SQLite but keep its lake MV table + descriptor.
+        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "mv_orders");
         assert!(
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
-                .is_none(),
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders").is_none(),
             "definition should be gone from SQLite after drop"
         );
 
@@ -19831,7 +19829,7 @@ mod tests {
 
         // The definition reappears with matching select_sql / target / schema
         // contract / watermark, and its base dependencies are restored.
-        let after = find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+        let after = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
             .expect("mv definition reappears after rebuild");
         assert_eq!(after.select_sql, before.select_sql);
         assert_eq!(after.storage_engine, before.storage_engine);
@@ -19859,9 +19857,8 @@ mod tests {
         // Idempotent: a second rebuild is a no-op (the MV is now a cache hit).
         crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(&env.state)
             .expect("second rebuild is a no-op");
-        let after_again =
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
-                .expect("mv definition still present after idempotent rebuild");
+        let after_again = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition still present after idempotent rebuild");
         assert_eq!(after_again.select_sql, after.select_sql);
         assert_eq!(
             list_mv_dependency_names(&env.state, after_again.mv_id),
@@ -19881,28 +19878,27 @@ mod tests {
         );
         create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect("create iceberg mv");
-        // A completed refresh stamps provenance onto the storage table's current
+        // A completed refresh stamps provenance onto the MV table's current
         // snapshot and records the watermark in SQLite.
         let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
         refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
             .expect("refresh iceberg mv");
 
-        let before =
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
-                .expect("mv definition present after refresh");
+        let before = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition present after refresh");
         assert!(
             !before.last_refresh_snapshots.is_empty(),
             "refresh should have recorded a watermark: {before:?}"
         );
 
-        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
+        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "mv_orders");
         crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(&env.state)
             .expect("rebuild imv cache from lake");
 
-        // The rebuilt definition recovers the refresh watermark from the storage
+        // The rebuilt definition recovers the refresh watermark from the MV
         // table's current-snapshot provenance, so incremental refresh has its
         // baseline back without a full re-refresh.
-        let after = find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+        let after = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
             .expect("mv definition reappears after rebuild");
         assert_eq!(after.last_refresh_snapshots, before.last_refresh_snapshots);
         assert_eq!(
@@ -19943,7 +19939,7 @@ mod tests {
         );
         create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect("create iceberg mv");
-        // Refresh so the storage table's current snapshot carries provenance:
+        // Refresh so the MV table's current snapshot carries provenance:
         // this makes the `full` report exercise non-null provenance/waterline
         // hashes AND a non-empty watermark to round-trip.
         let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
@@ -19952,9 +19948,8 @@ mod tests {
 
         // Golden: the SQLite definition + dependencies as they stand before the
         // destructive round-trip.
-        let before =
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
-                .expect("mv definition present after refresh");
+        let before = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition present after refresh");
         assert!(
             !before.last_refresh_snapshots.is_empty(),
             "refresh should have recorded a watermark: {before:?}"
@@ -19995,7 +19990,7 @@ mod tests {
         // Round-trip proof: the SQLite definition reappeared and is equivalent
         // to the pre-clear golden (same select_sql / target / schema contract /
         // partition spec / watermark), and its dependencies were restored.
-        let after = find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+        let after = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
             .expect("mv definition reappears after full rebuild");
         assert_eq!(after.select_sql, before.select_sql);
         assert_eq!(after.storage_engine, before.storage_engine);
@@ -20030,9 +20025,9 @@ mod tests {
         );
         create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect("create iceberg mv");
-        // Forget the MV in SQLite (lake storage table stays), so `full` has no
+        // Forget the MV in SQLite (lake MV table stays), so `full` has no
         // cached record to clear.
-        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
+        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "mv_orders");
 
         let req = crate::engine::mv::stateless_rebuild::ImvStatelessRebuildRequest {
             catalog: "ice".to_string(),
@@ -23998,14 +23993,14 @@ mod tests {
 
     /// M6: a refresh that advances the base watermark but yields zero net MV
     /// rows (the inserted rows are filtered out by the MV's WHERE) must still
-    /// advance the MV's *lake* watermark — i.e. the storage table's current
+    /// advance the MV's *lake* watermark — i.e. the MV table's current
     /// snapshot must carry provenance whose `to_snapshot` equals the new base
     /// snapshot. Otherwise, after a cluster rebuild (drop SQLite + rebuild from
     /// lake) the recovered watermark would be stale and the MV would redundantly
     /// re-scan the net-zero delta.
     ///
     /// This is a freshness/redundant-rescan refinement: the MV data itself is
-    /// correct with or without the fix. The test asserts (1) the storage table's
+    /// correct with or without the fix. The test asserts (1) the MV table's
     /// current snapshot advanced, (2) its provenance is a MetadataOnly technique
     /// whose watermark equals the new base snapshot, (3) the materialized data is
     /// unchanged (live data-file count invariant + SQLite row count unchanged),
@@ -24028,23 +24023,18 @@ mod tests {
 
         // State after the materializing refresh: this is the pre-net-zero
         // baseline for both the lake watermark and the materialized data.
-        let after_first =
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
-                .expect("mv definition present after first refresh");
+        let after_first = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition present after first refresh");
         let base_snapshot_after_first = *after_first
             .last_refresh_snapshots
             .get("ice.sales.orders")
             .expect("base watermark recorded after first refresh");
         let target_snapshot_before_net_zero =
-            read_target_current_snapshot_id(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+            read_target_current_snapshot_id(&env.state, "ice", "analytics", "mv_orders")
                 .expect("target has a current snapshot after first refresh");
-        let provenance_before_net_zero = read_target_current_snapshot_provenance(
-            &env.state,
-            "ice",
-            "analytics",
-            "__nr_mv_mv_orders",
-        )
-        .expect("target snapshot carries provenance after first refresh");
+        let provenance_before_net_zero =
+            read_target_current_snapshot_provenance(&env.state, "ice", "analytics", "mv_orders")
+                .expect("target snapshot carries provenance after first refresh");
         assert_eq!(
             provenance_before_net_zero
                 .bases
@@ -24055,7 +24045,7 @@ mod tests {
             "lake watermark should match SQLite watermark after the first refresh"
         );
         let data_files_before =
-            live_target_data_file_count(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
+            live_target_data_file_count(&env.state, "ice", "analytics", "mv_orders");
         assert_eq!(
             data_files_before, 1,
             "the kept row should have produced exactly one materialized data file"
@@ -24085,7 +24075,7 @@ mod tests {
 
         // (1) SQLite watermark advanced to the new base snapshot.
         let after_net_zero =
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
                 .expect("mv definition present after net-zero refresh");
         assert_eq!(
             after_net_zero
@@ -24095,22 +24085,18 @@ mod tests {
             "SQLite watermark should advance to the new base snapshot"
         );
 
-        // (2) The storage table's current snapshot ADVANCED, and its provenance
+        // (2) The MV table's current snapshot ADVANCED, and its provenance
         // carries the MetadataOnly technique with the advanced base watermark.
         let target_snapshot_after_net_zero =
-            read_target_current_snapshot_id(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
+            read_target_current_snapshot_id(&env.state, "ice", "analytics", "mv_orders")
                 .expect("target has a current snapshot after net-zero refresh");
         assert_ne!(
             target_snapshot_after_net_zero, target_snapshot_before_net_zero,
-            "the storage table's current snapshot must advance via a data-free snapshot"
+            "the MV table's current snapshot must advance via a data-free snapshot"
         );
-        let provenance_after_net_zero = read_target_current_snapshot_provenance(
-            &env.state,
-            "ice",
-            "analytics",
-            "__nr_mv_mv_orders",
-        )
-        .expect("advanced target snapshot carries provenance");
+        let provenance_after_net_zero =
+            read_target_current_snapshot_provenance(&env.state, "ice", "analytics", "mv_orders")
+                .expect("advanced target snapshot carries provenance");
         assert_eq!(
             provenance_after_net_zero.technique,
             RefreshTechnique::MetadataOnly,
@@ -24129,7 +24115,7 @@ mod tests {
         // (3) The materialized data is unchanged: no data files added or removed,
         // and SQLite's recorded row count is unchanged.
         let data_files_after =
-            live_target_data_file_count(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
+            live_target_data_file_count(&env.state, "ice", "analytics", "mv_orders");
         assert_eq!(
             data_files_after, data_files_before,
             "a data-free watermark snapshot must not add or remove materialized data files"
@@ -24142,12 +24128,11 @@ mod tests {
         // (4) Statelessness tie-in: drop the SQLite definition and rebuild purely
         // from the lake. The rebuilt watermark must be the ADVANCED one (read from
         // the data-free snapshot's provenance), not the pre-net-zero watermark.
-        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "__nr_mv_mv_orders");
+        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "mv_orders");
         crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(&env.state)
             .expect("rebuild imv cache from lake");
-        let rebuilt =
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "__nr_mv_mv_orders")
-                .expect("mv definition reappears after rebuild");
+        let rebuilt = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition reappears after rebuild");
         assert_eq!(
             rebuilt.last_refresh_snapshots.get("ice.sales.orders"),
             Some(&base_snapshot_after_net_zero_insert),

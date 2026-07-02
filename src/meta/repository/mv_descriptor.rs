@@ -242,7 +242,7 @@ mod tests {
         );
         assert_eq!(
             descriptor.content_hash().unwrap(),
-            "d28301a7a51374da0211eac50ab64b8656a24520517e71ce96ac414a6e56b29f"
+            "3388ae5d5cc385e8b9a150bc0fb5417b281c6c2173a844fe23523be9ee28c1c1"
         );
     }
 
