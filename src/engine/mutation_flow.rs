@@ -86,6 +86,11 @@ pub(crate) fn execute_update_statement(
     );
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_properties(
+        &target,
+        table.metadata().properties(),
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Update,
+    )?;
 
     // Branch writes require Iceberg v3 (row-lineage semantics).
     if target_ref != "main" {
@@ -2382,6 +2387,11 @@ pub(crate) fn execute_merge_statement(
     );
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_properties(
+        &target,
+        table.metadata().properties(),
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Merge,
+    )?;
 
     // Validate writability up front (resolvable default-sort-order, no variant
     // in partition spec / sort order) before any branch write. The folded

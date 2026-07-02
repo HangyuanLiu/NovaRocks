@@ -143,6 +143,18 @@ pub(crate) fn execute_maintenance_action(
     state: &Arc<StandaloneState>,
     request: MaintenanceActionRequest,
 ) -> Result<StatementResult, String> {
+    let target = crate::engine::backend_resolver::TargetBackend {
+        backend_name: "iceberg",
+        catalog: request.catalog.clone(),
+        namespace: request.namespace.clone(),
+        table: request.table.clone(),
+    };
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
+        state,
+        &target,
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
+    )?;
+
     match request.source {
         MaintenanceActionSource::SparkProcedure => {
             let outcome = execute_maintenance_action_outcome(state, &request)?;

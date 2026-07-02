@@ -971,9 +971,13 @@ pub(crate) fn execute_drop_catalog_statement(
     if_exists: bool,
 ) -> Result<StatementResult, String> {
     // The catalog name passed in by the user may carry quoting/case the
-    // dependency graph normalizes away; `ensure_no_external_iceberg_dependents`
-    // already does case-insensitive matching, so pass the user-typed value
-    // straight through.
+    // dependency graph normalizes away; the MV drop-scope guards already do
+    // case-insensitive matching, so pass the user-typed value straight through.
+    crate::engine::mv::dependency::ensure_no_iceberg_mv_targets_in_scope(
+        state,
+        catalog_name,
+        None,
+    )?;
     crate::engine::mv::dependency::ensure_no_external_iceberg_dependents(
         state,
         catalog_name,
@@ -1024,6 +1028,11 @@ pub(crate) fn execute_drop_database_statement(
         };
     }
     if target.backend_name == "iceberg" {
+        crate::engine::mv::dependency::ensure_no_iceberg_mv_targets_in_scope(
+            state,
+            &target.catalog,
+            Some(&target.namespace),
+        )?;
         crate::engine::mv::dependency::ensure_no_external_iceberg_dependents(
             state,
             &target.catalog,
@@ -1090,6 +1099,22 @@ pub(crate) fn execute_drop_table_statement(
     } else {
         crate::engine::mv::dependency::starrocks_table_object_ref(&target.namespace, &target.table)
     };
+    match crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
+        state,
+        &target,
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::DropTable,
+    ) {
+        Ok(()) => {}
+        Err(err)
+            if if_exists
+                && target.backend_name == "iceberg"
+                && is_missing_table_guard_error(&err) =>
+        {
+            cleanup_iceberg_drop_table_registration_if_exists(state, &target)?;
+            return Ok(StatementResult::Ok);
+        }
+        Err(err) => return Err(err),
+    }
     crate::engine::mv::dependency::ensure_no_downstream_dependencies(state, &dependency_ref)?;
     // Resolve the dictionary owner BEFORE the backend `drop_table` call so we
     // still have access to the table's metadata (db_id/table_id or table_uuid)
@@ -1125,17 +1150,7 @@ pub(crate) fn execute_drop_table_statement(
         }
         Err(err) if if_exists && err.contains("table") => {
             if target.backend_name == "iceberg" {
-                crate::engine::query_prep::invalidate_catalog_mgr_table(
-                    state,
-                    &target.catalog,
-                    &target.namespace,
-                    &target.table,
-                )?;
-                crate::engine::query_prep::drop_local_table_registration_if_exists(
-                    state,
-                    &target.namespace,
-                    &target.table,
-                )?;
+                cleanup_iceberg_drop_table_registration_if_exists(state, &target)?;
             }
             Ok(StatementResult::Ok)
         }
@@ -1155,6 +1170,28 @@ pub(crate) fn execute_drop_table_statement(
             Err(err)
         }
     }
+}
+
+fn is_missing_table_guard_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("unknown table:") || lower.contains("table not found")
+}
+
+fn cleanup_iceberg_drop_table_registration_if_exists(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+) -> Result<(), String> {
+    crate::engine::query_prep::invalidate_catalog_mgr_table(
+        state,
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+    )?;
+    crate::engine::query_prep::drop_local_table_registration_if_exists(
+        state,
+        &target.namespace,
+        &target.table,
+    )
 }
 
 fn drop_local_catalog_table(
@@ -1231,6 +1268,11 @@ pub(crate) fn execute_truncate_table_statement(
         reg.catalog_backend(target.backend_name)?
     };
     let resolved_table = catalog.load_table(&target.catalog, &target.namespace, &target.table)?;
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
+        state,
+        &target,
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Truncate,
+    )?;
     crate::engine::iceberg_truncate::execute_iceberg_truncate_table(
         state,
         &target,
@@ -2763,6 +2805,22 @@ pub(crate) fn parse_add_equality_delete_sql(sql: &str) -> Result<AddEqualityDele
         columns,
         rows,
     })
+}
+
+#[cfg(test)]
+mod drop_table_if_exists_tests {
+    #[test]
+    fn guard_missing_table_error_is_soft_drop_candidate_but_mv_error_is_not() {
+        assert!(super::is_missing_table_guard_error(
+            "unknown table: db.missing"
+        ));
+        assert!(super::is_missing_table_guard_error(
+            "load iceberg table db.missing: table not found: warehouse/db/missing"
+        ));
+        assert!(!super::is_missing_table_guard_error(
+            "table ice.db.mv_orders is a materialized view; use DROP MATERIALIZED VIEW"
+        ));
+    }
 }
 
 #[cfg(test)]
