@@ -998,14 +998,16 @@ impl HashJoinBuildSinkOperator {
             return Ok(params);
         }
 
-        for chunk in &self.build_input_chunks {
-            let mut key_arrays = Vec::with_capacity(self.build_keys.len());
-            for expr in &self.build_keys {
-                let array = self.arena.eval(*expr, chunk).map_err(|e| e.to_string())?;
-                key_arrays.push(array);
-            }
+        // Collect build values from `build_key_batches`: they hold the already
+        // evaluated key arrays for every sunk chunk and are retained until
+        // after publish regardless of row-payload elision. `build_input_chunks`
+        // must NOT be used here — presence-only builds (e.g. LEFT SEMI without
+        // residual) do not retain input chunks, and collecting from them would
+        // publish an empty membership filter that wrongly prunes every probe
+        // row while build_row_count > 0.
+        for batch in &self.build_key_batches {
             for (idx, spec) in self.runtime_filter_specs.iter().enumerate() {
-                let Some(array) = key_arrays.get(spec.expr_order) else {
+                let Some(array) = batch.arrays().get(spec.expr_order) else {
                     continue;
                 };
                 if let Some(param) = params.get_mut(idx) {
@@ -1502,6 +1504,58 @@ mod tests {
         assert_eq!(artifact.build_row_count, 2);
         assert_eq!(operator.build_store_builder.row_count(), 0);
         assert!(operator.build_input_chunks.is_empty());
+    }
+
+    #[test]
+    fn presence_only_left_semi_membership_filter_retains_matching_probe_rows() {
+        // Regression: membership filters used to collect build values from
+        // `build_input_chunks`, which presence-only builds (LEFT SEMI without
+        // residual) do not retain. The published bloom then contained zero
+        // entries while build_row_count > 0, so every probe row was wrongly
+        // pruned. Values must come from `build_key_batches`, which are kept
+        // for hash-table construction regardless of row-payload elision.
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = direct_set_build_operator(Arc::clone(&state));
+        operator.runtime_filter_specs = vec![JoinRuntimeFilterSpec {
+            filter_id: 7,
+            expr_order: 0,
+            probe_slot_id: SlotId::new(1),
+            build_data_type: DataType::Int32,
+            merge_nodes: Vec::new(),
+            has_remote_targets: false,
+        }];
+
+        operator
+            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .expect("push chunk");
+        // Presence-only store elision must still hold.
+        assert!(operator.build_input_chunks.is_empty());
+
+        let params = operator
+            .build_membership_filter_params()
+            .expect("membership params");
+        let filters = operator
+            .build_membership_filters_from_params(
+                operator.build_row_count as u64,
+                &params,
+                RuntimeMembershipBuildOptions {
+                    enable_join_runtime_bitset_filter: false,
+                    global_runtime_filter_build_max_size: u64::MAX,
+                },
+            )
+            .expect("membership filters");
+        assert_eq!(filters.len(), 1);
+
+        let probe_chunk = int32_chunk(vec![1, 2, 3, 99]);
+        let key_array = probe_chunk.batch.column(0).clone();
+        let kept = filters[0]
+            .filter_chunk_with_array(&key_array, probe_chunk)
+            .expect("filter probe chunk");
+        let kept_rows = kept.map(|c| c.len()).unwrap_or(0);
+        assert_eq!(
+            kept_rows, 3,
+            "membership filter must accept build keys 1,2,3 and reject 99"
+        );
     }
 
     #[test]

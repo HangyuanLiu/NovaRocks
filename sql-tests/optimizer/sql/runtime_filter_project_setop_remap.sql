@@ -18,8 +18,8 @@ ANALYZE TABLE ${case_db}.rf_remap_b;
 ANALYZE TABLE ${case_db}.rf_remap_c;
 
 -- @explain_contains=HASH JOIN (BROADCAST, LEFT SEMI
--- @explain_not_contains=build runtime filters:
--- @explain_not_contains=probe runtime filters:
+-- @explain_contains=build runtime filters:
+-- @explain_contains=probe runtime filters:
 SELECT count(*)
 FROM (
     SELECT k AS ak, v
