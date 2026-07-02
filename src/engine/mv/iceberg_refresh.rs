@@ -16678,7 +16678,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_fact_region");
+        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_fact_region");
         let fields = loaded
             .table
             .metadata()
@@ -16722,7 +16722,7 @@ mod tests {
         let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_region")
             .expect("mv definition after aggregate incremental refresh");
         assert_eq!(mv.last_refresh_rows, Some(3));
-        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_fact_region");
+        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_fact_region");
         let second_snapshot = loaded
             .table
             .metadata()
@@ -16778,7 +16778,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_fact_dim_region");
+        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_fact_dim_region");
         let fields = loaded
             .table
             .metadata()
@@ -16822,7 +16822,7 @@ mod tests {
         let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_dim_region")
             .expect("mv definition after join aggregate incremental refresh");
         assert_eq!(mv.last_refresh_rows, Some(3));
-        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_fact_dim_region");
+        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_fact_dim_region");
         let second_snapshot = loaded
             .table
             .metadata()
@@ -17350,7 +17350,7 @@ mod tests {
             let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get(current_catalog).expect("catalog")
         };
-        let loaded = load_iceberg_mv_storage_table(&entry, current_database, mv_name);
+        let loaded = load_iceberg_mv_table(&entry, current_database, mv_name);
         let mut rows = data_block_on(async {
             let scan = loaded
                 .table
@@ -17862,13 +17862,13 @@ mod tests {
             .expect("lookup mv definition")
     }
 
-    fn load_iceberg_mv_storage_table(
+    fn load_iceberg_mv_table(
         entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
         namespace: &str,
         table: &str,
     ) -> crate::connector::iceberg::catalog::IcebergLoadedTable {
         crate::connector::iceberg::catalog::load_table(entry, namespace, table)
-            .expect("load iceberg MV storage table")
+            .expect("load iceberg MV table")
     }
 
     fn rewrite_mv_descriptor_package_id_for_test(
@@ -19434,7 +19434,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_sales_agg");
+        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_sales_agg");
         let spec = loaded.table.metadata().default_partition_spec();
         assert_ne!(spec.spec_id(), 0);
         assert_eq!(spec.fields().len(), 1);
@@ -19520,7 +19520,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_orders_customers");
+        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_orders_customers");
         let spec = loaded.table.metadata().default_partition_spec();
         assert_ne!(spec.spec_id(), 0);
         assert_eq!(spec.fields().len(), 1);
@@ -20341,7 +20341,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_fact_region");
+        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_fact_region");
         assert_eq!(
             loaded
                 .table
@@ -20511,7 +20511,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_union_agg_join");
+        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_union_agg_join");
         let field_names = loaded
             .table
             .metadata()
@@ -20619,7 +20619,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_union_orders");
+        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_union_orders");
         let fields = loaded
             .table
             .metadata()
@@ -20987,7 +20987,7 @@ mod tests {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get(catalog).expect("catalog")
         };
-        let loaded = load_iceberg_mv_storage_table(&entry, "analytics", "mv_union_orders");
+        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_union_orders");
         let spec = loaded.table.metadata().default_partition_spec();
         assert_ne!(spec.spec_id(), 0);
         assert_eq!(spec.fields().len(), 1);

@@ -380,11 +380,11 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_candidate_display_name_uses_direct_mv_table_name() {
+    fn rewrite_candidate_display_name_uses_target_table_name_directly() {
+        assert_eq!(rewrite_candidate_public_name("agg_mv"), "agg_mv");
         assert_eq!(
             rewrite_candidate_public_name("__nr_mv_agg_mv"),
             "__nr_mv_agg_mv"
         );
-        assert_eq!(rewrite_candidate_public_name("legacy_mv"), "legacy_mv");
     }
 }
