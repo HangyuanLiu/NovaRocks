@@ -821,6 +821,84 @@ mod tests {
     }
 
     #[test]
+    fn project_reuses_overwritten_dictionary_carrier_for_follow_up_expr() {
+        let input_slot = SlotId::new(8);
+        let output_slot = SlotId::new(9);
+        let mut arena = ExprArena::default();
+        let source = arena.push_typed(ExprNode::SlotId(input_slot), DataType::Utf8);
+        let lower = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::String("lower"),
+                args: vec![source],
+            },
+            DataType::Utf8,
+        );
+        let read_overwritten = arena.push_typed(ExprNode::SlotId(input_slot), DataType::Utf8);
+        let output_chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::new_with_field(
+                    input_slot,
+                    Field::new("status", DataType::Utf8, true),
+                    None,
+                    None,
+                ),
+                ChunkSlotSchema::new_with_field(
+                    output_slot,
+                    Field::new("status_copy", DataType::Utf8, true),
+                    None,
+                    None,
+                ),
+            ])
+            .expect("output schema"),
+        );
+        let mut op = ProjectProcessorOperator {
+            name: "PROJECT".to_string(),
+            arena: Arc::new(arena),
+            exprs: vec![lower, read_overwritten],
+            expr_slot_ids: vec![input_slot, output_slot],
+            expr_slot_schemas: HashMap::new(),
+            output_indices: None,
+            output_chunk_schema,
+            pending_output: None,
+            finishing: false,
+            finished: false,
+        };
+
+        let output = op
+            .process_one(dict_string_chunk(input_slot))
+            .expect("project should succeed")
+            .expect("project output");
+        let lower_dict = output
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("lower dictionary output");
+        let copy_dict = output
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("follow-up dictionary output");
+        assert_eq!(copy_dict.keys(), lower_dict.keys());
+        let lower_values = lower_dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("lower values");
+        let copy_values = copy_dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("copy values");
+        assert_eq!(copy_values, lower_values);
+        assert_eq!(copy_values.value(0), "paid");
+        assert_eq!(copy_values.value(1), "new");
+        assert_eq!(copy_values.value(2), " shipped ");
+        assert!(copy_dict.is_null(1));
+    }
+
+    #[test]
     fn project_allows_overwriting_existing_slot_for_follow_up_exprs() {
         let mut arena = ExprArena::default();
         let expr_write_slot17 =
