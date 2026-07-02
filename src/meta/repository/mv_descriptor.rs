@@ -24,8 +24,6 @@ pub struct MvDescriptorV1 {
     pub package_id: String,
     pub logical_sql: String,
     pub dialect: String,
-    pub public_view: String,
-    pub storage_table: String,
     pub visible_columns: Vec<String>,
     pub hidden_columns: Vec<String>,
     pub base_dependencies: Vec<DescriptorDependency>,
@@ -142,11 +140,9 @@ mod tests {
     fn sample() -> MvDescriptorV1 {
         MvDescriptorV1 {
             descriptor_version: MV_DESCRIPTOR_VERSION,
-            package_id: "pkg-1".to_string(),
+            package_id: "analytics.mv_orders".to_string(),
             logical_sql: "SELECT id FROM ice.sales.orders".to_string(),
             dialect: "starrocks".to_string(),
-            public_view: "analytics.mv_orders".to_string(),
-            storage_table: "analytics.__nr_mv_mv_orders".to_string(),
             visible_columns: vec!["id".to_string()],
             hidden_columns: vec!["__nova_base_row_id".to_string()],
             base_dependencies: vec![DescriptorDependency {
@@ -191,6 +187,20 @@ mod tests {
     }
 
     #[test]
+    fn canonical_json_has_no_w1_view_or_storage_pointers() {
+        let descriptor = sample();
+
+        let canonical = descriptor.to_canonical_json().unwrap();
+
+        assert!(!canonical.contains("public_view"), "{canonical}");
+        assert!(!canonical.contains("storage_table"), "{canonical}");
+        assert_eq!(
+            canonical,
+            "{\"base_dependencies\":[{\"catalog\":\"ice\",\"name\":\"orders\",\"namespace\":\"sales\",\"object_type\":\"table\",\"storage_engine\":\"iceberg\"}],\"created_at_ms\":123,\"descriptor_version\":1,\"dialect\":\"starrocks\",\"hidden_columns\":[\"__nova_base_row_id\"],\"logical_sql\":\"SELECT id FROM ice.sales.orders\",\"package_id\":\"analytics.mv_orders\",\"refresh_contract\":null,\"schema_contract\":{\"a\":{\"a\":1,\"z\":2},\"z\":3},\"visible_columns\":[\"id\"]}"
+        );
+    }
+
+    #[test]
     fn canonical_json_is_key_sorted_and_hash_stable() {
         let descriptor = sample();
 
@@ -198,11 +208,11 @@ mod tests {
 
         assert_eq!(
             canonical,
-            "{\"base_dependencies\":[{\"catalog\":\"ice\",\"name\":\"orders\",\"namespace\":\"sales\",\"object_type\":\"table\",\"storage_engine\":\"iceberg\"}],\"created_at_ms\":123,\"descriptor_version\":1,\"dialect\":\"starrocks\",\"hidden_columns\":[\"__nova_base_row_id\"],\"logical_sql\":\"SELECT id FROM ice.sales.orders\",\"package_id\":\"pkg-1\",\"public_view\":\"analytics.mv_orders\",\"refresh_contract\":null,\"schema_contract\":{\"a\":{\"a\":1,\"z\":2},\"z\":3},\"storage_table\":\"analytics.__nr_mv_mv_orders\",\"visible_columns\":[\"id\"]}"
+            "{\"base_dependencies\":[{\"catalog\":\"ice\",\"name\":\"orders\",\"namespace\":\"sales\",\"object_type\":\"table\",\"storage_engine\":\"iceberg\"}],\"created_at_ms\":123,\"descriptor_version\":1,\"dialect\":\"starrocks\",\"hidden_columns\":[\"__nova_base_row_id\"],\"logical_sql\":\"SELECT id FROM ice.sales.orders\",\"package_id\":\"analytics.mv_orders\",\"refresh_contract\":null,\"schema_contract\":{\"a\":{\"a\":1,\"z\":2},\"z\":3},\"visible_columns\":[\"id\"]}"
         );
         assert_eq!(
             descriptor.content_hash().unwrap(),
-            "05707bad24830c2246f225b7bf59e3d8b2a8b79ebbb53eb938cd4fc9087f2802"
+            "1cc794340a4c5415b7065669de028e103394b255aaee981c7fd64db1f60e85f9"
         );
     }
 
@@ -218,7 +228,10 @@ mod tests {
                 .map(|(_, value)| value.clone())
         };
 
-        assert_eq!(get(MV_DESCRIPTOR_PACKAGE_ID_PROP).as_deref(), Some("pkg-1"));
+        assert_eq!(
+            get(MV_DESCRIPTOR_PACKAGE_ID_PROP).as_deref(),
+            Some("analytics.mv_orders")
+        );
         assert_eq!(
             get(MV_DESCRIPTOR_HASH_PROP),
             Some(descriptor.content_hash().unwrap())

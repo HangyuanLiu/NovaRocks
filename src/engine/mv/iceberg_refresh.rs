@@ -482,8 +482,6 @@ pub(crate) fn create_iceberg_mv(
         package_id: format!("{}.{}", target.namespace, public_name),
         logical_sql: canonical_select_query.to_string(),
         dialect: "starrocks".to_string(),
-        public_view: format!("{}.{}", target.namespace, public_name),
-        storage_table: format!("{}.{}", target.namespace, target.table),
         visible_columns: analysis
             .output_columns
             .iter()
@@ -19159,8 +19157,6 @@ mod tests {
             "SELECT id, name FROM ice.sales.orders"
         );
         assert_eq!(descriptor.dialect, "starrocks");
-        assert_eq!(descriptor.public_view, "analytics.mv_orders");
-        assert_eq!(descriptor.storage_table, "analytics.__nr_mv_mv_orders");
         assert_eq!(
             descriptor.visible_columns,
             vec!["id".to_string(), "name".to_string()]
@@ -19245,8 +19241,7 @@ mod tests {
             mv.source,
             crate::engine::mv::iceberg_discovery::IcebergMvDiscoverySource::StorageTable
         );
-        assert_eq!(mv.descriptor.public_view, "analytics.mv_orders");
-        assert_eq!(mv.descriptor.storage_table, "analytics.__nr_mv_mv_orders");
+        assert_eq!(mv.descriptor.package_id, "analytics.mv_orders");
         assert_eq!(mv.descriptor.base_dependencies[0].name.as_str(), "orders");
     }
 
@@ -19441,8 +19436,7 @@ mod tests {
         let descriptor =
             MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
                 .expect("descriptor after repartition");
-        assert_eq!(descriptor.public_view, "analytics.mv_orders");
-        assert_eq!(descriptor.storage_table, "analytics.__nr_mv_mv_orders");
+        assert_eq!(descriptor.package_id, "analytics.mv_orders");
         assert_eq!(
             descriptor.refresh_contract,
             Some(serde_json::json!({

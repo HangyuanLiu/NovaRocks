@@ -203,7 +203,7 @@ fn parse_storage_table_pointer(pointer: &str) -> Result<(String, String), String
 
 fn public_name_from_descriptor(descriptor: &MvDescriptorV1) -> Option<String> {
     descriptor
-        .public_view
+        .package_id
         .rsplit('.')
         .next()
         .filter(|value| !value.is_empty())

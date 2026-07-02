@@ -70,7 +70,7 @@ impl IcebergCatalogBackend {
     fn storage_matches_public_mv_alias(
         namespace: &str,
         public_table: &str,
-        storage_table: &str,
+        _storage_table: &str,
         loaded: &IcebergLoadedTable,
     ) -> Result<bool, String> {
         let descriptor =
@@ -78,11 +78,8 @@ impl IcebergCatalogBackend {
                 loaded.table.metadata().properties(),
             )?;
         Ok(descriptor
-            .public_view
-            .eq_ignore_ascii_case(&format!("{namespace}.{public_table}"))
-            && descriptor
-                .storage_table
-                .eq_ignore_ascii_case(&format!("{namespace}.{storage_table}")))
+            .package_id
+            .eq_ignore_ascii_case(&format!("{namespace}.{public_table}")))
     }
 }
 
