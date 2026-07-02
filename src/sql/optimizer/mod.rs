@@ -988,7 +988,11 @@ mod is_known_rule_name_tests {
     use std::cell::RefCell;
 
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
-    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarNode};
+    use crate::sql::optimizer::stats_input::{
+        BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue, StatsRef,
+        StatsSource,
+    };
     use crate::sql::planner::optimizer_bridge::plan::{
         logical_plan_to_opt_expr, opt_expr_to_logical_plan, try_logical_plan_to_opt_expr,
     };
@@ -1030,6 +1034,313 @@ mod is_known_rule_name_tests {
             factory,
             root_distribution,
         )
+    }
+
+    fn iceberg_info(catalog: &str, ns: &str, tbl: &str) -> crate::sql::catalog::IcebergTableInfo {
+        crate::sql::catalog::IcebergTableInfo {
+            catalog: catalog.to_string(),
+            namespace: ns.to_string(),
+            table: tbl.to_string(),
+            table_uuid: None,
+            current_snapshot_id: None,
+            schema_id: 0,
+            location: String::new(),
+            schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
+        }
+    }
+
+    fn iceberg_table(catalog: &str, ns: &str, tbl: &str, columns: &[&str]) -> TableDef {
+        TableDef {
+            name: tbl.to_string(),
+            columns: columns
+                .iter()
+                .map(|name| ColumnDef {
+                    name: name.to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                })
+                .collect(),
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergDataFiles {
+                table: iceberg_info(catalog, ns, tbl),
+                files: vec![],
+                cloud_properties: Default::default(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            },
+        }
+    }
+
+    fn int_col(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    fn scalar_col(
+        arena: &mut ScalarArena,
+        column: &OutputColumn,
+    ) -> crate::sql::optimizer::scalar::ScalarId {
+        arena.remember_source_column_display(column.column_id, None, column.name.clone());
+        arena.intern(
+            ScalarNode::ColumnRef(column.column_id),
+            column.data_type.clone(),
+            column.nullable,
+        )
+    }
+
+    fn scalar_int(arena: &mut ScalarArena, value: i64) -> crate::sql::optimizer::scalar::ScalarId {
+        arena.intern(
+            ScalarNode::Literal(HashableLiteral(crate::sql::common::LiteralValue::Int(
+                value,
+            ))),
+            DataType::Int64,
+            false,
+        )
+    }
+
+    fn scalar_cmp(
+        arena: &mut ScalarArena,
+        left: crate::sql::optimizer::scalar::ScalarId,
+        op: crate::sql::common::BinOp,
+        value: i64,
+    ) -> crate::sql::optimizer::scalar::ScalarId {
+        let right = scalar_int(arena, value);
+        arena.intern(
+            ScalarNode::BinaryOp { left, op, right },
+            DataType::Boolean,
+            true,
+        )
+    }
+
+    fn scalar_cast_int64(
+        arena: &mut ScalarArena,
+        child: crate::sql::optimizer::scalar::ScalarId,
+    ) -> crate::sql::optimizer::scalar::ScalarId {
+        arena.intern(
+            ScalarNode::Cast {
+                child,
+                target: DataType::Int64,
+            },
+            DataType::Int64,
+            true,
+        )
+    }
+
+    fn scalar_or(
+        arena: &mut ScalarArena,
+        left: crate::sql::optimizer::scalar::ScalarId,
+        right: crate::sql::optimizer::scalar::ScalarId,
+    ) -> crate::sql::optimizer::scalar::ScalarId {
+        arena.intern(
+            ScalarNode::BinaryOp {
+                left,
+                op: crate::sql::common::BinOp::Or,
+                right,
+            },
+            DataType::Boolean,
+            true,
+        )
+    }
+
+    fn narrow_base_stats(row_count: u64, columns: &[&str]) -> BaseTableStatistics {
+        BaseTableStatistics {
+            row_count: StatValue::known(
+                row_count,
+                crate::sql::optimizer::statistics::Confidence::Exact,
+                StatsSource::TestFixture,
+            ),
+            columns: columns
+                .iter()
+                .map(|column| {
+                    (
+                        column.to_string(),
+                        BaseColumnStatistics {
+                            nulls_fraction: StatValue::known(
+                                0.0,
+                                crate::sql::optimizer::statistics::Confidence::Exact,
+                                StatsSource::TestFixture,
+                            ),
+                            average_row_size: StatValue::known(
+                                1.0,
+                                crate::sql::optimizer::statistics::Confidence::Exact,
+                                StatsSource::TestFixture,
+                            ),
+                            min_value: StatValue::known(
+                                0.0,
+                                crate::sql::optimizer::statistics::Confidence::Exact,
+                                StatsSource::TestFixture,
+                            ),
+                            max_value: StatValue::known(
+                                100.0,
+                                crate::sql::optimizer::statistics::Confidence::Exact,
+                                StatsSource::TestFixture,
+                            ),
+                            ndv: StatValue::missing(
+                                crate::sql::optimizer::stats_input::StatsMissingReason::ColumnNotReported(
+                                    column.to_string(),
+                                ),
+                            ),
+                        },
+                    )
+                })
+                .collect(),
+            source: StatsSource::TestFixture,
+        }
+    }
+
+    fn plan_contains_mv_scan(node: &OptimizerPhysicalNode, mv_name: &str) -> bool {
+        match &node.op {
+            Operator::PhysicalScan(scan) if scan.mv_rewritten_from.as_deref() == Some(mv_name) => {
+                true
+            }
+            _ => node
+                .children
+                .iter()
+                .any(|child| plan_contains_mv_scan(child, mv_name)),
+        }
+    }
+
+    #[test]
+    fn optimizer_selects_cheaper_exact_or_mv_candidate() {
+        let base_a = int_col(1, "a");
+        let base_b = int_col(2, "b");
+        let base_v = int_col(3, "v");
+        let base_table = iceberg_table("cat", "ns", "t", &["a", "b", "v"]);
+
+        let mut query_scalars = ScalarArena::new();
+        let query_a = scalar_col(&mut query_scalars, &base_a);
+        let query_b = scalar_col(&mut query_scalars, &base_b);
+        let query_predicate = {
+            let query_a = scalar_cast_int64(&mut query_scalars, query_a);
+            let query_b = scalar_cast_int64(&mut query_scalars, query_b);
+            let left = scalar_cmp(
+                &mut query_scalars,
+                query_a,
+                crate::sql::common::BinOp::Gt,
+                10,
+            );
+            let right = scalar_cmp(
+                &mut query_scalars,
+                query_b,
+                crate::sql::common::BinOp::Lt,
+                3,
+            );
+            scalar_or(&mut query_scalars, left, right)
+        };
+        let scan = OptExpr::leaf(Operator::LogicalScan(
+            crate::sql::optimizer::operator::ScanOp {
+                database: "ns".to_string(),
+                table: base_table.clone(),
+                alias: None,
+                stats_ref: Some(StatsRef::new(0)),
+                columns: vec![base_a.clone(), base_b.clone(), base_v.clone()],
+                predicates: vec![query_predicate],
+                required_columns: Some(vec!["a".to_string(), "b".to_string()]),
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            },
+        ));
+        let project_items = [base_a.clone(), base_b.clone()]
+            .into_iter()
+            .map(
+                |column| crate::sql::optimizer::operator::ScalarProjectItem {
+                    expr: scalar_col(&mut query_scalars, &column),
+                    output_name: column.name.clone(),
+                    output_column_id: column.column_id,
+                    expr_display: None,
+                },
+            )
+            .collect();
+        let query = OptExpr::new(
+            Operator::LogicalProject(crate::sql::optimizer::operator::ProjectOp {
+                items: project_items,
+                output_qualifier: None,
+            }),
+            vec![scan],
+        );
+
+        let mv_a = int_col(100, "a");
+        let mv_b = int_col(101, "b");
+        let mv_v = int_col(102, "v");
+        let mut mv_scalars = ScalarArena::new();
+        let mv_a_ref = scalar_col(&mut mv_scalars, &mv_a);
+        let mv_b_ref = scalar_col(&mut mv_scalars, &mv_b);
+        let mv_predicate = {
+            let mv_a_ref = scalar_cast_int64(&mut mv_scalars, mv_a_ref);
+            let mv_b_ref = scalar_cast_int64(&mut mv_scalars, mv_b_ref);
+            let left = scalar_cmp(&mut mv_scalars, mv_a_ref, crate::sql::common::BinOp::Gt, 10);
+            let right = scalar_cmp(&mut mv_scalars, mv_b_ref, crate::sql::common::BinOp::Lt, 3);
+            scalar_or(&mut mv_scalars, left, right)
+        };
+        let mv_scan = OptExpr::leaf(Operator::LogicalScan(
+            crate::sql::optimizer::operator::ScanOp {
+                database: "ns".to_string(),
+                table: iceberg_table("cat", "ns", "t", &["a", "b", "v"]),
+                alias: None,
+                stats_ref: None,
+                columns: vec![mv_a.clone(), mv_b.clone(), mv_v.clone()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            },
+        ));
+        let mv_expr = OptExpr::new(
+            Operator::LogicalFilter(crate::sql::optimizer::operator::FilterOp {
+                predicate: mv_predicate,
+            }),
+            vec![mv_scan],
+        );
+        let mv_desc = cascades_rules::mv_rewrite::descriptor::SpjgDescriptor::from_opt_expr(
+            &mv_expr,
+            &mut mv_scalars,
+        )
+        .expect("mv descriptor");
+        let candidate = cascades_rules::mv_rewrite::MvRewriteCandidate {
+            mv_name: "or_mv".to_string(),
+            mv: mv_desc,
+            mv_scalars,
+            target_database: "ns".to_string(),
+            target_table: iceberg_table("cat", "ns", "or_mv", &["a", "b", "v"]),
+            target_stats_ref: StatsRef::new(1),
+        };
+
+        let mut stats = QueryStatsSnapshot::empty();
+        stats.insert(
+            StatsRef::new(0),
+            "cat.ns.t",
+            narrow_base_stats(2_400, &["a", "b", "v"]),
+        );
+        stats.insert(
+            StatsRef::new(1),
+            "cat.ns.or_mv",
+            narrow_base_stats(1_680, &["a", "b", "v"]),
+        );
+
+        let physical = optimize(
+            query,
+            query_scalars,
+            &stats,
+            ColumnRefFactory::new(),
+            None,
+            vec![candidate],
+        )
+        .expect("optimize");
+
+        assert!(
+            plan_contains_mv_scan(&physical, "or_mv"),
+            "optimizer should select the cheaper exact OR MV alternative, got {physical:#?}"
+        );
     }
 
     struct AlwaysSomeProvider;

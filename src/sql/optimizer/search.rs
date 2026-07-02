@@ -310,6 +310,7 @@ impl SearchContext {
                     required_output: required,
                     alt_kind: &alt.kind,
                     scalars: Some(&memo.scalars),
+                    stats_input: Some(&self.stats_input),
                     options: &self.cost_options,
                 };
                 let operator_estimate = compute_cost_estimate(&cost_input).sanitized();
@@ -983,6 +984,7 @@ mod tests {
             required_output: &required,
             alt_kind: &winner.alt_kind,
             scalars: Some(&memo.scalars),
+            stats_input: None,
             options: &ctx.cost_options,
         };
         let scan_estimate = super::super::cost::compute_cost_estimate(&scan_input).sanitized();
@@ -1032,6 +1034,7 @@ mod tests {
             required_output: &required,
             alt_kind: &winner.alt_kind,
             scalars: Some(&memo.scalars),
+            stats_input: None,
             options: &ctx.cost_options,
         };
         let scan_estimate = super::super::cost::compute_cost_estimate(&scan_input).sanitized();
@@ -1148,6 +1151,7 @@ mod tests {
             required_output: &required,
             alt_kind: &parent_winner.alt_kind,
             scalars: Some(&memo.scalars),
+            stats_input: None,
             options: &ctx.cost_options,
         };
         let parent_self_estimate = compute_cost_estimate(&parent_input).sanitized();
