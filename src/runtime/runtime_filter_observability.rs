@@ -272,10 +272,13 @@ impl RfLifecycleHandle {
     }
 
     pub fn acquired(&self, outcome: impl Into<String>, latency_ns: i64) {
-        *mutex_lock(&self.record.acquired) = Some(RfAcquiredInfo {
-            outcome: outcome.into(),
-            latency_ns,
-        });
+        let mut acquired = mutex_lock(&self.record.acquired);
+        if acquired.is_none() {
+            *acquired = Some(RfAcquiredInfo {
+                outcome: outcome.into(),
+                latency_ns,
+            });
+        }
     }
 
     pub fn applied(&self, input_rows: i64, output_rows: i64, evals: i64) {
@@ -410,6 +413,26 @@ mod tests {
 
         registry.remove_query(q);
         assert!(registry.snapshot(q).is_none());
+    }
+
+    #[test]
+    fn acquired_preserves_first_record() {
+        let registry = RuntimeFilterLifecycleRegistry::new();
+        let q = QueryKey::from_hi_lo(3, 4);
+        let rec = registry.recorder(q);
+
+        rec.acquired(7, "complete", 4_000);
+        rec.acquired(7, "complete", 0);
+
+        let snap = registry.snapshot(q).expect("query snapshot");
+        let filter = snap.filters.get(&7).expect("filter 7");
+        assert_eq!(
+            filter
+                .acquired
+                .as_ref()
+                .map(|a| (a.outcome.as_str(), a.latency_ns)),
+            Some(("complete", 4_000))
+        );
     }
 
     #[test]
