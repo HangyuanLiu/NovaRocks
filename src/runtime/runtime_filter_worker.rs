@@ -29,6 +29,9 @@ use crate::exec::runtime_filter::{
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
+use crate::runtime::runtime_filter_observability::{
+    QueryKey, RfDropReason, RfLifecycleRecorder, RuntimeFilterLifecycleRegistry,
+};
 use crate::service::exchange_sender;
 use crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams;
 
@@ -181,7 +184,7 @@ impl RuntimeFilterWorker {
             "runtime filter merge state: filter_id={} expected_builders={}",
             filter_id, expected
         );
-        let ready = {
+        let (ready, merge_progress) = {
             let mut guard = self.merge_states.lock().expect("runtime filter merge lock");
             let state = guard
                 .entry(filter_id)
@@ -196,33 +199,57 @@ impl RuntimeFilterWorker {
                 return Ok(());
             }
             state.received.insert(build_be_number, filter);
+            let merge_progress = Some((state.received.len(), state.expected));
             if state.received.len() < state.expected {
-                return Ok(());
+                (None, merge_progress)
+            } else {
+                let mut parts = Vec::with_capacity(state.received.len());
+                for value in state.received.values() {
+                    parts.push(value.clone());
+                }
+                state.received.clear();
+                state.done = true;
+                (Some(parts), merge_progress)
             }
-            let mut parts = Vec::with_capacity(state.received.len());
-            for value in state.received.values() {
-                parts.push(value.clone());
-            }
-            state.received.clear();
-            state.done = true;
-            Some(parts)
         };
+
+        if let Some((received, expected)) = merge_progress {
+            self.recorder()
+                .merge_progress(filter_id, received as i64, expected as i64);
+        }
 
         if let Some(parts) = ready {
             let max_size = self.params.runtime_filter_max_size();
-            let data = merge_and_encode_filters(parts, max_size)?;
+            let payload = merge_and_encode_filters(parts, max_size)?;
+            if payload.size_exceeded {
+                if let Some(limit) = max_size {
+                    warn!(
+                        "runtime filter merge size exceeded: filter_id={} limit={} final_bytes={}",
+                        filter_id,
+                        limit,
+                        payload.data.len()
+                    );
+                }
+                self.recorder()
+                    .dropped(filter_id, RfDropReason::SizeExceeded);
+            }
             debug!(
                 "runtime filter merged final: filter_id={} bytes={}",
                 filter_id,
-                data.len()
+                payload.data.len()
             );
-            self.broadcast_final_filter(filter_id, data);
+            self.broadcast_final_filter(filter_id, payload.data);
         }
         Ok(())
     }
 
     fn expected_builders(&self, filter_id: i32) -> usize {
         self.params.expected_builders(filter_id)
+    }
+
+    fn recorder(&self) -> RfLifecycleRecorder {
+        RuntimeFilterLifecycleRegistry::global()
+            .recorder(QueryKey::from_hi_lo(self.query_id.hi, self.query_id.lo))
     }
 
     fn broadcast_final_filter(&self, filter_id: i32, data: Vec<u8>) {
@@ -262,6 +289,7 @@ impl RuntimeFilterWorker {
                     filter_id,
                     e
                 );
+                self.recorder().dropped(filter_id, RfDropReason::SendFailed);
             }
         }
     }
@@ -291,10 +319,15 @@ enum RuntimeFilterPayload {
     Membership(RuntimeMembershipFilter),
 }
 
+struct MergedRuntimeFilterPayload {
+    data: Vec<u8>,
+    size_exceeded: bool,
+}
+
 fn merge_and_encode_filters(
     parts: Vec<RuntimeFilterPayload>,
     max_size: Option<i64>,
-) -> Result<Vec<u8>, String> {
+) -> Result<MergedRuntimeFilterPayload, String> {
     let mut iter = parts.into_iter();
     let first = iter
         .next()
@@ -308,17 +341,23 @@ fn merge_and_encode_filters(
                 }
             }
             let mut data = encode_starrocks_in_filter(&merged)?;
+            let mut size_exceeded = false;
             if let Some(limit) = max_size
                 && data.len() as i64 > limit
             {
                 merged = merged.empty_like();
                 data = encode_starrocks_in_filter(&merged)?;
+                size_exceeded = true;
             }
-            Ok(data)
+            Ok(MergedRuntimeFilterPayload {
+                data,
+                size_exceeded,
+            })
         }
         RuntimeFilterPayload::Membership(merged) => {
             let mut total_size = merged.size();
             let mut force_empty = !merged.can_use_for_merge();
+            let mut size_exceeded = false;
             let mut min_max = merged.min_max().clone();
             let mut merged_membership = if matches!(merged, RuntimeMembershipFilter::Empty(_)) {
                 None
@@ -351,6 +390,7 @@ fn merge_and_encode_filters(
                 && total_size as i64 > limit
             {
                 force_empty = true;
+                size_exceeded = true;
             }
             let mut result = if force_empty {
                 let mut base = merged_membership.unwrap_or(merged);
@@ -368,8 +408,12 @@ fn merge_and_encode_filters(
                 result = result.to_empty();
                 result.set_min_max(min_max);
                 data = encode_membership_filter(&result)?;
+                size_exceeded = true;
             }
-            Ok(data)
+            Ok(MergedRuntimeFilterPayload {
+                data,
+                size_exceeded,
+            })
         }
     }
 }
@@ -398,6 +442,9 @@ mod tests {
     use crate::exec::runtime_filter::{
         RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeEmptyFilter, RuntimeFilterType,
         RuntimeMinMaxFilter,
+    };
+    use crate::runtime::runtime_filter_observability::{
+        QueryKey, RfDropReason, RuntimeFilterLifecycleRegistry,
     };
 
     type SendHook =
@@ -445,6 +492,28 @@ mod tests {
         params: PTransmitRuntimeFilterParams,
     }
 
+    struct LifecycleQueryGuard {
+        query_key: QueryKey,
+    }
+
+    impl LifecycleQueryGuard {
+        fn new(query_id: QueryId) -> Self {
+            let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+            RuntimeFilterLifecycleRegistry::global().remove_query(query_key);
+            Self { query_key }
+        }
+
+        fn query_key(&self) -> QueryKey {
+            self.query_key
+        }
+    }
+
+    impl Drop for LifecycleQueryGuard {
+        fn drop(&mut self) {
+            RuntimeFilterLifecycleRegistry::global().remove_query(self.query_key);
+        }
+    }
+
     #[test]
     fn receive_partial_does_not_broadcast_until_all_builders_arrive() {
         let sends = Arc::new(Mutex::new(Vec::new()));
@@ -463,6 +532,8 @@ mod tests {
 
         let filter_id = 1;
         let slot_id = SlotId::new(7);
+        let query_id = QueryId { hi: 123, lo: 456 };
+        let lifecycle_guard = LifecycleQueryGuard::new(query_id);
         let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
         hub.register_filter_specs(
             100,
@@ -484,7 +555,7 @@ mod tests {
             HashMap::from([(filter_id, 2)]),
             None,
         );
-        let worker = RuntimeFilterWorker::new(QueryId { hi: 123, lo: 456 }, params, hub);
+        let worker = RuntimeFilterWorker::new(query_id, params, hub);
         let first = encoded_empty_membership_partial(filter_id, slot_id);
         let second = encoded_empty_membership_partial(filter_id, slot_id);
 
@@ -498,10 +569,29 @@ mod tests {
                 .is_empty(),
             "first of two build BE partials must not broadcast a final filter"
         );
+        let snapshot = RuntimeFilterLifecycleRegistry::global()
+            .snapshot(lifecycle_guard.query_key())
+            .expect("query snapshot after first partial");
+        let filter = snapshot
+            .filters
+            .get(&filter_id)
+            .expect("filter lifecycle after first partial");
+        assert_eq!(filter.merged_received(), 1);
+        assert_eq!(filter.merged_expected(), 2);
 
         worker
             .receive_partial(filter_id, &second, 11, Some(DataType::Int32))
             .expect("second partial");
+        let snapshot = RuntimeFilterLifecycleRegistry::global()
+            .snapshot(lifecycle_guard.query_key())
+            .expect("query snapshot after second partial");
+        let filter = snapshot
+            .filters
+            .get(&filter_id)
+            .expect("filter lifecycle after second partial");
+        assert_eq!(filter.merged_received(), 2);
+        assert_eq!(filter.merged_expected(), 2);
+
         let sends = sends.lock().expect("captured runtime filter sends lock");
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].hostname, "127.0.0.1");
@@ -513,6 +603,127 @@ mod tests {
             Some((123, 456))
         );
         assert!(sends[0].params.data.is_some());
+    }
+
+    #[test]
+    fn size_capped_merge_records_dropped_and_broadcasts_empty() {
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let sends_capture = Arc::clone(&sends);
+        let _hook_guard = install_final_send_hook(Box::new(move |hostname, port, params| {
+            sends_capture
+                .lock()
+                .expect("captured runtime filter sends lock")
+                .push(CapturedFinalRuntimeFilterSend {
+                    hostname: hostname.to_string(),
+                    port,
+                    params,
+                });
+            Ok(())
+        }));
+
+        let filter_id = 2;
+        let slot_id = SlotId::new(8);
+        let query_id = QueryId { hi: 223, lo: 456 };
+        let lifecycle_guard = LifecycleQueryGuard::new(query_id);
+        let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+        hub.register_filter_specs(
+            100,
+            &[JoinRuntimeFilterSpec {
+                filter_id,
+                expr_order: 0,
+                probe_slot_id: slot_id,
+                build_data_type: DataType::Int32,
+                merge_nodes: Vec::new(),
+                has_remote_targets: true,
+            }],
+        );
+
+        let params = RuntimeFilterWorkerParams::new(
+            HashMap::from([(
+                filter_id,
+                vec![RuntimeFilterProberTarget::new("127.0.0.1", 18031)],
+            )]),
+            HashMap::from([(filter_id, 2)]),
+            Some(1),
+        );
+        let worker = RuntimeFilterWorker::new(query_id, params, hub);
+        let first = encoded_empty_membership_partial(filter_id, slot_id);
+        let second = encoded_empty_membership_partial(filter_id, slot_id);
+
+        worker
+            .receive_partial(filter_id, &first, 20, Some(DataType::Int32))
+            .expect("first partial");
+        worker
+            .receive_partial(filter_id, &second, 21, Some(DataType::Int32))
+            .expect("second partial");
+
+        let snapshot = RuntimeFilterLifecycleRegistry::global()
+            .snapshot(lifecycle_guard.query_key())
+            .expect("query snapshot");
+        let filter = snapshot.filters.get(&filter_id).expect("filter lifecycle");
+        assert_eq!(filter.merged_received(), 2);
+        assert_eq!(filter.merged_expected(), 2);
+        assert_eq!(filter.dropped, Some(RfDropReason::SizeExceeded));
+
+        let sends = sends.lock().expect("captured runtime filter sends lock");
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].params.is_partial, Some(false));
+        assert_eq!(sends[0].params.filter_id, Some(filter_id));
+        assert!(
+            sends[0]
+                .params
+                .data
+                .as_ref()
+                .is_some_and(|data| !data.is_empty())
+        );
+    }
+
+    #[test]
+    fn send_failure_records_dropped() {
+        let _hook_guard =
+            install_final_send_hook(Box::new(
+                |_hostname, _port, _params| Err("boom".to_string()),
+            ));
+
+        let filter_id = 3;
+        let slot_id = SlotId::new(9);
+        let query_id = QueryId { hi: 323, lo: 456 };
+        let lifecycle_guard = LifecycleQueryGuard::new(query_id);
+        let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+        hub.register_filter_specs(
+            100,
+            &[JoinRuntimeFilterSpec {
+                filter_id,
+                expr_order: 0,
+                probe_slot_id: slot_id,
+                build_data_type: DataType::Int32,
+                merge_nodes: Vec::new(),
+                has_remote_targets: true,
+            }],
+        );
+
+        let params = RuntimeFilterWorkerParams::new(
+            HashMap::from([(
+                filter_id,
+                vec![RuntimeFilterProberTarget::new("127.0.0.1", 18032)],
+            )]),
+            HashMap::from([(filter_id, 1)]),
+            None,
+        );
+        let worker = RuntimeFilterWorker::new(query_id, params, hub);
+        let partial = encoded_empty_membership_partial(filter_id, slot_id);
+
+        worker
+            .receive_partial(filter_id, &partial, 30, Some(DataType::Int32))
+            .expect("partial");
+
+        let snapshot = RuntimeFilterLifecycleRegistry::global()
+            .snapshot(lifecycle_guard.query_key())
+            .expect("query snapshot");
+        let filter = snapshot.filters.get(&filter_id).expect("filter lifecycle");
+        assert_eq!(filter.merged_received(), 1);
+        assert_eq!(filter.merged_expected(), 1);
+        assert_eq!(filter.dropped, Some(RfDropReason::SendFailed));
     }
 
     fn encoded_empty_membership_partial(filter_id: i32, slot_id: SlotId) -> Vec<u8> {
