@@ -110,6 +110,7 @@ fn test_iceberg_connector_module() {
         case_sensitive: false,
         enable_page_index: false,
         min_max_predicates: vec![],
+        runtime_min_max_filter_columns: std::collections::HashMap::new(),
         variant_path_predicates: Vec::new(),
         batch_size: None,
         datacache: DataCacheManager::instance().external_context(test_cache_options()),

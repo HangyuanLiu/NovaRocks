@@ -51,7 +51,7 @@ use crate::runtime::descriptor_snapshot::{
     DescriptorLogicalType, DescriptorSlot, DescriptorSnapshot,
 };
 use crate::runtime::descriptor_snapshot_thrift::descriptor_snapshot_from_thrift;
-use crate::thrift::{descriptors, exprs, internal_service, plan_nodes, types};
+use crate::thrift::{descriptors, exprs, internal_service, plan_nodes, runtime_filter, types};
 
 /// Cache Iceberg table locations from the normalized descriptor snapshot for HDFS scan lowering.
 pub(crate) fn cache_iceberg_table_locations(snapshot: Option<&DescriptorSnapshot>) {
@@ -116,6 +116,57 @@ fn hdfs_scan_file_format_from_thrift(
         descriptors::THdfsFileFormat::ORC => crate::exec::node::scan::HdfsScanFileFormat::Orc,
         _ => crate::exec::node::scan::HdfsScanFileFormat::Other,
     }
+}
+
+fn build_topn_filter_column_map(
+    node: &plan_nodes::TPlanNode,
+    desc_tbl: &descriptors::TDescriptorTable,
+) -> HashMap<i32, String> {
+    let mut map = HashMap::new();
+    let Some(descs) = node
+        .probe_runtime_filters
+        .as_ref()
+        .filter(|v| !v.is_empty())
+    else {
+        return map;
+    };
+    for desc in descs {
+        if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER) {
+            continue;
+        }
+        let Some(filter_id) = desc.filter_id else {
+            continue;
+        };
+        let probe_column_name = desc
+            .plan_node_id_to_target_expr
+            .as_ref()
+            .and_then(|m| m.get(&node.node_id))
+            .and_then(simple_topn_probe_slot_ref)
+            .and_then(|slot_ref| {
+                let slot_id = slot_ref.slot_id;
+                desc_tbl.slot_descriptors.as_ref().and_then(|slots| {
+                    slots
+                        .iter()
+                        .find(|sd| sd.id == Some(slot_id))
+                        .and_then(|sd| sd.col_name.clone())
+                })
+            });
+        if let Some(name) = probe_column_name.filter(|name| !name.is_empty()) {
+            map.insert(filter_id, name);
+        }
+    }
+    map
+}
+
+fn simple_topn_probe_slot_ref(probe_expr: &exprs::TExpr) -> Option<&exprs::TSlotRef> {
+    if probe_expr.nodes.len() != 1 {
+        return None;
+    }
+    let node = probe_expr.nodes.first()?;
+    if node.node_type != exprs::TExprNodeType::SLOT_REF || node.num_children != 0 {
+        return None;
+    }
+    node.slot_ref.as_ref()
 }
 
 fn convert_scan_range_delete_files(
@@ -821,6 +872,7 @@ fn apply_row_position_pruning_gate(
     enable_page_index: &mut bool,
     min_max_predicates: &mut Vec<MinMaxPredicate>,
     variant_path_predicates: &mut Vec<VariantPathPruningPredicate>,
+    runtime_min_max_filter_columns: &mut HashMap<i32, String>,
 ) {
     if row_position_required {
         // When row position is required, we must keep a stable row_id sequence.
@@ -828,6 +880,7 @@ fn apply_row_position_pruning_gate(
         *enable_page_index = false;
         min_max_predicates.clear();
         variant_path_predicates.clear();
+        runtime_min_max_filter_columns.clear();
     }
 }
 
@@ -1550,11 +1603,13 @@ pub(crate) fn lower_hdfs_scan_node(
         }
     }
     let has_position_delete_files = scan_ranges_have_position_delete_files(&ranges);
+    let mut runtime_min_max_filter_columns = build_topn_filter_column_map(node, desc_tbl);
     apply_row_position_pruning_gate(
         row_position_spec.is_some() || has_position_delete_files,
         &mut enable_page_index,
         &mut min_max_predicates,
         &mut variant_path_predicates,
+        &mut runtime_min_max_filter_columns,
     );
 
     debug!(
@@ -1688,6 +1743,7 @@ pub(crate) fn lower_hdfs_scan_node(
         case_sensitive,
         enable_page_index,
         min_max_predicates,
+        runtime_min_max_filter_columns,
         batch_size,
         datacache: external_datacache,
         cache_policy: ParquetReadCachePolicy::with_flags(
@@ -1817,12 +1873,12 @@ mod tests {
     };
     use crate::lower::layout::layout_from_slot_ids;
     use crate::thrift::internal_service::TQueryOptions;
-    use crate::thrift::{descriptors, exprs, plan_nodes, types};
+    use crate::thrift::{descriptors, exprs, plan_nodes, runtime_filter, types};
     use arrow::datatypes::{DataType, Field};
 
     use super::{
         DescriptorLogicalType, HdfsScanReadColumns, HdfsSlotInfo, apply_row_position_pruning_gate,
-        build_hdfs_slot_info_map, descriptor_snapshot_from_thrift,
+        build_hdfs_slot_info_map, build_topn_filter_column_map, descriptor_snapshot_from_thrift,
         extract_change_op_from_extended_columns, file_cache_flags_from_query_options,
         parse_hdfs_scan_pruning_predicates, parse_hdfs_scan_variant_path_columns,
         resolve_cloud_object_store_config, scan_ranges_have_position_delete_files,
@@ -2136,6 +2192,169 @@ mod tests {
         build_hdfs_slot_info_map(&snapshot, tuple_id).expect("slot info map")
     }
 
+    fn test_hdfs_plan_node_with_probe_filters(
+        node_id: i32,
+        probe_runtime_filters: Vec<runtime_filter::TRuntimeFilterDescription>,
+    ) -> plan_nodes::TPlanNode {
+        plan_nodes::TPlanNode {
+            node_id,
+            node_type: plan_nodes::TPlanNodeType::HDFS_SCAN_NODE,
+            num_children: 0,
+            limit: -1,
+            row_tuples: vec![1],
+            nullable_tuples: vec![false],
+            conjuncts: None,
+            compact_data: false,
+            common: None,
+            hash_join_node: None,
+            agg_node: None,
+            sort_node: None,
+            merge_node: None,
+            exchange_node: None,
+            mysql_scan_node: None,
+            olap_scan_node: None,
+            file_scan_node: None,
+            schema_scan_node: None,
+            meta_scan_node: None,
+            analytic_node: None,
+            union_node: None,
+            resource_profile: None,
+            es_scan_node: None,
+            repeat_node: None,
+            assert_num_rows_node: None,
+            intersect_node: None,
+            except_node: None,
+            merge_join_node: None,
+            raw_values_node: None,
+            use_vectorized: None,
+            hdfs_scan_node: None,
+            project_node: None,
+            table_function_node: None,
+            probe_runtime_filters: Some(probe_runtime_filters),
+            decode_node: None,
+            local_rf_waiting_set: None,
+            filter_null_value_columns: None,
+            need_create_tuple_columns: None,
+            jdbc_scan_node: None,
+            connector_scan_node: None,
+            cross_join_node: None,
+            lake_scan_node: None,
+            nestloop_join_node: None,
+            stream_scan_node: None,
+            stream_join_node: None,
+            stream_agg_node: None,
+            select_node: None,
+            fetch_node: None,
+            look_up_node: None,
+            benchmark_scan_node: None,
+            cache_stats_scan_node: None,
+            iceberg_delta_scan_node: None,
+            change_event_expand_node: None,
+        }
+    }
+
+    fn test_topn_filter_desc(
+        filter_id: i32,
+        node_id: i32,
+        target_expr: exprs::TExpr,
+    ) -> runtime_filter::TRuntimeFilterDescription {
+        runtime_filter::TRuntimeFilterDescription {
+            filter_id: Some(filter_id),
+            plan_node_id_to_target_expr: Some(BTreeMap::from([(node_id, target_expr)])),
+            filter_type: Some(runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER),
+            ..Default::default()
+        }
+    }
+
+    fn test_descriptor_table_for_topn_slot(
+        slot_id: i32,
+        tuple_id: i32,
+        column_name: &str,
+    ) -> descriptors::TDescriptorTable {
+        descriptors::TDescriptorTable::new(
+            Some(vec![test_slot_descriptor(
+                slot_id,
+                tuple_id,
+                column_name,
+                types::TPrimitiveType::INT,
+                true,
+                None,
+            )]),
+            vec![descriptors::TTupleDescriptor::new(
+                Some(tuple_id),
+                None,
+                None,
+                Some(100),
+                None,
+            )],
+            None::<Vec<descriptors::TTableDescriptor>>,
+            None,
+        )
+    }
+
+    fn test_slot_ref_expr(slot_id: i32, tuple_id: i32) -> exprs::TExpr {
+        let type_desc = crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::INT);
+        exprs::TExpr::new(vec![exprs::TExprNode {
+            node_type: exprs::TExprNodeType::SLOT_REF,
+            type_: type_desc,
+            num_children: 0,
+            slot_ref: Some(exprs::TSlotRef { slot_id, tuple_id }),
+            ..default_expr_node()
+        }])
+    }
+
+    fn test_non_simple_slot_ref_expr(slot_id: i32, tuple_id: i32) -> exprs::TExpr {
+        let type_desc = crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::INT);
+        exprs::TExpr::new(vec![
+            exprs::TExprNode {
+                node_type: exprs::TExprNodeType::SLOT_REF,
+                type_: type_desc.clone(),
+                num_children: 1,
+                slot_ref: Some(exprs::TSlotRef { slot_id, tuple_id }),
+                ..default_expr_node()
+            },
+            exprs::TExprNode {
+                node_type: exprs::TExprNodeType::INT_LITERAL,
+                type_: type_desc,
+                num_children: 0,
+                int_literal: Some(exprs::TIntLiteral { value: 1 }),
+                ..default_expr_node()
+            },
+        ])
+    }
+
+    #[test]
+    fn hdfs_topn_filter_column_map_binds_plain_slot_ref() {
+        let node_id = 7;
+        let desc_tbl = test_descriptor_table_for_topn_slot(3, 1, "id");
+        let node = test_hdfs_plan_node_with_probe_filters(
+            node_id,
+            vec![test_topn_filter_desc(11, node_id, test_slot_ref_expr(3, 1))],
+        );
+
+        let map = build_topn_filter_column_map(&node, &desc_tbl);
+
+        assert_eq!(map.get(&11).map(String::as_str), Some("id"));
+    }
+
+    #[test]
+    fn hdfs_topn_filter_column_map_skips_non_simple_target_expr() {
+        let node_id = 7;
+        let desc_tbl = test_descriptor_table_for_topn_slot(3, 1, "id");
+        let node = test_hdfs_plan_node_with_probe_filters(
+            node_id,
+            vec![test_topn_filter_desc(
+                11,
+                node_id,
+                test_non_simple_slot_ref_expr(3, 1),
+            )],
+        );
+
+        let map = build_topn_filter_column_map(&node, &desc_tbl);
+
+        assert!(map.is_empty());
+    }
+
     fn test_variant_path_column(
         source_slot_id: Option<i32>,
         output_slot_id: Option<i32>,
@@ -2445,17 +2664,20 @@ mod tests {
         let mut enable_page_index = true;
         let mut min_max_predicates = predicates.physical;
         let mut variant_path_predicates = predicates.variant;
+        let mut runtime_min_max_filter_columns = HashMap::from([(11, "id".to_string())]);
 
         apply_row_position_pruning_gate(
             true,
             &mut enable_page_index,
             &mut min_max_predicates,
             &mut variant_path_predicates,
+            &mut runtime_min_max_filter_columns,
         );
 
         assert!(!enable_page_index);
         assert!(min_max_predicates.is_empty());
         assert!(variant_path_predicates.is_empty());
+        assert!(runtime_min_max_filter_columns.is_empty());
     }
 
     fn test_range_with_delete_file(file_content: IcebergFileContent) -> FileScanRange {
@@ -2505,17 +2727,20 @@ mod tests {
         let mut enable_page_index = true;
         let mut min_max_predicates = predicates.physical;
         let mut variant_path_predicates = predicates.variant;
+        let mut runtime_min_max_filter_columns = HashMap::from([(11, "id".to_string())]);
 
         apply_row_position_pruning_gate(
             scan_ranges_have_position_delete_files(&ranges),
             &mut enable_page_index,
             &mut min_max_predicates,
             &mut variant_path_predicates,
+            &mut runtime_min_max_filter_columns,
         );
 
         assert!(!enable_page_index);
         assert!(min_max_predicates.is_empty());
         assert!(variant_path_predicates.is_empty());
+        assert!(runtime_min_max_filter_columns.is_empty());
     }
 
     #[test]
@@ -2542,17 +2767,23 @@ mod tests {
         let mut enable_page_index = true;
         let mut min_max_predicates = predicates.physical;
         let mut variant_path_predicates = predicates.variant;
+        let mut runtime_min_max_filter_columns = HashMap::from([(11, "id".to_string())]);
 
         apply_row_position_pruning_gate(
             scan_ranges_have_position_delete_files(&ranges),
             &mut enable_page_index,
             &mut min_max_predicates,
             &mut variant_path_predicates,
+            &mut runtime_min_max_filter_columns,
         );
 
         assert!(enable_page_index);
         assert_eq!(min_max_predicates.len(), 1);
         assert_eq!(variant_path_predicates.len(), 1);
+        assert_eq!(
+            runtime_min_max_filter_columns.get(&11).map(String::as_str),
+            Some("id")
+        );
     }
 
     #[test]

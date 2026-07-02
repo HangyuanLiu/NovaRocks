@@ -41,6 +41,7 @@ fn apply_parquet_pruning_gate_for_delete_files(
     if delete_files_have_position_deletes(delete_files) {
         parquet_cfg.enable_page_index = false;
         parquet_cfg.min_max_predicates.clear();
+        parquet_cfg.runtime_min_max_filter_columns.clear();
         parquet_cfg.variant_path_predicates.clear();
     }
 }
@@ -650,6 +651,7 @@ mod tests {
                 column: "0".to_string(),
                 value: MinMaxPredicateValue::Int32(5),
             }],
+            runtime_min_max_filter_columns: std::collections::HashMap::new(),
             variant_path_predicates: vec![VariantPathPruningPredicate {
                 output_slot_id: SlotId::new(2),
                 source_slot_id: SlotId::new(3),
@@ -677,6 +679,9 @@ mod tests {
     #[test]
     fn hdfs_scan_position_delete_morsel_strips_parquet_pruning() {
         let mut parquet_cfg = test_prunable_parquet_config();
+        parquet_cfg
+            .runtime_min_max_filter_columns
+            .insert(11, "id".to_string());
 
         apply_parquet_pruning_gate_for_delete_files(
             &mut parquet_cfg,
@@ -685,6 +690,7 @@ mod tests {
 
         assert!(!parquet_cfg.enable_page_index);
         assert!(parquet_cfg.min_max_predicates.is_empty());
+        assert!(parquet_cfg.runtime_min_max_filter_columns.is_empty());
         assert!(parquet_cfg.variant_path_predicates.is_empty());
     }
 

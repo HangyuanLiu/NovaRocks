@@ -252,6 +252,7 @@ pub(crate) fn execute_lookup_request(
             case_sensitive: scan_cfg.case_sensitive,
             enable_page_index: false,
             min_max_predicates: Vec::new(),
+            runtime_min_max_filter_columns: HashMap::new(),
             variant_path_predicates: Vec::new(),
             batch_size: scan_cfg.batch_size,
             datacache: DataCacheManager::instance().external_context(cache_options.clone()),
