@@ -167,7 +167,6 @@ fn encode_utf8_column_to_dict_ids(
 ) -> Result<ArrayRef, String> {
     let mut builder = Int32Builder::with_capacity(array.len());
     let mut non_null_count = 0usize;
-    let mut miss_count = 0usize;
     match array.data_type() {
         DataType::Utf8 => {
             let values = array
@@ -179,13 +178,12 @@ fn encode_utf8_column_to_dict_ids(
                     builder.append_null();
                 } else {
                     non_null_count += 1;
-                    let code = dict_map
-                        .get(values.value(row).as_bytes())
-                        .copied()
-                        .unwrap_or_else(|| {
-                            miss_count += 1;
-                            0
-                        });
+                    let code = lookup_global_dict_code(
+                        dict_map,
+                        values.value(row).as_bytes(),
+                        slot_id,
+                        output_name,
+                    )?;
                     builder.append_value(code);
                 }
             }
@@ -200,13 +198,12 @@ fn encode_utf8_column_to_dict_ids(
                     builder.append_null();
                 } else {
                     non_null_count += 1;
-                    let code = dict_map
-                        .get(values.value(row).as_bytes())
-                        .copied()
-                        .unwrap_or_else(|| {
-                            miss_count += 1;
-                            0
-                        });
+                    let code = lookup_global_dict_code(
+                        dict_map,
+                        values.value(row).as_bytes(),
+                        slot_id,
+                        output_name,
+                    )?;
                     builder.append_value(code);
                 }
             }
@@ -220,11 +217,10 @@ fn encode_utf8_column_to_dict_ids(
     }
     if non_null_count > 0 {
         info!(
-            "starrocks global dict encode stats: slot_id={} output_column={} non_null={} miss={} dict_size={}",
+            "starrocks global dict encode stats: slot_id={} output_column={} non_null={} dict_size={}",
             slot_id,
             output_name,
             non_null_count,
-            miss_count,
             dict_map.len()
         );
     }
@@ -236,6 +232,24 @@ fn encode_utf8_column_to_dict_ids(
         format!(
             "cast dict-encoded column to output type failed: slot_id={}, output_column={}, output_type={:?}, error={}",
             slot_id, output_name, output_type, e
+        )
+    })
+}
+
+fn lookup_global_dict_code(
+    dict_map: &HashMap<Vec<u8>, i32>,
+    value: &[u8],
+    slot_id: SlotId,
+    output_name: &str,
+) -> Result<i32, String> {
+    dict_map.get(value).copied().ok_or_else(|| {
+        let sample = String::from_utf8_lossy(value);
+        format!(
+            "value not found in query global dict: slot_id={}, output_column={}, value_sample='{}', dict_size={}",
+            slot_id,
+            output_name,
+            sample,
+            dict_map.len()
         )
     })
 }
@@ -303,7 +317,7 @@ fn encode_column_to_dict_ids(
 #[cfg(test)]
 mod tests {
     use super::{QueryGlobalDictEncodeMap, encode_batch_with_query_global_dicts};
-    use arrow::array::{Array, Int32Array, StringArray};
+    use arrow::array::{Array, Int32Array, LargeStringArray, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
@@ -327,11 +341,7 @@ mod tests {
         );
         let scan_batch = RecordBatch::try_new(
             scan_schema,
-            vec![Arc::new(StringArray::from(vec![
-                Some("a"),
-                Some("x"),
-                None,
-            ]))],
+            vec![Arc::new(StringArray::from(vec![Some("a"), None]))],
         )
         .expect("scan batch");
         let mut dict_values = HashMap::new();
@@ -348,7 +358,117 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("int32 column");
         assert_eq!(values.value(0), 11);
-        assert_eq!(values.value(1), 0);
-        assert!(values.is_null(2));
+        assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn encode_batch_with_query_global_dicts_rejects_missing_value() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Int32, true)]));
+        let scan_schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Utf8, true)]));
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(7),
+                Field::new("v1", DataType::Utf8, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        let scan_batch = RecordBatch::try_new(
+            scan_schema,
+            vec![Arc::new(StringArray::from(vec![Some("missing")]))],
+        )
+        .expect("scan batch");
+        let mut dict_values = HashMap::new();
+        dict_values.insert(b"a".to_vec(), 11);
+        let mut dict_map = QueryGlobalDictEncodeMap::new();
+        dict_map.insert(SlotId::new(7), Arc::new(dict_values));
+
+        let err =
+            encode_batch_with_query_global_dicts(scan_batch, &schema, &chunk_schema, &dict_map)
+                .unwrap_err();
+        assert!(
+            err.contains("value not found in query global dict")
+                && err.contains("slot_id=7")
+                && err.contains("output_column=v1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn encode_batch_with_query_global_dicts_maps_large_utf8_to_ids() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Int32, true)]));
+        let scan_schema = Arc::new(Schema::new(vec![Field::new(
+            "v1",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(7),
+                Field::new("v1", DataType::LargeUtf8, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        let scan_batch = RecordBatch::try_new(
+            scan_schema,
+            vec![Arc::new(LargeStringArray::from(vec![Some("a"), None]))],
+        )
+        .expect("scan batch");
+        let mut dict_values = HashMap::new();
+        dict_values.insert(b"a".to_vec(), 11);
+        let mut dict_map = QueryGlobalDictEncodeMap::new();
+        dict_map.insert(SlotId::new(7), Arc::new(dict_values));
+
+        let encoded =
+            encode_batch_with_query_global_dicts(scan_batch, &schema, &chunk_schema, &dict_map)
+                .expect("encode");
+        let values = encoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 column");
+        assert_eq!(values.value(0), 11);
+        assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn encode_batch_with_query_global_dicts_rejects_missing_large_utf8_value() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Int32, true)]));
+        let scan_schema = Arc::new(Schema::new(vec![Field::new(
+            "v1",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(7),
+                Field::new("v1", DataType::LargeUtf8, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        let scan_batch = RecordBatch::try_new(
+            scan_schema,
+            vec![Arc::new(LargeStringArray::from(vec![Some("missing")]))],
+        )
+        .expect("scan batch");
+        let mut dict_values = HashMap::new();
+        dict_values.insert(b"a".to_vec(), 11);
+        let mut dict_map = QueryGlobalDictEncodeMap::new();
+        dict_map.insert(SlotId::new(7), Arc::new(dict_values));
+
+        let err =
+            encode_batch_with_query_global_dicts(scan_batch, &schema, &chunk_schema, &dict_map)
+                .unwrap_err();
+        assert!(
+            err.contains("value not found in query global dict")
+                && err.contains("slot_id=7")
+                && err.contains("output_column=v1"),
+            "{err}"
+        );
     }
 }

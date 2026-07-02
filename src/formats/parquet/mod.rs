@@ -3150,11 +3150,7 @@ mod tests {
         // 2) encode Utf8 -> Int32 ids:
         let scan_batch = RecordBatch::try_new(
             scan_arrow,
-            vec![Arc::new(StringArray::from(vec![
-                Some("a"),
-                Some("z"),
-                None,
-            ]))],
+            vec![Arc::new(StringArray::from(vec![Some("a"), None]))],
         )
         .expect("scan batch");
         let encoded = crate::exec::dict_encode::encode_batch_with_query_global_dicts(
@@ -3170,8 +3166,52 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("int32");
         assert_eq!(ids.value(0), 11);
-        assert_eq!(ids.value(1), 0); // dict miss -> 0
-        assert!(ids.is_null(2));
+        assert!(ids.is_null(1));
+    }
+
+    #[test]
+    fn parquet_scan_iter_rejects_missing_query_global_dict_value() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("dict_status_miss.parquet");
+        write_status_parquet(&file_path, false);
+
+        let mut cfg = test_parquet_scan_cfg(
+            vec!["status".to_string()],
+            vec![types::TPrimitiveType::INT],
+            None,
+        );
+        let mut dict_values = HashMap::new();
+        dict_values.insert(b"NEW".to_vec(), 11);
+        cfg.query_global_dicts
+            .insert(SlotId::new(1), Arc::new(dict_values));
+
+        let file_len = fs::metadata(&file_path).expect("file metadata").len();
+        let scan = FileScanContext::build(
+            vec![FileScanRange {
+                path: file_path.to_string_lossy().to_string(),
+                file_len,
+                offset: 0,
+                length: file_len,
+                scan_range_id: -1,
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+                included_positions: None,
+                external_datacache: None,
+                delete_files: Vec::new(),
+            }],
+            None,
+            None,
+        )
+        .expect("file scan context");
+        let mut iter = build_parquet_iter(scan, cfg, None, None, None).expect("build parquet iter");
+        let err = iter.next().expect("first batch").unwrap_err();
+        assert!(
+            err.contains("value not found in query global dict")
+                && err.contains("slot_id=1")
+                && err.contains("output_column=status"),
+            "{err}"
+        );
     }
 
     fn read_single_batch(cfg: ParquetScanConfig, path: &Path) -> arrow::record_batch::RecordBatch {
