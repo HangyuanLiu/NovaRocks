@@ -43,6 +43,7 @@ pub(crate) mod write_coordinator;
 #[allow(dead_code)]
 pub mod result_buffer;
 pub mod runtime_filter_hub;
+pub mod runtime_filter_observability;
 pub mod runtime_filter_worker;
 pub mod runtime_state;
 pub mod scan_executor;
