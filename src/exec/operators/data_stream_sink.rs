@@ -1954,6 +1954,17 @@ impl DataStreamSinkOperator {
 }
 
 impl ProcessorOperator for DataStreamSinkOperator {
+    fn accepts_encoded_column(&self, _slot_id: SlotId, data_type: &DataType) -> bool {
+        is_low_cardinality_exchange_dictionary(data_type)
+            && matches!(
+                self.sink.output_partition.type_,
+                partitions::TPartitionType::UNPARTITIONED
+                    | partitions::TPartitionType::RANDOM
+                    | partitions::TPartitionType::HASH_PARTITIONED
+                    | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED
+            )
+    }
+
     fn need_input(&self) -> bool {
         if self.maybe_mark_finished() {
             return false;
@@ -2309,6 +2320,38 @@ mod tests {
         )
         .expect("zero-column batch");
         Chunk::new_with_chunk_schema(batch, Arc::new(crate::exec::chunk::ChunkSchema::empty()))
+    }
+
+    #[test]
+    fn data_stream_sink_accepts_low_cardinality_dictionary_carriers() {
+        let op = make_test_operator();
+        let utf8_dict = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let large_utf8_dict =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeUtf8));
+
+        assert!(op.accepts_encoded_column(SlotId::new(91), &utf8_dict));
+        assert!(op.accepts_encoded_column(SlotId::new(91), &large_utf8_dict));
+    }
+
+    #[test]
+    fn data_stream_sink_rejects_non_string_or_non_int32_dictionaries() {
+        let op = make_test_operator();
+        let wrong_key = DataType::Dictionary(Box::new(DataType::Int64), Box::new(DataType::Utf8));
+        let wrong_value =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32));
+
+        assert!(!op.accepts_encoded_column(SlotId::new(91), &wrong_key));
+        assert!(!op.accepts_encoded_column(SlotId::new(91), &wrong_value));
+        assert!(!op.accepts_encoded_column(SlotId::new(91), &DataType::Utf8));
+    }
+
+    #[test]
+    fn data_stream_sink_accepts_dictionary_for_hash_partition_after_hash_support() {
+        let mut op = make_test_operator();
+        op.sink.output_partition.type_ = partitions::TPartitionType::HASH_PARTITIONED;
+        let utf8_dict = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+
+        assert!(op.accepts_encoded_column(SlotId::new(91), &utf8_dict));
     }
 
     #[test]
