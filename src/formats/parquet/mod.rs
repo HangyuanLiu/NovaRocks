@@ -40,8 +40,10 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::{
-    ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+    ParquetRecordBatchReaderBuilder, RowSelection,
 };
+use parquet::basic::Encoding;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -101,7 +103,9 @@ fn normalize_batch_to_chunk_schema(
     let batch_schema = batch.schema();
     for (idx, slot) in chunk_schema.slots().iter().enumerate() {
         let column = batch.column(idx).clone();
-        let casted = if column.data_type() == slot.data_type() {
+        let preserve_dictionary =
+            is_dictionary_string_carrier_for_slot(column.data_type(), slot.data_type());
+        let casted = if column.data_type() == slot.data_type() || preserve_dictionary {
             column
         } else {
             cast_with_special_rules(&column, slot.data_type()).map_err(|e| {
@@ -113,10 +117,15 @@ fn normalize_batch_to_chunk_schema(
                 )
             })?
         };
-        let mut field = if casted.null_count() > 0 && !slot.nullable() {
-            slot.field().clone().with_nullable(true)
-        } else {
+        let mut field = if slot.field().data_type() == casted.data_type() {
             slot.field().clone()
+        } else {
+            slot.field()
+                .clone()
+                .with_data_type(casted.data_type().clone())
+        };
+        if casted.null_count() > 0 && !field.is_nullable() {
+            field = field.with_nullable(true);
         };
         let source_field = batch_schema.field(idx);
         if !source_field.metadata().is_empty() {
@@ -129,6 +138,78 @@ fn normalize_batch_to_chunk_schema(
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| format!("normalize parquet scan batch failed: {e}"))
+}
+
+fn is_dictionary_string_carrier_for_slot(actual: &DataType, slot: &DataType) -> bool {
+    let DataType::Dictionary(key_type, value_type) = actual else {
+        return false;
+    };
+    key_type.as_ref() == &DataType::Int32
+        && ((slot == &DataType::Utf8 && value_type.as_ref() == &DataType::Utf8)
+            || (slot == &DataType::LargeUtf8 && value_type.as_ref() == &DataType::LargeUtf8))
+}
+
+fn is_string_data_type(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Utf8 | DataType::LargeUtf8)
+}
+
+fn dictionary_carrier_type_for_string(data_type: &DataType) -> Option<DataType> {
+    if is_string_data_type(data_type) {
+        Some(DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(data_type.clone()),
+        ))
+    } else {
+        None
+    }
+}
+
+fn normalized_column_name(name: &str, case_sensitive: bool) -> String {
+    if case_sensitive {
+        name.to_string()
+    } else {
+        name.to_ascii_lowercase()
+    }
+}
+
+fn parquet_column_uses_dictionary_encoding(metadata: &ParquetMetaData, column_idx: usize) -> bool {
+    metadata.num_row_groups() > 0
+        && (0..metadata.num_row_groups()).all(|row_group_idx| {
+            metadata
+                .row_group(row_group_idx)
+                .column(column_idx)
+                .encodings()
+                .any(|encoding| {
+                    matches!(
+                        encoding,
+                        Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                    )
+                })
+        })
+}
+
+fn top_level_parquet_column_index(
+    metadata: &ParquetMetaData,
+    field_name: &str,
+    case_sensitive: bool,
+) -> Option<usize> {
+    metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .enumerate()
+        .find_map(|(idx, column)| {
+            let parts = column.path().parts();
+            if parts.len() == 1
+                && normalized_column_name(&parts[0], case_sensitive)
+                    == normalized_column_name(field_name, case_sensitive)
+            {
+                Some(idx)
+            } else {
+                None
+            }
+        })
 }
 
 fn runtime_filters_to_min_max_predicates(
@@ -484,6 +565,117 @@ impl ParquetScanIter {
         self.cfg.iceberg_output_schema.is_some()
     }
 
+    fn arrow_reader_options(&self) -> ArrowReaderOptions {
+        let mut opts = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
+        if self.cfg.enable_page_index {
+            opts = opts.with_page_index_policy(PageIndexPolicy::Required);
+        }
+        opts
+    }
+
+    fn dictionary_string_scan_candidates(
+        &self,
+        arrow_schema: &Schema,
+    ) -> HashMap<String, DataType> {
+        if self.cfg.query_global_dicts.is_empty() && !self.has_iceberg_schema_evolution() {
+            let mut candidates = HashMap::new();
+            if self.cfg.columns.is_empty() {
+                if self.materialized_chunk_schema.slots().len() != arrow_schema.fields().len() {
+                    return candidates;
+                }
+                for (field, slot) in arrow_schema
+                    .fields()
+                    .iter()
+                    .zip(self.materialized_chunk_schema.slots())
+                {
+                    if is_string_data_type(slot.data_type()) {
+                        candidates.insert(
+                            normalized_column_name(field.name(), self.cfg.case_sensitive),
+                            slot.data_type().clone(),
+                        );
+                    }
+                }
+            } else if self.cfg.columns.len() == self.materialized_chunk_schema.slots().len() {
+                for (column_name, slot) in self
+                    .cfg
+                    .columns
+                    .iter()
+                    .zip(self.materialized_chunk_schema.slots())
+                {
+                    if column_name == "___count___" {
+                        continue;
+                    }
+                    if is_string_data_type(slot.data_type()) {
+                        candidates.insert(
+                            normalized_column_name(column_name, self.cfg.case_sensitive),
+                            slot.data_type().clone(),
+                        );
+                    }
+                }
+            }
+            candidates
+        } else {
+            HashMap::new()
+        }
+    }
+
+    fn dictionary_preserving_arrow_schema(
+        &self,
+        metadata: &ParquetMetaData,
+        arrow_schema: &SchemaRef,
+    ) -> Option<SchemaRef> {
+        let candidates = self.dictionary_string_scan_candidates(arrow_schema.as_ref());
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let root_fields = metadata
+            .file_metadata()
+            .schema_descr()
+            .root_schema()
+            .get_fields();
+        let mut changed = false;
+        let mut fields = Vec::with_capacity(arrow_schema.fields().len());
+        for (field_idx, field) in arrow_schema.fields().iter().enumerate() {
+            let candidate = candidates.get(&normalized_column_name(
+                field.name(),
+                self.cfg.case_sensitive,
+            ));
+            let Some(slot_type) = candidate else {
+                fields.push(field.as_ref().clone());
+                continue;
+            };
+            let Some(root_field) = root_fields.get(field_idx) else {
+                fields.push(field.as_ref().clone());
+                continue;
+            };
+            let Some(dictionary_type) = dictionary_carrier_type_for_string(slot_type) else {
+                fields.push(field.as_ref().clone());
+                continue;
+            };
+            if !is_string_data_type(field.data_type()) {
+                fields.push(field.as_ref().clone());
+                continue;
+            }
+            let Some(column_idx) =
+                top_level_parquet_column_index(metadata, field.name(), self.cfg.case_sensitive)
+            else {
+                fields.push(field.as_ref().clone());
+                continue;
+            };
+            if root_field.is_primitive()
+                && parquet_column_uses_dictionary_encoding(metadata, column_idx)
+            {
+                fields.push(field.as_ref().clone().with_data_type(dictionary_type));
+                changed = true;
+            } else {
+                fields.push(field.as_ref().clone());
+            }
+        }
+
+        changed.then(|| Arc::new(Schema::new(fields)))
+    }
+
     fn record_delayed_decision(&self, counter: &str) {
         if let Some(profile) = self.profile.as_ref() {
             profile.counter_add(counter, metrics::TUnit::UNIT, 1);
@@ -514,14 +706,33 @@ impl ParquetScanIter {
         &self,
         cached_reader: &CachedRangeReader,
     ) -> Result<ParquetRecordBatchReaderBuilder<ParquetCachedReader>, String> {
-        let mut opts = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
-        if self.cfg.enable_page_index {
-            opts = opts.with_page_index_policy(PageIndexPolicy::Required);
-        }
         let parquet_reader =
             ParquetCachedReader::new(cached_reader.clone(), self.cfg.cache_policy.clone());
-        ParquetRecordBatchReaderBuilder::try_new_with_options(parquet_reader, opts)
-            .map_err(|e| e.to_string())
+        let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            parquet_reader.clone(),
+            self.arrow_reader_options(),
+        )
+        .map_err(|e| e.to_string())?;
+
+        let Some(dict_schema) =
+            self.dictionary_preserving_arrow_schema(builder.metadata(), builder.schema())
+        else {
+            return Ok(builder);
+        };
+        let dict_opts = self.arrow_reader_options().with_schema(dict_schema);
+        match ArrowReaderMetadata::try_new(builder.metadata().clone(), dict_opts) {
+            Ok(metadata) => Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
+                parquet_reader,
+                metadata,
+            )),
+            Err(e) => {
+                debug!(
+                    "parquet dictionary carrier schema rejected, falling back to flat strings: {}",
+                    e
+                );
+                Ok(builder)
+            }
+        }
     }
 
     fn build_projected_parquet_reader(
@@ -2190,12 +2401,15 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        Array, ArrayRef, Float64Array, Int32Array, Int64Array, StringArray, StructArray,
+        Array, ArrayRef, DictionaryArray, Float64Array, Int32Array, Int64Array, StringArray,
+        StructArray,
     };
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use parquet::arrow::{
-        ArrowWriter, PARQUET_FIELD_ID_META_KEY, arrow_reader::ParquetRecordBatchReaderBuilder,
+        ArrowWriter, PARQUET_FIELD_ID_META_KEY,
+        arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
     };
+    use parquet::basic::Encoding;
     use parquet::file::metadata::ParquetMetaData;
     use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -2985,6 +3199,143 @@ mod tests {
             .expect("first batch")
             .expect("decode batch")
             .batch
+    }
+
+    fn write_status_parquet(path: &Path, dictionary_enabled: bool) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec![
+                Some("NEW"),
+                Some("PAID"),
+                Some("NEW"),
+                None,
+                Some("PAID"),
+            ]))],
+        )
+        .expect("record batch");
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(dictionary_enabled)
+            .build();
+        let file = File::create(path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+    }
+
+    #[test]
+    fn parquet_reader_preserves_requested_dictionary_string_column() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("dict_status.parquet");
+        write_status_parquet(&file_path, true);
+
+        let dict_schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let opts = ArrowReaderOptions::new().with_schema(dict_schema);
+        let file = File::open(&file_path).expect("open parquet");
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, opts)
+            .expect("parquet builder")
+            .build()
+            .expect("reader");
+        let batch = reader.next().expect("first batch").expect("decode batch");
+
+        assert!(matches!(
+            batch.column(0).data_type(),
+            DataType::Dictionary(key, value)
+                if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8
+        ));
+        let dict = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("dictionary array");
+        assert_eq!(dict.keys().len(), 5);
+    }
+
+    #[test]
+    fn parquet_metadata_marks_dictionary_encoded_string_column() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("dict_status.parquet");
+        write_status_parquet(&file_path, true);
+
+        let file = File::open(&file_path).expect("open parquet");
+        let reader = SerializedFileReader::new(file).expect("metadata reader");
+        let encodings = reader
+            .metadata()
+            .row_group(0)
+            .column(0)
+            .encodings()
+            .collect::<Vec<_>>();
+
+        assert!(
+            encodings.contains(&Encoding::RLE_DICTIONARY)
+                || encodings.contains(&Encoding::PLAIN_DICTIONARY),
+            "expected dictionary encoding, got {encodings:?}"
+        );
+    }
+
+    #[test]
+    fn scan_preserves_dictionary_string_carrier_for_encoded_parquet() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("dict_status.parquet");
+        write_status_parquet(&file_path, true);
+
+        let batch = read_single_batch(
+            test_parquet_scan_cfg(
+                vec!["status".to_string()],
+                vec![types::TPrimitiveType::VARCHAR],
+                None,
+            ),
+            &file_path,
+        );
+
+        assert!(matches!(
+            batch.column(0).data_type(),
+            DataType::Dictionary(key, value)
+                if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8
+        ));
+        let flat = arrow::compute::cast(batch.column(0).as_ref(), &DataType::Utf8)
+            .expect("cast dictionary to utf8");
+        let values = flat
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 values");
+        assert_eq!(values.value(0), "NEW");
+        assert_eq!(values.value(1), "PAID");
+        assert!(values.is_null(3));
+    }
+
+    #[test]
+    fn scan_keeps_plain_string_flat_without_dictionary_encoding() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("plain_status.parquet");
+        write_status_parquet(&file_path, false);
+
+        let batch = read_single_batch(
+            test_parquet_scan_cfg(
+                vec!["status".to_string()],
+                vec![types::TPrimitiveType::VARCHAR],
+                None,
+            ),
+            &file_path,
+        );
+
+        assert_eq!(batch.column(0).data_type(), &DataType::Utf8);
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 values");
+        assert_eq!(values.value(0), "NEW");
+        assert!(values.is_null(3));
     }
 
     #[test]

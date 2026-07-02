@@ -279,7 +279,20 @@ fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<D
         return Ok(expected.clone());
     }
     check_chunk_data_type(expected, actual, "column")?;
+    if is_dictionary_string_carrier(expected, actual) {
+        return Ok(actual.clone());
+    }
     Ok(expected.clone())
+}
+
+fn is_dictionary_string_carrier(expected: &DataType, actual: &DataType) -> bool {
+    matches!(
+        (expected, actual),
+        (
+            DataType::Utf8 | DataType::LargeUtf8,
+            DataType::Dictionary(key, value),
+        ) if key.as_ref() == &DataType::Int32 && value.as_ref() == expected
+    )
 }
 
 impl ChunkSchema {

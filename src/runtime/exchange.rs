@@ -1013,6 +1013,9 @@ fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("failed to create Arrow IPC writer: {e}"))?;
 
     for batch in batches {
+        #[cfg(debug_assertions)]
+        crate::exec::chunk::assert_no_dictionary(&batch)
+            .expect("dict must not cross exchange in C0");
         writer
             .write(&batch)
             .map_err(|e| format!("failed to write batch: {e}"))?;

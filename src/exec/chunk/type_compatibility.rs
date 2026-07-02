@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact runtime descriptor type checks for the execution layer.
+//! Runtime descriptor type compatibility checks for the execution layer.
 //!
 //! This is the keystone of the distributed-execution target architecture
 //! (pillar P1, see `docs/design/specs/2026-06-12-distributed-execution-target-architecture.md`).
-//! It is the one place that answers "does column type `actual` exactly match the
-//! authoritative descriptor type `expected`?". It replaces the five hand-rolled
+//! It is the one place that answers "does column type `actual` satisfy the
+//! authoritative descriptor type `expected`?". Most types must match exactly;
+//! the explicit C0 carrier exception is that `Dictionary(Int32, Utf8)` and
+//! `Dictionary(Int32, LargeUtf8)` are valid physical representations for
+//! matching string slots. It replaces the five hand-rolled
 //! copies of that predicate that drifted apart:
 //!   - `exec::chunk::schema::is_compatible_chunk_field_type` / `reconcile_chunk_data_type`
 //!   - `exec::operators::sort::is_compatible_sort_field_type`
@@ -36,6 +39,8 @@
 //!   - the historical `List <-> Struct[len==1]` collapse is DROPPED: it papered
 //!     over an aggregate-state shape inconsistency that pillar P5 makes
 //!     deterministic instead.
+//!   - `Dictionary(Int32, Utf8/LargeUtf8)` is accepted as a carrier for matching
+//!     string slots, but retagging must not decode it to a plain string array.
 //!
 //! Type only: this check says nothing about nullability. Field-level
 //! nullability reconciliation (and the root-boundary `required -> null`
@@ -83,9 +88,11 @@ pub(crate) struct TypeMismatch {
     pub kind: TypeMismatchKind,
 }
 
-/// The one recursive descriptor check. Returns `Ok(())` when `actual` exactly
-/// matches the authoritative `expected`, or a structured [`TypeMismatch`]
-/// otherwise.
+/// The one recursive descriptor check. Returns `Ok(())` when `actual`
+/// is compatible with the authoritative `expected` descriptor, or a structured
+/// [`TypeMismatch`] otherwise. Compatibility is exact except for the explicit
+/// `Dictionary(Int32, Utf8/LargeUtf8)` physical carrier allowed for matching
+/// string slots.
 pub(crate) fn check_exact(expected: &DataType, actual: &DataType) -> Result<(), TypeMismatch> {
     let mut path = Vec::new();
     check_exact_inner(expected, actual, &mut path)
@@ -125,6 +132,11 @@ fn check_exact_inner(
         }
         (Timestamp(_, _), Timestamp(_, _)) | (Utf8, Binary) | (Binary, Utf8) => {
             Err(mismatch(ScalarMismatch, path))
+        }
+        (Utf8 | LargeUtf8, Dictionary(key, value))
+            if key.as_ref() == &Int32 && value.as_ref() == expected =>
+        {
+            Ok(())
         }
         (List(ef), List(af)) => {
             path.push(NestedStep::ListItem);
@@ -327,11 +339,12 @@ mod tests {
     use super::TypeMismatchKind::*;
     use super::{NestedStep, check_exact, nested_path_label, retag_column};
     use arrow::array::{
-        Array, ArrayRef, BinaryArray, Decimal128Array, Int32Array, Int64Array, ListArray,
-        StringArray, StructArray, TimestampMicrosecondArray,
+        Array, ArrayRef, BinaryArray, Decimal128Array, DictionaryArray, Int32Array, Int64Array,
+        LargeStringDictionaryBuilder, ListArray, StringArray, StructArray,
+        TimestampMicrosecondArray,
     };
     use arrow::buffer::OffsetBuffer;
-    use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+    use arrow::datatypes::{DataType, Field, Fields, Int32Type, TimeUnit};
     use std::sync::Arc;
 
     fn list(item: DataType) -> DataType {
@@ -364,6 +377,20 @@ mod tests {
     }
     fn d256(p: u8, s: i8) -> DataType {
         DataType::Decimal256(p, s)
+    }
+    fn dict_utf8() -> ArrayRef {
+        Arc::new(
+            vec!["PAID", "NEW", "PAID"]
+                .into_iter()
+                .collect::<DictionaryArray<Int32Type>>(),
+        )
+    }
+    fn dict_large_utf8() -> ArrayRef {
+        let mut builder = LargeStringDictionaryBuilder::<Int32Type>::new();
+        builder.append_value("PAID");
+        builder.append_value("NEW");
+        builder.append_value("PAID");
+        Arc::new(builder.finish())
     }
 
     #[test]
@@ -419,6 +446,28 @@ mod tests {
                 .kind,
             ScalarMismatch
         );
+    }
+
+    #[test]
+    fn dict_int32_string_is_compatible_with_string_slot() {
+        for (slot_type, dict) in [
+            (DataType::Utf8, dict_utf8()),
+            (DataType::LargeUtf8, dict_large_utf8()),
+        ] {
+            let dict_type = dict.data_type().clone();
+
+            assert!(
+                check_exact(&slot_type, &dict_type).is_ok(),
+                "Dictionary(Int32, {:?}) must be compatible with a {:?} slot",
+                slot_type,
+                slot_type
+            );
+            assert!(
+                retag_column(&dict, &slot_type).is_err(),
+                "retag must refuse to silently decode a dict column to {:?}",
+                slot_type
+            );
+        }
     }
 
     #[test]
