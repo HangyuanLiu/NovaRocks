@@ -8,7 +8,6 @@ mod tests;
 pub(crate) mod type_compatibility;
 
 pub use chunk_impl::Chunk;
-#[allow(unused_imports)]
 pub(crate) use hydrate::hydrate_dictionary_columns_except;
 pub(crate) use hydrate::{assert_no_dictionary, hydrate_dictionary_columns};
 pub use memory::record_batch_bytes;

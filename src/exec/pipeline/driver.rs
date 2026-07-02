@@ -892,11 +892,11 @@ impl PipelineDriver {
             }
             let downstream_idx = e + 1;
             let (downstream_name, need_input) = {
-                let Some(downstream_op) = self.operators.get_mut(downstream_idx) else {
+                let Some(downstream_op) = self.operators.get(downstream_idx) else {
                     return Err("pipeline operator index out of bounds".to_string());
                 };
                 let downstream_name = downstream_op.name().to_string();
-                let downstream = downstream_op.as_processor_mut().ok_or_else(|| {
+                let downstream = downstream_op.as_processor_ref().ok_or_else(|| {
                     format!(
                         "pipeline operator {} missing processor operator",
                         downstream_name
@@ -908,7 +908,19 @@ impl PipelineDriver {
                 continue;
             }
             let mut chunk = self.edge_chunks[e].take().expect("checked is_some");
-            chunk = crate::exec::chunk::hydrate_dictionary_columns(&chunk)?;
+            chunk = {
+                let downstream_ref = self
+                    .operators
+                    .get(downstream_idx)
+                    .and_then(|op| op.as_processor_ref())
+                    .ok_or_else(|| {
+                        format!(
+                            "pipeline operator {} missing processor operator",
+                            downstream_name
+                        )
+                    })?;
+                crate::exec::pipeline::operator::hydrate_for_downstream(&chunk, downstream_ref)?
+            };
             if let Some(tracker) = self
                 .operator_mem_trackers
                 .get(downstream_idx)
