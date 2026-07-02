@@ -752,6 +752,72 @@ impl RuntimeInFilterValues {
         }
     }
 
+    fn scan_predicate_values(
+        &self,
+        max_values: usize,
+    ) -> Result<Option<Vec<MinMaxPredicateValue>>, String> {
+        if max_values == 0 {
+            return Ok(None);
+        }
+        match self {
+            RuntimeInFilterValues::Int8(values) => bounded_values(values, max_values, |value| {
+                MinMaxPredicateValue::Int32(i32::from(*value))
+            }),
+            RuntimeInFilterValues::Int16(values) => bounded_values(values, max_values, |value| {
+                MinMaxPredicateValue::Int32(i32::from(*value))
+            }),
+            RuntimeInFilterValues::Int32(values) => bounded_values(values, max_values, |value| {
+                MinMaxPredicateValue::Int32(*value)
+            }),
+            RuntimeInFilterValues::Int64(values) => bounded_values(values, max_values, |value| {
+                MinMaxPredicateValue::Int64(*value)
+            }),
+            RuntimeInFilterValues::LargeInt(values) => {
+                bounded_values(values, max_values, |value| {
+                    MinMaxPredicateValue::LargeInt(*value)
+                })
+            }
+            RuntimeInFilterValues::Bool(values) => bounded_values(values, max_values, |value| {
+                MinMaxPredicateValue::Boolean(*value)
+            }),
+            RuntimeInFilterValues::Utf8(values) => bounded_values(values, max_values, |value| {
+                MinMaxPredicateValue::ByteArray(value.as_bytes().to_vec())
+            }),
+            RuntimeInFilterValues::Date32(values) => bounded_values(values, max_values, |value| {
+                MinMaxPredicateValue::Date32(*value)
+            }),
+            RuntimeInFilterValues::TimestampSecond(values)
+            | RuntimeInFilterValues::TimestampMillisecond(values)
+            | RuntimeInFilterValues::TimestampMicrosecond(values)
+            | RuntimeInFilterValues::TimestampNanosecond(values) => {
+                if values.is_empty() || values.len() > max_values {
+                    return Ok(None);
+                }
+                let unit = self.timestamp_unit();
+                let mut converted = Vec::with_capacity(values.len());
+                for value in values {
+                    let micros = timestamp_to_microseconds(*value, unit).ok_or_else(|| {
+                        "runtime in-filter timestamp conversion overflow".to_string()
+                    })?;
+                    converted.push(MinMaxPredicateValue::DateTimeMicros(micros));
+                }
+                Ok(Some(converted))
+            }
+            RuntimeInFilterValues::Decimal128 {
+                values,
+                precision,
+                scale,
+            } => bounded_values(values, max_values, |value| {
+                MinMaxPredicateValue::Decimal128 {
+                    value: *value,
+                    precision: *precision,
+                    scale: *scale,
+                }
+            }),
+            RuntimeInFilterValues::Float32(_) | RuntimeInFilterValues::Float64(_) => Ok(None),
+        }
+    }
+
     fn timestamp_unit(&self) -> arrow::datatypes::TimeUnit {
         match self {
             RuntimeInFilterValues::TimestampSecond(_) => arrow::datatypes::TimeUnit::Second,
@@ -765,6 +831,22 @@ impl RuntimeInFilterValues {
             _ => arrow::datatypes::TimeUnit::Microsecond,
         }
     }
+}
+
+fn bounded_values<T, F>(
+    values: &HashSet<T>,
+    max_values: usize,
+    convert: F,
+) -> Result<Option<Vec<MinMaxPredicateValue>>, String>
+where
+    T: Eq + std::hash::Hash,
+    F: Fn(&T) -> MinMaxPredicateValue,
+{
+    if values.is_empty() || values.len() > max_values {
+        return Ok(None);
+    }
+    let converted = values.iter().map(convert).collect::<Vec<_>>();
+    Ok(Some(converted))
 }
 
 fn timestamp_to_microseconds(value: i64, unit: arrow::datatypes::TimeUnit) -> Option<i64> {
@@ -965,6 +1047,13 @@ impl RuntimeInFilter {
         self.values.min_max_predicate_values()
     }
 
+    pub(crate) fn scan_predicate_values(
+        &self,
+        max_values: usize,
+    ) -> Result<Option<Vec<MinMaxPredicateValue>>, String> {
+        self.values.scan_predicate_values(max_values)
+    }
+
     pub(in crate::exec::runtime_filter) fn values(&self) -> &RuntimeInFilterValues {
         &self.values
     }
@@ -1098,5 +1187,65 @@ impl RuntimeInFilter {
         let mask = BooleanArray::from(keep);
         let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::common::min_max_predicate::MinMaxPredicateValue;
+
+    #[test]
+    fn runtime_in_filter_discrete_values_are_bounded() {
+        let filter = RuntimeInFilter::new(
+            7,
+            SlotId::new(3),
+            RuntimeInFilterValues::Int32([10, 1, 5].into_iter().collect()),
+        );
+
+        let values = filter
+            .scan_predicate_values(8)
+            .expect("scan predicate values")
+            .expect("bounded set");
+
+        assert_eq!(values.len(), 3);
+        assert!(values.contains(&MinMaxPredicateValue::Int32(1)));
+        assert!(values.contains(&MinMaxPredicateValue::Int32(5)));
+        assert!(values.contains(&MinMaxPredicateValue::Int32(10)));
+    }
+
+    #[test]
+    fn runtime_in_filter_discrete_values_fall_back_when_too_large() {
+        let filter = RuntimeInFilter::new(
+            7,
+            SlotId::new(3),
+            RuntimeInFilterValues::Int32((0..9).collect()),
+        );
+
+        assert!(
+            filter
+                .scan_predicate_values(8)
+                .expect("scan predicate values")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_in_filter_float_values_use_envelope_only() {
+        let filter = RuntimeInFilter::new(
+            7,
+            SlotId::new(3),
+            RuntimeInFilterValues::Float32(
+                [1.0f32.to_bits(), 2.0f32.to_bits()].into_iter().collect(),
+            ),
+        );
+
+        assert!(
+            filter
+                .scan_predicate_values(8)
+                .expect("scan predicate values")
+                .is_none()
+        );
     }
 }
