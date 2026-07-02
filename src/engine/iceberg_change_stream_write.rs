@@ -503,8 +503,8 @@ mod tests {
             vec![(10, "reuse.parquet"), (11, "fresh.parquet")],
         );
         let plan = ChangeStreamWriterCommitPlan::new(BTreeMap::from([
-            (10, ChangeStreamWriteBranchKind::ReuseData),
-            (11, ChangeStreamWriteBranchKind::FreshData),
+            (10, ChangeStreamBranchKind::ReuseData),
+            (11, ChangeStreamBranchKind::FreshData),
         ]));
 
         route_change_stream_writer_reports(&collector, &metadata, &write_commit, &plan)
