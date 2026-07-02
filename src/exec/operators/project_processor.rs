@@ -35,6 +35,10 @@ use arrow::datatypes::{DataType, Field};
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use crate::exec::expr::dict_peel::{
+    expr_can_peel_from_slot, is_supported_i32_string_dictionary, referenced_slots,
+    try_peel_dict_expr,
+};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, cast_array_to_target};
 
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -84,7 +88,10 @@ fn cast_project_output_to_slot(
     let Some(slot_schema) = slot_schema else {
         return Ok(array);
     };
-    if array.data_type() == slot_schema.data_type() {
+    if array.data_type() == slot_schema.data_type()
+        || (slot_schema.data_type() == &DataType::Utf8
+            && is_supported_i32_string_dictionary(array.data_type()))
+    {
         return Ok(array);
     }
     cast_array_to_target(&array, slot_schema.data_type()).map_err(|e| {
@@ -230,6 +237,16 @@ impl Operator for ProjectProcessorOperator {
 }
 
 impl ProcessorOperator for ProjectProcessorOperator {
+    fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
+        is_supported_i32_string_dictionary(data_type)
+            && self.exprs.iter().any(|expr_id| {
+                matches!(
+                    self.arena.node(*expr_id),
+                    Some(ExprNode::SlotId(source_slot)) if *source_slot == slot_id
+                ) || expr_can_peel_from_slot(&self.arena, *expr_id, slot_id)
+            })
+    }
+
     fn need_input(&self) -> bool {
         !self.finishing && !self.finished && self.pending_output.is_none()
     }
@@ -276,6 +293,37 @@ impl ProjectProcessorOperator {
         Ok(Arc::new(ChunkSchema::try_new(slot_schemas)?))
     }
 
+    fn eval_project_expr(&self, expr_id: ExprId, chunk: &Chunk) -> Result<ArrayRef, String> {
+        if let Some(array) = try_peel_dict_expr(&self.arena, expr_id, chunk)? {
+            return Ok(array);
+        }
+        if self.expr_references_dictionary_slot(expr_id, chunk) {
+            let referenced = referenced_slots(&self.arena, expr_id).unwrap_or_default();
+            let hydrated =
+                crate::exec::chunk::hydrate_dictionary_columns_except(chunk, |slot, _| {
+                    !referenced.contains(&slot)
+                })?;
+            return self
+                .arena
+                .eval(expr_id, &hydrated)
+                .map_err(|e| e.to_string());
+        }
+        self.arena.eval(expr_id, chunk).map_err(|e| e.to_string())
+    }
+
+    fn expr_references_dictionary_slot(&self, expr_id: ExprId, chunk: &Chunk) -> bool {
+        let Some(referenced) = referenced_slots(&self.arena, expr_id) else {
+            return false;
+        };
+        referenced.iter().any(|slot| {
+            chunk
+                .slot_id_to_index()
+                .get(slot)
+                .and_then(|idx| chunk.columns().get(*idx))
+                .is_some_and(|column| is_supported_i32_string_dictionary(column.data_type()))
+        })
+    }
+
     fn process_one(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
         if chunk.is_empty() {
             return Ok(Some(self.empty_output_chunk()?));
@@ -296,10 +344,7 @@ impl ProjectProcessorOperator {
 
         for (expr_id, slot_id) in self.exprs.iter().zip(self.expr_slot_ids.iter()) {
             // Evaluate expression on the current working chunk (which includes previously computed columns)
-            let array = self
-                .arena
-                .eval(*expr_id, &working_chunk)
-                .map_err(|e| e.to_string())?;
+            let array = self.eval_project_expr(*expr_id, &working_chunk)?;
 
             computed_columns.push(array.clone());
 
@@ -460,7 +505,14 @@ impl ProjectProcessorOperator {
             let base = declared_output_slot_schema
                 .as_ref()
                 .map(|schema| {
-                    let field = field_from_slot_schema(schema, schema.data_type());
+                    let field_data_type = if schema.data_type() == &DataType::Utf8
+                        && is_supported_i32_string_dictionary(array.data_type())
+                    {
+                        array.data_type()
+                    } else {
+                        schema.data_type()
+                    };
+                    let field = field_from_slot_schema(schema, field_data_type);
                     if runtime_nullable && !field.is_nullable() {
                         with_nullable_preserving_metadata(&field, true)
                     } else {
@@ -560,19 +612,212 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{BinaryArray, Int32Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{
+        Array, ArrayRef, BinaryArray, DictionaryArray, Int32Array, Int64Array, StringArray,
+    };
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
 
     use super::ProjectProcessorOperator;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::exec::expr::LiteralValue;
+    use crate::exec::expr::function::FunctionKind;
     use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::pipeline::operator::ProcessorOperator;
     use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> Arc<ChunkSchema> {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
             .expect("chunk schema")
+    }
+
+    fn dict_string_chunk(slot_id: SlotId) -> Chunk {
+        let column: ArrayRef = Arc::new(
+            vec![Some("PAID"), None, Some("New"), Some(" shipped ")]
+                .into_iter()
+                .collect::<DictionaryArray<Int32Type>>(),
+        );
+        let slot = ChunkSlotSchema::new_with_field(
+            slot_id,
+            Field::new("status", column.data_type().clone(), true),
+            None,
+            None,
+        );
+        Chunk::try_new_with_columns(
+            Arc::new(ChunkSchema::try_new(vec![slot]).unwrap()),
+            vec![column],
+        )
+        .unwrap()
+    }
+
+    fn utf8_output_schema(slot_id: SlotId, name: &str) -> Arc<ChunkSchema> {
+        Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                slot_id,
+                Field::new(name, DataType::Utf8, true),
+                None,
+                None,
+            )])
+            .expect("output schema"),
+        )
+    }
+
+    #[test]
+    fn project_accepts_encoded_column_for_peelable_lower_expression() {
+        let input_slot = SlotId::new(1);
+        let output_slot = SlotId::new(2);
+        let mut arena = ExprArena::default();
+        let source = arena.push_typed(ExprNode::SlotId(input_slot), DataType::Utf8);
+        let lower = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::String("lower"),
+                args: vec![source],
+            },
+            DataType::Utf8,
+        );
+        let op = ProjectProcessorOperator {
+            name: "PROJECT".to_string(),
+            arena: Arc::new(arena),
+            exprs: vec![lower],
+            expr_slot_ids: vec![output_slot],
+            expr_slot_schemas: HashMap::new(),
+            output_indices: None,
+            output_chunk_schema: utf8_output_schema(output_slot, "lower_status"),
+            pending_output: None,
+            finishing: false,
+            finished: false,
+        };
+
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        assert!(op.accepts_encoded_column(input_slot, &dictionary_type));
+        assert!(!op.accepts_encoded_column(input_slot, &DataType::Utf8));
+    }
+
+    #[test]
+    fn project_peels_lower_dictionary_output_without_flattening_final_slot() {
+        let input_slot = SlotId::new(3);
+        let output_slot = SlotId::new(4);
+        let mut arena = ExprArena::default();
+        let source = arena.push_typed(ExprNode::SlotId(input_slot), DataType::Utf8);
+        let lower = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::String("lower"),
+                args: vec![source],
+            },
+            DataType::Utf8,
+        );
+        let mut op = ProjectProcessorOperator {
+            name: "PROJECT".to_string(),
+            arena: Arc::new(arena),
+            exprs: vec![lower],
+            expr_slot_ids: vec![output_slot],
+            expr_slot_schemas: HashMap::new(),
+            output_indices: None,
+            output_chunk_schema: utf8_output_schema(output_slot, "lower_status"),
+            pending_output: None,
+            finishing: false,
+            finished: false,
+        };
+
+        let output = op
+            .process_one(dict_string_chunk(input_slot))
+            .expect("project should succeed")
+            .expect("project output");
+        let column = output.batch.column(0);
+        assert_eq!(
+            column.data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        );
+        let dict = column
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("dictionary output");
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string values");
+        assert_eq!(values.value(0), "paid");
+        assert_eq!(values.value(1), "new");
+        assert_eq!(values.value(2), " shipped ");
+        assert!(dict.is_null(1));
+    }
+
+    #[test]
+    fn project_locally_hydrates_unsafe_mixed_expression_when_slot_is_kept_for_peeling() {
+        let input_slot = SlotId::new(5);
+        let lower_slot = SlotId::new(6);
+        let coalesce_slot = SlotId::new(7);
+        let mut arena = ExprArena::default();
+        let source = arena.push_typed(ExprNode::SlotId(input_slot), DataType::Utf8);
+        let lower = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::String("lower"),
+                args: vec![source],
+            },
+            DataType::Utf8,
+        );
+        let fallback = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("missing".to_string())),
+            DataType::Utf8,
+        );
+        let coalesce = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Coalesce,
+                args: vec![source, fallback],
+            },
+            DataType::Utf8,
+        );
+        let output_chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::new_with_field(
+                    lower_slot,
+                    Field::new("lower_status", DataType::Utf8, true),
+                    None,
+                    None,
+                ),
+                ChunkSlotSchema::new_with_field(
+                    coalesce_slot,
+                    Field::new("status_or_missing", DataType::Utf8, true),
+                    None,
+                    None,
+                ),
+            ])
+            .expect("output schema"),
+        );
+        let mut op = ProjectProcessorOperator {
+            name: "PROJECT".to_string(),
+            arena: Arc::new(arena),
+            exprs: vec![lower, coalesce],
+            expr_slot_ids: vec![lower_slot, coalesce_slot],
+            expr_slot_schemas: HashMap::new(),
+            output_indices: None,
+            output_chunk_schema,
+            pending_output: None,
+            finishing: false,
+            finished: false,
+        };
+
+        let output = op
+            .process_one(dict_string_chunk(input_slot))
+            .expect("project should succeed")
+            .expect("project output");
+        assert_eq!(
+            output.batch.column(0).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        );
+        assert_eq!(output.batch.column(1).data_type(), &DataType::Utf8);
+        let status_or_missing = output
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("flat utf8 output");
+        assert_eq!(status_or_missing.value(0), "PAID");
+        assert_eq!(status_or_missing.value(1), "missing");
+        assert_eq!(status_or_missing.value(2), "New");
     }
 
     #[test]
