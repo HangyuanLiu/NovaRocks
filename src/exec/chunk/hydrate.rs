@@ -21,6 +21,8 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::common::ids::SlotId;
+
 use super::{Chunk, ChunkSchema};
 
 pub(crate) fn assert_no_dictionary(batch: &RecordBatch) -> Result<(), String> {
@@ -48,6 +50,13 @@ pub(crate) fn assert_no_dictionary(batch: &RecordBatch) -> Result<(), String> {
 }
 
 pub(crate) fn hydrate_dictionary_columns(chunk: &Chunk) -> Result<Chunk, String> {
+    hydrate_dictionary_columns_except(chunk, |_, _| false)
+}
+
+pub(crate) fn hydrate_dictionary_columns_except(
+    chunk: &Chunk,
+    keep_encoded: impl Fn(SlotId, &DataType) -> bool,
+) -> Result<Chunk, String> {
     let mut changed = false;
     let mut columns = Vec::with_capacity(chunk.columns().len());
     let mut fields = Vec::with_capacity(chunk.schema().fields().len());
@@ -60,8 +69,9 @@ pub(crate) fn hydrate_dictionary_columns(chunk: &Chunk) -> Result<Chunk, String>
         .zip(chunk.chunk_schema().slots().iter())
         .enumerate()
     {
-        match column.data_type() {
-            DataType::Dictionary(_, value_type) => {
+        let column_type = column.data_type();
+        match column_type {
+            DataType::Dictionary(_, value_type) if !keep_encoded(slot.slot_id(), column_type) => {
                 changed = true;
                 let value_type = value_type.as_ref().clone();
                 let flat_field = field.as_ref().clone().with_data_type(value_type.clone());
@@ -108,7 +118,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use super::{assert_no_dictionary, hydrate_dictionary_columns};
+    use super::{
+        assert_no_dictionary, hydrate_dictionary_columns, hydrate_dictionary_columns_except,
+    };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
     use crate::types::logical::{LogicalType, field_with_logical_type};
@@ -268,6 +280,66 @@ mod tests {
         assert_eq!(hydrated_slot.unique_id(), Some(77));
         assert_eq!(hydrated_slot.data_type(), &DataType::Utf8);
         assert!(hydrated_slot.field_schema().json_semantic());
+    }
+
+    #[test]
+    fn hydrate_dictionary_columns_except_keeps_selected_slots_and_matches_default_hydration() {
+        let slot_id = SlotId::new(1);
+        let chunk = chunk_with_column(
+            slot_id,
+            Field::new("status", DataType::Utf8, true),
+            dict_utf8_with_nulls_and_empty(),
+        );
+
+        let kept = hydrate_dictionary_columns_except(&chunk, |slot, _dt| slot == SlotId::new(1))
+            .expect("keep selected slot");
+
+        assert!(matches!(
+            kept.columns()[0].data_type(),
+            DataType::Dictionary(_, value_type) if value_type.as_ref() == &DataType::Utf8
+        ));
+        assert!(matches!(
+            kept.schema().fields()[0].data_type(),
+            DataType::Dictionary(_, value_type) if value_type.as_ref() == &DataType::Utf8
+        ));
+        assert!(matches!(
+            kept.chunk_schema()
+                .slot(slot_id)
+                .expect("kept slot")
+                .data_type(),
+            DataType::Dictionary(_, value_type) if value_type.as_ref() == &DataType::Utf8
+        ));
+
+        let keep_none =
+            hydrate_dictionary_columns_except(&chunk, |_, _| false).expect("hydrate all");
+        let default_hydrated = hydrate_dictionary_columns(&chunk).expect("default hydrate");
+
+        assert_eq!(keep_none.columns()[0].data_type(), &DataType::Utf8);
+        assert_eq!(
+            keep_none.columns()[0].data_type(),
+            default_hydrated.columns()[0].data_type()
+        );
+        let keep_none_values = keep_none.columns()[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("keep-none string array");
+        let default_values = default_hydrated.columns()[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("default string array");
+        assert_eq!(keep_none_values, default_values);
+        assert_eq!(
+            keep_none
+                .chunk_schema()
+                .slot(slot_id)
+                .expect("keep-none slot")
+                .data_type(),
+            default_hydrated
+                .chunk_schema()
+                .slot(slot_id)
+                .expect("default slot")
+                .data_type()
+        );
     }
 
     #[test]
