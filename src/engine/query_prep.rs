@@ -85,6 +85,17 @@ pub(crate) fn add_files(
         .expect("iceberg catalog read lock");
     let entry = guard.get(&catalog_name)?;
     drop(guard);
+    let target = crate::engine::backend_resolver::TargetBackend {
+        backend_name: "iceberg",
+        catalog: catalog_name.clone(),
+        namespace: namespace.clone(),
+        table: table_name.clone(),
+    };
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
+        state,
+        &target,
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Insert,
+    )?;
     let count = crate::connector::iceberg::catalog::add_files::add_files(
         &entry,
         &namespace,

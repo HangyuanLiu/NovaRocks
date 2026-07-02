@@ -1714,6 +1714,19 @@ impl StandaloneSession {
         current_database: &str,
     ) -> Result<StatementResult, String> {
         let stmt = parse_alter_iceberg_properties_sql(sql)?;
+        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+            &self.inner,
+            &stmt.table,
+            current_catalog,
+            current_database,
+        )?;
+        if target.backend_name == "iceberg" {
+            crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
+                &self.inner,
+                &target,
+                crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
+            )?;
+        }
         crate::connector::iceberg::catalog::alter_table_properties(
             &self.inner,
             &stmt,
@@ -1739,6 +1752,11 @@ impl StandaloneSession {
         if target.backend_name != "iceberg" {
             return self.handle_local_schema_change(stmt, target);
         }
+        crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
+            &self.inner,
+            &target,
+            crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
+        )?;
         crate::connector::iceberg::catalog::alter_table_schema(
             &self.inner,
             &stmt,
@@ -1795,6 +1813,11 @@ impl StandaloneSession {
                 target.backend_name
             ));
         }
+        crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
+            &self.inner,
+            &target,
+            crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
+        )?;
         let backend = self
             .inner
             .connectors
@@ -7044,13 +7067,11 @@ enable_path_style_access = true
                     .expect("load generic iceberg table metadata")
                     == false
             );
-            let storage_table =
-                crate::engine::mv::iceberg_refresh::nr_mv_storage_lookup_name("mv_orders");
             assert!(
                 engine
                     .inner
                     .mv_repo
-                    .find_by_target(read.as_ref(), "ice", "analytics", &storage_table)
+                    .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
                     .expect("find iceberg mv definition")
                     .is_some()
             );

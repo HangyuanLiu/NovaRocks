@@ -63,6 +63,11 @@ pub(crate) fn run_insert(
         )
     };
     let resolved = catalog.load_table(&target.catalog, &target.namespace, &target.table)?;
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
+        state,
+        &target,
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Insert,
+    )?;
 
     // Branch-qualified INSERT requires an iceberg backend and v3 table format.
     if ref_suffix.is_some() {

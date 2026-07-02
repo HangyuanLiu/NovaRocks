@@ -45,8 +45,8 @@ SELECT id, name FROM mv_orders_${uuid0} ORDER BY id;
 SHOW MATERIALIZED VIEWS;
 
 -- query 7
--- @expect_error=Iceberg MV target table iceberg_rest_${suite_uuid0}.analytics_${uuid0}.__nr_mv_mv_conflict_${uuid0} already exists
-CREATE TABLE __nr_mv_mv_conflict_${uuid0} (id INT);
+-- @expect_error=Iceberg MV target table iceberg_rest_${suite_uuid0}.analytics_${uuid0}.mv_conflict_${uuid0} already exists
+CREATE TABLE mv_conflict_${uuid0} (id INT);
 CREATE MATERIALIZED VIEW mv_conflict_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES('storage_engine' = 'iceberg')
@@ -55,7 +55,7 @@ FROM iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0};
 
 -- query 8
 -- @skip_result_check=true
-DROP TABLE __nr_mv_mv_conflict_${uuid0};
+DROP TABLE mv_conflict_${uuid0};
 
 -- query 9
 -- @expect_error=requires current catalog to be an Iceberg catalog

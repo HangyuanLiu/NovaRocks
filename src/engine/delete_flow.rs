@@ -119,6 +119,11 @@ pub(crate) fn execute_delete_statement(
     );
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_properties(
+        &target,
+        table.metadata().properties(),
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Delete,
+    )?;
 
     // Branch writes require Iceberg v3 (row-lineage semantics).
     if target_ref != "main" {

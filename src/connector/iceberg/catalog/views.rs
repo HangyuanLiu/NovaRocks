@@ -469,8 +469,8 @@ mod rest_view_tests {
             .mock("GET", "/v1/namespaces/analytics/views/v_demo")
             .with_status(200)
             .with_body(load_view_body_with_properties(
-                r#"[{"type":"sql","sql":"SELECT id FROM analytics.__nr_mv_mv_orders","dialect":"starrocks"}]"#,
-                r#"{"comment":"a test view","novarocks.mv":"true","novarocks.mv.storage-table":"analytics.__nr_mv_mv_orders"}"#,
+                r#"[{"type":"sql","sql":"SELECT id FROM analytics.orders","dialect":"starrocks"}]"#,
+                r#"{"comment":"a test view","owner":"analytics","quality":"gold","purpose":"dashboard"}"#,
             ))
             .create_async()
             .await;
@@ -483,14 +483,16 @@ mod rest_view_tests {
         .expect("join");
         assert_eq!(view.comment.as_deref(), Some("a test view"));
         assert_eq!(
-            view.properties.get("novarocks.mv").map(String::as_str),
-            Some("true")
+            view.properties.get("owner").map(String::as_str),
+            Some("analytics")
         );
         assert_eq!(
-            view.properties
-                .get("novarocks.mv.storage-table")
-                .map(String::as_str),
-            Some("analytics.__nr_mv_mv_orders")
+            view.properties.get("quality").map(String::as_str),
+            Some("gold")
+        );
+        assert_eq!(
+            view.properties.get("purpose").map(String::as_str),
+            Some("dashboard")
         );
     }
 

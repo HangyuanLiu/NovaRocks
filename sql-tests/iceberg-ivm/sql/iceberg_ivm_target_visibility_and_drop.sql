@@ -2,9 +2,9 @@
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,storage_engine_iceberg,target_catalog,drop
 -- Test Objective:
--- 1. Validate an Iceberg-backed MV target is queryable as an Iceberg relation in the active catalog.
+-- 1. Validate an Iceberg-backed MV is queryable directly as its Iceberg table in the active catalog.
 -- 2. Validate SHOW MATERIALIZED VIEWS exposes the Iceberg storage engine.
--- 3. Validate DROP MATERIALIZED VIEW removes the target table from the Iceberg catalog.
+-- 3. Validate DROP MATERIALIZED VIEW removes that single MV table from the Iceberg catalog.
 
 -- query 1
 -- @skip_result_check=true

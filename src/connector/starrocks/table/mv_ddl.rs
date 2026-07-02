@@ -1045,10 +1045,8 @@ pub(crate) fn list_mv_rows(
             let Some(target_table) = mv.target_table.clone() else {
                 continue;
             };
-            let public_name = crate::engine::mv::iceberg_refresh::nr_mv_public_name(&target_table)
-                .unwrap_or_else(|| target_table.clone());
             rows.push(MvListRow {
-                name: public_name,
+                name: target_table,
                 database: target_namespace,
                 storage_engine: mv.storage_engine.clone(),
                 refresh_mode: mv.refresh_policy.as_sql_str().to_string(),
@@ -1187,7 +1185,7 @@ fn dependency_display_for_mv(
         .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
     Ok(dependencies
         .iter()
-        .map(|dep| crate::engine::mv::dependency::dependency_display_name(&dep.upstream))
+        .map(|dep| dep.upstream.display_name())
         .collect::<Vec<_>>()
         .join(", "))
 }
@@ -2506,13 +2504,13 @@ mod tests {
     }
 
     #[test]
-    fn show_materialized_views_strips_iceberg_internal_storage_prefix() {
+    fn show_materialized_views_uses_direct_iceberg_mv_table_name() {
         let (state, _dir) = open_state_with_sqlite_store();
         insert_iceberg_mv_relationship(
             &state,
             "ice",
             "analytics",
-            "__nr_mv_mv_orders",
+            "mv_orders",
             "SELECT id FROM ice.sales.orders",
         );
 
@@ -2521,14 +2519,11 @@ mod tests {
         let row = rows
             .iter()
             .find(|row| row.name == "mv_orders")
-            .expect("public MV row should be present");
+            .expect("MV row should be present");
 
         assert_eq!(row.database, "analytics");
         assert_eq!(row.storage_engine, "iceberg");
-        assert!(
-            rows.iter().all(|row| !row.name.starts_with("__nr_mv_")),
-            "rows={rows:?}"
-        );
+        assert_eq!(row.name, "mv_orders");
     }
 
     #[test]

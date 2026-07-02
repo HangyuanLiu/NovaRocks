@@ -28,6 +28,17 @@ pub(crate) fn execute(
     //    build a fresh HadoopFileSystemCatalog for the async commit path.
     let loaded =
         crate::connector::iceberg::catalog::registry::load_table(&entry, &namespace, &table_name)?;
+    let target = crate::engine::backend_resolver::TargetBackend {
+        backend_name: "iceberg",
+        catalog: catalog_name.clone(),
+        namespace: namespace.clone(),
+        table: table_name.clone(),
+    };
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_properties(
+        &target,
+        loaded.table.metadata().properties(),
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
+    )?;
     let metadata = loaded.table.metadata();
 
     // 4. Run the analyzer: validates the action against current snapshot state.
@@ -109,5 +120,39 @@ fn resolve_table_parts(name: &ObjectName) -> Result<(String, String, String), St
             "iceberg ref: invalid table name (parts: {})",
             parts.len()
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ref_action_guard_runs_after_load_and_before_analysis_or_commit() {
+        let src = include_str!("iceberg_ref_flow.rs");
+        let execute_body = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source before tests");
+        let load_pos = execute_body
+            .find("let loaded =")
+            .expect("execute must load table metadata");
+        let guard_pos = execute_body
+            .find("reject_if_iceberg_mv_properties")
+            .expect("ref actions must guard Iceberg MV tables");
+        let analysis_pos = execute_body
+            .find("analyze_alter_iceberg_ref")
+            .expect("execute must analyze ref action");
+        let commit_pos = execute_body
+            .find("execute_ref_action")
+            .expect("execute must commit ref action");
+
+        assert!(load_pos < guard_pos, "guard must run after table load");
+        assert!(
+            guard_pos < analysis_pos,
+            "guard must run before ref action analysis"
+        );
+        assert!(
+            guard_pos < commit_pos,
+            "guard must run before ref action commit"
+        );
     }
 }
