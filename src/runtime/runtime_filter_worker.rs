@@ -663,7 +663,7 @@ mod tests {
         let filter = snapshot.filters.get(&filter_id).expect("filter lifecycle");
         assert_eq!(filter.merged_received(), 2);
         assert_eq!(filter.merged_expected(), 2);
-        assert_eq!(filter.dropped, Some(RfDropReason::SizeExceeded));
+        assert!(filter.has_drop_reason(RfDropReason::SizeExceeded));
 
         let sends = sends.lock().expect("captured runtime filter sends lock");
         assert_eq!(sends.len(), 1);
@@ -723,7 +723,62 @@ mod tests {
         let filter = snapshot.filters.get(&filter_id).expect("filter lifecycle");
         assert_eq!(filter.merged_received(), 1);
         assert_eq!(filter.merged_expected(), 1);
-        assert_eq!(filter.dropped, Some(RfDropReason::SendFailed));
+        assert!(filter.has_drop_reason(RfDropReason::SendFailed));
+    }
+
+    #[test]
+    fn size_capped_merge_and_send_failure_preserve_both_dropped_reasons() {
+        let _hook_guard =
+            install_final_send_hook(Box::new(
+                |_hostname, _port, _params| Err("boom".to_string()),
+            ));
+
+        let filter_id = 4;
+        let slot_id = SlotId::new(10);
+        let query_id = QueryId { hi: 423, lo: 456 };
+        let lifecycle_guard = LifecycleQueryGuard::new(query_id);
+        let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+        hub.register_filter_specs(
+            100,
+            &[JoinRuntimeFilterSpec {
+                filter_id,
+                expr_order: 0,
+                probe_slot_id: slot_id,
+                build_data_type: DataType::Int32,
+                merge_nodes: Vec::new(),
+                has_remote_targets: true,
+            }],
+        );
+
+        let params = RuntimeFilterWorkerParams::new(
+            HashMap::from([(
+                filter_id,
+                vec![RuntimeFilterProberTarget::new("127.0.0.1", 18033)],
+            )]),
+            HashMap::from([(filter_id, 2)]),
+            Some(1),
+        );
+        let worker = RuntimeFilterWorker::new(query_id, params, hub);
+        let first = encoded_empty_membership_partial(filter_id, slot_id);
+        let second = encoded_empty_membership_partial(filter_id, slot_id);
+
+        worker
+            .receive_partial(filter_id, &first, 40, Some(DataType::Int32))
+            .expect("first partial");
+        worker
+            .receive_partial(filter_id, &second, 41, Some(DataType::Int32))
+            .expect("second partial");
+
+        let snapshot = RuntimeFilterLifecycleRegistry::global()
+            .snapshot(lifecycle_guard.query_key())
+            .expect("query snapshot");
+        let filter = snapshot.filters.get(&filter_id).expect("filter lifecycle");
+        assert_eq!(
+            filter.drop_reasons(),
+            &[RfDropReason::SizeExceeded, RfDropReason::SendFailed]
+        );
+        assert!(filter.has_drop_reason(RfDropReason::SizeExceeded));
+        assert!(filter.has_drop_reason(RfDropReason::SendFailed));
     }
 
     fn encoded_empty_membership_partial(filter_id: i32, slot_id: SlotId) -> Vec<u8> {

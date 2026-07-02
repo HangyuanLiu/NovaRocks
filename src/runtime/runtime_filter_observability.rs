@@ -152,7 +152,7 @@ struct RfLifecycleRecord {
     applied_input_rows: AtomicI64,
     applied_output_rows: AtomicI64,
     applied_evals: AtomicI64,
-    dropped: Mutex<Option<RfDropReason>>,
+    drop_reasons: Mutex<Vec<RfDropReason>>,
     disabled: Mutex<Option<String>>,
 }
 
@@ -162,6 +162,7 @@ impl RfLifecycleRecord {
     }
 
     fn snapshot(&self) -> RfRecordView {
+        let drop_reasons = mutex_lock(&self.drop_reasons).clone();
         RfRecordView {
             planned: self.planned.load(Ordering::Relaxed),
             built: *mutex_lock(&self.built),
@@ -174,7 +175,8 @@ impl RfLifecycleRecord {
             applied_input_rows: self.applied_input_rows.load(Ordering::Relaxed),
             applied_output_rows: self.applied_output_rows.load(Ordering::Relaxed),
             applied_evals: self.applied_evals.load(Ordering::Relaxed),
-            dropped: *mutex_lock(&self.dropped),
+            dropped: drop_reasons.first().copied(),
+            drop_reasons,
             disabled: mutex_lock(&self.disabled).clone(),
         }
     }
@@ -289,7 +291,10 @@ impl RfLifecycleHandle {
     }
 
     pub fn dropped(&self, reason: RfDropReason) {
-        *mutex_lock(&self.record.dropped) = Some(reason);
+        let mut drop_reasons = mutex_lock(&self.record.drop_reasons);
+        if !drop_reasons.contains(&reason) {
+            drop_reasons.push(reason);
+        }
     }
 }
 
@@ -312,6 +317,7 @@ pub struct RfRecordView {
     applied_output_rows: i64,
     applied_evals: i64,
     pub dropped: Option<RfDropReason>,
+    pub drop_reasons: Vec<RfDropReason>,
     disabled: Option<String>,
 }
 
@@ -334,6 +340,14 @@ impl RfRecordView {
 
     pub fn applied_evals(&self) -> i64 {
         self.applied_evals
+    }
+
+    pub fn drop_reasons(&self) -> &[RfDropReason] {
+        &self.drop_reasons
+    }
+
+    pub fn has_drop_reason(&self, reason: RfDropReason) -> bool {
+        self.drop_reasons.contains(&reason)
     }
 }
 
@@ -391,10 +405,31 @@ mod tests {
         assert_eq!(f7.applied_output_rows(), 150);
         assert_eq!(f7.applied_evals(), 2);
         let f9 = snap.filters.get(&9).expect("filter 9");
-        assert_eq!(f9.dropped, Some(RfDropReason::SizeExceeded));
+        assert!(f9.has_drop_reason(RfDropReason::SizeExceeded));
+        assert_eq!(f9.drop_reasons(), &[RfDropReason::SizeExceeded]);
 
         registry.remove_query(q);
         assert!(registry.snapshot(q).is_none());
+    }
+
+    #[test]
+    fn dropped_reasons_preserve_order_and_dedupe() {
+        let registry = RuntimeFilterLifecycleRegistry::new();
+        let q = QueryKey::from_hi_lo(7, 8);
+        let rec = registry.recorder(q);
+
+        rec.dropped(13, RfDropReason::SizeExceeded);
+        rec.dropped(13, RfDropReason::SendFailed);
+        rec.dropped(13, RfDropReason::SizeExceeded);
+
+        let snap = registry.snapshot(q).expect("query snapshot");
+        let filter = snap.filters.get(&13).expect("filter 13");
+        assert_eq!(
+            filter.drop_reasons(),
+            &[RfDropReason::SizeExceeded, RfDropReason::SendFailed]
+        );
+        assert!(filter.has_drop_reason(RfDropReason::SizeExceeded));
+        assert!(filter.has_drop_reason(RfDropReason::SendFailed));
     }
 
     #[test]
