@@ -870,16 +870,7 @@ impl RuntimeFilterProbe {
     }
 
     fn release(&self, reason: RuntimeFilterUnavailableReason) -> AcquiredRuntimeFilters {
-        let reason = {
-            let mut guard = self
-                .inner
-                .entry
-                .release_reason
-                .lock()
-                .expect("runtime filter release reason lock");
-            *guard.get_or_insert(reason)
-        };
-        self.inner.entry.dep.set_ready();
+        let reason = release_entry(&self.inner.entry, reason);
         AcquiredRuntimeFilters::Unavailable(reason)
     }
 
@@ -895,11 +886,11 @@ impl RuntimeFilterProbe {
         };
         let Some(timeout) = timeout else {
             // No wait timeout configured: do not block on runtime filters.
-            dep.set_ready();
+            self.release(RuntimeFilterUnavailableReason::NoWaitConfigured);
             return None;
         };
         if timeout.is_zero() {
-            dep.set_ready();
+            self.release(RuntimeFilterUnavailableReason::NoWaitConfigured);
             return None;
         }
         let mut guard = self
@@ -910,15 +901,17 @@ impl RuntimeFilterProbe {
         let start = guard.get_or_insert_with(Instant::now);
         let elapsed = start.elapsed();
         if elapsed >= timeout {
-            dep.set_ready();
+            self.release(RuntimeFilterUnavailableReason::Timeout);
             return None;
         }
         if !self.inner.timeout_armed.swap(true, Ordering::AcqRel) {
-            let dep_clone = dep.clone();
+            let entry = Arc::clone(&self.inner.entry);
             let sleep_for = timeout.saturating_sub(elapsed);
             std::thread::spawn(move || {
                 std::thread::sleep(sleep_for);
-                dep_clone.set_ready();
+                if !entry.complete.load(Ordering::Acquire) {
+                    release_entry(&entry, RuntimeFilterUnavailableReason::Timeout);
+                }
             });
         }
         Some(dep)
@@ -958,6 +951,21 @@ impl RuntimeFilterProbe {
         let start = guard.take()?;
         Some(start.elapsed())
     }
+}
+
+fn release_entry(
+    entry: &RuntimeFilterEntry,
+    reason: RuntimeFilterUnavailableReason,
+) -> RuntimeFilterUnavailableReason {
+    let reason = {
+        let mut guard = entry
+            .release_reason
+            .lock()
+            .expect("runtime filter release reason lock");
+        *guard.get_or_insert(reason)
+    };
+    entry.dep.set_ready();
+    reason
 }
 
 fn duration_to_ms(timeout: Option<Duration>) -> i64 {
@@ -1131,6 +1139,42 @@ mod tests {
         assert!(probe.dependency_or_timeout(false).is_none());
         assert!(dep.is_ready());
         assert!(probe.snapshot().is_empty());
+    }
+
+    #[test]
+    fn dependency_or_timeout_no_wait_records_no_wait_reason() {
+        let hub = registered_hub_with_timeouts(None, None);
+        let probe = hub.register_probe(42);
+
+        assert!(probe.dependency_or_timeout(true).is_none());
+
+        match probe.poll_acquire(true) {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Unavailable(reason)) => {
+                assert_eq!(reason, RuntimeFilterUnavailableReason::NoWaitConfigured);
+            }
+            other => panic!("expected no-wait unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dependency_or_timeout_records_timeout_reason_after_timer_fires() {
+        let hub = registered_hub_with_timeouts(
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_millis(1)),
+        );
+        let probe = hub.register_probe(42);
+        let dep = probe
+            .dependency_or_timeout(true)
+            .expect("dependency should be returned before timeout");
+
+        wait_until_ready(&dep, Duration::from_millis(200));
+
+        match probe.poll_acquire(true) {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Unavailable(reason)) => {
+                assert_eq!(reason, RuntimeFilterUnavailableReason::Timeout);
+            }
+            other => panic!("expected timeout unavailable, got {other:?}"),
+        }
     }
 
     #[test]
