@@ -104,7 +104,12 @@ pub(crate) fn hydrate_dictionary_columns_except(
     let batch = RecordBatch::try_new(schema.clone(), columns)
         .map_err(|e| format!("build hydrated chunk record batch failed: {e}"))?;
     let chunk_schema = Arc::new(ChunkSchema::try_new(slots)?);
-    Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+    let mut hydrated = Chunk::try_new_with_chunk_schema(batch, chunk_schema)?;
+    if hydrated.schema().metadata() != schema.metadata() {
+        hydrated.batch = RecordBatch::try_new(schema, hydrated.columns().to_vec())
+            .map_err(|e| format!("restore hydrated chunk schema metadata failed: {e}"))?;
+    }
+    Ok(hydrated)
 }
 
 #[cfg(test)]
@@ -340,6 +345,34 @@ mod tests {
                 .expect("default slot")
                 .data_type()
         );
+    }
+
+    #[test]
+    fn hydrate_dictionary_columns_except_preserves_schema_metadata_when_hydrating() {
+        let slot_id = SlotId::new(23);
+        let column = dict_utf8_with_nulls_and_empty();
+        let mut chunk = chunk_with_column(
+            slot_id,
+            Field::new("status", DataType::Utf8, true),
+            Arc::clone(&column),
+        );
+        let mut schema_metadata = std::collections::HashMap::new();
+        schema_metadata.insert("tenant".to_string(), "analytics".to_string());
+        let batch_schema = Arc::new(Schema::new_with_metadata(
+            vec![Arc::new(Field::new(
+                "status",
+                column.data_type().clone(),
+                true,
+            ))],
+            schema_metadata.clone(),
+        ));
+        chunk.batch = RecordBatch::try_new(batch_schema, vec![column]).expect("record batch");
+        assert_eq!(chunk.schema().metadata(), &schema_metadata);
+
+        let hydrated =
+            hydrate_dictionary_columns_except(&chunk, |_, _| false).expect("hydrate all");
+
+        assert_eq!(hydrated.schema().metadata(), &schema_metadata);
     }
 
     #[test]
