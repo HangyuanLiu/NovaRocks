@@ -880,7 +880,10 @@ impl QueryContextManager {
         let hub = if let Some(hub) = ctx.runtime_filter_hub() {
             hub
         } else {
-            let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+            let hub = Arc::new(RuntimeFilterHub::new_for_query(
+                DependencyManager::new(),
+                query_id,
+            ));
             ctx.set_runtime_filter_hub(Arc::clone(&hub));
             hub
         };

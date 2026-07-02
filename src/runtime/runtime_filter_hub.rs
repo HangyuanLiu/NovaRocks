@@ -28,6 +28,8 @@ use crate::exec::runtime_filter::{
     decode_starrocks_in_filter, decode_starrocks_membership_filter, peek_starrocks_filter_type,
 };
 use crate::novarocks_logging::{debug, warn};
+use crate::runtime::query_context::QueryId;
+use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 
 #[derive(Clone)]
 pub(crate) struct RuntimeFilterHandle {
@@ -195,6 +197,7 @@ pub(crate) struct RuntimeFilterHub {
         std::sync::Mutex<std::collections::HashMap<i32, arrow::datatypes::DataType>>,
     scan_wait_timeout_ms: AtomicI64,
     wait_timeout_ms: AtomicI64,
+    query_key: Option<QueryKey>,
 }
 
 #[derive(Clone)]
@@ -236,6 +239,17 @@ struct RuntimeFilterTarget {
 
 impl RuntimeFilterHub {
     pub(crate) fn new(dep_manager: DependencyManager) -> Self {
+        Self::with_query_key(dep_manager, None)
+    }
+
+    pub(crate) fn new_for_query(dep_manager: DependencyManager, query_id: QueryId) -> Self {
+        Self::with_query_key(
+            dep_manager,
+            Some(QueryKey::from_hi_lo(query_id.hi, query_id.lo)),
+        )
+    }
+
+    fn with_query_key(dep_manager: DependencyManager, query_key: Option<QueryKey>) -> Self {
         Self {
             dep_manager,
             entries: Mutex::new(HashMap::new()),
@@ -249,6 +263,7 @@ impl RuntimeFilterHub {
             probe_data_type_by_filter: std::sync::Mutex::new(std::collections::HashMap::new()),
             scan_wait_timeout_ms: AtomicI64::new(-1),
             wait_timeout_ms: AtomicI64::new(-1),
+            query_key,
         }
     }
 
@@ -289,12 +304,13 @@ impl RuntimeFilterHub {
         if specs.is_empty() {
             return;
         }
-        let (expected, snapshot) = {
+        let (expected, snapshot, newly_planned) = {
             let mut specs_guard = self
                 .probe_specs_by_node
                 .lock()
                 .expect("runtime filter hub lock");
             let entry = specs_guard.entry(node_id).or_default();
+            let mut newly_planned = Vec::new();
             for spec in specs {
                 if let Some(existing) = entry.get(&spec.filter_id) {
                     if *existing != spec.slot_id {
@@ -306,9 +322,20 @@ impl RuntimeFilterHub {
                     continue;
                 }
                 entry.insert(spec.filter_id, spec.slot_id);
+                newly_planned.push(spec.filter_id);
             }
-            (entry.len(), entry.clone())
+            (entry.len(), entry.clone(), newly_planned)
         };
+        if let Some(query_key) = self.query_key {
+            let recorder = RuntimeFilterLifecycleRegistry::global().recorder(query_key);
+            for filter_id in newly_planned {
+                recorder.planned(filter_id);
+                debug!(
+                    "rf-lifecycle query={}:{} filter={} stage=planned node_id={}",
+                    query_key.hi, query_key.lo, filter_id, node_id
+                );
+            }
+        }
         {
             let mut expected_guard = self
                 .expected_by_node
@@ -522,6 +549,11 @@ impl RuntimeFilterHub {
                     RuntimeFilterUpdate::Membership(filter_for_node),
                 );
             }
+        }
+        if let Some(query_key) = self.query_key {
+            RuntimeFilterLifecycleRegistry::global()
+                .recorder(query_key)
+                .delivered(filter_id);
         }
         Ok(())
     }
@@ -958,6 +990,8 @@ mod tests {
         RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeEmptyFilter, RuntimeFilterType,
         RuntimeMembershipFilter, RuntimeMinMaxFilter,
     };
+    use crate::runtime::query_context::QueryId;
+    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 
     fn new_probe_with_timeouts() -> RuntimeFilterProbe {
         let hub = RuntimeFilterHub::new(DependencyManager::new());
@@ -1021,6 +1055,36 @@ mod tests {
             0,
             min_max,
         ))
+    }
+
+    #[test]
+    fn query_aware_probe_registration_records_planned_lifecycle() {
+        let query_id = QueryId {
+            hi: 30_001,
+            lo: 40_001,
+        };
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+
+        let hub = RuntimeFilterHub::new_for_query(DependencyManager::new(), query_id);
+        hub.register_probe_specs(
+            42,
+            &[RuntimeFilterProbeSpec {
+                filter_id: 7,
+                expr_id: ExprId(0),
+                slot_id: SlotId::new(11),
+                data_type: DataType::Int32,
+            }],
+        );
+
+        let snapshot = registry
+            .snapshot(query_key)
+            .expect("query lifecycle snapshot");
+        let filter = snapshot.filters.get(&7).expect("filter lifecycle");
+        assert!(filter.planned);
+
+        registry.remove_query(query_key);
     }
 
     #[test]

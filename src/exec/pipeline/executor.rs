@@ -96,9 +96,12 @@ pub(crate) fn execute_plan_with_pipeline_with_root_sink_dop(
             if let Some(hub) = query_context_manager().get_runtime_filter_hub(qid) {
                 hub
             } else {
-                let hub = Arc::new(crate::runtime::runtime_filter_hub::RuntimeFilterHub::new(
-                    DependencyManager::new(),
-                ));
+                let hub = Arc::new(
+                    crate::runtime::runtime_filter_hub::RuntimeFilterHub::new_for_query(
+                        DependencyManager::new(),
+                        qid,
+                    ),
+                );
                 let _ = query_context_manager().set_runtime_filter_hub(qid, Arc::clone(&hub));
                 hub
             }
