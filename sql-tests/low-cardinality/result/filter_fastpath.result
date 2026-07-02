@@ -1,0 +1,15 @@
+-- query 4
+id	status	channel
+1	PAID	web
+5	PAID	ops
+
+-- query 5
+id	status
+1	PAID
+3	CLOSED
+5	PAID
+
+-- query 6
+id	status
+4	NULL
+6	NULL

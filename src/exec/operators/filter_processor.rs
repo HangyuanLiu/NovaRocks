@@ -386,11 +386,18 @@ impl ProcessorOperator for FilterProcessorOperator {
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
-    use arrow::datatypes::DataType;
+    use arrow::array::{Array, ArrayRef, DictionaryArray, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+    use arrow::record_batch::RecordBatch;
 
     fn dict_utf8_type() -> DataType {
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+    }
+
+    fn dict_utf8(values: Vec<Option<&str>>) -> ArrayRef {
+        Arc::new(values.into_iter().collect::<DictionaryArray<Int32Type>>())
     }
 
     fn utf8_literal(arena: &mut ExprArena, value: &str) -> ExprId {
@@ -398,6 +405,52 @@ mod tests {
             ExprNode::Literal(LiteralValue::Utf8(value.to_string())),
             DataType::Utf8,
         )
+    }
+
+    fn filter_test_chunk() -> Chunk {
+        let status = dict_utf8(vec![Some("PAID"), Some("PENDING"), None, Some("PAID")]);
+        let channel = dict_utf8(vec![Some("web"), Some("retail"), Some("ops"), Some("web")]);
+        let amount = Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef;
+        let slots = vec![
+            ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                Field::new("status", DataType::Utf8, true),
+                None,
+                None,
+            ),
+            ChunkSlotSchema::new_with_field(
+                SlotId::new(2),
+                Field::new("channel", DataType::Utf8, true),
+                None,
+                None,
+            ),
+            ChunkSlotSchema::new_with_field(
+                SlotId::new(3),
+                Field::new("amount", DataType::Int32, false),
+                None,
+                None,
+            ),
+        ];
+        let chunk_schema = Arc::new(ChunkSchema::try_new(slots).expect("chunk schema"));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("status", status.data_type().clone(), true),
+                Field::new("channel", channel.data_type().clone(), true),
+                Field::new("amount", DataType::Int32, false),
+            ])),
+            vec![status, channel, amount],
+        )
+        .expect("record batch");
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+    }
+
+    fn assert_int32_utf8_dictionary(column: &ArrayRef) {
+        assert!(matches!(
+            column.data_type(),
+            DataType::Dictionary(key_type, value_type)
+                if key_type.as_ref() == &DataType::Int32
+                    && value_type.as_ref() == &DataType::Utf8
+        ));
     }
 
     #[test]
@@ -475,5 +528,46 @@ mod tests {
         let null_pred = complex_arena.push_typed(ExprNode::IsNull(cast_status), DataType::Boolean);
         let complex = FilterEncodingPolicy::from_predicate(&complex_arena, null_pred);
         assert!(!complex.accepts_encoded_column(SlotId::new(1), &dict_utf8_type()));
+    }
+
+    #[test]
+    fn filter_processor_preserves_dictionary_columns_for_supported_predicates() {
+        let mut arena = ExprArena::default();
+        let status = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let paid = utf8_literal(&mut arena, "PAID");
+        let predicate = arena.push_typed(ExprNode::Eq(status, paid), DataType::Boolean);
+        let arena = Arc::new(arena);
+        let factory = FilterProcessorFactory::new(7, Arc::clone(&arena), predicate);
+        let mut op = factory.create(1, 0);
+        let processor = op.as_processor_mut().expect("processor");
+        let dict_type = dict_utf8_type();
+
+        assert!(processor.accepts_encoded_column(SlotId::new(1), &dict_type));
+        assert!(processor.accepts_encoded_column(SlotId::new(2), &dict_type));
+        assert!(!processor.accepts_encoded_column(SlotId::new(3), &DataType::Int32));
+
+        let state = RuntimeState::default();
+        processor
+            .push_chunk(&state, filter_test_chunk())
+            .expect("push");
+        let output = processor.pull_chunk(&state).expect("pull").expect("output");
+
+        assert_eq!(output.len(), 2);
+        assert_int32_utf8_dictionary(&output.columns()[0]);
+        assert_int32_utf8_dictionary(&output.columns()[1]);
+
+        let status = output.columns()[0]
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("status dictionary");
+        let values = status
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("status values");
+        for row in 0..status.len() {
+            let key = status.keys().value(row) as usize;
+            assert_eq!(values.value(key), "PAID");
+        }
     }
 }
