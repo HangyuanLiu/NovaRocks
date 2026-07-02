@@ -236,12 +236,17 @@ fn build_candidate(
     }
 
     Ok(Some(PreparedMvRewriteCandidate {
-        mv_name: tbl.clone(),
+        mv_name: rewrite_candidate_public_name(tbl),
         mv: mv_desc,
         mv_scalars,
         target_database: ns.clone(),
         target_table,
     }))
+}
+
+fn rewrite_candidate_public_name(target_table: &str) -> String {
+    crate::engine::mv::iceberg_refresh::nr_mv_public_name(target_table)
+        .unwrap_or_else(|| target_table.to_string())
 }
 
 /// Recursively collect "cat.ns.tbl" FQNs of every Iceberg data-file scan in
@@ -373,5 +378,11 @@ mod tests {
         }));
 
         assert!(!supports_current_mv_rewrite_shape(&desc));
+    }
+
+    #[test]
+    fn rewrite_candidate_display_name_uses_public_mv_name() {
+        assert_eq!(rewrite_candidate_public_name("__nr_mv_agg_mv"), "agg_mv");
+        assert_eq!(rewrite_candidate_public_name("legacy_mv"), "legacy_mv");
     }
 }
