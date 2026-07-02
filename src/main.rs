@@ -792,6 +792,10 @@ fn main() {
                 brpc_port: server.brpc_port,
                 http_port: server.http_port,
                 starlet_port: advertise_endpoint.port,
+                mem_limit_bytes: cfg
+                    .runtime
+                    .effective_be_mem_limit_bytes()
+                    .expect("resolve BE memory limit"),
             };
             novarocks::service::heartbeat_service::start_heartbeat_server(heartbeat_cfg)
                 .expect("start heartbeat server");

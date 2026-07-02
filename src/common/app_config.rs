@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 static CONFIG: OnceLock<RwLock<&'static NovaRocksConfig>> = OnceLock::new();
+pub use crate::common::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
 
 fn install_config(cfg: NovaRocksConfig) -> &'static NovaRocksConfig {
     let leaked: &'static NovaRocksConfig = Box::leak(Box::new(cfg));
@@ -621,6 +622,10 @@ pub struct RuntimeConfig {
     pub exchange_io_threads: usize,
     #[serde(default = "default_exchange_io_max_inflight_bytes")]
     pub exchange_io_max_inflight_bytes: usize,
+    #[serde(default = "default_mem_limit")]
+    pub mem_limit: String,
+    #[serde(default = "default_be_mem_limit_bytes")]
+    pub be_mem_limit_bytes: u64,
     #[serde(default = "default_optimizer_query_mem_limit_bytes")]
     pub optimizer_query_mem_limit_bytes: u64,
     /// `0` means derive the backend count from the live BE registry (the normal path).
@@ -843,6 +848,14 @@ fn default_exchange_io_max_inflight_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+fn default_mem_limit() -> String {
+    DEFAULT_MEM_LIMIT_SPEC.to_string()
+}
+
+fn default_be_mem_limit_bytes() -> u64 {
+    0
+}
+
 fn default_optimizer_query_mem_limit_bytes() -> u64 {
     2 * 1024 * 1024 * 1024
 }
@@ -1026,6 +1039,8 @@ impl Default for RuntimeConfig {
             exchange_max_transmit_batched_bytes: default_exchange_max_transmit_batched_bytes(),
             exchange_io_threads: default_exchange_io_threads(),
             exchange_io_max_inflight_bytes: default_exchange_io_max_inflight_bytes(),
+            mem_limit: default_mem_limit(),
+            be_mem_limit_bytes: default_be_mem_limit_bytes(),
             optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),
             optimizer_effective_backend_count: default_optimizer_effective_backend_count(),
             local_exchange_buffer_mem_limit_per_driver:
@@ -1161,6 +1176,30 @@ impl ExecutionServicesConfig {
 }
 
 impl RuntimeConfig {
+    pub fn effective_be_mem_limit_bytes(&self) -> Result<u64> {
+        if self.be_mem_limit_bytes > 0 {
+            return Ok(self.be_mem_limit_bytes);
+        }
+
+        crate::common::memory_limit::resolve_starrocks_process_mem_limit_bytes(&self.mem_limit)
+            .with_context(|| format!("resolve runtime.mem_limit '{}'", self.mem_limit))
+    }
+
+    pub fn effective_be_mem_limit_bytes_for_visible_memory(
+        &self,
+        visible_memory_bytes: u64,
+    ) -> Result<u64> {
+        if self.be_mem_limit_bytes > 0 {
+            return Ok(self.be_mem_limit_bytes);
+        }
+
+        crate::common::memory_limit::resolve_starrocks_process_mem_limit_bytes_for_visible_memory(
+            &self.mem_limit,
+            visible_memory_bytes,
+        )
+        .with_context(|| format!("resolve runtime.mem_limit '{}'", self.mem_limit))
+    }
+
     /// Get the actual number of executor threads.
     /// Returns CPU cores if configured as 0.
     pub fn actual_exec_threads(&self) -> usize {
@@ -1497,8 +1536,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        MetadataProviderConfig, NovaRocksConfig, RuntimeConfig, StandaloneObjectStoreConfig,
-        StandaloneServerConfig, StandaloneStarRocksTableConfig,
+        DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, RuntimeConfig,
+        StandaloneObjectStoreConfig, StandaloneServerConfig, StandaloneStarRocksTableConfig,
     };
 
     #[test]
@@ -2051,6 +2090,86 @@ data_runtime_max_blocking_threads = 99
         )
         .expect("parse config");
         assert_eq!(cfg.runtime.internal_service_query_rpc_thread_num, 0);
+    }
+
+    #[test]
+    fn test_runtime_mem_limit_defaults_to_starrocks_spec() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.runtime.mem_limit, DEFAULT_MEM_LIMIT_SPEC);
+        assert_eq!(cfg.runtime.be_mem_limit_bytes, 0);
+    }
+
+    #[test]
+    fn test_runtime_be_mem_limit_bytes_override_wins() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+mem_limit = "10%"
+be_mem_limit_bytes = 34359738368
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(
+            cfg.runtime
+                .effective_be_mem_limit_bytes_for_visible_memory(128 * 1024 * 1024 * 1024)
+                .expect("resolve mem limit"),
+            32 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_runtime_mem_limit_derives_starrocks_soft_limit_from_percentage() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+mem_limit = "90%"
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(
+            cfg.runtime
+                .effective_be_mem_limit_bytes_for_visible_memory(1000)
+                .expect("resolve mem limit"),
+            810
+        );
+    }
+
+    #[test]
+    fn test_runtime_mem_limit_derives_starrocks_soft_limit_from_units_and_clamps() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+mem_limit = "200G"
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(
+            cfg.runtime
+                .effective_be_mem_limit_bytes_for_visible_memory(100 * 1024 * 1024 * 1024)
+                .expect("resolve mem limit"),
+            100 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_runtime_mem_limit_rejects_zero_effective_limit() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+mem_limit = "0"
+"#,
+        )
+        .expect("parse config");
+        assert!(
+            cfg.runtime
+                .effective_be_mem_limit_bytes_for_visible_memory(100 * 1024 * 1024 * 1024)
+                .is_err()
+        );
     }
 
     #[test]
