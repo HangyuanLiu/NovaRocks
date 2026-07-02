@@ -3574,4 +3574,277 @@ mod tests {
             .unwrap();
         assert!(matches!(t, Type::Primitive(PrimitiveType::TimestampNs)));
     }
+
+    // --- RF empty-range short-circuit guard tests (RF milestone M4) ---
+    //
+    // These tests characterize an already-working production behavior: when a
+    // runtime filter's min/max range is disjoint from every row group's
+    // statistics, `open_next_reader` prunes all row groups for a range and
+    // `continue`s *before* building any column-chunk reader (see the
+    // `row_groups.is_empty()` short-circuits in this file). They exist to
+    // guard that behavior against regression, not to introduce it.
+
+    const RUNTIME_FILTER_ROW_GROUP_ROWS: i32 = 100;
+    const RUNTIME_FILTER_ROW_GROUP_COUNT: i32 = 10;
+
+    /// Writes a single-column (`id: Int32`) parquet file containing
+    /// `RUNTIME_FILTER_ROW_GROUP_COUNT` row groups of
+    /// `RUNTIME_FILTER_ROW_GROUP_ROWS` rows each, with values `0..(count*rows)`
+    /// in ascending order so each row group covers a disjoint, known key
+    /// sub-range. Per-row-group statistics are enabled so min/max pruning can
+    /// take effect.
+    fn write_runtime_filter_row_group_fixture(path: &Path) -> ParquetMetaData {
+        let total_rows = (RUNTIME_FILTER_ROW_GROUP_ROWS * RUNTIME_FILTER_ROW_GROUP_COUNT) as usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(field_id_meta(1)),
+        ]));
+        let ids: Vec<i32> = (0..total_rows as i32).collect();
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(ids)) as ArrayRef],
+        )
+        .expect("runtime filter fixture batch");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(RUNTIME_FILTER_ROW_GROUP_ROWS as usize))
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .build();
+        let file = File::create(path).expect("create runtime filter fixture parquet");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).expect("parquet writer");
+        writer.write(&batch).expect("write runtime filter fixture");
+        writer.close().expect("close runtime filter fixture writer");
+
+        let file = File::open(path).expect("open runtime filter fixture parquet");
+        let reader = SerializedFileReader::new(file).expect("metadata reader");
+        reader.metadata().clone()
+    }
+
+    fn runtime_filter_row_group_scan_cfg() -> ParquetScanConfig {
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            &Schema::new(vec![Field::new("id", DataType::Int32, false)]),
+            &[SlotId::new(1)],
+        )
+        .expect("runtime filter fixture chunk schema");
+        ParquetScanConfig {
+            columns: vec!["id".to_string()],
+            chunk_schema,
+            slot_kinds: vec![ParquetSlotKind::Regular],
+            case_sensitive: true,
+            enable_page_index: false,
+            min_max_predicates: Vec::new(),
+            variant_path_predicates: Vec::new(),
+            batch_size: Some(1024),
+            datacache: test_datacache_context(),
+            cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
+            profile_label: None,
+            iceberg_output_schema: None,
+            variant_path_columns: Vec::new(),
+            query_global_dicts: Default::default(),
+        }
+    }
+
+    /// Builds an in-filter `RuntimeFilterContext` (round-tripped through
+    /// `RuntimeFilterSnapshot`/`RuntimeFilterContext::from_snapshot`, matching
+    /// how the scan-runner path reconstructs a context from a hub snapshot)
+    /// whose min/max range is derived from `key_values` and bound to slot 1
+    /// (the `id` column).
+    fn runtime_filter_ctx_for_keys(
+        key_values: Vec<i32>,
+    ) -> crate::exec::node::scan::RuntimeFilterContext {
+        let specs = [crate::exec::node::join::JoinRuntimeFilterSpec {
+            filter_id: 1,
+            expr_order: 0,
+            probe_slot_id: SlotId::new(1),
+            build_data_type: DataType::Int32,
+            merge_nodes: Vec::new(),
+            has_remote_targets: false,
+        }];
+        let key_arrays: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(key_values))];
+        let mut local_filters =
+            crate::exec::runtime_filter::LocalRuntimeInFilterSet::new(&specs, &key_arrays)
+                .expect("local runtime in-filter");
+        local_filters
+            .add_build_arrays(&key_arrays)
+            .expect("runtime in-filter build values");
+        let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
+            local_filters.into_filters(),
+            Vec::new(),
+        );
+        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+    }
+
+    /// Opens a `ParquetScanIter` over the whole fixture file with the given
+    /// runtime filter context attached and a fresh profile, so row-group
+    /// pruning counters can be asserted after the iterator is drained.
+    fn open_runtime_filter_scan_iter(
+        path: &Path,
+        runtime_filters: crate::exec::node::scan::RuntimeFilterContext,
+        profile: crate::runtime::profile::RuntimeProfile,
+    ) -> ParquetScanIter {
+        let file_len = fs::metadata(path).expect("fixture file metadata").len();
+        let temp_dir = path.parent().expect("fixture parent dir");
+        let op = build_fs_operator(temp_dir.to_str().expect("temp dir path")).expect("fs operator");
+        let factory = OpendalRangeReaderFactory::from_operator(op)
+            .expect("reader factory")
+            .with_profile(Some(profile.clone()));
+        let range = FileScanRange {
+            path: path
+                .file_name()
+                .expect("fixture file name")
+                .to_string_lossy()
+                .to_string(),
+            file_len,
+            offset: 0,
+            length: file_len,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+        };
+        ParquetScanIter::new(
+            runtime_filter_row_group_scan_cfg(),
+            vec![range],
+            factory,
+            None,
+            Some(profile),
+            Some(runtime_filters),
+        )
+        .expect("runtime filter scan iter")
+    }
+
+    fn collect_id_values(chunks: &[arrow::record_batch::RecordBatch]) -> Vec<i32> {
+        let mut out = Vec::new();
+        for batch in chunks {
+            let ids = batch
+                .column_by_name("id")
+                .expect("id column")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id Int32Array");
+            out.extend((0..ids.len()).map(|i| ids.value(i)));
+        }
+        out
+    }
+
+    #[test]
+    fn runtime_filter_disjoint_range_short_circuits_with_zero_row_groups_selected() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("rf_empty_range.parquet");
+        let metadata = write_runtime_filter_row_group_fixture(&file_path);
+        assert_eq!(
+            metadata.num_row_groups(),
+            RUNTIME_FILTER_ROW_GROUP_COUNT as usize
+        );
+
+        // Data keys span [0, 999]; this runtime filter's min/max range is
+        // [10_000, 10_001], disjoint from every row group's statistics.
+        let runtime_filters = runtime_filter_ctx_for_keys(vec![10_000, 10_001]);
+        let profile = crate::runtime::profile::RuntimeProfile::new("rf_empty_range_test");
+        let mut iter = open_runtime_filter_scan_iter(&file_path, runtime_filters, profile.clone());
+
+        let mut chunks_yielded = 0usize;
+        for item in &mut iter {
+            let chunk = item.expect("scan iter should not error");
+            chunks_yielded += chunk.batch.num_rows();
+        }
+        assert_eq!(
+            chunks_yielded, 0,
+            "disjoint runtime filter must prune every row and yield zero rows"
+        );
+        assert!(
+            iter.next().is_none(),
+            "exhausted scan iter must return None (EOF) on further next() calls"
+        );
+
+        let total = profile
+            .counter_value("ParquetRowGroupsTotal")
+            .expect("ParquetRowGroupsTotal counter recorded");
+        let selected = profile
+            .counter_value("ParquetRowGroupsSelected")
+            .expect("ParquetRowGroupsSelected counter recorded");
+        let pruned = profile
+            .counter_value("ParquetRowGroupsPruned")
+            .expect("ParquetRowGroupsPruned counter recorded");
+
+        assert_eq!(total, RUNTIME_FILTER_ROW_GROUP_COUNT as i64);
+        assert_eq!(
+            selected, 0,
+            "disjoint runtime filter must select zero row groups"
+        );
+        assert_eq!(
+            pruned, total,
+            "every row group must be pruned when the runtime filter range is disjoint"
+        );
+    }
+
+    #[test]
+    fn runtime_filter_partial_overlap_prunes_to_single_row_group() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("rf_partial_overlap.parquet");
+        let metadata = write_runtime_filter_row_group_fixture(&file_path);
+        assert_eq!(
+            metadata.num_row_groups(),
+            RUNTIME_FILTER_ROW_GROUP_COUNT as usize
+        );
+
+        // Row group 0 covers keys [0, 99]. A runtime filter range of
+        // [0, RUNTIME_FILTER_ROW_GROUP_ROWS - 1] overlaps only that row group
+        // and is disjoint from every other row group's statistics.
+        let overlap_max = RUNTIME_FILTER_ROW_GROUP_ROWS - 1;
+        let runtime_filters = runtime_filter_ctx_for_keys(vec![0, overlap_max]);
+        let profile = crate::runtime::profile::RuntimeProfile::new("rf_partial_overlap_test");
+        let mut iter = open_runtime_filter_scan_iter(&file_path, runtime_filters, profile.clone());
+
+        let mut rf_on_batches = Vec::new();
+        for item in &mut iter {
+            let chunk = item.expect("scan iter should not error");
+            rf_on_batches.push(chunk.batch);
+        }
+        let rf_on_values = collect_id_values(&rf_on_batches);
+
+        let selected = profile
+            .counter_value("ParquetRowGroupsSelected")
+            .expect("ParquetRowGroupsSelected counter recorded");
+        assert_eq!(
+            selected, 1,
+            "runtime filter overlapping only the first row group must select exactly one"
+        );
+        assert!(
+            !rf_on_values.is_empty(),
+            "surviving row group must yield rows"
+        );
+        assert!(
+            rf_on_values
+                .iter()
+                .all(|&v| (0..RUNTIME_FILTER_ROW_GROUP_ROWS).contains(&v)),
+            "all RF-on rows must come from the first row group's key range"
+        );
+
+        // RF-off: same fixture, same config, no runtime filter attached.
+        let rf_off_batch = read_single_batch(runtime_filter_row_group_scan_cfg(), &file_path);
+        let rf_off_values = (0..rf_off_batch.num_rows())
+            .map(|i| {
+                rf_off_batch
+                    .column_by_name("id")
+                    .expect("id column")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id Int32Array")
+                    .value(i)
+            })
+            .collect::<Vec<_>>();
+
+        let rf_off_set: HashSet<i32> = rf_off_values.into_iter().collect();
+        assert!(
+            rf_on_values.iter().all(|v| rf_off_set.contains(v)),
+            "RF-on rows must be a subset of RF-off rows"
+        );
+        assert!(
+            rf_on_values.len() < rf_off_set.len(),
+            "partial pruning must strictly reduce the row count versus RF-off"
+        );
+    }
 }
