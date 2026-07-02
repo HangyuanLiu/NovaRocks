@@ -93,6 +93,12 @@ pub(crate) struct Lowered {
     pub(crate) layout: Layout,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlanOrigin {
+    StarRocksFeCompatible,
+    NovaRocksGenerated,
+}
+
 #[cfg(test)]
 pub(crate) fn test_plan_node(
     node_id: types::TPlanNodeId,
@@ -216,6 +222,7 @@ pub(crate) fn lower_plan(
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
+    plan_origin: PlanOrigin,
 ) -> Result<Lowered, String> {
     let mut idx = 0usize;
     let global_common_slot_map = collect_global_common_slot_map(&plan.nodes);
@@ -242,6 +249,7 @@ pub(crate) fn lower_plan(
         &global_common_slot_map,
         last_query_id,
         fe_addr,
+        plan_origin,
     )?;
     if idx != plan.nodes.len() {
         // best-effort: ignore trailing nodes
@@ -293,6 +301,7 @@ fn lower_node(
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
+    plan_origin: PlanOrigin,
 ) -> Result<Lowered, String> {
     let root_index = *idx;
     let root_node = nodes
@@ -336,6 +345,7 @@ fn lower_node(
             global_common_slot_map,
             last_query_id,
             fe_addr,
+            plan_origin,
         )?;
         if let Some(parent) = stack.last_mut() {
             parent.children.push(lowered);
@@ -362,6 +372,7 @@ fn lower_node_with_children(
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
+    _plan_origin: PlanOrigin,
 ) -> Result<Lowered, String> {
     let mut out_layout = layout_for_row_tuples(&node.row_tuples, tuple_slots);
     // Some plan nodes carry multiple tuples in `row_tuples` (e.g. aggregate intermediate vs output).
