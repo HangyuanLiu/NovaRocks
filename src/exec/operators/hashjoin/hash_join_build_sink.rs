@@ -55,6 +55,7 @@ use crate::novarocks_logging::{debug, warn};
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
+use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::exchange_sender;
 use std::collections::{HashMap, HashSet};
@@ -650,6 +651,7 @@ impl HashJoinBuildSinkOperator {
                 let membership_for_remote = self.filter_membership_for_remote(&membership_filters);
                 self.runtime_filter_hub
                     .publish_filters(&local_filters, &membership_for_publish);
+                self.record_built_lifecycle(state, &membership_for_publish);
                 self.send_runtime_filters_remote(state, &membership_for_remote)?;
             }
         } else {
@@ -674,9 +676,36 @@ impl HashJoinBuildSinkOperator {
             let membership_for_remote = self.filter_membership_for_remote(&membership_filters);
             self.runtime_filter_hub
                 .publish_filters(&local_filters, &membership_for_publish);
+            self.record_built_lifecycle(state, &membership_for_publish);
             self.send_runtime_filters_remote(state, &membership_for_remote)?;
         }
         Ok(())
+    }
+
+    fn record_built_lifecycle(&self, state: &RuntimeState, filters: &[RuntimeMembershipFilter]) {
+        let Some(query_id) = state.query_id() else {
+            return;
+        };
+        let recorder = RuntimeFilterLifecycleRegistry::global()
+            .recorder(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
+        for filter in filters {
+            recorder.built(
+                filter.filter_id(),
+                self.build_row_count as i64,
+                filter.size() as i64,
+            );
+        }
+    }
+
+    fn record_sent_lifecycle(
+        &self,
+        query_id: crate::runtime::query_context::QueryId,
+        filter_id: i32,
+        bytes: usize,
+    ) {
+        RuntimeFilterLifecycleRegistry::global()
+            .recorder(QueryKey::from_hi_lo(query_id.hi, query_id.lo))
+            .sent_partial(filter_id, bytes as i64);
     }
 
     fn send_runtime_filters_remote(
@@ -779,6 +808,7 @@ impl HashJoinBuildSinkOperator {
             };
             encoded_bytes = encoded_bytes.saturating_add(data.len() as i64);
 
+            let mut recorded_sent = false;
             let mut seen_hosts = HashSet::new();
             if use_merge_nodes {
                 for addr in &spec.merge_nodes {
@@ -803,6 +833,10 @@ impl HashJoinBuildSinkOperator {
                             ..Default::default()
                         };
                     let dest_port = addr.port as u16;
+                    if !recorded_sent {
+                        self.record_sent_lifecycle(query_id, filter.filter_id(), data.len());
+                        recorded_sent = true;
+                    }
                     if let Err(e) = exchange_sender::send_runtime_filter(&addr.host, dest_port, req)
                     {
                         warn!(
@@ -838,8 +872,12 @@ impl HashJoinBuildSinkOperator {
                             finst_id,
                             data: Some(data.clone()),
                             ..Default::default()
-                        };
+                    };
                     let dest_port = addr.port as u16;
+                    if !recorded_sent {
+                        self.record_sent_lifecycle(query_id, filter.filter_id(), data.len());
+                        recorded_sent = true;
+                    }
                     if let Err(e) =
                         exchange_sender::send_runtime_filter(&addr.hostname, dest_port, req)
                     {
@@ -1292,6 +1330,8 @@ mod tests {
     use crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind;
     use crate::exec::pipeline::dependency::DependencyManager;
     use crate::runtime::profile::{OperatorProfiles, RuntimeProfile};
+    use crate::runtime::query_context::QueryId;
+    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 
     #[derive(Default)]
     struct TestBuildState {
@@ -1741,6 +1781,57 @@ mod tests {
         assert_eq!(artifact.build_row_count, 0);
         assert!(artifact.build_store.is_none());
         assert!(artifact.build_table.is_none());
+    }
+
+    #[test]
+    fn records_built_lifecycle_for_membership_runtime_filter() {
+        let query_id = QueryId {
+            hi: 30_002,
+            lo: 40_002,
+        };
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+
+        let state = Arc::new(TestBuildState::default());
+        let mut operator = direct_set_build_operator(Arc::clone(&state));
+        operator.runtime_filter_specs = vec![JoinRuntimeFilterSpec {
+            filter_id: 17,
+            expr_order: 0,
+            probe_slot_id: SlotId::new(1),
+            build_data_type: DataType::Int32,
+            merge_nodes: Vec::new(),
+            has_remote_targets: false,
+        }];
+        let runtime_state = RuntimeState::new(
+            None,
+            None,
+            Some(query_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        operator
+            .push_chunk(&runtime_state, int32_chunk(vec![1, 2, 3]))
+            .expect("push chunk");
+        operator.set_finishing(&runtime_state).expect("finish");
+
+        let snapshot = registry
+            .snapshot(query_key)
+            .expect("query lifecycle snapshot");
+        let built = snapshot
+            .filters
+            .get(&17)
+            .and_then(|filter| filter.built)
+            .expect("built lifecycle");
+        assert_eq!(built.rows, 3);
+        assert!(built.bytes > 0, "built bytes must report filter size");
+
+        registry.remove_query(query_key);
     }
 
     #[test]

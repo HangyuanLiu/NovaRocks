@@ -42,6 +42,7 @@ use crate::runtime::descriptor_snapshot_thrift::descriptor_snapshot_from_thrift;
 use crate::runtime::lookup::GlobalLateMaterializationContext;
 use crate::runtime::mem_tracker::{self, MemTracker};
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
+use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 use crate::runtime::runtime_filter_worker::{
     RuntimeFilterProberTarget, RuntimeFilterWorker, RuntimeFilterWorkerParams,
 };
@@ -474,6 +475,12 @@ pub(crate) struct QueryContextManager {
     stopped: AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FragmentFinishReportDecision {
+    pub(crate) include_runtime_filter_profile: bool,
+    remove_runtime_filter_lifecycle_after_report: bool,
+}
+
 impl QueryContextManager {
     fn new() -> Arc<Self> {
         let manager = Arc::new(Self {
@@ -502,6 +509,7 @@ impl QueryContextManager {
         }
         for qid in to_remove {
             guard.second_chance.remove(&qid);
+            remove_runtime_filter_lifecycle(qid);
         }
     }
 
@@ -880,7 +888,10 @@ impl QueryContextManager {
         let hub = if let Some(hub) = ctx.runtime_filter_hub() {
             hub
         } else {
-            let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+            let hub = Arc::new(RuntimeFilterHub::new_for_query(
+                DependencyManager::new(),
+                query_id,
+            ));
             ctx.set_runtime_filter_hub(Arc::clone(&hub));
             hub
         };
@@ -1106,21 +1117,60 @@ impl QueryContextManager {
     }
 
     pub(crate) fn finish_fragment(&self, query_id: QueryId) {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        let Some(mut ctx) = guard.active.remove(&query_id) else {
-            return;
-        };
-        ctx.count_down_fragments();
-        if ctx.is_dead() {
-            return;
-        }
-        if ctx.has_no_active_instances() {
-            ctx.extend_delivery_lifetime();
-            guard.second_chance.insert(query_id, ctx);
-        } else {
-            guard.active.insert(query_id, ctx);
+        let decision = self.finish_fragment_internal(query_id);
+        if decision.remove_runtime_filter_lifecycle_after_report {
+            remove_runtime_filter_lifecycle(query_id);
         }
     }
+
+    pub(crate) fn finish_fragment_for_report(
+        &self,
+        query_id: QueryId,
+    ) -> FragmentFinishReportDecision {
+        self.finish_fragment_internal(query_id)
+    }
+
+    pub(crate) fn cleanup_after_fragment_report(
+        &self,
+        query_id: QueryId,
+        decision: FragmentFinishReportDecision,
+    ) {
+        if decision.remove_runtime_filter_lifecycle_after_report {
+            remove_runtime_filter_lifecycle(query_id);
+        }
+    }
+
+    fn finish_fragment_internal(&self, query_id: QueryId) -> FragmentFinishReportDecision {
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        let Some(mut ctx) = guard.active.remove(&query_id) else {
+            return FragmentFinishReportDecision {
+                include_runtime_filter_profile: true,
+                remove_runtime_filter_lifecycle_after_report: false,
+            };
+        };
+        let no_active_fragments = ctx.count_down_fragments();
+        if !no_active_fragments {
+            guard.active.insert(query_id, ctx);
+            return FragmentFinishReportDecision::default();
+        }
+        if ctx.is_dead() {
+            return FragmentFinishReportDecision {
+                include_runtime_filter_profile: true,
+                remove_runtime_filter_lifecycle_after_report: true,
+            };
+        }
+        ctx.extend_delivery_lifetime();
+        guard.second_chance.insert(query_id, ctx);
+        FragmentFinishReportDecision {
+            include_runtime_filter_profile: true,
+            remove_runtime_filter_lifecycle_after_report: false,
+        }
+    }
+}
+
+fn remove_runtime_filter_lifecycle(query_id: QueryId) {
+    RuntimeFilterLifecycleRegistry::global()
+        .remove_query(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
 }
 
 fn runtime_filter_worker_params_from_thrift(
@@ -1237,6 +1287,133 @@ mod sender_error_tests {
 
         assert_eq!(finsts, vec![finst]);
         assert!(snapshot_receiver_state(key).is_none());
+    }
+}
+
+#[cfg(test)]
+mod runtime_filter_lifecycle_cleanup_tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        FragmentFinishReportDecision, QueryContext, QueryContextManager, QueryContextManagerInner,
+        QueryId,
+    };
+    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
+
+    fn test_manager() -> QueryContextManager {
+        QueryContextManager {
+            inner: Mutex::new(QueryContextManagerInner::default()),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn finish_fragment_removes_runtime_filter_lifecycle_when_query_is_dead() {
+        let mgr = test_manager();
+        let query_id = QueryId {
+            hi: 4_101,
+            lo: 4_102,
+        };
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        registry.recorder(query_key).planned(7);
+
+        mgr.get_or_register(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("query context must be created");
+        {
+            let mut guard = mgr.inner.lock().expect("query ctx manager lock");
+            guard
+                .active
+                .get_mut(&query_id)
+                .expect("active query")
+                .total_fragments = Some(1);
+        }
+
+        mgr.finish_fragment(query_id);
+
+        assert!(registry.snapshot(query_key).is_none());
+    }
+
+    #[test]
+    fn finish_fragment_for_report_claims_runtime_filter_export_once_before_cleanup() {
+        let mgr = test_manager();
+        let query_id = QueryId {
+            hi: 4_151,
+            lo: 4_152,
+        };
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        registry.recorder(query_key).planned(7);
+
+        mgr.get_or_register(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("first query context fragment must be created");
+        mgr.get_or_register(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("second query context fragment must be created");
+        {
+            let mut guard = mgr.inner.lock().expect("query ctx manager lock");
+            guard
+                .active
+                .get_mut(&query_id)
+                .expect("active query")
+                .total_fragments = Some(2);
+        }
+
+        let first = mgr.finish_fragment_for_report(query_id);
+        assert_eq!(first, FragmentFinishReportDecision::default());
+        mgr.cleanup_after_fragment_report(query_id, first);
+        assert!(registry.snapshot(query_key).is_some());
+
+        let second = mgr.finish_fragment_for_report(query_id);
+        assert!(second.include_runtime_filter_profile);
+        assert!(second.remove_runtime_filter_lifecycle_after_report);
+        assert!(registry.snapshot(query_key).is_some());
+
+        mgr.cleanup_after_fragment_report(query_id, second);
+
+        assert!(registry.snapshot(query_key).is_none());
+    }
+
+    #[test]
+    fn clean_expired_removes_runtime_filter_lifecycle_for_second_chance_query() {
+        let mgr = test_manager();
+        let query_id = QueryId {
+            hi: 4_201,
+            lo: 4_202,
+        };
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        registry.recorder(query_key).planned(7);
+
+        let mut ctx = QueryContext::new(query_id, Duration::from_millis(1), Duration::from_secs(5));
+        ctx.delivery_deadline = Instant::now() - Duration::from_millis(1);
+        {
+            let mut guard = mgr.inner.lock().expect("query ctx manager lock");
+            guard.second_chance.insert(query_id, ctx);
+        }
+
+        mgr.clean_expired();
+
+        assert!(registry.snapshot(query_key).is_none());
     }
 }
 

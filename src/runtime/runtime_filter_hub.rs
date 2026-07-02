@@ -28,6 +28,8 @@ use crate::exec::runtime_filter::{
     decode_starrocks_in_filter, decode_starrocks_membership_filter, peek_starrocks_filter_type,
 };
 use crate::novarocks_logging::{debug, warn};
+use crate::runtime::query_context::QueryId;
+use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 
 #[derive(Clone)]
 pub(crate) struct RuntimeFilterHandle {
@@ -195,6 +197,7 @@ pub(crate) struct RuntimeFilterHub {
         std::sync::Mutex<std::collections::HashMap<i32, arrow::datatypes::DataType>>,
     scan_wait_timeout_ms: AtomicI64,
     wait_timeout_ms: AtomicI64,
+    query_key: Option<QueryKey>,
 }
 
 #[derive(Clone)]
@@ -236,6 +239,17 @@ struct RuntimeFilterTarget {
 
 impl RuntimeFilterHub {
     pub(crate) fn new(dep_manager: DependencyManager) -> Self {
+        Self::with_query_key(dep_manager, None)
+    }
+
+    pub(crate) fn new_for_query(dep_manager: DependencyManager, query_id: QueryId) -> Self {
+        Self::with_query_key(
+            dep_manager,
+            Some(QueryKey::from_hi_lo(query_id.hi, query_id.lo)),
+        )
+    }
+
+    fn with_query_key(dep_manager: DependencyManager, query_key: Option<QueryKey>) -> Self {
         Self {
             dep_manager,
             entries: Mutex::new(HashMap::new()),
@@ -249,6 +263,7 @@ impl RuntimeFilterHub {
             probe_data_type_by_filter: std::sync::Mutex::new(std::collections::HashMap::new()),
             scan_wait_timeout_ms: AtomicI64::new(-1),
             wait_timeout_ms: AtomicI64::new(-1),
+            query_key,
         }
     }
 
@@ -289,12 +304,13 @@ impl RuntimeFilterHub {
         if specs.is_empty() {
             return;
         }
-        let (expected, snapshot) = {
+        let (expected, snapshot, newly_planned) = {
             let mut specs_guard = self
                 .probe_specs_by_node
                 .lock()
                 .expect("runtime filter hub lock");
             let entry = specs_guard.entry(node_id).or_default();
+            let mut newly_planned = Vec::new();
             for spec in specs {
                 if let Some(existing) = entry.get(&spec.filter_id) {
                     if *existing != spec.slot_id {
@@ -306,9 +322,20 @@ impl RuntimeFilterHub {
                     continue;
                 }
                 entry.insert(spec.filter_id, spec.slot_id);
+                newly_planned.push(spec.filter_id);
             }
-            (entry.len(), entry.clone())
+            (entry.len(), entry.clone(), newly_planned)
         };
+        if let Some(query_key) = self.query_key {
+            let recorder = RuntimeFilterLifecycleRegistry::global().recorder(query_key);
+            for filter_id in newly_planned {
+                recorder.planned(filter_id);
+                debug!(
+                    "rf-lifecycle query={}:{} filter={} stage=planned node_id={}",
+                    query_key.hi, query_key.lo, filter_id, node_id
+                );
+            }
+        }
         {
             let mut expected_guard = self
                 .expected_by_node
@@ -522,6 +549,11 @@ impl RuntimeFilterHub {
                     RuntimeFilterUpdate::Membership(filter_for_node),
                 );
             }
+        }
+        if let Some(query_key) = self.query_key {
+            RuntimeFilterLifecycleRegistry::global()
+                .recorder(query_key)
+                .delivered(filter_id);
         }
         Ok(())
     }
@@ -838,16 +870,7 @@ impl RuntimeFilterProbe {
     }
 
     fn release(&self, reason: RuntimeFilterUnavailableReason) -> AcquiredRuntimeFilters {
-        let reason = {
-            let mut guard = self
-                .inner
-                .entry
-                .release_reason
-                .lock()
-                .expect("runtime filter release reason lock");
-            *guard.get_or_insert(reason)
-        };
-        self.inner.entry.dep.set_ready();
+        let reason = release_entry(&self.inner.entry, reason);
         AcquiredRuntimeFilters::Unavailable(reason)
     }
 
@@ -863,11 +886,11 @@ impl RuntimeFilterProbe {
         };
         let Some(timeout) = timeout else {
             // No wait timeout configured: do not block on runtime filters.
-            dep.set_ready();
+            self.release(RuntimeFilterUnavailableReason::NoWaitConfigured);
             return None;
         };
         if timeout.is_zero() {
-            dep.set_ready();
+            self.release(RuntimeFilterUnavailableReason::NoWaitConfigured);
             return None;
         }
         let mut guard = self
@@ -878,15 +901,17 @@ impl RuntimeFilterProbe {
         let start = guard.get_or_insert_with(Instant::now);
         let elapsed = start.elapsed();
         if elapsed >= timeout {
-            dep.set_ready();
+            self.release(RuntimeFilterUnavailableReason::Timeout);
             return None;
         }
         if !self.inner.timeout_armed.swap(true, Ordering::AcqRel) {
-            let dep_clone = dep.clone();
+            let entry = Arc::clone(&self.inner.entry);
             let sleep_for = timeout.saturating_sub(elapsed);
             std::thread::spawn(move || {
                 std::thread::sleep(sleep_for);
-                dep_clone.set_ready();
+                if !entry.complete.load(Ordering::Acquire) {
+                    release_entry(&entry, RuntimeFilterUnavailableReason::Timeout);
+                }
             });
         }
         Some(dep)
@@ -928,6 +953,21 @@ impl RuntimeFilterProbe {
     }
 }
 
+fn release_entry(
+    entry: &RuntimeFilterEntry,
+    reason: RuntimeFilterUnavailableReason,
+) -> RuntimeFilterUnavailableReason {
+    let reason = {
+        let mut guard = entry
+            .release_reason
+            .lock()
+            .expect("runtime filter release reason lock");
+        *guard.get_or_insert(reason)
+    };
+    entry.dep.set_ready();
+    reason
+}
+
 fn duration_to_ms(timeout: Option<Duration>) -> i64 {
     timeout.map(|v| v.as_millis() as i64).unwrap_or(-1)
 }
@@ -958,6 +998,8 @@ mod tests {
         RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeEmptyFilter, RuntimeFilterType,
         RuntimeMembershipFilter, RuntimeMinMaxFilter,
     };
+    use crate::runtime::query_context::QueryId;
+    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 
     fn new_probe_with_timeouts() -> RuntimeFilterProbe {
         let hub = RuntimeFilterHub::new(DependencyManager::new());
@@ -1024,6 +1066,36 @@ mod tests {
     }
 
     #[test]
+    fn query_aware_probe_registration_records_planned_lifecycle() {
+        let query_id = QueryId {
+            hi: 30_001,
+            lo: 40_001,
+        };
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+
+        let hub = RuntimeFilterHub::new_for_query(DependencyManager::new(), query_id);
+        hub.register_probe_specs(
+            42,
+            &[RuntimeFilterProbeSpec {
+                filter_id: 7,
+                expr_id: ExprId(0),
+                slot_id: SlotId::new(11),
+                data_type: DataType::Int32,
+            }],
+        );
+
+        let snapshot = registry
+            .snapshot(query_key)
+            .expect("query lifecycle snapshot");
+        let filter = snapshot.filters.get(&7).expect("filter lifecycle");
+        assert!(filter.planned);
+
+        registry.remove_query(query_key);
+    }
+
+    #[test]
     fn snapshot_excludes_filter_until_membership_published() {
         // Invariant (P0a): the probe handle exposes empty -> complete, never partial.
         let handle = RuntimeFilterHandle::new();
@@ -1067,6 +1139,42 @@ mod tests {
         assert!(probe.dependency_or_timeout(false).is_none());
         assert!(dep.is_ready());
         assert!(probe.snapshot().is_empty());
+    }
+
+    #[test]
+    fn dependency_or_timeout_no_wait_records_no_wait_reason() {
+        let hub = registered_hub_with_timeouts(None, None);
+        let probe = hub.register_probe(42);
+
+        assert!(probe.dependency_or_timeout(true).is_none());
+
+        match probe.poll_acquire(true) {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Unavailable(reason)) => {
+                assert_eq!(reason, RuntimeFilterUnavailableReason::NoWaitConfigured);
+            }
+            other => panic!("expected no-wait unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dependency_or_timeout_records_timeout_reason_after_timer_fires() {
+        let hub = registered_hub_with_timeouts(
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_millis(1)),
+        );
+        let probe = hub.register_probe(42);
+        let dep = probe
+            .dependency_or_timeout(true)
+            .expect("dependency should be returned before timeout");
+
+        wait_until_ready(&dep, Duration::from_millis(200));
+
+        match probe.poll_acquire(true) {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Unavailable(reason)) => {
+                assert_eq!(reason, RuntimeFilterUnavailableReason::Timeout);
+            }
+            other => panic!("expected timeout unavailable, got {other:?}"),
+        }
     }
 
     #[test]

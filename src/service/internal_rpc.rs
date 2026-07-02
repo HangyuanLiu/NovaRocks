@@ -377,6 +377,7 @@ mod tests {
     use crate::runtime::descriptor_snapshot_thrift::descriptor_snapshot_from_thrift;
     use crate::runtime::exchange;
     use crate::runtime::query_context::{QueryId, query_context_manager};
+    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     #[cfg(feature = "compat")]
     use crate::service::internal_rpc_client;
     use crate::thrift::descriptors;
@@ -851,6 +852,9 @@ mod tests {
     #[test]
     fn test_handle_transmit_runtime_filter_final_delivery_updates_probe() {
         let query_id = QueryId { hi: 300, lo: 400 };
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
         query_context_manager()
             .ensure_context(
                 query_id,
@@ -859,9 +863,12 @@ mod tests {
                 Duration::from_secs(60),
             )
             .expect("ensure query context");
-        let hub = Arc::new(crate::runtime::runtime_filter_hub::RuntimeFilterHub::new(
-            crate::exec::pipeline::dependency::DependencyManager::new(),
-        ));
+        let hub = Arc::new(
+            crate::runtime::runtime_filter_hub::RuntimeFilterHub::new_for_query(
+                crate::exec::pipeline::dependency::DependencyManager::new(),
+                query_id,
+            ),
+        );
         hub.register_probe_specs(
             88,
             &[RuntimeFilterProbeSpec {
@@ -895,6 +902,12 @@ mod tests {
         let snapshot = probe.snapshot();
         assert_eq!(snapshot.in_filters().len(), 1);
         assert_eq!(snapshot.in_filters()[0].filter_id(), 7);
+        let lifecycle = registry
+            .snapshot(query_key)
+            .expect("query lifecycle snapshot");
+        let filter = lifecycle.filters.get(&7).expect("filter lifecycle");
+        assert!(filter.delivered);
+        registry.remove_query(query_key);
     }
 
     #[test]

@@ -1111,10 +1111,15 @@ fn spawn_exec_fragment(
                 exchange::cancel_fragment(id.hi, id.lo);
             }
         }
-        fe_report::report_fragment_done(finst_id, report_error);
+        let report_decision = mgr.finish_fragment_for_report(query_id);
+        fe_report::report_fragment_done(
+            finst_id,
+            report_error,
+            report_decision.include_runtime_filter_profile,
+        );
         exchange::remove_fragment(finst_id.hi, finst_id.lo);
         mgr.unregister_finst(finst_id);
-        mgr.finish_fragment(query_id);
+        mgr.cleanup_after_fragment_report(query_id, report_decision);
     });
 }
 

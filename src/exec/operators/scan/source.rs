@@ -41,6 +41,9 @@ use crate::exec::pipeline::scan::morsel::DynamicMorselQueue;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
+use crate::runtime::runtime_filter_observability::{
+    QueryKey, RfLifecycleHandle, RuntimeFilterLifecycleRegistry,
+};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::scan_executor::scan_executor;
 use std::collections::{HashMap, HashSet};
@@ -175,6 +178,7 @@ impl OperatorFactory for ScanSourceFactory {
             local_rf_deps: self.local_rf_deps(),
             runtime_filter_exprs: self.runtime_filter_exprs.clone(),
             runtime_filters_expected: self.runtime_filters_expected,
+            runtime_filter_lifecycle_handles: HashMap::new(),
             arena: Arc::clone(&self.arena),
             profiles: None,
             async_state: ScanAsyncState::new(operator_buffer_chunks().max(1), label),
@@ -205,6 +209,7 @@ struct ScanSourceOperator {
     local_rf_deps: Vec<DependencyHandle>,
     runtime_filter_exprs: HashMap<i32, ExprId>,
     runtime_filters_expected: usize,
+    runtime_filter_lifecycle_handles: HashMap<i32, RfLifecycleHandle>,
     arena: Arc<ExprArena>,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     async_state: Arc<ScanAsyncState>,
@@ -326,7 +331,7 @@ impl ScanSourceOperator {
         }
         let dispatch = self.dispatch.as_ref().expect("scan dispatch");
         for _ in 0..max_io_tasks {
-            let runner = ScanAsyncRunner::new(
+            let mut runner = ScanAsyncRunner::new(
                 self.name.clone(),
                 self.scan.clone(),
                 Arc::clone(dispatch),
@@ -337,9 +342,37 @@ impl ScanSourceOperator {
                 self.profiles.clone(),
                 self.driver_id,
             );
+            runner.set_runtime_filter_lifecycle_handles(
+                self.runtime_filter_lifecycle_handles.clone(),
+            );
             guard.push(runner);
         }
         Ok(())
+    }
+
+    fn bind_runtime_filter_lifecycle(&mut self, state: &RuntimeState) {
+        let Some(query_id) = state.query_id() else {
+            self.runtime_filter_lifecycle_handles.clear();
+            self.propagate_runtime_filter_lifecycle_handles();
+            return;
+        };
+        let recorder = RuntimeFilterLifecycleRegistry::global()
+            .recorder(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
+        self.runtime_filter_lifecycle_handles = self
+            .runtime_filter_exprs
+            .keys()
+            .map(|filter_id| (*filter_id, recorder.filter(*filter_id)))
+            .collect();
+        self.propagate_runtime_filter_lifecycle_handles();
+    }
+
+    fn propagate_runtime_filter_lifecycle_handles(&mut self) {
+        let mut runners = self.async_runners.lock().expect("scan runner lock");
+        for runner in runners.iter_mut() {
+            runner.set_runtime_filter_lifecycle_handles(
+                self.runtime_filter_lifecycle_handles.clone(),
+            );
+        }
     }
 
     fn maybe_start_async_scan(&self) {
@@ -586,6 +619,7 @@ impl Operator for ScanSourceOperator {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+        self.bind_runtime_filter_lifecycle(state);
         self.register_incremental_dispatch(state)
     }
 

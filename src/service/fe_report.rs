@@ -32,6 +32,7 @@ use crate::runtime::load_tracking;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
+use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 use crate::runtime::sink_commit;
 use crate::service::exec_state_reporter::{self, ExecStateReportTask};
 use crate::service::exec_status_report::{self, ExecStatusReportInput};
@@ -184,7 +185,11 @@ pub(crate) fn mark_fe_query_gone(finst_id: UniqueId) {
     }
 }
 
-pub(crate) fn report_fragment_done(finst_id: UniqueId, error: Option<String>) {
+pub(crate) fn report_fragment_done(
+    finst_id: UniqueId,
+    error: Option<String>,
+    include_runtime_filters: bool,
+) {
     let instance = {
         let mut guard = registry().lock().expect("report registry lock");
         guard.remove(&finst_id)
@@ -215,10 +220,12 @@ pub(crate) fn report_fragment_done(finst_id: UniqueId, error: Option<String>) {
         None => status::TStatus::new(status_code::TStatusCode::OK, None),
     };
     let profile = build_profile_tree(
+        instance.query_id,
         instance.enable_profile,
         instance.profiler.as_ref(),
         instance.mem_tracker.as_ref(),
         instance.query_mem_tracker.as_ref(),
+        include_runtime_filters,
     );
     let load_datacache_metrics = build_load_datacache_metrics(profile.as_ref());
     let params = exec_status_report::build_report_params(ExecStatusReportInput {
@@ -277,10 +284,12 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
     }
     let status = status::TStatus::new(status_code::TStatusCode::OK, None);
     let profile = build_profile_tree(
+        instance.query_id,
         instance.enable_profile,
         instance.profiler.as_ref(),
         instance.mem_tracker.as_ref(),
         instance.query_mem_tracker.as_ref(),
+        false,
     );
     let load_datacache_metrics = build_load_datacache_metrics(profile.as_ref());
     let params = exec_status_report::build_report_params(ExecStatusReportInput {
@@ -475,16 +484,22 @@ fn build_load_datacache_metrics(
 }
 
 fn build_profile_tree(
+    query_id: QueryId,
     enable_profile: bool,
     profiler: Option<&Profiler>,
     mem_tracker: Option<&Arc<MemTracker>>,
     query_mem_tracker: Option<&Arc<MemTracker>>,
+    include_runtime_filters: bool,
 ) -> Option<runtime_profile::TRuntimeProfileTree> {
     if !enable_profile {
         return None;
     }
     let profiler = profiler?;
     let merged = merge_pipeline_profiles_for_fe(profiler);
+    if include_runtime_filters {
+        RuntimeFilterLifecycleRegistry::global()
+            .export_to_profile(QueryKey::from_hi_lo(query_id.hi, query_id.lo), &merged);
+    }
     if let Some(tracker) = mem_tracker {
         merged.counter_set(
             "InstancePeakMemoryUsage",
@@ -568,6 +583,9 @@ fn normalize_profile_tree_for_fe(tree: &mut runtime_profile::TRuntimeProfileTree
         let name = node.name.as_str();
         let mut skip_warn = stack.last().map(|(_, _, skip)| *skip).unwrap_or(false);
         if name.starts_with("MemTracker") {
+            skip_warn = true;
+        }
+        if name == "RuntimeFilters" {
             skip_warn = true;
         }
         if name.starts_with("Pipeline (id=") || name.starts_with("PipelineDriver (id=") {
@@ -814,7 +832,9 @@ mod tests {
     };
     use crate::common::types::UniqueId;
     use crate::runtime::load_tracking;
+    use crate::runtime::profile::Profiler;
     use crate::runtime::query_context::QueryId;
+    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::service::exec_state_reporter;
     use crate::thrift::frontend_service;
     use crate::thrift::{status, status_code, types};
@@ -849,7 +869,7 @@ mod tests {
         test_insert_report_instance(finst_id, query_id);
 
         mark_fe_query_gone(finst_id);
-        report_fragment_done(finst_id, None);
+        report_fragment_done(finst_id, None, false);
 
         assert_eq!(exec_state_reporter::test_priority_queue_len(), 0);
         assert!(super::list_report_instances().is_empty());
@@ -926,7 +946,7 @@ mod tests {
         test_insert_report_instance(finst_id, query_id);
         load_tracking::append_logs(query_id, ["rejected row".to_string()]);
 
-        report_fragment_done(finst_id, None);
+        report_fragment_done(finst_id, None, false);
 
         let params = captured
             .lock()
@@ -954,7 +974,7 @@ mod tests {
         test_reset_report_registry();
         test_insert_standalone_report_instance(finst_id, query_id, report_addr.clone(), 3);
 
-        report_fragment_done(finst_id, None);
+        report_fragment_done(finst_id, None, false);
 
         let (coord, params) = captured
             .lock()
@@ -1017,7 +1037,7 @@ mod tests {
         test_insert_standalone_report_instance(finst_id, query_id, report_addr.clone(), 5);
         mark_fe_query_gone(finst_id);
 
-        report_fragment_done(finst_id, None);
+        report_fragment_done(finst_id, None, false);
 
         let (coord, params) = captured
             .lock()
@@ -1028,5 +1048,44 @@ mod tests {
         assert_eq!(params.done, Some(true));
         assert_eq!(params.backend_num, Some(5));
         test_reset_report_registry();
+    }
+
+    #[test]
+    fn build_profile_tree_exports_runtime_filter_lifecycle() {
+        let query_id = QueryId { hi: 91, lo: 92 };
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        registry.recorder(query_key).built(17, 5, 256);
+        registry.recorder(query_key).applied(17, 100, 40, 1);
+
+        let profiler = Profiler::new("Query");
+        let tree = super::build_profile_tree(query_id, true, Some(&profiler), None, None, true)
+            .expect("profile tree");
+
+        let rf_node = tree
+            .nodes
+            .iter()
+            .find(|node| node.name == "RuntimeFilters")
+            .expect("runtime filters node");
+        assert_eq!(rf_node.num_children, 1);
+        let filter_node = tree
+            .nodes
+            .iter()
+            .find(|node| node.name == "Filter17")
+            .expect("filter node");
+        let counter_value = |name: &str| {
+            filter_node
+                .counters
+                .iter()
+                .find(|counter| counter.name == name)
+                .map(|counter| counter.value)
+        };
+        assert_eq!(counter_value("BuiltRows"), Some(5));
+        assert_eq!(counter_value("BuiltBytes"), Some(256));
+        assert_eq!(counter_value("AppliedInputRows"), Some(100));
+        assert_eq!(counter_value("AppliedOutputRows"), Some(40));
+
+        registry.remove_query(query_key);
     }
 }
