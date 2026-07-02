@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit PIR-2 plan kind split boundaries."""
+"""Audit PIR plan-kind split boundaries."""
 
 from __future__ import annotations
 
@@ -28,6 +28,9 @@ def main() -> int:
     plan_rs = read("src/sql/planner/plan.rs")
     planner_mod = read("src/sql/planner/mod.rs")
     distributed_node = read("src/sql/planner/distributed_node.rs")
+    planner_sources = "\n".join(
+        p.read_text(encoding="utf-8") for p in (ROOT / "src/sql/planner").rglob("*.rs")
+    )
 
     assert_absent(r"enum\s+PlanNodeKind\b", plan_rs, "mixed PlanNodeKind enum")
     assert_absent(r"kind:\s*PlanNodeKind\b", plan_rs, "LogicalPlanNode kind type")
@@ -43,12 +46,19 @@ def main() -> int:
     assert_absent(r"optimizer::operator::Operator\b", plan_rs, "optimizer operator in planner physical type")
     assert_absent(r"PlanNodeKind", planner_mod, "planner public re-export")
 
-    if "enum DistributedPlanKind" not in distributed_node:
-        fail("DistributedPlanKind is missing from distributed_node.rs")
-    if "kind: DistributedPlanKind" not in distributed_node:
-        fail("DistributedPlanNode.kind does not use DistributedPlanKind")
+    assert_absent(r"enum\s+DistributedPlanKind\b", planner_sources, "distributed kind enum")
+    assert_absent(r"kind:\s*DistributedPlanKind\b", planner_sources, "distributed node kind type")
 
-    print("PIR-2 plan kind split audit passed")
+    if "pub(crate) enum DistributedPayload" not in distributed_node:
+        fail("DistributedPayload is missing from distributed_node.rs")
+    if "Physical(PhysicalPlanKind)" not in distributed_node:
+        fail("DistributedPayload must wrap PhysicalPlanKind payloads")
+    if "Exchange(ExchangeReceiver)" not in distributed_node:
+        fail("DistributedPayload must preserve explicit Exchange payloads")
+    if "payload: DistributedPayload" not in distributed_node:
+        fail("DistributedNode.payload does not use DistributedPayload")
+
+    print("PIR plan kind split audit passed")
     return 0
 
 
