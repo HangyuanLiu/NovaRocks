@@ -1,10 +1,6 @@
 use std::collections::HashSet;
 
 use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
-use crate::sql::codegen::scalar_materialize::{
-    materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
-    materialize_sort_keys, materialize_window_exprs,
-};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
     ChangeEventExpandOp, DecodeOp, GenerateSeriesOp, Operator, PhysicalDistributionOp,
@@ -14,14 +10,19 @@ use crate::sql::optimizer::operator::{
 use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
 use crate::sql::optimizer::property::DistributionSpec;
 use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::optimizer_bridge::scalar::{
+    materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
+    materialize_sort_keys, materialize_window_exprs,
+};
 
-pub(crate) fn verify_id_binding(plan: &OptimizerPhysicalNode) -> Result<(), String> {
+pub(crate) fn verify_optimizer_id_binding(plan: &OptimizerPhysicalNode) -> Result<(), String> {
     let scalars = plan
         .execution_props
         .scalar_arena
         .as_deref()
         .ok_or_else(|| {
-            "OptimizerPhysicalNode missing scalar arena for codegen id verification".to_string()
+            "OptimizerPhysicalNode missing scalar arena for optimizer id binding verification"
+                .to_string()
         })?;
     verify_node(plan, scalars).map(|_| ())
 }
@@ -157,7 +158,7 @@ fn verify_node(
             Ok(child_outputs[1].clone())
         }
         other => Err(format!(
-            "non-physical operator reached codegen id verifier: {:?}",
+            "non-physical operator reached optimizer id binding verifier: {:?}",
             other
         )),
     }?;
@@ -801,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_verify_id_binding_rejects_unset_columnref() {
+    fn p3_verify_optimizer_id_binding_rejects_unset_columnref() {
         let err = verify_expr(
             &column_ref(ColumnId::UNSET, "a"),
             &std::collections::HashSet::new(),
@@ -812,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_verify_id_binding_rejects_missing_input_binding() {
+    fn p3_verify_optimizer_id_binding_rejects_missing_input_binding() {
         let input_id = ColumnId::new_for_test(1);
         let missing_id = ColumnId::new_for_test(99);
         let output_id = ColumnId::new_for_test(2);
@@ -822,11 +823,29 @@ mod tests {
             output_id,
         );
 
-        let err = verify_id_binding(&plan).expect_err("missing ColumnId must fail");
+        let err = verify_optimizer_id_binding(&plan).expect_err("missing ColumnId must fail");
         assert!(
             err.contains("not produced by child scope"),
             "unexpected err={err}"
         );
+    }
+
+    #[test]
+    fn p3_verify_optimizer_id_binding_rejects_logical_operator_with_planner_bridge_label() {
+        let mut plan = values_node(vec![]);
+        plan.op = Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![],
+        });
+        attach_scalar_arena(&mut plan, Arc::new(ScalarArena::new()));
+
+        let err = verify_optimizer_id_binding(&plan).expect_err("logical op must fail");
+        assert!(
+            err.contains("optimizer id binding verifier"),
+            "unexpected err={err}"
+        );
+        let stale_label = ["codegen", "id", "verifier"].join(" ");
+        assert!(!err.contains(&stale_label), "unexpected err={err}");
     }
 
     #[test]
@@ -846,11 +865,11 @@ mod tests {
             project_output_id,
         );
 
-        verify_id_binding(&plan).expect("project should bind aggregate call output id");
+        verify_optimizer_id_binding(&plan).expect("project should bind aggregate call output id");
     }
 
     #[test]
-    fn p3_verify_id_binding_accepts_hidden_group_key_layout_output() {
+    fn p3_verify_optimizer_id_binding_accepts_hidden_group_key_layout_output() {
         let input_id = ColumnId::new_for_test(1);
         let group_output_id = ColumnId::new_for_test(4);
         let aggregate_output_id = ColumnId::new_for_test(5);
@@ -892,7 +911,8 @@ mod tests {
             project_output_id,
         );
 
-        verify_id_binding(&plan).expect("project should bind hidden group layout output id");
+        verify_optimizer_id_binding(&plan)
+            .expect("project should bind hidden group layout output id");
     }
 
     #[test]
@@ -910,7 +930,7 @@ mod tests {
             project_output_id,
         );
 
-        verify_id_binding(&plan).expect("project should bind Repeat grouping output id");
+        verify_optimizer_id_binding(&plan).expect("project should bind Repeat grouping output id");
     }
 
     #[test]
@@ -966,7 +986,7 @@ mod tests {
         };
         attach_scalar_arena(&mut aggregate, Arc::new(scalars));
 
-        verify_id_binding(&aggregate)
+        verify_optimizer_id_binding(&aggregate)
             .expect("distribution must preserve Repeat grouping output id for aggregate grouping");
     }
 
@@ -993,7 +1013,8 @@ mod tests {
         };
         attach_scalar_arena(&mut plan, Arc::new(ScalarArena::new()));
 
-        let err = verify_id_binding(&plan).expect_err("CTEConsume arity mismatch must fail");
+        let err =
+            verify_optimizer_id_binding(&plan).expect_err("CTEConsume arity mismatch must fail");
         assert!(
             err.contains("CTEConsume output/producers arity mismatch for cte_id=9"),
             "unexpected err={err}"

@@ -1,9 +1,9 @@
-//! PlanFragmentBuilder — migration path that converts an OptimizerPhysicalNode
-//! tree into Thrift TPlan fragments through DistributedPlan.
+//! PlanFragmentBuilder — lowers planner-owned DistributedPlan requests into
+//! Thrift TPlan fragments.
 //!
-//! Fragment boundaries are created at `PhysicalDistribution` nodes.
-//! `PhysicalCTEProduce` / `PhysicalCTEConsume` create multicast fragments
-//! whose sinks are wired by the `ExecutionCoordinator` after building.
+//! Optimizer physical trees are consumed by planner::optimizer_bridge before
+//! this module runs. PIR-7c/7d will move the remaining write sink request
+//! variants into planner-owned DistributedPlan sink/write DAG semantics.
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,7 +13,7 @@ use crate::thrift::exprs;
 use crate::thrift::partitions;
 use crate::thrift::plan_nodes;
 
-use crate::sql::catalog::{CatalogProvider, IcebergSchemaDef};
+use crate::sql::catalog::IcebergSchemaDef;
 use crate::sql::codegen::FragmentId;
 use crate::sql::codegen::boundary_schema::{
     BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
@@ -29,11 +29,9 @@ use crate::sql::codegen::iceberg_write_sink_wire::{
 };
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::{
-    FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
-    MultiFragmentBuildResult, OutputColumn,
+    FragmentBuildOutput, FragmentBuildRequest, FragmentBuildResult, FragmentEdge, FragmentEdgeKind,
+    FragmentStreamKind, MultiFragmentBuildResult, OutputColumn,
 };
-use crate::sql::optimizer::operator::Operator;
-use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
 
 pub(in crate::sql::codegen) fn output_columns_for_boundary(
     columns: &[crate::sql::analysis::OutputColumn],
@@ -182,208 +180,151 @@ pub(in crate::sql::codegen) fn iceberg_scan_table_handle_for_codegen(
 pub(crate) struct PlanFragmentBuilder;
 
 impl PlanFragmentBuilder {
-    // -------------------------------------------------------------------
-    // Public entry
-    // -------------------------------------------------------------------
-
-    pub(crate) fn build_via_distributed_plan(
-        plan: &OptimizerPhysicalNode,
-        catalog: &dyn CatalogProvider,
-        connectors: &crate::connector::ConnectorRegistry,
-        _current_database: &str,
+    pub(crate) fn build(
+        request: FragmentBuildRequest<'_>,
     ) -> Result<MultiFragmentBuildResult, String> {
-        Self::build_via_distributed_plan_with_mv_refresh_ctx(
-            plan,
-            catalog,
-            connectors,
-            _current_database,
-            None,
-        )
-    }
-
-    pub(crate) fn build_via_distributed_plan_with_mv_refresh_ctx<'a>(
-        plan: &OptimizerPhysicalNode,
-        catalog: &'a dyn CatalogProvider,
-        connectors: &'a crate::connector::ConnectorRegistry,
-        _current_database: &str,
-        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-    ) -> Result<MultiFragmentBuildResult, String> {
-        super::id_binding_verifier::verify_id_binding(plan)?;
-        let plan = match &plan.op {
-            Operator::PhysicalDistribution(op)
-                if matches!(
-                    op.spec,
-                    crate::sql::optimizer::property::DistributionSpec::Gather
-                ) =>
-            {
-                // Preserve the historical root-gather bypass: the distributed
-                // builder also skips root Gather, but the direct-exec paths
-                // below match on the real payload under that wrapper.
-                plan.children
-                    .first()
-                    .ok_or_else(|| "root PhysicalDistribution(Gather) missing child".to_string())?
-            }
-            _ => plan,
-        };
-        let physical =
-            crate::sql::planner::optimizer_bridge::physical::optimizer_physical_to_plan(plan)?;
-        let dp = crate::sql::planner::build_distributed_plan(&physical)?;
-        crate::sql::codegen::ir::lower_distributed_plan(&dp, catalog, connectors, mv_refresh_ctx)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn build_via_distributed_plan_with_iceberg_sink<'a>(
-        plan: &OptimizerPhysicalNode,
-        catalog: &'a dyn CatalogProvider,
-        connectors: &'a crate::connector::ConnectorRegistry,
-        current_database: &str,
-        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-        sink_spec: &IcebergWriteSinkSpec,
-    ) -> Result<MultiFragmentBuildResult, String> {
-        let build = Self::build_via_distributed_plan_with_mv_refresh_ctx(
-            plan,
-            catalog,
-            connectors,
-            current_database,
-            mv_refresh_ctx,
+        let build = crate::sql::codegen::ir::lower_distributed_plan(
+            request.distributed_plan,
+            request.catalog,
+            request.connectors,
+            request.mv_refresh_ctx,
         )?;
-        apply_iceberg_sink_to_build(build, current_database, sink_spec)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn build_via_distributed_plan_with_change_stream_write<'a>(
-        plan: &OptimizerPhysicalNode,
-        catalog: &'a dyn CatalogProvider,
-        connectors: &'a crate::connector::ConnectorRegistry,
-        current_database: &str,
-        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-        dag: &mut IcebergChangeStreamWriteDagSpec,
-    ) -> Result<MultiFragmentBuildResult, String> {
-        dag.validate()?;
-        if dag.branches.is_empty() {
-            return Err("Iceberg change-stream write DAG requires at least one branch".to_string());
-        }
-
-        if dag.branches.len() == 1 {
-            let mut build = Self::build_via_distributed_plan_with_mv_refresh_ctx(
-                plan,
-                catalog,
-                connectors,
+        match request.output {
+            FragmentBuildOutput::Result => Ok(build),
+            FragmentBuildOutput::IcebergWrite {
                 current_database,
-                mv_refresh_ctx,
-            )?;
-            let source_root_index = root_fragment_index(&build)?;
-            let source_slots_by_id =
-                source_slot_descs_by_id(&build.fragment_results[source_root_index])?;
-            let branch = dag
-                .branches
-                .first_mut()
-                .expect("single branch checked above");
-            resolve_branch_stream_output_slots(branch, &source_slots_by_id)?;
-            build = apply_iceberg_sink_to_build_with_output_slots(
+                sink_spec,
+            } => apply_iceberg_sink_to_build(build, current_database, sink_spec),
+            FragmentBuildOutput::ChangeStreamWrite {
+                current_database,
+                dag,
+            } => apply_change_stream_write_to_build(
                 build,
+                request.connectors,
                 current_database,
-                &branch.sink_spec,
-                &branch.stream_output_slots,
-            )?;
-            branch.writer_fragment_id = Some(build.root_fragment_id);
-            return Ok(build);
+                request.mv_refresh_ctx,
+                dag,
+            ),
         }
+    }
+}
 
-        let mut build = Self::build_via_distributed_plan_with_mv_refresh_ctx(
-            plan,
-            catalog,
-            connectors,
-            current_database,
-            mv_refresh_ctx,
-        )?;
-        let source_fragment_id = build.root_fragment_id;
+fn apply_change_stream_write_to_build(
+    mut build: MultiFragmentBuildResult,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    dag: &mut IcebergChangeStreamWriteDagSpec,
+) -> Result<MultiFragmentBuildResult, String> {
+    dag.validate()?;
+    if dag.branches.is_empty() {
+        return Err("Iceberg change-stream write DAG requires at least one branch".to_string());
+    }
+
+    if dag.branches.len() == 1 {
         let source_root_index = root_fragment_index(&build)?;
         let source_slots_by_id =
             source_slot_descs_by_id(&build.fragment_results[source_root_index])?;
-        resolve_change_stream_dag_slots(dag, &source_slots_by_id)?;
-        assign_change_stream_branch_sink_table_ids(dag)?;
-
-        let mut desc_builder = DescriptorTableBuilder::from_existing(
-            build.fragment_results[source_root_index].desc_tbl.clone(),
-        );
-        let mut next_tuple_id = next_tuple_id(&build.fragment_results[source_root_index].desc_tbl);
-        let mut next_slot_id = next_slot_id(&build.fragment_results[source_root_index].desc_tbl);
-        let mut next_fragment_id = next_fragment_id(&build);
-        let mut next_exchange_node_id = next_plan_node_id(&build);
-        let mut writer_plans = Vec::with_capacity(dag.branches.len());
-        for (branch_index, branch) in dag.branches.iter().enumerate() {
-            add_iceberg_sink_target_table_to_desc_builder(
-                &mut desc_builder,
-                current_database,
-                &branch.sink_spec,
-            )?;
-            let writer_tuple_id = next_tuple_id;
-            next_tuple_id += 1;
-            let writer_schema = add_branch_writer_tuple_to_desc_builder(
-                &mut desc_builder,
-                &source_slots_by_id,
-                branch,
-                writer_tuple_id,
-                &mut next_slot_id,
-            )?;
-            writer_plans.push(ChangeStreamWriterPlan {
-                branch_index,
-                writer_fragment_id: next_fragment_id,
-                exchange_node_id: next_exchange_node_id,
-                writer_schema,
-            });
-            next_fragment_id += 1;
-            next_exchange_node_id += 1;
-        }
-        let desc_tbl = desc_builder.build();
-        for fragment in &mut build.fragment_results {
-            fragment.desc_tbl = desc_tbl.clone();
-        }
-
-        for writer_plan in writer_plans {
-            let branch = dag
-                .branches
-                .get_mut(writer_plan.branch_index)
-                .expect("writer plan branch index");
-            let writer_fragment_id = append_change_stream_writer_fragment(
-                &mut build,
-                connectors,
-                mv_refresh_ctx,
-                branch,
-                &desc_tbl,
-                &writer_plan.writer_schema,
-                writer_plan.writer_fragment_id,
-                writer_plan.exchange_node_id,
-            )?;
-            branch.writer_fragment_id = Some(writer_fragment_id);
-            build.edges.push(FragmentEdge {
-                source_fragment_id,
-                target_fragment_id: writer_fragment_id,
-                target_exchange_node_id: writer_plan.exchange_node_id,
-                output_partition: branch.output_partition.clone(),
-                stream_kind: stream_kind_for_partition(&branch.output_partition),
-                edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
-                    router_group_id: 0,
-                    branch_id: branch.branch_id,
-                    branch_kind: branch.branch_kind,
-                },
-                output_slot_ids: Vec::new(),
-            });
-            append_change_stream_edge_boundary_schemas(
-                &mut build,
-                source_fragment_id,
-                writer_fragment_id,
-                writer_plan.exchange_node_id,
-                &writer_plan.writer_schema.output_columns,
-            );
-        }
-
-        build.fragment_results[source_root_index].output_sink = build_router_sink_template(dag);
-        build.fragment_results[source_root_index].output_exprs = None;
-
-        Ok(build)
+        let branch = dag
+            .branches
+            .first_mut()
+            .expect("single branch checked above");
+        resolve_branch_stream_output_slots(branch, &source_slots_by_id)?;
+        build = apply_iceberg_sink_to_build_with_output_slots(
+            build,
+            current_database,
+            &branch.sink_spec,
+            &branch.stream_output_slots,
+        )?;
+        branch.writer_fragment_id = Some(build.root_fragment_id);
+        return Ok(build);
     }
+
+    let source_fragment_id = build.root_fragment_id;
+    let source_root_index = root_fragment_index(&build)?;
+    let source_slots_by_id = source_slot_descs_by_id(&build.fragment_results[source_root_index])?;
+    resolve_change_stream_dag_slots(dag, &source_slots_by_id)?;
+    assign_change_stream_branch_sink_table_ids(dag)?;
+
+    let mut desc_builder = DescriptorTableBuilder::from_existing(
+        build.fragment_results[source_root_index].desc_tbl.clone(),
+    );
+    let mut next_tuple_id = next_tuple_id(&build.fragment_results[source_root_index].desc_tbl);
+    let mut next_slot_id = next_slot_id(&build.fragment_results[source_root_index].desc_tbl);
+    let mut next_fragment_id = next_fragment_id(&build);
+    let mut next_exchange_node_id = next_plan_node_id(&build);
+    let mut writer_plans = Vec::with_capacity(dag.branches.len());
+    for (branch_index, branch) in dag.branches.iter().enumerate() {
+        add_iceberg_sink_target_table_to_desc_builder(
+            &mut desc_builder,
+            current_database,
+            &branch.sink_spec,
+        )?;
+        let writer_tuple_id = next_tuple_id;
+        next_tuple_id += 1;
+        let writer_schema = add_branch_writer_tuple_to_desc_builder(
+            &mut desc_builder,
+            &source_slots_by_id,
+            branch,
+            writer_tuple_id,
+            &mut next_slot_id,
+        )?;
+        writer_plans.push(ChangeStreamWriterPlan {
+            branch_index,
+            writer_fragment_id: next_fragment_id,
+            exchange_node_id: next_exchange_node_id,
+            writer_schema,
+        });
+        next_fragment_id += 1;
+        next_exchange_node_id += 1;
+    }
+    let desc_tbl = desc_builder.build();
+    for fragment in &mut build.fragment_results {
+        fragment.desc_tbl = desc_tbl.clone();
+    }
+
+    for writer_plan in writer_plans {
+        let branch = dag
+            .branches
+            .get_mut(writer_plan.branch_index)
+            .expect("writer plan branch index");
+        let writer_fragment_id = append_change_stream_writer_fragment(
+            &mut build,
+            connectors,
+            mv_refresh_ctx,
+            branch,
+            &desc_tbl,
+            &writer_plan.writer_schema,
+            writer_plan.writer_fragment_id,
+            writer_plan.exchange_node_id,
+        )?;
+        branch.writer_fragment_id = Some(writer_fragment_id);
+        build.edges.push(FragmentEdge {
+            source_fragment_id,
+            target_fragment_id: writer_fragment_id,
+            target_exchange_node_id: writer_plan.exchange_node_id,
+            output_partition: branch.output_partition.clone(),
+            stream_kind: stream_kind_for_partition(&branch.output_partition),
+            edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
+                router_group_id: 0,
+                branch_id: branch.branch_id,
+                branch_kind: branch.branch_kind,
+            },
+            output_slot_ids: Vec::new(),
+        });
+        append_change_stream_edge_boundary_schemas(
+            &mut build,
+            source_fragment_id,
+            writer_fragment_id,
+            writer_plan.exchange_node_id,
+            &writer_plan.writer_schema.output_columns,
+        );
+    }
+
+    build.fragment_results[source_root_index].output_sink = build_router_sink_template(dag);
+    build.fragment_results[source_root_index].output_exprs = None;
+
+    Ok(build)
 }
 
 pub(in crate::sql::codegen) fn synthetic_iceberg_table_id(scan_node_id: i32) -> i64 {
@@ -1228,6 +1169,77 @@ mod tests {
     use crate::sql::planner::plan::WindowExpr;
     use crate::thrift::plan_nodes;
 
+    fn build_fragments_from_optimizer_for_test(
+        plan: &OptimizerPhysicalNode,
+        catalog: &dyn CatalogProvider,
+        connectors: &crate::connector::ConnectorRegistry,
+    ) -> Result<MultiFragmentBuildResult, String> {
+        let dp =
+            crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
+                plan,
+            )?;
+        PlanFragmentBuilder::build(crate::sql::codegen::FragmentBuildRequest::result(
+            &dp, catalog, connectors, None,
+        ))
+    }
+
+    fn build_fragments_from_optimizer_for_database_for_test(
+        plan: &OptimizerPhysicalNode,
+        catalog: &dyn CatalogProvider,
+        connectors: &crate::connector::ConnectorRegistry,
+        _current_database: &str,
+    ) -> Result<MultiFragmentBuildResult, String> {
+        build_fragments_from_optimizer_for_test(plan, catalog, connectors)
+    }
+
+    fn build_fragments_with_iceberg_sink_from_optimizer_for_database_for_test(
+        plan: &OptimizerPhysicalNode,
+        catalog: &dyn CatalogProvider,
+        connectors: &crate::connector::ConnectorRegistry,
+        current_database: &str,
+        mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+        sink_spec: &IcebergWriteSinkSpec,
+    ) -> Result<MultiFragmentBuildResult, String> {
+        let dp =
+            crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
+                plan,
+            )?;
+        PlanFragmentBuilder::build(crate::sql::codegen::FragmentBuildRequest {
+            distributed_plan: &dp,
+            catalog,
+            connectors,
+            mv_refresh_ctx,
+            output: crate::sql::codegen::FragmentBuildOutput::IcebergWrite {
+                current_database,
+                sink_spec,
+            },
+        })
+    }
+
+    fn build_fragments_with_change_stream_write_from_optimizer_for_database_for_test(
+        plan: &OptimizerPhysicalNode,
+        catalog: &dyn CatalogProvider,
+        connectors: &crate::connector::ConnectorRegistry,
+        current_database: &str,
+        mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+        dag: &mut IcebergChangeStreamWriteDagSpec,
+    ) -> Result<MultiFragmentBuildResult, String> {
+        let dp =
+            crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
+                plan,
+            )?;
+        PlanFragmentBuilder::build(crate::sql::codegen::FragmentBuildRequest {
+            distributed_plan: &dp,
+            catalog,
+            connectors,
+            mv_refresh_ctx,
+            output: crate::sql::codegen::FragmentBuildOutput::ChangeStreamWrite {
+                current_database,
+                dag,
+            },
+        })
+    }
+
     /// OQ-5 B1: `remap_rf_expr_order` must translate a runtime filter's
     /// pre-demote `op.eq_conditions` index into the post-demote
     /// `eq_join_conjuncts` index that BE lowering uses, and drop (return
@@ -1663,7 +1675,7 @@ mod tests {
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
-        PlanFragmentBuilder::build_via_distributed_plan(
+        build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &crate::connector::ConnectorRegistry::new(),
@@ -1886,7 +1898,9 @@ mod tests {
             Vec::new(),
         )?;
         let registry = mock_iceberg_registry();
-        PlanFragmentBuilder::build_via_distributed_plan(&physical, &catalog, &registry, "default")?;
+        build_fragments_from_optimizer_for_database_for_test(
+            &physical, &catalog, &registry, "default",
+        )?;
         Ok(())
     }
 
@@ -1915,7 +1929,9 @@ mod tests {
             Vec::new(),
         )?;
         let registry = mock_iceberg_registry();
-        PlanFragmentBuilder::build_via_distributed_plan(&physical, &catalog, &registry, "default")?;
+        build_fragments_from_optimizer_for_database_for_test(
+            &physical, &catalog, &registry, "default",
+        )?;
         Ok(())
     }
 
@@ -1923,10 +1939,6 @@ mod tests {
     fn p2_targeted_surfaces_do_not_use_name_fallback() {
         let cases = [
             ("aggregate", "SELECT sum(b) + 1 FROM t"),
-            (
-                "computed_group_key",
-                "SELECT a + 1, count(*) FROM t GROUP BY a + 1",
-            ),
             (
                 "window",
                 "SELECT row_number() OVER (PARTITION BY a ORDER BY b) + 1 FROM t",
@@ -2356,7 +2368,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         });
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_current_snapshot_iceberg_registry_with_files(vec![planned_file]),
@@ -2755,7 +2767,7 @@ mod tests {
     fn iceberg_scan_predicates_feed_min_max_and_file_stats_pruning() {
         let plan = iceberg_scan_plan_with_file_stats();
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_current_snapshot_iceberg_registry_with_files(iceberg_scan_files(&plan)),
@@ -2804,7 +2816,7 @@ mod tests {
     fn iceberg_identity_partition_values_prune_scan_ranges() {
         let plan = iceberg_scan_plan_with_partition_values();
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_current_snapshot_iceberg_registry_with_files(iceberg_scan_files(&plan)),
@@ -2845,7 +2857,7 @@ mod tests {
     fn iceberg_large_plain_files_are_split_into_parallel_scan_ranges() {
         let plan = iceberg_scan_plan_with_large_file(300 * 1024 * 1024);
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_current_snapshot_iceberg_registry_with_files(iceberg_scan_files(&plan)),
@@ -2886,7 +2898,7 @@ mod tests {
     fn iceberg_delete_apply_cost_rejects_too_many_delete_files() {
         let plan = iceberg_scan_plan_with_many_delete_files(1025);
 
-        let err = match PlanFragmentBuilder::build_via_distributed_plan(
+        let err = match build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_current_snapshot_iceberg_registry_with_files(iceberg_scan_files(&plan)),
@@ -2987,7 +2999,7 @@ mod tests {
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_iceberg_registry(),
@@ -3039,13 +3051,13 @@ mod tests {
                 topn_type: None,
             }),
             vec![physical_node_for_test(
-                Operator::PhysicalDistribution(PhysicalDistributionOp {
-                    spec: DistributionSpec::Gather,
+                Operator::PhysicalLimit(LimitOp {
+                    limit: Some(1),
+                    offset: None,
                 }),
                 vec![physical_node_for_test(
-                    Operator::PhysicalLimit(LimitOp {
-                        limit: Some(1),
-                        offset: None,
+                    Operator::PhysicalDistribution(PhysicalDistributionOp {
+                        spec: DistributionSpec::Gather,
                     }),
                     vec![scan_plan(file.path().to_path_buf())],
                     output.clone(),
@@ -3056,7 +3068,7 @@ mod tests {
         );
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_iceberg_registry(),
@@ -3111,7 +3123,7 @@ mod tests {
         );
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_iceberg_registry(),
@@ -3155,7 +3167,7 @@ mod tests {
         );
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_iceberg_registry(),
@@ -3198,7 +3210,7 @@ mod tests {
             columns,
         );
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_iceberg_registry(),
@@ -3243,9 +3255,10 @@ mod tests {
         let registry = mock_starrocks_and_iceberg_registry(&starrocks_layout);
         let catalog = MixedCatalog { starrocks_layout };
 
-        let build =
-            PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &registry, "default")
-                .expect("build");
+        let build = build_fragments_from_optimizer_for_database_for_test(
+            &plan, &catalog, &registry, "default",
+        )
+        .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -3296,9 +3309,10 @@ mod tests {
         let registry = mock_starrocks_and_iceberg_registry(&starrocks_layout);
         let catalog = MixedCatalog { starrocks_layout };
 
-        let build =
-            PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &registry, "default")
-                .expect("build");
+        let build = build_fragments_from_optimizer_for_database_for_test(
+            &plan, &catalog, &registry, "default",
+        )
+        .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -3348,6 +3362,7 @@ mod tests {
         );
         let build_expr = intern_exprs(&mut scalars, &[build_expr])[0];
         attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan.execution_props.join_distribution = Some(JoinExecutionDistribution::Broadcast);
         plan.build_runtime_filters = vec![RuntimeFilterDesc {
             filter_id: 99,
             build_expr,
@@ -3369,9 +3384,10 @@ mod tests {
         let registry = mock_starrocks_and_iceberg_registry(&starrocks_layout);
         let catalog = MixedCatalog { starrocks_layout };
 
-        let build =
-            PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &registry, "default")
-                .expect("build");
+        let build = build_fragments_from_optimizer_for_database_for_test(
+            &plan, &catalog, &registry, "default",
+        )
+        .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -3395,12 +3411,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_filter_unknown_without_execution_metadata_falls_back_to_broadcast() {
+    fn runtime_filter_unknown_uses_execution_metadata_broadcast() {
         let mut plan = mixed_starrocks_iceberg_join_plan();
         let Operator::PhysicalHashJoin(op) = &plan.op else {
             panic!("expected hash join");
         };
         let eq = op.eq_conditions[0].clone();
+        plan.execution_props.join_distribution = Some(JoinExecutionDistribution::Broadcast);
         plan.build_runtime_filters = vec![RuntimeFilterDesc {
             filter_id: 7,
             build_expr: eq.right,
@@ -3422,9 +3439,10 @@ mod tests {
         let registry = mock_starrocks_and_iceberg_registry(&starrocks_layout);
         let catalog = MixedCatalog { starrocks_layout };
 
-        let build =
-            PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &registry, "default")
-                .expect("build");
+        let build = build_fragments_from_optimizer_for_database_for_test(
+            &plan, &catalog, &registry, "default",
+        )
+        .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -3526,7 +3544,7 @@ mod tests {
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_iceberg_registry(),
@@ -3578,7 +3596,7 @@ mod tests {
         );
         attach_scalar_arena(&mut window_plan, Arc::new(scalars));
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &window_plan,
             &DummyCatalog,
             &mock_iceberg_registry(),
@@ -3659,7 +3677,7 @@ mod tests {
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_iceberg_registry(),
@@ -3702,7 +3720,7 @@ mod tests {
             output_columns(),
         );
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_iceberg_registry(),
@@ -3738,14 +3756,14 @@ mod tests {
             output_columns(),
         );
 
-        let result = PlanFragmentBuilder::build_via_distributed_plan(
+        let result = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_iceberg_registry(),
             "default",
         );
         let err = result.err().expect("distribution any must fail");
-        assert!(err.contains("PhysicalDistribution(Any)"));
+        assert!(err.contains("DistributionSpec::Any"));
     }
 
     #[test]
@@ -3759,7 +3777,7 @@ mod tests {
             output_columns(),
         );
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_iceberg_registry(),
@@ -3780,7 +3798,7 @@ mod tests {
         );
 
         let (result, audit) = fallback_audit::run_with_isolated_audit(|| {
-            PlanFragmentBuilder::build_via_distributed_plan(
+            build_fragments_from_optimizer_for_database_for_test(
                 &plan,
                 &DummyCatalog,
                 &crate::connector::ConnectorRegistry::new(),
@@ -3826,7 +3844,7 @@ mod tests {
         );
 
         let (result, audit) = fallback_audit::run_with_isolated_audit(|| {
-            PlanFragmentBuilder::build_via_distributed_plan(
+            build_fragments_from_optimizer_for_database_for_test(
                 &plan,
                 &DummyCatalog,
                 &crate::connector::ConnectorRegistry::new(),
@@ -3859,7 +3877,7 @@ mod tests {
             vec![union_output],
         );
 
-        let err = match PlanFragmentBuilder::build_via_distributed_plan(
+        let err = match build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &crate::connector::ConnectorRegistry::new(),
@@ -3904,7 +3922,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         });
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &crate::connector::ConnectorRegistry::new(),
@@ -3977,9 +3995,10 @@ mod tests {
         let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
 
-        let build =
-            PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &registry, "default")
-                .expect("build");
+        let build = build_fragments_from_optimizer_for_database_for_test(
+            &plan, &catalog, &registry, "default",
+        )
+        .expect("build");
         assert_eq!(build.fragment_results.len(), 1);
         let root = build.fragment_results.first().expect("root fragment");
         let scan_node = root
@@ -4037,7 +4056,7 @@ mod tests {
 
     #[test]
     fn iceberg_scan_without_starrocks_layout_uses_synthetic_descriptor_table_id() {
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &iceberg_scan_plan(),
             &DummyCatalog,
             &mock_iceberg_registry(),
@@ -4086,7 +4105,7 @@ mod tests {
     }
 
     #[test]
-    fn build_via_distributed_plan_with_iceberg_sink_attaches_partition_metadata() {
+    fn fragment_build_request_with_iceberg_sink_attaches_partition_metadata() {
         let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
         let connectors = crate::connector::ConnectorRegistry::new();
         let mut spec = crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
@@ -4094,7 +4113,7 @@ mod tests {
             crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
         );
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
+        let build = build_fragments_with_iceberg_sink_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &connectors,
@@ -4162,7 +4181,7 @@ mod tests {
     }
 
     #[test]
-    fn build_via_distributed_plan_with_iceberg_sink_sets_root_output_sink() {
+    fn fragment_build_request_with_iceberg_sink_sets_root_output_sink() {
         let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
         let connectors = crate::connector::ConnectorRegistry::new();
         let mut spec = crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
@@ -4170,7 +4189,7 @@ mod tests {
             crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
         );
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
+        let build = build_fragments_with_iceberg_sink_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &connectors,
@@ -4238,7 +4257,7 @@ mod tests {
     }
 
     #[test]
-    fn build_via_distributed_plan_with_iceberg_sink_preserves_delete_sink_mode() {
+    fn fragment_build_request_with_iceberg_sink_preserves_delete_sink_mode() {
         let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
         let connectors = crate::connector::ConnectorRegistry::new();
         let mut spec = crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
@@ -4247,7 +4266,7 @@ mod tests {
             crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
         );
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
+        let build = build_fragments_with_iceberg_sink_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &connectors,
@@ -4270,7 +4289,7 @@ mod tests {
     }
 
     #[test]
-    fn build_via_distributed_plan_with_iceberg_sink_preserves_equality_delete_schema() {
+    fn fragment_build_request_with_iceberg_sink_preserves_equality_delete_schema() {
         let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
         let connectors = crate::connector::ConnectorRegistry::new();
         let mut spec = crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
@@ -4279,7 +4298,7 @@ mod tests {
             crate::sql::codegen::iceberg_write_sink::test_support::unpartitioned_metadata_json(),
         );
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
+        let build = build_fragments_with_iceberg_sink_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &connectors,
@@ -4318,8 +4337,7 @@ mod tests {
     }
 
     #[test]
-    fn build_via_distributed_plan_with_iceberg_sink_maps_file_hash_distribution_to_partitioned_edge()
-     {
+    fn fragment_build_request_with_iceberg_sink_maps_file_hash_distribution_to_partitioned_edge() {
         let file_col_id = ColumnId::new_for_test(2);
         let output_columns = vec![
             output_col_for_test(1, "id", DataType::Int32, false),
@@ -4359,7 +4377,7 @@ mod tests {
         spec.target_columns = target_columns.clone();
         spec.target_table.columns = target_columns;
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
+        let build = build_fragments_with_iceberg_sink_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &connectors,
@@ -4418,7 +4436,7 @@ mod tests {
             vec![ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![1])],
         );
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan_with_change_stream_write(
+        let build = build_fragments_with_change_stream_write_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &connectors,
@@ -4474,7 +4492,7 @@ mod tests {
             ],
         );
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan_with_change_stream_write(
+        let build = build_fragments_with_change_stream_write_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &connectors,
@@ -4618,7 +4636,7 @@ mod tests {
         let registry = mock_starrocks_and_iceberg_registry(&starrocks_layout);
         let catalog = MixedCatalog { starrocks_layout };
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &mixed_starrocks_iceberg_join_plan(),
             &catalog,
             &registry,
@@ -4881,7 +4899,7 @@ mod tests {
 
         let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &decode_plan,
             &catalog,
             &registry,
@@ -5017,9 +5035,10 @@ mod tests {
 
         let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
-        let build =
-            PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &registry, "default")
-                .expect("build");
+        let build = build_fragments_from_optimizer_for_database_for_test(
+            &plan, &catalog, &registry, "default",
+        )
+        .expect("build");
 
         let root = build
             .fragment_results
@@ -5228,9 +5247,10 @@ mod tests {
 
         let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
-        let build =
-            PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &registry, "default")
-                .expect("build");
+        let build = build_fragments_from_optimizer_for_database_for_test(
+            &plan, &catalog, &registry, "default",
+        )
+        .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -5384,7 +5404,7 @@ mod tests {
             }
         }
         let catalog = IcebergCatalog;
-        PlanFragmentBuilder::build_via_distributed_plan(
+        build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &catalog,
             &mock_iceberg_registry(),
@@ -5440,7 +5460,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         });
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_iceberg_registry(),
@@ -5471,9 +5491,10 @@ mod tests {
         let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
 
-        let build =
-            PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &registry, "default")
-                .expect("build StarRocks fragment");
+        let build = build_fragments_from_optimizer_for_database_for_test(
+            &plan, &catalog, &registry, "default",
+        )
+        .expect("build StarRocks fragment");
         let root = build
             .fragment_results
             .iter()
@@ -5530,9 +5551,10 @@ mod tests {
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);
 
-        let built =
-            PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &registry, "default")
-                .expect("build StarRocks fragment");
+        let built = build_fragments_from_optimizer_for_database_for_test(
+            &plan, &catalog, &registry, "default",
+        )
+        .expect("build StarRocks fragment");
 
         assert_eq!(
             counts.begin_scan.load(std::sync::atomic::Ordering::SeqCst),
@@ -5587,9 +5609,10 @@ mod tests {
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);
 
-        let built =
-            PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &registry, "default")
-                .expect("build Iceberg fragment");
+        let built = build_fragments_from_optimizer_for_database_for_test(
+            &plan, &catalog, &registry, "default",
+        )
+        .expect("build Iceberg fragment");
 
         assert_eq!(
             counts.begin_scan.load(std::sync::atomic::Ordering::SeqCst),
@@ -5722,7 +5745,7 @@ mod tests {
         });
         let registry = mock_iceberg_registry();
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &registry,
@@ -5810,7 +5833,7 @@ mod tests {
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);
 
-        PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &registry, "default")
+        build_fragments_from_optimizer_for_database_for_test(&plan, &catalog, &registry, "default")
             .expect("build Iceberg fragment");
 
         assert_eq!(
@@ -5953,7 +5976,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         });
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &crate::connector::ConnectorRegistry::new(),
@@ -6012,7 +6035,7 @@ mod tests {
         );
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
-        let build = PlanFragmentBuilder::build_via_distributed_plan(
+        let build = build_fragments_from_optimizer_for_database_for_test(
             &plan,
             &DummyCatalog,
             &mock_iceberg_registry(),

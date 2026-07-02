@@ -30,7 +30,8 @@ mod tests {
     };
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::{
-        FragmentBuildResult, FragmentEdgeKind, FragmentId, MultiFragmentBuildResult,
+        FragmentBuildOutput, FragmentBuildRequest, FragmentBuildResult, FragmentEdgeKind,
+        FragmentId, MultiFragmentBuildResult,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
@@ -589,7 +590,7 @@ mod tests {
 
     #[test]
     fn iceberg_sink_builds_ir_fragment_structure() {
-        let plan = values_plan_for_columns(vec![output_col(1, "id", DataType::Int32, false)]);
+        let mut plan = values_plan_for_columns(vec![output_col(1, "id", DataType::Int32, false)]);
         let connectors = ConnectorRegistry::new();
         let mut sink_spec =
             crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
@@ -597,14 +598,21 @@ mod tests {
             crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
         );
         let catalog = DummyCatalog;
-        let distributed = PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
+        prepare_bridge2_test_props(&mut plan);
+        let dp = crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
             &plan,
-            &catalog,
-            &connectors,
-            "test_db",
-            None,
-            &sink_spec,
         )
+        .expect("build DistributedPlan");
+        let distributed = PlanFragmentBuilder::build(FragmentBuildRequest {
+            distributed_plan: &dp,
+            catalog: &catalog,
+            connectors: &connectors,
+            mv_refresh_ctx: None,
+            output: FragmentBuildOutput::IcebergWrite {
+                current_database: "test_db",
+                sink_spec: &sink_spec,
+            },
+        })
         .expect("DistributedPlan iceberg sink build");
 
         let root = fragment_by_id("iceberg_sink", &distributed, distributed.root_fragment_id);
@@ -642,8 +650,15 @@ mod tests {
     ) -> MultiFragmentBuildResult {
         prepare_bridge2_test_props(&mut plan);
         let catalog = DummyCatalog;
-        PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, connectors, "test_db")
-            .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"))
+        let dp =
+            crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
+                &plan,
+            )
+            .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"));
+        PlanFragmentBuilder::build(FragmentBuildRequest::result(
+            &dp, &catalog, connectors, None,
+        ))
+        .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"))
     }
 
     fn build_distributed_plan_with_mv_refresh_ctx(
@@ -654,13 +669,17 @@ mod tests {
     ) -> MultiFragmentBuildResult {
         prepare_bridge2_test_props(&mut plan);
         let catalog = DummyCatalog;
-        PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
-            &plan,
+        let dp =
+            crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
+                &plan,
+            )
+            .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"));
+        PlanFragmentBuilder::build(FragmentBuildRequest::result(
+            &dp,
             &catalog,
             connectors,
-            "test_db",
             mv_refresh_ctx,
-        )
+        ))
         .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"))
     }
 
@@ -671,8 +690,18 @@ mod tests {
         prepare_bridge2_test_props(&mut plan);
         let catalog = DummyCatalog;
         let connectors = ConnectorRegistry::new();
-        PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &connectors, "test_db")
-            .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"))
+        let dp =
+            crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
+                &plan,
+            )
+            .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"));
+        PlanFragmentBuilder::build(FragmentBuildRequest::result(
+            &dp,
+            &catalog,
+            &connectors,
+            None,
+        ))
+        .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"))
     }
 
     fn assert_distributed_plan_error_contains(
@@ -683,13 +712,18 @@ mod tests {
         prepare_bridge2_test_props(&mut plan);
         let catalog = DummyCatalog;
         let connectors = ConnectorRegistry::new();
-        let err = match PlanFragmentBuilder::build_via_distributed_plan(
+        let err = match crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
             &plan,
-            &catalog,
-            &connectors,
-            "test_db",
         ) {
-            Ok(_) => panic!("{case_name}: DistributedPlan build unexpectedly succeeded"),
+            Ok(dp) => match PlanFragmentBuilder::build(FragmentBuildRequest::result(
+                &dp,
+                &catalog,
+                &connectors,
+                None,
+            )) {
+                Ok(_) => panic!("{case_name}: DistributedPlan build unexpectedly succeeded"),
+                Err(err) => err,
+            },
             Err(err) => err,
         };
         assert!(

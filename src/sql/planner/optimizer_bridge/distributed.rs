@@ -1,0 +1,115 @@
+use crate::sql::optimizer::OptimizerPhysicalNode;
+use crate::sql::planner::DistributedPlan;
+
+use super::id_binding::verify_optimizer_id_binding;
+use super::physical::optimizer_physical_to_plan;
+
+pub(crate) fn optimizer_physical_to_distributed_plan(
+    plan: &OptimizerPhysicalNode,
+) -> Result<DistributedPlan, String> {
+    verify_optimizer_id_binding(plan)?;
+    let physical = optimizer_physical_to_plan(plan)?;
+    crate::sql::planner::build_distributed_plan(&physical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analysis::{ExprKind, ProjectItem, TypedExpr};
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::common::OutputColumn;
+    use crate::sql::optimizer::operator::{Operator, ProjectOp, ValuesOp};
+    use crate::sql::optimizer::physical_tree::{
+        OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
+    };
+    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
+    use arrow::datatypes::DataType;
+    use std::sync::Arc;
+
+    fn int_col(column_id: ColumnId, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id,
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn column_ref(column_id: ColumnId, name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: name.to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn values_node(columns: Vec<OutputColumn>) -> OptimizerPhysicalNode {
+        OptimizerPhysicalNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: columns.clone(),
+            }),
+            children: vec![],
+            output_columns: columns,
+            stats: Statistics::default(),
+            explain_stats: Default::default(),
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    #[test]
+    fn bridge_builds_distributed_plan_from_optimizer_values() {
+        let mut plan = values_node(vec![int_col(ColumnId::new_for_test(1), "v")]);
+        attach_scalar_arena(&mut plan, Arc::new(ScalarArena::new()));
+
+        let dp = optimizer_physical_to_distributed_plan(&plan).expect("build DistributedPlan");
+        assert_eq!(dp.fragments.len(), 1);
+        assert_eq!(dp.root_fragment_id, 0);
+    }
+
+    #[test]
+    fn bridge_rejects_unbound_project_column_before_distributed_build() {
+        let input_id = ColumnId::new_for_test(1);
+        let missing_id = ColumnId::new_for_test(99);
+        let output_id = ColumnId::new_for_test(2);
+        let mut scalars = ScalarArena::new();
+        let items = intern_project_items(
+            &mut scalars,
+            &[ProjectItem {
+                expr: column_ref(missing_id, "missing"),
+                output_name: "p".to_string(),
+                output_column_id: output_id,
+            }],
+        );
+        let mut plan = OptimizerPhysicalNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items,
+                output_qualifier: None,
+            }),
+            children: vec![values_node(vec![int_col(input_id, "v")])],
+            output_columns: vec![int_col(output_id, "p")],
+            stats: Statistics::default(),
+            explain_stats: Default::default(),
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+
+        let err = optimizer_physical_to_distributed_plan(&plan)
+            .expect_err("unbound project ColumnId must fail");
+        assert!(
+            err.contains("not produced by child scope"),
+            "unexpected err={err}"
+        );
+    }
+}

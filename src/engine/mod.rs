@@ -2848,7 +2848,6 @@ fn explain_analyze_query(
 ) -> Result<QueryResult, String> {
     use crate::sql::codegen::ir::explain_distributed_plan_analyze;
     use crate::sql::explain::ExplainLevel;
-    use crate::sql::planner::build_distributed_plan;
 
     let planning_start = std::time::Instant::now();
     let (resolved, cte_registry, mut factory) =
@@ -2884,16 +2883,13 @@ fn explain_analyze_query(
         mv_candidates,
     )?;
 
-    let planner_physical =
-        crate::sql::planner::optimizer_bridge::physical::optimizer_physical_to_plan(&physical)?;
-    let dp = build_distributed_plan(&planner_physical)?;
-    let build_result =
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
+    let dp =
+        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
             &physical,
-            codegen_catalog,
-            connectors,
-            current_database,
         )?;
+    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
+        crate::sql::codegen::FragmentBuildRequest::result(&dp, codegen_catalog, connectors, None),
+    )?;
     let planning_elapsed = planning_start.elapsed();
 
     let mut query_opts = query_opts.unwrap_or_default();
@@ -3008,7 +3004,6 @@ fn explain_query(
 ) -> Result<QueryResult, String> {
     use crate::sql::codegen::ir::explain_distributed_plan;
     use crate::sql::explain::ExplainLevel;
-    use crate::sql::planner::build_distributed_plan;
 
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
@@ -3050,9 +3045,10 @@ fn explain_query(
     if matches!(level, ExplainLevel::Costs) {
         lines.extend(query_stats.snapshot.display_rows());
     }
-    let planner_physical =
-        crate::sql::planner::optimizer_bridge::physical::optimizer_physical_to_plan(&physical)?;
-    let dp = build_distributed_plan(&planner_physical)?;
+    let dp =
+        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
+            &physical,
+        )?;
     lines.extend(explain_distributed_plan(&dp, level));
 
     build_string_query_result("Explain String", lines)
@@ -3249,15 +3245,22 @@ pub(crate) fn execute_query_as_iceberg_write(
             Vec::new(),
         )?,
     };
-    let build_result =
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
+    let dp =
+        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
             &physical,
-            &catalog_snapshot,
-            &connectors_snapshot,
-            current_database,
-            None,
-            &sink_spec,
         )?;
+    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
+        crate::sql::codegen::FragmentBuildRequest {
+            distributed_plan: &dp,
+            catalog: &catalog_snapshot,
+            connectors: &connectors_snapshot,
+            mv_refresh_ctx: None,
+            output: crate::sql::codegen::FragmentBuildOutput::IcebergWrite {
+                current_database,
+                sink_spec: &sink_spec,
+            },
+        },
+    )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
@@ -3406,15 +3409,22 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         .expect("standalone connector registry read lock")
         .clone();
     snapshot_effective_backend_count_into_session();
-    let build_result =
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_change_stream_write(
+    let dp =
+        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
             physical_plan,
-            &catalog_snapshot,
-            &connectors_snapshot,
-            current_database,
-            mv_refresh_ctx,
-            dag,
         )?;
+    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
+        crate::sql::codegen::FragmentBuildRequest {
+            distributed_plan: &dp,
+            catalog: &catalog_snapshot,
+            connectors: &connectors_snapshot,
+            mv_refresh_ctx,
+            output: crate::sql::codegen::FragmentBuildOutput::ChangeStreamWrite {
+                current_database,
+                dag,
+            },
+        },
+    )?;
     let commit_plan =
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_dag(dag)?;
     Ok(PlannedIcebergChangeStreamWrite {
@@ -3788,22 +3798,18 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         exchange_port,
     )?;
 
-    let build_result = if let Some(mv_refresh_ctx) = mv_refresh_ctx {
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
+    let dp =
+        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
             &physical,
+        )?;
+    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
+        crate::sql::codegen::FragmentBuildRequest::result(
+            &dp,
             codegen_catalog,
             connectors,
-            current_database,
-            Some(mv_refresh_ctx),
-        )?
-    } else {
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
-            &physical,
-            codegen_catalog,
-            connectors,
-            current_database,
-        )?
-    };
+            mv_refresh_ctx,
+        ),
+    )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
@@ -3822,7 +3828,7 @@ pub(crate) fn execute_logical_plan_with_options(
     factory: crate::sql::column_id::ColumnRefFactory,
     codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
-    current_database: &str,
+    _current_database: &str,
     exchange_port: u16,
     query_opts: Option<StandaloneQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
@@ -3854,22 +3860,18 @@ pub(crate) fn execute_logical_plan_with_options(
         exchange_port,
     )?;
 
-    let build_result = if let Some(mv_refresh_ctx) = mv_refresh_ctx {
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
+    let dp =
+        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
             &physical,
+        )?;
+    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
+        crate::sql::codegen::FragmentBuildRequest::result(
+            &dp,
             codegen_catalog,
             connectors,
-            current_database,
-            Some(mv_refresh_ctx),
-        )?
-    } else {
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
-            &physical,
-            codegen_catalog,
-            connectors,
-            current_database,
-        )?
-    };
+            mv_refresh_ctx,
+        ),
+    )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
@@ -5695,16 +5697,21 @@ enable_path_style_access = true
             Vec::new(),
         )
         .expect("optimize");
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
-            &physical, &catalog, &registry, "default",
+        let dp =
+            crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
+                &physical,
+            )
+            .expect("build DistributedPlan");
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
+            crate::sql::codegen::FragmentBuildRequest::result(&dp, &catalog, &registry, None),
         )
         .expect("build fragments")
     }
 
     /// Build a `ConnectorRegistry` with a mock StarRocks scan planner that
     /// returns the schema_id and tablet splits from the given layout. Used by
-    /// engine-level tests that call `PlanFragmentBuilder::build_via_distributed_plan` with a
-    /// StarRocks table but do not have a full `StandaloneState` available.
+    /// engine-level tests that build fragments for a StarRocks table but do not
+    /// have a full `StandaloneState` available.
     fn mock_starrocks_registry_for_engine_test(
         layout: &crate::sql::catalog::PhysicalTableLayout,
     ) -> crate::connector::ConnectorRegistry {
