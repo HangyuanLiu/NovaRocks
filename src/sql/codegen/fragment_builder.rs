@@ -208,7 +208,7 @@ impl PlanFragmentBuilder {
         _current_database: &str,
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     ) -> Result<MultiFragmentBuildResult, String> {
-        super::id_binding_verifier::verify_id_binding(plan)?;
+        crate::sql::planner::optimizer_bridge::id_binding::verify_optimizer_id_binding(plan)?;
         let plan = match &plan.op {
             Operator::PhysicalDistribution(op)
                 if matches!(

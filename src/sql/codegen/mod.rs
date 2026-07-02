@@ -14,7 +14,6 @@ pub(crate) mod helpers;
 pub(crate) mod iceberg_change_stream_write;
 pub(crate) mod iceberg_write_sink;
 pub(crate) mod iceberg_write_sink_wire;
-pub(crate) mod id_binding_verifier;
 pub(crate) mod ir;
 pub(crate) mod nodes;
 pub(crate) mod resolve;

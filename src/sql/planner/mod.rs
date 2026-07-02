@@ -4741,7 +4741,7 @@ mod tests {
         )
         .expect("optimizer should produce a physical plan");
 
-        crate::sql::codegen::id_binding_verifier::verify_id_binding(&physical)
+        crate::sql::planner::optimizer_bridge::id_binding::verify_optimizer_id_binding(&physical)
             .expect("CUBE synthetic grouping output must survive optimizer extraction");
     }
 

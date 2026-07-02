@@ -1,3 +1,4 @@
+pub(crate) mod id_binding;
 pub(crate) mod physical;
 pub(crate) mod plan;
 pub(crate) mod property;

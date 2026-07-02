@@ -2863,7 +2863,9 @@ mod tests {
                 .expect("join projection/filter coalesce plan");
                 let physical = optimize_logical_for_test(coalesce);
 
-                crate::sql::codegen::id_binding_verifier::verify_id_binding(&physical)
+                crate::sql::planner::optimizer_bridge::id_binding::verify_optimizer_id_binding(
+                    &physical,
+                )
                     .expect("join projection/filter physical coalesce plan must bind ids");
                 assert_physical_project_refs_resolve_to_child_outputs(&physical);
             })
