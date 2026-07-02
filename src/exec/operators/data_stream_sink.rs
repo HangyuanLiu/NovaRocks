@@ -38,6 +38,7 @@ use crate::runtime::exchange;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::service::exchange_sender::{ExchangeSendTask, ExchangeSendTracker, exchange_send_queue};
 use crate::thrift::{data_sinks, internal_service, partitions, types};
+use arrow::datatypes::DataType;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -63,18 +64,28 @@ fn should_log_need_input() -> bool {
         .is_multiple_of(every)
 }
 
+fn is_low_cardinality_exchange_dictionary(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Dictionary(key_type, value_type)
+            if key_type.as_ref() == &DataType::Int32
+                && matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8)
+    )
+}
+
 // Hash partition implementation (vectorized, no row conversion)
 mod data_stream_sink_hash_partition {
-    use super::{Chunk, ExprArena, ExprId};
+    use super::{Chunk, ExprArena, ExprId, is_low_cardinality_exchange_dictionary};
     use arrow::array::{
         Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
-        FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-        LargeBinaryArray, ListArray, StringArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+        DictionaryArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array,
+        Int64Array, LargeBinaryArray, LargeStringArray, ListArray, StringArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
     };
     use arrow::compute::cast;
     use arrow::compute::take;
-    use arrow::datatypes::{DataType, TimeUnit};
+    use arrow::datatypes::{DataType, Int32Type, TimeUnit};
     use std::sync::Arc;
 
     use crate::common::largeint;
@@ -131,6 +142,63 @@ mod data_stream_sink_hash_partition {
             }
         }
         hash
+    }
+
+    fn dictionary_int32_indices(array: &ArrayRef) -> Result<&DictionaryArray<Int32Type>, String> {
+        array
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .ok_or_else(|| {
+                format!(
+                    "hash_partition: failed to downcast dictionary carrier {:?} to DictionaryArray<Int32Type>",
+                    array.data_type()
+                )
+            })
+    }
+
+    fn dictionary_key_index(key: i32, values_len: usize, row: usize) -> Result<usize, String> {
+        let idx = usize::try_from(key)
+            .map_err(|_| format!("hash_partition: negative dictionary key {key} at row {row}"))?;
+        if idx >= values_len {
+            return Err(format!(
+                "hash_partition: dictionary key {key} at row {row} exceeds values len {values_len}"
+            ));
+        }
+        Ok(idx)
+    }
+
+    fn compute_fnv_hash_dictionary_array(array: &ArrayRef) -> Result<Vec<u64>, String> {
+        let dict = dictionary_int32_indices(array)?;
+        let values = dict.values();
+        let value_hashes = compute_fnv_hash_array(values)?;
+        let keys = dict.keys();
+        let mut out = vec![FNV_SEED; dict.len()];
+        for (row, hash_value) in out.iter_mut().enumerate().take(dict.len()) {
+            if dict.is_null(row) {
+                *hash_value = hash_value.wrapping_mul(FNV_PRIME);
+            } else {
+                let idx = dictionary_key_index(keys.value(row), value_hashes.len(), row)?;
+                *hash_value = value_hashes[idx];
+            }
+        }
+        Ok(out)
+    }
+
+    fn compute_crc32_hash_dictionary_array(array: &ArrayRef) -> Result<Vec<u32>, String> {
+        let dict = dictionary_int32_indices(array)?;
+        let values = dict.values();
+        let value_hashes = compute_crc32_hash_array(values)?;
+        let keys = dict.keys();
+        let mut out = vec![0u32; dict.len()];
+        for (row, hash_value) in out.iter_mut().enumerate().take(dict.len()) {
+            if dict.is_null(row) {
+                *hash_value = 0;
+            } else {
+                let idx = dictionary_key_index(keys.value(row), value_hashes.len(), row)?;
+                *hash_value = value_hashes[idx];
+            }
+        }
+        Ok(out)
     }
 
     // Compute FNV hash for each row in an array
@@ -239,6 +307,21 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
+                    if arr.is_null(i) {
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
+                    } else {
+                        let val = arr.value(i);
+                        *hash_value ^= fnv_hash_value(val.as_bytes());
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
+                    }
+                }
+            }
+            DataType::LargeUtf8 => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| "failed to downcast to LargeStringArray".to_string())?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
@@ -447,6 +530,9 @@ mod data_stream_sink_hash_partition {
                     }
                 }
             }
+            dict_type if is_low_cardinality_exchange_dictionary(dict_type) => {
+                return compute_fnv_hash_dictionary_array(array);
+            }
             _ => {
                 return Err(format!(
                     "hash_partition: unsupported array type for FNV hash: {:?}",
@@ -561,6 +647,18 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
+                    if !arr.is_null(i) {
+                        let val = arr.value(i);
+                        *hash_value = crc32_hash_value(val.as_bytes());
+                    }
+                }
+            }
+            DataType::LargeUtf8 => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| "failed to downcast to LargeStringArray".to_string())?;
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
@@ -758,6 +856,9 @@ mod data_stream_sink_hash_partition {
                         *hash_value = crc32_hash_value(&encoded);
                     }
                 }
+            }
+            dict_type if is_low_cardinality_exchange_dictionary(dict_type) => {
+                return compute_crc32_hash_dictionary_array(array);
             }
             _ => {
                 return Err(format!(
@@ -2099,8 +2200,11 @@ fn project_chunk_by_slot_ids(chunk: &Chunk, slot_ids: &[SlotId]) -> Result<Chunk
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::BinaryArray;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+    use arrow::array::{
+        Array, ArrayRef, BinaryArray, DictionaryArray, Int32Array, LargeStringArray, StringArray,
+    };
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatchOptions;
     use std::collections::BTreeMap;
 
@@ -2300,6 +2404,159 @@ mod tests {
                 .map(|chunk| chunk.batch.num_rows())
                 .sum::<usize>(),
             3
+        );
+    }
+
+    fn status_chunk_from_array(array: ArrayRef) -> Chunk {
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(91),
+                Field::new("status", DataType::Utf8, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        Chunk::try_new_with_columns(schema, vec![array]).expect("status chunk")
+    }
+
+    fn large_status_chunk_from_array(array: ArrayRef) -> Chunk {
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(92),
+                Field::new("status_l", DataType::LargeUtf8, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        Chunk::try_new_with_columns(schema, vec![array]).expect("large status chunk")
+    }
+
+    fn status_values(chunk: &Chunk) -> Vec<Option<String>> {
+        if chunk.is_empty() {
+            return Vec::new();
+        }
+        let flat = arrow::compute::cast(chunk.columns()[0].as_ref(), &DataType::Utf8)
+            .expect("cast status to utf8");
+        let strings = flat
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 values");
+        (0..strings.len())
+            .map(|idx| {
+                if strings.is_null(idx) {
+                    None
+                } else {
+                    Some(strings.value(idx).to_string())
+                }
+            })
+            .collect()
+    }
+
+    fn partition_status_values(chunks: &[Chunk]) -> Vec<Vec<Option<String>>> {
+        chunks.iter().map(status_values).collect()
+    }
+
+    fn flat_and_dict_status_chunks() -> (Chunk, ArrayRef, Chunk, ArrayRef) {
+        let flat: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("PAID"),
+            Some("NEW"),
+            None,
+            Some("PAID"),
+            Some("CANCELLED"),
+            Some("NEW"),
+        ]));
+        let dict: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::new(
+            Int32Array::from(vec![Some(0), Some(1), None, Some(0), Some(2), Some(1)]),
+            Arc::new(StringArray::from(vec!["PAID", "NEW", "CANCELLED"])),
+        ));
+        (
+            status_chunk_from_array(flat.clone()),
+            flat,
+            status_chunk_from_array(dict.clone()),
+            dict,
+        )
+    }
+
+    fn flat_and_dict_large_status_chunks() -> (Chunk, ArrayRef, Chunk, ArrayRef) {
+        let flat: ArrayRef = Arc::new(LargeStringArray::from(vec![
+            Some("PAID"),
+            Some("NEW"),
+            None,
+            Some("PAID"),
+            Some("CANCELLED"),
+            Some("NEW"),
+        ]));
+        let dict: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::new(
+            Int32Array::from(vec![Some(2), Some(0), None, Some(2), Some(1), Some(0)]),
+            Arc::new(LargeStringArray::from(vec!["NEW", "CANCELLED", "PAID"])),
+        ));
+        (
+            large_status_chunk_from_array(flat.clone()),
+            flat,
+            large_status_chunk_from_array(dict.clone()),
+            dict,
+        )
+    }
+
+    #[test]
+    fn hash_partition_dictionary_utf8_matches_flat_utf8_fnv() {
+        let (flat_chunk, flat_array, dict_chunk, dict_array) = flat_and_dict_status_chunks();
+
+        let flat_parts =
+            partition_chunk_by_hash_arrays(&flat_chunk, &[flat_array], 4, false).expect("flat fnv");
+        let dict_parts =
+            partition_chunk_by_hash_arrays(&dict_chunk, &[dict_array], 4, false).expect("dict fnv");
+
+        assert_eq!(
+            partition_status_values(&dict_parts),
+            partition_status_values(&flat_parts)
+        );
+    }
+
+    #[test]
+    fn hash_partition_dictionary_utf8_matches_flat_utf8_crc32() {
+        let (flat_chunk, flat_array, dict_chunk, dict_array) = flat_and_dict_status_chunks();
+
+        let flat_parts =
+            partition_chunk_by_hash_arrays(&flat_chunk, &[flat_array], 4, true).expect("flat crc");
+        let dict_parts =
+            partition_chunk_by_hash_arrays(&dict_chunk, &[dict_array], 4, true).expect("dict crc");
+
+        assert_eq!(
+            partition_status_values(&dict_parts),
+            partition_status_values(&flat_parts)
+        );
+    }
+
+    #[test]
+    fn hash_partition_dictionary_large_utf8_matches_flat_large_utf8_fnv() {
+        let (flat_chunk, flat_array, dict_chunk, dict_array) = flat_and_dict_large_status_chunks();
+
+        let flat_parts =
+            partition_chunk_by_hash_arrays(&flat_chunk, &[flat_array], 4, false).expect("flat fnv");
+        let dict_parts =
+            partition_chunk_by_hash_arrays(&dict_chunk, &[dict_array], 4, false).expect("dict fnv");
+
+        assert_eq!(
+            partition_status_values(&dict_parts),
+            partition_status_values(&flat_parts)
+        );
+    }
+
+    #[test]
+    fn hash_partition_dictionary_large_utf8_matches_flat_large_utf8_crc32() {
+        let (flat_chunk, flat_array, dict_chunk, dict_array) = flat_and_dict_large_status_chunks();
+
+        let flat_parts =
+            partition_chunk_by_hash_arrays(&flat_chunk, &[flat_array], 4, true).expect("flat crc");
+        let dict_parts =
+            partition_chunk_by_hash_arrays(&dict_chunk, &[dict_array], 4, true).expect("dict crc");
+
+        assert_eq!(
+            partition_status_values(&dict_parts),
+            partition_status_values(&flat_parts)
         );
     }
 
