@@ -19016,7 +19016,7 @@ mod tests {
     }
 
     #[test]
-    fn iceberg_catalog_backend_reads_mv_table_by_direct_name() {
+    fn iceberg_catalog_backend_reads_mv_table_directly_without_alias() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
         let stmt = parse_create_mv(
@@ -19036,8 +19036,31 @@ mod tests {
         };
         let resolved = backend
             .load_table_for_read("ice", "analytics", "mv_orders")
-            .expect("resolve MV table");
+            .expect("read MV table by public name");
         assert_eq!(resolved.table, "mv_orders");
+
+        let (schema_table, schema_id) = backend
+            .current_schema_id_for_read("ice", "analytics", "mv_orders")
+            .expect("read MV schema id by public name");
+        assert_eq!(schema_table, "mv_orders");
+        assert!(schema_id.is_some());
+
+        let old_alias_schema_err = backend
+            .current_schema_id_for_read("ice", "analytics", "__nr_mv_mv_orders")
+            .expect_err("old storage alias schema id must not resolve");
+        assert!(
+            old_alias_schema_err.contains("__nr_mv_mv_orders")
+                || old_alias_schema_err.contains("not"),
+            "{old_alias_schema_err}"
+        );
+
+        let old_alias_err = backend
+            .load_table_for_read("ice", "analytics", "__nr_mv_mv_orders")
+            .expect_err("old storage alias must not resolve");
+        assert!(
+            old_alias_err.contains("__nr_mv_mv_orders") || old_alias_err.contains("not"),
+            "{old_alias_err}"
+        );
     }
 
     #[test]
