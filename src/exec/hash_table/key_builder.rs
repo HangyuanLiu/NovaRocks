@@ -16,11 +16,12 @@
 // under the License.
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
-    FixedSizeBinaryArray, Int32Array, LargeBinaryArray, ListArray, MapArray, StringArray,
-    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
+    DictionaryArray, FixedSizeBinaryArray, Int32Array, LargeBinaryArray, LargeStringArray,
+    ListArray, MapArray, StringArray, StructArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Int32Type, TimeUnit};
+use std::sync::Arc;
 
 use crate::common::largeint;
 use crate::exec::expr::agg::{FloatArrayView, IntArrayView};
@@ -31,11 +32,136 @@ use super::hash::{
 };
 use super::key_layout::{CompressedKeyContext, compressed_key_is_valid};
 
+pub(crate) enum DictionaryStringValues<'a> {
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a LargeStringArray),
+}
+
+impl<'a> DictionaryStringValues<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Utf8(values) => values.len(),
+            Self::LargeUtf8(values) => values.len(),
+        }
+    }
+
+    fn is_null(&self, code: usize) -> bool {
+        match self {
+            Self::Utf8(values) => values.is_null(code),
+            Self::LargeUtf8(values) => values.is_null(code),
+        }
+    }
+
+    fn value(&self, code: usize) -> &'a str {
+        match self {
+            Self::Utf8(values) => values.value(code),
+            Self::LargeUtf8(values) => values.value(code),
+        }
+    }
+}
+
+pub(crate) struct DictionaryGroupKeyView<'a> {
+    dict: &'a DictionaryArray<Int32Type>,
+    values: DictionaryStringValues<'a>,
+    values_ptr: usize,
+}
+
+impl<'a> DictionaryGroupKeyView<'a> {
+    pub(crate) fn new(dict: &'a DictionaryArray<Int32Type>) -> Result<Self, String> {
+        let values = dict.values();
+        let values_ptr = Arc::as_ptr(values) as *const () as usize;
+        let values = match values.data_type() {
+            DataType::Utf8 => {
+                let values = values
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        "failed to downcast dictionary values to StringArray".to_string()
+                    })?;
+                if values.null_count() != 0 {
+                    return Err("dictionary group key values must not contain nulls".to_string());
+                }
+                DictionaryStringValues::Utf8(values)
+            }
+            DataType::LargeUtf8 => {
+                let values = values
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| {
+                        "failed to downcast dictionary values to LargeStringArray".to_string()
+                    })?;
+                if values.null_count() != 0 {
+                    return Err("dictionary group key values must not contain nulls".to_string());
+                }
+                DictionaryStringValues::LargeUtf8(values)
+            }
+            other => {
+                return Err(format!(
+                    "dictionary group key unsupported value type: {:?}",
+                    other
+                ));
+            }
+        };
+        Ok(Self {
+            dict,
+            values,
+            values_ptr,
+        })
+    }
+
+    pub(crate) fn values_ptr(&self) -> usize {
+        self.values_ptr
+    }
+
+    pub(crate) fn values_len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub(crate) fn code_at(&self, row: usize) -> Result<Option<usize>, String> {
+        if self.dict.is_null(row) {
+            return Ok(None);
+        }
+        let code = self.dict.keys().value(row);
+        usize::try_from(code).map(Some).map_err(|_| {
+            format!(
+                "dictionary group key code must be non-negative, got {} at row {}",
+                code, row
+            )
+        })
+    }
+
+    pub(crate) fn is_null(&self, row: usize) -> bool {
+        self.dict.is_null(row)
+    }
+
+    pub(crate) fn value_as_bytes(&self, row: usize) -> Result<Option<&'a [u8]>, String> {
+        let Some(code) = self.code_at(row)? else {
+            return Ok(None);
+        };
+        self.value_bytes_for_code(code).map(Some)
+    }
+
+    pub(crate) fn value_bytes_for_code(&self, code: usize) -> Result<&'a [u8], String> {
+        Ok(self.value_str_for_code(code)?.as_bytes())
+    }
+
+    pub(crate) fn value_str_for_code(&self, code: usize) -> Result<&'a str, String> {
+        if code >= self.values_len() {
+            return Err("dictionary group key code out of bounds".to_string());
+        }
+        if self.values.is_null(code) {
+            return Err("dictionary group key value cannot be null when key is valid".to_string());
+        }
+        Ok(self.values.value(code))
+    }
+}
+
 pub(crate) enum GroupKeyArrayView<'a> {
     Int(IntArrayView<'a>),
     Float(FloatArrayView<'a>),
     Boolean(&'a BooleanArray),
     Utf8(&'a StringArray),
+    Dictionary(DictionaryGroupKeyView<'a>),
     Date32(&'a Date32Array),
     TimestampSecond(&'a TimestampSecondArray),
     TimestampMillisecond(&'a TimestampMillisecondArray),
@@ -80,6 +206,24 @@ pub(crate) fn build_group_key_views<'a>(
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
                 GroupKeyArrayView::Utf8(arr)
+            }
+            DataType::Dictionary(key_type, value_type)
+                if matches!(key_type.as_ref(), DataType::Int32)
+                    && matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+            {
+                let dict = array
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()
+                    .ok_or_else(|| {
+                        "failed to downcast to DictionaryArray<Int32Type>".to_string()
+                    })?;
+                GroupKeyArrayView::Dictionary(DictionaryGroupKeyView::new(dict)?)
+            }
+            DataType::Dictionary(key_type, value_type) => {
+                return Err(format!(
+                    "dictionary group key unsupported type: key={:?}, value={:?}",
+                    key_type, value_type
+                ));
             }
             DataType::Date32 => {
                 let arr = array
@@ -908,6 +1052,7 @@ pub(crate) fn build_one_number_hashes(
             }
         }
         GroupKeyArrayView::Utf8(_)
+        | GroupKeyArrayView::Dictionary(_)
         | GroupKeyArrayView::ListUtf8 { .. }
         | GroupKeyArrayView::ListInt32 { .. }
         | GroupKeyArrayView::Complex(_) => {
@@ -1086,6 +1231,27 @@ fn hash_column(
                         combine_hash_at(hashes, row, value_hash);
                     }
                 }
+            }
+        }
+        GroupKeyArrayView::Dictionary(dict) => {
+            let mut value_hashes = vec![None; dict.values_len()];
+            for row in 0..num_rows {
+                let Some(code) = dict.code_at(row)? else {
+                    combine_hash_at(hashes, row, null_hash);
+                    continue;
+                };
+                let value_hash = match value_hashes.get(code).copied().flatten() {
+                    Some(hash) => hash,
+                    None => {
+                        let hash = hash_bytes_with_seed(seed, dict.value_bytes_for_code(code)?);
+                        let slot = value_hashes
+                            .get_mut(code)
+                            .ok_or_else(|| "dictionary group key code out of bounds".to_string())?;
+                        *slot = Some(hash);
+                        hash
+                    }
+                };
+                combine_hash_at(hashes, row, value_hash);
             }
         }
         GroupKeyArrayView::Date32(arr) => {
@@ -1281,7 +1447,72 @@ fn hash_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{ArrayRef, DictionaryArray};
+    use arrow::datatypes::Int32Type;
     use std::sync::Arc;
+
+    fn dict_utf8(values: Vec<Option<&str>>) -> ArrayRef {
+        Arc::new(values.into_iter().collect::<DictionaryArray<Int32Type>>())
+    }
+
+    #[test]
+    fn build_group_key_views_builds_dictionary_view_for_utf8_dictionary() {
+        let array = dict_utf8(vec![Some("PAID"), None, Some("NEW"), Some("PAID")]);
+        let arrays = [array];
+        let views = build_group_key_views(&arrays).expect("views");
+        let GroupKeyArrayView::Dictionary(dict) = &views[0] else {
+            panic!("expected dictionary view");
+        };
+        assert_ne!(dict.values_ptr(), 0);
+        assert_eq!(
+            dict.value_as_bytes(0).expect("value"),
+            Some(b"PAID".as_slice())
+        );
+        assert_eq!(dict.value_as_bytes(1).expect("null"), None);
+        assert_eq!(
+            dict.value_as_bytes(2).expect("value"),
+            Some(b"NEW".as_slice())
+        );
+    }
+
+    #[test]
+    fn dictionary_group_key_hashes_by_logical_value_across_local_codes() {
+        let first = dict_utf8(vec![Some("A"), Some("B")]);
+        let second = dict_utf8(vec![Some("B"), Some("A")]);
+        let first_arrays = [first];
+        let second_arrays = [second];
+        let first_views = build_group_key_views(&first_arrays).expect("first views");
+        let second_views = build_group_key_views(&second_arrays).expect("second views");
+
+        let first_hashes = build_group_key_hashes(&first_views, 2, 0x1234).expect("first hashes");
+        let second_hashes =
+            build_group_key_hashes(&second_views, 2, 0x1234).expect("second hashes");
+
+        assert_eq!(
+            first_hashes[0], second_hashes[1],
+            "A must hash by value, not code"
+        );
+        assert_eq!(
+            first_hashes[1], second_hashes[0],
+            "B must hash by value, not code"
+        );
+    }
+
+    #[test]
+    fn build_group_key_views_rejects_dictionary_values_with_nulls() {
+        let keys = Int32Array::from(vec![Some(1)]);
+        let values: ArrayRef = Arc::new(StringArray::from(vec![Some("A"), None]));
+        let array: ArrayRef =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
+        let arrays = [array];
+
+        let err = match build_group_key_views(&arrays) {
+            Ok(_) => panic!("expected dictionary values null error"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err, "dictionary group key values must not contain nulls");
+    }
 
     #[test]
     fn encode_group_key_row_accepts_binary_arrays() {

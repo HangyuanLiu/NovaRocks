@@ -64,6 +64,7 @@ pub(in crate::exec::runtime_filter) fn row_has_null(
             GroupKeyArrayView::Float(view) => view.value_at(row).is_none(),
             GroupKeyArrayView::Boolean(arr) => arr.is_null(row),
             GroupKeyArrayView::Utf8(arr) => arr.is_null(row),
+            GroupKeyArrayView::Dictionary(dict) => dict.is_null(row),
             GroupKeyArrayView::Date32(arr) => arr.is_null(row),
             GroupKeyArrayView::TimestampSecond(arr) => arr.is_null(row),
             GroupKeyArrayView::TimestampMillisecond(arr) => arr.is_null(row),
