@@ -20,10 +20,10 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, DictionaryArray};
 use arrow::compute::take;
-use arrow::datatypes::{DataType, Field, Int32Type};
+use arrow::datatypes::{DataType, Int32Type};
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::function::FunctionKind;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 
@@ -74,18 +74,7 @@ pub(crate) fn try_peel_dict_expr(
         return Ok(None);
     }
 
-    let value_field = Field::new(
-        chunk
-            .chunk_schema()
-            .field_by_slot(source_slot)
-            .map(|field| field.name().as_str())
-            .unwrap_or("dict_values"),
-        dict.values().data_type().clone(),
-        dict.values().is_nullable(),
-    );
-    let value_slot = ChunkSlotSchema::new_with_field(source_slot, value_field, None, None);
-    let value_schema = Arc::new(ChunkSchema::try_new(vec![value_slot])?);
-    let value_chunk = Chunk::try_new_with_columns(value_schema, vec![Arc::clone(dict.values())])?;
+    let value_chunk = dict_values_chunk_for_source(chunk, source_slot, Arc::clone(dict.values()))?;
     let new_values = arena.eval(expr_id, &value_chunk)?;
 
     if new_values.data_type() == &DataType::Utf8 && new_values.null_count() == 0 {
@@ -97,6 +86,25 @@ pub(crate) fn try_peel_dict_expr(
     let expanded = take(new_values.as_ref(), dict.keys(), None)
         .map_err(|e| format!("dictionary peel take failed: {e}"))?;
     Ok(Some(expanded))
+}
+
+fn dict_values_chunk_for_source(
+    chunk: &Chunk,
+    source_slot: SlotId,
+    values: ArrayRef,
+) -> Result<Chunk, String> {
+    let source_slot_schema = chunk
+        .chunk_schema()
+        .slot(source_slot)
+        .ok_or_else(|| format!("slot id {} missing from chunk schema", source_slot))?;
+    let value_field = source_slot_schema
+        .field()
+        .clone()
+        .with_data_type(values.data_type().clone())
+        .with_nullable(values.is_nullable());
+    let value_slot = source_slot_schema.with_field(value_field)?;
+    let value_schema = Arc::new(ChunkSchema::try_new(vec![value_slot])?);
+    Chunk::try_new_with_columns(value_schema, vec![values])
 }
 
 fn peel_source_slot(arena: &ExprArena, expr_id: ExprId) -> Option<SlotId> {
@@ -115,19 +123,43 @@ fn collect_referenced_slots(
     expr_id: ExprId,
     slots: &mut BTreeSet<SlotId>,
 ) -> bool {
+    collect_referenced_slots_with_bound(arena, expr_id, &BTreeSet::new(), slots)
+}
+
+fn collect_referenced_slots_with_bound(
+    arena: &ExprArena,
+    expr_id: ExprId,
+    bound: &BTreeSet<SlotId>,
+    slots: &mut BTreeSet<SlotId>,
+) -> bool {
     let Some(node) = arena.node(expr_id) else {
         return false;
     };
     match node {
         ExprNode::Literal(_) => true,
         ExprNode::SlotId(slot_id) => {
-            slots.insert(*slot_id);
+            if !bound.contains(slot_id) {
+                slots.insert(*slot_id);
+            }
             true
         }
         ExprNode::ArrayExpr { elements } | ExprNode::StructExpr { fields: elements } => {
-            collect_all_referenced_slots(arena, elements, slots)
+            collect_all_referenced_slots_with_bound(arena, elements, bound, slots)
         }
-        ExprNode::LambdaFunction { .. } => false,
+        ExprNode::LambdaFunction {
+            body,
+            arg_slots,
+            common_sub_exprs,
+            ..
+        } => {
+            let mut nested_bound = bound.clone();
+            nested_bound.extend(arg_slots.iter().copied());
+            nested_bound.extend(common_sub_exprs.iter().map(|(slot_id, _)| *slot_id));
+            collect_referenced_slots_with_bound(arena, *body, &nested_bound, slots)
+                && common_sub_exprs.iter().all(|(_, expr_id)| {
+                    collect_referenced_slots_with_bound(arena, *expr_id, &nested_bound, slots)
+                })
+        }
         ExprNode::DictDecode { child, .. }
         | ExprNode::Cast(child)
         | ExprNode::CastTime(child)
@@ -135,7 +167,9 @@ fn collect_referenced_slots(
         | ExprNode::Not(child)
         | ExprNode::IsNull(child)
         | ExprNode::IsNotNull(child)
-        | ExprNode::Clone(child) => collect_referenced_slots(arena, *child, slots),
+        | ExprNode::Clone(child) => {
+            collect_referenced_slots_with_bound(arena, *child, bound, slots)
+        }
         ExprNode::Add(left, right)
         | ExprNode::Sub(left, right)
         | ExprNode::Mul(left, right)
@@ -150,27 +184,32 @@ fn collect_referenced_slots(
         | ExprNode::Ge(left, right)
         | ExprNode::And(left, right)
         | ExprNode::Or(left, right) => {
-            collect_referenced_slots(arena, *left, slots)
-                && collect_referenced_slots(arena, *right, slots)
+            collect_referenced_slots_with_bound(arena, *left, bound, slots)
+                && collect_referenced_slots_with_bound(arena, *right, bound, slots)
         }
         ExprNode::In { child, values, .. } => {
-            collect_referenced_slots(arena, *child, slots)
-                && collect_all_referenced_slots(arena, values, slots)
+            collect_referenced_slots_with_bound(arena, *child, bound, slots)
+                && collect_all_referenced_slots_with_bound(arena, values, bound, slots)
         }
-        ExprNode::Case { children, .. } => collect_all_referenced_slots(arena, children, slots),
-        ExprNode::FunctionCall { args, .. } => collect_all_referenced_slots(arena, args, slots),
+        ExprNode::Case { children, .. } => {
+            collect_all_referenced_slots_with_bound(arena, children, bound, slots)
+        }
+        ExprNode::FunctionCall { args, .. } => {
+            collect_all_referenced_slots_with_bound(arena, args, bound, slots)
+        }
     }
 }
 
-fn collect_all_referenced_slots(
+fn collect_all_referenced_slots_with_bound(
     arena: &ExprArena,
     expr_ids: &[ExprId],
+    bound: &BTreeSet<SlotId>,
     slots: &mut BTreeSet<SlotId>,
 ) -> bool {
     expr_ids
         .iter()
         .copied()
-        .all(|expr_id| collect_referenced_slots(arena, expr_id, slots))
+        .all(|expr_id| collect_referenced_slots_with_bound(arena, expr_id, bound, slots))
 }
 
 fn is_peel_safe_expr(arena: &ExprArena, expr_id: ExprId) -> bool {
@@ -210,31 +249,20 @@ fn is_peel_safe_function(kind: FunctionKind) -> bool {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Array, ArrayRef, DictionaryArray, StringArray};
+    use arrow::array::{Array, ArrayRef, DictionaryArray, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type};
 
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::function::FunctionKind;
-    use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
+    use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 
     use super::{
         expr_can_peel_from_slot, is_supported_i32_string_dictionary, referenced_slots,
         try_peel_dict_expr,
     };
 
-    fn dict_status_chunk(slot_id: SlotId) -> Chunk {
-        let values: ArrayRef = Arc::new(
-            vec![
-                Some("PAID"),
-                None,
-                Some("New"),
-                Some("PAID"),
-                Some(" shipped "),
-            ]
-            .into_iter()
-            .collect::<DictionaryArray<Int32Type>>(),
-        );
+    fn chunk_with_column(slot_id: SlotId, values: ArrayRef) -> Chunk {
         let slot = ChunkSlotSchema::new_with_field(
             slot_id,
             Field::new("status", values.data_type().clone(), true),
@@ -248,19 +276,38 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn peel_lower_over_utf8_dictionary_reuses_keys_and_lowercases_values() {
-        let slot = SlotId::new(7);
-        let chunk = dict_status_chunk(slot);
-        let mut arena = ExprArena::default();
+    fn dict_status_chunk(slot_id: SlotId) -> Chunk {
+        let values: ArrayRef = Arc::new(
+            vec![
+                Some("PAID"),
+                None,
+                Some("New"),
+                Some("PAID"),
+                Some(" shipped "),
+            ]
+            .into_iter()
+            .collect::<DictionaryArray<Int32Type>>(),
+        );
+        chunk_with_column(slot_id, values)
+    }
+
+    fn lower_expr_for_slot(arena: &mut ExprArena, slot: SlotId) -> ExprId {
         let source = arena.push_typed(ExprNode::SlotId(slot), DataType::Utf8);
-        let lower = arena.push_typed(
+        arena.push_typed(
             ExprNode::FunctionCall {
                 kind: FunctionKind::String("lower"),
                 args: vec![source],
             },
             DataType::Utf8,
-        );
+        )
+    }
+
+    #[test]
+    fn peel_lower_over_utf8_dictionary_reuses_keys_and_lowercases_values() {
+        let slot = SlotId::new(7);
+        let chunk = dict_status_chunk(slot);
+        let mut arena = ExprArena::default();
+        let lower = lower_expr_for_slot(&mut arena, slot);
 
         assert!(expr_can_peel_from_slot(&arena, lower, slot));
         let out = try_peel_dict_expr(&arena, lower, &chunk)
@@ -315,6 +362,62 @@ mod tests {
             vec![slot]
         );
         assert!(!expr_can_peel_from_slot(&arena, coalesce, slot));
+    }
+
+    #[test]
+    fn lambda_slot_collection_reports_captures_but_excludes_bound_and_cse_slots() {
+        let lambda_arg = SlotId::new(21);
+        let captured_outer = SlotId::new(22);
+        let cse_slot = SlotId::new(23);
+        let captured_by_cse = SlotId::new(24);
+
+        let mut arena = ExprArena::default();
+        let arg_ref = arena.push_typed(ExprNode::SlotId(lambda_arg), DataType::Int32);
+        let captured_ref = arena.push_typed(ExprNode::SlotId(captured_outer), DataType::Int32);
+        let cse_ref = arena.push_typed(ExprNode::SlotId(cse_slot), DataType::Int32);
+        let body = arena.push_typed(
+            ExprNode::ArrayExpr {
+                elements: vec![arg_ref, captured_ref, cse_ref],
+            },
+            DataType::Null,
+        );
+        let cse_expr = arena.push_typed(ExprNode::SlotId(captured_by_cse), DataType::Int32);
+        let lambda = arena.push_typed(
+            ExprNode::LambdaFunction {
+                body,
+                arg_slots: vec![lambda_arg],
+                common_sub_exprs: vec![(cse_slot, cse_expr)],
+                is_nondeterministic: false,
+            },
+            DataType::Null,
+        );
+
+        assert_eq!(
+            referenced_slots(&arena, lambda)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![captured_outer, captured_by_cse]
+        );
+        assert!(!expr_can_peel_from_slot(&arena, lambda, captured_outer));
+    }
+
+    #[test]
+    fn dictionary_values_with_null_entries_are_not_peeled() {
+        let slot = SlotId::new(10);
+        let values: ArrayRef = Arc::new(StringArray::from(vec![Some("PAID"), None, Some("New")]));
+        let keys = Int32Array::from(vec![Some(0), Some(1), None, Some(2)]);
+        let dict: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
+        let chunk = chunk_with_column(slot, dict);
+        let mut arena = ExprArena::default();
+        let lower = lower_expr_for_slot(&mut arena, slot);
+
+        assert!(expr_can_peel_from_slot(&arena, lower, slot));
+        assert!(
+            try_peel_dict_expr(&arena, lower, &chunk)
+                .expect("null dictionary values should not error")
+                .is_none()
+        );
     }
 
     #[test]
