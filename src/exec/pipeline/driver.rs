@@ -908,6 +908,7 @@ impl PipelineDriver {
                 continue;
             }
             let mut chunk = self.edge_chunks[e].take().expect("checked is_some");
+            chunk = crate::exec::chunk::hydrate_dictionary_columns(&chunk)?;
             if let Some(tracker) = self
                 .operator_mem_trackers
                 .get(downstream_idx)
