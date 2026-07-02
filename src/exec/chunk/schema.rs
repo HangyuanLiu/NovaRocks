@@ -297,6 +297,13 @@ fn is_dictionary_string_carrier(expected: &DataType, actual: &DataType) -> bool 
 
 impl ChunkSchema {
     pub fn try_new(slots: Vec<ChunkSlotSchema>) -> Result<Self, String> {
+        Self::try_new_with_schema_metadata(slots, HashMap::new())
+    }
+
+    pub(crate) fn try_new_with_schema_metadata(
+        slots: Vec<ChunkSlotSchema>,
+        metadata: HashMap<String, String>,
+    ) -> Result<Self, String> {
         let mut index_by_slot = HashMap::with_capacity(slots.len());
         let mut slot_ids = Vec::with_capacity(slots.len());
         let mut fields = Vec::with_capacity(slots.len());
@@ -313,7 +320,9 @@ impl ChunkSchema {
         }
         Ok(Self {
             slots,
-            arrow_schema: Arc::new(arrow::datatypes::Schema::new(fields)),
+            arrow_schema: Arc::new(arrow::datatypes::Schema::new_with_metadata(
+                fields, metadata,
+            )),
             slot_ids,
             index_by_slot,
         })

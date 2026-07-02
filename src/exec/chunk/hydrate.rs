@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
@@ -59,7 +59,6 @@ pub(crate) fn hydrate_dictionary_columns_except(
 ) -> Result<Chunk, String> {
     let mut changed = false;
     let mut columns = Vec::with_capacity(chunk.columns().len());
-    let mut fields = Vec::with_capacity(chunk.schema().fields().len());
     let mut slots = Vec::with_capacity(chunk.chunk_schema().slots().len());
 
     for (idx, ((column, field), slot)) in chunk
@@ -82,12 +81,10 @@ pub(crate) fn hydrate_dictionary_columns_except(
                     )
                 })?;
                 columns.push(flat);
-                fields.push(Arc::new(flat_field.clone()));
                 slots.push(slot.with_field(flat_field)?);
             }
             _ => {
                 columns.push(Arc::clone(column));
-                fields.push(Arc::clone(field));
                 slots.push(slot.clone());
             }
         }
@@ -97,19 +94,13 @@ pub(crate) fn hydrate_dictionary_columns_except(
         return Ok(chunk.clone());
     }
 
-    let schema = Arc::new(Schema::new_with_metadata(
-        fields,
+    let chunk_schema = Arc::new(ChunkSchema::try_new_with_schema_metadata(
+        slots,
         chunk.schema().metadata().clone(),
-    ));
-    let batch = RecordBatch::try_new(schema.clone(), columns)
+    )?);
+    let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
         .map_err(|e| format!("build hydrated chunk record batch failed: {e}"))?;
-    let chunk_schema = Arc::new(ChunkSchema::try_new(slots)?);
-    let mut hydrated = Chunk::try_new_with_chunk_schema(batch, chunk_schema)?;
-    if hydrated.schema().metadata() != schema.metadata() {
-        hydrated.batch = RecordBatch::try_new(schema, hydrated.columns().to_vec())
-            .map_err(|e| format!("restore hydrated chunk schema metadata failed: {e}"))?;
-    }
-    Ok(hydrated)
+    Chunk::try_new_with_chunk_schema(batch, chunk_schema)
 }
 
 #[cfg(test)]
@@ -373,6 +364,10 @@ mod tests {
             hydrate_dictionary_columns_except(&chunk, |_, _| false).expect("hydrate all");
 
         assert_eq!(hydrated.schema().metadata(), &schema_metadata);
+        assert_eq!(
+            hydrated.chunk_schema().arrow_schema_ref().metadata(),
+            &schema_metadata
+        );
     }
 
     #[test]
