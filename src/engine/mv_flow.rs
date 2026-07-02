@@ -744,6 +744,15 @@ pub(crate) fn execute_query_for_mv_refresh(
     current_database: &str,
     sql: &str,
 ) -> Result<QueryResult, String> {
+    execute_query_for_mv_refresh_with_catalog(state, None, current_database, sql)
+}
+
+pub(crate) fn execute_query_for_mv_refresh_with_catalog(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    sql: &str,
+) -> Result<QueryResult, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
     let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
         .map_err(|e| format!("sql parser error: {e}"))?;
@@ -751,7 +760,13 @@ pub(crate) fn execute_query_for_mv_refresh(
         return Err("REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string());
     };
 
-    crate::engine::execute_query_with_catalog_mgr(state, None, current_database, &query, None)
+    crate::engine::execute_query_with_catalog_mgr(
+        state,
+        current_catalog,
+        current_database,
+        &query,
+        None,
+    )
 }
 
 fn normalize_incremental_mv_base_ref(

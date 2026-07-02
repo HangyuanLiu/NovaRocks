@@ -1569,11 +1569,12 @@ fn register_iceberg_tables_for_mv_analysis(
         };
         drop_local_table_registration_if_exists(state, namespace, table)?;
         let resolved = catalog_backend
-            .load_table(catalog, namespace, table)
+            .load_table_for_read(catalog, namespace, table)
             .map_err(|err| {
                 format!("load iceberg table {catalog}.{namespace}.{table} failed: {err}")
             })?;
-        let table_def = table_source.build_table_def(&resolved)?;
+        let mut table_def = table_source.build_table_def(&resolved)?;
+        table_def.name = table.clone();
         let mut local_catalog = state
             .catalog
             .write()

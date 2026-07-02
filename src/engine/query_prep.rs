@@ -467,14 +467,15 @@ pub(crate) fn materialize_external_schema_table_for_statement(
     drop_local_table_registration_if_exists(state, &target.namespace, &target.table)?;
 
     let resolved = catalog
-        .load_table(&target.catalog, &target.namespace, &target.table)
+        .load_table_for_read(&target.catalog, &target.namespace, &target.table)
         .map_err(|err| {
             format!(
                 "load iceberg table {}.{}.{} failed: {err}",
                 target.catalog, target.namespace, target.table
             )
         })?;
-    let table_def = source.build_schema_table_def(&resolved)?;
+    let mut table_def = source.build_schema_table_def(&resolved)?;
+    table_def.name = target.table;
     register_local_table_registration(state, &target.namespace, table_def)
 }
 

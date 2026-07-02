@@ -25,6 +25,7 @@ use super::registry::{
 };
 use super::views;
 
+const NR_MV_STORAGE_PREFIX: &str = "__nr_mv_";
 const NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
 const NOVAROCKS_MV_HIDDEN_COLUMNS_PROPERTY: &str = "novarocks.mv.hidden-columns";
 pub(crate) const ICEBERG_ROW_IDENTITY_FILE_COLUMN: &str = "_file";
@@ -42,6 +43,46 @@ impl IcebergCatalogBackend {
     fn entry(&self, catalog: &str) -> Result<IcebergCatalogEntry, String> {
         let guard = self.registry.read().expect("iceberg catalog read lock");
         guard.get(catalog)
+    }
+
+    fn resolved_table(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        loaded: IcebergLoadedTable,
+    ) -> ResolvedTable {
+        ResolvedTable {
+            catalog: catalog.to_string(),
+            namespace: namespace.to_string(),
+            table: table.to_string(),
+            columns: loaded.columns,
+        }
+    }
+
+    fn mv_storage_read_alias(table: &str) -> Option<String> {
+        if table.starts_with(NR_MV_STORAGE_PREFIX) {
+            None
+        } else {
+            Some(format!("{NR_MV_STORAGE_PREFIX}{table}"))
+        }
+    }
+
+    fn storage_matches_public_mv_alias(
+        namespace: &str,
+        public_table: &str,
+        storage_table: &str,
+        loaded: &IcebergLoadedTable,
+    ) -> Result<bool, String> {
+        let descriptor =
+            crate::meta::repository::mv_descriptor::MvDescriptorV1::from_storage_properties(
+                loaded.table.metadata().properties(),
+            )?;
+        Ok(descriptor
+            .public_view
+            .eq_ignore_ascii_case(&format!("{namespace}.{public_table}"))
+            && descriptor
+                .storage_table
+                .eq_ignore_ascii_case(&format!("{namespace}.{storage_table}")))
     }
 }
 
@@ -116,12 +157,41 @@ impl CatalogBackend for IcebergCatalogBackend {
         table: &str,
     ) -> Result<ResolvedTable, String> {
         let loaded = reg_load_table(&self.entry(catalog)?, namespace, table)?;
-        Ok(ResolvedTable {
-            catalog: catalog.to_string(),
-            namespace: namespace.to_string(),
-            table: table.to_string(),
-            columns: loaded.columns,
-        })
+        Ok(Self::resolved_table(catalog, namespace, table, loaded))
+    }
+
+    fn load_table_for_read(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<ResolvedTable, String> {
+        let entry = self.entry(catalog)?;
+        match reg_load_table(&entry, namespace, table) {
+            Ok(loaded) => return Ok(Self::resolved_table(catalog, namespace, table, loaded)),
+            Err(primary_err) => {
+                let Some(storage_table) = Self::mv_storage_read_alias(table) else {
+                    return Err(primary_err);
+                };
+                let Ok(loaded) = reg_load_table(&entry, namespace, &storage_table) else {
+                    return Err(primary_err);
+                };
+                match Self::storage_matches_public_mv_alias(
+                    namespace,
+                    table,
+                    &storage_table,
+                    &loaded,
+                ) {
+                    Ok(true) => Ok(Self::resolved_table(
+                        catalog,
+                        namespace,
+                        &storage_table,
+                        loaded,
+                    )),
+                    Ok(false) | Err(_) => Err(primary_err),
+                }
+            }
+        }
     }
 
     fn current_schema_id(
@@ -131,6 +201,39 @@ impl CatalogBackend for IcebergCatalogBackend {
         table: &str,
     ) -> Result<Option<i32>, String> {
         reg_current_schema_id(&self.entry(catalog)?, namespace, table).map(Some)
+    }
+
+    fn current_schema_id_for_read(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<(String, Option<i32>), String> {
+        let entry = self.entry(catalog)?;
+        match reg_current_schema_id(&entry, namespace, table) {
+            Ok(schema_id) => Ok((table.to_string(), Some(schema_id))),
+            Err(primary_err) => {
+                let Some(storage_table) = Self::mv_storage_read_alias(table) else {
+                    return Err(primary_err);
+                };
+                let Ok(loaded) = reg_load_table(&entry, namespace, &storage_table) else {
+                    return Err(primary_err);
+                };
+                match Self::storage_matches_public_mv_alias(
+                    namespace,
+                    table,
+                    &storage_table,
+                    &loaded,
+                ) {
+                    Ok(true) => {
+                        let schema_id =
+                            reg_current_schema_id(&entry, namespace, &storage_table).map(Some)?;
+                        Ok((storage_table, schema_id))
+                    }
+                    Ok(false) | Err(_) => Err(primary_err),
+                }
+            }
+        }
     }
 
     fn create_view(&self, req: CreateViewRequest) -> Result<(), String> {

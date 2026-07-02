@@ -49,7 +49,7 @@ impl<'a> CatalogMgrProvider<'a> {
             TableLookupMode::ExplainStats => {
                 let backend = self.connectors.catalog_backend("iceberg")?;
                 let source = self.connectors.table_source("iceberg")?;
-                let resolved = backend.load_table(catalog, database, table)?;
+                let resolved = backend.load_table_for_read(catalog, database, table)?;
                 source.build_table_def(&resolved)
             }
             TableLookupMode::IcebergMetadata {
@@ -57,7 +57,7 @@ impl<'a> CatalogMgrProvider<'a> {
             } => {
                 let backend = self.connectors.catalog_backend("iceberg")?;
                 let source = self.connectors.table_source("iceberg")?;
-                let resolved = backend.load_table(catalog, database, table)?;
+                let resolved = backend.load_table_for_read(catalog, database, table)?;
                 source.build_table_def(&resolved)
             }
             TableLookupMode::IcebergMetadata {
@@ -71,13 +71,13 @@ impl<'a> CatalogMgrProvider<'a> {
             {
                 let backend = self.connectors.catalog_backend("iceberg")?;
                 let source = self.connectors.table_source("iceberg")?;
-                let resolved = backend.load_table(catalog, database, table)?;
+                let resolved = backend.load_table_for_read(catalog, database, table)?;
                 source.build_metadata_rows_table_def(&resolved, metadata_table_type.clone())
             }
             TableLookupMode::IcebergMetadata { .. } => {
                 let backend = self.connectors.catalog_backend("iceberg")?;
                 let source = self.connectors.table_source("iceberg")?;
-                let resolved = backend.load_table(catalog, database, table)?;
+                let resolved = backend.load_table_for_read(catalog, database, table)?;
                 source.build_schema_table_def(&resolved)
             }
         }

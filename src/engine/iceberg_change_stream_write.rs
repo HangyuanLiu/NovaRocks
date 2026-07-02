@@ -121,6 +121,7 @@ impl ChangeStreamRoutedWriterFiles {
         if matches!(
             collector.op_kind,
             crate::connector::iceberg::commit::CommitOpKind::FastAppend
+                | crate::connector::iceberg::commit::CommitOpKind::Overwrite
         ) {
             let mut files = self.reuse_or_dv;
             files.extend(self.fresh);
@@ -331,9 +332,9 @@ mod tests {
             .metadata
     }
 
-    fn test_collector(metadata: &TableMetadata) -> IcebergCommitCollector {
+    fn test_collector(metadata: &TableMetadata, op_kind: CommitOpKind) -> IcebergCommitCollector {
         IcebergCommitCollector::new(
-            CommitOpKind::RowDeltaDvFromFiles,
+            op_kind,
             TableIdent::new(NamespaceIdent::new("db".to_string()), "t".to_string()),
             metadata.current_snapshot().map(|s| s.snapshot_id()),
             metadata.last_sequence_number(),
@@ -431,7 +432,7 @@ mod tests {
     #[test]
     fn change_stream_commit_routes_fresh_files_to_appended_channel() {
         let metadata = test_unpartitioned_metadata();
-        let collector = test_collector(&metadata);
+        let collector = test_collector(&metadata, CommitOpKind::RowDeltaDvFromFiles);
         let write_commit = write_commit_for_fragments(
             &metadata,
             vec![(10, "reuse.parquet"), (11, "fresh.parquet")],
@@ -464,9 +465,34 @@ mod tests {
     }
 
     #[test]
+    fn change_stream_commit_routes_overwrite_fresh_files_to_written_channel() {
+        let metadata = test_unpartitioned_metadata();
+        let collector = test_collector(&metadata, CommitOpKind::Overwrite);
+        let write_commit = write_commit_for_fragments(
+            &metadata,
+            vec![(10, "reuse.parquet"), (11, "fresh.parquet")],
+        );
+        let plan = ChangeStreamWriterCommitPlan::new(BTreeMap::from([
+            (10, ChangeStreamWriteBranchKind::ReuseData),
+            (11, ChangeStreamWriteBranchKind::FreshData),
+        ]));
+
+        route_change_stream_writer_reports(&collector, &metadata, &write_commit, &plan)
+            .expect("route writer reports")
+            .inject(&collector);
+
+        let written = collector.take_written_files().expect("written channel");
+        assert_eq!(
+            written.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["reuse.parquet", "fresh.parquet"]
+        );
+        assert!(collector.take_appended_files().is_empty());
+    }
+
+    #[test]
     fn change_stream_commit_rejects_unknown_writer_fragment() {
         let metadata = test_unpartitioned_metadata();
-        let collector = test_collector(&metadata);
+        let collector = test_collector(&metadata, CommitOpKind::RowDeltaDvFromFiles);
         let write_commit = write_commit_for_fragments(&metadata, vec![(12, "unknown.parquet")]);
         let plan = ChangeStreamWriterCommitPlan::new(BTreeMap::from([(
             10,

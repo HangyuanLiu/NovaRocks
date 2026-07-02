@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::connector::starrocks::table::mv_ddl::ResolvedTableRef;
 use crate::engine::StandaloneState;
+use crate::engine::mv::iceberg_refresh::nr_mv_storage_lookup_name;
 use crate::meta::repository::mv::{
     CreateMvDependencyRequest, MvDependencyObjectRef, MvDependencyObjectType,
     MvDependencyStorageEngine, StoredMvDefinition,
@@ -133,21 +134,27 @@ pub(crate) fn resolve_create_mv_dependencies(
                 namespace,
                 table,
             } => {
+                let storage_table = nr_mv_storage_lookup_name(table);
+                let is_mv_dependency = state
+                    .mv_repo
+                    .find_by_target(read.as_ref(), catalog, namespace, &storage_table)
+                    .map_err(|e| format!("load MV target dependency failed: {e}"))?
+                    .is_some();
+                let base_table = if is_mv_dependency {
+                    storage_table
+                } else {
+                    table.clone()
+                };
                 let base = IcebergTableRef {
                     catalog: catalog.clone(),
                     namespace: namespace.clone(),
-                    table: table.clone(),
+                    table: base_table.clone(),
                 };
                 if !base_refs.contains(&base) {
                     base_refs.push(base.clone());
                 }
-                let upstream = if state
-                    .mv_repo
-                    .find_by_target(read.as_ref(), catalog, namespace, table)
-                    .map_err(|e| format!("load MV target dependency failed: {e}"))?
-                    .is_some()
-                {
-                    iceberg_mv_dependency_ref(catalog, namespace, table)
+                let upstream = if is_mv_dependency {
+                    iceberg_mv_dependency_ref(catalog, namespace, &base_table)
                 } else {
                     iceberg_table_dependency_ref(&base)
                 };
