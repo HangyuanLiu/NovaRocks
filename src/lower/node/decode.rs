@@ -32,7 +32,7 @@ use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::{Layout, chunk_schema_for_layout, slot_arrow_type_lookup};
-use crate::lower::node::Lowered;
+use crate::lower::node::{Lowered, PlanOrigin};
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::novarocks_logging::info;
 use crate::thrift::{data, descriptors, exprs, plan_nodes, types};
@@ -611,6 +611,23 @@ fn supports_dict_decode_input_type(data_type: &DataType) -> bool {
     }
 }
 
+fn dict_decode_input_supported_for_origin(
+    encoded_slot_id: types::TSlotId,
+    encoded_type: &DataType,
+    plan_origin: PlanOrigin,
+) -> Result<bool, String> {
+    if supports_dict_decode_input_type(encoded_type) {
+        return Ok(true);
+    }
+    if plan_origin == PlanOrigin::StarRocksFeCompatible {
+        return Err(format!(
+            "DECODE_NODE encoded slot_id={} has non-integer input type {:?} in FE-compatible global dict path",
+            encoded_slot_id, encoded_type
+        ));
+    }
+    Ok(false)
+}
+
 pub(crate) fn lower_decode_node(
     child: Lowered,
     node: &plan_nodes::TPlanNode,
@@ -618,6 +635,7 @@ pub(crate) fn lower_decode_node(
     arena: &mut ExprArena,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     query_global_dict_map: &QueryGlobalDictMap,
+    plan_origin: PlanOrigin,
 ) -> Result<Lowered, String> {
     let decode = node
         .decode_node
@@ -673,10 +691,9 @@ pub(crate) fn lower_decode_node(
                         encoded_tuple_id, encoded_slot_id
                     )
                 })?;
-            let encoded_expr = arena.push_typed(ExprNode::SlotId(encoded_slot), encoded_type);
-            if arena
-                .data_type(encoded_expr)
-                .is_some_and(supports_dict_decode_input_type)
+            let encoded_expr =
+                arena.push_typed(ExprNode::SlotId(encoded_slot), encoded_type.clone());
+            if dict_decode_input_supported_for_origin(*encoded_slot_id, &encoded_type, plan_origin)?
             {
                 arena.push_typed(
                     ExprNode::DictDecode {
@@ -727,6 +744,32 @@ mod tests {
             Some(ids),
             None,
         )
+    }
+
+    #[test]
+    fn fe_compatible_decode_rejects_non_integer_encoded_input() {
+        let err = dict_decode_input_supported_for_origin(
+            7,
+            &DataType::Utf8,
+            crate::lower::node::PlanOrigin::StarRocksFeCompatible,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("DECODE_NODE encoded slot_id=7"), "{err}");
+        assert!(err.contains("FE-compatible"), "{err}");
+        assert!(err.contains("Utf8"), "{err}");
+    }
+
+    #[test]
+    fn native_decode_keeps_existing_noop_behavior_for_non_integer_input() {
+        let supported = dict_decode_input_supported_for_origin(
+            7,
+            &DataType::Utf8,
+            crate::lower::node::PlanOrigin::NovaRocksGenerated,
+        )
+        .unwrap();
+
+        assert!(!supported);
     }
 
     #[test]

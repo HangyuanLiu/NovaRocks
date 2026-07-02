@@ -474,6 +474,7 @@ fn lower_node_with_children(
                 arena,
                 desc_tbl,
                 query_global_dict_map,
+                plan_origin,
             )?
         }
         t if t == plan_nodes::TPlanNodeType::UNION_NODE => lower_union_node(
