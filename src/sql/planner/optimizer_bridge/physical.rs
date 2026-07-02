@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 
-use crate::sql::analysis::TypedExpr;
+use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::scalar_materialize::{
     materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
 };
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::operator::{Operator, PhysicalDistributionOp};
 use crate::sql::optimizer::physical_tree::{JoinExecutionDistribution, OptimizerPhysicalNode};
 use crate::sql::optimizer::property::DistributionSpec;
@@ -453,7 +454,7 @@ fn redistribute_mode(op: &PhysicalDistributionOp) -> Result<RedistributeMode, St
 }
 
 fn redistribute_partition_exprs(
-    scalars: &ScalarArena,
+    _scalars: &ScalarArena,
     mode: &RedistributeMode,
     child: &OptimizerPhysicalNode,
 ) -> Vec<TypedExpr> {
@@ -466,20 +467,29 @@ fn redistribute_partition_exprs(
 
     let mut exprs = Vec::with_capacity(cols.len());
     for col_id in cols {
-        let Some(position) = aggregate
+        let Some(column) = aggregate
             .output_layout
             .group_key_columns
             .iter()
-            .position(|column| column.column_id == *col_id)
+            .find(|column| column.column_id == *col_id)
         else {
             return Vec::new();
         };
-        let Some(group_by) = aggregate.group_by.get(position) else {
-            return Vec::new();
-        };
-        exprs.push(materialize(scalars, *group_by));
+        exprs.push(output_column_ref(column));
     }
     exprs
+}
+
+fn output_column_ref(column: &OutputColumn) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id: column.column_id,
+            qualifier: None,
+            column: column.name.clone(),
+        },
+        data_type: column.data_type.clone(),
+        nullable: column.nullable,
+    }
 }
 
 fn planner_confidence(confidence: Confidence) -> PlannerConfidence {
@@ -807,8 +817,52 @@ mod tests {
             panic!("expected partition ColumnRef");
         };
         assert_eq!(*column_id, ColumnId::new_for_test(7));
-        assert_eq!(qualifier.as_deref(), Some("a"));
+        assert_eq!(qualifier.as_deref(), None);
         assert_eq!(column, "k");
+    }
+
+    #[test]
+    fn physical_distribution_over_aggregate_partitions_by_group_key_output_id() {
+        let mut arena = ScalarArena::new();
+        let group_expr = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId::new_for_test(7),
+                    qualifier: Some("a".to_string()),
+                    column: "k".to_string(),
+                },
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+            },
+        );
+        let group_column = output_column(8, "k_group");
+        let mut aggregate = base_node(Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::Global,
+            group_by: vec![group_expr],
+            aggregates: vec![],
+            output_layout: AggregateOutputLayout::new(vec![group_column.clone()], vec![]),
+            output_columns: vec![group_column.clone()],
+            is_merge: vec![],
+        }));
+        aggregate.children.push(raw_values_node());
+        let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
+            spec: DistributionSpec::HashPartitioned {
+                cols: vec![ColumnId::new_for_test(8)],
+                source: HashSource::ShuffleAgg,
+            },
+        }));
+        node.output_columns = vec![group_column];
+        node.children.push(aggregate);
+        let node = attach_arena(node, Arc::new(arena));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
+            panic!("expected Redistribute");
+        };
+
+        assert_eq!(redistribute.partition_exprs.len(), 1);
+        assert_column_ref(&redistribute.partition_exprs[0], 8, "k_group");
     }
 
     #[test]
