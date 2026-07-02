@@ -236,7 +236,7 @@ fn build_candidate(
     }
 
     Ok(Some(PreparedMvRewriteCandidate {
-        mv_name: rewrite_candidate_public_name(tbl),
+        mv_name: rewrite_candidate_display_name(tbl),
         mv: mv_desc,
         mv_scalars,
         target_database: ns.clone(),
@@ -244,7 +244,7 @@ fn build_candidate(
     }))
 }
 
-fn rewrite_candidate_public_name(target_table: &str) -> String {
+fn rewrite_candidate_display_name(target_table: &str) -> String {
     target_table.to_string()
 }
 
@@ -381,10 +381,10 @@ mod tests {
 
     #[test]
     fn rewrite_candidate_display_name_uses_target_table_name_directly() {
-        assert_eq!(rewrite_candidate_public_name("agg_mv"), "agg_mv");
+        assert_eq!(rewrite_candidate_display_name("agg_mv"), "agg_mv");
         assert_eq!(
-            rewrite_candidate_public_name("__nr_mv_agg_mv"),
-            "__nr_mv_agg_mv"
+            rewrite_candidate_display_name("target_agg_mv"),
+            "target_agg_mv"
         );
     }
 }

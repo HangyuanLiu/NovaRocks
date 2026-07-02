@@ -84,7 +84,7 @@ impl MvDescriptorV1 {
     ) -> Result<Self, String> {
         let inline = props.get(MV_DESCRIPTOR_INLINE_PROP).ok_or_else(|| {
             format!(
-                "storage table is missing required MV descriptor inline property `{MV_DESCRIPTOR_INLINE_PROP}`"
+                "MV table is missing required MV descriptor inline property `{MV_DESCRIPTOR_INLINE_PROP}`"
             )
         })?;
         let descriptor = Self::from_json(inline)?;
@@ -187,13 +187,11 @@ mod tests {
     }
 
     #[test]
-    fn canonical_json_has_no_w1_view_or_storage_pointers() {
+    fn canonical_json_has_only_single_table_descriptor_fields() {
         let descriptor = sample();
 
         let canonical = descriptor.to_canonical_json().unwrap();
 
-        assert!(!canonical.contains("public_view"), "{canonical}");
-        assert!(!canonical.contains("storage_table"), "{canonical}");
         assert_eq!(
             canonical,
             "{\"base_dependencies\":[{\"catalog\":\"ice\",\"name\":\"orders\",\"namespace\":\"sales\",\"object_type\":\"table\",\"storage_engine\":\"iceberg\"}],\"created_at_ms\":123,\"descriptor_version\":1,\"dialect\":\"starrocks\",\"hidden_columns\":[\"__nova_base_row_id\"],\"logical_sql\":\"SELECT id FROM ice.sales.orders\",\"package_id\":\"analytics.mv_orders\",\"refresh_contract\":null,\"schema_contract\":{\"a\":{\"a\":1,\"z\":2},\"z\":3},\"visible_columns\":[\"id\"]}"

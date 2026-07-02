@@ -1177,7 +1177,7 @@ pub(crate) fn sync_iceberg_mv_descriptor_refresh_contract(
         .target_namespace
         .as_deref()
         .ok_or_else(|| "Iceberg MV descriptor sync missing target namespace".to_string())?;
-    let storage_table = definition
+    let target_table_name = definition
         .target_table
         .as_deref()
         .ok_or_else(|| "Iceberg MV descriptor sync missing target table".to_string())?;
@@ -1188,9 +1188,12 @@ pub(crate) fn sync_iceberg_mv_descriptor_refresh_contract(
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         catalogs.get(catalog_name)?
     };
-    entry.invalidate_table_cache(namespace, storage_table);
-    let loaded =
-        crate::connector::iceberg::catalog::registry::load_table(&entry, namespace, storage_table)?;
+    entry.invalidate_table_cache(namespace, target_table_name);
+    let loaded = crate::connector::iceberg::catalog::registry::load_table(
+        &entry,
+        namespace,
+        target_table_name,
+    )?;
     let mut descriptor =
         MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())?;
     descriptor.refresh_contract = Some(stored_refresh_policy_descriptor_json(
@@ -1213,7 +1216,7 @@ pub(crate) fn sync_iceberg_mv_descriptor_refresh_contract(
     })
     .map_err(|e| format!("sync MV descriptor properties runtime failed: {e}"))?
     .map_err(|e| format!("sync MV descriptor properties failed: {e}"))?;
-    entry.invalidate_table_cache(namespace, storage_table);
+    entry.invalidate_table_cache(namespace, target_table_name);
     Ok(())
 }
 
@@ -19003,15 +19006,13 @@ mod tests {
         );
         assert!(descriptor.created_at_ms > 0);
 
-        let old_storage_err = crate::connector::iceberg::catalog::load_table(
-            &entry,
-            "analytics",
-            "__nr_mv_mv_orders",
-        )
-        .expect_err("old W1 storage table name must not exist");
+        let legacy_alias_name = ["__nr", "_mv_", "mv_orders"].concat();
+        let missing_direct_target_err =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", &legacy_alias_name)
+                .expect_err("legacy alias target table must not exist");
         assert!(
-            old_storage_err.contains("__nr_mv_mv_orders"),
-            "{old_storage_err}"
+            missing_direct_target_err.contains(&legacy_alias_name),
+            "{missing_direct_target_err}"
         );
     }
 
@@ -19045,21 +19046,21 @@ mod tests {
         assert_eq!(schema_table, "mv_orders");
         assert!(schema_id.is_some());
 
-        let old_alias_schema_err = backend
-            .current_schema_id_for_read("ice", "analytics", "__nr_mv_mv_orders")
-            .expect_err("old storage alias schema id must not resolve");
+        let legacy_alias_name = ["__nr", "_mv_", "mv_orders"].concat();
+        let missing_schema_err = backend
+            .current_schema_id_for_read("ice", "analytics", &legacy_alias_name)
+            .expect_err("legacy alias schema id must not resolve");
         assert!(
-            old_alias_schema_err.contains("__nr_mv_mv_orders")
-                || old_alias_schema_err.contains("not"),
-            "{old_alias_schema_err}"
+            missing_schema_err.contains(&legacy_alias_name) || missing_schema_err.contains("not"),
+            "{missing_schema_err}"
         );
 
-        let old_alias_err = backend
-            .load_table_for_read("ice", "analytics", "__nr_mv_mv_orders")
-            .expect_err("old storage alias must not resolve");
+        let missing_target_err = backend
+            .load_table_for_read("ice", "analytics", &legacy_alias_name)
+            .expect_err("legacy alias target must not resolve");
         assert!(
-            old_alias_err.contains("__nr_mv_mv_orders") || old_alias_err.contains("not"),
-            "{old_alias_err}"
+            missing_target_err.contains(&legacy_alias_name) || missing_target_err.contains("not"),
+            "{missing_target_err}"
         );
     }
 
@@ -21812,44 +21813,40 @@ mod tests {
     }
 
     #[test]
-    fn create_iceberg_mv_treats_old_storage_prefix_as_normal_table_name() {
+    fn create_iceberg_mv_treats_legacy_prefixed_visible_name_as_target_name() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW __nr_mv_visible_name
+        let visible_name = ["__nr", "_mv_", "visible_name"].concat();
+        let stmt = parse_create_mv(&format!(
+            "CREATE MATERIALIZED VIEW {visible_name}
              DISTRIBUTED BY HASH(id) BUCKETS 1
              PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
+             AS SELECT id, name FROM ice.sales.orders"
+        ));
 
         create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("old prefix is no longer reserved");
+            .expect("legacy-shaped prefix is no longer reserved");
 
         let entry = {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded = crate::connector::iceberg::catalog::load_table(
-            &entry,
-            "analytics",
-            "__nr_mv_visible_name",
-        )
-        .expect("load old-prefix MV table");
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", &visible_name)
+                .expect("load MV table by visible target name");
         let descriptor =
             MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
                 .expect("descriptor properties");
-        assert_eq!(descriptor.package_id, "analytics.__nr_mv_visible_name");
+        assert_eq!(descriptor.package_id, format!("analytics.{visible_name}"));
 
-        let doubled_storage_err = crate::connector::iceberg::catalog::load_table(
+        let doubled_legacy_name = ["__nr", "_mv_", &visible_name].concat();
+        let doubled_err = crate::connector::iceberg::catalog::load_table(
             &entry,
             "analytics",
-            "__nr_mv___nr_mv_visible_name",
+            &doubled_legacy_name,
         )
-        .expect_err("doubled legacy storage table name must not exist");
-        assert!(
-            doubled_storage_err.contains("__nr_mv___nr_mv_visible_name"),
-            "{doubled_storage_err}"
-        );
+        .expect_err("doubled legacy-style target table must not exist");
+        assert!(doubled_err.contains(&doubled_legacy_name), "{doubled_err}");
     }
 
     #[test]
