@@ -1824,6 +1824,49 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_utf8_missing_comparison_operators_use_logical_values() {
+        let cases: [(&str, fn(ExprId, ExprId) -> ExprNode, Vec<Option<bool>>); 4] = [
+            (
+                "ne",
+                ExprNode::Ne,
+                vec![Some(true), Some(true), None, Some(false)],
+            ),
+            (
+                "le",
+                ExprNode::Le,
+                vec![Some(true), Some(false), None, Some(true)],
+            ),
+            (
+                "gt",
+                ExprNode::Gt,
+                vec![Some(false), Some(true), None, Some(false)],
+            ),
+            (
+                "ge",
+                ExprNode::Ge,
+                vec![Some(false), Some(true), None, Some(true)],
+            ),
+        ];
+
+        for (name, make_expr, expected) in cases {
+            let chunk = create_test_chunk_dict_status(vec![Some("a"), Some("c"), None, Some("b")]);
+            let mut arena = ExprArena::default();
+            let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+            let lit = arena.push_typed(
+                ExprNode::Literal(LiteralValue::Utf8("b".to_string())),
+                DataType::Utf8,
+            );
+            let expr = arena.push_typed(make_expr(slot, lit), DataType::Boolean);
+
+            let result = arena
+                .eval(expr, &chunk)
+                .unwrap_or_else(|err| panic!("dictionary {name}: {err}"));
+
+            assert_eq!(bool_values(&result), expected, "{name}");
+        }
+    }
+
+    #[test]
     fn test_lt_integers() {
         let mut arena = ExprArena::default();
         let lit3 = arena.push(ExprNode::Literal(LiteralValue::Int64(3)));
