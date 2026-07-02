@@ -307,10 +307,61 @@ fn distribution_is_crossable(node: &OptimizerPhysicalNode) -> bool {
     )
 }
 
+/// True when `node` is a `HashPartitioned` exchange whose partition columns
+/// carry every column of `probe_expr`. A Shuffle/Colocate probe RF may cross
+/// such an exchange because matching rows remain co-located by the shared
+/// partitioning; crossing an exchange partitioned on an unrelated key would
+/// place a probe that drops rows which legitimately join (a correctness gate).
+fn hash_partition_carries_probe_key(
+    node: &OptimizerPhysicalNode,
+    scalars: &ScalarArena,
+    probe_expr: ScalarId,
+) -> bool {
+    use crate::sql::optimizer::property::DistributionSpec;
+    let Operator::PhysicalDistribution(op) = &node.op else {
+        return false;
+    };
+    let DistributionSpec::HashPartitioned { cols, .. } = &op.spec else {
+        return false;
+    };
+    let mut needed = HashSet::new();
+    column_ids(scalars, probe_expr, &mut needed);
+    if needed.is_empty() {
+        return false;
+    }
+    needed.iter().all(|id| cols.contains(id))
+}
+
+/// How a probe runtime filter may cross a shuffle (`HashPartitioned`) exchange
+/// on its way down to the producing fragment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossExchangeMode {
+    /// Distribution unknown — never cross.
+    Disabled,
+    /// Broadcast: the build RF is complete at every instance
+    /// (StarRocks `directly_send_broadcast_grf`), so it may cross any shuffle
+    /// exchange unconditionally.
+    Unconditional,
+    /// Shuffle/Colocate: the merged (total) RF is only valid within the same
+    /// partitioning, so it may cross an exchange ONLY when that exchange
+    /// re-partitions on the probe key (StarRocks `canCrossExchangeNode`).
+    KeyAligned,
+}
+
+impl From<&JoinDistribution> for CrossExchangeMode {
+    fn from(d: &JoinDistribution) -> Self {
+        match d {
+            JoinDistribution::Broadcast => CrossExchangeMode::Unconditional,
+            JoinDistribution::Shuffle | JoinDistribution::Colocate => CrossExchangeMode::KeyAligned,
+            JoinDistribution::Unknown => CrossExchangeMode::Disabled,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ProbePushPolicy {
     allow_cross_exchange: bool,
-    cross_exchange_build_complete: bool,
+    cross_exchange: CrossExchangeMode,
 }
 
 fn join_is_outer_or_anti_boundary(kind: JoinKind) -> bool {
@@ -337,9 +388,14 @@ fn is_probe_semantic_boundary(node: &OptimizerPhysicalNode) -> bool {
 ///
 /// Rules:
 /// 1. Crossable exchange (HashPartitioned/shuffle): descend transparently only
-///    when the policy allows it and the build RF is complete. Shuffle exchanges
-///    preserve column ids and carry no projection, so no exchange bind check is
-///    needed in that case.
+///    when the policy allows it and `policy.cross_exchange` permits crossing
+///    THIS node — `Unconditional` (complete build RF, e.g. Broadcast) always
+///    permits it; `KeyAligned` (Shuffle/Colocate) permits it only when the
+///    exchange re-partitions on the probe key (`hash_partition_carries_probe_key`);
+///    `Disabled` never crosses. Shuffle exchanges preserve column ids and carry
+///    no projection, so no exchange bind check is needed once crossing is
+///    permitted. When crossing is not permitted, the exchange falls through to
+///    rule 2 and becomes a hard boundary.
 /// 2. Non-crossable exchange (Gather/Any): hard fragment boundary — stop.
 /// 3. If `node` cannot bind the probe, stop (return false) — do not descend.
 /// 4. Outer/anti/null-preserving joins are semantic boundaries: place there.
@@ -352,14 +408,22 @@ fn push_probe_down(
     probe: &RuntimeFilterProbe,
     policy: ProbePushPolicy,
 ) -> bool {
-    if policy.allow_cross_exchange
-        && policy.cross_exchange_build_complete
-        && distribution_is_crossable(node)
-    {
-        if let Some(child) = node.children.first_mut() {
-            return push_probe_down(child, scalars, probe, policy);
+    if policy.allow_cross_exchange && distribution_is_crossable(node) {
+        let may_cross = match policy.cross_exchange {
+            CrossExchangeMode::Unconditional => true,
+            CrossExchangeMode::KeyAligned => {
+                hash_partition_carries_probe_key(node, scalars, probe.probe_expr)
+            }
+            CrossExchangeMode::Disabled => false,
+        };
+        if may_cross {
+            if let Some(child) = node.children.first_mut() {
+                return push_probe_down(child, scalars, probe, policy);
+            }
+            return false;
         }
-        return false;
+        // Not allowed to cross this exchange: fall through so it is treated as a
+        // hard boundary (probe stays build-only for this branch).
     }
     if is_exchange(node) {
         return false;
@@ -515,11 +579,12 @@ fn annotate_node(
     }
 
     // Push each probe descriptor down to the deepest binding descendant within
-    // the true probe child. Stops at exchange (fragment) boundaries.
+    // the true probe child. Stops at exchange (fragment) boundaries unless
+    // `CrossExchangeMode` permits crossing (see `push_probe_down`).
     // If no binding node is found the RF is build-only (probe remains unplaced).
     let policy = ProbePushPolicy {
         allow_cross_exchange: options.allow_cross_exchange_rf,
-        cross_exchange_build_complete: matches!(distribution, JoinDistribution::Broadcast),
+        cross_exchange: CrossExchangeMode::from(&distribution),
     };
     for d in &descs {
         let probe = RuntimeFilterProbe {
@@ -898,6 +963,70 @@ pub(crate) mod test_support {
         with_scalars(plan, scalars)
     }
 
+    /// Shuffle join where the probe child is a `PhysicalDistribution(HashPartitioned)`
+    /// over a leaf scan, but the exchange re-partitions on a column UNRELATED to the
+    /// probe key. Tests that a Shuffle probe RF stops at (does not cross) an exchange
+    /// whose partitioning does not carry the probe key — crossing it would place a
+    /// probe that drops rows which legitimately join.
+    pub(crate) fn shuffle_join_with_misaligned_probe_exchange() -> OptimizerPhysicalNode {
+        use crate::sql::optimizer::operator::PhysicalDistributionOp;
+        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+        let mut scalars = ScalarArena::new();
+        let (loc, lexpr) = col(1, "lc"); // probe column
+        let (roc, rexpr) = col(2, "rc"); // build column
+        let (unrelated_oc, _unrelated_expr) = col(99, "unrelated_key"); // exchange partition key
+        // probe side: PhysicalDistribution(HashPartitioned on col 99) over a leaf scan
+        // that outputs both the probe column (1) and the unrelated key (99).
+        let mut scan = leaf(1_000_000.0, loc.clone());
+        scan.output_columns = vec![loc.clone(), unrelated_oc.clone()];
+        let exch = OptimizerPhysicalNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::HashPartitioned {
+                    cols: vec![unrelated_oc.column_id],
+                    source: HashSource::ShuffleJoin,
+                },
+            }),
+            children: vec![scan],
+            stats: Statistics {
+                output_row_count: 1_000_000.0,
+                row_count_confidence: crate::sql::optimizer::statistics::Confidence::Estimated,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            // exchange preserves both columns; probe key (1) is still bindable here,
+            // but the partition key (99) is unrelated to it.
+            output_columns: vec![loc.clone(), unrelated_oc],
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        // build side SMALL so the build gate and probe gate both pass
+        // (build_size = 100 * 8 = 800 bytes, well below BUILD_MIN 128KB).
+        let build = leaf(100.0, roc.clone());
+        let plan = OptimizerPhysicalNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![eq(&mut scalars, &lexpr, &rexpr)],
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+            }),
+            children: vec![exch, build], // children[0]=probe-exchange, children[1]=build
+            stats: Statistics {
+                output_row_count: 100.0,
+                row_count_confidence: crate::sql::optimizer::statistics::Confidence::Estimated,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        with_scalars(plan, scalars)
+    }
+
     pub(crate) fn broadcast_join_with_probe_exchange() -> OptimizerPhysicalNode {
         use crate::sql::optimizer::operator::PhysicalDistributionOp;
         use crate::sql::optimizer::property::{DistributionSpec, HashSource};
@@ -1147,7 +1276,12 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_rf_does_not_cross_exchange_even_when_flag_enabled() {
+    fn key_aligned_partitioned_rf_crosses_exchange_when_flag_enabled() {
+        // M2: a Shuffle probe RF now crosses a HashPartitioned exchange when that
+        // exchange re-partitions on the probe key (`shuffle_join_with_probe_exchange`
+        // partitions on the same column the join probes). See
+        // `cross_exchange_tests::shuffle_rf_stops_at_misaligned_exchange` for the
+        // complementary case where the exchange key does NOT carry the probe key.
         let mut j = super::test_support::shuffle_join_with_probe_exchange();
         let mut opts = OptimizerOptions::default_settings();
         opts.allow_cross_exchange_rf = true;
@@ -1158,11 +1292,35 @@ mod tests {
         let exch = &j.children[0];
         assert!(
             exch.probe_runtime_filters.is_empty(),
-            "partitioned probe RF must not be placed on the exchange"
+            "key-aligned probe RF must not stop at the exchange"
+        );
+        assert_eq!(
+            exch.children[0].probe_runtime_filters.len(),
+            1,
+            "key-aligned partitioned probe RF should cross the exchange"
+        );
+    }
+
+    #[test]
+    fn key_aligned_partitioned_rf_does_not_cross_exchange_when_flag_disabled() {
+        // The session override from Task 1 (`allow_cross_exchange_rf = false`)
+        // must still block crossing even when the exchange is key-aligned.
+        let mut j = super::test_support::shuffle_join_with_probe_exchange();
+        let mut opts = OptimizerOptions::default_settings();
+        opts.allow_cross_exchange_rf = false;
+
+        annotate_test(&mut j, &opts);
+
+        assert_eq!(j.build_runtime_filters.len(), 1, "build RF expected");
+        let exch = &j.children[0];
+        assert!(
+            exch.probe_runtime_filters.is_empty(),
+            "probe must not be placed on the exchange"
         );
         assert!(
             exch.children[0].probe_runtime_filters.is_empty(),
-            "partitioned probe RF must not cross the exchange"
+            "crossing must stay disabled when allow_cross_exchange_rf is false, \
+             even for a key-aligned exchange"
         );
     }
 
@@ -1207,11 +1365,31 @@ mod tests {
     }
 
     #[test]
-    fn probe_stays_within_fragment_by_default() {
-        // Default: partial partitioned RF must not cross the shuffle exchange.
-        // It falls back to build-only — the probe stays unplaced above the
-        // exchange.
+    fn key_aligned_probe_crosses_fragment_by_default() {
+        // M2: with default options (`allow_cross_exchange_rf` defaults to true),
+        // a Shuffle probe RF crosses a shuffle exchange re-partitioned on the
+        // probe key without needing any explicit override.
         let mut j = super::test_support::shuffle_join_with_probe_exchange();
+        annotate_test(&mut j, &OptimizerOptions::default_settings());
+        assert_eq!(j.build_runtime_filters.len(), 1, "build RF still expected");
+        let exch = &j.children[0];
+        assert!(
+            exch.probe_runtime_filters.is_empty(),
+            "probe must not be placed on the exchange"
+        );
+        assert_eq!(
+            exch.children[0].probe_runtime_filters.len(),
+            1,
+            "key-aligned probe RF should cross the exchange by default"
+        );
+    }
+
+    #[test]
+    fn misaligned_probe_stays_within_fragment_by_default() {
+        // Default: a Shuffle probe RF must not cross an exchange partitioned on
+        // an unrelated key. It falls back to build-only — the probe stays
+        // unplaced above the exchange.
+        let mut j = super::test_support::shuffle_join_with_misaligned_probe_exchange();
         annotate_test(&mut j, &OptimizerOptions::default_settings());
         assert_eq!(j.build_runtime_filters.len(), 1, "build RF still expected");
         let exch = &j.children[0];
@@ -1221,7 +1399,7 @@ mod tests {
         );
         assert!(
             exch.children[0].probe_runtime_filters.is_empty(),
-            "probe must NOT cross the exchange by default (within-fragment fallback)"
+            "misaligned probe must NOT cross the exchange (within-fragment fallback)"
         );
     }
 
@@ -1417,5 +1595,153 @@ mod tests {
                 .iter()
                 .map(probe_runtime_filter_count)
                 .sum::<usize>()
+    }
+}
+
+#[cfg(test)]
+mod cross_exchange_tests {
+    use super::*;
+    use crate::sql::analysis::{ExprKind, TypedExpr};
+    use crate::sql::optimizer::operator::PhysicalDistributionOp;
+    use crate::sql::optimizer::physical_tree::{OptimizerExplainStats, PlanExecutionProps};
+    use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+    use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
+
+    #[test]
+    fn mode_from_distribution_maps_correctly() {
+        assert_eq!(
+            CrossExchangeMode::from(&JoinDistribution::Broadcast),
+            CrossExchangeMode::Unconditional
+        );
+        assert_eq!(
+            CrossExchangeMode::from(&JoinDistribution::Shuffle),
+            CrossExchangeMode::KeyAligned
+        );
+        assert_eq!(
+            CrossExchangeMode::from(&JoinDistribution::Colocate),
+            CrossExchangeMode::KeyAligned
+        );
+        assert_eq!(
+            CrossExchangeMode::from(&JoinDistribution::Unknown),
+            CrossExchangeMode::Disabled
+        );
+    }
+
+    /// Minimal `PhysicalDistribution(HashPartitioned)` node over no children —
+    /// `hash_partition_carries_probe_key` only inspects `node.op`, so a childless
+    /// stub is sufficient and avoids coupling this isolated helper test to the
+    /// heavier join-tree fixtures in `test_support`.
+    fn distribution_node(cols: Vec<ColumnId>) -> OptimizerPhysicalNode {
+        OptimizerPhysicalNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::HashPartitioned {
+                    cols,
+                    source: HashSource::ShuffleJoin,
+                },
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            explain_stats: OptimizerExplainStats::default(),
+            output_columns: vec![],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    /// Builds a `ScalarArena` with a single `ColumnRef(probe_col)` scalar, plus
+    /// a `HashPartitioned` node on `probe_col` (aligned) and one on a distinct,
+    /// unrelated column (misaligned).
+    fn build_alignment_fixture() -> (
+        ScalarArena,
+        ScalarId,
+        OptimizerPhysicalNode,
+        OptimizerPhysicalNode,
+    ) {
+        let probe_col = ColumnId::new_for_test(1);
+        let unrelated_col = ColumnId::new_for_test(2);
+        let mut scalars = ScalarArena::new();
+        let probe_expr = intern_typed(
+            &mut scalars,
+            &TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: probe_col,
+                    qualifier: None,
+                    column: "probe_col".to_string(),
+                },
+                data_type: arrow::datatypes::DataType::Int32,
+                nullable: true,
+            },
+        );
+        let aligned_node = distribution_node(vec![probe_col]);
+        let misaligned_node = distribution_node(vec![unrelated_col]);
+        (scalars, probe_expr, aligned_node, misaligned_node)
+    }
+
+    #[test]
+    fn key_alignment_requires_probe_col_in_shuffle_cols() {
+        let (scalars, probe_expr, aligned_node, misaligned_node) = build_alignment_fixture();
+        assert!(hash_partition_carries_probe_key(
+            &aligned_node,
+            &scalars,
+            probe_expr
+        ));
+        assert!(!hash_partition_carries_probe_key(
+            &misaligned_node,
+            &scalars,
+            probe_expr
+        ));
+    }
+
+    #[test]
+    fn shuffle_rf_crosses_key_aligned_exchange() {
+        let mut j = super::test_support::shuffle_join_with_probe_exchange();
+        let opts = OptimizerOptions::default_settings();
+
+        let scalars = j
+            .execution_props
+            .scalar_arena
+            .as_ref()
+            .expect("plan must carry scalar arena")
+            .clone();
+        annotate(&mut j, scalars.as_ref(), &opts);
+
+        assert_eq!(j.build_runtime_filters.len(), 1, "build RF expected");
+        let exch = &j.children[0];
+        assert!(
+            exch.probe_runtime_filters.is_empty(),
+            "key-aligned probe RF must not stop at the exchange"
+        );
+        assert_eq!(
+            exch.children[0].probe_runtime_filters.len(),
+            1,
+            "key-aligned Shuffle probe RF should cross into the scan below the exchange"
+        );
+    }
+
+    #[test]
+    fn shuffle_rf_stops_at_misaligned_exchange() {
+        let mut j = super::test_support::shuffle_join_with_misaligned_probe_exchange();
+        let opts = OptimizerOptions::default_settings();
+
+        let scalars = j
+            .execution_props
+            .scalar_arena
+            .as_ref()
+            .expect("plan must carry scalar arena")
+            .clone();
+        annotate(&mut j, scalars.as_ref(), &opts);
+
+        assert_eq!(j.build_runtime_filters.len(), 1, "build RF expected");
+        let exch = &j.children[0];
+        assert!(
+            exch.probe_runtime_filters.is_empty(),
+            "probe must not be placed on the exchange"
+        );
+        assert!(
+            exch.children[0].probe_runtime_filters.is_empty(),
+            "misaligned Shuffle probe RF must NOT cross the exchange"
+        );
     }
 }
