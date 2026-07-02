@@ -130,6 +130,15 @@ impl IcebergCatalogRegistry {
         Ok(self.catalogs.contains_key(&key))
     }
 
+    /// Return the normalized names of every registered catalog, sorted for
+    /// deterministic iteration. Used by lake-native IMV cache rebuild to walk
+    /// all live Iceberg catalogs (see `engine::mv::lake_rebuild`).
+    pub(crate) fn catalog_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.catalogs.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     pub(crate) fn drop_catalog(&mut self, catalog_name: &str) -> Result<(), String> {
         let key = normalize_identifier(catalog_name)?;
         self.catalogs
@@ -483,6 +492,16 @@ fn s3_table_prefix(
     ))
 }
 
+fn s3_table_name_from_list_entry(ns_prefix: &str, entry_name: &str) -> Option<String> {
+    let entry = entry_name.trim_matches('/');
+    let relative = entry
+        .strip_prefix(ns_prefix.trim_matches('/'))
+        .unwrap_or(entry)
+        .trim_matches('/');
+    let table = relative.split('/').next().unwrap_or_default();
+    (!table.is_empty() && !table.starts_with('.')).then(|| table.to_string())
+}
+
 pub(crate) fn list_tables(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,
@@ -503,8 +522,7 @@ pub(crate) fn list_tables(
     if entry.s3_config.is_some() {
         let access = resolve_warehouse_access_for_entry(entry, "list tables")?;
         let op = access.operator();
-        let root_prefix = access.single_relative_path()?;
-        let ns_prefix = format!("{}/{}/", root_prefix.trim_end_matches('/'), ns_name);
+        let ns_prefix = s3_namespace_prefix(entry, &ns_name)?;
         block_on_iceberg(async {
             let entries = op
                 .list(&ns_prefix)
@@ -512,10 +530,8 @@ pub(crate) fn list_tables(
                 .map_err(|e| format!("list namespace {ns_name}: {e}"))?;
             let mut tables = Vec::new();
             for e in entries {
-                let name = e.name().trim_matches('/');
-                let table_name = name.split('/').next().unwrap_or_default();
-                if !table_name.is_empty() && !table_name.starts_with('.') {
-                    tables.push(table_name.to_string());
+                if let Some(table_name) = s3_table_name_from_list_entry(&ns_prefix, e.name()) {
+                    tables.push(table_name);
                 }
             }
             tables.sort();
@@ -3259,6 +3275,42 @@ mod data_file_with_stats_tests {
                 .cached_data_files("db1", "tbl1", Some(8))
                 .expect("read invalidated snapshot 8")
                 .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod s3_listing_tests {
+    use super::s3_table_name_from_list_entry;
+
+    #[test]
+    fn s3_table_name_from_list_entry_strips_full_namespace_prefix() {
+        assert_eq!(
+            s3_table_name_from_list_entry(
+                "warehouse/root/analytics/",
+                "warehouse/root/analytics/orders_mv/metadata/v1.metadata.json",
+            )
+            .as_deref(),
+            Some("orders_mv")
+        );
+    }
+
+    #[test]
+    fn s3_table_name_from_list_entry_accepts_relative_table_entries() {
+        assert_eq!(
+            s3_table_name_from_list_entry("warehouse/root/analytics/", "orders_mv/"),
+            Some("orders_mv".to_string())
+        );
+    }
+
+    #[test]
+    fn s3_table_name_from_list_entry_skips_hidden_namespace_markers() {
+        assert_eq!(
+            s3_table_name_from_list_entry(
+                "warehouse/root/analytics/",
+                "warehouse/root/analytics/.novarocks_namespace",
+            ),
+            None
         );
     }
 }

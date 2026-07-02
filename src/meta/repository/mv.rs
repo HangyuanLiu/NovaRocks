@@ -577,6 +577,36 @@ impl MvMetaRepository {
         Ok(definition)
     }
 
+    /// Set the last-refresh watermark maps on an existing definition.
+    ///
+    /// Used by lake-native IMV cache rebuild (`engine::mv::lake_rebuild`) to
+    /// stamp a freshly rebuilt definition with the refresh watermark carried by
+    /// its storage table's current-snapshot provenance. This writes only the
+    /// two watermark fields `finalize_refresh` would have set, without requiring
+    /// a refresh-intent lifecycle — the definition was just rebuilt from the
+    /// lake and has no refresh in progress. Callers pass empty maps for an MV
+    /// that was created but never refreshed, which is a no-op relative to a
+    /// freshly created definition (its watermark maps are already empty).
+    pub fn set_rebuilt_refresh_watermark(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        mv_id: i64,
+        last_refresh_snapshots: BTreeMap<String, i64>,
+        last_refresh_table_uuids: BTreeMap<String, String>,
+    ) -> RepositoryResult<StoredMvDefinition> {
+        let mut definition = self.load_versioned_by_id(txn, mv_id)?.ok_or_else(|| {
+            RepositoryError::not_found(format!("mv definition {mv_id} not found"))
+        })?;
+        definition.value.last_refresh_snapshots = last_refresh_snapshots;
+        definition.value.last_refresh_table_uuids = last_refresh_table_uuids;
+        put_definition(
+            txn,
+            &definition,
+            ExpectedRevision::Exact(definition.record_revision.clone()),
+        )?;
+        Ok(definition.value)
+    }
+
     pub fn update_refresh_metadata(
         &self,
         txn: &mut dyn MetaWriteTxn,

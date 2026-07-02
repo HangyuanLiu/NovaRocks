@@ -2,6 +2,7 @@ mod benchmark_bootstrap;
 mod cluster;
 mod config;
 mod fault_injection;
+mod imv_stateless;
 mod parser;
 mod results;
 mod runner;
