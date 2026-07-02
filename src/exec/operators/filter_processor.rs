@@ -27,13 +27,16 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;
+use arrow::datatypes::DataType;
 
+use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -44,6 +47,7 @@ pub struct FilterProcessorFactory {
     name: String,
     arena: Arc<ExprArena>,
     predicate: ExprId,
+    encoding_policy: FilterEncodingPolicy,
 }
 
 impl FilterProcessorFactory {
@@ -53,10 +57,12 @@ impl FilterProcessorFactory {
         } else {
             "FILTER".to_string()
         };
+        let encoding_policy = FilterEncodingPolicy::from_predicate(arena.as_ref(), predicate);
         Self {
             name,
             arena,
             predicate,
+            encoding_policy,
         }
     }
 }
@@ -71,6 +77,7 @@ impl OperatorFactory for FilterProcessorFactory {
             name: self.name.clone(),
             arena: Arc::clone(&self.arena),
             predicate: self.predicate,
+            encoding_policy: self.encoding_policy.clone(),
             pending_output: None,
             finishing: false,
             finished: false,
@@ -78,10 +85,217 @@ impl OperatorFactory for FilterProcessorFactory {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct FilterEncodingPolicy {
+    predicate_slots: HashSet<SlotId>,
+    unsupported_predicate_slots: HashSet<SlotId>,
+}
+
+impl FilterEncodingPolicy {
+    fn from_predicate(arena: &ExprArena, predicate: ExprId) -> Self {
+        let mut policy = Self::default();
+        policy.analyze_predicate(arena, predicate);
+        policy
+    }
+
+    fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
+        if !is_low_cardinality_string_dictionary(data_type) {
+            return false;
+        }
+        !self.predicate_slots.contains(&slot_id)
+            || !self.unsupported_predicate_slots.contains(&slot_id)
+    }
+
+    fn analyze_predicate(&mut self, arena: &ExprArena, expr: ExprId) -> bool {
+        match arena.node(expr) {
+            Some(ExprNode::And(left, right)) | Some(ExprNode::Or(left, right)) => {
+                let left_supported = self.analyze_predicate(arena, *left);
+                let right_supported = self.analyze_predicate(arena, *right);
+                left_supported && right_supported
+            }
+            Some(ExprNode::Not(child)) => self.analyze_predicate(arena, *child),
+            Some(ExprNode::Eq(left, right))
+            | Some(ExprNode::Ne(left, right))
+            | Some(ExprNode::Lt(left, right))
+            | Some(ExprNode::Le(left, right))
+            | Some(ExprNode::Gt(left, right))
+            | Some(ExprNode::Ge(left, right)) => {
+                self.analyze_binary_predicate(arena, *left, *right)
+            }
+            Some(ExprNode::In { child, values, .. }) => {
+                self.analyze_in_predicate(arena, *child, values)
+            }
+            Some(ExprNode::IsNull(child)) | Some(ExprNode::IsNotNull(child)) => {
+                self.analyze_null_predicate(arena, *child)
+            }
+            _ => {
+                self.mark_slots_unsupported(arena, expr);
+                false
+            }
+        }
+    }
+
+    fn analyze_binary_predicate(&mut self, arena: &ExprArena, left: ExprId, right: ExprId) -> bool {
+        match (direct_slot(arena, left), direct_slot(arena, right)) {
+            (Some(slot_id), None) if is_supported_literal_expr(arena, right) => {
+                self.predicate_slots.insert(slot_id);
+                true
+            }
+            (None, Some(slot_id)) if is_supported_literal_expr(arena, left) => {
+                self.predicate_slots.insert(slot_id);
+                true
+            }
+            _ => {
+                self.mark_slots_unsupported(arena, left);
+                self.mark_slots_unsupported(arena, right);
+                false
+            }
+        }
+    }
+
+    fn analyze_in_predicate(
+        &mut self,
+        arena: &ExprArena,
+        child: ExprId,
+        values: &[ExprId],
+    ) -> bool {
+        let Some(slot_id) = direct_slot(arena, child) else {
+            self.mark_slots_unsupported(arena, child);
+            for value in values {
+                self.mark_slots_unsupported(arena, *value);
+            }
+            return false;
+        };
+        if values.iter().any(|value| expr_contains_slot(arena, *value)) {
+            self.mark_slots_unsupported(arena, child);
+            for value in values {
+                self.mark_slots_unsupported(arena, *value);
+            }
+            return false;
+        }
+        self.predicate_slots.insert(slot_id);
+        true
+    }
+
+    fn analyze_null_predicate(&mut self, arena: &ExprArena, child: ExprId) -> bool {
+        let Some(slot_id) = direct_slot(arena, child) else {
+            self.mark_slots_unsupported(arena, child);
+            return false;
+        };
+        self.predicate_slots.insert(slot_id);
+        true
+    }
+
+    fn mark_slots_unsupported(&mut self, arena: &ExprArena, expr: ExprId) {
+        collect_slot_ids(arena, expr, &mut self.predicate_slots);
+        collect_slot_ids(arena, expr, &mut self.unsupported_predicate_slots);
+    }
+}
+
+fn is_supported_literal_expr(arena: &ExprArena, expr: ExprId) -> bool {
+    matches!(arena.node(expr), Some(ExprNode::Literal(_)))
+}
+
+fn is_low_cardinality_string_dictionary(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Dictionary(key_type, value_type)
+            if key_type.as_ref() == &DataType::Int32
+                && matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8)
+    )
+}
+
+fn direct_slot(arena: &ExprArena, expr: ExprId) -> Option<SlotId> {
+    match arena.node(expr) {
+        Some(ExprNode::SlotId(slot_id)) => Some(*slot_id),
+        _ => None,
+    }
+}
+
+fn expr_contains_slot(arena: &ExprArena, expr: ExprId) -> bool {
+    let mut slots = HashSet::new();
+    collect_slot_ids(arena, expr, &mut slots);
+    !slots.is_empty()
+}
+
+fn collect_slot_ids(arena: &ExprArena, expr: ExprId, out: &mut HashSet<SlotId>) {
+    let Some(node) = arena.node(expr) else {
+        return;
+    };
+    match node {
+        ExprNode::Literal(_) => {}
+        ExprNode::SlotId(slot_id) => {
+            out.insert(*slot_id);
+        }
+        ExprNode::ArrayExpr { elements } => {
+            for child in elements {
+                collect_slot_ids(arena, *child, out);
+            }
+        }
+        ExprNode::StructExpr { fields } => {
+            for child in fields {
+                collect_slot_ids(arena, *child, out);
+            }
+        }
+        ExprNode::LambdaFunction {
+            body,
+            common_sub_exprs,
+            ..
+        } => {
+            collect_slot_ids(arena, *body, out);
+            for (_, expr_id) in common_sub_exprs {
+                collect_slot_ids(arena, *expr_id, out);
+            }
+        }
+        ExprNode::DictDecode { child, .. }
+        | ExprNode::Cast(child)
+        | ExprNode::CastTime(child)
+        | ExprNode::CastTimeFromDatetime(child)
+        | ExprNode::Not(child)
+        | ExprNode::IsNull(child)
+        | ExprNode::IsNotNull(child)
+        | ExprNode::Clone(child) => collect_slot_ids(arena, *child, out),
+        ExprNode::Add(left, right)
+        | ExprNode::Sub(left, right)
+        | ExprNode::Mul(left, right)
+        | ExprNode::Div(left, right)
+        | ExprNode::Mod(left, right)
+        | ExprNode::Eq(left, right)
+        | ExprNode::EqForNull(left, right)
+        | ExprNode::Ne(left, right)
+        | ExprNode::Lt(left, right)
+        | ExprNode::Le(left, right)
+        | ExprNode::Gt(left, right)
+        | ExprNode::Ge(left, right)
+        | ExprNode::And(left, right)
+        | ExprNode::Or(left, right) => {
+            collect_slot_ids(arena, *left, out);
+            collect_slot_ids(arena, *right, out);
+        }
+        ExprNode::In { child, values, .. } => {
+            collect_slot_ids(arena, *child, out);
+            for value in values {
+                collect_slot_ids(arena, *value, out);
+            }
+        }
+        ExprNode::Case { children, .. } => {
+            for child in children {
+                collect_slot_ids(arena, *child, out);
+            }
+        }
+        ExprNode::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_slot_ids(arena, *arg, out);
+            }
+        }
+    }
+}
+
 struct FilterProcessorOperator {
     name: String,
     arena: Arc<ExprArena>,
     predicate: ExprId,
+    encoding_policy: FilterEncodingPolicy,
     pending_output: Option<Chunk>,
     finishing: bool,
     finished: bool,
@@ -160,5 +374,106 @@ impl ProcessorOperator for FilterProcessorOperator {
             self.finished = true;
         }
         Ok(())
+    }
+
+    fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
+        self.encoding_policy
+            .accepts_encoded_column(slot_id, data_type)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
+    use arrow::datatypes::DataType;
+
+    fn dict_utf8_type() -> DataType {
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+    }
+
+    fn utf8_literal(arena: &mut ExprArena, value: &str) -> ExprId {
+        arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8(value.to_string())),
+            DataType::Utf8,
+        )
+    }
+
+    #[test]
+    fn filter_policy_accepts_passthrough_and_supported_predicate_dict_slots() {
+        let mut arena = ExprArena::default();
+        let status = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let state = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Utf8);
+        let paid = utf8_literal(&mut arena, "PAID");
+        let status_is_paid = arena.push_typed(ExprNode::Eq(status, paid), DataType::Boolean);
+        let state_not_null = arena.push_typed(ExprNode::IsNotNull(state), DataType::Boolean);
+        let predicate = arena.push_typed(
+            ExprNode::And(status_is_paid, state_not_null),
+            DataType::Boolean,
+        );
+
+        let policy = FilterEncodingPolicy::from_predicate(&arena, predicate);
+        let dict = dict_utf8_type();
+
+        assert!(policy.accepts_encoded_column(SlotId::new(1), &dict));
+        assert!(policy.accepts_encoded_column(SlotId::new(2), &dict));
+        assert!(policy.accepts_encoded_column(SlotId::new(3), &dict));
+        assert!(!policy.accepts_encoded_column(SlotId::new(1), &DataType::Int32));
+    }
+
+    #[test]
+    fn filter_policy_hydrates_slots_used_inside_complex_expressions() {
+        let mut arena = ExprArena::default();
+        let status = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let cast_status = arena.push_typed(ExprNode::Cast(status), DataType::Utf8);
+        let paid = utf8_literal(&mut arena, "PAID");
+        let predicate = arena.push_typed(ExprNode::Eq(cast_status, paid), DataType::Boolean);
+
+        let policy = FilterEncodingPolicy::from_predicate(&arena, predicate);
+        let dict = dict_utf8_type();
+
+        assert!(!policy.accepts_encoded_column(SlotId::new(1), &dict));
+        assert!(policy.accepts_encoded_column(SlotId::new(2), &dict));
+    }
+
+    #[test]
+    fn filter_policy_rejects_cast_literal_comparison_side() {
+        let mut arena = ExprArena::default();
+        let status = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let paid = utf8_literal(&mut arena, "PAID");
+        let cast_paid = arena.push_typed(ExprNode::Cast(paid), DataType::Utf8);
+        let predicate = arena.push_typed(ExprNode::Eq(status, cast_paid), DataType::Boolean);
+
+        let policy = FilterEncodingPolicy::from_predicate(&arena, predicate);
+        let dict = dict_utf8_type();
+
+        assert!(!policy.accepts_encoded_column(SlotId::new(1), &dict));
+        assert!(policy.accepts_encoded_column(SlotId::new(2), &dict));
+    }
+
+    #[test]
+    fn filter_policy_accepts_in_and_null_predicates_only_when_child_is_direct_slot() {
+        let mut arena = ExprArena::default();
+        let status = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let paid = utf8_literal(&mut arena, "PAID");
+        let pending = utf8_literal(&mut arena, "PENDING");
+        let in_pred = arena.push_typed(
+            ExprNode::In {
+                child: status,
+                values: vec![paid, pending],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+        let policy = FilterEncodingPolicy::from_predicate(&arena, in_pred);
+        assert!(policy.accepts_encoded_column(SlotId::new(1), &dict_utf8_type()));
+
+        let mut complex_arena = ExprArena::default();
+        let status = complex_arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let cast_status = complex_arena.push_typed(ExprNode::Cast(status), DataType::Utf8);
+        let null_pred = complex_arena.push_typed(ExprNode::IsNull(cast_status), DataType::Boolean);
+        let complex = FilterEncodingPolicy::from_predicate(&complex_arena, null_pred);
+        assert!(!complex.accepts_encoded_column(SlotId::new(1), &dict_utf8_type()));
     }
 }
