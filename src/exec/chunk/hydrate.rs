@@ -23,6 +23,30 @@ use arrow::record_batch::RecordBatch;
 
 use super::{Chunk, ChunkSchema};
 
+pub(crate) fn assert_no_dictionary(batch: &RecordBatch) -> Result<(), String> {
+    for (idx, field) in batch.schema().fields().iter().enumerate() {
+        if matches!(field.data_type(), DataType::Dictionary(_, _)) {
+            return Err(format!(
+                "dictionary column must be hydrated before flat boundary: column {} field {} has type {:?}",
+                idx,
+                field.name(),
+                field.data_type()
+            ));
+        }
+        if let Some(column) = batch.columns().get(idx) {
+            if matches!(column.data_type(), DataType::Dictionary(_, _)) {
+                return Err(format!(
+                    "dictionary column must be hydrated before flat boundary: column {} field {} has array type {:?}",
+                    idx,
+                    field.name(),
+                    column.data_type()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn hydrate_dictionary_columns(chunk: &Chunk) -> Result<Chunk, String> {
     let mut changed = false;
     let mut columns = Vec::with_capacity(chunk.columns().len());
@@ -81,9 +105,10 @@ mod tests {
         Array, ArrayRef, DictionaryArray, LargeStringArray, LargeStringDictionaryBuilder,
         StringArray,
     };
-    use arrow::datatypes::{DataType, Field, Int32Type};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+    use arrow::record_batch::RecordBatch;
 
-    use super::hydrate_dictionary_columns;
+    use super::{assert_no_dictionary, hydrate_dictionary_columns};
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
     use crate::types::logical::{LogicalType, field_with_logical_type};
@@ -243,5 +268,40 @@ mod tests {
         assert_eq!(hydrated_slot.unique_id(), Some(77));
         assert_eq!(hydrated_slot.data_type(), &DataType::Utf8);
         assert!(hydrated_slot.field_schema().json_semantic());
+    }
+
+    #[test]
+    fn assert_no_dictionary_allows_flat_utf8_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some("PAID"), None]))],
+        )
+        .expect("record batch");
+
+        assert_no_dictionary(&batch).expect("flat batch should pass");
+    }
+
+    #[test]
+    fn assert_no_dictionary_rejects_dictionary_batch_with_field_name() {
+        let column = dict_utf8_with_nulls_and_empty();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            column.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![column]).expect("record batch");
+
+        let err = assert_no_dictionary(&batch).expect_err("dictionary batch should fail");
+
+        assert!(err.contains("status"), "error should identify field: {err}");
+        assert!(
+            err.contains("Dictionary"),
+            "error should identify dictionary type: {err}"
+        );
     }
 }
