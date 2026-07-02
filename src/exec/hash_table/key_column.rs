@@ -243,6 +243,24 @@ impl KeyColumn {
                 offsets.push(data.len());
                 Ok(())
             }
+            (
+                KeyColumn::Utf8 {
+                    offsets,
+                    data,
+                    nulls,
+                },
+                GroupKeyArrayView::Dictionary(dict),
+            ) => {
+                let Some(code) = dict.code_at(row)? else {
+                    nulls.push(0);
+                    offsets.push(data.len());
+                    return Ok(());
+                };
+                data.extend_from_slice(dict.value_bytes_for_code(code)?);
+                nulls.push(1);
+                offsets.push(data.len());
+                Ok(())
+            }
             (KeyColumn::Date32 { values, nulls }, GroupKeyArrayView::Date32(arr)) => {
                 if arr.is_null(row) {
                     values.push(0);
@@ -472,6 +490,33 @@ impl KeyColumn {
                     }
                     None => Ok(!valid),
                 }
+            }
+            (
+                KeyColumn::Utf8 {
+                    offsets,
+                    data,
+                    nulls,
+                },
+                GroupKeyArrayView::Dictionary(dict),
+            ) => {
+                let valid = *nulls
+                    .get(group_id)
+                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    != 0;
+                let Some(code) = dict.code_at(row)? else {
+                    return Ok(!valid);
+                };
+                if !valid {
+                    return Ok(false);
+                }
+                let start = *offsets
+                    .get(group_id)
+                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                let end = *offsets
+                    .get(group_id + 1)
+                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                let current = dict.value_bytes_for_code(code)?;
+                Ok(data.get(start..end).is_some_and(|bytes| bytes == current))
             }
             (KeyColumn::Date32 { values, nulls }, GroupKeyArrayView::Date32(arr)) => {
                 let stored = values
@@ -1166,7 +1211,8 @@ mod tests {
     use super::{KeyColumn, build_output_schema_from_kernels};
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-    use arrow::datatypes::{DataType, Field};
+    use arrow::array::{Array, ArrayRef, DictionaryArray, StringArray};
+    use arrow::datatypes::{DataType, Field, Int32Type};
     use std::sync::Arc;
 
     #[test]
@@ -1190,5 +1236,50 @@ mod tests {
                 .expect("output schema");
 
         assert!(schema.field(0).is_nullable());
+    }
+
+    #[test]
+    fn utf8_key_column_pushes_dictionary_values_as_flat_utf8() {
+        use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
+
+        let dict: ArrayRef = Arc::new(
+            vec![Some("PAID"), None, Some("NEW"), Some("PAID")]
+                .into_iter()
+                .collect::<DictionaryArray<Int32Type>>(),
+        );
+        let arrays = [dict];
+        let views = build_group_key_views(&arrays).expect("views");
+        let view = &views[0];
+        let mut col = KeyColumn::Utf8 {
+            offsets: vec![0],
+            data: Vec::new(),
+            nulls: Vec::new(),
+        };
+        col.push_value_from_view(view, 0).expect("push paid");
+        col.push_value_from_view(view, 1).expect("push null");
+        col.push_value_from_view(view, 2).expect("push new");
+
+        let out = col.to_array().expect("array");
+        assert_eq!(out.data_type(), &DataType::Utf8);
+        let strings = out.as_any().downcast_ref::<StringArray>().expect("strings");
+        assert_eq!(strings.value(0), "PAID");
+        assert!(strings.is_null(1));
+        assert_eq!(strings.value(2), "NEW");
+        assert!(
+            col.value_equals(0, view, 3)
+                .expect("dictionary value equality")
+        );
+        assert!(
+            col.value_equals(1, view, 1)
+                .expect("dictionary null equality")
+        );
+        assert!(
+            !col.value_equals(2, view, 0)
+                .expect("dictionary value mismatch")
+        );
+
+        let GroupKeyArrayView::Dictionary(_) = view else {
+            panic!("expected dictionary view");
+        };
     }
 }
