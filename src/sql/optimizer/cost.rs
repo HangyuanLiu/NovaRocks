@@ -14,8 +14,9 @@ use crate::sql::common::JoinKind;
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::statistics::{
     CostEstimate, DEFAULT_CPU_COST_WEIGHT, DEFAULT_MEMORY_COST_WEIGHT, DEFAULT_NETWORK_COST_WEIGHT,
-    MAX_FINITE_COST, Statistics, finite_non_negative_dimension,
+    MAX_FINITE_COST, Statistics, TableStatistics, finite_non_negative_dimension,
 };
+use crate::sql::optimizer::stats_input::OptimizerStatsInput;
 
 /// Network transfer multiplier applied to data that crosses node boundaries.
 /// Single source of truth: `derive` imports this constant.
@@ -48,6 +49,7 @@ pub(crate) struct CostInput<'a> {
     pub required_output: &'a PhysicalPropertySet,
     pub alt_kind: &'a PropertyAlternativeKind,
     pub scalars: Option<&'a ScalarArena>,
+    pub stats_input: Option<&'a OptimizerStatsInput>,
     pub options: &'a CostOptions,
 }
 
@@ -656,6 +658,98 @@ fn scan_cost_size(scan: &ScanOp, stats: &Statistics) -> f64 {
     }
 }
 
+fn scan_required_column_names(scan: &ScanOp) -> Vec<String> {
+    let names = scan
+        .required_columns
+        .as_ref()
+        .filter(|columns| !columns.is_empty())
+        .cloned()
+        .unwrap_or_else(|| {
+            scan.columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect()
+        });
+    let mut out = Vec::new();
+    for name in names {
+        let lower = name.to_ascii_lowercase();
+        if !out.iter().any(|existing| existing == &lower) {
+            out.push(lower);
+        }
+    }
+    out
+}
+
+fn table_scan_row_count(table_stats: &TableStatistics) -> f64 {
+    let rows = table_stats.row_count as f64;
+    if rows.is_finite() && rows > 0.0 {
+        finite_non_negative_cost(rows)
+    } else {
+        1.0
+    }
+}
+
+fn table_column_width(table_stats: &TableStatistics, column_name: &str) -> f64 {
+    table_stats
+        .column_stats
+        .get(&column_name.to_ascii_lowercase())
+        .map(|stat| stat.average_row_size)
+        .filter(|width| width.is_finite() && *width > 0.0)
+        .map(finite_non_negative_cost)
+        .unwrap_or(DEFAULT_ROW_WIDTH)
+}
+
+fn scan_bound_table_statistics<'a>(
+    scan: &ScanOp,
+    stats_input: Option<&'a OptimizerStatsInput>,
+) -> Option<TableStatistics> {
+    let stats_ref = scan.stats_ref?;
+    stats_input?
+        .query_stats()
+        .get(stats_ref)
+        .and_then(TableStatistics::try_from_base_stats_with_confidence)
+        .map(|(stats, _)| stats)
+}
+
+fn scan_input_cost_size(scan: &ScanOp, input: &CostInput<'_>) -> f64 {
+    let Some(table_stats) = scan_bound_table_statistics(scan, input.stats_input) else {
+        return scan_cost_size(scan, input.own_stats);
+    };
+    let required_columns = scan_required_column_names(scan);
+    if required_columns.is_empty() {
+        return scan_cost_size(scan, input.own_stats);
+    }
+    let row_count = table_scan_row_count(&table_stats);
+    let row_width = required_columns.iter().fold(0.0, |acc, column| {
+        finite_non_negative_cost(acc + table_column_width(&table_stats, column))
+    });
+    finite_non_negative_cost(row_count * row_width)
+}
+
+fn scan_input_row_count(scan: &ScanOp, input: &CostInput<'_>) -> f64 {
+    scan_bound_table_statistics(scan, input.stats_input)
+        .map(|stats| table_scan_row_count(&stats))
+        .unwrap_or_else(|| cost_row_count(input.own_stats))
+}
+
+fn estimate_scan_cost_estimate(input: &CostInput<'_>, scan: &ScanOp) -> CostEstimate {
+    let payload_cost = scan_input_cost_size(scan, input);
+    let predicate_cost = if scan.predicates.is_empty() {
+        0.0
+    } else {
+        finite_non_negative_cost(
+            scan_input_row_count(scan, input)
+                * scalar_list_complexity(input.scalars, &scan.predicates)
+                * input.options.predicate_cost_factor,
+        )
+    };
+    CostEstimate {
+        cpu_cost: finite_non_negative_cost(payload_cost + predicate_cost),
+        memory_cost: 0.0,
+        network_cost: 0.0,
+    }
+}
+
 fn stats_has_positive_overflow_signal(stats: &Statistics) -> bool {
     safe_compute_size(stats) >= MAX_FINITE_COST
 }
@@ -767,6 +861,19 @@ fn scalar_complexity(arena: Option<&ScalarArena>, expr: ScalarId) -> f64 {
                 + order_by.len() as f64
         }
     }
+}
+
+fn is_passthrough_project(
+    arena: Option<&ScalarArena>,
+    project: &super::operator::ProjectOp,
+) -> bool {
+    let Some(arena) = arena else {
+        return false;
+    };
+    project
+        .items
+        .iter()
+        .all(|item| matches!(arena.node(item.expr), ScalarNode::ColumnRef(_)))
 }
 
 fn scalar_list_complexity(arena: Option<&ScalarArena>, exprs: &[ScalarId]) -> f64 {
@@ -934,11 +1041,7 @@ pub(crate) fn estimate_sort_cost_estimate(
 
 pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
     match input.op {
-        Operator::PhysicalScan(scan) => CostEstimate {
-            cpu_cost: scan_cost_size(scan, input.own_stats),
-            memory_cost: 0.0,
-            network_cost: 0.0,
-        },
+        Operator::PhysicalScan(scan) => estimate_scan_cost_estimate(input, scan),
         Operator::PhysicalFilter(filter) => {
             let input_rows = input
                 .child_stats
@@ -961,13 +1064,18 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
                 .map(|stats| cost_row_count(stats))
                 .unwrap_or_else(|| cost_row_count(input.own_stats));
             let exprs: Vec<_> = project.items.iter().map(|item| item.expr).collect();
+            let memory_cost = if is_passthrough_project(input.scalars, project) {
+                0.0
+            } else {
+                safe_compute_size(input.own_stats) * 0.02
+            };
             CostEstimate {
                 cpu_cost: finite_non_negative_cost(
                     input_rows
                         * scalar_list_complexity(input.scalars, &exprs)
                         * input.options.projection_cost_factor,
                 ),
-                memory_cost: safe_compute_size(input.own_stats) * 0.02,
+                memory_cost,
                 network_cost: 0.0,
             }
         }
@@ -1071,6 +1179,7 @@ fn compute_legacy_cost_with_properties(
                 required_output: &required_output,
                 alt_kind,
                 scalars: None,
+                stats_input: None,
                 options,
             };
             estimate_hash_join_cost(&input, join).total_with_options(options)
@@ -1096,6 +1205,7 @@ pub(crate) fn compute_cost_with_properties(
         required_output: &required_output,
         alt_kind,
         scalars: None,
+        stats_input: None,
         options,
     };
     compute_cost_from_input(&input)
@@ -1218,6 +1328,58 @@ mod tests {
         assert!(estimate.network_cost.is_finite() && estimate.network_cost >= 0.0);
     }
 
+    #[test]
+    fn passthrough_project_has_no_materialization_memory_cost() {
+        let mut scalars = ScalarArena::new();
+        let exprs: Vec<_> = [1, 2, 3]
+            .into_iter()
+            .map(|id| {
+                scalars.intern(
+                    ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                )
+            })
+            .collect();
+        let op = Operator::PhysicalProject(ProjectOp {
+            items: exprs
+                .iter()
+                .enumerate()
+                .map(|(idx, expr)| ScalarProjectItem {
+                    expr: *expr,
+                    output_column_id: ColumnId::new_for_test(idx as u32 + 101),
+                    output_name: format!("c{idx}"),
+                    expr_display: None,
+                })
+                .collect(),
+            output_qualifier: None,
+        });
+        let own = stats_with_column_widths(1_680.0, &[1024.0, 1024.0, 1024.0]);
+        let child = stats_with_column_widths(1_680.0, &[1024.0, 1024.0, 1024.0]);
+        let child_stats = [&child];
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any()];
+        let child_output_refs = [&child_outputs[0]];
+        let alt_kind = PropertyAlternativeKind::Default;
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &own,
+            child_stats: &child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &alt_kind,
+            scalars: Some(&scalars),
+            stats_input: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+
+        assert_eq!(estimate.memory_cost, 0.0);
+        assert!(estimate.cpu_cost > 0.0);
+    }
+
     fn test_eq_condition(
         arena: &mut ScalarArena,
         left_value: i64,
@@ -1337,6 +1499,7 @@ mod tests {
             required_output: required,
             alt_kind: alt,
             scalars: None,
+            stats_input: None,
             options: o,
         }
     }
@@ -1359,6 +1522,7 @@ mod tests {
             required_output: required,
             alt_kind: alt,
             scalars: Some(scalars),
+            stats_input: None,
             options: o,
         }
     }
@@ -1914,6 +2078,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -1921,6 +2086,154 @@ mod tests {
         assert_eq!(estimate.cpu_cost, s.compute_size());
         assert_eq!(estimate.memory_cost, 0.0);
         assert_eq!(estimate.network_cost, 0.0);
+    }
+
+    #[test]
+    fn scan_cost_charges_scan_predicates() {
+        let s = stats(1000.0, 100.0);
+        let mut arena = ScalarArena::new();
+        let predicate = intern_typed(
+            &mut arena,
+            &crate::sql::analysis::TypedExpr {
+                kind: crate::sql::analysis::ExprKind::Literal(
+                    crate::sql::analysis::LiteralValue::Bool(true),
+                ),
+                data_type: arrow::datatypes::DataType::Boolean,
+                nullable: false,
+            },
+        );
+        let mut op = scan_op();
+        let Operator::PhysicalScan(scan) = &mut op else {
+            panic!("expected scan");
+        };
+        scan.predicates.push(predicate);
+
+        let child_stats: [&Statistics; 0] = [];
+        let child_outputs: [&PhysicalPropertySet; 0] = [];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let no_predicate_op = scan_op();
+        let no_predicate_input = CostInput {
+            op: &no_predicate_op,
+            own_stats: &s,
+            child_stats: &child_stats,
+            child_outputs: &child_outputs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: Some(&arena),
+            stats_input: None,
+            options: &options,
+        };
+        let predicate_input = CostInput {
+            op: &op,
+            own_stats: &s,
+            child_stats: &child_stats,
+            child_outputs: &child_outputs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: Some(&arena),
+            stats_input: None,
+            options: &options,
+        };
+
+        let no_predicate_cost = compute_cost_estimate(&no_predicate_input).cpu_cost;
+        let predicate_cost = compute_cost_estimate(&predicate_input).cpu_cost;
+
+        assert!(
+            predicate_cost > no_predicate_cost,
+            "scan predicates must not be cost-free: predicate_cost={predicate_cost}, no_predicate_cost={no_predicate_cost}"
+        );
+    }
+
+    #[test]
+    fn scan_cost_uses_bound_table_rows_before_pushdown_predicates() {
+        let filtered_stats = stats(10.0, 8.0);
+        let mut arena = ScalarArena::new();
+        let predicate = intern_typed(
+            &mut arena,
+            &crate::sql::analysis::TypedExpr {
+                kind: crate::sql::analysis::ExprKind::Literal(
+                    crate::sql::analysis::LiteralValue::Bool(true),
+                ),
+                data_type: arrow::datatypes::DataType::Boolean,
+                nullable: false,
+            },
+        );
+        let mut op = two_column_scan_op(Some(vec!["narrow"]));
+        let Operator::PhysicalScan(scan) = &mut op else {
+            panic!("expected scan");
+        };
+        scan.stats_ref = Some(crate::sql::optimizer::stats_input::StatsRef::new(3));
+        scan.predicates.push(predicate);
+
+        let mut query_stats = crate::sql::optimizer::stats_input::QueryStatsSnapshot::empty();
+        query_stats.insert(
+            crate::sql::optimizer::stats_input::StatsRef::new(3),
+            "db.t",
+            crate::sql::optimizer::stats_input::BaseTableStatistics {
+                row_count: crate::sql::optimizer::stats_input::StatValue::known(
+                    1000,
+                    Confidence::Exact,
+                    crate::sql::optimizer::stats_input::StatsSource::TestFixture,
+                ),
+                columns: std::collections::HashMap::from([(
+                    "narrow".to_string(),
+                    crate::sql::optimizer::stats_input::BaseColumnStatistics {
+                        nulls_fraction: crate::sql::optimizer::stats_input::StatValue::known(
+                            0.0,
+                            Confidence::Exact,
+                            crate::sql::optimizer::stats_input::StatsSource::TestFixture,
+                        ),
+                        average_row_size: crate::sql::optimizer::stats_input::StatValue::known(
+                            2.0,
+                            Confidence::Exact,
+                            crate::sql::optimizer::stats_input::StatsSource::TestFixture,
+                        ),
+                        min_value: crate::sql::optimizer::stats_input::StatValue::missing(
+                            crate::sql::optimizer::stats_input::StatsMissingReason::ColumnNotReported(
+                                "narrow".to_string(),
+                            ),
+                        ),
+                        max_value: crate::sql::optimizer::stats_input::StatValue::missing(
+                            crate::sql::optimizer::stats_input::StatsMissingReason::ColumnNotReported(
+                                "narrow".to_string(),
+                            ),
+                        ),
+                        ndv: crate::sql::optimizer::stats_input::StatValue::missing(
+                            crate::sql::optimizer::stats_input::StatsMissingReason::ColumnNotReported(
+                                "narrow".to_string(),
+                            ),
+                        ),
+                    },
+                )]),
+                source: crate::sql::optimizer::stats_input::StatsSource::TestFixture,
+            },
+        );
+        let stats_input =
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_query_stats(&query_stats);
+
+        let child_stats: [&Statistics; 0] = [];
+        let child_outputs: [&PhysicalPropertySet; 0] = [];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &filtered_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_outputs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: Some(&arena),
+            stats_input: Some(&stats_input),
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+
+        assert!(
+            estimate.cpu_cost >= 2000.0,
+            "scan payload must use pre-predicate table rows, not filtered output rows: {estimate:?}"
+        );
     }
 
     #[test]
@@ -1952,6 +2265,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: Some(&arena),
+            stats_input: None,
             options: &options,
         };
 
@@ -1990,6 +2304,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
         let topn_input = CostInput {
@@ -2000,6 +2315,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2033,6 +2349,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2062,6 +2379,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2092,6 +2410,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2116,6 +2435,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2140,6 +2460,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2164,6 +2485,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2196,6 +2518,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2229,6 +2552,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2261,6 +2585,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2288,6 +2613,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2320,6 +2646,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::BroadcastJoin,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2363,6 +2690,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2400,6 +2728,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::BroadcastJoin,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2615,6 +2944,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::ShuffleJoin,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2653,6 +2983,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::ShuffleJoin,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2691,6 +3022,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::ShuffleJoin,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2734,6 +3066,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: Some(&scalars),
+            stats_input: None,
             options: &options,
         };
         let multi_input = CostInput {
@@ -2744,6 +3077,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: Some(&scalars),
+            stats_input: None,
             options: &options,
         };
 
@@ -2778,6 +3112,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: Some(&scalars),
+            stats_input: None,
             options: &options,
         };
         let high_input = CostInput {
@@ -2788,6 +3123,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: Some(&scalars),
+            stats_input: None,
             options: &options,
         };
 
@@ -2817,6 +3153,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
 
@@ -2923,6 +3260,7 @@ mod tests {
             required_output: &PhysicalPropertySet::any(),
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &CostOptions::default(),
         };
         let estimate = compute_cost_estimate(&input);
@@ -2945,6 +3283,7 @@ mod tests {
             required_output: &PhysicalPropertySet::any(),
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
+            stats_input: None,
             options: &CostOptions::default(),
         };
         let estimate = compute_cost_estimate(&input);
@@ -3047,6 +3386,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::BroadcastJoin,
             scalars: None,
+            stats_input: None,
             options: &options,
         };
         let estimate = compute_cost_estimate(&input);
@@ -3116,6 +3456,7 @@ mod tests {
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::BroadcastJoin,
             scalars: Some(&scalars),
+            stats_input: None,
             options: &options,
         };
         let estimate = compute_cost_estimate(&input);

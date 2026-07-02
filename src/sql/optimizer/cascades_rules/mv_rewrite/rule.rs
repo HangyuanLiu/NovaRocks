@@ -16,7 +16,7 @@ use std::sync::Mutex;
 
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::{LiteralValue, OutputColumn};
-use crate::sql::optimizer::memo::{MExpr, MExprId, Memo};
+use crate::sql::optimizer::memo::{GroupId, MExpr, MExprId, Memo};
 use crate::sql::optimizer::operator::{
     AggregateOutputLayout, FilterOp, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec,
     ScalarProjectItem, ScanOp,
@@ -205,6 +205,14 @@ fn try_rewrite(
         .iter()
         .map(|p| col_map.rewrite(&mut memo.scalars, *p, &q_names))
         .collect::<Option<Vec<_>>>()?;
+    let mut compensation_required_columns = HashSet::new();
+    for predicate in &compensation {
+        collect_required_columns(
+            &memo.scalars,
+            *predicate,
+            &mut compensation_required_columns,
+        );
+    }
 
     // 5. Build the operator chain bottom-up.
     let scan_group = memo.new_group(MExpr {
@@ -214,7 +222,7 @@ fn try_rewrite(
             table: cand.target_table.clone(),
             alias: None,
             stats_ref: Some(cand.target_stats_ref),
-            columns: scan_columns,
+            columns: scan_columns.clone(),
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
@@ -253,6 +261,9 @@ fn try_rewrite(
                     ))
                 })
                 .collect::<Option<Vec<_>>>()?;
+            let mut required_columns = compensation_required_columns.clone();
+            collect_project_required_columns(&memo.scalars, &items, &mut required_columns);
+            set_mv_scan_required_columns(memo, scan_group, &scan_columns, &required_columns);
             Some(NewExpr {
                 op: Operator::LogicalProject(ProjectOp {
                     items,
@@ -275,6 +286,14 @@ fn try_rewrite(
                 .iter()
                 .map(|c| rewrite_aggregate_to_mv(&mut memo.scalars, c, &col_map, &q_names))
                 .collect::<Option<Vec<_>>>()?;
+            let mut required_columns = compensation_required_columns.clone();
+            for expr in &group_by {
+                collect_required_columns(&memo.scalars, *expr, &mut required_columns);
+            }
+            for aggregate in &aggregates {
+                collect_aggregate_required_columns(&memo.scalars, aggregate, &mut required_columns);
+            }
+            set_mv_scan_required_columns(memo, scan_group, &scan_columns, &required_columns);
             // DISTINCT over an SPJ MV is sound (detail rows preserved); args
             // were rewritten like any other above, so no special handling.
             Some(NewExpr {
@@ -327,6 +346,14 @@ fn try_rewrite(
                             oc.column_id,
                         ));
                     }
+                    let mut required_columns = compensation_required_columns.clone();
+                    collect_project_required_columns(&memo.scalars, &items, &mut required_columns);
+                    set_mv_scan_required_columns(
+                        memo,
+                        scan_group,
+                        &scan_columns,
+                        &required_columns,
+                    );
                     Some(NewExpr {
                         op: Operator::LogicalProject(ProjectOp {
                             items,
@@ -376,6 +403,23 @@ fn try_rewrite(
                             })
                         })
                         .collect::<Option<Vec<_>>>()?;
+                    let mut required_columns = compensation_required_columns.clone();
+                    for expr in &group_by {
+                        collect_required_columns(&memo.scalars, *expr, &mut required_columns);
+                    }
+                    for aggregate in &aggregates {
+                        collect_aggregate_required_columns(
+                            &memo.scalars,
+                            aggregate,
+                            &mut required_columns,
+                        );
+                    }
+                    set_mv_scan_required_columns(
+                        memo,
+                        scan_group,
+                        &scan_columns,
+                        &required_columns,
+                    );
                     let aggregate_visible_outputs = remap_visible_outputs_to_layout(
                         &original_agg.output_columns,
                         &original_agg.output_layout,
@@ -474,6 +518,56 @@ fn column_display(arena: &ScalarArena, expr: ScalarId) -> Option<ColumnDisplay> 
         ScalarNode::ColumnRef(column_id) => arena.column_display(*column_id).cloned(),
         _ => None,
     }
+}
+
+fn collect_required_columns(arena: &ScalarArena, expr: ScalarId, out: &mut HashSet<ColumnId>) {
+    out.extend(crate::sql::optimizer::topn_proof::collect_column_ids(arena, expr).iter());
+}
+
+fn collect_project_required_columns(
+    arena: &ScalarArena,
+    items: &[ScalarProjectItem],
+    out: &mut HashSet<ColumnId>,
+) {
+    for item in items {
+        collect_required_columns(arena, item.expr, out);
+    }
+}
+
+fn collect_aggregate_required_columns(
+    arena: &ScalarArena,
+    aggregate: &ScalarAggregateSpec,
+    out: &mut HashSet<ColumnId>,
+) {
+    for arg in &aggregate.args {
+        collect_required_columns(arena, *arg, out);
+    }
+    for key in &aggregate.order_by {
+        collect_required_columns(arena, key.expr, out);
+    }
+}
+
+fn set_mv_scan_required_columns(
+    memo: &mut Memo,
+    scan_group: GroupId,
+    scan_columns: &[OutputColumn],
+    required_column_ids: &HashSet<ColumnId>,
+) {
+    let required_columns = scan_columns
+        .iter()
+        .filter(|column| required_column_ids.contains(&column.column_id))
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    if required_columns.is_empty() {
+        return;
+    }
+    let Some(expr) = memo.groups[scan_group].logical_exprs.first_mut() else {
+        return;
+    };
+    let Operator::LogicalScan(scan) = &mut expr.op else {
+        return;
+    };
+    scan.required_columns = Some(required_columns);
 }
 
 fn rewrite_aggregate_to_mv(
@@ -638,6 +732,42 @@ mod tests {
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
                 op: BinOp::Eq,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        }
+    }
+
+    fn gt(left: TypedExpr, v: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Gt,
+                right: Box::new(int_lit(v)),
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        }
+    }
+
+    fn lt(left: TypedExpr, v: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Lt,
+                right: Box::new(int_lit(v)),
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        }
+    }
+
+    fn or(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Or,
                 right: Box::new(right),
             },
             data_type: DataType::Boolean,
@@ -1248,6 +1378,173 @@ mod tests {
         assert_eq!(scan.table.name, "spj_mv");
         assert_eq!(scan.stats_ref, Some(stats_ref_for_test(701)));
         assert_eq!(scan.mv_rewritten_from.as_deref(), Some("spj_mv"));
+    }
+
+    #[test]
+    fn spj_query_on_wider_spj_mv_prunes_injected_scan_columns() {
+        // SPJ MV: SELECT a, b, v FROM t WHERE a >= 0.
+        let mv_a = col(100, "a");
+        let mv_b = col(101, "b");
+        let mv_v = col(102, "v");
+        let mv_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Filter(LogicalFilterNode {
+                predicate: ge(col_ref(&mv_a), 0),
+            }),
+            vec![base_scan(&[mv_a.clone(), mv_b.clone(), mv_v.clone()])],
+            None,
+        );
+        let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
+        let candidate = MvRewriteCandidate {
+            mv_name: "wide_spj_mv".to_string(),
+            mv,
+            mv_scalars,
+            target_database: "ns".to_string(),
+            target_table: iceberg_table("cat", "ns", "wide_spj_mv", &["a", "b", "v"]),
+            target_stats_ref: stats_ref_for_test(704),
+        };
+
+        // Query only needs a,b; the injected MV scan must not cost/read v.
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Filter(LogicalFilterNode {
+                predicate: ge(col_ref(&a), 0),
+            }),
+            vec![base_scan(&[a.clone(), b.clone()])],
+            None,
+        );
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        let rule = MvRewriteRule::new(vec![candidate]);
+        let alts = rule.apply(&root_expr, &mut memo);
+        assert_eq!(alts.len(), 1);
+
+        let scan = find_scan(&memo, alts[0].children[0]);
+        assert_eq!(
+            scan.required_columns.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn spj_query_on_exact_or_spj_mv_injects_alternative() {
+        // SPJ MV: SELECT a, b, v FROM t WHERE a > 10 OR b < 3.
+        let mv_a = col(100, "a");
+        let mv_b = col(101, "b");
+        let mv_v = col(102, "v");
+        let mv_predicate = or(gt(col_ref(&mv_a), 10), lt(col_ref(&mv_b), 3));
+        let mv_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Filter(LogicalFilterNode {
+                predicate: mv_predicate,
+            }),
+            vec![base_scan(&[mv_a.clone(), mv_b.clone(), mv_v.clone()])],
+            None,
+        );
+        let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
+        let candidate = MvRewriteCandidate {
+            mv_name: "or_mv".to_string(),
+            mv,
+            mv_scalars,
+            target_database: "ns".to_string(),
+            target_table: iceberg_table("cat", "ns", "or_mv", &["a", "b", "v"]),
+            target_stats_ref: stats_ref_for_test(705),
+        };
+
+        // Query uses the same OR arms in the opposite order; normalization must
+        // still match and require no compensation filter.
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let query_predicate = or(lt(col_ref(&b), 3), gt(col_ref(&a), 10));
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Filter(LogicalFilterNode {
+                predicate: query_predicate,
+            }),
+            vec![base_scan(&[a.clone(), b.clone()])],
+            None,
+        );
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        let rule = MvRewriteRule::new(vec![candidate]);
+        let alts = rule.apply(&root_expr, &mut memo);
+        assert_eq!(alts.len(), 1);
+        assert!(
+            !has_filter(&memo, alts[0].children[0]),
+            "exact OR predicate should be fully implied by the MV"
+        );
+        let scan = find_scan(&memo, alts[0].children[0]);
+        assert_eq!(scan.table.name, "or_mv");
+        assert_eq!(scan.mv_rewritten_from.as_deref(), Some("or_mv"));
+        assert_eq!(
+            scan.required_columns.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn spj_scan_root_with_pushed_or_predicate_injects_alternative() {
+        // Production query rewrite has already pushed the OR into the scan and
+        // pruned the required scan output list before Cascades MV rewrite runs.
+        let mv_a = col(100, "a");
+        let mv_b = col(101, "b");
+        let mv_v = col(102, "v");
+        let mv_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Filter(LogicalFilterNode {
+                predicate: or(gt(col_ref(&mv_a), 10), lt(col_ref(&mv_b), 3)),
+            }),
+            vec![base_scan(&[mv_a.clone(), mv_b.clone(), mv_v.clone()])],
+            None,
+        );
+        let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
+        let candidate = MvRewriteCandidate {
+            mv_name: "or_mv".to_string(),
+            mv,
+            mv_scalars,
+            target_database: "ns".to_string(),
+            target_table: iceberg_table("cat", "ns", "or_mv", &["a", "b", "v"]),
+            target_stats_ref: stats_ref_for_test(706),
+        };
+
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let v = col(3, "v");
+        let query_scan = LogicalPlanNode::new(
+            LogicalPlanKind::Scan(LogicalScanNode {
+                database: "ns".to_string(),
+                table: iceberg_table("cat", "ns", "t", &["a", "b", "v"]),
+                alias: None,
+                columns: vec![a.clone(), b.clone(), v],
+                predicates: vec![or(lt(col_ref(&b), 3), gt(col_ref(&a), 10))],
+                required_columns: Some(vec!["a".to_string(), "b".to_string()]),
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            None,
+        );
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_scan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        let rule = MvRewriteRule::new(vec![candidate]);
+        let alts = rule.apply(&root_expr, &mut memo);
+        assert_eq!(alts.len(), 1);
+        let scan = find_scan(&memo, alts[0].children[0]);
+        assert_eq!(scan.table.name, "or_mv");
+        assert_eq!(
+            scan.required_columns.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
     }
 
     #[test]

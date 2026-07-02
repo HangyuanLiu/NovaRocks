@@ -790,6 +790,7 @@ fn synthetic_project_explain_stats(
         required_output: output_property,
         alt_kind: &crate::sql::optimizer::derive::PropertyAlternativeKind::Default,
         scalars: Some(scalars),
+        stats_input: None,
         options: cost_options,
     };
     OptimizerExplainStats {
@@ -821,6 +822,7 @@ fn rewritten_node_explain_stats(
         required_output: &node.execution_props.output_property,
         alt_kind: &crate::sql::optimizer::derive::PropertyAlternativeKind::Default,
         scalars: Some(scalars),
+        stats_input: None,
         options: cost_options,
     };
     OptimizerExplainStats {
