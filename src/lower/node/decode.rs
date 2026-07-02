@@ -108,10 +108,33 @@ pub(crate) fn build_query_global_dict_map(
             ));
         }
         let mut dict_values = HashMap::with_capacity(ids.len());
+        let mut value_to_id = HashMap::<Vec<u8>, i32>::with_capacity(strings.len());
         for (id, value) in ids.iter().zip(strings.iter()) {
-            dict_values.insert(*id, value.clone());
+            if let Some(existing) = dict_values.insert(*id, value.clone())
+                && existing != *value
+            {
+                return Err(format!(
+                    "query_global_dict column_id={} duplicate id {} maps to different strings",
+                    column_id, id
+                ));
+            }
+            if let Some(existing_id) = value_to_id.insert(value.clone(), *id)
+                && existing_id != *id
+            {
+                return Err(format!(
+                    "query_global_dict column_id={} duplicate string maps to different ids: existing_id={}, new_id={}",
+                    column_id, existing_id, id
+                ));
+            }
         }
-        out.insert(column_id, Arc::new(dict_values));
+        if let Some(existing) = out.insert(column_id, Arc::new(dict_values)) {
+            return Err(format!(
+                "query_global_dict column_id={} appears more than once in the same fragment (existing_size={}, new_size={})",
+                column_id,
+                existing.len(),
+                ids.len()
+            ));
+        }
     }
 
     // FE may send derived dictionary expressions in `query_global_dict_exprs`, where target
@@ -691,4 +714,68 @@ pub(crate) fn lower_decode_node(
         },
         layout: out_layout,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict(column_id: i32, strings: Vec<&str>, ids: Vec<i32>) -> data::TGlobalDict {
+        data::TGlobalDict::new(
+            Some(column_id),
+            Some(strings.into_iter().map(|s| s.as_bytes().to_vec()).collect()),
+            Some(ids),
+            None,
+        )
+    }
+
+    #[test]
+    fn query_global_dict_rejects_duplicate_id_with_different_value() {
+        let err = build_query_global_dict_map(Some(&[dict(7, vec!["a", "b"], vec![1, 1])]), None)
+            .unwrap_err();
+        assert!(
+            err.contains("duplicate id") && err.contains("column_id=7"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn query_global_dict_rejects_duplicate_value_with_different_id() {
+        let err = build_query_global_dict_map(Some(&[dict(7, vec!["a", "a"], vec![1, 2])]), None)
+            .unwrap_err();
+        assert!(
+            err.contains("duplicate string") && err.contains("column_id=7"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn query_global_dict_rejects_duplicate_column_id_in_same_fragment() {
+        let err = build_query_global_dict_map(
+            Some(&[dict(7, vec!["a"], vec![1]), dict(7, vec!["b"], vec![2])]),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("column_id=7") && err.contains("appears more than once"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn query_global_dict_accepts_consistent_payload() {
+        let out = build_query_global_dict_map(Some(&[dict(7, vec!["a", "b"], vec![1, 2])]), None)
+            .expect("dict");
+        assert_eq!(out.get(&7).unwrap().get(&1).unwrap(), b"a");
+        assert_eq!(out.get(&7).unwrap().get(&2).unwrap(), b"b");
+    }
+
+    #[test]
+    fn query_global_dict_accepts_consistent_duplicate_entry() {
+        let out = build_query_global_dict_map(Some(&[dict(7, vec!["a", "a"], vec![1, 1])]), None)
+            .expect("dict");
+        let values = out.get(&7).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values.get(&1).unwrap(), b"a");
+    }
 }
