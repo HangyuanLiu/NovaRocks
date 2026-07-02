@@ -2970,12 +2970,18 @@ mod tests {
                     crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
                 ));
 
-                crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
-                    &physical,
-                    &catalog,
-                    &connectors,
-                    "default",
-                    Some(&refresh_ctx),
+                let dp =
+                    crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
+                        &physical,
+                    )
+                    .expect("build DistributedPlan");
+                crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
+                    crate::sql::codegen::FragmentBuildRequest::result(
+                        &dp,
+                        &catalog,
+                        &connectors,
+                        Some(&refresh_ctx),
+                    ),
                 )
                 .expect("join projection coalesce plan must lower");
             })

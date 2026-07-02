@@ -5218,7 +5218,10 @@ mod tests {
         PartitionKind, PlanFragment,
     };
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
-    use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
+    use crate::sql::codegen::{
+        FragmentBuildRequest, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+        MultiFragmentBuildResult,
+    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         AggMode, AggregateOutputLayout, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, JoinDistribution,
@@ -5235,9 +5238,18 @@ mod tests {
     use crate::thrift::plan_nodes::TPlanNodeType;
 
     fn build_distributed_plan(plan: &OptimizerPhysicalNode) -> Result<DistributedPlan, String> {
-        let physical =
-            crate::sql::planner::optimizer_bridge::physical::optimizer_physical_to_plan(plan)?;
-        crate::sql::planner::build_distributed_plan(&physical)
+        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
+            plan,
+        )
+    }
+
+    fn build_fragments_from_optimizer_for_test(
+        plan: &OptimizerPhysicalNode,
+        catalog: &dyn CatalogProvider,
+        connectors: &ConnectorRegistry,
+    ) -> Result<MultiFragmentBuildResult, String> {
+        let dp = build_distributed_plan(plan)?;
+        PlanFragmentBuilder::build(FragmentBuildRequest::result(&dp, catalog, connectors, None))
     }
 
     #[test]
@@ -5588,16 +5600,15 @@ mod tests {
     }
 
     #[test]
-    fn build_via_distributed_plan_lowers_project_over_scan() {
+    fn fragment_build_request_lowers_project_over_scan() {
         let catalog = DummyCatalog;
         let connectors = ConnectorRegistry::new();
-        let result = PlanFragmentBuilder::build_via_distributed_plan(
+        let result = build_fragments_from_optimizer_for_test(
             &project_over_metadata_scan_plan(),
             &catalog,
             &connectors,
-            "test_db",
         )
-        .expect("build_via_distributed_plan");
+        .expect("fragment build request");
 
         assert_eq!(result.root_fragment_id, 0);
         assert_eq!(result.fragment_results.len(), 1);

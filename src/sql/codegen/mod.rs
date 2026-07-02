@@ -10,6 +10,7 @@ pub(crate) mod descriptors;
 pub(crate) mod expr_compiler;
 pub(crate) mod fallback_audit;
 pub(crate) mod fragment_builder;
+pub(crate) mod fragment_request;
 pub(crate) mod helpers;
 pub(crate) mod iceberg_change_stream_write;
 pub(crate) mod iceberg_write_sink;
@@ -33,6 +34,8 @@ use super::analysis::cte::CteId;
 use super::column_id::ColumnId;
 
 pub(crate) type FragmentId = u32;
+
+pub(crate) use fragment_request::{FragmentBuildOutput, FragmentBuildRequest};
 
 // ---------------------------------------------------------------------------
 // Public types
