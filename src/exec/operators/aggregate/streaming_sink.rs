@@ -38,10 +38,11 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use super::streaming_state::AggregateStreamingState;
 use super::{ENABLE_GROUP_KEY_OPTIMIZATIONS, align_schema_with_arrays, build_agg_views};
 use crate::common::failpoint;
+use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
+use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
@@ -391,23 +392,13 @@ impl AggregateStreamingSinkOperator {
                     let view = key_views
                         .first()
                         .ok_or_else(|| "one string key view missing".to_string())?;
-                    let GroupKeyArrayView::Utf8(arr) = view else {
-                        return Err("one string key expects Utf8 view".to_string());
-                    };
                     let hashes = key_table
                         .build_group_hashes(&key_views, num_rows)
                         .map_err(|e| e.to_string())?;
                     for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
-                        let lookup = if arr.is_null(row) {
-                            key_table
-                                .find_or_insert_one_string(view, row, None, hash)
-                                .map_err(|e| e.to_string())?
-                        } else {
-                            let key = arr.value(row);
-                            key_table
-                                .find_or_insert_one_string(view, row, Some(key), hash)
-                                .map_err(|e| e.to_string())?
-                        };
+                        let lookup = key_table
+                            .find_or_insert_one_string_like(view, row, hash)
+                            .map_err(|e| e.to_string())?;
                         self.ensure_group_state(&lookup)
                             .map_err(|e| e.to_string())?;
                         group_ids.push(lookup.group_id);
@@ -984,6 +975,16 @@ impl ProcessorOperator for AggregateStreamingSinkOperator {
         self.streaming_state.mark_sink_finished();
         self.finished = true;
         Ok(())
+    }
+
+    fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
+        super::aggregate_accepts_encoded_group_column(
+            &self.arena,
+            &self.group_by,
+            &self.functions,
+            slot_id,
+            data_type,
+        )
     }
 }
 
