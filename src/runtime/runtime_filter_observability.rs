@@ -15,6 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Per-filter runtime-filter lifecycle observability.
+//!
+//! This module records query-scoped runtime-filter lifecycle events without
+//! affecting execution semantics. Low-frequency call sites can use
+//! `RfLifecycleRecorder` directly; apply hot paths can cache an
+//! `RfLifecycleHandle` and update counters with relaxed atomics only.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -92,22 +99,22 @@ impl RuntimeFilterLifecycleRegistry {
     }
 }
 
-pub fn runtime_filter_lifecycle_registry() -> &'static RuntimeFilterLifecycleRegistry {
+fn runtime_filter_lifecycle_registry() -> &'static RuntimeFilterLifecycleRegistry {
     static REGISTRY: OnceLock<RuntimeFilterLifecycleRegistry> = OnceLock::new();
     REGISTRY.get_or_init(RuntimeFilterLifecycleRegistry::new)
 }
 
 #[derive(Default)]
-pub struct QueryRfLifecycle {
+struct QueryRfLifecycle {
     filters: RwLock<HashMap<i32, Arc<RfLifecycleRecord>>>,
 }
 
 impl QueryRfLifecycle {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
-    pub fn snapshot(&self) -> QueryRfSnapshot {
+    fn snapshot(&self) -> QueryRfSnapshot {
         let filters = rw_read(&self.filters)
             .iter()
             .map(|(filter_id, record)| (*filter_id, record.snapshot()))
@@ -116,6 +123,13 @@ impl QueryRfLifecycle {
     }
 
     fn record(&self, filter_id: i32) -> Arc<RfLifecycleRecord> {
+        if let Some(record) = {
+            let guard = rw_read(&self.filters);
+            guard.get(&filter_id).cloned()
+        } {
+            return record;
+        }
+
         let mut guard = rw_write(&self.filters);
         Arc::clone(
             guard
@@ -126,7 +140,7 @@ impl QueryRfLifecycle {
 }
 
 #[derive(Default)]
-pub struct RfLifecycleRecord {
+struct RfLifecycleRecord {
     planned: AtomicBool,
     built: Mutex<Option<RfBuiltInfo>>,
     sent_partials: AtomicI64,
@@ -139,11 +153,11 @@ pub struct RfLifecycleRecord {
     applied_output_rows: AtomicI64,
     applied_evals: AtomicI64,
     dropped: Mutex<Option<RfDropReason>>,
-    disabled: AtomicBool,
+    disabled: Mutex<Option<String>>,
 }
 
 impl RfLifecycleRecord {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
@@ -161,7 +175,7 @@ impl RfLifecycleRecord {
             applied_output_rows: self.applied_output_rows.load(Ordering::Relaxed),
             applied_evals: self.applied_evals.load(Ordering::Relaxed),
             dropped: *mutex_lock(&self.dropped),
-            disabled: self.disabled.load(Ordering::Relaxed),
+            disabled: mutex_lock(&self.disabled).clone(),
         }
     }
 }
@@ -177,55 +191,105 @@ impl RfLifecycleRecorder {
         self.query
     }
 
+    pub fn filter(&self, filter_id: i32) -> RfLifecycleHandle {
+        RfLifecycleHandle {
+            filter_id,
+            record: self.lifecycle.record(filter_id),
+        }
+    }
+
     pub fn planned(&self, filter_id: i32) {
-        let record = self.lifecycle.record(filter_id);
-        record.planned.store(true, Ordering::Relaxed);
+        self.filter(filter_id).planned();
     }
 
     pub fn built(&self, filter_id: i32, rows: i64, bytes: i64) {
-        let record = self.lifecycle.record(filter_id);
-        *mutex_lock(&record.built) = Some(RfBuiltInfo { rows, bytes });
+        self.filter(filter_id).built(rows, bytes);
     }
 
     pub fn sent_partial(&self, filter_id: i32, bytes: i64) {
-        let record = self.lifecycle.record(filter_id);
-        record.sent_partials.fetch_add(1, Ordering::Relaxed);
-        record.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.filter(filter_id).sent_partial(bytes);
     }
 
     pub fn merge_progress(&self, filter_id: i32, received: i64, expected: i64) {
-        let record = self.lifecycle.record(filter_id);
-        record.merged_received.store(received, Ordering::Relaxed);
-        record.merged_expected.store(expected, Ordering::Relaxed);
+        self.filter(filter_id).merge_progress(received, expected);
     }
 
     pub fn delivered(&self, filter_id: i32) {
-        let record = self.lifecycle.record(filter_id);
-        record.delivered.store(true, Ordering::Relaxed);
+        self.filter(filter_id).delivered();
     }
 
     pub fn acquired(&self, filter_id: i32, outcome: impl Into<String>, latency_ns: i64) {
-        let record = self.lifecycle.record(filter_id);
-        *mutex_lock(&record.acquired) = Some(RfAcquiredInfo {
+        self.filter(filter_id).acquired(outcome, latency_ns);
+    }
+
+    pub fn applied(&self, filter_id: i32, input_rows: i64, output_rows: i64, evals: i64) {
+        self.filter(filter_id)
+            .applied(input_rows, output_rows, evals);
+    }
+
+    pub fn dropped(&self, filter_id: i32, reason: RfDropReason) {
+        self.filter(filter_id).dropped(reason);
+    }
+}
+
+#[derive(Clone)]
+pub struct RfLifecycleHandle {
+    filter_id: i32,
+    record: Arc<RfLifecycleRecord>,
+}
+
+impl RfLifecycleHandle {
+    pub fn filter_id(&self) -> i32 {
+        self.filter_id
+    }
+
+    pub fn planned(&self) {
+        self.record.planned.store(true, Ordering::Relaxed);
+    }
+
+    pub fn built(&self, rows: i64, bytes: i64) {
+        *mutex_lock(&self.record.built) = Some(RfBuiltInfo { rows, bytes });
+    }
+
+    pub fn sent_partial(&self, bytes: i64) {
+        self.record.sent_partials.fetch_add(1, Ordering::Relaxed);
+        self.record.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn merge_progress(&self, received: i64, expected: i64) {
+        self.record
+            .merged_received
+            .store(received, Ordering::Relaxed);
+        self.record
+            .merged_expected
+            .store(expected, Ordering::Relaxed);
+    }
+
+    pub fn delivered(&self) {
+        self.record.delivered.store(true, Ordering::Relaxed);
+    }
+
+    pub fn acquired(&self, outcome: impl Into<String>, latency_ns: i64) {
+        *mutex_lock(&self.record.acquired) = Some(RfAcquiredInfo {
             outcome: outcome.into(),
             latency_ns,
         });
     }
 
-    pub fn applied(&self, filter_id: i32, input_rows: i64, output_rows: i64, evals: i64) {
-        let record = self.lifecycle.record(filter_id);
-        record
+    pub fn applied(&self, input_rows: i64, output_rows: i64, evals: i64) {
+        self.record
             .applied_input_rows
             .fetch_add(input_rows, Ordering::Relaxed);
-        record
+        self.record
             .applied_output_rows
             .fetch_add(output_rows, Ordering::Relaxed);
-        record.applied_evals.fetch_add(evals, Ordering::Relaxed);
+        self.record
+            .applied_evals
+            .fetch_add(evals, Ordering::Relaxed);
     }
 
-    pub fn dropped(&self, filter_id: i32, reason: RfDropReason) {
-        let record = self.lifecycle.record(filter_id);
-        *mutex_lock(&record.dropped) = Some(reason);
+    pub fn dropped(&self, reason: RfDropReason) {
+        *mutex_lock(&self.record.dropped) = Some(reason);
     }
 }
 
@@ -248,7 +312,7 @@ pub struct RfRecordView {
     applied_output_rows: i64,
     applied_evals: i64,
     pub dropped: Option<RfDropReason>,
-    pub disabled: bool,
+    disabled: Option<String>,
 }
 
 impl RfRecordView {
@@ -289,6 +353,7 @@ fn rw_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     #[test]
     fn lifecycle_record_accumulates_and_exports() {
@@ -302,16 +367,26 @@ mod tests {
         rec.merge_progress(7, 1, 3);
         rec.merge_progress(7, 3, 3);
         rec.delivered(7);
+        rec.acquired(7, "Complete", 4_000);
         rec.applied(7, 1024, 100, 1);
         rec.applied(7, 1024, 50, 1);
         rec.dropped(9, RfDropReason::SizeExceeded);
 
         let snap = registry.snapshot(q).expect("query snapshot");
         let f7 = snap.filters.get(&7).expect("filter 7");
+        assert!(f7.planned);
         assert_eq!(f7.built.as_ref().map(|b| (b.rows, b.bytes)), Some((3, 128)));
+        assert_eq!(f7.sent_partials, 1);
+        assert_eq!(f7.sent_bytes, 128);
         assert_eq!(f7.merged_received(), 3);
         assert_eq!(f7.merged_expected(), 3);
         assert!(f7.delivered);
+        assert_eq!(
+            f7.acquired
+                .as_ref()
+                .map(|a| (a.outcome.as_str(), a.latency_ns)),
+            Some(("Complete", 4_000))
+        );
         assert_eq!(f7.applied_input_rows(), 2048);
         assert_eq!(f7.applied_output_rows(), 150);
         assert_eq!(f7.applied_evals(), 2);
@@ -331,5 +406,32 @@ mod tests {
             registry.snapshot(q).is_some(),
             "recorder auto-creates the query entry"
         );
+    }
+
+    #[test]
+    fn cached_filter_handle_accumulates_applied_counters_concurrently() {
+        let registry = RuntimeFilterLifecycleRegistry::new();
+        let q = QueryKey::from_hi_lo(5, 6);
+        let handle = registry.recorder(q).filter(11);
+        assert_eq!(handle.filter_id(), 11);
+
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let handle = handle.clone();
+            workers.push(thread::spawn(move || {
+                for _ in 0..1000 {
+                    handle.applied(2, 1, 1);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+
+        let snap = registry.snapshot(q).expect("query snapshot");
+        let filter = snap.filters.get(&11).expect("filter 11");
+        assert_eq!(filter.applied_input_rows(), 16_000);
+        assert_eq!(filter.applied_output_rows(), 8_000);
+        assert_eq!(filter.applied_evals(), 8_000);
     }
 }
