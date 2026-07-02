@@ -14731,13 +14731,8 @@ fn iceberg_change_stream_write_dag_for_imv_refresh(
         &refresh_plan.producer_branches,
         target_ref,
     )?;
-    let change_op_output_ordinal = if branches.len() > 1 {
-        Some(imv_change_op_output_ordinal(refresh_plan)?)
-    } else {
-        None
-    };
     Ok(crate::sql::planner::ChangeStreamWriteDagSpec {
-        change_op_output_ordinal,
+        change_op_output_ordinal: Some(imv_change_op_output_ordinal(refresh_plan)?),
         data_route_output_ordinal,
         branches,
     })
