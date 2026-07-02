@@ -736,6 +736,125 @@ fn run_imv_equivalence_check(
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
+// @imv_stateless_rebuild helpers
+// ---------------------------------------------------------------------------
+
+/// A server that can rebuild at `available` can also serve any weaker
+/// (lower-fidelity) requirement, since `ImvStatelessLevel`'s derived `Ord`
+/// is defined in increasing fidelity order (Baseline < Package < Provenance < Full).
+fn stateless_level_satisfies(available: ImvStatelessLevel, required: ImvStatelessLevel) -> bool {
+    available >= required
+}
+
+/// Run `sql` and unwrap the `(bool, Option<QueryExecution>, String)` triple
+/// returned by `MysqlSession::execute_query` into a single `Result`, so
+/// `@imv_stateless_rebuild` call sites can use `?`.
+fn execute_required_query(
+    session: &mut crate::session::MysqlSession,
+    query_timeout: u64,
+    sql: &str,
+) -> Result<crate::types::QueryExecution, String> {
+    let (ok, execution, msg) = session.execute_query(query_timeout, sql, None);
+    if !ok {
+        return Err(format!("query failed: {sql}\n{msg}"));
+    }
+    execution.ok_or_else(|| format!("query returned no result: {sql}"))
+}
+
+/// Parse the `AvailableLevel` value out of the first row/column of the
+/// `CALL <catalog>.system.novarocks_imv_stateless_rebuild(...)` result.
+/// Matching is case-insensitive since the value crosses a wire boundary from
+/// the server.
+fn parse_available_stateless_level(
+    exec: &crate::types::QueryExecution,
+) -> Result<ImvStatelessLevel, String> {
+    let raw = exec
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .ok_or_else(|| {
+            "novarocks_imv_stateless_rebuild returned no AvailableLevel row".to_string()
+        })?;
+    match raw.to_ascii_lowercase().as_str() {
+        "baseline" => Ok(ImvStatelessLevel::Baseline),
+        "package" => Ok(ImvStatelessLevel::Package),
+        "provenance" => Ok(ImvStatelessLevel::Provenance),
+        "full" => Ok(ImvStatelessLevel::Full),
+        other => Err(format!(
+            "novarocks_imv_stateless_rebuild returned unknown AvailableLevel `{other}`"
+        )),
+    }
+}
+
+/// Trigger a stateless rebuild of `directive.mv` via the server-side
+/// `novarocks_imv_stateless_rebuild` procedure and assert that (a) the
+/// server's reported available fidelity level covers the requested level,
+/// and (b) the MV's read face (`SELECT * FROM <fqn>`) is unchanged by the
+/// rebuild — the trigger must not alter what the MV returns, only how it is
+/// physically backed. MV is qualified by `db` like wait_alter_*.
+fn run_imv_stateless_rebuild_check(
+    directive: &ImvStatelessDirective,
+    session: &mut crate::session::MysqlSession,
+    query_timeout: u64,
+    db: Option<&str>,
+    epsilon: Option<f64>,
+    log: &mut String,
+) -> Result<(), String> {
+    // When no case db is active, `fqn` is the bare MV name and both the SELECT
+    // and the `table => '<mv>'` procedure argument resolve their namespace from
+    // the session's current database. A case mounting this directive must have
+    // established the catalog/db (e.g. via SET CATALOG / USE) on the shared
+    // session before this step, as the iceberg-ivm cases do.
+    let fqn = match db {
+        Some(d) if !d.is_empty() => format!("{d}.{}", directive.mv),
+        _ => directive.mv.clone(),
+    };
+    let select = format!("SELECT * FROM {fqn}");
+    let _ = writeln!(
+        log,
+        "    @imv_stateless_rebuild: capturing read face of {fqn} before rebuild"
+    );
+    let before = execute_required_query(session, query_timeout, &select)?;
+
+    let catalog = directive.catalog.as_deref().unwrap_or("ice");
+    let call = format!(
+        "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => '{fqn}', level => '{}')",
+        directive.level.as_sql()
+    );
+    let _ = writeln!(log, "    @imv_stateless_rebuild: {call}");
+    let procedure_rows = execute_required_query(session, query_timeout, &call)?;
+    let available = parse_available_stateless_level(&procedure_rows)?;
+    if !stateless_level_satisfies(available, directive.level) {
+        return Err(format!(
+            "@imv_stateless_rebuild: server only supports level {:?}, required {:?}",
+            available, directive.level
+        ));
+    }
+
+    let after = execute_required_query(session, query_timeout, &select)?;
+    let (same, reason) = compare_result_sets(
+        &before.header,
+        &before.rows,
+        &after.header,
+        &after.rows,
+        false,
+        epsilon,
+    );
+    if !same {
+        return Err(format!(
+            "@imv_stateless_rebuild: SELECT result changed after lake rebuild for `{fqn}`\n{reason}"
+        ));
+    }
+    let _ = writeln!(
+        log,
+        "    @imv_stateless_rebuild: {fqn} level {:?} passed ✅",
+        directive.level
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // @explain_* helpers
 // ---------------------------------------------------------------------------
 
@@ -1332,6 +1451,24 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
+                        // @imv_stateless_rebuild: trigger the lake-native stateless
+                        // rebuild procedure for the named MV and assert its read
+                        // face is unchanged. Runs before @imv_equivalence_check so
+                        // that, when both directives are present on a step, the
+                        // equivalence oracle below validates the rebuilt MV.
+                        if let Some(directive) = step.meta.imv_stateless_rebuild.as_ref() {
+                            if let Err(reason) = run_imv_stateless_rebuild_check(
+                                directive,
+                                &mut target_session,
+                                ctx.query_timeout,
+                                step.meta.db.as_deref().or(primary_case_db),
+                                epsilon,
+                                &mut log,
+                            ) {
+                                let _ = writeln!(log, "    ❌ FAIL: {reason}");
+                                case_failed = true;
+                            }
+                        }
                         // @imv_equivalence_check: assert MV incremental contents
                         // == a full recompute derived by running the MV's SelectText
                         // directly against the base tables (no MV side effects).
@@ -3584,5 +3721,23 @@ enable_path_style_access = true
         let full = exec(&["k", "c"], &[&["a", "3"]]);
         let msg = super::imv_equivalence_failure("m", &inc, &full, None).expect("diff");
         assert!(msg.contains("incremental result != full recompute"), "{msg}");
+    }
+
+    #[test]
+    fn imv_stateless_available_level_must_cover_required_level() {
+        use crate::types::ImvStatelessLevel;
+
+        assert!(super::stateless_level_satisfies(
+            ImvStatelessLevel::Package,
+            ImvStatelessLevel::Baseline
+        ));
+        assert!(super::stateless_level_satisfies(
+            ImvStatelessLevel::Package,
+            ImvStatelessLevel::Package
+        ));
+        assert!(!super::stateless_level_satisfies(
+            ImvStatelessLevel::Baseline,
+            ImvStatelessLevel::Package
+        ));
     }
 }

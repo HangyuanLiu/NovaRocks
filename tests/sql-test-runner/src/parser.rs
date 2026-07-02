@@ -62,6 +62,32 @@ fn legacy_name_line_has_sequential_tag(line: &str) -> bool {
         .any(|token| token.eq_ignore_ascii_case("@sequential"))
 }
 
+fn parse_imv_stateless_rebuild(raw: &str) -> anyhow::Result<ImvStatelessDirective> {
+    let mut parts = raw.split(',').map(str::trim).filter(|s| !s.is_empty());
+    let mv = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("@imv_stateless_rebuild requires an MV name"))?
+        .to_string();
+    let mut level = ImvStatelessLevel::Package;
+    let mut catalog = None;
+    for part in parts {
+        if let Some(value) = part.strip_prefix("level=") {
+            level = match value {
+                "baseline" => ImvStatelessLevel::Baseline,
+                "package" => ImvStatelessLevel::Package,
+                "provenance" => ImvStatelessLevel::Provenance,
+                "full" => ImvStatelessLevel::Full,
+                other => anyhow::bail!("unknown @imv_stateless_rebuild level `{other}`"),
+            };
+        } else if let Some(value) = part.strip_prefix("catalog=") {
+            catalog = Some(value.to_string());
+        } else {
+            anyhow::bail!("unknown @imv_stateless_rebuild option `{part}`");
+        }
+    }
+    Ok(ImvStatelessDirective { mv, level, catalog })
+}
+
 fn detect_case_sequential(lines: &[String], file_meta_lines: &[String], meta_re: &Regex) -> bool {
     file_meta_lines.iter().any(|line| {
         parse_meta_line(line, meta_re)
@@ -188,6 +214,9 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "imv_equivalence_check" => {
                 meta.imv_equivalence_check = Some(raw_value);
             }
+            "imv_stateless_rebuild" => {
+                meta.imv_stateless_rebuild = Some(parse_imv_stateless_rebuild(&raw_value)?);
+            }
             "sequential" => {
                 // Parsed here but ignored in merge_meta; handled at case level.
             }
@@ -269,6 +298,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .imv_equivalence_check
             .clone()
             .or_else(|| base.imv_equivalence_check.clone()),
+        imv_stateless_rebuild: override_meta
+            .imv_stateless_rebuild
+            .clone()
+            .or_else(|| base.imv_stateless_rebuild.clone()),
     }
 }
 
@@ -717,6 +750,38 @@ mod opt5_directive_tests {
         let lines = vec!["-- @imv_equivalence_check=orders_mv".to_string()];
         let meta = parse_meta(&lines, &re).unwrap();
         assert_eq!(meta.imv_equivalence_check.as_deref(), Some("orders_mv"));
+    }
+
+    #[test]
+    fn parse_meta_collects_imv_stateless_rebuild_with_default_level() {
+        let re = meta_re();
+        let lines = vec!["-- @imv_stateless_rebuild=orders_mv".to_string()];
+        let meta = parse_meta(&lines, &re).expect("parse");
+        let directive = meta.imv_stateless_rebuild.as_ref().expect("directive");
+        assert_eq!(directive.mv, "orders_mv");
+        assert_eq!(directive.level, ImvStatelessLevel::Package);
+    }
+
+    #[test]
+    fn parse_meta_collects_imv_stateless_rebuild_with_explicit_level() {
+        let re = meta_re();
+        let lines = vec!["-- @imv_stateless_rebuild=orders_mv,level=baseline".to_string()];
+        let meta = parse_meta(&lines, &re).expect("parse");
+        let directive = meta.imv_stateless_rebuild.as_ref().expect("directive");
+        assert_eq!(directive.mv, "orders_mv");
+        assert_eq!(directive.level, ImvStatelessLevel::Baseline);
+    }
+
+    #[test]
+    fn parse_meta_collects_imv_stateless_rebuild_with_catalog_and_level() {
+        let re = meta_re();
+        let lines =
+            vec!["-- @imv_stateless_rebuild=orders_mv,catalog=mv_ice_x,level=package".to_string()];
+        let meta = parse_meta(&lines, &re).expect("parse");
+        let d = meta.imv_stateless_rebuild.as_ref().expect("directive");
+        assert_eq!(d.mv, "orders_mv");
+        assert_eq!(d.level, ImvStatelessLevel::Package);
+        assert_eq!(d.catalog.as_deref(), Some("mv_ice_x"));
     }
 
     #[test]
