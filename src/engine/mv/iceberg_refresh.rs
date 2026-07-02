@@ -18,6 +18,9 @@ use crate::common::engine_error::EngineError;
 use crate::connector::iceberg::changes::{
     IcebergChangePolicySignal, plan_changes, policy_signal_from_change_error,
 };
+use crate::connector::iceberg::commit::mv_provenance::{
+    MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
+};
 use crate::connector::iceberg::commit::{
     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
     MvRefreshPublishPlan, MvRefreshSnapshotMarker, PositionDeleteGroup, RecoveryEvidence,
@@ -3355,6 +3358,18 @@ fn refresh_iceberg_mv_with_planned_partitions(
             descriptor_contract.as_ref(),
             dispatch_schema_contract,
         )?;
+        // W3a: verify the watermark recorded in the MV table's current
+        // snapshot provenance matches the store. First refresh (no current
+        // snapshot, or a snapshot without provenance) has no watermark yet —
+        // skip.
+        if let Some(current) = loaded.table.metadata().current_snapshot() {
+            if let Some(prov) = MvProvenanceV1::from_snapshot_summary(current)? {
+                crate::engine::mv::schema_contract::ensure_summary_watermark_matches_store(
+                    &prov.bases,
+                    &mv_definition.last_refresh_snapshots,
+                )?;
+            }
+        }
     }
     let caps = RefreshCapabilities::from_schema_contract(dispatch_schema_contract)?;
     match (caps.has_agg_state, &caps.snapshot_policy, &caps.identity) {
@@ -7492,6 +7507,62 @@ fn load_iceberg_mv_refresh_marker(
     })
 }
 
+/// Stable, deterministic fingerprint of an MV definition, used as
+/// [`MvProvenanceV1::definition_fingerprint`]. It hashes only the stored
+/// SELECT text so a byte-for-byte rebuild from the same definition produces
+/// the same fingerprint. Sha256/hex keeps it collision-resistant and short.
+fn mv_definition_fingerprint(select_sql: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(select_sql.as_bytes()))
+}
+
+/// Build the per-base watermark list for a refresh provenance record.
+///
+/// `new_snapshots` is the set of base snapshots THIS refresh consumed (the
+/// value about to be persisted as the MV's new watermark, keyed by base FQN),
+/// `table_uuids` the matching base table UUIDs, and `previous_snapshots` the
+/// MV's prior watermark (`mv_definition.last_refresh_snapshots`) so each base
+/// carries its `from_snapshot` (`None` on the first refresh for that base).
+fn build_mv_refresh_provenance_bases(
+    new_snapshots: &BTreeMap<String, i64>,
+    table_uuids: &BTreeMap<String, String>,
+    previous_snapshots: &BTreeMap<String, i64>,
+) -> Vec<ProvenanceBase> {
+    new_snapshots
+        .iter()
+        .map(|(table_fqn, &to_snapshot)| ProvenanceBase {
+            table_fqn: table_fqn.clone(),
+            uuid: table_uuids.get(table_fqn).cloned().unwrap_or_default(),
+            from_snapshot: previous_snapshots.get(table_fqn).copied(),
+            to_snapshot,
+        })
+        .collect()
+}
+
+/// Assemble a full [`MvProvenanceV1`] record from the narrow marker plus the
+/// refresh's watermark/technique/row-count facts. Centralized so every
+/// staging-commit site emits an identical, drift-free record; the record is a
+/// superset of the marker, so `to_summary_properties()` still emits the three
+/// narrow marker keys that publish/recovery match on.
+fn build_mv_refresh_provenance(
+    marker: &MvRefreshSnapshotMarker,
+    technique: RefreshTechnique,
+    bases: Vec<ProvenanceBase>,
+    definition_fingerprint: String,
+    rows: i64,
+) -> MvProvenanceV1 {
+    MvProvenanceV1 {
+        provenance_version: MV_PROVENANCE_VERSION,
+        refresh_id: marker.refresh_id,
+        mv_id: marker.mv_id,
+        token: marker.token.clone(),
+        technique,
+        bases,
+        definition_fingerprint,
+        rows,
+    }
+}
+
 fn record_iceberg_mv_staging_commit(
     state: &Arc<StandaloneState>,
     refresh_id: i64,
@@ -8023,8 +8094,19 @@ fn first_refresh_iceberg_mv_with_physical_sql(
 
     // 2–3. Write data files and commit snapshot inside an async block.
     let ident = iceberg_mv_table_ident(target)?;
-    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)?
-        .to_summary_properties();
+    let refresh_marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)?;
+    let marker = build_mv_refresh_provenance(
+        &refresh_marker,
+        RefreshTechnique::Full,
+        build_mv_refresh_provenance_bases(
+            &snapshots,
+            &table_uuids,
+            &mv_definition.last_refresh_snapshots,
+        ),
+        mv_definition_fingerprint(&mv_definition.select_sql),
+        total_rows,
+    )
+    .to_summary_properties()?;
     if let Err(err) = ensure_iceberg_mv_staging_branch(
         iceberg_catalog,
         target,
@@ -8262,8 +8344,19 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
     }
 
     let ident = iceberg_mv_table_ident(target)?;
-    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)?
-        .to_summary_properties();
+    let refresh_marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)?;
+    let marker = build_mv_refresh_provenance(
+        &refresh_marker,
+        RefreshTechnique::Full,
+        build_mv_refresh_provenance_bases(
+            &pin.to_snapshot_map(),
+            &pin.to_table_uuid_map(),
+            &mv_definition.last_refresh_snapshots,
+        ),
+        mv_definition_fingerprint(&mv_definition.select_sql),
+        total_rows,
+    )
+    .to_summary_properties()?;
     if let Err(err) = ensure_iceberg_mv_staging_branch(
         iceberg_catalog,
         target,
@@ -9023,7 +9116,20 @@ fn commit_rebuild_payload(
         }
     };
     let marker = match load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id) {
-        Ok(marker) => marker.to_summary_properties(),
+        Ok(refresh_marker) => build_mv_refresh_provenance(
+            &refresh_marker,
+            // A repartition/full rebuild re-derives the entire MV state from
+            // the base watermark, so it is a Full refresh.
+            RefreshTechnique::Full,
+            build_mv_refresh_provenance_bases(
+                &payload.base_snapshots,
+                &payload.base_table_uuids,
+                &mv_definition.last_refresh_snapshots,
+            ),
+            mv_definition_fingerprint(&mv_definition.select_sql),
+            total_rows,
+        )
+        .to_summary_properties()?,
         Err(err) => {
             if let Some(restore) = repartition_restore {
                 return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
@@ -10823,18 +10929,37 @@ fn first_refresh_iceberg_join_mv(
     .map_err(|err| {
         handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
     })?;
-    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, ctx.rewrite.mv_definition.mv_id)
-        .map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-            )
-        })?
-        .to_summary_properties();
+    let refresh_marker =
+        load_iceberg_mv_refresh_marker(state, refresh_id, ctx.rewrite.mv_definition.mv_id)
+            .map_err(|err| {
+                handle_iceberg_mv_commit_error(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                )
+            })?;
+    let mv_definition = &*ctx.rewrite.mv_definition;
+    let marker = build_mv_refresh_provenance(
+        &refresh_marker,
+        RefreshTechnique::Full,
+        build_mv_refresh_provenance_bases(
+            &ctx.rewrite.pin.to_snapshot_map(),
+            &ctx.rewrite.pin.to_table_uuid_map(),
+            &mv_definition.last_refresh_snapshots,
+        ),
+        mv_definition_fingerprint(&mv_definition.select_sql),
+        // TODO(W3a): thread exact row count. The join first-refresh row count
+        // (`added_rows`) is only known after the change-stream write below, so
+        // the watermark is stamped now and rows is left at 0.
+        0,
+    )
+    .to_summary_properties()
+    .map_err(|err| {
+        handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
+    })?;
     let ident = iceberg_mv_table_ident(target).map_err(|err| {
         handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
     })?;
@@ -13083,7 +13208,32 @@ fn execute_join_delta_branches_logical(
         &staging_branch,
     )?;
     let marker = match load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id) {
-        Ok(marker) => marker.to_summary_properties(),
+        Ok(refresh_marker) => build_mv_refresh_provenance(
+            &refresh_marker,
+            RefreshTechnique::Incremental,
+            build_mv_refresh_provenance_bases(
+                &snapshots,
+                &table_uuids,
+                &mv_definition.last_refresh_snapshots,
+            ),
+            mv_definition_fingerprint(&mv_definition.select_sql),
+            // TODO(W3a): thread exact row count. The delta row counts
+            // (`added_rows`/`deleted_rows`) are only known after the
+            // change-stream write below, so the watermark is stamped now and
+            // rows is left at 0.
+            0,
+        )
+        .to_summary_properties()
+        .map_err(|err| {
+            handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            )
+        })?,
         Err(err) => {
             return Err(handle_iceberg_mv_commit_error(
                 state,
@@ -15061,8 +15211,22 @@ fn incremental_refresh_iceberg_mv_with_changes(
         &staging_branch,
     )?;
     let ident = iceberg_mv_table_ident(target)?;
-    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)?
-        .to_summary_properties();
+    let refresh_marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)?;
+    let marker = build_mv_refresh_provenance(
+        &refresh_marker,
+        RefreshTechnique::Incremental,
+        build_mv_refresh_provenance_bases(
+            &snapshots,
+            &table_uuids,
+            &mv_definition.last_refresh_snapshots,
+        ),
+        mv_definition_fingerprint(&mv_definition.select_sql),
+        // TODO(W3a): thread exact row count. The incremental delta row counts
+        // are only known after the change-stream write below, so the watermark
+        // is stamped now and rows is left at 0.
+        0,
+    )
+    .to_summary_properties()?;
     if let Err(err) = ensure_iceberg_mv_staging_branch(
         iceberg_catalog,
         target,
