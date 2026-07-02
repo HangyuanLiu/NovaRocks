@@ -16,245 +16,193 @@
 // under the License.
 use std::collections::HashMap;
 
-use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::lower::expr::parse_min_max_conjuncts;
-use crate::lower::layout::{
-    Layout, chunk_schema_for_layout, chunk_schema_for_tuple, layout_for_row_tuples,
-    layout_from_slot_ids,
-};
-use crate::lower::node::{Lowered, local_rf_waiting_set};
-use crate::novarocks_connectors::{
-    ConnectorRegistry, ScanConfig, StarRocksScanConfig, StarRocksScanRange,
-};
-use crate::novarocks_logging::debug;
-use crate::novarocks_logging::warn;
-use crate::thrift::{descriptors, internal_service, plan_nodes, runtime_filter, types};
+use crate::lower::node::decode::QueryGlobalDictMap;
+use crate::lower::node::{Lowered, PlanOrigin};
+use crate::novarocks_connectors::ConnectorRegistry;
+use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
-/// Lower a STARROCKS_SCAN_NODE plan node to a `Lowered` ExecNode.
+/// Lower an OLAP_SCAN_NODE StarRocks tablet scan node to a `Lowered` ExecNode.
 pub(crate) fn lower_starrocks_scan_node(
     node: &plan_nodes::TPlanNode,
-    desc_tbl: Option<&descriptors::TDescriptorTable>,
-    tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
-    layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
-    exec_params: Option<&internal_service::TPlanFragmentExecParams>,
-    query_opts: Option<&internal_service::TQueryOptions>,
-    connectors: &ConnectorRegistry,
+    _desc_tbl: Option<&descriptors::TDescriptorTable>,
+    _tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
+    _layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
+    _exec_params: Option<&internal_service::TPlanFragmentExecParams>,
+    _query_opts: Option<&internal_service::TQueryOptions>,
+    _connectors: &ConnectorRegistry,
+    _query_global_dict_map: &QueryGlobalDictMap,
+    _plan_origin: PlanOrigin,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {
         return Err(format!(
-            "STARROCKS_SCAN_NODE expected 0 children, got {}",
+            "OLAP_SCAN_NODE expected 0 children, got {}",
             node.num_children
         ));
     }
 
-    let Some(sr) = node.starrocks_scan_node.as_ref() else {
-        return Err("STARROCKS_SCAN_NODE missing starrocks_scan_node payload".to_string());
+    let Some(olap) = node.olap_scan_node.as_ref() else {
+        return Err("OLAP_SCAN_NODE missing olap_scan_node payload".to_string());
     };
-    let tuple_id = sr
-        .tuple_id
-        .or_else(|| node.row_tuples.get(0).copied())
-        .ok_or_else(|| "STARROCKS_SCAN_NODE missing tuple_id".to_string())?;
+    Err(format!(
+        "OLAP_SCAN_NODE StarRocks OLAP direct-read requires partition_storage_paths metadata, but current OLAP thrift/descriptors only provide tuple_id={} and do not provide tablet storage paths or the schema_key needed to resolve them without guessing",
+        olap.tuple_id
+    ))
+}
 
-    let mut out_layout = Layout {
-        order: Vec::new(),
-        index: HashMap::new(),
-    };
-    if out_layout.order.is_empty() {
-        if let Some(hint) = layout_hints.get(&tuple_id).filter(|v| !v.is_empty()) {
-            out_layout = layout_from_slot_ids(tuple_id, hint.iter().copied());
-        } else {
-            out_layout = layout_for_row_tuples(&[tuple_id], tuple_slots);
-        }
-    }
-    if out_layout.order.is_empty() {
-        return Err(format!(
-            "STARROCKS_SCAN_NODE tuple_id={tuple_id} has empty output layout"
-        ));
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lower::node::decode::QueryGlobalDictMap;
+    use crate::sql::codegen::descriptors::DescriptorTableBuilder;
+    use crate::thrift::{descriptors, internal_service, plan_nodes, types};
+    use arrow::datatypes::DataType;
+    use std::collections::{BTreeMap, HashMap};
 
-    let desc_tbl = desc_tbl.ok_or_else(|| {
-        format!(
-            "STARROCKS_SCAN_NODE node_id={} requires descriptor table for schema",
-            node.node_id
-        )
-    })?;
-    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
-    let required_chunk_schema = chunk_schema_for_tuple(desc_tbl, tuple_id)?;
-    let output_schema = output_chunk_schema.arrow_schema_ref();
-
-    if !output_chunk_schema.slot_ids().is_empty()
-        && output_chunk_schema.slot_ids().len() != output_schema.fields().len()
-    {
-        return Err(format!(
-            "STARROCKS_SCAN_NODE output layout/schema mismatch: layout_len={}, schema_len={}",
-            output_chunk_schema.slot_ids().len(),
-            output_schema.fields().len()
-        ));
+    fn single_int_olap_desc_table(
+        tuple_id: i32,
+        slot_id: i32,
+        table_id: i64,
+    ) -> descriptors::TDescriptorTable {
+        let mut builder = DescriptorTableBuilder::new();
+        builder.add_table(table_id, "db", "tbl", 1);
+        builder.add_tuple(tuple_id, Some(table_id));
+        builder.add_slot(slot_id, tuple_id, "status", &DataType::Utf8, true, 0);
+        builder.build()
     }
 
-    let Some(exec_params) = exec_params else {
-        return Err("STARROCKS_SCAN_NODE requires exec_params.per_node_scan_ranges".to_string());
-    };
-    let scan_ranges = exec_params
-        .per_node_scan_ranges
-        .get(&node.node_id)
-        .ok_or_else(|| format!("missing per_node_scan_ranges for node_id={}", node.node_id))?;
-
-    let mut ranges = Vec::new();
-    let mut has_more = false;
-    for p in scan_ranges {
-        if p.empty.unwrap_or(false) {
-            if p.has_more.unwrap_or(false) {
-                has_more = true;
-            }
-            continue;
-        }
-        let Some(internal) = p.scan_range.internal_scan_range.as_ref() else {
-            continue;
-        };
-        let version = internal.version.parse::<i64>().ok().filter(|v| *v >= 0);
-        let fill_data_cache = internal.fill_data_cache.unwrap_or(true);
-        let skip_page_cache = internal.skip_page_cache.unwrap_or(false);
-        let skip_disk_cache = internal.skip_disk_cache.unwrap_or(false);
-        if !fill_data_cache || skip_page_cache || skip_disk_cache {
-            return Err(format!(
-                "STARROCKS_SCAN_NODE node_id={} does not support internal-table cache controls yet (fill_data_cache={}, skip_page_cache={}, skip_disk_cache={})",
-                node.node_id, fill_data_cache, skip_page_cache, skip_disk_cache
-            ));
-        }
-
-        ranges.push(StarRocksScanRange {
-            tablet_id: internal.tablet_id,
-            partition_id: internal.partition_id,
-            version,
+    fn olap_plan_node(node_id: i32, tuple_id: i32) -> plan_nodes::TPlanNode {
+        let mut node = crate::lower::node::test_plan_node(
+            node_id,
+            plan_nodes::TPlanNodeType::OLAP_SCAN_NODE,
+            0,
+        );
+        node.row_tuples = vec![tuple_id];
+        node.olap_scan_node = Some(plan_nodes::TOlapScanNode {
+            tuple_id,
+            key_column_name: vec![],
+            key_column_type: vec![],
+            is_preaggregation: false,
+            sort_column: None,
+            rollup_name: None,
+            sql_predicates: None,
+            enable_column_expr_predicate: None,
+            dict_string_id_to_int_ids: None,
+            unused_output_column_name: None,
+            sorted_by_keys_per_tablet: None,
+            bucket_exprs: None,
+            sort_key_column_names: None,
+            max_parallel_scan_instance_num: None,
+            column_access_paths: None,
+            use_pk_index: None,
+            columns_desc: None,
+            output_chunk_by_bucket: None,
+            output_asc_hint: None,
+            partition_order_hint: None,
+            enable_prune_column_after_index_filter: None,
+            enable_gin_filter: None,
+            schema_id: None,
+            vector_search_options: None,
+            sample_options: None,
+            enable_topn_filter_back_pressure: None,
+            back_pressure_max_rounds: None,
+            back_pressure_throttle_time: None,
+            back_pressure_throttle_time_upper_bound: None,
+            back_pressure_num_rows: None,
+            next_uniq_id: None,
+            enable_global_late_materialization: None,
+            partition_conjuncts: None,
         });
+        node
     }
 
-    if has_more {
-        return Err(format!(
-            "STARROCKS_SCAN_NODE node_id={} has incremental scan ranges which are not supported",
-            node.node_id
-        ));
-    }
-
-    debug!(
-        "STARROCKS_SCAN_NODE node_id={} ranges={}, tuple_id={}",
-        node.node_id,
-        ranges.len(),
-        tuple_id
-    );
-
-    let limit = (node.limit >= 0).then_some(node.limit as usize);
-    let batch_size = query_opts.and_then(|opts| opts.batch_size).or(Some(4096));
-    let query_timeout = query_opts.and_then(|opts| opts.query_timeout);
-    let mem_limit = query_opts
-        .and_then(|opts| opts.query_mem_limit.or(opts.mem_limit))
-        .filter(|v| *v > 0);
-    let connector_io_tasks_per_scan_operator =
-        query_opts.and_then(|opts| opts.connector_io_tasks_per_scan_operator);
-    let mut min_max_predicates = Vec::new();
-    if let Some(conjuncts) = node.conjuncts.as_ref() {
-        for conj in conjuncts {
-            for pred in parse_min_max_conjuncts(conj, &out_layout)? {
-                min_max_predicates.push(pred);
-            }
+    fn olap_exec_params(node_id: i32) -> internal_service::TPlanFragmentExecParams {
+        let internal_scan_range = plan_nodes::TInternalScanRange::new(
+            vec![],
+            "123".to_string(),
+            "7".to_string(),
+            "0".to_string(),
+            10,
+            "db".to_string(),
+            None::<Vec<plan_nodes::TKeyRange>>,
+            None::<String>,
+            Some("tbl".to_string()),
+            Some(20),
+            None::<i64>,
+            Some(true),
+            None::<i32>,
+            Some(false),
+            Some(false),
+            None::<i64>,
+            Some("default_catalog".to_string()),
+        );
+        let scan_range = internal_service::TScanRangeParams::new(
+            plan_nodes::TScanRange::new(
+                Some(internal_scan_range),
+                None::<Vec<u8>>,
+                None::<plan_nodes::TBrokerScanRange>,
+                None::<plan_nodes::TEsScanRange>,
+                None::<plan_nodes::THdfsScanRange>,
+                None::<plan_nodes::TBinlogScanRange>,
+                None::<plan_nodes::TBenchmarkScanRange>,
+            ),
+            None::<i32>,
+            Some(false),
+            Some(false),
+        );
+        let mut per_node_scan_ranges = BTreeMap::new();
+        per_node_scan_ranges.insert(node_id, vec![scan_range]);
+        internal_service::TPlanFragmentExecParams {
+            query_id: types::TUniqueId::new(0, 1),
+            fragment_instance_id: types::TUniqueId::new(0, 1),
+            per_node_scan_ranges,
+            per_exch_num_senders: BTreeMap::new(),
+            destinations: None,
+            sender_id: None,
+            num_senders: None,
+            send_query_statistics_with_every_batch: None,
+            use_vectorized: None,
+            runtime_filter_params: None,
+            instances_number: None,
+            enable_exchange_pass_through: None,
+            node_to_per_driver_seq_scan_ranges: None,
+            enable_exchange_perf: None,
+            pipeline_sink_dop: None,
+            report_when_finish: None,
+            exec_debug_options: None,
         }
     }
-    if !min_max_predicates.is_empty() {
-        debug!(
-            "STARROCKS_SCAN_NODE node_id={} parsed {} min/max predicates for native pruning",
-            node.node_id,
-            min_max_predicates.len()
+
+    #[test]
+    fn olap_scan_without_partition_storage_paths_fails_at_lowering() {
+        let node_id = 11;
+        let tuple_id = 1;
+        let slot_id = 7;
+        let table_id = 100;
+        let node = olap_plan_node(node_id, tuple_id);
+        let desc_tbl = single_int_olap_desc_table(tuple_id, slot_id, table_id);
+        let tuple_slots = HashMap::from([(tuple_id, vec![slot_id])]);
+        let exec_params = olap_exec_params(node_id);
+        let connectors = crate::connector::ConnectorRegistry::default();
+        let query_global_dict_map = QueryGlobalDictMap::new();
+
+        let result = lower_starrocks_scan_node(
+            &node,
+            Some(&desc_tbl),
+            &tuple_slots,
+            &HashMap::new(),
+            Some(&exec_params),
+            None,
+            &connectors,
+            &query_global_dict_map,
+            crate::lower::node::PlanOrigin::StarRocksFeCompatible,
+        );
+
+        let Err(err) = result else {
+            panic!("OLAP scan without direct-read metadata should fail at lowering");
+        };
+        assert!(
+            err.contains("OLAP_SCAN_NODE StarRocks OLAP direct-read requires partition_storage_paths metadata"),
+            "unexpected error: {err}"
         );
     }
-
-    // Parse TOPN_FILTER probe descriptors to build filter_id -> column_name map.
-    let mut topn_filter_column_map = HashMap::new();
-    if let Some(descs) = node
-        .probe_runtime_filters
-        .as_ref()
-        .filter(|v| !v.is_empty())
-    {
-        for desc in descs {
-            if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER) {
-                continue;
-            }
-            let Some(filter_id) = desc.filter_id else {
-                warn!(
-                    "TOPN_FILTER probe descriptor missing filter_id: node_id={}",
-                    node.node_id
-                );
-                continue;
-            };
-            // Look up the probe expression targeted at this scan node.
-            let probe_column_name = desc
-                .plan_node_id_to_target_expr
-                .as_ref()
-                .and_then(|m| m.get(&node.node_id))
-                .and_then(|probe_expr| probe_expr.nodes.first())
-                .and_then(|probe_node| probe_node.slot_ref.as_ref())
-                .and_then(|slot_ref| {
-                    let slot_id = slot_ref.slot_id;
-                    // Resolve slot_id to column name via the descriptor table.
-                    desc_tbl
-                        .slot_descriptors
-                        .as_ref()
-                        .and_then(|slots| {
-                            slots
-                                .iter()
-                                .find(|sd| sd.id == Some(slot_id))
-                                .and_then(|sd| sd.col_name.clone())
-                        })
-                        .or_else(|| Some(format!("__slot_{}", slot_id)))
-                });
-            match probe_column_name {
-                Some(name) if !name.is_empty() => {
-                    debug!(
-                        "STARROCKS_SCAN_NODE node_id={} topn_filter_id={} -> column={}",
-                        node.node_id, filter_id, name
-                    );
-                    topn_filter_column_map.insert(filter_id, name);
-                }
-                _ => {
-                    warn!(
-                        "TOPN_FILTER probe filter_id={} could not resolve column name for node_id={}",
-                        filter_id, node.node_id
-                    );
-                }
-            }
-        }
-    }
-
-    let cfg = StarRocksScanConfig {
-        db_name: sr.db_name.clone().filter(|s| !s.is_empty()),
-        table_name: sr.table_name.clone().filter(|s| !s.is_empty()),
-        properties: sr.properties.clone().unwrap_or_default(),
-        ranges,
-        has_more,
-        required_chunk_schema,
-        output_chunk_schema: output_chunk_schema.clone(),
-        query_global_dicts: std::collections::HashMap::new(),
-        limit,
-        batch_size,
-        query_timeout,
-        mem_limit,
-        profile_label: Some(format!("starrocks_scan_node_id={}", node.node_id)),
-        min_max_predicates,
-        lake_schema_meta: None,
-        topn_filter_column_map,
-    };
-
-    let scan = connectors
-        .create_scan_node("starrocks", ScanConfig::StarRocks(Box::new(cfg)))?
-        .with_node_id(node.node_id)
-        .with_output_chunk_schema(output_chunk_schema)
-        .with_limit(limit)
-        .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
-        .with_local_rf_waiting_set(local_rf_waiting_set(node));
-    Ok(Lowered {
-        node: ExecNode {
-            kind: ExecNodeKind::Scan(scan),
-        },
-        layout: out_layout,
-    })
 }
