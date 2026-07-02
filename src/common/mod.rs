@@ -29,6 +29,7 @@ pub mod memory_limit;
 pub mod min_max_predicate;
 pub mod network;
 pub mod percentile;
+pub mod scan_predicate;
 pub mod sketch_hash;
 pub mod thrift;
 pub mod types;
