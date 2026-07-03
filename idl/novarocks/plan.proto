@@ -73,11 +73,35 @@ message ExchangeReceiver {
   ExchangeFlavor flavor = 6;                             // exchange semantic flavor.
 }
 
-// Physical operator placeholder. NIDL-3 Task B2 appends the operator oneof.
+// Physical operator payload. Each arm mirrors one PhysicalPlanKind variant.
 // Owner: produced by the future FE/native plan encoder and consumed by the
 // future BE/native plan prepare layer.
 message PlanNode {
   repeated novarocks.common.OutputColumn output_columns = 1; // node-owned output schema.
+  oneof kind {
+    ScanNode scan = 10;                              // table scan.
+    FilterNode filter = 11;                          // filter predicate.
+    ProjectNode project = 12;                        // projection list.
+    SortNode sort = 13;                              // sort or partitioned sort.
+    LimitNode limit = 14;                            // limit/offset node.
+    ValuesNode values = 15;                          // literal values node.
+    DecodeNode decode = 16;                          // low-cardinality dictionary decode node.
+    RepeatNode repeat = 17;                          // grouping sets repeat node.
+    WindowNode window = 18;                          // window node.
+    GenerateSeriesNode generate_series = 19;         // generate-series table function node.
+    TableFunctionNode table_function = 20;           // generic table function node.
+    AssertOneRowNode assert_one_row = 21;            // scalar subquery row-count assertion.
+    TopNNode topn = 22;                              // physical TopN node.
+    HashAggregateNode hash_aggregate = 23;           // physical hash aggregate node.
+    HashJoinNode hash_join = 24;                     // physical hash join node.
+    NestLoopJoinNode nest_loop_join = 25;            // physical nested-loop join node.
+    SetOpNode set_op = 26;                           // set operation node.
+    ChangeEventExpandNode change_event_expand = 27;  // IVM change-event expansion node.
+    CteAnchorNode cte_anchor = 28;                   // CTE anchor node.
+    CteProduceNode cte_produce = 29;                 // CTE producer node.
+    CteConsumeNode cte_consume = 30;                 // CTE consumer node.
+    RedistributeNode redistribute = 31;              // explicit redistribution node.
+  }
 }
 
 // Native exchange partition type, replacing StarRocks thrift TPartitionType.
@@ -228,15 +252,24 @@ message DataSink {
   }
 }
 
-// Placeholder for Iceberg write sink payload; Task B2 appends fields.
+// Iceberg write sink payload.
 // Owner: produced by the future FE/native plan encoder and consumed by the
 // future BE/native plan prepare layer.
-message IcebergWriteFragmentSink {}
+message IcebergWriteFragmentSink {
+  string descriptor_database = 1;     // database used for descriptor naming.
+  IcebergWriteSinkSpec spec = 2;      // write target and file-writing specification.
+  IcebergWriteInputBinding input = 3; // mapping from fragment output to sink input.
+}
 
-// Placeholder for Iceberg change-stream router sink payload; Task B2 appends fields.
+// Iceberg change-stream router sink payload.
 // Owner: produced by the future FE/native plan encoder and consumed by the
 // future BE/native plan prepare layer.
-message IcebergChangeStreamRouterSink {}
+message IcebergChangeStreamRouterSink {
+  int32 group_id = 1;                              // change-stream router group id.
+  uint64 change_op_output_ordinal = 2;             // output ordinal carrying the change op.
+  optional uint64 data_route_output_ordinal = 3;   // optional output ordinal carrying route choice.
+  repeated IcebergChangeStreamBranchRoute branches = 4; // target writer branches.
+}
 
 // Join kind. Mirrors src/sql/common/expr.rs JoinKind.
 enum JoinKind {
@@ -309,4 +342,800 @@ enum HashSource {
   HASH_SOURCE_UNSPECIFIED = 0;
   HASH_SOURCE_SHUFFLE_AGG = 1;
   HASH_SOURCE_SHUFFLE_JOIN = 2;
+}
+
+// Scan physical node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ScanNode {
+  string database = 1;                                  // database name resolved by the analyzer.
+  TableDef table = 2;                                   // resolved table definition.
+  optional string alias = 3;                            // optional table alias.
+  repeated novarocks.common.OutputColumn columns = 4;   // scan output columns.
+  repeated novarocks.expr.Expr predicates = 5;          // scan predicates.
+  repeated string required_columns = 6;                 // required physical column names.
+  repeated ScanDictionaryColumn dict_columns = 7;       // dictionary rewrite columns.
+  repeated ScanVariantColumn variant_columns = 8;       // variant-path synthetic columns.
+  optional string mv_rewritten_from = 9;                // source MV name when rewritten.
+}
+
+// Low-cardinality dictionary scan column. Dictionary payload is opaque until
+// the low-cardinality C0 arc owns the serialization format.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ScanDictionaryColumn {
+  string source_column = 1; // source string column name.
+  string dict_column = 2;   // dictionary column name.
+  bytes dictionary = 3;     // opaque dictionary snapshot payload.
+}
+
+// Variant-path synthetic scan column.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ScanVariantColumn {
+  uint32 source_column_id = 1;                    // source ColumnId.
+  string source_column = 2;                       // source column name.
+  uint32 synthetic_column_id = 3;                 // synthetic output ColumnId.
+  string synthetic_column = 4;                    // synthetic output column name.
+  string canonical_path = 5;                      // canonical variant path.
+  novarocks.common.TypeDesc requested_type = 6;   // requested SQL type.
+  bool strict = 7;                                // true when strict extraction is required.
+}
+
+// Filter physical node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message FilterNode {
+  novarocks.expr.Expr predicate = 1; // filter predicate.
+}
+
+// Project physical node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ProjectNode {
+  repeated ProjectItem items = 1;        // projection items.
+  optional string output_qualifier = 2;  // optional output qualifier.
+}
+
+// One projection item.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ProjectItem {
+  novarocks.expr.Expr expr = 1; // projected expression.
+  string output_name = 2;       // display output name.
+  uint32 output_column_id = 3;  // analyzer-minted output ColumnId.
+}
+
+// Sort physical node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message SortNode {
+  repeated novarocks.expr.SortItem items = 1;             // ordering items.
+  repeated novarocks.expr.Expr analytic_partition_by = 2; // analytic partition keys.
+  repeated novarocks.common.OutputColumn output_columns = 3; // sort output schema.
+  optional int64 offset = 4;                              // optional OFFSET.
+  optional uint64 partition_limit = 5;                    // optional per-partition limit.
+  optional SortTopNType topn_type = 6;                    // optional ranking semantics for TopN.
+}
+
+// Sort TopN boundary semantics.
+enum SortTopNType {
+  SORT_TOPN_TYPE_UNSPECIFIED = 0;
+  SORT_TOPN_TYPE_ROW_NUMBER = 1;
+  SORT_TOPN_TYPE_RANK = 2;
+  SORT_TOPN_TYPE_DENSE_RANK = 3;
+}
+
+// Limit physical node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message LimitNode {
+  optional int64 limit = 1;  // optional LIMIT.
+  optional int64 offset = 2; // optional OFFSET.
+}
+
+// Values physical node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ValuesNode {
+  repeated ExprList rows = 1;                            // rows of literal/constant expressions.
+  repeated novarocks.common.OutputColumn columns = 2;    // output schema.
+}
+
+// Ordered expression list wrapper.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ExprList {
+  repeated novarocks.expr.Expr values = 1; // expressions in this list.
+}
+
+// Decode physical node for dictionary rewrite.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message DecodeNode {
+  repeated DecodeMapping mappings = 1;                   // dictionary decode mappings.
+  repeated novarocks.common.OutputColumn output_columns = 2; // decoded output schema.
+}
+
+// Low-cardinality dictionary decode mapping.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message DecodeMapping {
+  uint32 source_column_id = 1; // encoded source ColumnId.
+  uint32 output_column_id = 2; // decoded output ColumnId.
+  string dict_column = 3;      // dictionary column name.
+  string string_column = 4;    // decoded string column name.
+}
+
+// Repeat physical node for ROLLUP/CUBE/GROUPING SETS.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message RepeatNode {
+  repeated StringList repeat_column_ref_list = 1;     // non-null column names per repeat level.
+  repeated UInt32List repeat_column_ref_ids = 2;      // non-null ColumnIds per repeat level.
+  repeated uint64 grouping_ids = 3;                   // grouping id bitmap per repeat level.
+  repeated string all_rollup_columns = 4;             // all rollup column names.
+  repeated uint32 all_rollup_column_ids = 5;          // all rollup ColumnIds.
+  repeated StringPair grouping_key_aliases = 6;       // grouping key aliases.
+  repeated NamedStringList grouping_fn_args = 7;      // GROUPING output names to argument names.
+  repeated UInt32List grouping_fn_arg_ids = 8;        // GROUPING argument ColumnIds.
+  repeated NamedUInt32 grouping_fn_ids = 9;           // GROUPING output names to output ColumnIds.
+  optional int32 virtual_tuple_id = 10;               // virtual tuple id used by current lowering.
+}
+
+// Ordered string list wrapper.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message StringList {
+  repeated string values = 1; // string values.
+}
+
+// Ordered uint32 list wrapper.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message UInt32List {
+  repeated uint32 values = 1; // uint32 values.
+}
+
+// Ordered uint64 list wrapper.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message UInt64List {
+  repeated uint64 values = 1; // uint64 values.
+}
+
+// Pair of strings.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message StringPair {
+  string first = 1;  // first string value.
+  string second = 2; // second string value.
+}
+
+// Named list of strings.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message NamedStringList {
+  string name = 1;          // list name.
+  repeated string values = 2; // list values.
+}
+
+// Named uint32 value.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message NamedUInt32 {
+  string name = 1;  // value name.
+  uint32 value = 2; // uint32 value.
+}
+
+// Window physical node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message WindowNode {
+  repeated WindowExpr window_exprs = 1;                // window expressions.
+  repeated novarocks.common.OutputColumn output_columns = 2; // window output schema.
+}
+
+// Window expression payload.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message WindowExpr {
+  string name = 1;                                  // window function name.
+  repeated novarocks.expr.Expr args = 2;            // function arguments.
+  bool distinct = 3;                                // true when DISTINCT is requested.
+  repeated novarocks.expr.Expr partition_by = 4;    // partition expressions.
+  repeated novarocks.expr.SortItem order_by = 5;    // order-by items.
+  novarocks.expr.WindowFrame window_frame = 6;      // optional window frame.
+  novarocks.common.TypeDesc result_type = 7;        // result SQL type.
+  string output_name = 8;                           // output display name.
+  uint32 output_column_id = 9;                      // output ColumnId.
+  bool ignore_nulls = 10;                           // true when IGNORE NULLS is requested.
+}
+
+// Generate-series physical node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message GenerateSeriesNode {
+  int64 start = 1;                  // inclusive start value.
+  int64 end = 2;                    // inclusive end value.
+  int64 step = 3;                   // step value.
+  string column_name = 4;           // generated column name.
+  optional string alias = 5;        // optional table alias.
+  uint32 output_column_id = 6;      // output ColumnId.
+}
+
+// Table-function physical node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message TableFunctionNode {
+  string function_name = 1;                           // table function name.
+  repeated novarocks.expr.Expr args = 2;              // table function arguments.
+  repeated novarocks.common.OutputColumn output_columns = 3; // output schema.
+  optional string alias = 4;                          // optional table alias.
+  bool is_left_join = 5;                              // true when emitted for left join semantics.
+}
+
+// Assert-one-row physical node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message AssertOneRowNode {
+  string subquery_text = 1; // diagnostic subquery text.
+}
+
+// Physical TopN node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message TopNNode {
+  repeated novarocks.expr.SortItem items = 1; // ordering items.
+  optional int64 limit = 2;                   // optional LIMIT.
+  optional int64 offset = 3;                  // optional OFFSET.
+  TopNPhase phase = 4;                        // partial/final TopN phase.
+  bool is_split = 5;                          // true when split TopN is used.
+}
+
+// Physical hash aggregate node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message HashAggregateNode {
+  AggMode mode = 1;                                   // aggregate execution mode.
+  repeated novarocks.expr.Expr group_by = 2;          // grouping expressions.
+  repeated PlanAggregateCall aggregates = 3;          // aggregate calls.
+  repeated bool is_merge = 4;                         // merge flag per aggregate.
+  AggregateOutputLayout output_layout = 5;            // output layout.
+  repeated novarocks.common.OutputColumn output_columns = 6; // aggregate output schema.
+}
+
+// Plan-level aggregate call payload.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message PlanAggregateCall {
+  string name = 1;                              // aggregate function name.
+  repeated novarocks.expr.Expr args = 2;        // aggregate arguments.
+  bool distinct = 3;                            // true for DISTINCT aggregate.
+  novarocks.common.TypeDesc result_type = 4;    // aggregate result SQL type.
+  repeated novarocks.expr.SortItem order_by = 5; // order-by items for order-sensitive aggregates.
+  uint32 output_column_id = 6;                  // output ColumnId for this aggregate.
+}
+
+// Aggregate output layout.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message AggregateOutputLayout {
+  repeated novarocks.common.OutputColumn group_key_columns = 1;  // group-key output columns.
+  repeated novarocks.common.OutputColumn aggregate_columns = 2;  // aggregate output columns.
+}
+
+// Physical hash join node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message HashJoinNode {
+  JoinKind join_type = 1;                              // join type.
+  repeated HashJoinEqCondition eq_conditions = 2;      // equality join conditions.
+  novarocks.expr.Expr other_condition = 3;             // optional non-equality join predicate.
+  JoinDistribution distribution = 4;                   // physical join distribution.
+  optional JoinExecutionMode execution_mode = 5;       // optional runtime-filter execution mode.
+  repeated RuntimeFilterBuildIntent build_runtime_filters = 6; // planned runtime filter builds.
+}
+
+// Hash join equality condition.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message HashJoinEqCondition {
+  novarocks.expr.Expr left = 1;  // left equality expression.
+  novarocks.expr.Expr right = 2; // right equality expression.
+  bool null_safe = 3;            // true for null-safe equality.
+}
+
+// Runtime filter build intent before fragment assignment.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message RuntimeFilterBuildIntent {
+  int32 filter_id = 1;                   // runtime filter id.
+  novarocks.expr.Expr build_expr = 2;    // build-side expression.
+  novarocks.expr.Expr probe_expr = 3;    // probe-side expression.
+  uint32 expr_order = 4;                 // expression order within join keys.
+  JoinExecutionMode execution_mode = 5;  // join execution mode.
+}
+
+// Physical nested-loop join node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message NestLoopJoinNode {
+  JoinKind join_type = 1;                 // join type.
+  novarocks.expr.Expr condition = 2;      // optional join condition.
+}
+
+// Physical set-operation node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message SetOpNode {
+  PlanSetOpKind kind = 1;                              // set operation kind.
+  repeated novarocks.common.OutputColumn output_columns = 2; // output schema.
+  repeated OutputColumnList child_output_columns = 3;  // per-child output schemas.
+}
+
+// Ordered output-column list wrapper.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message OutputColumnList {
+  repeated novarocks.common.OutputColumn columns = 1; // output columns.
+}
+
+// Change-event expansion node for IVM change streams.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ChangeEventExpandNode {
+  repeated DistributedChangeEventSpec events = 1;      // change events to emit.
+  repeated novarocks.common.OutputColumn output_columns = 2; // output schema.
+  uint32 change_op_column_id = 3;                      // output ColumnId for change op.
+  optional uint32 data_route_column_id = 4;            // optional output ColumnId for data route.
+}
+
+// One change-event branch specification.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message DistributedChangeEventSpec {
+  novarocks.expr.Expr predicate = 1;                   // optional branch predicate.
+  ChangeStreamBranchKind branch_kind = 2;              // branch semantic kind.
+  repeated DistributedChangeEventOutputExpr assignments = 3; // output assignments.
+}
+
+// One change-event output assignment.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message DistributedChangeEventOutputExpr {
+  uint32 output_column_id = 1;       // output ColumnId.
+  novarocks.expr.Expr expr = 2;      // optional expression assigned to the output.
+}
+
+// CTE anchor node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message CteAnchorNode {
+  uint32 cte_id = 1; // CTE identity.
+}
+
+// CTE producer node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message CteProduceNode {
+  uint32 cte_id = 1;                                // CTE identity.
+  repeated novarocks.common.OutputColumn output_columns = 2; // producer output schema.
+}
+
+// CTE consumer node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message CteConsumeNode {
+  uint32 cte_id = 1;                                // CTE identity.
+  string alias = 2;                                 // consumer alias.
+  repeated novarocks.common.OutputColumn output_columns = 3; // consumer output schema.
+  repeated uint32 producer_column_ids = 4;          // producer ColumnIds consumed here.
+}
+
+// Explicit redistribution node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message RedistributeNode {
+  RedistributeMode mode = 1;                        // redistribution mode.
+  repeated novarocks.expr.Expr partition_exprs = 2; // hash partition expressions.
+  repeated novarocks.common.OutputColumn output_columns = 3; // output schema.
+}
+
+// Redistribution mode.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message RedistributeMode {
+  oneof mode {
+    bool gather = 1;                // true for gather redistribution.
+    RedistributeHash hash = 2;      // hash redistribution.
+    bool broadcast = 3;             // true for broadcast redistribution.
+  }
+}
+
+// Hash redistribution details.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message RedistributeHash {
+  repeated uint32 cols = 1; // partition ColumnIds.
+  HashSource source = 2;    // hash source.
+}
+
+// Resolved table definition for native scans and sinks.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message TableDef {
+  string name = 1;                                      // table name.
+  repeated ColumnDef columns = 2;                       // logical table columns.
+  repeated ColumnDef iceberg_row_lineage_metadata_columns = 3; // Iceberg row-lineage pseudo-columns.
+  ScanSource source = 4;                                // native scan source.
+}
+
+// Resolved column definition.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ColumnDef {
+  string name = 1;                              // column name.
+  novarocks.common.TypeDesc data_type = 2;      // SQL type.
+  bool nullable = 3;                            // true when column is nullable.
+  optional string write_default_json = 4;       // optional Iceberg JSON write default.
+  novarocks.common.TypeDesc logical_type = 5;   // optional logical SQL type when distinct from storage type.
+}
+
+// Native scan source. StarRocks table scans are compat-only and intentionally
+// absent from this oneof.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ScanSource {
+  oneof kind {
+    IcebergDataFiles iceberg_data_files = 1;              // Iceberg data-file scan.
+    IcebergMetadataTable iceberg_metadata_table = 2;      // Iceberg metadata-table scan.
+    IcebergDeltaTable iceberg_delta_table = 3;            // Iceberg delta scan.
+    IcebergVersionTable iceberg_version_table = 4;        // pinned Iceberg snapshot scan.
+    IcebergMvTargetState iceberg_mv_target_state = 5;     // IMV target-state scan.
+    IcebergMvTargetLocator iceberg_mv_target_locator = 6; // IMV target-locator scan.
+  }
+}
+
+// Iceberg data-file scan source.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergDataFiles {
+  IcebergTableInfo table = 1;                      // Iceberg table identity and schema.
+  repeated IcebergDataFileInfo files = 2;          // explicit data files, possibly empty.
+  map<string, string> cloud_properties = 3;        // object-store properties.
+  IcebergDataFileBinding binding = 4;              // current-snapshot vs explicit-file binding.
+}
+
+// Iceberg data-file binding provenance.
+enum IcebergDataFileBinding {
+  ICEBERG_DATA_FILE_BINDING_UNSPECIFIED = 0;
+  ICEBERG_DATA_FILE_BINDING_CURRENT_SNAPSHOT = 1;
+  ICEBERG_DATA_FILE_BINDING_EXPLICIT_FILES = 2;
+}
+
+// Iceberg metadata-table scan source.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergMetadataTable {
+  IcebergTableInfo table = 1;                         // underlying Iceberg table.
+  IcebergMetadataTableType metadata_table_type = 2;   // metadata table flavor.
+  string serialized_table = 3;                        // JSON-serialized Iceberg TableMetadata.
+  map<string, string> cloud_properties = 4;           // object-store properties.
+  optional string metadata_payload = 5;               // optional native metadata payload JSON.
+}
+
+// Iceberg metadata-table type.
+enum IcebergMetadataTableType {
+  ICEBERG_METADATA_TABLE_TYPE_UNSPECIFIED = 0;
+  ICEBERG_METADATA_TABLE_TYPE_FILES = 1;
+  ICEBERG_METADATA_TABLE_TYPE_MANIFESTS = 2;
+  ICEBERG_METADATA_TABLE_TYPE_LOGICAL_ICEBERG_METADATA = 3;
+  ICEBERG_METADATA_TABLE_TYPE_SNAPSHOTS = 4;
+  ICEBERG_METADATA_TABLE_TYPE_HISTORY = 5;
+  ICEBERG_METADATA_TABLE_TYPE_REFS = 6;
+  ICEBERG_METADATA_TABLE_TYPE_PARTITIONS = 7;
+}
+
+// Iceberg delta table scan source.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergDeltaTable {
+  IcebergTableInfo table = 1;  // underlying Iceberg table.
+  int64 from_snapshot_id = 2;  // starting snapshot id.
+  int64 to_snapshot_id = 3;    // ending snapshot id.
+}
+
+// Pinned Iceberg snapshot scan source.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergVersionTable {
+  IcebergTableInfo table = 1; // underlying Iceberg table.
+  int64 snapshot_id = 2;      // pinned snapshot id.
+}
+
+// IMV target-state scan source.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergMvTargetState {
+  string catalog = 1;                                 // catalog name.
+  string database = 2;                                // database name.
+  string table = 3;                                   // table name.
+  string target_table_uuid = 4;                       // target Iceberg table UUID.
+  optional int64 target_snapshot_id = 5;              // optional target snapshot id.
+  uint32 aggregate_state_layout_version = 6;          // aggregate-state layout version.
+  repeated ColumnDef columns = 7;                     // target-state columns.
+  repeated string group_key_names = 8;                // group key column names.
+  repeated string aggregate_state_names = 9;          // aggregate state column names.
+  repeated string physical_column_names = 10;         // physical column names.
+  string row_id_column_name = 11;                     // row-id column name.
+  IcebergMvTargetStateRowFilter row_filter = 12;      // target-state row filter.
+  IcebergMvTargetStatePartitionConstraint partition_constraint = 13; // partition constraint.
+}
+
+// IMV target-state row filter.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergMvTargetStateRowFilter {
+  oneof kind {
+    DeltaInputRowIdsFilter delta_input_row_ids = 1; // filter by delta input row ids.
+  }
+}
+
+// Delta-input-row-id target-state filter.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message DeltaInputRowIdsFilter {
+  string row_id_column_name = 1; // row-id column name.
+  BranchScope branch_scope = 2;  // optional branch scope.
+}
+
+// Optional branch scope for an IMV target-state filter.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message BranchScope {
+  string branch_id_column_name = 1; // branch id column name.
+  int32 branch_id = 2;              // branch id value.
+}
+
+// IMV target-state partition constraint.
+enum IcebergMvTargetStatePartitionConstraint {
+  ICEBERG_MV_TARGET_STATE_PARTITION_CONSTRAINT_UNSPECIFIED = 0;
+  ICEBERG_MV_TARGET_STATE_PARTITION_CONSTRAINT_UNPARTITIONED = 1;
+  ICEBERG_MV_TARGET_STATE_PARTITION_CONSTRAINT_AFFECTED_PARTITION_ALLOW_LIST_REQUIRED = 2;
+}
+
+// IMV target-locator scan source.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergMvTargetLocator {
+  string catalog = 1;                    // catalog name.
+  string database = 2;                   // database name.
+  string table = 3;                      // table name.
+  string target_table_uuid = 4;          // target Iceberg table UUID.
+  optional int64 target_snapshot_id = 5; // optional target snapshot id.
+  string apply_key_column = 6;           // logical apply-key column name.
+  optional string branch_id_column = 7;  // optional branch id column name.
+}
+
+// Iceberg table identity, schema, and serialized metadata.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergTableInfo {
+  string catalog = 1;                         // catalog name.
+  string namespace = 2;                       // namespace/database name.
+  string table = 3;                           // table name.
+  optional string table_uuid = 4;             // optional Iceberg table UUID.
+  optional int64 current_snapshot_id = 5;     // optional current snapshot id.
+  int32 schema_id = 6;                        // current schema id.
+  string location = 7;                        // table location URI.
+  IcebergSchemaDef schema = 8;                // Iceberg schema definition.
+  optional string serialized_metadata = 9;    // optional JSON TableMetadata.
+  optional string serialized_metadata_rows = 10; // optional JSON metadata rows.
+}
+
+// Iceberg schema definition.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergSchemaDef {
+  repeated IcebergSchemaFieldDef fields = 1; // top-level schema fields.
+}
+
+// Iceberg schema field definition.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergSchemaFieldDef {
+  int32 field_id = 1;                         // Iceberg field id.
+  string name = 2;                            // field name.
+  optional string initial_default_json = 3;   // optional JSON initial default.
+  optional string write_default_json = 4;     // optional JSON write default.
+  repeated IcebergSchemaFieldDef children = 5; // nested child fields.
+}
+
+// Iceberg data file planned for scanning.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergDataFileInfo {
+  string path = 1;                                     // data file path.
+  int64 size = 2;                                      // file size in bytes.
+  optional int64 row_count = 3;                        // optional row count.
+  IcebergColumnStatsMap column_stats = 4;              // optional per-column stats.
+  optional int32 partition_spec_id = 5;                // optional partition spec id.
+  optional string partition_key = 6;                   // optional stable partition key string.
+  optional int64 first_row_id = 7;                     // optional Iceberg v3 first row id.
+  optional int64 data_sequence_number = 8;             // optional Iceberg data sequence number.
+  optional int32 ivm_change_op = 9;                    // optional IVM change-op tag.
+  Int64List included_positions = 10;                   // optional absolute row positions.
+  repeated IcebergDeleteFileInfo delete_files = 11;    // delete files applying to this data file.
+  optional string manifest_path = 12;                  // optional manifest path.
+  repeated IcebergPartitionFieldValue partition_values = 13; // decoded partition values.
+}
+
+// Optional map wrapper for Iceberg per-column stats.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergColumnStatsMap {
+  map<string, IcebergColumnStats> entries = 1; // column name to stats.
+}
+
+// Ordered int64 list wrapper.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message Int64List {
+  repeated int64 values = 1; // int64 values.
+}
+
+// Iceberg manifest column statistics.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergColumnStats {
+  optional int64 null_count = 1;   // optional null count.
+  optional int64 value_count = 2;  // optional total value count.
+  optional int64 column_size = 3;  // optional column byte size.
+  optional bytes lower_bound = 4;  // optional lower-bound bytes.
+  optional bytes upper_bound = 5;  // optional upper-bound bytes.
+}
+
+// Iceberg delete file applying to a data file.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergDeleteFileInfo {
+  string path = 1;                                      // delete file path.
+  IcebergDeleteFileFormat file_format = 2;             // delete file format.
+  IcebergDeleteFileContent file_content = 3;           // delete file content kind.
+  optional int64 length = 4;                            // optional file length.
+  optional int64 content_offset = 5;                    // optional content offset.
+  optional int64 content_size_in_bytes = 6;             // optional content size.
+  optional int64 sequence_number = 7;                   // optional sequence number.
+  optional int32 partition_spec_id = 8;                 // optional partition spec id.
+  optional string partition_key = 9;                    // optional partition key string.
+  repeated string equality_column_names = 10;           // equality delete column names.
+  repeated int32 equality_field_ids = 11;               // equality delete field ids.
+}
+
+// Iceberg delete file format.
+enum IcebergDeleteFileFormat {
+  ICEBERG_DELETE_FILE_FORMAT_UNSPECIFIED = 0;
+  ICEBERG_DELETE_FILE_FORMAT_PARQUET = 1;
+  ICEBERG_DELETE_FILE_FORMAT_PUFFIN = 2;
+}
+
+// Iceberg delete file content kind.
+enum IcebergDeleteFileContent {
+  ICEBERG_DELETE_FILE_CONTENT_UNSPECIFIED = 0;
+  ICEBERG_DELETE_FILE_CONTENT_POSITION = 1;
+  ICEBERG_DELETE_FILE_CONTENT_EQUALITY = 2;
+}
+
+// One decoded Iceberg partition field value.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergPartitionFieldValue {
+  string source_column = 1;        // source column name.
+  string field_name = 2;           // partition field name.
+  string transform = 3;            // partition transform string.
+  IcebergPartitionValue value = 4; // optional partition value.
+}
+
+// Iceberg partition scalar value.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergPartitionValue {
+  oneof value {
+    bool bool_value = 1;    // boolean partition value.
+    int32 int32_value = 2;  // int32 partition value.
+    int64 int64_value = 3;  // int64 partition value.
+    float float_value = 4;  // float partition value.
+    double double_value = 5; // double partition value.
+    string string_value = 6; // string partition value.
+    bytes binary_value = 7; // binary partition value.
+  }
+}
+
+// Iceberg write sink specification.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergWriteSinkSpec {
+  IcebergWriteSinkMode mode = 1;                        // write sink mode.
+  int64 target_table_id = 2;                             // synthetic or catalog target table id.
+  TableDef target_table = 3;                             // target table definition.
+  IcebergTableInfo iceberg = 4;                          // target Iceberg table info.
+  repeated ColumnDef target_columns = 5;                 // target write columns.
+  string table_location = 6;                             // Iceberg table location.
+  string data_location = 7;                              // data file output location.
+  int32 target_partition_spec_id = 8;                    // target partition spec id.
+  map<string, string> cloud_properties = 9;              // object-store properties.
+  string file_format = 10;                               // output file format.
+  IcebergWriteFileCompression compression = 11;          // output file compression.
+  PositionDeleteDescriptorInput position_delete_output_descriptor = 12; // optional position-delete descriptor.
+}
+
+// Iceberg write sink mode.
+enum IcebergWriteSinkMode {
+  ICEBERG_WRITE_SINK_MODE_UNSPECIFIED = 0;
+  ICEBERG_WRITE_SINK_MODE_DATA = 1;
+  ICEBERG_WRITE_SINK_MODE_ROW_LINEAGE_DATA = 2;
+  ICEBERG_WRITE_SINK_MODE_POSITION_DELETES = 3;
+  ICEBERG_WRITE_SINK_MODE_DELETION_VECTORS = 4;
+  ICEBERG_WRITE_SINK_MODE_EQUALITY_DELETES = 5;
+}
+
+// Iceberg write file compression.
+enum IcebergWriteFileCompression {
+  ICEBERG_WRITE_FILE_COMPRESSION_UNSPECIFIED = 0;
+  ICEBERG_WRITE_FILE_COMPRESSION_SNAPPY = 1;
+}
+
+// Mapping from fragment output columns to Iceberg writer input.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergWriteInputBinding {
+  oneof kind {
+    bool root_output_by_ordinal = 1; // true when writer consumes root output by ordinal.
+    UInt64List output_ordinals = 2;  // explicit output ordinals consumed by writer.
+  }
+}
+
+// Position-delete output descriptor.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message PositionDeleteDescriptorInput {
+  PositionDeleteOutputField file_path = 1;                      // file-path output field.
+  PositionDeleteOutputField pos = 2;                            // row-position output field.
+  repeated PositionDeletePartitionSourceField partition_source_fields = 3; // partition source fields.
+  int32 target_partition_spec_id = 4;                           // target partition spec id.
+}
+
+// One position-delete output field.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message PositionDeleteOutputField {
+  uint64 output_expr_index = 1;              // output expression index.
+  string name = 2;                           // output field name.
+  novarocks.common.TypeDesc data_type = 3;   // output field SQL type.
+  int32 field_id = 4;                        // Iceberg field id.
+}
+
+// One partition source field for position-delete output.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message PositionDeletePartitionSourceField {
+  uint64 output_expr_index = 1;            // output expression index.
+  string source_column_name = 2;           // source data column name.
+  string partition_field_name = 3;         // output partition field name.
+  string transform_expr = 4;               // Iceberg transform expression string.
+  int32 source_field_id = 5;               // Iceberg source field id.
+  novarocks.common.TypeDesc data_type = 6; // source field SQL type.
+}
+
+// One Iceberg change-stream branch route.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergChangeStreamBranchRoute {
+  int32 branch_id = 1;                       // branch id within the router group.
+  ChangeStreamBranchKind branch_kind = 2;    // branch semantic kind.
+  uint32 target_fragment_id = 3;             // target writer fragment id.
+  int32 target_exchange_node_id = 4;         // target writer exchange node id.
+  repeated uint64 output_ordinals = 5;       // output ordinals sent to this branch.
+  repeated uint64 output_partition_ordinals = 6; // output ordinals used for partitioning.
 }
