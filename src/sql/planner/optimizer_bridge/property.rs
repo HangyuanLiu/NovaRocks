@@ -1,4 +1,4 @@
-//! Planner-owned bridges from analyzer ordering metadata to optimizer properties.
+//! Planner-owned bridges from analyzer ordering metadata to planner ordering vocabulary.
 
 use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
