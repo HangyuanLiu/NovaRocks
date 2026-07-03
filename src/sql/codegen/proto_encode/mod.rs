@@ -803,6 +803,192 @@ mod tests {
             exchange.partition_type,
             crate::proto::plan::PartitionType::Hash as i32
         );
+        assert_eq!(exchange.output_columns.len(), 1);
+        assert_eq!(exchange.output_columns[0].column_id, 10);
+        assert_eq!(exchange.output_columns[0].name, "v");
+    }
+
+    #[test]
+    fn stream_edge_patches_exchange_columns_from_aggregate_layout_when_fragment_output_is_empty() {
+        let group_column = planner_output_column(2, "c1", DataType::Utf8);
+        let source_root = crate::sql::planner::DistributedNode {
+            node_id: 11,
+            fragment_id: 0,
+            tuple_ids: vec![11],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: vec![values_distributed_node(0, 10, vec![group_column.clone()])],
+            stats: physical_stats(),
+            payload: crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::HashAggregate(Box::new(
+                    crate::sql::planner::plan::PhysicalHashAggregateNode {
+                        mode: crate::sql::optimizer::operator::AggMode::Local,
+                        group_by: vec![column_expr(2, "c1", DataType::Utf8)],
+                        aggregates: Vec::new(),
+                        is_merge: Vec::new(),
+                        output_layout: crate::sql::optimizer::operator::AggregateOutputLayout::new(
+                            vec![group_column.clone()],
+                            Vec::new(),
+                        ),
+                        output_columns: Vec::new(),
+                    },
+                )),
+            ),
+        };
+        let source = crate::sql::planner::PlanFragment {
+            fragment_id: 0,
+            root: source_root,
+            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::DataSink::Noop,
+            output_exprs: None,
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        let receiver = crate::sql::planner::DistributedNode {
+            node_id: 42,
+            fragment_id: 1,
+            tuple_ids: vec![42],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: physical_stats(),
+            payload: crate::sql::planner::DistributedPayload::Exchange(
+                crate::sql::planner::ExchangeReceiver {
+                    partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 0,
+                    output_columns: Vec::new(),
+                    output_qualifier: None,
+                    flavor: crate::sql::planner::plan::ExchangeFlavor::Distribution,
+                },
+            ),
+        };
+        let target = crate::sql::planner::PlanFragment {
+            fragment_id: 1,
+            root: receiver,
+            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::DataSink::Result,
+            output_exprs: None,
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        let plan = crate::sql::planner::DistributedPlan {
+            fragments: vec![source, target],
+            root_fragment_id: 1,
+            edges: vec![crate::sql::codegen::FragmentEdge {
+                source_fragment_id: 0,
+                target_fragment_id: 1,
+                target_exchange_node_id: 42,
+                output_partition: crate::thrift::partitions::TDataPartition::new(
+                    crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                    None::<Vec<crate::thrift::exprs::TExpr>>,
+                    None::<Vec<crate::thrift::partitions::TRangePartition>>,
+                    None::<Vec<crate::thrift::partitions::TBucketProperty>>,
+                ),
+                stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
+                edge_kind: crate::sql::codegen::FragmentEdgeKind::Stream,
+                output_slot_ids: vec![2],
+            }],
+        };
+
+        let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let target_fragment = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 1)
+            .expect("target fragment");
+        let root = target_fragment.root.as_ref().expect("target root");
+        let Some(crate::proto::plan::distributed_node::Payload::Exchange(exchange)) =
+            root.payload.as_ref()
+        else {
+            panic!("expected exchange receiver");
+        };
+        assert_eq!(exchange.output_columns.len(), 1);
+        assert_eq!(exchange.output_columns[0].column_id, 2);
+        assert_eq!(exchange.output_columns[0].name, "c1");
+    }
+
+    #[test]
+    fn iceberg_write_fragment_uses_sink_output_contract_for_duplicate_input_columns() {
+        let mut sink_spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
+        sink_spec.target_columns = vec![
+            crate::sql::catalog::ColumnDef {
+                name: "c0".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            },
+            crate::sql::catalog::ColumnDef {
+                name: "c1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            },
+        ];
+        sink_spec.target_table.columns = sink_spec.target_columns.clone();
+
+        let repeated_input = vec![
+            planner_output_column(7, "g0", DataType::Int64),
+            planner_output_column(7, "g1", DataType::Int64),
+        ];
+        let fragment = crate::sql::planner::PlanFragment {
+            fragment_id: 0,
+            root: values_distributed_node(0, 11, repeated_input.clone()),
+            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::DataSink::IcebergWrite(
+                crate::sql::planner::IcebergWriteFragmentSink {
+                    descriptor_database: "db".to_string(),
+                    spec: sink_spec,
+                    input: crate::sql::planner::IcebergWriteInputBinding::RootOutputByOrdinal,
+                },
+            ),
+            output_exprs: None,
+            output_columns: repeated_input,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+
+        let encoded = plan::encode_plan_fragment(&fragment).expect("encode fragment");
+
+        assert_eq!(encoded.output_exprs.len(), 2);
+        let encoded_ids = encoded
+            .output_exprs
+            .iter()
+            .map(|expr| {
+                let Some(crate::proto::expr::expr::Kind::ColumnRef(column)) = expr.kind.as_ref()
+                else {
+                    panic!("expected column ref");
+                };
+                column.column_id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(encoded_ids, vec![7, 7]);
+
+        let output_ids = encoded
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect::<Vec<_>>();
+        assert_eq!(output_ids, vec![1, 2]);
+        assert_eq!(
+            encoded
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c0", "c1"]
+        );
     }
 
     #[test]

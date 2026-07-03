@@ -15,18 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Native proto plan lowering scaffolding.
-
-mod expr;
-mod fragment;
-mod layout;
-mod node;
-mod scan;
-mod sink;
-
-#[allow(unused_imports)]
-pub(crate) use crate::sql::codegen::proto_encode::types::{decode_field_type, decode_type};
-#[allow(unused_imports)]
-pub(crate) use fragment::execute_fragment_native;
-#[allow(unused_imports)]
-pub(crate) use node::{LoweredNode, NodeLoweringContext, lower_proto_node};
+#[derive(Clone, Debug)]
+pub(crate) struct FragmentOutput {
+    pub(crate) profile_json: Option<String>,
+}

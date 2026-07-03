@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
@@ -63,6 +64,45 @@ impl MultiCastDataStreamSinkFactory {
         last_query_id: Option<String>,
         fe_addr: Option<types::TNetworkAddress>,
     ) -> Self {
+        Self::new_internal(
+            multi_cast,
+            exec_params,
+            Some(layout),
+            None,
+            plan_node_id,
+            last_query_id,
+            fe_addr,
+        )
+    }
+
+    pub(crate) fn new_with_pre_lowered_partitions(
+        multi_cast: data_sinks::TMultiCastDataStreamSink,
+        exec_params: internal_service::TPlanFragmentExecParams,
+        pre_lowered_partitions: Vec<(ExprArena, Vec<ExprId>)>,
+        plan_node_id: i32,
+        last_query_id: Option<String>,
+        fe_addr: Option<types::TNetworkAddress>,
+    ) -> Self {
+        Self::new_internal(
+            multi_cast,
+            exec_params,
+            None,
+            Some(pre_lowered_partitions),
+            plan_node_id,
+            last_query_id,
+            fe_addr,
+        )
+    }
+
+    fn new_internal(
+        multi_cast: data_sinks::TMultiCastDataStreamSink,
+        exec_params: internal_service::TPlanFragmentExecParams,
+        layout: Option<Layout>,
+        pre_lowered_partitions: Option<Vec<(ExprArena, Vec<ExprId>)>>,
+        plan_node_id: i32,
+        last_query_id: Option<String>,
+        fe_addr: Option<types::TNetworkAddress>,
+    ) -> Self {
         let name = if plan_node_id >= 0 {
             format!("MULTI_CAST_DATA_STREAM_SINK (id={plan_node_id})")
         } else {
@@ -77,11 +117,21 @@ impl MultiCastDataStreamSinkFactory {
                 multi_cast.sinks.len(),
                 multi_cast.destinations.len()
             ));
+        } else if pre_lowered_partitions
+            .as_ref()
+            .is_some_and(|partitions| partitions.len() != multi_cast.sinks.len())
+        {
+            init_error = Some(format!(
+                "MULTI_CAST_DATA_STREAM_SINK: pre-lowered partition size {} != sinks size {}",
+                pre_lowered_partitions.as_ref().map(Vec::len).unwrap_or(0),
+                multi_cast.sinks.len()
+            ));
         } else {
-            for (sink, destinations) in multi_cast
+            for (idx, (sink, destinations)) in multi_cast
                 .sinks
                 .into_iter()
                 .zip(multi_cast.destinations.into_iter())
+                .enumerate()
             {
                 let limit_remaining = match sink.limit {
                     Some(v) if v != -1 && v >= 0 => Some(Arc::new(AtomicI64::new(v))),
@@ -90,17 +140,42 @@ impl MultiCastDataStreamSinkFactory {
 
                 let mut params = exec_params.clone();
                 params.destinations = Some(destinations);
-
-                sinks.push(InnerSinkSpec {
-                    limit_remaining,
-                    factory: DataStreamSinkFactory::new(
+                let factory = if let Some((arena, exprs)) = pre_lowered_partitions
+                    .as_ref()
+                    .and_then(|partitions| partitions.get(idx))
+                {
+                    DataStreamSinkFactory::new_with_pre_lowered_partition(
                         sink,
                         params,
-                        layout.clone(),
+                        plan_node_id,
+                        arena.clone(),
+                        exprs.clone(),
+                        last_query_id.clone(),
+                        fe_addr.clone(),
+                    )
+                } else {
+                    let Some(layout) = layout.as_ref().cloned() else {
+                        if init_error.is_none() {
+                            init_error = Some(
+                                "MULTI_CAST_DATA_STREAM_SINK: thrift partition lowering requires layout"
+                                    .to_string(),
+                            );
+                        }
+                        continue;
+                    };
+                    DataStreamSinkFactory::new(
+                        sink,
+                        params,
+                        layout,
                         plan_node_id,
                         last_query_id.clone(),
                         fe_addr.clone(),
-                    ),
+                    )
+                };
+
+                sinks.push(InnerSinkSpec {
+                    limit_remaining,
+                    factory,
                 });
             }
         }

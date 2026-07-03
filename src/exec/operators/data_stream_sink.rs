@@ -993,9 +993,10 @@ pub(crate) struct DataStreamSinkFactory {
     init_error: Option<String>,
     sink: data_sinks::TDataStreamSink,
     exec_params: internal_service::TPlanFragmentExecParams,
-    layout: Layout,
+    layout: Option<Layout>,
     plan_node_id: i32,
     output_columns: Vec<SlotId>,
+    pre_lowered_partition: Option<(ExprArena, Vec<ExprId>)>,
     last_query_id: Option<String>,
     fe_addr: Option<types::TNetworkAddress>,
     finish_state: Arc<DataStreamSinkFinishState>,
@@ -1008,6 +1009,46 @@ impl DataStreamSinkFactory {
         exec_params: internal_service::TPlanFragmentExecParams,
         layout: Layout,
         plan_node_id: i32,
+        last_query_id: Option<String>,
+        fe_addr: Option<types::TNetworkAddress>,
+    ) -> Self {
+        Self::new_internal(
+            sink,
+            exec_params,
+            Some(layout),
+            plan_node_id,
+            None,
+            last_query_id,
+            fe_addr,
+        )
+    }
+
+    pub(crate) fn new_with_pre_lowered_partition(
+        sink: data_sinks::TDataStreamSink,
+        exec_params: internal_service::TPlanFragmentExecParams,
+        plan_node_id: i32,
+        partition_arena: ExprArena,
+        partition_exprs: Vec<ExprId>,
+        last_query_id: Option<String>,
+        fe_addr: Option<types::TNetworkAddress>,
+    ) -> Self {
+        Self::new_internal(
+            sink,
+            exec_params,
+            None,
+            plan_node_id,
+            Some((partition_arena, partition_exprs)),
+            last_query_id,
+            fe_addr,
+        )
+    }
+
+    fn new_internal(
+        sink: data_sinks::TDataStreamSink,
+        exec_params: internal_service::TPlanFragmentExecParams,
+        layout: Option<Layout>,
+        plan_node_id: i32,
+        pre_lowered_partition: Option<(ExprArena, Vec<ExprId>)>,
         last_query_id: Option<String>,
         fe_addr: Option<types::TNetworkAddress>,
     ) -> Self {
@@ -1051,6 +1092,7 @@ impl DataStreamSinkFactory {
             layout,
             plan_node_id,
             output_columns,
+            pre_lowered_partition,
             last_query_id,
             fe_addr,
             finish_state: Arc::new(DataStreamSinkFinishState::default()),
@@ -1121,27 +1163,38 @@ impl OperatorFactory for DataStreamSinkFactory {
             );
         }
 
-        let mut arena = ExprArena::default();
+        let mut arena = self
+            .pre_lowered_partition
+            .as_ref()
+            .map(|(arena, _)| arena.clone())
+            .unwrap_or_default();
         let mut init_error = self.init_error.clone();
-        let expr_ids = if init_error.is_none()
+        let expr_ids = if let Some((_, exprs)) = self.pre_lowered_partition.as_ref() {
+            exprs.clone()
+        } else if init_error.is_none()
             && matches!(
                 self.sink.output_partition.type_,
                 partitions::TPartitionType::HASH_PARTITIONED
                     | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED
-            ) {
+            )
+        {
             let exprs = self
                 .sink
                 .output_partition
                 .partition_exprs
                 .as_deref()
                 .unwrap_or(&[]);
+            let layout = self.layout.as_ref().ok_or_else(|| {
+                "DATA_STREAM_SINK: thrift partition lowering requires layout".to_string()
+            });
             match exprs
                 .iter()
                 .map(|e| {
+                    let layout = layout.as_ref().map_err(|err| err.to_string())?;
                     lower_t_expr(
                         e,
                         &mut arena,
-                        &self.layout,
+                        layout,
                         self.last_query_id.as_deref(),
                         self.fe_addr.as_ref(),
                     )

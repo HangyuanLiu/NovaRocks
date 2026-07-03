@@ -249,7 +249,36 @@ message DataSink {
     bool noop = 2;                                        // true for a no-op sink.
     IcebergWriteFragmentSink iceberg_write = 3;           // Iceberg write sink.
     IcebergChangeStreamRouterSink iceberg_change_stream_router = 4; // Iceberg change-stream router sink.
+    DataStreamSink data_stream = 5;                       // Exchange stream sink.
+    MultiCastDataStreamSink multi_cast_data_stream = 6;   // CTE-style multicast stream sink.
   }
+}
+
+// Exchange stream sink payload.
+// Owner: produced by FE/native plan encoder and consumed by BE/native plan
+// prepare. Runtime destinations for normal stream sinks are carried by
+// novarocks.InstanceParams because they are per fragment instance.
+message DataStreamSink {
+  int32 dest_node_id = 1;                 // destination exchange node id.
+  DataPartition output_partition = 2;     // stream partitioning and hash exprs.
+  repeated int32 output_columns = 3;      // optional projected output slot ids.
+  optional int64 limit = 4;               // optional sender-side limit.
+}
+
+// Native destination copy for sink payloads that carry destinations per child
+// sink, such as multicast.
+message StreamDestination {
+  novarocks.common.UniqueId finst_id = 1;
+  string brpc_addr = 2;
+}
+
+message StreamDestinationList {
+  repeated StreamDestination destinations = 1;
+}
+
+message MultiCastDataStreamSink {
+  repeated DataStreamSink sinks = 1;
+  repeated StreamDestinationList destinations = 2;
 }
 
 // Iceberg write sink payload.
@@ -1138,4 +1167,6 @@ message IcebergChangeStreamBranchRoute {
   int32 target_exchange_node_id = 4;         // target writer exchange node id.
   repeated uint64 output_ordinals = 5;       // output ordinals sent to this branch.
   repeated uint64 output_partition_ordinals = 6; // output ordinals used for partitioning.
+  DataPartition output_partition = 7;        // runtime partition kind + native hash exprs.
+  StreamDestinationList destinations = 8;    // runtime destinations for this branch.
 }

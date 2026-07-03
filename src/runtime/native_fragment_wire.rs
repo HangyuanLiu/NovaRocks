@@ -22,9 +22,18 @@ use std::collections::BTreeMap;
 use thrift::OrderedFloat;
 
 use crate::proto;
-use crate::thrift::{data_sinks, internal_service, runtime_filter, types};
+use crate::thrift::{data_sinks, internal_service, partitions, runtime_filter, types};
 
 pub(crate) type NetworkAddress = types::TNetworkAddress;
+pub(crate) type DataStreamSink = data_sinks::TDataStreamSink;
+pub(crate) type IcebergChangeStreamRouterBranch = data_sinks::TIcebergChangeStreamRouterBranch;
+pub(crate) type IcebergChangeStreamRouterBranchKind =
+    data_sinks::TIcebergChangeStreamRouterBranchKind;
+pub(crate) type IcebergChangeStreamRouterSink = data_sinks::TIcebergChangeStreamRouterSink;
+pub(crate) type MultiCastDataStreamSink = data_sinks::TMultiCastDataStreamSink;
+pub(crate) type PlanFragmentDestination = data_sinks::TPlanFragmentDestination;
+pub(crate) type PlanFragmentExecParams = internal_service::TPlanFragmentExecParams;
+pub(crate) type DataPartition = partitions::TDataPartition;
 pub(crate) type QueryOptions = internal_service::TQueryOptions;
 pub(crate) type ResultSinkType = data_sinks::TResultSinkType;
 pub(crate) type RuntimeFilterParams = runtime_filter::TRuntimeFilterParams;
@@ -143,4 +152,177 @@ pub(crate) fn network_address_from_native(src: &str) -> Result<NetworkAddress, S
         .parse::<i32>()
         .map_err(|e| format!("native network address has invalid port '{src}': {e}"))?;
     Ok(types::TNetworkAddress::new(host.to_string(), port))
+}
+
+pub(crate) fn destination_from_native(
+    src: &proto::novarocks::Destination,
+) -> Result<PlanFragmentDestination, String> {
+    let finst_id = src
+        .finst_id
+        .as_ref()
+        .ok_or_else(|| "native Destination missing finst_id".to_string())?;
+    Ok(data_sinks::TPlanFragmentDestination::new(
+        types::TUniqueId::new(finst_id.hi, finst_id.lo),
+        None::<types::TNetworkAddress>,
+        Some(network_address_from_native(&src.brpc_addr)?),
+        None::<i32>,
+    ))
+}
+
+pub(crate) fn destinations_from_native(
+    src: &[proto::novarocks::Destination],
+) -> Result<Vec<PlanFragmentDestination>, String> {
+    src.iter().map(destination_from_native).collect()
+}
+
+pub(crate) fn exec_params_from_native(
+    src: &proto::novarocks::InstanceParams,
+    destinations: Vec<PlanFragmentDestination>,
+) -> Result<PlanFragmentExecParams, String> {
+    let query_id = src
+        .query_id
+        .as_ref()
+        .ok_or_else(|| "native InstanceParams missing query_id".to_string())?;
+    let fragment_instance_id = src
+        .fragment_instance_id
+        .as_ref()
+        .ok_or_else(|| "native InstanceParams missing fragment_instance_id".to_string())?;
+    Ok(internal_service::TPlanFragmentExecParams {
+        query_id: types::TUniqueId::new(query_id.hi, query_id.lo),
+        fragment_instance_id: types::TUniqueId::new(
+            fragment_instance_id.hi,
+            fragment_instance_id.lo,
+        ),
+        per_node_scan_ranges: Default::default(),
+        per_exch_num_senders: src
+            .per_exch_num_senders
+            .iter()
+            .map(|(node_id, count)| (*node_id, *count))
+            .collect(),
+        destinations: Some(destinations),
+        sender_id: None,
+        num_senders: None,
+        send_query_statistics_with_every_batch: None,
+        use_vectorized: None,
+        runtime_filter_params: None,
+        instances_number: None,
+        enable_exchange_pass_through: None,
+        node_to_per_driver_seq_scan_ranges: None,
+        enable_exchange_perf: None,
+        pipeline_sink_dop: None,
+        report_when_finish: None,
+        exec_debug_options: None,
+    })
+}
+
+pub(crate) fn data_partition_without_exprs(
+    src: &proto::plan::DataPartition,
+) -> Result<DataPartition, String> {
+    let partition_type = match proto::plan::PartitionKind::try_from(src.kind)
+        .map_err(|_| format!("unknown native PartitionKind value {}", src.kind))?
+    {
+        proto::plan::PartitionKind::Unpartitioned => partitions::TPartitionType::UNPARTITIONED,
+        proto::plan::PartitionKind::Random => partitions::TPartitionType::RANDOM,
+        proto::plan::PartitionKind::Hash => partitions::TPartitionType::HASH_PARTITIONED,
+        proto::plan::PartitionKind::Unspecified => {
+            return Err("native DataPartition kind is unspecified".to_string());
+        }
+    };
+    Ok(partitions::TDataPartition::new(
+        partition_type,
+        None::<Vec<crate::thrift::exprs::TExpr>>,
+        None::<Vec<partitions::TRangePartition>>,
+        None::<Vec<partitions::TBucketProperty>>,
+    ))
+}
+
+pub(crate) fn data_stream_sink_from_native(
+    src: &proto::plan::DataStreamSink,
+) -> Result<DataStreamSink, String> {
+    let output_partition = src
+        .output_partition
+        .as_ref()
+        .ok_or_else(|| "native DATA_STREAM_SINK missing output_partition".to_string())
+        .and_then(data_partition_without_exprs)?;
+    let output_columns = (!src.output_columns.is_empty()).then_some(src.output_columns.clone());
+    Ok(data_sinks::TDataStreamSink::new(
+        src.dest_node_id,
+        output_partition,
+        None::<bool>,
+        None::<bool>,
+        None::<i32>,
+        output_columns,
+        src.limit,
+    ))
+}
+
+pub(crate) fn stream_destination_from_native(
+    src: &proto::plan::StreamDestination,
+) -> Result<PlanFragmentDestination, String> {
+    let finst_id = src
+        .finst_id
+        .as_ref()
+        .ok_or_else(|| "native StreamDestination missing finst_id".to_string())?;
+    Ok(data_sinks::TPlanFragmentDestination::new(
+        types::TUniqueId::new(finst_id.hi, finst_id.lo),
+        None::<types::TNetworkAddress>,
+        Some(network_address_from_native(&src.brpc_addr)?),
+        None::<i32>,
+    ))
+}
+
+pub(crate) fn stream_destinations_from_native(
+    src: &proto::plan::StreamDestinationList,
+) -> Result<Vec<PlanFragmentDestination>, String> {
+    src.destinations
+        .iter()
+        .map(stream_destination_from_native)
+        .collect()
+}
+
+pub(crate) fn multi_cast_data_stream_sink_from_native(
+    src: &proto::plan::MultiCastDataStreamSink,
+) -> Result<MultiCastDataStreamSink, String> {
+    if src.sinks.len() != src.destinations.len() {
+        return Err(format!(
+            "native MULTI_CAST_DATA_STREAM_SINK sinks size {} != destinations size {}",
+            src.sinks.len(),
+            src.destinations.len()
+        ));
+    }
+    let sinks = src
+        .sinks
+        .iter()
+        .map(data_stream_sink_from_native)
+        .collect::<Result<Vec<_>, _>>()?;
+    let destinations = src
+        .destinations
+        .iter()
+        .map(stream_destinations_from_native)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(data_sinks::TMultiCastDataStreamSink::new(
+        sinks,
+        destinations,
+    ))
+}
+
+pub(crate) fn iceberg_change_stream_branch_kind_from_native(
+    value: i32,
+) -> Result<IcebergChangeStreamRouterBranchKind, String> {
+    match proto::plan::ChangeStreamBranchKind::try_from(value)
+        .map_err(|_| format!("unknown native ChangeStreamBranchKind value {value}"))?
+    {
+        proto::plan::ChangeStreamBranchKind::DeleteDv => {
+            Ok(data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV)
+        }
+        proto::plan::ChangeStreamBranchKind::ReuseData => {
+            Ok(data_sinks::TIcebergChangeStreamRouterBranchKind::REUSE_DATA)
+        }
+        proto::plan::ChangeStreamBranchKind::FreshData => {
+            Ok(data_sinks::TIcebergChangeStreamRouterBranchKind::FRESH_DATA)
+        }
+        proto::plan::ChangeStreamBranchKind::Unspecified => {
+            Err("native ChangeStreamBranchKind is unspecified".to_string())
+        }
+    }
 }

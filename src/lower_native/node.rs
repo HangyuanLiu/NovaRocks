@@ -49,6 +49,7 @@ use crate::exec::node::project::ProjectNode;
 use crate::exec::node::repeat::RepeatNode;
 use crate::exec::node::set_op::{SetOpKind, SetOpNode};
 use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
+use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use crate::exec::node::union_all::UnionAllNode;
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -210,7 +211,9 @@ fn lower_physical_node(
         }
         plan::plan_node::Kind::Window(_) => unsupported("Window"),
         plan::plan_node::Kind::Repeat(repeat) => lower_repeat_node(node, repeat, children),
-        plan::plan_node::Kind::GenerateSeries(_) => unsupported("GenerateSeries"),
+        plan::plan_node::Kind::GenerateSeries(generate_series) => {
+            lower_generate_series_node(node, generate_series, children, arena)
+        }
         plan::plan_node::Kind::TableFunction(_) => unsupported("TableFunction"),
         plan::plan_node::Kind::Decode(_) => unsupported("Decode"),
         plan::plan_node::Kind::ChangeEventExpand(expand) => {
@@ -227,8 +230,33 @@ fn lower_physical_node(
 
 fn unsupported<T>(kind: &str) -> Result<T, String> {
     Err(format!(
-        "{kind} native proto node lowering is not implemented in M2.4a"
+        "{kind} native proto node lowering is not implemented"
     ))
+}
+
+fn exec_node_kind_label(kind: &ExecNodeKind) -> &'static str {
+    match kind {
+        ExecNodeKind::Scan(_) => "Scan",
+        ExecNodeKind::IcebergDeltaScan(_) => "IcebergDeltaScan",
+        ExecNodeKind::Project(_) => "Project",
+        ExecNodeKind::Filter(_) => "Filter",
+        ExecNodeKind::Aggregate(_) => "Aggregate",
+        ExecNodeKind::Join(_) => "Join",
+        ExecNodeKind::NestedLoopJoin(_) => "NestedLoopJoin",
+        ExecNodeKind::Sort(_) => "Sort",
+        ExecNodeKind::Limit(_) => "Limit",
+        ExecNodeKind::ExchangeSource(_) => "ExchangeSource",
+        ExecNodeKind::UnionAll(_) => "UnionAll",
+        ExecNodeKind::SetOp(_) => "SetOp",
+        ExecNodeKind::Values(_) => "Values",
+        ExecNodeKind::TableFunction(_) => "TableFunction",
+        ExecNodeKind::Repeat(_) => "Repeat",
+        ExecNodeKind::ChangeEventExpand(_) => "ChangeEventExpand",
+        ExecNodeKind::AssertNumRows(_) => "AssertNumRows",
+        ExecNodeKind::Analytic(_) => "Analytic",
+        ExecNodeKind::Fetch(_) => "Fetch",
+        ExecNodeKind::LookUp(_) => "LookUp",
+    }
 }
 
 fn check_arity(kind: &str, expected: &str, actual: usize, ok: bool) -> Result<(), String> {
@@ -281,6 +309,9 @@ fn materialize_values_chunk(
     output_schema: ChunkSchemaRef,
     arena: &mut ExprArena,
 ) -> Result<Chunk, String> {
+    if columns.is_empty() {
+        return empty_chunk_with_row_count(rows.len().max(1));
+    }
     if rows.is_empty() {
         let batch = RecordBatch::new_empty(output_schema.arrow_schema_ref());
         return Chunk::try_new_with_chunk_schema(batch, output_schema);
@@ -335,6 +366,120 @@ fn empty_chunk_with_row_count(row_count: usize) -> Result<Chunk, String> {
     Chunk::try_new_with_chunk_schema(batch, Arc::new(ChunkSchema::empty()))
 }
 
+fn lower_generate_series_node(
+    node: &plan::DistributedNode,
+    generate_series: &plan::GenerateSeriesNode,
+    children: Vec<LoweredNode>,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    check_exact_arity("GenerateSeriesNode", 0, children.len())?;
+    if generate_series.step == 0 {
+        return Err("GenerateSeriesNode step must not be zero".to_string());
+    }
+
+    let param_slots = generate_series_param_slots(generate_series.output_column_id)?;
+    let param_columns = vec![
+        bigint_output_column(param_slots[0].as_u32(), "generate_series_start", false),
+        bigint_output_column(param_slots[1].as_u32(), "generate_series_end", false),
+        bigint_output_column(param_slots[2].as_u32(), "generate_series_step", false),
+    ];
+    let input_schema = chunk_schema_from_output_columns(&param_columns)?;
+    let rows = vec![plan::ExprList {
+        values: vec![
+            int64_literal_expr(generate_series.start),
+            int64_literal_expr(generate_series.end),
+            int64_literal_expr(generate_series.step),
+        ],
+    }];
+    let input_chunk = materialize_values_chunk(&rows, &param_columns, input_schema, arena)?;
+
+    let output_columns = vec![bigint_output_column(
+        generate_series.output_column_id,
+        if generate_series.column_name.is_empty() {
+            "generate_series"
+        } else {
+            &generate_series.column_name
+        },
+        false,
+    )];
+    let layout = layout_from_output_columns(&output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(&output_columns)?;
+
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::TableFunction(TableFunctionNode {
+                input: Box::new(ExecNode {
+                    kind: ExecNodeKind::Values(ValuesNode {
+                        chunk: input_chunk,
+                        node_id: node.node_id,
+                    }),
+                }),
+                node_id: node.node_id,
+                function_name: "generate_series".to_string(),
+                param_slots: param_slots.to_vec(),
+                outer_slots: Vec::new(),
+                fn_result_slots: vec![SlotId::new(generate_series.output_column_id)],
+                fn_result_required: true,
+                is_left_join: false,
+                param_types: vec![DataType::Int64, DataType::Int64, DataType::Int64],
+                ret_types: vec![DataType::Int64],
+                output_chunk_schema: output_schema.clone(),
+                output_slot_sources: vec![TableFunctionOutputSlot::Result { index: 0 }],
+            }),
+        },
+        layout,
+        output_schema,
+    })
+}
+
+fn generate_series_param_slots(output_column_id: u32) -> Result<[SlotId; 3], String> {
+    let mut slot = u32::MAX;
+    let mut slots = Vec::with_capacity(3);
+    while slots.len() < 3 {
+        if slot != output_column_id {
+            slots.push(SlotId::new(slot));
+        }
+        slot = slot
+            .checked_sub(1)
+            .ok_or_else(|| "GenerateSeriesNode could not allocate internal slots".to_string())?;
+    }
+    Ok([slots[0], slots[1], slots[2]])
+}
+
+fn bigint_output_column(column_id: u32, name: &str, nullable: bool) -> common::OutputColumn {
+    common::OutputColumn {
+        column_id,
+        name: name.to_string(),
+        r#type: Some(bigint_type_desc()),
+        nullable,
+        is_internal: false,
+    }
+}
+
+fn bigint_type_desc() -> common::TypeDesc {
+    common::TypeDesc {
+        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+            r#type: common::PrimitiveType::Bigint as i32,
+            len: None,
+            precision: None,
+            scale: None,
+            time_unit: None,
+        })),
+    }
+}
+
+fn int64_literal_expr(value: i64) -> expr::Expr {
+    expr::Expr {
+        r#type: Some(bigint_type_desc()),
+        nullable: false,
+        kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+            value: Some(common::LiteralValue {
+                value: Some(common::literal_value::Value::IntValue(value)),
+            }),
+        })),
+    }
+}
+
 fn lower_project_node(
     node: &plan::DistributedNode,
     project: &plan::ProjectNode,
@@ -343,25 +488,32 @@ fn lower_project_node(
 ) -> Result<LoweredNode, String> {
     check_exact_arity("ProjectNode", 1, children.len())?;
     let child = children.pop().expect("child");
-    let output_columns = project_output_columns(project)?;
-    let layout = layout_from_output_columns(&output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(&output_columns)?;
-    let expr_slot_schemas = slot_schemas_from_output_columns(&output_columns)?;
+    let project_outputs = project_output_plan(project)?;
+    let layout = layout_from_output_columns(&project_outputs.output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(&project_outputs.output_columns)?;
+    let expr_slot_schemas = slot_schemas_from_output_columns(&project_outputs.computed_columns)?;
 
-    let exprs = project
-        .items
+    let exprs = project_outputs
+        .computed_item_indices
         .iter()
-        .enumerate()
-        .map(|(idx, item)| {
+        .map(|idx| {
+            let item = project
+                .items
+                .get(*idx)
+                .ok_or_else(|| format!("ProjectNode item {idx} missing"))?;
             let expr = item
                 .expr
                 .as_ref()
-                .ok_or_else(|| format!("ProjectNode item {idx} expr missing"))?;
+                .ok_or_else(|| format!("ProjectNode item {} expr missing", idx))?;
             lower_proto_expr(expr, arena, &child.layout)
-                .map_err(|err| format!("ProjectNode item {idx}: {err}"))
+                .map_err(|err| format!("ProjectNode item {}: {err}", idx))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let expr_slot_ids = layout.order().to_vec();
+    let expr_slot_ids = project_outputs
+        .computed_columns
+        .iter()
+        .map(|column| SlotId::new(column.column_id))
+        .collect();
 
     Ok(LoweredNode {
         node: ExecNode {
@@ -372,7 +524,7 @@ fn lower_project_node(
                 exprs,
                 expr_slot_ids,
                 expr_slot_schemas: Some(expr_slot_schemas),
-                output_indices: None,
+                output_indices: project_outputs.output_indices,
                 output_chunk_schema: output_schema.clone(),
             }),
         },
@@ -381,31 +533,122 @@ fn lower_project_node(
     })
 }
 
-fn project_output_columns(
-    project: &plan::ProjectNode,
-) -> Result<Vec<common::OutputColumn>, String> {
-    project
+struct ProjectOutputPlan {
+    computed_item_indices: Vec<usize>,
+    computed_columns: Vec<common::OutputColumn>,
+    output_columns: Vec<common::OutputColumn>,
+    output_indices: Option<Vec<usize>>,
+}
+
+fn project_output_plan(project: &plan::ProjectNode) -> Result<ProjectOutputPlan, String> {
+    let item_outputs = project
         .items
         .iter()
         .enumerate()
-        .map(|(idx, item)| {
-            let expr = item
-                .expr
-                .as_ref()
-                .ok_or_else(|| format!("ProjectNode item {idx} expr missing"))?;
-            let r#type = expr
-                .r#type
-                .clone()
-                .ok_or_else(|| format!("ProjectNode item {idx} expr type missing"))?;
-            Ok(common::OutputColumn {
-                column_id: item.output_column_id,
+        .map(project_item_output)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut used_column_ids = item_outputs
+        .iter()
+        .map(|item| item.physical_column_id)
+        .collect::<HashSet<_>>();
+    let mut next_synthetic_column_id = used_column_ids
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut first_expr_index_by_column_id = HashMap::new();
+    let mut computed_item_indices = Vec::new();
+    let mut computed_columns = Vec::new();
+    let mut output_columns = Vec::with_capacity(project.items.len());
+    let mut output_indices = Vec::with_capacity(project.items.len());
+    let mut has_duplicate_outputs = false;
+
+    for item in item_outputs {
+        let (computed_idx, is_duplicate) = if let Some(computed_idx) =
+            first_expr_index_by_column_id.get(&item.physical_column_id)
+        {
+            (*computed_idx, true)
+        } else {
+            let computed_idx = computed_columns.len();
+            first_expr_index_by_column_id.insert(item.physical_column_id, computed_idx);
+            computed_item_indices.push(item.item_index);
+            computed_columns.push(common::OutputColumn {
+                column_id: item.physical_column_id,
                 name: item.output_name.clone(),
-                r#type: Some(r#type),
-                nullable: expr.nullable,
+                r#type: Some(item.r#type.clone()),
+                nullable: item.nullable,
                 is_internal: false,
-            })
-        })
-        .collect()
+            });
+            (computed_idx, false)
+        };
+
+        let output_column_id = if is_duplicate {
+            has_duplicate_outputs = true;
+            while used_column_ids.contains(&next_synthetic_column_id) {
+                next_synthetic_column_id =
+                    next_synthetic_column_id.checked_add(1).ok_or_else(|| {
+                        "ProjectNode cannot allocate synthetic output column id".to_string()
+                    })?;
+            }
+            let synthetic = next_synthetic_column_id;
+            used_column_ids.insert(synthetic);
+            next_synthetic_column_id =
+                next_synthetic_column_id.checked_add(1).ok_or_else(|| {
+                    "ProjectNode cannot allocate synthetic output column id".to_string()
+                })?;
+            synthetic
+        } else {
+            item.physical_column_id
+        };
+        output_columns.push(common::OutputColumn {
+            column_id: output_column_id,
+            name: item.output_name.clone(),
+            r#type: Some(item.r#type),
+            nullable: item.nullable,
+            is_internal: false,
+        });
+        output_indices.push(computed_idx);
+    }
+
+    Ok(ProjectOutputPlan {
+        computed_item_indices,
+        computed_columns,
+        output_columns,
+        output_indices: has_duplicate_outputs.then_some(output_indices),
+    })
+}
+
+struct ProjectItemOutput {
+    item_index: usize,
+    physical_column_id: u32,
+    output_name: String,
+    r#type: common::TypeDesc,
+    nullable: bool,
+}
+
+fn project_item_output(
+    (idx, item): (usize, &plan::ProjectItem),
+) -> Result<ProjectItemOutput, String> {
+    let expr = item
+        .expr
+        .as_ref()
+        .ok_or_else(|| format!("ProjectNode item {idx} expr missing"))?;
+    let r#type = expr
+        .r#type
+        .clone()
+        .ok_or_else(|| format!("ProjectNode item {idx} expr type missing"))?;
+    let physical_column_id = match expr.kind.as_ref() {
+        Some(expr::expr::Kind::ColumnRef(column)) => column.column_id,
+        _ => item.output_column_id,
+    };
+    Ok(ProjectItemOutput {
+        item_index: idx,
+        physical_column_id,
+        output_name: item.output_name.clone(),
+        r#type,
+        nullable: expr.nullable,
+    })
 }
 
 fn lower_filter_node(
@@ -481,7 +724,7 @@ fn lower_sort_node(
         let layout = layout_from_output_columns(output_columns)?;
         if layout.order() != child.layout.order() {
             return Err(format!(
-                "SortNode output column reorder is not implemented in M2.4a: child={:?} output={:?}",
+                "SortNode output column reorder is not implemented for native proto lowering: child={:?} output={:?}",
                 child.layout.order(),
                 layout.order()
             ));
@@ -910,17 +1153,24 @@ fn lower_hash_aggregate_node(
     if mode == plan::AggMode::Unspecified {
         return Err("HashAggregateNode mode is unspecified".to_string());
     }
-    let output_columns = if aggregate.output_columns.is_empty() {
-        &physical.output_columns
-    } else {
-        &aggregate.output_columns
-    };
-    let layout = layout_from_output_columns(output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
     let output_layout = aggregate
         .output_layout
         .as_ref()
         .ok_or_else(|| "HashAggregateNode output_layout missing".to_string())?;
+    let synthesized_output_columns;
+    let output_columns = if !aggregate.output_columns.is_empty() {
+        aggregate.output_columns.as_slice()
+    } else if !physical.output_columns.is_empty() {
+        physical.output_columns.as_slice()
+    } else {
+        synthesized_output_columns = aggregate_output_columns_from_layout(
+            output_layout.group_key_columns.as_slice(),
+            output_layout.aggregate_columns.as_slice(),
+        );
+        synthesized_output_columns.as_slice()
+    };
+    let layout = layout_from_output_columns(output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(output_columns)?;
     if output_layout.aggregate_columns.len() != aggregate.aggregates.len() {
         return Err(format!(
             "HashAggregateNode output_layout aggregate column mismatch: columns={} aggregates={}",
@@ -941,8 +1191,13 @@ fn lower_hash_aggregate_node(
         .iter()
         .enumerate()
         .map(|(idx, expr)| {
-            lower_proto_expr(expr, arena, &child.layout)
-                .map_err(|err| format!("HashAggregateNode group_by[{idx}]: {err}"))
+            lower_proto_expr(expr, arena, &child.layout).map_err(|err| {
+                format!(
+                    "HashAggregateNode group_by[{idx}]: {err}; child_kind={} child_slots={:?}",
+                    exec_node_kind_label(&child.node.kind),
+                    child.layout.order()
+                )
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     for expr_id in &group_by {
@@ -1027,6 +1282,16 @@ fn lower_hash_aggregate_node(
         layout,
         output_schema,
     })
+}
+
+fn aggregate_output_columns_from_layout(
+    group_key_columns: &[common::OutputColumn],
+    aggregate_columns: &[common::OutputColumn],
+) -> Vec<common::OutputColumn> {
+    let mut columns = Vec::with_capacity(group_key_columns.len() + aggregate_columns.len());
+    columns.extend_from_slice(group_key_columns);
+    columns.extend_from_slice(aggregate_columns);
+    columns
 }
 
 fn aggregate_function_name(call: &plan::PlanAggregateCall) -> Result<String, String> {
@@ -2318,6 +2583,150 @@ mod tests {
     }
 
     #[test]
+    fn lowers_zero_column_values_rows_as_seed_rows() {
+        let node = physical_node(
+            10,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList { values: vec![] }],
+                columns: vec![],
+            }),
+            vec![],
+            Vec::new(),
+        );
+
+        let lowered = lower(&node);
+        let ExecNodeKind::Values(values) = lowered.node.kind else {
+            panic!("expected Values");
+        };
+        assert_eq!(values.chunk.len(), 1);
+        assert!(values.chunk.chunk_schema().slot_ids().is_empty());
+        assert!(lowered.layout.order().is_empty());
+        assert!(lowered.output_schema.slot_ids().is_empty());
+    }
+
+    #[test]
+    fn lowers_empty_zero_column_values_as_single_seed_row() {
+        let node = physical_node(
+            10,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+            Vec::new(),
+        );
+
+        let lowered = lower(&node);
+        let ExecNodeKind::Values(values) = lowered.node.kind else {
+            panic!("expected Values");
+        };
+        assert_eq!(values.chunk.len(), 1);
+        assert!(values.chunk.chunk_schema().slot_ids().is_empty());
+        assert!(lowered.layout.order().is_empty());
+        assert!(lowered.output_schema.slot_ids().is_empty());
+    }
+
+    #[test]
+    fn lowers_generate_series_to_table_function_exec_node() {
+        let node = physical_node(
+            20,
+            plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
+                start: 1,
+                end: 5,
+                step: 2,
+                column_name: "x".to_string(),
+                alias: Some("gs".to_string()),
+                output_column_id: 9,
+            }),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let lowered = lower(&node);
+        let ExecNodeKind::TableFunction(table_function) = lowered.node.kind else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(table_function.node_id, 20);
+        assert_eq!(table_function.function_name, "generate_series");
+        assert_eq!(table_function.param_slots.len(), 3);
+        assert!(table_function.outer_slots.is_empty());
+        assert_eq!(table_function.fn_result_slots, vec![SlotId::new(9)]);
+        assert!(table_function.fn_result_required);
+        assert!(!table_function.is_left_join);
+        assert_eq!(
+            table_function.param_types,
+            vec![DataType::Int64, DataType::Int64, DataType::Int64]
+        );
+        assert_eq!(table_function.ret_types, vec![DataType::Int64]);
+        assert_eq!(
+            table_function.output_chunk_schema.slot_ids(),
+            &[SlotId::new(9)]
+        );
+        assert_eq!(
+            table_function.output_chunk_schema.field(0).unwrap().name(),
+            "x"
+        );
+        assert_eq!(lowered.layout.order(), &[SlotId::new(9)]);
+        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(9)]);
+        assert!(matches!(
+            table_function.output_slot_sources.as_slice(),
+            [crate::exec::node::table_function::TableFunctionOutputSlot::Result { index: 0 }]
+        ));
+
+        let ExecNodeKind::Values(input) = table_function.input.kind else {
+            panic!("expected synthetic Values input");
+        };
+        assert_eq!(input.chunk.len(), 1);
+        assert_eq!(input.chunk.chunk_schema().slot_ids().len(), 3);
+        for (slot, expected) in table_function.param_slots.iter().zip([1, 5, 2]) {
+            let column = input.chunk.column_by_slot_id(*slot).expect("param column");
+            let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(values.value(0), expected);
+        }
+    }
+
+    #[test]
+    fn generate_series_rejects_zero_step_and_children() {
+        let zero_step = physical_node(
+            20,
+            plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
+                start: 1,
+                end: 5,
+                step: 0,
+                column_name: "x".to_string(),
+                alias: None,
+                output_column_id: 9,
+            }),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut arena = ExprArena::default();
+        let err =
+            lower_proto_node(&zero_step, &mut arena, &NodeLoweringContext::default()).unwrap_err();
+        assert!(err.contains("step must not be zero"), "{err}");
+
+        let with_child = physical_node(
+            21,
+            plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
+                start: 1,
+                end: 5,
+                step: 1,
+                column_name: "x".to_string(),
+                alias: None,
+                output_column_id: 9,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let err =
+            lower_proto_node(&with_child, &mut arena, &NodeLoweringContext::default()).unwrap_err();
+        assert!(
+            err.contains("GenerateSeriesNode expected 0 children"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn lowers_project_items_to_output_slots_and_schema() {
         let project = physical_node(
             20,
@@ -2338,14 +2747,59 @@ mod tests {
             panic!("expected Project");
         };
         assert_eq!(project.node_id, 20);
-        assert_eq!(project.expr_slot_ids, vec![SlotId::new(7)]);
-        assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(7)]);
+        assert_eq!(project.expr_slot_ids, vec![SlotId::new(1)]);
+        assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
         assert_eq!(
             project.output_chunk_schema.field(0).unwrap().name(),
             "projected_id"
         );
-        assert_eq!(lowered.layout.order(), &[SlotId::new(7)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
         assert!(matches!(project.input.kind, ExecNodeKind::Values(_)));
+    }
+
+    #[test]
+    fn lowers_project_duplicate_output_ids_with_output_indices() {
+        let project = physical_node(
+            20,
+            plan::plan_node::Kind::Project(plan::ProjectNode {
+                items: vec![
+                    plan::ProjectItem {
+                        expr: Some(column_ref(1, DataType::Int64)),
+                        output_name: "left_copy".to_string(),
+                        output_column_id: 7,
+                    },
+                    plan::ProjectItem {
+                        expr: Some(column_ref(1, DataType::Int64)),
+                        output_name: "right_copy".to_string(),
+                        output_column_id: 7,
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let lowered = lower(&project);
+        let ExecNodeKind::Project(project) = lowered.node.kind else {
+            panic!("expected Project");
+        };
+        assert_eq!(project.exprs.len(), 1);
+        assert_eq!(project.expr_slot_ids, vec![SlotId::new(1)]);
+        assert_eq!(project.output_indices, Some(vec![0, 0]));
+        assert_eq!(
+            project.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert_eq!(
+            project.output_chunk_schema.field(0).unwrap().name(),
+            "left_copy"
+        );
+        assert_eq!(
+            project.output_chunk_schema.field(1).unwrap().name(),
+            "right_copy"
+        );
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1), SlotId::new(2)]);
     }
 
     #[test]
@@ -2703,6 +3157,36 @@ mod tests {
             join.join_type,
             crate::exec::node::join::JoinType::Inner
         ));
+    }
+
+    #[test]
+    fn hash_aggregate_derives_output_columns_from_layout_sidecar() {
+        let group_column = output_column(1, "id", DataType::Int64);
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: vec![column_ref(1, DataType::Int64)],
+                aggregates: Vec::new(),
+                is_merge: Vec::new(),
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: vec![group_column],
+                    aggregate_columns: Vec::new(),
+                }),
+                output_columns: Vec::new(),
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let lowered = lower(&aggregate);
+        let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
+            panic!("expected Aggregate");
+        };
+        assert_eq!(aggregate.group_by.len(), 1);
+        assert!(aggregate.functions.is_empty());
+        assert_eq!(aggregate.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
     }
 
     #[test]

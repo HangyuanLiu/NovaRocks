@@ -25,6 +25,7 @@ use arrow::compute::take;
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
@@ -188,6 +189,45 @@ impl IcebergChangeStreamRouterSinkFactory {
         last_query_id: Option<String>,
         fe_addr: Option<types::TNetworkAddress>,
     ) -> Self {
+        Self::new_internal(
+            router,
+            exec_params,
+            Some(layout),
+            None,
+            plan_node_id,
+            last_query_id,
+            fe_addr,
+        )
+    }
+
+    pub(crate) fn new_with_pre_lowered_partitions(
+        router: data_sinks::TIcebergChangeStreamRouterSink,
+        exec_params: internal_service::TPlanFragmentExecParams,
+        pre_lowered_partitions: Vec<(ExprArena, Vec<ExprId>)>,
+        plan_node_id: i32,
+        last_query_id: Option<String>,
+        fe_addr: Option<types::TNetworkAddress>,
+    ) -> Self {
+        Self::new_internal(
+            router,
+            exec_params,
+            None,
+            Some(pre_lowered_partitions),
+            plan_node_id,
+            last_query_id,
+            fe_addr,
+        )
+    }
+
+    fn new_internal(
+        router: data_sinks::TIcebergChangeStreamRouterSink,
+        exec_params: internal_service::TPlanFragmentExecParams,
+        layout: Option<Layout>,
+        pre_lowered_partitions: Option<Vec<(ExprArena, Vec<ExprId>)>>,
+        plan_node_id: i32,
+        last_query_id: Option<String>,
+        fe_addr: Option<types::TNetworkAddress>,
+    ) -> Self {
         let name = if plan_node_id >= 0 {
             format!("ICEBERG_CHANGE_STREAM_ROUTER_SINK (id={plan_node_id})")
         } else {
@@ -237,6 +277,16 @@ impl IcebergChangeStreamRouterSinkFactory {
         if router.branches.is_empty() && init_error.is_none() {
             init_error =
                 Some("ICEBERG_CHANGE_STREAM_ROUTER_SINK requires at least one branch".to_string());
+        } else if pre_lowered_partitions
+            .as_ref()
+            .is_some_and(|partitions| partitions.len() != router.branches.len())
+            && init_error.is_none()
+        {
+            init_error = Some(format!(
+                "ICEBERG_CHANGE_STREAM_ROUTER_SINK: pre-lowered partition size {} != branches size {}",
+                pre_lowered_partitions.as_ref().map(Vec::len).unwrap_or(0),
+                router.branches.len()
+            ));
         }
 
         let raw_branches = router.branches;
@@ -286,17 +336,42 @@ impl IcebergChangeStreamRouterSinkFactory {
             }
             let mut branch_exec_params = exec_params.clone();
             branch_exec_params.destinations = Some(branch.destinations);
-            branches.push(IcebergChangeStreamRouterBranchFactory {
-                branch_id: branch.branch_id,
-                branch_kind,
-                data_stream: DataStreamSinkFactory::new(
+            let data_stream = if let Some((arena, exprs)) = pre_lowered_partitions
+                .as_ref()
+                .and_then(|partitions| partitions.get(branch_index))
+            {
+                DataStreamSinkFactory::new_with_pre_lowered_partition(
                     branch.stream_sink,
                     branch_exec_params,
-                    layout.clone(),
+                    plan_node_id,
+                    arena.clone(),
+                    exprs.clone(),
+                    last_query_id.clone(),
+                    fe_addr.clone(),
+                )
+            } else {
+                let Some(layout) = layout.as_ref().cloned() else {
+                    if init_error.is_none() {
+                        init_error = Some(
+                            "ICEBERG_CHANGE_STREAM_ROUTER_SINK: thrift partition lowering requires layout"
+                                .to_string(),
+                        );
+                    }
+                    continue;
+                };
+                DataStreamSinkFactory::new(
+                    branch.stream_sink,
+                    branch_exec_params,
+                    layout,
                     plan_node_id,
                     last_query_id.clone(),
                     fe_addr.clone(),
-                ),
+                )
+            };
+            branches.push(IcebergChangeStreamRouterBranchFactory {
+                branch_id: branch.branch_id,
+                branch_kind,
+                data_stream,
             });
         }
 
@@ -330,6 +405,29 @@ impl IcebergChangeStreamRouterSinkFactory {
             router,
             exec_params,
             layout,
+            plan_node_id,
+            last_query_id,
+            fe_addr,
+        );
+        if let Some(err) = factory.init_error.as_ref() {
+            return Err(err.clone());
+        }
+        Ok(factory)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_with_pre_lowered_partitions(
+        router: data_sinks::TIcebergChangeStreamRouterSink,
+        exec_params: internal_service::TPlanFragmentExecParams,
+        pre_lowered_partitions: Vec<(ExprArena, Vec<ExprId>)>,
+        plan_node_id: i32,
+        last_query_id: Option<String>,
+        fe_addr: Option<types::TNetworkAddress>,
+    ) -> Result<Self, String> {
+        let factory = Self::new_with_pre_lowered_partitions(
+            router,
+            exec_params,
+            pre_lowered_partitions,
             plan_node_id,
             last_query_id,
             fe_addr,

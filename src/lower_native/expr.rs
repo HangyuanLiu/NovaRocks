@@ -214,6 +214,9 @@ fn lower_function_call(
             call.function_name
         ));
     }
+    if call.function_name == "__array_literal" {
+        return lower_array_literal(call, arena, input_layout, data_type);
+    }
     let kind = lookup_function(&call.function_name).ok_or_else(|| {
         format!(
             "unsupported native scalar function '{}'",
@@ -223,6 +226,21 @@ fn lower_function_call(
     let args = lower_expr_list(&call.args, arena, input_layout)?;
     validate_function_arity(&call.function_name, kind, args.len())?;
     Ok(arena.push_typed(ExprNode::FunctionCall { kind, args }, data_type))
+}
+
+fn lower_array_literal(
+    call: &expr::FunctionCall,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+    data_type: DataType,
+) -> Result<ExprId, String> {
+    if !matches!(data_type, DataType::List(_)) {
+        return Err(format!(
+            "ARRAY literal expects List type, got {data_type:?}"
+        ));
+    }
+    let elements = lower_expr_list(&call.args, arena, input_layout)?;
+    Ok(arena.push_typed(ExprNode::ArrayExpr { elements }, data_type))
 }
 
 fn lower_cast(
@@ -1018,6 +1036,60 @@ mod tests {
                 if matches!(arena.node(*left), Some(ExprNode::SlotId(SlotId(7))))
                     && matches!(arena.node(*right), Some(ExprNode::Literal(LiteralValue::Int64(5))))
         ));
+    }
+
+    #[test]
+    fn lowers_array_literal_internal_function_to_array_expr() {
+        let array_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let array = scalar_expr(
+            array_type.clone(),
+            expr::expr::Kind::FunctionCall(expr::FunctionCall {
+                function_name: "__array_literal".to_string(),
+                args: vec![
+                    int_lit(1),
+                    int_lit(2),
+                    scalar_expr(
+                        DataType::Int64,
+                        expr::expr::Kind::Literal(expr::LiteralExpr {
+                            value: Some(common::LiteralValue {
+                                value: Some(common::literal_value::Value::NullValue(true)),
+                            }),
+                        }),
+                    ),
+                ],
+                distinct: false,
+            }),
+        );
+
+        let (arena, id) = lower(&array);
+        let Some(ExprNode::ArrayExpr { elements }) = arena.node(id) else {
+            panic!("expected array literal to lower as ArrayExpr");
+        };
+        assert_eq!(elements.len(), 3);
+        assert_eq!(arena.data_type(id), Some(&array_type));
+        assert!(matches!(
+            arena.node(elements[0]),
+            Some(ExprNode::Literal(LiteralValue::Int64(1)))
+        ));
+        assert!(matches!(
+            arena.node(elements[2]),
+            Some(ExprNode::Literal(LiteralValue::Null))
+        ));
+    }
+
+    #[test]
+    fn array_literal_requires_list_result_type() {
+        let array = scalar_expr(
+            DataType::Int64,
+            expr::expr::Kind::FunctionCall(expr::FunctionCall {
+                function_name: "__array_literal".to_string(),
+                args: vec![int_lit(1)],
+                distinct: false,
+            }),
+        );
+
+        let err = lower_err_with_slots(&array, &[]);
+        assert!(err.contains("ARRAY literal expects List type"), "{err}");
     }
 
     #[test]
