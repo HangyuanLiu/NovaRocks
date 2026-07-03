@@ -169,7 +169,7 @@ fn query_id_from_native(src: &proto::common::UniqueId) -> QueryId {
     }
 }
 
-fn query_options_from_native(
+pub(crate) fn query_options_from_native(
     src: &proto::novarocks::QueryOptions,
 ) -> Result<internal_service::TQueryOptions, String> {
     let mut opts = internal_service::TQueryOptions::default();
@@ -238,7 +238,7 @@ fn apply_query_option_overrides(
     query_options
 }
 
-fn runtime_filter_params_from_native(
+pub(crate) fn runtime_filter_params_from_native(
     src: &proto::novarocks::RuntimeFilterParams,
 ) -> Result<runtime_filter::TRuntimeFilterParams, String> {
     let id_to_prober_params = src
@@ -281,7 +281,7 @@ fn prober_params_from_native(
     ))
 }
 
-fn network_address_from_native(src: &str) -> Result<types::TNetworkAddress, String> {
+pub(crate) fn network_address_from_native(src: &str) -> Result<types::TNetworkAddress, String> {
     let (host, port) = src
         .rsplit_once(':')
         .ok_or_else(|| format!("native network address must be host:port, got '{src}'"))?;
