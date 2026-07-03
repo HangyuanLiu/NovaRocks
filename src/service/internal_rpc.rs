@@ -25,6 +25,17 @@ use crate::runtime::exchange;
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
 use crate::runtime::query_context::{QueryId, query_context_manager, query_expire_durations};
 
+#[cfg(feature = "compat")]
+type CompatTransmitRuntimeFilterRequest = proto::starrocks::PTransmitRuntimeFilterParams; // cfg(feature = "compat")
+#[cfg(feature = "compat")]
+type CompatTransmitRuntimeFilterResponse = proto::starrocks::PTransmitRuntimeFilterResult; // cfg(feature = "compat")
+#[cfg(feature = "compat")]
+type CompatLookupRequest = proto::starrocks::PLookUpRequest; // cfg(feature = "compat")
+#[cfg(feature = "compat")]
+type CompatLookupResponse = proto::starrocks::PLookUpResponse; // cfg(feature = "compat")
+#[cfg(feature = "compat")]
+type CompatColumn = proto::starrocks::PColumn; // cfg(feature = "compat")
+
 fn ok_status() -> proto::starrocks::StatusPb {
     proto::starrocks::StatusPb {
         status_code: 0,
@@ -248,10 +259,10 @@ pub(crate) fn handle_transmit_runtime_filter(
 
 #[cfg(feature = "compat")]
 pub(crate) fn handle_transmit_runtime_filter_compat(
-    params: proto::starrocks::PTransmitRuntimeFilterParams,
-) -> proto::starrocks::PTransmitRuntimeFilterResult {
+    params: CompatTransmitRuntimeFilterRequest,
+) -> CompatTransmitRuntimeFilterResponse {
     let Some(filter_id) = params.filter_id else {
-        return proto::starrocks::PTransmitRuntimeFilterResult {
+        return CompatTransmitRuntimeFilterResponse {
             status: Some(error_status(
                 "missing filter_id for transmit_runtime_filter",
             )),
@@ -286,7 +297,7 @@ pub(crate) fn handle_transmit_runtime_filter_compat(
             vec![status.message]
         },
     });
-    proto::starrocks::PTransmitRuntimeFilterResult {
+    CompatTransmitRuntimeFilterResponse {
         status,
         filter_id: Some(response.filter_id),
     }
@@ -380,12 +391,10 @@ pub(crate) fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter:
 }
 
 #[cfg(feature = "compat")]
-pub(crate) fn handle_lookup_compat(
-    req: proto::starrocks::PLookUpRequest,
-) -> proto::starrocks::PLookUpResponse {
+pub(crate) fn handle_lookup_compat(req: CompatLookupRequest) -> CompatLookupResponse {
     let mut request_columns = Vec::with_capacity(req.request_columns.len());
     let Some(tuple_id) = req.request_tuple_id else {
-        return proto::starrocks::PLookUpResponse {
+        return CompatLookupResponse {
             status: Some(error_status("missing request_tuple_id for lookup")),
             columns: Vec::new(),
         };
@@ -393,14 +402,14 @@ pub(crate) fn handle_lookup_compat(
 
     for col in req.request_columns {
         let Some(slot_id) = col.slot_id else {
-            return proto::starrocks::PLookUpResponse {
+            return CompatLookupResponse {
                 status: Some(error_status("lookup request column missing slot_id")),
                 columns: Vec::new(),
             };
         };
         let data = col.data.unwrap_or_default();
         if data.is_empty() {
-            return proto::starrocks::PLookUpResponse {
+            return CompatLookupResponse {
                 status: Some(error_status(format!(
                     "lookup request column {} missing data",
                     slot_id
@@ -437,12 +446,12 @@ pub(crate) fn handle_lookup_compat(
             vec![status.message]
         },
     });
-    proto::starrocks::PLookUpResponse {
+    CompatLookupResponse {
         status,
         columns: response
             .columns
             .into_iter()
-            .map(|col| proto::starrocks::PColumn {
+            .map(|col| CompatColumn {
                 slot_id: Some(col.slot_id),
                 data_size: Some(col.data_size),
                 data: Some(col.data),
@@ -467,12 +476,15 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use tempfile::tempdir;
 
+    #[cfg(feature = "compat")]
+    use super::{
+        CompatColumn, CompatLookupRequest, CompatTransmitRuntimeFilterRequest,
+        handle_lookup_compat, handle_transmit_runtime_filter_compat,
+    };
     use super::{
         decode_column_ipc, encode_column_ipc, handle_lookup, handle_transmit_chunk,
         handle_transmit_runtime_filter, receive_total_runtime_filter,
     };
-    #[cfg(feature = "compat")]
-    use super::{handle_lookup_compat, handle_transmit_runtime_filter_compat};
     use crate::cache::CacheOptions;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
@@ -683,14 +695,13 @@ mod tests {
     #[test]
     #[cfg(feature = "compat")]
     fn test_handle_transmit_runtime_filter_compat_rejects_missing_filter_id() {
-        let response =
-            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
-                is_partial: Some(false),
-                query_id: Some(unique_id(10, 20)),
-                filter_id: None,
-                data: Some(vec![1]),
-                ..Default::default()
-            });
+        let response = handle_transmit_runtime_filter_compat(CompatTransmitRuntimeFilterRequest {
+            is_partial: Some(false),
+            query_id: Some(unique_id(10, 20)),
+            filter_id: None,
+            data: Some(vec![1]),
+            ..Default::default()
+        });
 
         assert!(!ok_status(response.status.as_ref()));
         assert_eq!(
@@ -743,37 +754,29 @@ mod tests {
                 .lock()
                 .expect("sent lock")
                 .push((host.to_string(), port, params));
-            Ok(proto::starrocks::PTransmitRuntimeFilterResult {
-                status: Some(proto::starrocks::StatusPb {
-                    status_code: 0,
-                    error_msgs: Vec::new(),
-                }),
-                filter_id: Some(7),
-            })
+            Ok(())
         });
 
         let filter =
             RuntimeInFilter::empty(7, SlotId::new(11), &DataType::Int32).expect("empty in filter");
         let payload = encode_starrocks_in_filter(&filter).expect("encode runtime filter");
 
-        let first =
-            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
-                is_partial: Some(true),
-                query_id: Some(unique_id(query_id.hi, query_id.lo)),
-                filter_id: Some(7),
-                build_be_number: Some(1),
-                data: Some(payload.clone()),
-                ..Default::default()
-            });
-        let second =
-            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
-                is_partial: Some(true),
-                query_id: Some(unique_id(query_id.hi, query_id.lo)),
-                filter_id: Some(7),
-                build_be_number: Some(2),
-                data: Some(payload),
-                ..Default::default()
-            });
+        let first = handle_transmit_runtime_filter_compat(CompatTransmitRuntimeFilterRequest {
+            is_partial: Some(true),
+            query_id: Some(unique_id(query_id.hi, query_id.lo)),
+            filter_id: Some(7),
+            build_be_number: Some(1),
+            data: Some(payload.clone()),
+            ..Default::default()
+        });
+        let second = handle_transmit_runtime_filter_compat(CompatTransmitRuntimeFilterRequest {
+            is_partial: Some(true),
+            query_id: Some(unique_id(query_id.hi, query_id.lo)),
+            filter_id: Some(7),
+            build_be_number: Some(2),
+            data: Some(payload),
+            ..Default::default()
+        });
 
         assert!(ok_status(first.status.as_ref()));
         assert!(ok_status(second.status.as_ref()));
@@ -781,7 +784,7 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, "probe-host");
         assert_eq!(sent[0].1, 9010);
-        assert_eq!(sent[0].2.is_partial, Some(false));
+        assert!(!sent[0].2.is_partial);
         internal_rpc_client::clear_test_hooks();
     }
 
@@ -828,13 +831,7 @@ mod tests {
                 .lock()
                 .expect("sent lock")
                 .push((host.to_string(), port, params));
-            Ok(proto::starrocks::PTransmitRuntimeFilterResult {
-                status: Some(proto::starrocks::StatusPb {
-                    status_code: 0,
-                    error_msgs: Vec::new(),
-                }),
-                filter_id: Some(9),
-            })
+            Ok(())
         });
 
         let dt = DataType::Decimal128(18, 2);
@@ -843,26 +840,24 @@ mod tests {
         let filter = RuntimeInFilter::empty(9, SlotId::new(11), &dt).expect("empty in filter");
         let payload = encode_starrocks_in_filter(&filter).expect("encode runtime filter");
 
-        let first =
-            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
-                is_partial: Some(true),
-                query_id: Some(unique_id(query_id.hi, query_id.lo)),
-                filter_id: Some(9),
-                build_be_number: Some(1),
-                data: Some(payload.clone()),
-                column_type: Some(column_type.clone()),
-                ..Default::default()
-            });
-        let second =
-            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
-                is_partial: Some(true),
-                query_id: Some(unique_id(query_id.hi, query_id.lo)),
-                filter_id: Some(9),
-                build_be_number: Some(2),
-                data: Some(payload),
-                column_type: Some(column_type),
-                ..Default::default()
-            });
+        let first = handle_transmit_runtime_filter_compat(CompatTransmitRuntimeFilterRequest {
+            is_partial: Some(true),
+            query_id: Some(unique_id(query_id.hi, query_id.lo)),
+            filter_id: Some(9),
+            build_be_number: Some(1),
+            data: Some(payload.clone()),
+            column_type: Some(column_type.clone()),
+            ..Default::default()
+        });
+        let second = handle_transmit_runtime_filter_compat(CompatTransmitRuntimeFilterRequest {
+            is_partial: Some(true),
+            query_id: Some(unique_id(query_id.hi, query_id.lo)),
+            filter_id: Some(9),
+            build_be_number: Some(2),
+            data: Some(payload),
+            column_type: Some(column_type),
+            ..Default::default()
+        });
 
         assert!(
             ok_status(first.status.as_ref()),
@@ -878,12 +873,8 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, "probe-host");
         assert_eq!(sent[0].1, 9010);
-        assert_eq!(sent[0].2.is_partial, Some(false));
-        let final_payload = sent[0]
-            .2
-            .data
-            .as_deref()
-            .expect("final runtime filter payload");
+        assert!(!sent[0].2.is_partial);
+        let final_payload = sent[0].2.data.as_slice();
         let decoded = decode_starrocks_in_filter(9, SlotId::new(11), Some(&dt), final_payload)
             .expect("decode final decimal runtime filter");
         assert!(decoded.is_empty());
@@ -904,13 +895,7 @@ mod tests {
                 .lock()
                 .expect("sent lock")
                 .push((host.to_string(), port, params));
-            Ok(proto::starrocks::PTransmitRuntimeFilterResult {
-                status: Some(proto::starrocks::StatusPb {
-                    status_code: 0,
-                    error_msgs: Vec::new(),
-                }),
-                filter_id: Some(10),
-            })
+            Ok(())
         });
 
         let dt = DataType::Decimal128(18, 2);
@@ -919,16 +904,15 @@ mod tests {
         let filter = RuntimeInFilter::empty(10, SlotId::new(11), &dt).expect("empty in filter");
         let payload = encode_starrocks_in_filter(&filter).expect("encode runtime filter");
 
-        let first =
-            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
-                is_partial: Some(true),
-                query_id: Some(unique_id(query_id.hi, query_id.lo)),
-                filter_id: Some(10),
-                build_be_number: Some(1),
-                data: Some(payload.clone()),
-                column_type: Some(column_type.clone()),
-                ..Default::default()
-            });
+        let first = handle_transmit_runtime_filter_compat(CompatTransmitRuntimeFilterRequest {
+            is_partial: Some(true),
+            query_id: Some(unique_id(query_id.hi, query_id.lo)),
+            filter_id: Some(10),
+            build_be_number: Some(1),
+            data: Some(payload.clone()),
+            column_type: Some(column_type.clone()),
+            ..Default::default()
+        });
         assert!(
             ok_status(first.status.as_ref()),
             "first status: {:?}",
@@ -964,16 +948,15 @@ mod tests {
             "single replayed partial must not broadcast before all builders arrive"
         );
 
-        let second =
-            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
-                is_partial: Some(true),
-                query_id: Some(unique_id(query_id.hi, query_id.lo)),
-                filter_id: Some(10),
-                build_be_number: Some(2),
-                data: Some(payload),
-                column_type: Some(column_type),
-                ..Default::default()
-            });
+        let second = handle_transmit_runtime_filter_compat(CompatTransmitRuntimeFilterRequest {
+            is_partial: Some(true),
+            query_id: Some(unique_id(query_id.hi, query_id.lo)),
+            filter_id: Some(10),
+            build_be_number: Some(2),
+            data: Some(payload),
+            column_type: Some(column_type),
+            ..Default::default()
+        });
         assert!(
             ok_status(second.status.as_ref()),
             "second status: {:?}",
@@ -984,12 +967,8 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, "probe-host");
         assert_eq!(sent[0].1, 9010);
-        assert_eq!(sent[0].2.is_partial, Some(false));
-        let final_payload = sent[0]
-            .2
-            .data
-            .as_deref()
-            .expect("final runtime filter payload");
+        assert!(!sent[0].2.is_partial);
+        let final_payload = sent[0].2.data.as_slice();
         let decoded = decode_starrocks_in_filter(10, SlotId::new(11), Some(&dt), final_payload)
             .expect("decode final decimal runtime filter");
         assert!(decoded.is_empty());
@@ -1312,17 +1291,17 @@ mod tests {
             .expect("encode scan_range_id column");
         let row_id = encode_column_ipc(&(Arc::new(Int64Array::from(vec![1])) as ArrayRef))
             .expect("encode row_id column");
-        let response = handle_lookup_compat(proto::starrocks::PLookUpRequest {
+        let response = handle_lookup_compat(CompatLookupRequest {
             query_id: Some(unique_id(query_id.hi, query_id.lo)),
             lookup_node_id: Some(77),
             request_tuple_id: Some(tuple_id),
             request_columns: vec![
-                proto::starrocks::PColumn {
+                CompatColumn {
                     slot_id: Some(2),
                     data_size: Some(scan_range.len() as i64),
                     data: Some(scan_range),
                 },
-                proto::starrocks::PColumn {
+                CompatColumn {
                     slot_id: Some(3),
                     data_size: Some(row_id.len() as i64),
                     data: Some(row_id),
@@ -1349,7 +1328,7 @@ mod tests {
     #[cfg(feature = "compat")]
     #[test]
     fn test_handle_lookup_compat_rejects_missing_request_tuple_id() {
-        let response = handle_lookup_compat(proto::starrocks::PLookUpRequest {
+        let response = handle_lookup_compat(CompatLookupRequest {
             query_id: Some(unique_id(1, 2)),
             lookup_node_id: Some(77),
             request_tuple_id: None,
@@ -1367,11 +1346,11 @@ mod tests {
     #[cfg(feature = "compat")]
     #[test]
     fn test_handle_lookup_compat_rejects_missing_slot_id() {
-        let response = handle_lookup_compat(proto::starrocks::PLookUpRequest {
+        let response = handle_lookup_compat(CompatLookupRequest {
             query_id: Some(unique_id(1, 2)),
             lookup_node_id: Some(77),
             request_tuple_id: Some(1),
-            request_columns: vec![proto::starrocks::PColumn {
+            request_columns: vec![CompatColumn {
                 slot_id: None,
                 data_size: Some(1),
                 data: Some(vec![1]),
@@ -1389,11 +1368,11 @@ mod tests {
     #[cfg(feature = "compat")]
     #[test]
     fn test_handle_lookup_compat_rejects_empty_data() {
-        let response = handle_lookup_compat(proto::starrocks::PLookUpRequest {
+        let response = handle_lookup_compat(CompatLookupRequest {
             query_id: Some(unique_id(1, 2)),
             lookup_node_id: Some(77),
             request_tuple_id: Some(1),
-            request_columns: vec![proto::starrocks::PColumn {
+            request_columns: vec![CompatColumn {
                 slot_id: Some(2),
                 data_size: Some(0),
                 data: Some(Vec::new()),

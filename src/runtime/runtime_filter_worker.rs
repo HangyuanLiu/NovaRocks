@@ -270,7 +270,6 @@ impl RuntimeFilterWorker {
             if !seen_hosts.insert(prober.hostname().to_string()) {
                 continue;
             }
-            #[cfg(not(feature = "compat"))]
             let req = crate::proto::filter::TransmitRuntimeFilterRequest {
                 is_partial: false,
                 query_id: Some(crate::proto::common::UniqueId {
@@ -282,20 +281,6 @@ impl RuntimeFilterWorker {
                 build_be_number: 0,
                 column_type: None,
             };
-            #[cfg(feature = "compat")]
-            let req =
-                crate::service::internal_rpc_client::proto::starrocks::PTransmitRuntimeFilterParams {
-                    is_partial: Some(false),
-                    query_id: Some(
-                        crate::service::internal_rpc_client::proto::starrocks::PUniqueId {
-                            hi: self.query_id.hi,
-                            lo: self.query_id.lo,
-                        },
-                    ),
-                    filter_id: Some(filter_id),
-                    data: Some(data.clone()),
-                    ..Default::default()
-                };
             let dest_port = prober.port() as u16;
             if let Err(e) = send_final_runtime_filter(prober.hostname(), dest_port, req) {
                 warn!(
@@ -314,9 +299,7 @@ impl RuntimeFilterWorker {
 fn send_final_runtime_filter(
     hostname: &str,
     port: u16,
-    #[cfg(not(feature = "compat"))] req: crate::proto::filter::TransmitRuntimeFilterRequest,
-    #[cfg(feature = "compat")]
-    req: crate::service::internal_rpc_client::proto::starrocks::PTransmitRuntimeFilterParams,
+    req: crate::proto::filter::TransmitRuntimeFilterRequest,
 ) -> Result<(), String> {
     exchange_sender::send_runtime_filter(hostname, port, req)
 }
@@ -334,7 +317,7 @@ fn send_final_runtime_filter(
 fn send_final_runtime_filter(
     hostname: &str,
     port: u16,
-    req: crate::service::internal_rpc_client::proto::starrocks::PTransmitRuntimeFilterParams,
+    req: crate::proto::filter::TransmitRuntimeFilterRequest,
 ) -> Result<(), String> {
     exchange_sender::send_runtime_filter(hostname, port, req)
 }

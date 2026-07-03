@@ -87,6 +87,32 @@ fn status_error(status: Option<&proto::starrocks::StatusPb>, rpc: &str) -> Resul
     Err(format!("{rpc} failed: {}", status.error_msgs.join("; ")))
 }
 
+fn runtime_filter_request_to_compat(
+    params: proto::filter::TransmitRuntimeFilterRequest,
+) -> proto::starrocks::PTransmitRuntimeFilterParams {
+    let column_type = params.column_type.and_then(|desc| {
+        crate::exec::runtime_filter::arrow_type_from_common_type_desc(&desc).and_then(|data_type| {
+            crate::exec::runtime_filter::arrow_type_to_proto_type_desc(&data_type)
+        })
+    });
+
+    proto::starrocks::PTransmitRuntimeFilterParams {
+        is_partial: Some(params.is_partial),
+        query_id: params
+            .query_id
+            .as_ref()
+            .map(|query_id| proto::starrocks::PUniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            }),
+        filter_id: Some(params.filter_id),
+        data: Some(params.data),
+        build_be_number: params.is_partial.then_some(params.build_be_number),
+        column_type,
+        ..Default::default()
+    }
+}
+
 fn call_unary<Request, Response>(
     dest_host: &str,
     dest_port: u16,
@@ -180,18 +206,33 @@ pub fn send_chunks(
 pub fn transmit_runtime_filter(
     dest_host: &str,
     dest_port: u16,
-    params: proto::starrocks::PTransmitRuntimeFilterParams,
+    params: proto::filter::TransmitRuntimeFilterRequest,
 ) -> Result<(), String> {
     #[cfg(test)]
     if let Some(result) = maybe_transmit_runtime_filter_hook(dest_host, dest_port, params.clone()) {
-        return result
-            .and_then(|resp| status_error(resp.status.as_ref(), "transmit_runtime_filter"));
+        return result;
     }
 
+    let compat_request = runtime_filter_request_to_compat(params);
+    #[cfg(test)]
+    let response: proto::starrocks::PTransmitRuntimeFilterResult = if let Some(result) =
+        maybe_transmit_runtime_filter_wire_hook(dest_host, dest_port, compat_request.clone())
+    {
+        result?
+    } else {
+        call_unary(
+            dest_host,
+            dest_port,
+            compat_request,
+            "transmit_runtime_filter",
+            novarocks_compat_transmit_runtime_filter,
+        )?
+    };
+    #[cfg(not(test))]
     let response: proto::starrocks::PTransmitRuntimeFilterResult = call_unary(
         dest_host,
         dest_port,
-        params,
+        compat_request,
         "transmit_runtime_filter",
         novarocks_compat_transmit_runtime_filter,
     )?;
@@ -287,6 +328,13 @@ type TransmitChunkHook = std::sync::Arc<
 
 #[cfg(test)]
 type TransmitRuntimeFilterHook = std::sync::Arc<
+    dyn Fn(&str, u16, proto::filter::TransmitRuntimeFilterRequest) -> Result<(), String>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+type TransmitRuntimeFilterWireHook = std::sync::Arc<
     dyn Fn(
             &str,
             u16,
@@ -329,6 +377,14 @@ fn transmit_runtime_filter_hook() -> &'static std::sync::Mutex<Option<TransmitRu
 }
 
 #[cfg(test)]
+fn transmit_runtime_filter_wire_hook()
+-> &'static std::sync::Mutex<Option<TransmitRuntimeFilterWireHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<TransmitRuntimeFilterWireHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
 fn lookup_hook() -> &'static std::sync::Mutex<Option<LookupHook>> {
     static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<LookupHook>>> =
         std::sync::OnceLock::new();
@@ -365,11 +421,24 @@ fn maybe_transmit_chunk_hook(
 fn maybe_transmit_runtime_filter_hook(
     host: &str,
     port: u16,
-    params: proto::starrocks::PTransmitRuntimeFilterParams,
-) -> Option<Result<proto::starrocks::PTransmitRuntimeFilterResult, String>> {
+    params: proto::filter::TransmitRuntimeFilterRequest,
+) -> Option<Result<(), String>> {
     let hook = transmit_runtime_filter_hook()
         .lock()
         .expect("transmit_runtime_filter hook lock")
+        .clone();
+    hook.map(|hook| hook(host, port, params))
+}
+
+#[cfg(test)]
+fn maybe_transmit_runtime_filter_wire_hook(
+    host: &str,
+    port: u16,
+    params: proto::starrocks::PTransmitRuntimeFilterParams,
+) -> Option<Result<proto::starrocks::PTransmitRuntimeFilterResult, String>> {
+    let hook = transmit_runtime_filter_wire_hook()
+        .lock()
+        .expect("transmit_runtime_filter wire hook lock")
         .clone();
     hook.map(|hook| hook(host, port, params))
 }
@@ -410,6 +479,9 @@ pub(crate) fn clear_test_hooks() {
     *transmit_runtime_filter_hook()
         .lock()
         .expect("transmit_runtime_filter hook lock") = None;
+    *transmit_runtime_filter_wire_hook()
+        .lock()
+        .expect("transmit_runtime_filter wire hook lock") = None;
     *lookup_hook().lock().expect("lookup hook lock") = None;
     *lookup_wire_hook().lock().expect("lookup wire hook lock") = None;
 }
@@ -435,6 +507,19 @@ where
 #[cfg(test)]
 pub(crate) fn set_transmit_runtime_filter_hook<F>(hook: F)
 where
+    F: Fn(&str, u16, proto::filter::TransmitRuntimeFilterRequest) -> Result<(), String>
+        + Send
+        + Sync
+        + 'static,
+{
+    *transmit_runtime_filter_hook()
+        .lock()
+        .expect("transmit_runtime_filter hook lock") = Some(std::sync::Arc::new(hook));
+}
+
+#[cfg(test)]
+fn set_transmit_runtime_filter_wire_hook<F>(hook: F)
+where
     F: Fn(
             &str,
             u16,
@@ -444,9 +529,9 @@ where
         + Sync
         + 'static,
 {
-    *transmit_runtime_filter_hook()
+    *transmit_runtime_filter_wire_hook()
         .lock()
-        .expect("transmit_runtime_filter hook lock") = Some(std::sync::Arc::new(hook));
+        .expect("transmit_runtime_filter wire hook lock") = Some(std::sync::Arc::new(hook));
 }
 
 #[cfg(test)]
@@ -480,6 +565,71 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn test_transmit_runtime_filter_accepts_native_request_and_maps_starrocks_wire_request() {
+        let _hook_guard = test_hook_lock();
+        clear_test_hooks();
+
+        let captured = Arc::new(Mutex::new(None));
+        let captured_hook = Arc::clone(&captured);
+        set_transmit_runtime_filter_wire_hook(move |host, port, req| {
+            *captured_hook.lock().expect("captured lock") = Some((host.to_string(), port, req));
+            Ok(proto::starrocks::PTransmitRuntimeFilterResult {
+                status: Some(proto::starrocks::StatusPb {
+                    status_code: 0,
+                    error_msgs: Vec::new(),
+                }),
+                filter_id: Some(7),
+            })
+        });
+
+        transmit_runtime_filter(
+            "compat-host",
+            9910,
+            proto::filter::TransmitRuntimeFilterRequest {
+                is_partial: true,
+                query_id: Some(proto::common::UniqueId { hi: 10, lo: 20 }),
+                filter_id: 7,
+                data: vec![1, 2, 3],
+                build_be_number: 3,
+                column_type: Some(proto::common::TypeDesc {
+                    kind: Some(proto::common::type_desc::Kind::Scalar(
+                        proto::common::ScalarType {
+                            r#type: proto::common::PrimitiveType::Int as i32,
+                            len: None,
+                            precision: None,
+                            scale: None,
+                            time_unit: None,
+                        },
+                    )),
+                }),
+            },
+        )
+        .expect("runtime filter should map through compat wire hook");
+
+        let captured = captured.lock().expect("captured lock");
+        let (host, port, request) = captured.as_ref().expect("captured request");
+        assert_eq!(host, "compat-host");
+        assert_eq!(*port, 9910);
+        assert_eq!(request.is_partial, Some(true));
+        assert_eq!(
+            request.query_id,
+            Some(proto::starrocks::PUniqueId { hi: 10, lo: 20 })
+        );
+        assert_eq!(request.filter_id, Some(7));
+        assert_eq!(request.data, Some(vec![1, 2, 3]));
+        assert_eq!(request.build_be_number, Some(3));
+        let column_type = request.column_type.as_ref().expect("column type");
+        let scalar = column_type
+            .types
+            .first()
+            .and_then(|node| node.scalar_type.as_ref())
+            .expect("scalar column type");
+        assert_eq!(scalar.r#type, crate::thrift::types::TPrimitiveType::INT.0);
+
+        clear_test_hooks();
+    }
 
     #[test]
     fn test_lookup_accepts_native_request_and_maps_starrocks_wire_response() {

@@ -41,10 +41,7 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::{JoinDistributionMode, JoinRuntimeFilterSpec, JoinType};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-#[cfg(not(feature = "compat"))]
 use crate::exec::runtime_filter::arrow_type_to_common_type_desc;
-#[cfg(feature = "compat")]
-use crate::exec::runtime_filter::arrow_type_to_proto_type_desc;
 use crate::exec::runtime_filter::{
     LocalRuntimeFilterSet, LocalRuntimeInFilterSet, MAX_RUNTIME_IN_FILTER_CONDITIONS,
     PartialRuntimeInFilterMerger, RUNTIME_FILTER_JOIN_MODE_BROADCAST,
@@ -740,13 +737,6 @@ impl HashJoinBuildSinkOperator {
             return Ok(());
         }
         let build_be_number = state.backend_num().unwrap_or(0);
-        #[cfg(feature = "compat")]
-        let finst_id = state.fragment_instance_id().map(|id| {
-            crate::service::grpc_client::proto::starrocks::PUniqueId {
-                hi: id.hi,
-                lo: id.lo,
-            }
-        });
 
         let mut encoded_bytes: i64 = 0;
         for filter in &filters {
@@ -822,7 +812,6 @@ impl HashJoinBuildSinkOperator {
                     if !seen_hosts.insert(addr.host.clone()) {
                         continue;
                     }
-                    #[cfg(not(feature = "compat"))]
                     let req = crate::proto::filter::TransmitRuntimeFilterRequest {
                         is_partial: true,
                         query_id: Some(crate::proto::common::UniqueId {
@@ -834,21 +823,6 @@ impl HashJoinBuildSinkOperator {
                         build_be_number,
                         column_type: arrow_type_to_common_type_desc(&spec.build_data_type),
                     };
-                    #[cfg(feature = "compat")]
-                    let req =
-                        crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams {
-                            is_partial: Some(true),
-                            query_id: Some(crate::service::grpc_client::proto::starrocks::PUniqueId {
-                                hi: query_id.hi,
-                                lo: query_id.lo,
-                            }),
-                            filter_id: Some(filter.filter_id()),
-                            finst_id: finst_id.clone(),
-                            build_be_number: Some(build_be_number),
-                            column_type: arrow_type_to_proto_type_desc(&spec.build_data_type),
-                            data: Some(data.clone()),
-                            ..Default::default()
-                        };
                     let dest_port = addr.port as u16;
                     if !recorded_sent {
                         self.record_sent_lifecycle(query_id, filter.filter_id(), data.len());
@@ -878,7 +852,6 @@ impl HashJoinBuildSinkOperator {
                     if !seen_hosts.insert(addr.hostname.clone()) {
                         continue;
                     }
-                    #[cfg(not(feature = "compat"))]
                     let req = crate::proto::filter::TransmitRuntimeFilterRequest {
                         is_partial: false,
                         query_id: Some(crate::proto::common::UniqueId {
@@ -890,19 +863,6 @@ impl HashJoinBuildSinkOperator {
                         build_be_number: 0,
                         column_type: None,
                     };
-                    #[cfg(feature = "compat")]
-                    let req =
-                        crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams {
-                            is_partial: Some(false),
-                            query_id: Some(crate::service::grpc_client::proto::starrocks::PUniqueId {
-                                hi: query_id.hi,
-                                lo: query_id.lo,
-                            }),
-                            filter_id: Some(filter.filter_id()),
-                            finst_id: finst_id.clone(),
-                            data: Some(data.clone()),
-                            ..Default::default()
-                        };
                     let dest_port = addr.port as u16;
                     if !recorded_sent {
                         self.record_sent_lifecycle(query_id, filter.filter_id(), data.len());

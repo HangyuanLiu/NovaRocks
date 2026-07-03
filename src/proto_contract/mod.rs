@@ -4,4 +4,5 @@
 
 mod common;
 mod expr;
+mod filter;
 mod plan;
