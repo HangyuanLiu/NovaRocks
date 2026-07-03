@@ -1,0 +1,312 @@
+syntax = "proto3";
+
+// NovaRocks-native distributed plan contract. Mirrors the PIR thin overlay:
+// DistributedPlan / PlanFragment / DistributedNode plus native support messages.
+// This is contract-only in NIDL-3; future NIDL-4 FE encode and BE prepare
+// conversion layers own translation. Planner and exec code must not import the
+// generated proto directly.
+package novarocks.plan;
+
+import "common.proto";
+import "expr.proto";
+
+// Whole-query distributed plan.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message DistributedPlan {
+  repeated PlanFragment fragments = 1;  // all fragments in this distributed plan.
+  uint32 root_fragment_id = 2;           // root fragment producing client-visible results.
+  repeated FragmentEdge edges = 3;       // directed data-flow edges between fragments.
+}
+
+// One fragment in a distributed plan.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message PlanFragment {
+  uint32 fragment_id = 1;                                // fragment identity.
+  DistributedNode root = 2;                              // root node of this fragment.
+  DataPartition data_partition = 3;                      // input partitioning expected by this fragment.
+  DataPartition output_partition = 4;                    // output partitioning produced by this fragment.
+  DataSink sink = 5;                                     // fragment sink behavior.
+  repeated novarocks.expr.Expr output_exprs = 6;         // optional output expressions when present.
+  repeated novarocks.common.OutputColumn output_columns = 7; // fragment output schema.
+  optional uint32 cte_id = 8;                            // CTE id when this fragment is CTE-owned.
+  repeated CteExchangeBinding cte_exchange_nodes = 9;    // CTE exchange bindings inside this fragment.
+}
+
+// Binding between one CTE and its exchange receiver nodes.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message CteExchangeBinding {
+  uint32 cte_id = 1;              // CTE identity.
+  int32 node_id = 2;              // exchange node id receiving this CTE stream.
+  repeated uint32 column_ids = 3; // producer column ids received by this exchange.
+}
+
+// Distributed plan tree node. Stats are intentionally off-wire.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message DistributedNode {
+  int32 node_id = 1;                                    // execution node id.
+  uint32 fragment_id = 2;                               // owning fragment id.
+  repeated int32 tuple_ids = 3;                         // legacy tuple ids needed during NIDL-4 prepare.
+  repeated int32 nullable_tuple_ids = 4;                // nullable tuple ids for outer-join semantics.
+  int64 limit = 5;                                      // node limit; -1 means no limit.
+  repeated RuntimeFilterBuild build_runtime_filters = 6; // runtime filters built by this node.
+  repeated RuntimeFilterProbe probe_runtime_filters = 7; // runtime filters probed by this node.
+  repeated DistributedNode children = 8;                // child plan nodes.
+  oneof payload {
+    PlanNode physical = 10;       // physical operator payload.
+    ExchangeReceiver exchange = 11; // exchange receiver payload.
+  }
+}
+
+// Exchange receiver node payload.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ExchangeReceiver {
+  PartitionType partition_type = 1;                     // source exchange partition type.
+  repeated novarocks.expr.Expr partition_exprs = 2;     // partition expressions.
+  uint32 source_fragment_id = 3;                         // fragment sending into this receiver.
+  repeated novarocks.common.OutputColumn output_columns = 4; // exchange output schema.
+  optional string output_qualifier = 5;                 // optional output qualifier for display.
+  ExchangeFlavor flavor = 6;                             // exchange semantic flavor.
+}
+
+// Physical operator placeholder. NIDL-3 Task B2 appends the operator oneof.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message PlanNode {
+  repeated novarocks.common.OutputColumn output_columns = 1; // node-owned output schema.
+}
+
+// Native exchange partition type, replacing StarRocks thrift TPartitionType.
+enum PartitionType {
+  PARTITION_TYPE_UNSPECIFIED = 0;
+  PARTITION_TYPE_UNPARTITIONED = 1;
+  PARTITION_TYPE_RANDOM = 2;
+  PARTITION_TYPE_HASH = 3;
+  PARTITION_TYPE_RANGE = 4;
+  PARTITION_TYPE_BUCKET_SHUFFLE_HASH = 5;
+  PARTITION_TYPE_HYBRID_HASH = 6;
+}
+
+// Fragment input/output partitioning.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message DataPartition {
+  PartitionKind kind = 1;                  // fragment partitioning kind.
+  repeated novarocks.expr.Expr exprs = 2;  // hash partition expressions when kind is HASH.
+}
+
+// Planner-level data partition kind.
+enum PartitionKind {
+  PARTITION_KIND_UNSPECIFIED = 0;
+  PARTITION_KIND_UNPARTITIONED = 1;
+  PARTITION_KIND_RANDOM = 2;
+  PARTITION_KIND_HASH = 3;
+}
+
+// Runtime filter build wiring after fragment assignment.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message RuntimeFilterBuild {
+  int32 filter_id = 1;                         // runtime filter id.
+  novarocks.expr.Expr build_expr = 2;          // build-side expression.
+  novarocks.expr.Expr probe_expr = 3;          // probe-side expression.
+  uint32 expr_order = 4;                       // expression order within the join key list.
+  JoinExecutionMode execution_mode = 5;        // distribution mode for this filter.
+  uint32 source_fragment_id = 6;               // build-side fragment id.
+  repeated uint32 target_fragment_ids = 7;     // probe-side target fragment ids.
+}
+
+// Runtime filter probe wiring after fragment assignment.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message RuntimeFilterProbe {
+  int32 filter_id = 1;                // runtime filter id.
+  novarocks.expr.Expr probe_expr = 2; // local probe expression.
+  uint32 source_fragment_id = 3;      // build-side source fragment id.
+}
+
+// Directed data-flow edge between two fragments.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message FragmentEdge {
+  uint32 source_fragment_id = 1;      // sending fragment id.
+  uint32 target_fragment_id = 2;      // receiving fragment id.
+  int32 target_exchange_node_id = 3;  // target exchange node id.
+  PartitionType output_partition = 4; // output exchange partition type.
+  FragmentStreamKind stream_kind = 5; // stream transport shape.
+  FragmentEdgeKind edge_kind = 6;     // semantic edge kind.
+  repeated int32 output_slot_ids = 7; // output slot ids crossing this edge.
+}
+
+// Semantic fragment edge kind.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message FragmentEdgeKind {
+  oneof kind {
+    bool stream = 1;                                      // true for a normal stream edge.
+    CteMulticastEdge cte_multicast = 2;                   // CTE multicast edge metadata.
+    IcebergChangeStreamRouterEdge iceberg_change_stream_router = 3; // Iceberg change-stream router edge metadata.
+  }
+}
+
+// CTE multicast edge metadata.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message CteMulticastEdge {
+  uint32 cte_id = 1;                                  // multicast CTE id.
+  repeated uint32 receive_producer_column_ids = 2;    // producer columns received by this edge.
+}
+
+// Iceberg change-stream router edge metadata.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergChangeStreamRouterEdge {
+  int32 router_group_id = 1;                  // router group id.
+  int32 branch_id = 2;                        // branch id within the router group.
+  ChangeStreamBranchKind branch_kind = 3;     // branch semantic kind.
+}
+
+// Stream transport shape for a fragment edge.
+enum FragmentStreamKind {
+  FRAGMENT_STREAM_KIND_UNSPECIFIED = 0;
+  FRAGMENT_STREAM_KIND_GATHER = 1;
+  FRAGMENT_STREAM_KIND_BROADCAST = 2;
+  FRAGMENT_STREAM_KIND_PARTITIONED = 3;
+  FRAGMENT_STREAM_KIND_OTHER = 4;
+}
+
+// Exchange receiver semantic flavor.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ExchangeFlavor {
+  oneof kind {
+    bool distribution = 1;                      // true for a plain distribution exchange.
+    LimitOffsetFlavor limit_offset = 2;         // limit/offset split exchange.
+    TopNSplitFlavor topn_split = 3;             // TopN split exchange.
+    CteMulticastFlavor cte_multicast = 4;       // CTE multicast exchange.
+  }
+}
+
+// Limit/offset exchange flavor.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message LimitOffsetFlavor {
+  optional int64 limit = 1;   // optional LIMIT.
+  optional int64 offset = 2;  // optional OFFSET.
+}
+
+// TopN split exchange flavor.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message TopNSplitFlavor {
+  repeated novarocks.expr.SortItem items = 1; // TopN ordering items.
+  optional int64 limit = 2;                   // optional LIMIT.
+  optional int64 offset = 3;                  // optional OFFSET.
+}
+
+// CTE multicast exchange flavor.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message CteMulticastFlavor {
+  uint32 cte_id = 1;                                // multicast CTE id.
+  repeated uint32 receive_producer_column_ids = 2;  // producer columns received by this exchange.
+}
+
+// Fragment sink payload. Detailed Iceberg sink fields are appended in Task B2.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message DataSink {
+  oneof kind {
+    bool result = 1;                                      // true for a result sink.
+    bool noop = 2;                                        // true for a no-op sink.
+    IcebergWriteFragmentSink iceberg_write = 3;           // Iceberg write sink.
+    IcebergChangeStreamRouterSink iceberg_change_stream_router = 4; // Iceberg change-stream router sink.
+  }
+}
+
+// Placeholder for Iceberg write sink payload; Task B2 appends fields.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergWriteFragmentSink {}
+
+// Placeholder for Iceberg change-stream router sink payload; Task B2 appends fields.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IcebergChangeStreamRouterSink {}
+
+// Join kind. Mirrors src/sql/common/expr.rs JoinKind.
+enum JoinKind {
+  JOIN_KIND_UNSPECIFIED = 0;
+  JOIN_KIND_INNER = 1;
+  JOIN_KIND_LEFT_OUTER = 2;
+  JOIN_KIND_RIGHT_OUTER = 3;
+  JOIN_KIND_FULL_OUTER = 4;
+  JOIN_KIND_CROSS = 5;
+  JOIN_KIND_LEFT_SEMI = 6;
+  JOIN_KIND_RIGHT_SEMI = 7;
+  JOIN_KIND_LEFT_ANTI = 8;
+  JOIN_KIND_RIGHT_ANTI = 9;
+  JOIN_KIND_NULL_AWARE_LEFT_ANTI = 10;
+}
+
+// Join distribution decision. Mirrors src/sql/optimizer/operator.rs.
+enum JoinDistribution {
+  JOIN_DISTRIBUTION_UNSPECIFIED = 0;
+  JOIN_DISTRIBUTION_UNKNOWN = 1;
+  JOIN_DISTRIBUTION_SHUFFLE = 2;
+  JOIN_DISTRIBUTION_BROADCAST = 3;
+  JOIN_DISTRIBUTION_COLOCATE = 4;
+}
+
+// Join execution mode for runtime filters. Mirrors runtime_filter.rs.
+enum JoinExecutionMode {
+  JOIN_EXECUTION_MODE_UNSPECIFIED = 0;
+  JOIN_EXECUTION_MODE_BROADCAST = 1;
+  JOIN_EXECUTION_MODE_PARTITIONED = 2;
+  JOIN_EXECUTION_MODE_COLOCATE = 3;
+}
+
+// Aggregate execution mode. Mirrors src/sql/optimizer/operator.rs AggMode.
+enum AggMode {
+  AGG_MODE_UNSPECIFIED = 0;
+  AGG_MODE_SINGLE = 1;
+  AGG_MODE_LOCAL = 2;
+  AGG_MODE_GLOBAL = 3;
+  AGG_MODE_DISTINCT_GLOBAL = 4;
+  AGG_MODE_DISTINCT_LOCAL = 5;
+}
+
+// TopN execution phase. Mirrors src/sql/optimizer/operator.rs TopNPhase.
+enum TopNPhase {
+  TOPN_PHASE_UNSPECIFIED = 0;
+  TOPN_PHASE_PARTIAL = 1;
+  TOPN_PHASE_FINAL = 2;
+}
+
+// Set operation kind. Mirrors src/sql/planner/plan.rs PlanSetOpKind.
+enum PlanSetOpKind {
+  PLAN_SET_OP_KIND_UNSPECIFIED = 0;
+  PLAN_SET_OP_KIND_UNION_ALL = 1;
+  PLAN_SET_OP_KIND_UNION_DISTINCT = 2;
+  PLAN_SET_OP_KIND_INTERSECT = 3;
+  PLAN_SET_OP_KIND_EXCEPT = 4;
+}
+
+// Iceberg change-stream branch kind. Mirrors src/sql/common/change_stream.rs.
+enum ChangeStreamBranchKind {
+  CHANGE_STREAM_BRANCH_KIND_UNSPECIFIED = 0;
+  CHANGE_STREAM_BRANCH_KIND_DELETE_DV = 1;
+  CHANGE_STREAM_BRANCH_KIND_REUSE_DATA = 2;
+  CHANGE_STREAM_BRANCH_KIND_FRESH_DATA = 3;
+}
+
+// Hash partition source. Mirrors src/sql/optimizer/property.rs HashSource.
+enum HashSource {
+  HASH_SOURCE_UNSPECIFIED = 0;
+  HASH_SOURCE_SHUFFLE_AGG = 1;
+  HASH_SOURCE_SHUFFLE_JOIN = 2;
+}
