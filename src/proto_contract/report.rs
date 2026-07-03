@@ -1,6 +1,6 @@
 use prost::Message;
 
-use crate::proto::novarocks;
+use crate::proto::{common, novarocks};
 use crate::runtime::profile::RuntimeProfile;
 use crate::thrift::metrics;
 
@@ -152,4 +152,111 @@ fn runtime_profile_tree_survives_proto_roundtrip() {
         .expect("NetworkTime counter");
     assert_eq!(network_time.unit, novarocks::ProfileUnit::TimeMs as i32);
     assert_eq!(network_time.value, 9);
+}
+
+#[test]
+fn exec_status_report_survives_proto_roundtrip() {
+    let report = novarocks::ExecStatusReport {
+        query_id: Some(common::UniqueId { hi: 11, lo: 12 }),
+        fragment_instance_id: Some(common::UniqueId { hi: 21, lo: 22 }),
+        backend_num: 3,
+        status: Some(common::Status {
+            code: 0,
+            message: String::new(),
+        }),
+        done: true,
+        iceberg_commits: vec![novarocks::IcebergCommitInfo {
+            iceberg_data_file: Some(novarocks::IcebergDataFile {
+                path: Some("s3://warehouse/db/t/data-1.parquet".to_string()),
+                format: Some("parquet".to_string()),
+                record_count: Some(9),
+                file_size_in_bytes: Some(90),
+                partition_path: Some("region=us".to_string()),
+                split_offsets: Some(novarocks::Int64List { values: vec![4, 8] }),
+                column_stats: Some(novarocks::IcebergColumnStats {
+                    column_sizes: [(1, 100)].into_iter().collect(),
+                    value_counts: [(1, 9)].into_iter().collect(),
+                    null_value_counts: [(1, 0)].into_iter().collect(),
+                    nan_value_counts: [(1, 0)].into_iter().collect(),
+                    lower_bounds: [(1, vec![0x01])].into_iter().collect(),
+                    upper_bounds: [(1, vec![0x09])].into_iter().collect(),
+                }),
+                partition_null_fingerprint: Some("0".to_string()),
+                file_content: novarocks::IcebergFileContent::Data as i32,
+                referenced_data_file: Some("s3://warehouse/db/t/base.parquet".to_string()),
+                first_row_id: Some(77),
+                equality_ids: Some(novarocks::Int32List { values: vec![1, 2] }),
+                key_metadata: Some(vec![0xaa, 0xbb]),
+                partition_spec_id: Some(5),
+                partition_values_descriptor: Some(novarocks::IcebergPartitionDescriptor {
+                    values: vec![novarocks::IcebergPartitionValue {
+                        is_null: Some(false),
+                        datum_bytes: Some(b"us".to_vec()),
+                    }],
+                }),
+                content_offset: Some(128),
+                content_size_in_bytes: Some(256),
+                cardinality: Some(4),
+            }),
+            is_overwrite: Some(true),
+            is_rewrite: Some(false),
+        }],
+        loaded_rows: 9,
+        sink_load_bytes: 90,
+        filtered_rows: 1,
+        profile: Some(RuntimeProfile::new("FragmentRoot").to_proto()),
+    };
+
+    let decoded: novarocks::ExecStatusReport = roundtrip_message(&report);
+    assert_eq!(decoded.query_id.expect("query id").hi, 11);
+    assert_eq!(
+        decoded
+            .fragment_instance_id
+            .expect("fragment instance id")
+            .lo,
+        22
+    );
+    assert_eq!(decoded.backend_num, 3);
+    assert_eq!(decoded.status.expect("status").code, 0);
+    assert!(decoded.done);
+    assert_eq!(decoded.loaded_rows, 9);
+    assert_eq!(decoded.sink_load_bytes, 90);
+    assert_eq!(decoded.filtered_rows, 1);
+    assert!(decoded.profile.and_then(|tree| tree.root).is_some());
+
+    let commit = decoded.iceberg_commits.into_iter().next().expect("commit");
+    assert_eq!(commit.is_overwrite, Some(true));
+    assert_eq!(commit.is_rewrite, Some(false));
+    let data_file = commit.iceberg_data_file.expect("data file");
+    assert_eq!(
+        data_file.path.as_deref(),
+        Some("s3://warehouse/db/t/data-1.parquet")
+    );
+    assert_eq!(data_file.format.as_deref(), Some("parquet"));
+    assert_eq!(data_file.record_count, Some(9));
+    assert_eq!(data_file.file_size_in_bytes, Some(90));
+    assert_eq!(data_file.partition_spec_id, Some(5));
+    assert_eq!(
+        data_file.file_content,
+        novarocks::IcebergFileContent::Data as i32
+    );
+    assert_eq!(
+        data_file.split_offsets.expect("split offsets").values,
+        vec![4, 8]
+    );
+    assert_eq!(
+        data_file.equality_ids.expect("equality ids").values,
+        vec![1, 2]
+    );
+    assert_eq!(data_file.key_metadata, Some(vec![0xaa, 0xbb]));
+    assert_eq!(data_file.content_size_in_bytes, Some(256));
+    let stats = data_file.column_stats.expect("column stats");
+    assert_eq!(stats.column_sizes.get(&1), Some(&100));
+    assert_eq!(stats.lower_bounds.get(&1), Some(&vec![0x01]));
+    let partition = data_file
+        .partition_values_descriptor
+        .expect("partition descriptor");
+    assert_eq!(partition.values.len(), 1);
+    assert_eq!(partition.values[0].is_null, Some(false));
+    assert_eq!(partition.values[0].datum_bytes, Some(b"us".to_vec()));
 }

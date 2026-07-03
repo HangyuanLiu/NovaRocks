@@ -464,15 +464,12 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::novarocks::ReportExecStatusRequest>,
     ) -> Result<tonic::Response<proto::novarocks::ReportExecStatusResponse>, tonic::Status> {
-        let bytes = request.into_inner().report_exec_status_params_thrift;
+        let report = request.into_inner().report;
         let result = tokio::task::spawn_blocking(move || {
-            let params: crate::thrift::frontend_service::TReportExecStatusParams =
-                crate::common::thrift::thrift_binary_deserialize(&bytes).map_err(|e| {
-                    EngineError::protocol_decode(format!(
-                        "failed to deserialize TReportExecStatusParams thrift: {e}"
-                    ))
-                })?;
-            handle_standalone_report_exec_status(params)?;
+            let report = report.ok_or_else(|| {
+                EngineError::protocol_decode("ReportExecStatusRequest missing report")
+            })?;
+            handle_native_standalone_report_exec_status(report)?;
             Ok::<(), EngineError>(())
         })
         .await
@@ -503,16 +500,10 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         request: tonic::Request<proto::novarocks::BatchReportExecStatusRequest>,
     ) -> Result<tonic::Response<proto::novarocks::BatchReportExecStatusResponse>, tonic::Status>
     {
-        let payloads = request.into_inner().report_exec_status_params_thrift;
+        let reports = request.into_inner().reports;
         let result = tokio::task::spawn_blocking(move || {
-            for bytes in payloads {
-                let params: crate::thrift::frontend_service::TReportExecStatusParams =
-                    crate::common::thrift::thrift_binary_deserialize(&bytes).map_err(|e| {
-                        EngineError::protocol_decode(format!(
-                            "failed to deserialize TReportExecStatusParams thrift: {e}"
-                        ))
-                    })?;
-                handle_standalone_report_exec_status(params)?;
+            for report in reports {
+                handle_native_standalone_report_exec_status(report)?;
             }
             Ok::<(), EngineError>(())
         })
@@ -547,18 +538,19 @@ fn emit_grpc_typed_fetch_marker(status: i32) {
     }
 }
 
-fn handle_standalone_report_exec_status(
-    params: crate::thrift::frontend_service::TReportExecStatusParams,
+fn handle_native_standalone_report_exec_status(
+    report: proto::novarocks::ExecStatusReport,
 ) -> Result<(), EngineError> {
-    let failure = failed_query_from_report(&params).map_err(EngineError::protocol_decode)?;
+    let failure = failed_query_from_native_report(&report).map_err(EngineError::protocol_decode)?;
     let profile_report_accepted =
-        crate::runtime::coordinator::record_standalone_query_profile_report(&params)
+        crate::runtime::coordinator::record_native_standalone_query_profile_report(&report)
             .map_err(EngineError::protocol_decode)?;
-    match crate::runtime::write_coordinator::lookup_writer_report(&params)
+    match crate::runtime::write_coordinator::lookup_native_writer_report(&report)
         .map_err(EngineError::protocol_decode)?
     {
         crate::runtime::write_coordinator::WriterReportLookup::Expected => {
-            let result = crate::runtime::write_coordinator::handle_report_exec_status(params);
+            let result =
+                crate::runtime::write_coordinator::handle_native_report_exec_status(report);
             match result {
                 Ok(_) => Ok(()),
                 Err(err) => {
@@ -598,29 +590,28 @@ struct FailedQueryReport {
     error: String,
 }
 
-fn failed_query_from_report(
-    params: &crate::thrift::frontend_service::TReportExecStatusParams,
+fn failed_query_from_native_report(
+    report: &proto::novarocks::ExecStatusReport,
 ) -> Result<Option<FailedQueryReport>, String> {
-    let Some(status) = params.status.as_ref() else {
+    let Some(status) = report.status.as_ref() else {
         return Ok(None);
     };
-    if status.status_code == crate::thrift::status_code::TStatusCode::OK {
+    if status.code == 0 {
         return Ok(None);
     }
-    let query = params
+    let query = report
         .query_id
         .as_ref()
-        .ok_or_else(|| "TReportExecStatusParams missing query_id".to_string())?;
-    let finst = params
+        .ok_or_else(|| "ExecStatusReport missing query_id".to_string())?;
+    let finst = report
         .fragment_instance_id
         .as_ref()
-        .ok_or_else(|| "TReportExecStatusParams missing fragment_instance_id".to_string())?;
-    let error = status
-        .error_msgs
-        .as_ref()
-        .filter(|msgs| !msgs.is_empty())
-        .map(|msgs| msgs.join("; "))
-        .unwrap_or_else(|| format!("status={:?}", status.status_code));
+        .ok_or_else(|| "ExecStatusReport missing fragment_instance_id".to_string())?;
+    let error = if status.message.is_empty() {
+        format!("status={}", status.code)
+    } else {
+        status.message.clone()
+    };
     Ok(Some(FailedQueryReport {
         query_id: crate::runtime::query_context::QueryId {
             hi: query.hi,
@@ -1342,132 +1333,70 @@ mod tests {
 #[cfg(test)]
 mod pr3_tests {
     use super::GrpcService;
-    use super::proto::common::UniqueId as ProtoUniqueId;
+    use super::proto::common::{Status as ProtoStatus, UniqueId as ProtoUniqueId};
     use super::proto::novarocks::fetch_result_response::Status as FetchStatus;
     use super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
     use super::proto::novarocks::{
-        CancelFragmentRequest, FetchResultRequest, HeartbeatRequest, ReportExecStatusRequest,
+        CancelFragmentRequest, ExecStatusReport, FetchResultRequest, HeartbeatRequest,
+        IcebergCommitInfo, IcebergDataFile, IcebergFileContent, ReportExecStatusRequest,
         SubmitFragmentRequest,
     };
-    use crate::common::thrift::thrift_binary_serialize;
-    use crate::thrift::{frontend_service, status, status_code, types};
+    use crate::thrift::types;
     use tonic::Request;
 
-    fn ok_report_params(
-        query: types::TUniqueId,
-        finst: types::TUniqueId,
-    ) -> frontend_service::TReportExecStatusParams {
-        frontend_service::TReportExecStatusParams::new(
-            frontend_service::FrontendServiceVersion::V1,
-            Some(query),
-            Some(0),
-            Some(finst),
-            Some(status::TStatus::new(status_code::TStatusCode::OK, None)),
-            Some(true),
-            None,
-            Option::<Vec<String>>::None,
-            Option::<Vec<String>>::None,
-            None,
-            None,
-            Option::<Vec<String>>::None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+    fn ok_report(query: types::TUniqueId, finst: types::TUniqueId) -> ExecStatusReport {
+        ExecStatusReport {
+            query_id: Some(ProtoUniqueId {
+                hi: query.hi,
+                lo: query.lo,
+            }),
+            fragment_instance_id: Some(ProtoUniqueId {
+                hi: finst.hi,
+                lo: finst.lo,
+            }),
+            backend_num: 0,
+            status: Some(ProtoStatus {
+                code: 0,
+                message: String::new(),
+            }),
+            done: true,
+            iceberg_commits: Vec::new(),
+            loaded_rows: 0,
+            sink_load_bytes: 0,
+            filtered_rows: 0,
+            profile: None,
+        }
     }
 
-    fn write_report_params(
-        query: types::TUniqueId,
-        finst: types::TUniqueId,
-    ) -> frontend_service::TReportExecStatusParams {
-        frontend_service::TReportExecStatusParams::new(
-            frontend_service::FrontendServiceVersion::V1,
-            Some(query),
-            Some(0),
-            Some(finst),
-            Some(status::TStatus::new(status_code::TStatusCode::OK, None)),
-            Some(true),
-            None,
-            Option::<Vec<String>>::None,
-            Option::<Vec<String>>::None,
-            None,
-            None,
-            Option::<Vec<String>>::None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(vec![types::TSinkCommitInfo {
-                iceberg_data_file: Some(types::TIcebergDataFile {
-                    path: Some("s3://w/grpc-query-gone.parquet".to_string()),
-                    record_count: Some(1),
-                    file_size_in_bytes: Some(1),
-                    ..Default::default()
-                }),
+    fn write_report(query: types::TUniqueId, finst: types::TUniqueId) -> ExecStatusReport {
+        let mut report = ok_report(query, finst);
+        report.iceberg_commits = vec![IcebergCommitInfo {
+            iceberg_data_file: Some(IcebergDataFile {
+                path: Some("s3://w/grpc-query-gone.parquet".to_string()),
+                format: Some("parquet".to_string()),
+                record_count: Some(1),
+                file_size_in_bytes: Some(1),
+                partition_spec_id: Some(0),
+                file_content: IcebergFileContent::Data as i32,
                 ..Default::default()
-            }]),
-            None,
-            None,
-            None,
-        )
+            }),
+            is_overwrite: None,
+            is_rewrite: None,
+        }];
+        report
     }
 
-    fn error_report_params(
+    fn error_report(
         query: types::TUniqueId,
         finst: types::TUniqueId,
         message: &str,
-    ) -> frontend_service::TReportExecStatusParams {
-        frontend_service::TReportExecStatusParams::new(
-            frontend_service::FrontendServiceVersion::V1,
-            Some(query),
-            Some(0),
-            Some(finst),
-            Some(status::TStatus::new(
-                status_code::TStatusCode::INTERNAL_ERROR,
-                Some(vec![message.to_string()]),
-            )),
-            Some(true),
-            None,
-            Option::<Vec<String>>::None,
-            Option::<Vec<String>>::None,
-            None,
-            None,
-            Option::<Vec<String>>::None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+    ) -> ExecStatusReport {
+        let mut report = ok_report(query, finst);
+        report.status = Some(ProtoStatus {
+            code: crate::thrift::status_code::TStatusCode::INTERNAL_ERROR.0,
+            message: message.to_string(),
+        });
+        report
     }
 
     #[tokio::test]
@@ -1591,11 +1520,9 @@ mod pr3_tests {
     }
 
     #[tokio::test]
-    async fn report_exec_status_bad_thrift_returns_business_error() {
+    async fn report_exec_status_missing_report_returns_business_error() {
         let svc = GrpcService::default();
-        let req = Request::new(ReportExecStatusRequest {
-            report_exec_status_params_thrift: vec![0xff, 0xff, 0xff],
-        });
+        let req = Request::new(ReportExecStatusRequest { report: None });
         let resp = svc
             .report_exec_status(req)
             .await
@@ -1603,15 +1530,13 @@ mod pr3_tests {
         let body = resp.into_inner();
         assert_ne!(body.status_code, 0);
         assert_eq!(body.error_code, "ProtocolDecodeError");
-        assert!(body.message.contains("deserialize") || body.message.contains("thrift"));
+        assert!(body.message.contains("missing report"), "{}", body.message);
     }
 
     #[tokio::test]
-    async fn report_only_report_exec_status_bad_thrift_reaches_report_handler() {
+    async fn report_only_report_exec_status_missing_report_reaches_report_handler() {
         let svc = GrpcService::report_only();
-        let req = Request::new(ReportExecStatusRequest {
-            report_exec_status_params_thrift: vec![0xff, 0xff, 0xff],
-        });
+        let req = Request::new(ReportExecStatusRequest { report: None });
         let resp = svc
             .report_exec_status(req)
             .await
@@ -1619,7 +1544,7 @@ mod pr3_tests {
         let body = resp.into_inner();
         assert_ne!(body.status_code, 0);
         assert_eq!(body.error_code, "ProtocolDecodeError");
-        assert!(body.message.contains("deserialize") || body.message.contains("thrift"));
+        assert!(body.message.contains("missing report"), "{}", body.message);
     }
 
     #[tokio::test]
@@ -1637,11 +1562,10 @@ mod pr3_tests {
                 }],
             )
             .expect("register write coordinator");
-        let bytes = thrift_binary_serialize(&ok_report_params(query, finst))
-            .expect("serialize report params");
+        let report = ok_report(query, finst);
         let svc = GrpcService::default();
         let req = Request::new(ReportExecStatusRequest {
-            report_exec_status_params_thrift: bytes,
+            report: Some(report),
         });
         let resp = svc
             .report_exec_status(req)
@@ -1668,11 +1592,10 @@ mod pr3_tests {
                 }],
             )
             .expect("register write coordinator");
-        let bytes = thrift_binary_serialize(&ok_report_params(query.clone(), ordinary_finst))
-            .expect("serialize ordinary report params");
+        let report = ok_report(query.clone(), ordinary_finst);
         let svc = GrpcService::default();
         let req = Request::new(ReportExecStatusRequest {
-            report_exec_status_params_thrift: bytes,
+            report: Some(report),
         });
         let resp = svc
             .report_exec_status(req)
@@ -1686,10 +1609,8 @@ mod pr3_tests {
             "ordinary OK fragment reports must not fail the write coordinator"
         );
 
-        let bytes = thrift_binary_serialize(&ok_report_params(query, writer_finst))
-            .expect("serialize writer report params");
         let req = Request::new(ReportExecStatusRequest {
-            report_exec_status_params_thrift: bytes,
+            report: Some(ok_report(query, writer_finst)),
         });
         let resp = svc
             .report_exec_status(req)
@@ -1722,11 +1643,10 @@ mod pr3_tests {
             )
             .expect("register write coordinator");
         let message = "remote non-writer fragment failed";
-        let bytes = thrift_binary_serialize(&error_report_params(query, ordinary_finst, message))
-            .expect("serialize ordinary error report params");
+        let report = error_report(query, ordinary_finst, message);
         let svc = GrpcService::default();
         let req = Request::new(ReportExecStatusRequest {
-            report_exec_status_params_thrift: bytes,
+            report: Some(report),
         });
         let resp = svc
             .report_exec_status(req)
@@ -1748,11 +1668,10 @@ mod pr3_tests {
         let _guard = crate::runtime::write_coordinator::write_registry_test_guard();
         let query = types::TUniqueId::new(801, 901);
         let finst = types::TUniqueId::new(802, 902);
-        let bytes = thrift_binary_serialize(&write_report_params(query, finst))
-            .expect("serialize report params");
+        let report = write_report(query, finst);
         let svc = GrpcService::default();
         let req = Request::new(ReportExecStatusRequest {
-            report_exec_status_params_thrift: bytes,
+            report: Some(report),
         });
 
         let resp = svc
@@ -1793,11 +1712,10 @@ mod pr3_tests {
         result_buffer::create_sender(finst_id);
         query_context_manager().register_finst(finst_id, query_id);
 
-        let bytes = thrift_binary_serialize(&error_report_params(query, finst, message))
-            .expect("serialize report params");
+        let report = error_report(query, finst, message);
         let svc = GrpcService::default();
         let req = Request::new(ReportExecStatusRequest {
-            report_exec_status_params_thrift: bytes,
+            report: Some(report),
         });
         let resp = svc
             .report_exec_status(req)

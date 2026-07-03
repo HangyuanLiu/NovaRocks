@@ -20,12 +20,11 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::common::config;
 use crate::common::types::UniqueId;
-use crate::common::{config, thrift::thrift_binary_serialize};
 use crate::novarocks_logging::{error, warn};
 use crate::runtime::query_context::QueryId;
 use crate::service::grpc_client::{NovaRocksGrpcRemoteClient, proto};
-use crate::thrift::frontend_service;
 use crate::thrift::types;
 
 const NORMAL_REPORT_QUEUE_LIMIT: usize = 1_000;
@@ -35,7 +34,7 @@ pub(crate) struct StandaloneExecStateReportTask {
     pub(crate) finst_id: UniqueId,
     pub(crate) query_id: QueryId,
     pub(crate) coord: types::TNetworkAddress,
-    pub(crate) params: frontend_service::TReportExecStatusParams,
+    pub(crate) report: proto::novarocks::ExecStatusReport,
 }
 
 #[derive(Clone, Copy)]
@@ -196,10 +195,9 @@ fn run_priority_worker(reporter: &'static StandaloneExecStateReporter) {
 
 fn send_once(task: &StandaloneExecStateReportTask) -> Result<(), String> {
     let addr = standalone_report_socket_addr(&task.coord)?;
-    let bytes = thrift_binary_serialize(&task.params)?;
     let client = NovaRocksGrpcRemoteClient::connect_blocking(addr)?;
     let resp = client.blocking_report_exec_status(proto::novarocks::ReportExecStatusRequest {
-        report_exec_status_params_thrift: bytes,
+        report: Some(task.report.clone()),
     })?;
     interpret_report_exec_status_response(resp)
 }
@@ -528,38 +526,21 @@ mod tests {
             finst_id: UniqueId { hi: 301, lo: 401 },
             query_id: QueryId { hi: 501, lo: 601 },
             coord: types::TNetworkAddress::new("127.0.0.1".to_string(), 18040),
-            params: frontend_service::TReportExecStatusParams::new(
-                frontend_service::FrontendServiceVersion::V1,
-                Some(types::TUniqueId::new(501, 601)),
-                Some(0),
-                Some(types::TUniqueId::new(301, 401)),
-                Some(crate::thrift::status::TStatus::new(
-                    crate::thrift::status_code::TStatusCode::OK,
-                    None,
-                )),
-                Some(true),
-                None,
-                Option::<Vec<String>>::None,
-                Option::<Vec<String>>::None,
-                None,
-                None,
-                Option::<Vec<String>>::None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
+            report: proto::novarocks::ExecStatusReport {
+                query_id: Some(proto::common::UniqueId { hi: 501, lo: 601 }),
+                fragment_instance_id: Some(proto::common::UniqueId { hi: 301, lo: 401 }),
+                backend_num: 0,
+                status: Some(proto::common::Status {
+                    code: 0,
+                    message: String::new(),
+                }),
+                done: true,
+                iceberg_commits: Vec::new(),
+                loaded_rows: 0,
+                sink_load_bytes: 0,
+                filtered_rows: 0,
+                profile: None,
+            },
         }
     }
 }

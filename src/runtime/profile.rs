@@ -586,6 +586,94 @@ fn unit_to_proto(unit: metrics::TUnit) -> novarocks::ProfileUnit {
     }
 }
 
+pub(crate) fn native_profile_tree_to_thrift(
+    tree: &novarocks::RuntimeProfileTree,
+) -> Result<runtime_profile::TRuntimeProfileTree, String> {
+    let root = tree
+        .root
+        .as_ref()
+        .ok_or_else(|| "RuntimeProfileTree missing root".to_string())?;
+    let mut nodes = Vec::new();
+    native_profile_node_to_thrift(root, &mut nodes)?;
+    Ok(runtime_profile::TRuntimeProfileTree::new(nodes))
+}
+
+fn native_profile_node_to_thrift(
+    node: &novarocks::ProfileNode,
+    out: &mut Vec<runtime_profile::TRuntimeProfileNode>,
+) -> Result<(), String> {
+    let mut counters = node
+        .counters
+        .iter()
+        .map(native_counter_to_thrift)
+        .collect::<Result<Vec<_>, _>>()?;
+    counters.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut child_counters_map = BTreeMap::<String, BTreeSet<String>>::new();
+    for counter in &node.counters {
+        child_counters_map
+            .entry(counter.parent_name.clone())
+            .or_default()
+            .insert(counter.name.clone());
+    }
+
+    let info_strings = node
+        .info_strings
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let info_strings_display_order = info_strings.keys().cloned().collect::<Vec<_>>();
+
+    out.push(runtime_profile::TRuntimeProfileNode::new(
+        node.name.clone(),
+        node.children.len() as i32,
+        counters,
+        i64::from(node.node_id),
+        false,
+        info_strings,
+        info_strings_display_order,
+        child_counters_map,
+        None,
+    ));
+
+    for child in &node.children {
+        native_profile_node_to_thrift(child, out)?;
+    }
+    Ok(())
+}
+
+fn native_counter_to_thrift(
+    counter: &novarocks::Counter,
+) -> Result<runtime_profile::TCounter, String> {
+    let unit = unit_from_proto(counter.unit)?;
+    Ok(runtime_profile::TCounter::new(
+        counter.name.clone(),
+        unit,
+        counter.value,
+        Some(default_counter_strategy(unit)),
+        counter.min_value,
+        counter.max_value,
+    ))
+}
+
+fn unit_from_proto(unit: i32) -> Result<metrics::TUnit, String> {
+    match novarocks::ProfileUnit::try_from(unit) {
+        Ok(novarocks::ProfileUnit::Unit) => Ok(metrics::TUnit::UNIT),
+        Ok(novarocks::ProfileUnit::CpuTicks) => Ok(metrics::TUnit::CPU_TICKS),
+        Ok(novarocks::ProfileUnit::Bytes) => Ok(metrics::TUnit::BYTES),
+        Ok(novarocks::ProfileUnit::TimeNs) => Ok(metrics::TUnit::TIME_NS),
+        Ok(novarocks::ProfileUnit::TimeMs) => Ok(metrics::TUnit::TIME_MS),
+        Ok(novarocks::ProfileUnit::TimeS) => Ok(metrics::TUnit::TIME_S),
+        Ok(novarocks::ProfileUnit::None) => Ok(metrics::TUnit::NONE),
+        Ok(novarocks::ProfileUnit::Unspecified) => {
+            Err("ProfileUnit is unspecified in native runtime profile".to_string())
+        }
+        Err(_) => Err(format!(
+            "unknown ProfileUnit value {unit} in native runtime profile"
+        )),
+    }
+}
+
 pub type CounterRef = Arc<Counter>;
 
 #[derive(Debug)]
@@ -770,7 +858,8 @@ fn merge_counter_values(
 
 #[cfg(test)]
 mod tests {
-    use super::{ROOT_COUNTER, RuntimeProfile};
+    use super::{ROOT_COUNTER, RuntimeProfile, native_profile_tree_to_thrift};
+    use crate::proto::novarocks;
     use crate::thrift::metrics;
 
     #[test]
@@ -824,5 +913,80 @@ mod tests {
             .get("IOTaskExecTime")
             .expect("IOTaskExecTime children");
         assert!(io_children.contains("OpenFile"));
+    }
+
+    #[test]
+    fn native_profile_tree_to_thrift_reconstructs_flat_tree() {
+        let native = novarocks::RuntimeProfileTree {
+            root: Some(novarocks::ProfileNode {
+                name: "Root".to_string(),
+                node_id: 10,
+                counters: vec![
+                    novarocks::Counter {
+                        name: "TotalTime".to_string(),
+                        parent_name: String::new(),
+                        unit: novarocks::ProfileUnit::TimeNs as i32,
+                        value: 100,
+                        min_value: Some(90),
+                        max_value: Some(110),
+                    },
+                    novarocks::Counter {
+                        name: "ScanTime".to_string(),
+                        parent_name: "TotalTime".to_string(),
+                        unit: novarocks::ProfileUnit::TimeNs as i32,
+                        value: 70,
+                        min_value: None,
+                        max_value: None,
+                    },
+                ],
+                info_strings: [
+                    ("z_key".to_string(), "last".to_string()),
+                    ("a_key".to_string(), "first".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                children: vec![novarocks::ProfileNode {
+                    name: "Child".to_string(),
+                    node_id: 20,
+                    counters: vec![novarocks::Counter {
+                        name: "RowsRead".to_string(),
+                        parent_name: String::new(),
+                        unit: novarocks::ProfileUnit::Unit as i32,
+                        value: 9,
+                        min_value: None,
+                        max_value: None,
+                    }],
+                    info_strings: Default::default(),
+                    children: vec![],
+                }],
+            }),
+        };
+
+        let thrift = native_profile_tree_to_thrift(&native).expect("native profile decode");
+
+        assert_eq!(thrift.nodes.len(), 2);
+        assert_eq!(thrift.nodes[0].name, "Root");
+        assert_eq!(thrift.nodes[0].num_children, 1);
+        assert_eq!(thrift.nodes[0].metadata, 10);
+        assert_eq!(
+            thrift.nodes[0].info_strings_display_order,
+            vec!["a_key".to_string(), "z_key".to_string()]
+        );
+        assert_eq!(
+            thrift.nodes[0]
+                .child_counters_map
+                .get(ROOT_COUNTER)
+                .expect("root counters"),
+            &["TotalTime".to_string()].into_iter().collect()
+        );
+        assert_eq!(
+            thrift.nodes[0]
+                .child_counters_map
+                .get("TotalTime")
+                .expect("child counters"),
+            &["ScanTime".to_string()].into_iter().collect()
+        );
+        assert_eq!(thrift.nodes[1].name, "Child");
+        assert_eq!(thrift.nodes[1].metadata, 20);
     }
 }

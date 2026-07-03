@@ -220,28 +220,29 @@ pub(crate) fn report_fragment_done(
         }
         None => status::TStatus::new(status_code::TStatusCode::OK, None),
     };
-    let profile = build_profile_tree(
-        instance.query_id,
-        instance.enable_profile,
-        instance.profiler.as_ref(),
-        instance.mem_tracker.as_ref(),
-        instance.query_mem_tracker.as_ref(),
-        include_runtime_filters,
-    );
-    let load_datacache_metrics = build_load_datacache_metrics(profile.as_ref());
-    let params = exec_status_report::build_report_params(ExecStatusReportInput {
-        finst_id,
-        query_id: instance.query_id,
-        backend_num: instance.backend_num,
-        status,
-        profile,
-        done: true,
-        tracking_url: build_tracking_url(instance.query_id),
-        load_channel_profile: None,
-        load_datacache_metrics,
-    });
     match instance.destination {
         ReportDestination::StarRocksFrontend(coord) => {
+            let profile = build_profile_tree(
+                instance.query_id,
+                instance.enable_profile,
+                instance.profiler.as_ref(),
+                instance.mem_tracker.as_ref(),
+                instance.query_mem_tracker.as_ref(),
+                include_runtime_filters,
+            );
+            let load_datacache_metrics = build_load_datacache_metrics(profile.as_ref());
+            let params = exec_status_report::build_report_params(ExecStatusReportInput {
+                finst_id,
+                query_id: instance.query_id,
+                backend_num: instance.backend_num,
+                status,
+                profile,
+                done: true,
+                tracking_url: build_tracking_url(instance.query_id),
+                load_channel_profile: None,
+                load_datacache_metrics,
+                native_profile: None,
+            });
             enqueue_final_report(ExecStateReportTask {
                 finst_id,
                 query_id: instance.query_id,
@@ -250,11 +251,31 @@ pub(crate) fn report_fragment_done(
             });
         }
         ReportDestination::NovaRocksCoordinator(coord) => {
+            let native_profile = build_native_profile_tree(
+                instance.query_id,
+                instance.enable_profile,
+                instance.profiler.as_ref(),
+                instance.mem_tracker.as_ref(),
+                instance.query_mem_tracker.as_ref(),
+                include_runtime_filters,
+            );
+            let report = exec_status_report::build_native_report(ExecStatusReportInput {
+                finst_id,
+                query_id: instance.query_id,
+                backend_num: instance.backend_num,
+                status,
+                profile: None,
+                done: true,
+                tracking_url: None,
+                load_channel_profile: None,
+                load_datacache_metrics: None,
+                native_profile,
+            });
             enqueue_standalone_final_report(StandaloneExecStateReportTask {
                 finst_id,
                 query_id: instance.query_id,
                 coord,
-                params,
+                report,
             });
         }
     }
@@ -284,28 +305,29 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
         return;
     }
     let status = status::TStatus::new(status_code::TStatusCode::OK, None);
-    let profile = build_profile_tree(
-        instance.query_id,
-        instance.enable_profile,
-        instance.profiler.as_ref(),
-        instance.mem_tracker.as_ref(),
-        instance.query_mem_tracker.as_ref(),
-        false,
-    );
-    let load_datacache_metrics = build_load_datacache_metrics(profile.as_ref());
-    let params = exec_status_report::build_report_params(ExecStatusReportInput {
-        finst_id,
-        query_id: instance.query_id,
-        backend_num: instance.backend_num,
-        status,
-        profile,
-        done: false,
-        tracking_url: build_tracking_url(instance.query_id),
-        load_channel_profile: None,
-        load_datacache_metrics,
-    });
     let enqueue_result = match instance.destination {
         ReportDestination::StarRocksFrontend(coord) => {
+            let profile = build_profile_tree(
+                instance.query_id,
+                instance.enable_profile,
+                instance.profiler.as_ref(),
+                instance.mem_tracker.as_ref(),
+                instance.query_mem_tracker.as_ref(),
+                false,
+            );
+            let load_datacache_metrics = build_load_datacache_metrics(profile.as_ref());
+            let params = exec_status_report::build_report_params(ExecStatusReportInput {
+                finst_id,
+                query_id: instance.query_id,
+                backend_num: instance.backend_num,
+                status,
+                profile,
+                done: false,
+                tracking_url: build_tracking_url(instance.query_id),
+                load_channel_profile: None,
+                load_datacache_metrics,
+                native_profile: None,
+            });
             enqueue_non_final_report(ExecStateReportTask {
                 finst_id,
                 query_id: instance.query_id,
@@ -314,11 +336,31 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
             })
         }
         ReportDestination::NovaRocksCoordinator(coord) => {
+            let native_profile = build_native_profile_tree(
+                instance.query_id,
+                instance.enable_profile,
+                instance.profiler.as_ref(),
+                instance.mem_tracker.as_ref(),
+                instance.query_mem_tracker.as_ref(),
+                false,
+            );
+            let report = exec_status_report::build_native_report(ExecStatusReportInput {
+                finst_id,
+                query_id: instance.query_id,
+                backend_num: instance.backend_num,
+                status,
+                profile: None,
+                done: false,
+                tracking_url: None,
+                load_channel_profile: None,
+                load_datacache_metrics: None,
+                native_profile,
+            });
             enqueue_standalone_non_final_report(StandaloneExecStateReportTask {
                 finst_id,
                 query_id: instance.query_id,
                 coord,
-                params,
+                report,
             })
         }
     };
@@ -871,6 +913,7 @@ mod tests {
         test_reset_report_registry,
     };
     use crate::common::types::UniqueId;
+    use crate::proto::novarocks;
     use crate::runtime::load_tracking;
     use crate::runtime::profile::Profiler;
     use crate::runtime::query_context::QueryId;
@@ -939,10 +982,7 @@ mod tests {
         ReportHookGuard
     }
 
-    type CapturedReport = Option<(
-        types::TNetworkAddress,
-        frontend_service::TReportExecStatusParams,
-    )>;
+    type CapturedReport = Option<(types::TNetworkAddress, novarocks::ExecStatusReport)>;
 
     fn capture_standalone_final_report(captured: Arc<Mutex<CapturedReport>>) -> ReportHookGuard {
         super::test_set_final_report_hook(Some(Box::new(|_| {
@@ -950,7 +990,7 @@ mod tests {
         })));
         super::test_set_standalone_final_report_hook(Some(Box::new(move |task| {
             *captured.lock().expect("capture standalone final report") =
-                Some((task.coord.clone(), task.params.clone()));
+                Some((task.coord.clone(), task.report.clone()));
         })));
         ReportHookGuard
     }
@@ -965,7 +1005,7 @@ mod tests {
             *captured
                 .lock()
                 .expect("capture standalone non-final report") =
-                Some((task.coord.clone(), task.params.clone()));
+                Some((task.coord.clone(), task.report.clone()));
         })));
         ReportHookGuard
     }
@@ -1016,17 +1056,17 @@ mod tests {
 
         report_fragment_done(finst_id, None, false);
 
-        let (coord, params) = captured
+        let (coord, report) = captured
             .lock()
             .expect("inspect standalone final report")
             .clone()
             .expect("standalone final report was captured");
         assert_eq!(coord, report_addr);
-        assert_eq!(params.done, Some(true));
-        assert_eq!(params.backend_num, Some(3));
+        assert!(report.done);
+        assert_eq!(report.backend_num, 3);
         assert_eq!(
-            params.fragment_instance_id,
-            Some(types::TUniqueId::new(71, 72))
+            report.fragment_instance_id,
+            Some(crate::proto::common::UniqueId { hi: 71, lo: 72 })
         );
         test_reset_report_registry();
     }
@@ -1047,17 +1087,17 @@ mod tests {
 
         report_exec_state(finst_id);
 
-        let (coord, params) = captured
+        let (coord, report) = captured
             .lock()
             .expect("inspect standalone non-final report")
             .clone()
             .expect("standalone non-final report was captured");
         assert_eq!(coord, report_addr);
-        assert_eq!(params.done, Some(false));
-        assert_eq!(params.backend_num, Some(4));
+        assert!(!report.done);
+        assert_eq!(report.backend_num, 4);
         assert_eq!(
-            params.fragment_instance_id,
-            Some(types::TUniqueId::new(73, 74))
+            report.fragment_instance_id,
+            Some(crate::proto::common::UniqueId { hi: 73, lo: 74 })
         );
         test_reset_report_registry();
     }
@@ -1079,14 +1119,14 @@ mod tests {
 
         report_fragment_done(finst_id, None, false);
 
-        let (coord, params) = captured
+        let (coord, report) = captured
             .lock()
             .expect("inspect standalone final report")
             .clone()
             .expect("standalone final report was captured");
         assert_eq!(coord, report_addr);
-        assert_eq!(params.done, Some(true));
-        assert_eq!(params.backend_num, Some(5));
+        assert!(report.done);
+        assert_eq!(report.backend_num, 5);
         test_reset_report_registry();
     }
 

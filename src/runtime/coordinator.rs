@@ -1402,6 +1402,33 @@ pub(crate) fn record_standalone_query_profile_report(
     Ok(true)
 }
 
+pub(crate) fn record_native_standalone_query_profile_report(
+    report: &crate::proto::novarocks::ExecStatusReport,
+) -> Result<bool, String> {
+    let Some(query_id) = report.query_id.as_ref() else {
+        return Ok(false);
+    };
+    let key = (query_id.hi, query_id.lo);
+    let mut guard = standalone_query_profiles()
+        .lock()
+        .expect("standalone query profile registry lock");
+    if !guard.active.contains(&key) {
+        return Ok(false);
+    }
+
+    let Some(status) = report.status.as_ref() else {
+        return Err("ExecStatusReport missing status".to_string());
+    };
+    if report.done
+        && status.code == 0
+        && let Some(profile) = report.profile.as_ref()
+    {
+        let thrift = crate::runtime::profile::native_profile_tree_to_thrift(profile)?;
+        guard.profiles.entry(key).or_default().push(thrift);
+    }
+    Ok(true)
+}
+
 fn standalone_query_profile_count(query_id: &types::TUniqueId) -> usize {
     standalone_query_profiles()
         .lock()

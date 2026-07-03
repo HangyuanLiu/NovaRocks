@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::common::engine_error::EngineError;
+use crate::proto::{common, novarocks};
+use crate::runtime::sink_commit_wire;
 use crate::thrift::{frontend_service, status, status_code, types};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -361,6 +363,60 @@ pub(crate) fn report_from_thrift(
     })
 }
 
+pub(crate) fn report_from_native(
+    report: novarocks::ExecStatusReport,
+) -> Result<FragmentExecStatusReport, String> {
+    let query_id = unique_id_from_native(report.query_id, "ExecStatusReport missing query_id")?;
+    let fragment_instance_id = unique_id_from_native(
+        report.fragment_instance_id,
+        "ExecStatusReport missing fragment_instance_id",
+    )?;
+    let status = status_from_native(report.status)?;
+    let sink_commit_infos = report
+        .iceberg_commits
+        .into_iter()
+        .map(sink_commit_wire::sink_commit_info_from_native)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(FragmentExecStatusReport {
+        query_id,
+        fragment_instance_id,
+        backend_num: report.backend_num,
+        done: report.done,
+        status,
+        sink_commit_infos,
+        tablet_commit_infos: Vec::new(),
+        tablet_fail_infos: Vec::new(),
+        load_counters: BTreeMap::new(),
+        loaded_rows: report.loaded_rows,
+        loaded_bytes: report.sink_load_bytes,
+        filtered_rows: report.filtered_rows,
+    })
+}
+
+fn unique_id_from_native(
+    id: Option<common::UniqueId>,
+    missing_message: &'static str,
+) -> Result<types::TUniqueId, String> {
+    let id = id.ok_or_else(|| missing_message.to_string())?;
+    Ok(types::TUniqueId {
+        hi: id.hi,
+        lo: id.lo,
+    })
+}
+
+fn status_from_native(status: Option<common::Status>) -> Result<status::TStatus, String> {
+    let status = status.ok_or_else(|| "ExecStatusReport missing status".to_string())?;
+    let error_msgs = if status.message.is_empty() {
+        None
+    } else {
+        Some(vec![status.message])
+    };
+    Ok(status::TStatus::new(
+        status_code::TStatusCode(status.code),
+        error_msgs,
+    ))
+}
+
 fn status_message(status: &status::TStatus) -> String {
     status
         .error_msgs
@@ -474,6 +530,34 @@ pub(crate) fn handle_report_exec_status(
         })
 }
 
+pub(crate) fn handle_native_report_exec_status(
+    report: novarocks::ExecStatusReport,
+) -> Result<ReportOutcome, EngineError> {
+    let report = report_from_native(report).map_err(EngineError::protocol_decode)?;
+    apply_report_to_query_state(&report);
+
+    let coord = registry()
+        .queries
+        .lock()
+        .expect("write coordinator registry lock")
+        .get(&query_key(&report.query_id))
+        .cloned();
+
+    let Some(coord) = coord else {
+        if report_has_write_metadata(&report) {
+            return Err(EngineError::write_coordinator_gone(report.query_id.clone()));
+        }
+        return Ok(ReportOutcome::Accepted);
+    };
+    coord
+        .lock()
+        .expect("write coordinator lock")
+        .apply_report(report)
+        .map_err(|message| {
+            EngineError::distributed_write_output_mismatch("reportExecStatus", message)
+        })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum WriterReportLookup {
     Expected,
@@ -481,26 +565,19 @@ pub(crate) enum WriterReportLookup {
     UnknownQuery { query_id: types::TUniqueId },
 }
 
-pub(crate) fn lookup_writer_report(
-    params: &frontend_service::TReportExecStatusParams,
+pub(crate) fn lookup_native_writer_report(
+    report: &novarocks::ExecStatusReport,
 ) -> Result<WriterReportLookup, String> {
-    let query_id = params
-        .query_id
-        .as_ref()
-        .ok_or_else(|| "TReportExecStatusParams missing query_id".to_string())?
-        .clone();
-    let fragment_instance_id = params
-        .fragment_instance_id
-        .as_ref()
-        .ok_or_else(|| "TReportExecStatusParams missing fragment_instance_id".to_string())?
-        .clone();
-    let backend_num = params
-        .backend_num
-        .ok_or_else(|| "TReportExecStatusParams missing backend_num".to_string())?;
+    let query_id =
+        unique_id_from_native(report.query_id.clone(), "ExecStatusReport missing query_id")?;
+    let fragment_instance_id = unique_id_from_native(
+        report.fragment_instance_id.clone(),
+        "ExecStatusReport missing fragment_instance_id",
+    )?;
     let key = WriterKey {
         query_id: query_id.clone(),
         fragment_instance_id,
-        backend_num,
+        backend_num: report.backend_num,
     };
     let coord = registry()
         .queries
@@ -707,6 +784,61 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn native_report(writer: &WriterKey) -> novarocks::ExecStatusReport {
+        novarocks::ExecStatusReport {
+            query_id: Some(common::UniqueId {
+                hi: writer.query_id.hi,
+                lo: writer.query_id.lo,
+            }),
+            fragment_instance_id: Some(common::UniqueId {
+                hi: writer.fragment_instance_id.hi,
+                lo: writer.fragment_instance_id.lo,
+            }),
+            backend_num: writer.backend_num,
+            status: Some(common::Status {
+                code: status_code::TStatusCode::OK.0,
+                message: String::new(),
+            }),
+            done: true,
+            iceberg_commits: vec![novarocks::IcebergCommitInfo {
+                iceberg_data_file: Some(novarocks::IcebergDataFile {
+                    path: Some("s3://w/native.parquet".to_string()),
+                    format: Some("parquet".to_string()),
+                    record_count: Some(9),
+                    file_size_in_bytes: Some(90),
+                    partition_spec_id: Some(3),
+                    file_content: novarocks::IcebergFileContent::Data as i32,
+                    split_offsets: Some(novarocks::Int64List { values: vec![4, 8] }),
+                    column_stats: Some(novarocks::IcebergColumnStats {
+                        column_sizes: [(1, 100)].into_iter().collect(),
+                        value_counts: [(1, 9)].into_iter().collect(),
+                        null_value_counts: [(1, 0)].into_iter().collect(),
+                        nan_value_counts: [(1, 0)].into_iter().collect(),
+                        lower_bounds: [(1, vec![1])].into_iter().collect(),
+                        upper_bounds: [(1, vec![9])].into_iter().collect(),
+                    }),
+                    first_row_id: Some(17),
+                    equality_ids: Some(novarocks::Int32List { values: vec![1, 2] }),
+                    key_metadata: Some(vec![0xaa]),
+                    content_size_in_bytes: Some(256),
+                    partition_values_descriptor: Some(novarocks::IcebergPartitionDescriptor {
+                        values: vec![novarocks::IcebergPartitionValue {
+                            is_null: Some(false),
+                            datum_bytes: Some(b"us".to_vec()),
+                        }],
+                    }),
+                    ..Default::default()
+                }),
+                is_overwrite: Some(true),
+                is_rewrite: Some(false),
+            }],
+            loaded_rows: 9,
+            sink_load_bytes: 90,
+            filtered_rows: 1,
+            profile: None,
+        }
     }
 
     #[test]
@@ -1121,6 +1253,44 @@ mod tests {
         .expect_err("unregistered write-looking report must fail");
         assert_eq!(err.code(), EngineErrorCode::WriteCoordinatorGone);
         assert!(err.to_user_message().contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn report_from_native_preserves_iceberg_commit_metadata() {
+        let writer = key(25, 35, 126, 226, 2);
+
+        let report = report_from_native(native_report(&writer)).expect("native report");
+
+        assert_eq!(report.query_id, writer.query_id);
+        assert_eq!(report.fragment_instance_id, writer.fragment_instance_id);
+        assert_eq!(report.backend_num, 2);
+        assert!(report.done);
+        assert_eq!(report.loaded_rows, 9);
+        assert_eq!(report.loaded_bytes, 90);
+        assert_eq!(report.filtered_rows, 1);
+        assert!(report.tablet_commit_infos.is_empty());
+        assert!(report.tablet_fail_infos.is_empty());
+        assert!(report.load_counters.is_empty());
+        let commit = report.sink_commit_infos.first().expect("sink commit");
+        assert_eq!(commit.is_overwrite, Some(true));
+        assert_eq!(commit.is_rewrite, Some(false));
+        let data_file = commit
+            .iceberg_data_file
+            .as_ref()
+            .expect("iceberg data file");
+        assert_eq!(data_file.path.as_deref(), Some("s3://w/native.parquet"));
+        assert_eq!(data_file.format.as_deref(), Some("parquet"));
+        assert_eq!(data_file.split_offsets, Some(vec![4, 8]));
+        assert_eq!(data_file.equality_ids, Some(vec![1, 2]));
+        assert_eq!(data_file.content_size_in_bytes, Some(256));
+        assert_eq!(
+            data_file
+                .column_stats
+                .as_ref()
+                .and_then(|stats| stats.lower_bounds.as_ref())
+                .and_then(|bounds| bounds.get(&1)),
+            Some(&vec![1])
+        );
     }
 
     #[test]

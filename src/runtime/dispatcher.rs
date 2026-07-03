@@ -708,9 +708,7 @@ mod tests {
             NovaRocksGrpcRemoteClient::connect_blocking(addr).expect("construct grpc client");
 
         let resp = client
-            .blocking_report_exec_status(ReportExecStatusRequest {
-                report_exec_status_params_thrift: vec![0xff],
-            })
+            .blocking_report_exec_status(ReportExecStatusRequest { report: None })
             .expect("RPC level success");
 
         assert_ne!(resp.status_code, 0);
