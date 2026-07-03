@@ -17,13 +17,13 @@
 
 //! Proto node lowering placeholder.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, ArrayRef};
 use arrow::compute::concat;
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use super::expr::lower_proto_expr;
@@ -33,13 +33,20 @@ use super::layout::{
 };
 use crate::common::config::exchange_wait_ms;
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
+use crate::exec::node::aggregate::{AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode};
 use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
+use crate::exec::node::change_event_expand::{
+    ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
+};
 use crate::exec::node::exchange_source::ExchangeSourceNode;
 use crate::exec::node::filter::FilterNode;
+use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinRuntimeFilterSpec, JoinType};
 use crate::exec::node::limit::LimitNode;
+use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use crate::exec::node::project::ProjectNode;
+use crate::exec::node::repeat::RepeatNode;
 use crate::exec::node::set_op::{SetOpKind, SetOpNode};
 use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::union_all::UnionAllNode;
@@ -47,6 +54,9 @@ use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common, expr, plan};
 use crate::runtime::exchange::ExchangeKey;
+use crate::sql::codegen::expr_compiler::infer_agg_function_types;
+use crate::sql::common::ChangeStreamBranchKind;
+use crate::types::wider_type;
 
 #[derive(Clone, Debug)]
 pub(crate) struct LoweredNode {
@@ -140,19 +150,27 @@ fn lower_physical_node(
             lower_assert_one_row_node(node, assert, children)
         }
         plan::plan_node::Kind::Scan(_) => unsupported("Scan"),
-        plan::plan_node::Kind::HashAggregate(_) => unsupported("HashAggregate"),
-        plan::plan_node::Kind::HashJoin(_) => unsupported("HashJoin"),
-        plan::plan_node::Kind::NestLoopJoin(_) => unsupported("NestLoopJoin"),
+        plan::plan_node::Kind::HashAggregate(aggregate) => {
+            lower_hash_aggregate_node(node, physical, aggregate, children, arena)
+        }
+        plan::plan_node::Kind::HashJoin(join) => lower_hash_join_node(node, join, children, arena),
+        plan::plan_node::Kind::NestLoopJoin(join) => {
+            lower_nest_loop_join_node(node, join, children, arena)
+        }
         plan::plan_node::Kind::Window(_) => unsupported("Window"),
-        plan::plan_node::Kind::Repeat(_) => unsupported("Repeat"),
+        plan::plan_node::Kind::Repeat(repeat) => lower_repeat_node(node, repeat, children),
         plan::plan_node::Kind::GenerateSeries(_) => unsupported("GenerateSeries"),
         plan::plan_node::Kind::TableFunction(_) => unsupported("TableFunction"),
         plan::plan_node::Kind::Decode(_) => unsupported("Decode"),
-        plan::plan_node::Kind::ChangeEventExpand(_) => unsupported("ChangeEventExpand"),
+        plan::plan_node::Kind::ChangeEventExpand(expand) => {
+            lower_change_event_expand_node(node, physical, expand, children, arena)
+        }
         plan::plan_node::Kind::CteAnchor(_) => unsupported("CTEAnchor"),
         plan::plan_node::Kind::CteProduce(_) => unsupported("CTEProduce"),
         plan::plan_node::Kind::CteConsume(_) => unsupported("CTEConsume"),
-        plan::plan_node::Kind::Redistribute(_) => unsupported("Redistribute"),
+        plan::plan_node::Kind::Redistribute(redistribute) => {
+            lower_redistribute_node(physical, redistribute, children, arena)
+        }
     }
 }
 
@@ -473,6 +491,9 @@ fn lower_topn_node(
     arena: &mut ExprArena,
 ) -> Result<LoweredNode, String> {
     check_exact_arity("TopNNode", 1, children.len())?;
+    if topn.is_split {
+        return unsupported("TopNNode split");
+    }
     let child = children.pop().expect("child");
     let payload_limit = parse_optional_nonnegative_i64(topn.limit, "TopNNode.limit")?;
     let outer_limit = parse_distributed_limit(node.limit, "TopNNode DistributedNode.limit")?;
@@ -683,7 +704,13 @@ fn normalize_set_op_inputs(
     arena: &mut ExprArena,
 ) -> Result<Vec<ExecNode>, String> {
     if child_output_columns.is_empty() {
-        return Ok(children.into_iter().map(|child| child.node).collect());
+        return normalize_set_op_inputs_by_position(
+            node_id,
+            children,
+            output_columns,
+            output_schema,
+            arena,
+        );
     }
     if child_output_columns.len() != children.len() {
         return Err(format!(
@@ -748,8 +775,1213 @@ fn normalize_set_op_inputs(
         .collect()
 }
 
+fn normalize_set_op_inputs_by_position(
+    node_id: i32,
+    children: Vec<LoweredNode>,
+    output_columns: &[common::OutputColumn],
+    output_schema: ChunkSchemaRef,
+    arena: &mut ExprArena,
+) -> Result<Vec<ExecNode>, String> {
+    let output_slots = slot_ids_from_columns(output_columns)?;
+    let output_slot_schemas = slot_schemas_from_output_columns(output_columns)?;
+    children
+        .into_iter()
+        .enumerate()
+        .map(|(idx, child)| {
+            if child.layout.order().len() != output_slots.len() {
+                return Err(format!(
+                    "SetOpNode child {idx} width mismatch without child_output_columns: expected {}, got {}",
+                    output_slots.len(),
+                    child.layout.order().len()
+                ));
+            }
+            if child.layout.order() == output_slots.as_slice() {
+                return Ok(child.node);
+            }
+            let exprs = child
+                .layout
+                .order()
+                .iter()
+                .copied()
+                .map(|slot| {
+                    let data_type = child
+                        .output_schema
+                        .slot(slot)
+                        .ok_or_else(|| {
+                            format!(
+                                "SetOpNode child {idx} slot {} missing from child output schema",
+                                slot
+                            )
+                        })?
+                        .data_type()
+                        .clone();
+                    Ok(arena.push_typed(ExprNode::SlotId(slot), data_type))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(ExecNode {
+                kind: ExecNodeKind::Project(ProjectNode {
+                    input: Box::new(child.node),
+                    node_id,
+                    is_subordinate: true,
+                    exprs,
+                    expr_slot_ids: output_slots.clone(),
+                    expr_slot_schemas: Some(output_slot_schemas.clone()),
+                    output_indices: None,
+                    output_chunk_schema: output_schema.clone(),
+                }),
+            })
+        })
+        .collect()
+}
+
 fn slot_ids_from_columns(cols: &[common::OutputColumn]) -> Result<Vec<SlotId>, String> {
     Ok(layout_from_output_columns(cols)?.order().to_vec())
+}
+
+fn lower_hash_aggregate_node(
+    node: &plan::DistributedNode,
+    physical: &plan::PlanNode,
+    aggregate: &plan::HashAggregateNode,
+    mut children: Vec<LoweredNode>,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    check_exact_arity("HashAggregateNode", 1, children.len())?;
+    let child = children.pop().expect("child");
+    if aggregate.is_merge.len() != aggregate.aggregates.len() {
+        return Err(format!(
+            "HashAggregateNode is_merge length mismatch: is_merge={} aggregates={}",
+            aggregate.is_merge.len(),
+            aggregate.aggregates.len()
+        ));
+    }
+    let mode = plan::AggMode::try_from(aggregate.mode)
+        .map_err(|_| format!("HashAggregateNode unknown mode {}", aggregate.mode))?;
+    if mode == plan::AggMode::Unspecified {
+        return Err("HashAggregateNode mode is unspecified".to_string());
+    }
+    let output_columns = if aggregate.output_columns.is_empty() {
+        &physical.output_columns
+    } else {
+        &aggregate.output_columns
+    };
+    let layout = layout_from_output_columns(output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let output_layout = aggregate
+        .output_layout
+        .as_ref()
+        .ok_or_else(|| "HashAggregateNode output_layout missing".to_string())?;
+    if output_layout.aggregate_columns.len() != aggregate.aggregates.len() {
+        return Err(format!(
+            "HashAggregateNode output_layout aggregate column mismatch: columns={} aggregates={}",
+            output_layout.aggregate_columns.len(),
+            aggregate.aggregates.len()
+        ));
+    }
+    if output_layout.group_key_columns.len() != aggregate.group_by.len() {
+        return Err(format!(
+            "HashAggregateNode output_layout group key mismatch: columns={} group_by={}",
+            output_layout.group_key_columns.len(),
+            aggregate.group_by.len()
+        ));
+    }
+
+    let group_by = aggregate
+        .group_by
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            lower_proto_expr(expr, arena, &child.layout)
+                .map_err(|err| format!("HashAggregateNode group_by[{idx}]: {err}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for expr_id in &group_by {
+        if let Some(dt) = arena.data_type(*expr_id)
+            && matches!(dt, DataType::LargeBinary)
+        {
+            return Err("VARIANT is not supported in GROUP BY".to_string());
+        }
+    }
+
+    let mut functions = Vec::with_capacity(aggregate.aggregates.len());
+    for (idx, call) in aggregate.aggregates.iter().enumerate() {
+        let is_merge = aggregate.is_merge[idx];
+        let output_col = output_layout
+            .aggregate_columns
+            .get(idx)
+            .ok_or_else(|| format!("HashAggregateNode aggregate column {idx} missing"))?;
+        let result_type = call
+            .result_type
+            .as_ref()
+            .ok_or_else(|| format!("HashAggregateNode aggregate {idx} result_type missing"))
+            .and_then(super::decode_type)?;
+        let function_name = aggregate_function_name(call)?;
+        let signature_arg_types = aggregate_signature_arg_types(call)?;
+        let (_, intermediate_type) =
+            infer_agg_function_types(&function_name, &signature_arg_types, call.distinct).map_err(
+                |err| format!("HashAggregateNode aggregate {idx} type inference: {err}"),
+            )?;
+        let signature_input_arg_type = signature_arg_types.first().cloned();
+
+        let raw_args = if is_merge {
+            let slot = SlotId::new(output_col.column_id);
+            let data_type = intermediate_type.clone().ok_or_else(|| {
+                format!(
+                    "HashAggregateNode merge aggregate {idx} requires a known intermediate type for {}",
+                    function_name
+                )
+            })?;
+            vec![arena.push_typed(ExprNode::SlotId(slot), data_type)]
+        } else {
+            call.args
+                .iter()
+                .enumerate()
+                .map(|(arg_idx, expr)| {
+                    lower_proto_expr(expr, arena, &child.layout).map_err(|err| {
+                        format!("HashAggregateNode aggregate {idx} arg {arg_idx}: {err}")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let inputs =
+            select_aggregate_inputs(&call.name.to_ascii_lowercase(), is_merge, raw_args, arena)?;
+        functions.push(AggFunction {
+            name: function_name,
+            inputs,
+            input_is_intermediate: is_merge,
+            types: Some(AggTypeSignature {
+                intermediate_type,
+                output_type: Some(result_type),
+                input_arg_type: signature_input_arg_type,
+            }),
+            order: aggregate_order_spec(call),
+        });
+    }
+
+    let input_is_intermediate = functions.iter().all(|f| f.input_is_intermediate);
+    let need_finalize = matches!(mode, plan::AggMode::Single | plan::AggMode::Global);
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Aggregate(AggregateNode {
+                input: Box::new(child.node),
+                node_id: node.node_id,
+                group_by,
+                functions,
+                need_finalize,
+                input_is_intermediate,
+                output_chunk_schema: output_schema.clone(),
+                topn_rf_specs: Vec::new(),
+                streaming_preaggregation_mode: None,
+            }),
+        },
+        layout,
+        output_schema,
+    })
+}
+
+fn aggregate_function_name(call: &plan::PlanAggregateCall) -> Result<String, String> {
+    let name = call.name.to_ascii_lowercase();
+    if call.distinct {
+        return match name.as_str() {
+            "count" => Ok("multi_distinct_count".to_string()),
+            "sum" => Ok("multi_distinct_sum".to_string()),
+            "array_agg" => Ok("array_agg_distinct".to_string()),
+            _ => Ok(name),
+        };
+    }
+    Ok(name)
+}
+
+fn aggregate_signature_arg_types(call: &plan::PlanAggregateCall) -> Result<Vec<DataType>, String> {
+    let mut types = call
+        .args
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            expr.r#type
+                .as_ref()
+                .ok_or_else(|| format!("aggregate {} argument {idx} type missing", call.name))
+                .and_then(super::decode_type)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (idx, item) in call.order_by.iter().enumerate() {
+        let expr = item
+            .expr
+            .as_ref()
+            .ok_or_else(|| format!("aggregate {} order_by[{idx}] expr missing", call.name))?;
+        let data_type = expr
+            .r#type
+            .as_ref()
+            .ok_or_else(|| format!("aggregate {} order_by[{idx}] type missing", call.name))
+            .and_then(super::decode_type)?;
+        types.push(data_type);
+    }
+    Ok(types)
+}
+
+fn aggregate_order_spec(call: &plan::PlanAggregateCall) -> AggOrderSpec {
+    AggOrderSpec {
+        is_asc_order: call.order_by.iter().map(|item| item.asc).collect(),
+        nulls_first: call.order_by.iter().map(|item| item.nulls_first).collect(),
+        is_distinct: call.distinct,
+        group_concat_max_len: if call.name.eq_ignore_ascii_case("group_concat")
+            || call.name.eq_ignore_ascii_case("string_agg")
+        {
+            Some(1024)
+        } else {
+            None
+        },
+    }
+}
+
+fn select_aggregate_inputs(
+    fn_name: &str,
+    is_merge: bool,
+    args: Vec<crate::exec::expr::ExprId>,
+    arena: &mut ExprArena,
+) -> Result<Vec<crate::exec::expr::ExprId>, String> {
+    if is_merge {
+        return args
+            .into_iter()
+            .next()
+            .map(|expr| vec![expr])
+            .ok_or_else(|| format!("{fn_name} merge input missing"));
+    }
+    if fn_name == "count_if" {
+        return match args.len() {
+            1 => Ok(args),
+            2 => Ok(vec![args[1]]),
+            other => Err(format!("count_if expects 1 or 2 arguments, got {other}")),
+        };
+    }
+    pack_struct_inputs(args, arena)
+}
+
+fn pack_struct_inputs(
+    args: Vec<crate::exec::expr::ExprId>,
+    arena: &mut ExprArena,
+) -> Result<Vec<crate::exec::expr::ExprId>, String> {
+    if args.len() <= 1 {
+        return Ok(args);
+    }
+    let mut fields = Vec::with_capacity(args.len());
+    for (idx, expr_id) in args.iter().enumerate() {
+        let data_type = arena
+            .data_type(*expr_id)
+            .ok_or_else(|| "aggregate input type missing".to_string())?;
+        fields.push(Field::new(format!("f{idx}"), data_type.clone(), true));
+    }
+    let struct_type = DataType::Struct(Fields::from(fields));
+    let struct_expr = arena.push_typed(ExprNode::StructExpr { fields: args }, struct_type);
+    Ok(vec![struct_expr])
+}
+
+fn lower_hash_join_node(
+    node: &plan::DistributedNode,
+    join: &plan::HashJoinNode,
+    children: Vec<LoweredNode>,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    check_exact_arity("HashJoinNode", 2, children.len())?;
+    let mut it = children.into_iter();
+    let left = it.next().expect("left");
+    let right = it.next().expect("right");
+    if join.eq_conditions.is_empty() {
+        return Err("HashJoinNode requires non-empty eq_conditions".to_string());
+    }
+    let join_type = proto_join_type(join.join_type, "HashJoinNode")?;
+    let distribution_mode = hash_join_distribution_mode(join)?;
+    let join_layout = concat_layouts(&left.layout, &right.layout)?;
+    let join_scope_chunk_schema = Arc::new(ChunkSchema::concat(&[
+        left.output_schema.clone(),
+        right.output_schema.clone(),
+    ])?);
+
+    let mut probe_keys = Vec::with_capacity(join.eq_conditions.len());
+    let mut build_keys = Vec::with_capacity(join.eq_conditions.len());
+    let mut eq_null_safe = Vec::with_capacity(join.eq_conditions.len());
+    for (idx, cond) in join.eq_conditions.iter().enumerate() {
+        let left_expr = cond
+            .left
+            .as_ref()
+            .ok_or_else(|| format!("HashJoinNode eq_conditions[{idx}] left missing"))?;
+        let right_expr = cond
+            .right
+            .as_ref()
+            .ok_or_else(|| format!("HashJoinNode eq_conditions[{idx}] right missing"))?;
+        let probe_key = lower_proto_expr(left_expr, arena, &left.layout)
+            .map_err(|err| format!("HashJoinNode eq_conditions[{idx}] left: {err}"))?;
+        let build_key = lower_proto_expr(right_expr, arena, &right.layout)
+            .map_err(|err| format!("HashJoinNode eq_conditions[{idx}] right: {err}"))?;
+        probe_keys.push(probe_key);
+        build_keys.push(build_key);
+        eq_null_safe.push(cond.null_safe);
+    }
+    let raw_probe_keys = probe_keys.clone();
+    let raw_build_keys = build_keys.clone();
+    coerce_join_key_types(&mut probe_keys, &mut build_keys, arena)?;
+    for key in probe_keys.iter().chain(build_keys.iter()) {
+        if let Some(dt) = arena.data_type(*key)
+            && matches!(dt, DataType::LargeBinary)
+        {
+            return Err("VARIANT is not supported in HASH_JOIN keys".to_string());
+        }
+    }
+
+    let residual_predicate = join
+        .other_condition
+        .as_ref()
+        .map(|expr| lower_proto_expr(expr, arena, &join_layout))
+        .transpose()
+        .map_err(|err| format!("HashJoinNode other_condition: {err}"))?;
+    let runtime_filters = lower_join_runtime_filters(
+        join,
+        join_type,
+        &left.layout,
+        &right.layout,
+        &raw_probe_keys,
+        &raw_build_keys,
+        &probe_keys,
+        &build_keys,
+        arena,
+    )?;
+
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Join(JoinNode {
+                left: Box::new(left.node),
+                right: Box::new(right.node),
+                node_id: node.node_id,
+                join_type,
+                distribution_mode,
+                left_chunk_schema: left.output_schema,
+                right_chunk_schema: right.output_schema,
+                join_scope_chunk_schema: join_scope_chunk_schema.clone(),
+                probe_keys,
+                build_keys,
+                eq_null_safe,
+                residual_predicate,
+                runtime_filters,
+            }),
+        },
+        layout: join_layout,
+        output_schema: join_scope_chunk_schema,
+    })
+}
+
+fn hash_join_distribution_mode(join: &plan::HashJoinNode) -> Result<JoinDistributionMode, String> {
+    if let Some(mode) = join.execution_mode {
+        return match plan::JoinExecutionMode::try_from(mode)
+            .map_err(|_| format!("HashJoinNode unknown execution_mode {mode}"))?
+        {
+            plan::JoinExecutionMode::Broadcast => Ok(JoinDistributionMode::Broadcast),
+            plan::JoinExecutionMode::Partitioned | plan::JoinExecutionMode::Colocate => {
+                Ok(JoinDistributionMode::Partitioned)
+            }
+            plan::JoinExecutionMode::Unspecified => {
+                Err("HashJoinNode execution_mode is unspecified".to_string())
+            }
+        };
+    }
+
+    match plan::JoinDistribution::try_from(join.distribution)
+        .map_err(|_| format!("HashJoinNode unknown distribution {}", join.distribution))?
+    {
+        plan::JoinDistribution::Broadcast | plan::JoinDistribution::Unknown => {
+            Ok(JoinDistributionMode::Broadcast)
+        }
+        plan::JoinDistribution::Shuffle | plan::JoinDistribution::Colocate => {
+            Ok(JoinDistributionMode::Partitioned)
+        }
+        plan::JoinDistribution::Unspecified => {
+            Err("HashJoinNode distribution is unspecified".to_string())
+        }
+    }
+}
+
+fn lower_join_runtime_filters(
+    join: &plan::HashJoinNode,
+    join_type: JoinType,
+    probe_layout: &Layout,
+    build_layout: &Layout,
+    raw_probe_keys: &[crate::exec::expr::ExprId],
+    raw_build_keys: &[crate::exec::expr::ExprId],
+    probe_keys: &[crate::exec::expr::ExprId],
+    build_keys: &[crate::exec::expr::ExprId],
+    arena: &mut ExprArena,
+) -> Result<Vec<JoinRuntimeFilterSpec>, String> {
+    if !join.build_runtime_filters.is_empty() && !is_runtime_filter_safe_join_type(join_type) {
+        return Err(format!(
+            "HashJoinNode runtime filters are not supported for join type {:?}",
+            join_type
+        ));
+    }
+    let mut runtime_filters = Vec::new();
+    for rf in &join.build_runtime_filters {
+        let expr_order = rf.expr_order as usize;
+        if expr_order >= probe_keys.len() || expr_order >= build_keys.len() {
+            return Err(format!(
+                "HashJoinNode runtime filter {} expr_order {} out of range",
+                rf.filter_id, expr_order
+            ));
+        }
+        validate_runtime_filter_intent(
+            rf,
+            expr_order,
+            probe_layout,
+            build_layout,
+            raw_probe_keys[expr_order],
+            raw_build_keys[expr_order],
+            arena,
+        )?;
+        if join
+            .eq_conditions
+            .get(expr_order)
+            .map(|cond| cond.null_safe)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let build_data_type = arena
+            .data_type(build_keys[expr_order])
+            .ok_or_else(|| format!("runtime filter {} build key type missing", rf.filter_id))?
+            .clone();
+        let Some(ExprNode::SlotId(probe_slot_id)) = arena.node(probe_keys[expr_order]) else {
+            continue;
+        };
+        runtime_filters.push(JoinRuntimeFilterSpec {
+            filter_id: rf.filter_id,
+            expr_order,
+            probe_slot_id: *probe_slot_id,
+            build_data_type,
+            merge_nodes: Vec::new(),
+            has_remote_targets: false,
+        });
+    }
+    Ok(runtime_filters)
+}
+
+fn is_runtime_filter_safe_join_type(join_type: JoinType) -> bool {
+    matches!(
+        join_type,
+        JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi
+    )
+}
+
+fn validate_runtime_filter_intent(
+    rf: &plan::RuntimeFilterBuildIntent,
+    expr_order: usize,
+    probe_layout: &Layout,
+    build_layout: &Layout,
+    expected_probe_key: crate::exec::expr::ExprId,
+    expected_build_key: crate::exec::expr::ExprId,
+    arena: &mut ExprArena,
+) -> Result<(), String> {
+    let probe_expr = rf.probe_expr.as_ref().ok_or_else(|| {
+        format!(
+            "HashJoinNode runtime filter {} probe_expr missing",
+            rf.filter_id
+        )
+    })?;
+    let probe_expr_id = lower_proto_expr(probe_expr, arena, probe_layout).map_err(|err| {
+        format!(
+            "HashJoinNode runtime filter {} probe_expr: {err}",
+            rf.filter_id
+        )
+    })?;
+    if !exprs_equivalent(arena, probe_expr_id, expected_probe_key) {
+        return Err(format!(
+            "HashJoinNode runtime filter {} probe_expr does not match join key at expr_order {}",
+            rf.filter_id, expr_order
+        ));
+    }
+
+    let build_expr = rf.build_expr.as_ref().ok_or_else(|| {
+        format!(
+            "HashJoinNode runtime filter {} build_expr missing",
+            rf.filter_id
+        )
+    })?;
+    let build_expr_id = lower_proto_expr(build_expr, arena, build_layout).map_err(|err| {
+        format!(
+            "HashJoinNode runtime filter {} build_expr: {err}",
+            rf.filter_id
+        )
+    })?;
+    if !exprs_equivalent(arena, build_expr_id, expected_build_key) {
+        return Err(format!(
+            "HashJoinNode runtime filter {} build_expr does not match join key at expr_order {}",
+            rf.filter_id, expr_order
+        ));
+    }
+
+    Ok(())
+}
+
+fn exprs_equivalent(
+    arena: &ExprArena,
+    left: crate::exec::expr::ExprId,
+    right: crate::exec::expr::ExprId,
+) -> bool {
+    if arena.data_type(left) != arena.data_type(right) {
+        return false;
+    }
+    let Some(left_node) = arena.node(left) else {
+        return false;
+    };
+    let Some(right_node) = arena.node(right) else {
+        return false;
+    };
+    match (left_node, right_node) {
+        (ExprNode::Literal(left), ExprNode::Literal(right)) => {
+            format!("{left:?}") == format!("{right:?}")
+        }
+        (ExprNode::SlotId(left), ExprNode::SlotId(right)) => left == right,
+        (ExprNode::ArrayExpr { elements: left }, ExprNode::ArrayExpr { elements: right })
+        | (ExprNode::StructExpr { fields: left }, ExprNode::StructExpr { fields: right }) => {
+            expr_id_slices_equivalent(arena, left, right)
+        }
+        (
+            ExprNode::LambdaFunction {
+                body: left_body,
+                arg_slots: left_args,
+                common_sub_exprs: left_common,
+                is_nondeterministic: left_nondeterministic,
+            },
+            ExprNode::LambdaFunction {
+                body: right_body,
+                arg_slots: right_args,
+                common_sub_exprs: right_common,
+                is_nondeterministic: right_nondeterministic,
+            },
+        ) => {
+            left_args == right_args
+                && left_nondeterministic == right_nondeterministic
+                && exprs_equivalent(arena, *left_body, *right_body)
+                && common_sub_exprs_equivalent(arena, left_common, right_common)
+        }
+        (
+            ExprNode::DictDecode {
+                child: left,
+                dict: left_dict,
+            },
+            ExprNode::DictDecode {
+                child: right,
+                dict: right_dict,
+            },
+        ) => Arc::ptr_eq(left_dict, right_dict) && exprs_equivalent(arena, *left, *right),
+        (ExprNode::Cast(left), ExprNode::Cast(right))
+        | (ExprNode::CastTime(left), ExprNode::CastTime(right))
+        | (ExprNode::CastTimeFromDatetime(left), ExprNode::CastTimeFromDatetime(right))
+        | (ExprNode::Not(left), ExprNode::Not(right))
+        | (ExprNode::IsNull(left), ExprNode::IsNull(right))
+        | (ExprNode::IsNotNull(left), ExprNode::IsNotNull(right))
+        | (ExprNode::Clone(left), ExprNode::Clone(right)) => exprs_equivalent(arena, *left, *right),
+        (ExprNode::Add(ll, lr), ExprNode::Add(rl, rr))
+        | (ExprNode::Sub(ll, lr), ExprNode::Sub(rl, rr))
+        | (ExprNode::Mul(ll, lr), ExprNode::Mul(rl, rr))
+        | (ExprNode::Div(ll, lr), ExprNode::Div(rl, rr))
+        | (ExprNode::Mod(ll, lr), ExprNode::Mod(rl, rr))
+        | (ExprNode::Eq(ll, lr), ExprNode::Eq(rl, rr))
+        | (ExprNode::EqForNull(ll, lr), ExprNode::EqForNull(rl, rr))
+        | (ExprNode::Ne(ll, lr), ExprNode::Ne(rl, rr))
+        | (ExprNode::Lt(ll, lr), ExprNode::Lt(rl, rr))
+        | (ExprNode::Le(ll, lr), ExprNode::Le(rl, rr))
+        | (ExprNode::Gt(ll, lr), ExprNode::Gt(rl, rr))
+        | (ExprNode::Ge(ll, lr), ExprNode::Ge(rl, rr))
+        | (ExprNode::And(ll, lr), ExprNode::And(rl, rr))
+        | (ExprNode::Or(ll, lr), ExprNode::Or(rl, rr)) => {
+            exprs_equivalent(arena, *ll, *rl) && exprs_equivalent(arena, *lr, *rr)
+        }
+        (
+            ExprNode::In {
+                child: left_child,
+                values: left_values,
+                is_not_in: left_not,
+            },
+            ExprNode::In {
+                child: right_child,
+                values: right_values,
+                is_not_in: right_not,
+            },
+        ) => {
+            left_not == right_not
+                && exprs_equivalent(arena, *left_child, *right_child)
+                && expr_id_slices_equivalent(arena, left_values, right_values)
+        }
+        (
+            ExprNode::Case {
+                has_case_expr: left_has_case,
+                has_else_expr: left_has_else,
+                children: left_children,
+            },
+            ExprNode::Case {
+                has_case_expr: right_has_case,
+                has_else_expr: right_has_else,
+                children: right_children,
+            },
+        ) => {
+            left_has_case == right_has_case
+                && left_has_else == right_has_else
+                && expr_id_slices_equivalent(arena, left_children, right_children)
+        }
+        (
+            ExprNode::FunctionCall {
+                kind: left_kind,
+                args: left_args,
+            },
+            ExprNode::FunctionCall {
+                kind: right_kind,
+                args: right_args,
+            },
+        ) => left_kind == right_kind && expr_id_slices_equivalent(arena, left_args, right_args),
+        _ => false,
+    }
+}
+
+fn expr_id_slices_equivalent(
+    arena: &ExprArena,
+    left: &[crate::exec::expr::ExprId],
+    right: &[crate::exec::expr::ExprId],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| exprs_equivalent(arena, *left, *right))
+}
+
+fn common_sub_exprs_equivalent(
+    arena: &ExprArena,
+    left: &[(SlotId, crate::exec::expr::ExprId)],
+    right: &[(SlotId, crate::exec::expr::ExprId)],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|((left_slot, left_expr), (right_slot, right_expr))| {
+                left_slot == right_slot && exprs_equivalent(arena, *left_expr, *right_expr)
+            })
+}
+
+fn coerce_join_key_types(
+    probe_keys: &mut [crate::exec::expr::ExprId],
+    build_keys: &mut [crate::exec::expr::ExprId],
+    arena: &mut ExprArena,
+) -> Result<(), String> {
+    for idx in 0..probe_keys.len() {
+        let probe_expr = probe_keys[idx];
+        let build_expr = build_keys[idx];
+        let probe_type = arena
+            .data_type(probe_expr)
+            .ok_or_else(|| "HASH_JOIN probe key type missing".to_string())?
+            .clone();
+        let build_type = arena
+            .data_type(build_expr)
+            .ok_or_else(|| "HASH_JOIN build key type missing".to_string())?
+            .clone();
+        if probe_type == build_type {
+            continue;
+        }
+        let common_type = common_join_key_type(&probe_type, &build_type)?;
+        match common_type {
+            Some(target_type) => {
+                if probe_type != target_type {
+                    probe_keys[idx] =
+                        arena.push_typed(ExprNode::Cast(probe_expr), target_type.clone());
+                }
+                if build_type != target_type {
+                    build_keys[idx] = arena.push_typed(ExprNode::Cast(build_expr), target_type);
+                }
+            }
+            None => {
+                build_keys[idx] = arena.push_typed(ExprNode::Cast(build_expr), probe_type);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn common_join_key_type(left: &DataType, right: &DataType) -> Result<Option<DataType>, String> {
+    if left == right {
+        return Ok(Some(left.clone()));
+    }
+    match (left, right) {
+        (
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
+        ) => Ok(Some(crate::types::coercion::decimal_compare_type(
+            left, right,
+        )?)),
+        (DataType::List(left_field), DataType::List(right_field)) => {
+            let Some(elem_type) =
+                common_join_key_type(left_field.data_type(), right_field.data_type())?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(DataType::List(Arc::new(Field::new(
+                left_field.name(),
+                elem_type,
+                left_field.is_nullable() || right_field.is_nullable(),
+            )))))
+        }
+        _ => Ok(Some(wider_type(left, right))),
+    }
+}
+
+fn lower_nest_loop_join_node(
+    node: &plan::DistributedNode,
+    join: &plan::NestLoopJoinNode,
+    children: Vec<LoweredNode>,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    check_exact_arity("NestLoopJoinNode", 2, children.len())?;
+    let mut it = children.into_iter();
+    let left = it.next().expect("left");
+    let right = it.next().expect("right");
+    let join_type = proto_nested_loop_join_type(join.join_type, "NestLoopJoinNode")?;
+    let join_layout = concat_layouts(&left.layout, &right.layout)?;
+    let join_scope_chunk_schema = Arc::new(ChunkSchema::concat(&[
+        left.output_schema.clone(),
+        right.output_schema.clone(),
+    ])?);
+    let join_conjunct = join
+        .condition
+        .as_ref()
+        .map(|expr| lower_proto_expr(expr, arena, &join_layout))
+        .transpose()
+        .map_err(|err| format!("NestLoopJoinNode condition: {err}"))?;
+
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::NestedLoopJoin(NestedLoopJoinNode {
+                left: Box::new(left.node),
+                right: Box::new(right.node),
+                node_id: node.node_id,
+                join_type,
+                join_conjunct,
+                left_chunk_schema: left.output_schema,
+                right_chunk_schema: right.output_schema,
+                join_scope_chunk_schema: join_scope_chunk_schema.clone(),
+            }),
+        },
+        layout: join_layout,
+        output_schema: join_scope_chunk_schema,
+    })
+}
+
+fn proto_join_type(value: i32, node_kind: &str) -> Result<JoinType, String> {
+    match plan::JoinKind::try_from(value)
+        .map_err(|_| format!("{node_kind} unknown join_type {value}"))?
+    {
+        plan::JoinKind::Inner => Ok(JoinType::Inner),
+        plan::JoinKind::LeftOuter => Ok(JoinType::LeftOuter),
+        plan::JoinKind::RightOuter => Ok(JoinType::RightOuter),
+        plan::JoinKind::FullOuter => Ok(JoinType::FullOuter),
+        plan::JoinKind::LeftSemi => Ok(JoinType::LeftSemi),
+        plan::JoinKind::RightSemi => Ok(JoinType::RightSemi),
+        plan::JoinKind::LeftAnti => Ok(JoinType::LeftAnti),
+        plan::JoinKind::RightAnti => Ok(JoinType::RightAnti),
+        plan::JoinKind::NullAwareLeftAnti => Ok(JoinType::NullAwareLeftAnti),
+        plan::JoinKind::Cross => Err(format!("{node_kind} CROSS join requires NestLoopJoinNode")),
+        plan::JoinKind::Unspecified => Err(format!("{node_kind} join_type is unspecified")),
+    }
+}
+
+fn proto_nested_loop_join_type(value: i32, node_kind: &str) -> Result<NestedLoopJoinType, String> {
+    match plan::JoinKind::try_from(value)
+        .map_err(|_| format!("{node_kind} unknown join_type {value}"))?
+    {
+        plan::JoinKind::Inner => Ok(NestedLoopJoinType::Inner),
+        plan::JoinKind::Cross => Ok(NestedLoopJoinType::Cross),
+        plan::JoinKind::LeftOuter => Ok(NestedLoopJoinType::LeftOuter),
+        plan::JoinKind::RightOuter => Ok(NestedLoopJoinType::RightOuter),
+        plan::JoinKind::FullOuter => Ok(NestedLoopJoinType::FullOuter),
+        plan::JoinKind::LeftSemi => Ok(NestedLoopJoinType::LeftSemi),
+        plan::JoinKind::LeftAnti => Ok(NestedLoopJoinType::LeftAnti),
+        plan::JoinKind::NullAwareLeftAnti => Ok(NestedLoopJoinType::NullAwareLeftAnti),
+        plan::JoinKind::RightSemi | plan::JoinKind::RightAnti => Err(format!(
+            "{node_kind} right semi/anti requires input swapping; native lowering does not support it yet"
+        )),
+        plan::JoinKind::Unspecified => Err(format!("{node_kind} join_type is unspecified")),
+    }
+}
+
+fn concat_layouts(left: &Layout, right: &Layout) -> Result<Layout, String> {
+    let mut slots = Vec::with_capacity(left.order().len() + right.order().len());
+    let mut seen = HashSet::with_capacity(left.order().len() + right.order().len());
+    for slot in left.order().iter().chain(right.order().iter()).copied() {
+        if !seen.insert(slot) {
+            return Err(format!("duplicate slot id {} in joined layout", slot));
+        }
+        slots.push(slot);
+    }
+    Ok(Layout::for_slots(slots))
+}
+
+fn lower_repeat_node(
+    node: &plan::DistributedNode,
+    repeat: &plan::RepeatNode,
+    mut children: Vec<LoweredNode>,
+) -> Result<LoweredNode, String> {
+    check_exact_arity("RepeatNode", 1, children.len())?;
+    let child = children.pop().expect("child");
+    let repeat_times = repeat.grouping_ids.len();
+    if repeat_times == 0 {
+        return Err("RepeatNode grouping_ids is empty".to_string());
+    }
+    if repeat.repeat_column_ref_ids.len() != repeat_times {
+        return Err(format!(
+            "RepeatNode repeat_column_ref_ids size mismatch: expected {}, got {}",
+            repeat_times,
+            repeat.repeat_column_ref_ids.len()
+        ));
+    }
+    let all_slot_ids = repeat
+        .all_rollup_column_ids
+        .iter()
+        .copied()
+        .map(SlotId::new)
+        .collect::<Vec<_>>();
+    let all_slot_set = all_slot_ids.iter().copied().collect::<HashSet<_>>();
+    let null_slot_ids = repeat
+        .repeat_column_ref_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, keep_ids)| {
+            let keep = keep_ids
+                .values
+                .iter()
+                .copied()
+                .map(SlotId::new)
+                .collect::<HashSet<_>>();
+            for slot in &keep {
+                if !all_slot_set.contains(slot) {
+                    return Err(format!(
+                        "RepeatNode keep set {idx} contains unknown rollup slot {}",
+                        slot
+                    ));
+                }
+            }
+            let mut nulls = all_slot_ids
+                .iter()
+                .copied()
+                .filter(|slot| !keep.contains(slot))
+                .collect::<Vec<_>>();
+            nulls.sort_by_key(|slot| slot.as_u32());
+            Ok(nulls)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let grouping_slot_ids = repeat
+        .grouping_fn_ids
+        .iter()
+        .map(|entry| SlotId::new(entry.value))
+        .collect::<Vec<_>>();
+    let grouping_list = repeat_grouping_values(repeat)?;
+    let (layout, output_schema) =
+        repeat_output_layout_and_schema(&child, &repeat.grouping_fn_ids, &grouping_slot_ids)?;
+
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Repeat(RepeatNode {
+                input: Box::new(child.node),
+                node_id: node.node_id,
+                null_slot_ids,
+                grouping_slot_ids,
+                grouping_list,
+                repeat_times,
+            }),
+        },
+        layout,
+        output_schema,
+    })
+}
+
+fn repeat_output_layout_and_schema(
+    child: &LoweredNode,
+    grouping_fn_ids: &[plan::NamedUInt32],
+    grouping_slot_ids: &[SlotId],
+) -> Result<(Layout, ChunkSchemaRef), String> {
+    let mut slots = child.output_schema.slots().to_vec();
+    let mut output_slot_ids = child.layout.order().to_vec();
+    for (idx, slot_id) in grouping_slot_ids.iter().copied().enumerate() {
+        if child.layout.contains_slot(slot_id) || output_slot_ids.contains(&slot_id) {
+            return Err(format!(
+                "RepeatNode grouping slot {} duplicates input slot",
+                slot_id
+            ));
+        }
+        let name = grouping_fn_ids
+            .get(idx)
+            .map(|entry| entry.name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("__grouping_fn");
+        let field = Field::new(name, DataType::Int64, true);
+        slots.push(ChunkSlotSchema::new_with_field(slot_id, field, None, None));
+        output_slot_ids.push(slot_id);
+    }
+    let layout = Layout::for_slots(output_slot_ids);
+    let output_schema = Arc::new(ChunkSchema::try_new(slots)?);
+    Ok((layout, output_schema))
+}
+
+fn repeat_grouping_values(repeat: &plan::RepeatNode) -> Result<Vec<Vec<i64>>, String> {
+    if repeat.grouping_fn_ids.len() != repeat.grouping_fn_arg_ids.len() {
+        return Err(format!(
+            "RepeatNode grouping fn length mismatch: ids={} arg_ids={}",
+            repeat.grouping_fn_ids.len(),
+            repeat.grouping_fn_arg_ids.len()
+        ));
+    }
+    let repeat_times = repeat.grouping_ids.len();
+    let keep_sets = repeat
+        .repeat_column_ref_ids
+        .iter()
+        .map(|ids| ids.values.iter().copied().collect::<HashSet<_>>())
+        .collect::<Vec<_>>();
+    repeat
+        .grouping_fn_arg_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, args)| {
+            if args.values.len() > 63 {
+                return Err(format!(
+                    "RepeatNode grouping_fn_arg_ids[{idx}] has too many arguments: {}",
+                    args.values.len()
+                ));
+            }
+            let mut values = Vec::with_capacity(repeat_times);
+            for (repeat_idx, keep) in keep_sets.iter().enumerate() {
+                let mut value = 0i64;
+                for (arg_idx, column_id) in args.values.iter().enumerate() {
+                    if !keep.contains(column_id) {
+                        let reverse_bit_pos = args.values.len() - 1 - arg_idx;
+                        value |= 1i64 << reverse_bit_pos;
+                    }
+                }
+                if repeat_idx >= repeat_times {
+                    return Err("RepeatNode internal repeat index overflow".to_string());
+                }
+                values.push(value);
+            }
+            Ok(values)
+        })
+        .collect()
+}
+
+fn lower_change_event_expand_node(
+    node: &plan::DistributedNode,
+    physical: &plan::PlanNode,
+    expand: &plan::ChangeEventExpandNode,
+    mut children: Vec<LoweredNode>,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    check_exact_arity("ChangeEventExpandNode", 1, children.len())?;
+    let child = children.pop().expect("child");
+    let output_columns = if expand.output_columns.is_empty() {
+        &physical.output_columns
+    } else {
+        &expand.output_columns
+    };
+    let layout = layout_from_output_columns(output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let output_slot_ids = layout.order().to_vec();
+    let output_set = output_slot_ids.iter().copied().collect::<HashSet<_>>();
+    let change_op_slot_id = SlotId::new(expand.change_op_column_id);
+    if !output_set.contains(&change_op_slot_id) {
+        return Err(format!(
+            "ChangeEventExpandNode change_op_column_id {} is not in outputs",
+            expand.change_op_column_id
+        ));
+    }
+    let change_op_field = output_schema.slot(change_op_slot_id).ok_or_else(|| {
+        format!(
+            "ChangeEventExpandNode change_op_column_id {} missing from output schema",
+            expand.change_op_column_id
+        )
+    })?;
+    if change_op_field.data_type() != &DataType::Int8 {
+        return Err(format!(
+            "ChangeEventExpandNode change_op_column_id {} must be Int8, got {:?}",
+            expand.change_op_column_id,
+            change_op_field.data_type()
+        ));
+    }
+    let data_route_slot_id = expand.data_route_column_id.map(SlotId::new);
+    if let Some(slot_id) = data_route_slot_id {
+        if slot_id == change_op_slot_id {
+            return Err(format!(
+                "ChangeEventExpandNode data_route_column_id {} must differ from change_op_column_id {}",
+                slot_id, change_op_slot_id
+            ));
+        }
+        if !output_set.contains(&slot_id) {
+            return Err(format!(
+                "ChangeEventExpandNode data_route_column_id {} is not in outputs",
+                slot_id
+            ));
+        }
+        let route_field = output_schema.slot(slot_id).ok_or_else(|| {
+            format!(
+                "ChangeEventExpandNode data_route_column_id {} missing from output schema",
+                slot_id
+            )
+        })?;
+        if !is_signed_integer_route_type(route_field.data_type()) {
+            return Err(format!(
+                "ChangeEventExpandNode data_route_column_id {} must be a signed integer route type, got {:?}",
+                slot_id,
+                route_field.data_type()
+            ));
+        }
+    }
+
+    let mut events = Vec::with_capacity(expand.events.len());
+    for (event_idx, event) in expand.events.iter().enumerate() {
+        let branch_kind = change_event_branch_kind(event.branch_kind)?;
+        if matches!(
+            branch_kind,
+            ChangeStreamBranchKind::ReuseData | ChangeStreamBranchKind::FreshData
+        ) && data_route_slot_id.is_none()
+        {
+            return Err(format!(
+                "ChangeEventExpandNode data branch {:?} requires data_route_column_id",
+                branch_kind
+            ));
+        }
+        let predicate = event
+            .predicate
+            .as_ref()
+            .map(|expr| lower_proto_expr(expr, arena, &child.layout))
+            .transpose()
+            .map_err(|err| format!("ChangeEventExpandNode event {event_idx} predicate: {err}"))?;
+        let assignments = event
+            .assignments
+            .iter()
+            .enumerate()
+            .map(|(assign_idx, assignment)| {
+                let slot_id = SlotId::new(assignment.output_column_id);
+                if !output_set.contains(&slot_id) {
+                    return Err(format!(
+                        "ChangeEventExpandNode event {event_idx} assignment {assign_idx} output column {} is not in outputs",
+                        assignment.output_column_id
+                    ));
+                }
+                let expr = assignment
+                    .expr
+                    .as_ref()
+                    .map(|expr| lower_proto_expr(expr, arena, &child.layout))
+                    .transpose()
+                    .map_err(|err| {
+                        format!(
+                            "ChangeEventExpandNode event {event_idx} assignment {assign_idx}: {err}"
+                        )
+                    })?;
+                Ok(ChangeEventRuntimeOutputExpr {
+                    output_slot_id: slot_id,
+                    expr,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        events.push(ChangeEventRuntimeSpec {
+            predicate,
+            branch_kind,
+            assignments,
+        });
+    }
+
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::ChangeEventExpand(ChangeEventExpandNode {
+                input: Box::new(child.node),
+                node_id: node.node_id,
+                events,
+                output_slot_ids,
+                output_chunk_schema: output_schema.clone(),
+                change_op_slot_id,
+                data_route_slot_id,
+            }),
+        },
+        layout,
+        output_schema,
+    })
+}
+
+fn is_signed_integer_route_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
+}
+
+fn change_event_branch_kind(value: i32) -> Result<ChangeStreamBranchKind, String> {
+    match plan::ChangeStreamBranchKind::try_from(value)
+        .map_err(|_| format!("unknown change event branch kind {value}"))?
+    {
+        plan::ChangeStreamBranchKind::DeleteDv => Ok(ChangeStreamBranchKind::DeleteDv),
+        plan::ChangeStreamBranchKind::ReuseData => Ok(ChangeStreamBranchKind::ReuseData),
+        plan::ChangeStreamBranchKind::FreshData => Ok(ChangeStreamBranchKind::FreshData),
+        plan::ChangeStreamBranchKind::Unspecified => {
+            Err("change event branch kind is unspecified".to_string())
+        }
+    }
+}
+
+fn lower_redistribute_node(
+    physical: &plan::PlanNode,
+    redistribute: &plan::RedistributeNode,
+    mut children: Vec<LoweredNode>,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    check_exact_arity("RedistributeNode", 1, children.len())?;
+    let child = children.pop().expect("child");
+    let mode = redistribute
+        .mode
+        .as_ref()
+        .and_then(|mode| mode.mode.as_ref())
+        .ok_or_else(|| "RedistributeNode mode missing".to_string())?;
+    match mode {
+        plan::redistribute_mode::Mode::Gather(true)
+        | plan::redistribute_mode::Mode::Broadcast(true) => {}
+        plan::redistribute_mode::Mode::Hash(hash) => {
+            if hash.cols.is_empty() {
+                return Err("RedistributeNode hash mode requires cols".to_string());
+            }
+            for col in &hash.cols {
+                child.layout.resolve_column_id(*col)?;
+            }
+        }
+        plan::redistribute_mode::Mode::Gather(false)
+        | plan::redistribute_mode::Mode::Broadcast(false) => {
+            return Err("RedistributeNode boolean mode must be true".to_string());
+        }
+    }
+    for (idx, expr) in redistribute.partition_exprs.iter().enumerate() {
+        lower_proto_expr(expr, arena, &child.layout)
+            .map_err(|err| format!("RedistributeNode partition_exprs[{idx}]: {err}"))?;
+    }
+    let output_columns = if redistribute.output_columns.is_empty() {
+        &physical.output_columns
+    } else {
+        &redistribute.output_columns
+    };
+    if output_columns.is_empty() {
+        return Ok(child);
+    }
+    let layout = layout_from_output_columns(output_columns)?;
+    if layout.order() != child.layout.order() {
+        return Err(format!(
+            "RedistributeNode output columns must preserve child order: child={:?} output={:?}",
+            child.layout.order(),
+            layout.order()
+        ));
+    }
+    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    Ok(LoweredNode {
+        node: child.node,
+        layout,
+        output_schema,
+    })
 }
 
 fn lower_assert_one_row_node(
@@ -947,12 +2179,39 @@ mod tests {
     }
 
     fn one_col_values_node(node_id: i32) -> plan::DistributedNode {
-        let columns = vec![output_column(1, "id", DataType::Int64)];
+        one_col_values_node_with(node_id, 1, "id", 10)
+    }
+
+    fn one_col_values_node_with(
+        node_id: i32,
+        column_id: u32,
+        name: &str,
+        value: i64,
+    ) -> plan::DistributedNode {
+        let columns = vec![output_column(column_id, name, DataType::Int64)];
         physical_node(
             node_id,
             plan::plan_node::Kind::Values(plan::ValuesNode {
                 rows: vec![plan::ExprList {
-                    values: vec![int_literal(10)],
+                    values: vec![int_literal(value)],
+                }],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
+    fn two_col_values_node(node_id: i32) -> plan::DistributedNode {
+        let columns = vec![
+            output_column(1, "a", DataType::Int64),
+            output_column(2, "b", DataType::Int64),
+        ];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList {
+                    values: vec![int_literal(10), int_literal(20)],
                 }],
                 columns: columns.clone(),
             }),
@@ -1117,6 +2376,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_split_topn() {
+        let topn = physical_node(
+            30,
+            plan::plan_node::Kind::Topn(plan::TopNNode {
+                items: vec![sort_item(1)],
+                limit: Some(3),
+                offset: Some(0),
+                phase: plan::TopNPhase::TopnPhaseFinal as i32,
+                is_split: true,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let mut arena = ExprArena::default();
+        let err = lower_proto_node(&topn, &mut arena, &NodeLoweringContext::default()).unwrap_err();
+        assert!(err.contains("TopNNode split"));
+        assert!(err.contains("not implemented"));
+    }
+
+    #[test]
     fn exchange_receiver_requires_sender_count() {
         let exchange = plan::DistributedNode {
             node_id: 40,
@@ -1261,5 +2540,444 @@ mod tests {
             }
             AssertNumRowsMode::PerKeyAtMostOne { .. } => panic!("expected global assert"),
         }
+    }
+
+    #[test]
+    fn union_all_retags_child_slots_when_sidecar_is_missing() {
+        let output_columns = vec![output_column(1, "id", DataType::Int64)];
+        let union_all = physical_node(
+            60,
+            plan::plan_node::Kind::SetOp(plan::SetOpNode {
+                kind: plan::PlanSetOpKind::UnionAll as i32,
+                output_columns: output_columns.clone(),
+                child_output_columns: Vec::new(),
+            }),
+            output_columns,
+            vec![
+                one_col_values_node_with(10, 11, "lhs_id", 10),
+                one_col_values_node_with(11, 21, "rhs_id", 20),
+            ],
+        );
+        let lowered = lower(&union_all);
+        let ExecNodeKind::UnionAll(union) = lowered.node.kind else {
+            panic!("expected UnionAll");
+        };
+        assert_eq!(union.inputs.len(), 2);
+        for input in union.inputs {
+            let ExecNodeKind::Project(project) = input.kind else {
+                panic!("expected retagging Project");
+            };
+            assert!(project.is_subordinate);
+            assert_eq!(project.expr_slot_ids, vec![SlotId::new(1)]);
+            assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        }
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_hash_aggregate_and_join_shapes() {
+        let output_columns = vec![
+            output_column(1, "id", DataType::Int64),
+            output_column(2, "cnt", DataType::Int64),
+        ];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: vec![column_ref(1, DataType::Int64)],
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "count".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Int64)),
+                    order_by: Vec::new(),
+                    output_column_id: 2,
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: vec![output_columns[0].clone()],
+                    aggregate_columns: vec![output_columns[1].clone()],
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&aggregate);
+        let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
+            panic!("expected Aggregate");
+        };
+        assert_eq!(aggregate.node_id, 20);
+        assert_eq!(aggregate.group_by.len(), 1);
+        assert_eq!(aggregate.functions.len(), 1);
+        assert!(aggregate.need_finalize);
+        assert_eq!(
+            aggregate.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+
+        let join = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: plan::JoinKind::Inner as i32,
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(column_ref(2, DataType::Int64)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: plan::JoinDistribution::Broadcast as i32,
+                execution_mode: None,
+                build_runtime_filters: Vec::new(),
+            }),
+            Vec::new(),
+            vec![
+                one_col_values_node_with(10, 1, "lhs", 10),
+                one_col_values_node_with(11, 2, "rhs", 10),
+            ],
+        );
+        let lowered = lower(&join);
+        let ExecNodeKind::Join(join) = lowered.node.kind else {
+            panic!("expected Join");
+        };
+        assert_eq!(join.probe_keys.len(), 1);
+        assert_eq!(join.build_keys.len(), 1);
+        assert_eq!(join.eq_null_safe, vec![false]);
+        assert_eq!(
+            join.join_scope_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert!(matches!(
+            join.join_type,
+            crate::exec::node::join::JoinType::Inner
+        ));
+    }
+
+    #[test]
+    fn hash_join_execution_mode_overrides_distribution_and_unknown_defaults_broadcast() {
+        let mut join = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: plan::JoinKind::Inner as i32,
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(column_ref(2, DataType::Int64)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: plan::JoinDistribution::Broadcast as i32,
+                execution_mode: Some(plan::JoinExecutionMode::Partitioned as i32),
+                build_runtime_filters: Vec::new(),
+            }),
+            Vec::new(),
+            vec![
+                one_col_values_node_with(10, 1, "lhs", 10),
+                one_col_values_node_with(11, 2, "rhs", 10),
+            ],
+        );
+        let lowered = lower(&join);
+        let ExecNodeKind::Join(join_node) = lowered.node.kind else {
+            panic!("expected Join");
+        };
+        assert_eq!(
+            join_node.distribution_mode,
+            crate::exec::node::join::JoinDistributionMode::Partitioned
+        );
+
+        let plan::distributed_node::Payload::Physical(physical) =
+            join.payload.as_mut().expect("physical")
+        else {
+            panic!("expected physical");
+        };
+        let Some(plan::plan_node::Kind::HashJoin(hash_join)) = physical.kind.as_mut() else {
+            panic!("expected hash join");
+        };
+        hash_join.distribution = plan::JoinDistribution::Unknown as i32;
+        hash_join.execution_mode = None;
+        let lowered = lower(&join);
+        let ExecNodeKind::Join(join_node) = lowered.node.kind else {
+            panic!("expected Join");
+        };
+        assert_eq!(
+            join_node.distribution_mode,
+            crate::exec::node::join::JoinDistributionMode::Broadcast
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_uses_inferred_intermediate_type() {
+        let output_columns = vec![output_column(2, "avg_id", DataType::Float64)];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "avg".to_string(),
+                    args: vec![column_ref(1, DataType::Int64)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Float64)),
+                    order_by: Vec::new(),
+                    output_column_id: 2,
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: output_columns.clone(),
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&aggregate);
+        let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
+            panic!("expected Aggregate");
+        };
+        let types = aggregate.functions[0]
+            .types
+            .as_ref()
+            .expect("aggregate type signature");
+        assert_eq!(types.intermediate_type, Some(DataType::Utf8));
+        assert_eq!(types.output_type, Some(DataType::Float64));
+        assert_eq!(types.input_arg_type, Some(DataType::Int64));
+    }
+
+    #[test]
+    fn hash_join_runtime_filter_rejects_unsafe_join_type_and_mismatched_exprs() {
+        let outer_with_rf = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: plan::JoinKind::LeftOuter as i32,
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(column_ref(3, DataType::Int64)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: plan::JoinDistribution::Broadcast as i32,
+                execution_mode: None,
+                build_runtime_filters: vec![plan::RuntimeFilterBuildIntent {
+                    filter_id: 1,
+                    build_expr: Some(column_ref(3, DataType::Int64)),
+                    probe_expr: Some(column_ref(1, DataType::Int64)),
+                    expr_order: 0,
+                    execution_mode: plan::JoinExecutionMode::Broadcast as i32,
+                }],
+            }),
+            Vec::new(),
+            vec![
+                two_col_values_node(10),
+                one_col_values_node_with(11, 3, "rhs", 10),
+            ],
+        );
+        let mut arena = ExprArena::default();
+        let err = lower_proto_node(&outer_with_rf, &mut arena, &NodeLoweringContext::default())
+            .unwrap_err();
+        assert!(err.contains("runtime filters are not supported"));
+
+        let mismatched_probe = physical_node(
+            31,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: plan::JoinKind::Inner as i32,
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(column_ref(3, DataType::Int64)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: plan::JoinDistribution::Broadcast as i32,
+                execution_mode: None,
+                build_runtime_filters: vec![plan::RuntimeFilterBuildIntent {
+                    filter_id: 2,
+                    build_expr: Some(column_ref(3, DataType::Int64)),
+                    probe_expr: Some(column_ref(2, DataType::Int64)),
+                    expr_order: 0,
+                    execution_mode: plan::JoinExecutionMode::Broadcast as i32,
+                }],
+            }),
+            Vec::new(),
+            vec![
+                two_col_values_node(10),
+                one_col_values_node_with(11, 3, "rhs", 10),
+            ],
+        );
+        let mut arena = ExprArena::default();
+        let err = lower_proto_node(
+            &mismatched_probe,
+            &mut arena,
+            &NodeLoweringContext::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("probe_expr does not match"));
+    }
+
+    #[test]
+    fn lowers_repeat_change_event_and_redistribute_shapes() {
+        let repeat = physical_node(
+            20,
+            plan::plan_node::Kind::Repeat(plan::RepeatNode {
+                repeat_column_ref_list: Vec::new(),
+                repeat_column_ref_ids: vec![
+                    plan::UInt32List { values: vec![1] },
+                    plan::UInt32List { values: Vec::new() },
+                ],
+                grouping_ids: vec![0, 1],
+                all_rollup_columns: vec!["id".to_string()],
+                all_rollup_column_ids: vec![1],
+                grouping_key_aliases: Vec::new(),
+                grouping_fn_args: Vec::new(),
+                grouping_fn_arg_ids: vec![plan::UInt32List { values: vec![1] }],
+                grouping_fn_ids: vec![plan::NamedUInt32 {
+                    name: "__grouping_fn_0".to_string(),
+                    value: 9,
+                }],
+                virtual_tuple_id: Some(7),
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&repeat);
+        let ExecNodeKind::Repeat(repeat) = lowered.node.kind else {
+            panic!("expected Repeat");
+        };
+        assert_eq!(repeat.repeat_times, 2);
+        assert_eq!(repeat.null_slot_ids, vec![vec![], vec![SlotId::new(1)]]);
+        assert_eq!(repeat.grouping_slot_ids, vec![SlotId::new(9)]);
+        assert_eq!(repeat.grouping_list, vec![vec![0, 1]]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1), SlotId::new(9)]);
+        assert_eq!(
+            lowered.output_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(9)]
+        );
+
+        let change_event = physical_node(
+            30,
+            plan::plan_node::Kind::ChangeEventExpand(plan::ChangeEventExpandNode {
+                events: vec![plan::DistributedChangeEventSpec {
+                    predicate: None,
+                    branch_kind: plan::ChangeStreamBranchKind::DeleteDv as i32,
+                    assignments: vec![plan::DistributedChangeEventOutputExpr {
+                        output_column_id: 2,
+                        expr: None,
+                    }],
+                }],
+                output_columns: vec![
+                    output_column(1, "id", DataType::Int64),
+                    output_column(2, "op", DataType::Int8),
+                ],
+                change_op_column_id: 2,
+                data_route_column_id: None,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&change_event);
+        let ExecNodeKind::ChangeEventExpand(change_event) = lowered.node.kind else {
+            panic!("expected ChangeEventExpand");
+        };
+        assert_eq!(
+            change_event.output_slot_ids,
+            vec![SlotId::new(1), SlotId::new(2)]
+        );
+        assert_eq!(change_event.change_op_slot_id, SlotId::new(2));
+        assert_eq!(change_event.events.len(), 1);
+
+        let redistribute = physical_node(
+            40,
+            plan::plan_node::Kind::Redistribute(plan::RedistributeNode {
+                mode: Some(plan::RedistributeMode {
+                    mode: Some(plan::redistribute_mode::Mode::Gather(true)),
+                }),
+                partition_exprs: Vec::new(),
+                output_columns: vec![output_column(1, "id", DataType::Int64)],
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&redistribute);
+        assert!(matches!(lowered.node.kind, ExecNodeKind::Values(_)));
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn repeat_grouping_function_uses_sql_reverse_bit_order() {
+        let repeat = physical_node(
+            20,
+            plan::plan_node::Kind::Repeat(plan::RepeatNode {
+                repeat_column_ref_list: Vec::new(),
+                repeat_column_ref_ids: vec![
+                    plan::UInt32List { values: vec![1, 2] },
+                    plan::UInt32List { values: vec![1] },
+                    plan::UInt32List { values: vec![2] },
+                    plan::UInt32List { values: Vec::new() },
+                ],
+                grouping_ids: vec![0, 1, 2, 3],
+                all_rollup_columns: vec!["a".to_string(), "b".to_string()],
+                all_rollup_column_ids: vec![1, 2],
+                grouping_key_aliases: Vec::new(),
+                grouping_fn_args: Vec::new(),
+                grouping_fn_arg_ids: vec![plan::UInt32List { values: vec![1, 2] }],
+                grouping_fn_ids: vec![plan::NamedUInt32 {
+                    name: "__grouping_fn_0".to_string(),
+                    value: 9,
+                }],
+                virtual_tuple_id: Some(7),
+            }),
+            Vec::new(),
+            vec![two_col_values_node(10)],
+        );
+        let lowered = lower(&repeat);
+        let ExecNodeKind::Repeat(repeat) = lowered.node.kind else {
+            panic!("expected Repeat");
+        };
+        assert_eq!(repeat.grouping_list, vec![vec![0, 1, 2, 3]]);
+    }
+
+    #[test]
+    fn change_event_rejects_invalid_data_route_slot() {
+        let same_slot = physical_node(
+            30,
+            plan::plan_node::Kind::ChangeEventExpand(plan::ChangeEventExpandNode {
+                events: vec![plan::DistributedChangeEventSpec {
+                    predicate: None,
+                    branch_kind: plan::ChangeStreamBranchKind::ReuseData as i32,
+                    assignments: Vec::new(),
+                }],
+                output_columns: vec![output_column(2, "op", DataType::Int8)],
+                change_op_column_id: 2,
+                data_route_column_id: Some(2),
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let mut arena = ExprArena::default();
+        let err =
+            lower_proto_node(&same_slot, &mut arena, &NodeLoweringContext::default()).unwrap_err();
+        assert!(err.contains("must differ"));
+
+        let non_integer = physical_node(
+            31,
+            plan::plan_node::Kind::ChangeEventExpand(plan::ChangeEventExpandNode {
+                events: vec![plan::DistributedChangeEventSpec {
+                    predicate: None,
+                    branch_kind: plan::ChangeStreamBranchKind::ReuseData as i32,
+                    assignments: Vec::new(),
+                }],
+                output_columns: vec![
+                    output_column(2, "op", DataType::Int8),
+                    output_column(3, "route", DataType::Utf8),
+                ],
+                change_op_column_id: 2,
+                data_route_column_id: Some(3),
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let mut arena = ExprArena::default();
+        let err = lower_proto_node(&non_integer, &mut arena, &NodeLoweringContext::default())
+            .unwrap_err();
+        assert!(err.contains("signed integer route type"));
     }
 }
