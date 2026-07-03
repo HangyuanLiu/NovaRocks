@@ -7,10 +7,6 @@ use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
-use novarocks::meta::repository::starrocks_table::{
-    StageStarRocksTruncateRequest, StarRocksPartitionState, StarRocksTableMetaRepository,
-};
-use novarocks::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
 use tempfile::TempDir;
 
 fn alloc_port() -> u16 {
@@ -173,35 +169,6 @@ fn run_curl_stream_load(
     String::from_utf8(output.stdout).expect("decode curl stdout")
 }
 
-fn starrocks_table_endpoint_reachable(endpoint: &str) -> bool {
-    let stripped = endpoint
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(endpoint);
-    let authority = stripped.split('/').next().unwrap_or(stripped);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => match port.parse::<u16>() {
-            Ok(port) => (host, port),
-            Err(_) => return false,
-        },
-        None => {
-            let default_port = if endpoint.starts_with("https://") {
-                443
-            } else {
-                80
-            };
-            (authority, default_port)
-        }
-    };
-    std::net::TcpStream::connect_timeout(
-        &format!("{host}:{port}")
-            .parse()
-            .expect("StarRocks table endpoint socket addr"),
-        Duration::from_secs(1),
-    )
-    .is_ok()
-}
-
 fn write_standalone_metadata_config(mysql_port: u16) -> (TempDir, PathBuf) {
     let config_dir = TempDir::new().expect("create standalone server config dir");
     let config_path = config_dir.path().join("novarocks.toml");
@@ -232,40 +199,7 @@ fn standalone_server_args_with_metadata(mysql_port: u16) -> (TempDir, Vec<String
     (config_dir, args)
 }
 
-fn maybe_write_starrocks_table_config(mysql_port: u16) -> Option<(TempDir, PathBuf)> {
-    let endpoint =
-        std::env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
-    if !starrocks_table_endpoint_reachable(&endpoint) {
-        eprintln!(
-            "skipping standalone StarRocks table mysql test: object store endpoint is unreachable: {endpoint}"
-        );
-        return None;
-    }
-
-    let access_key_id = std::env::var("AWS_S3_ACCESS_KEY_ID")
-        .or_else(|_| std::env::var("MINIO_ROOT_USER"))
-        .unwrap_or_else(|_| "admin".to_string());
-    let access_key_secret = std::env::var("AWS_S3_SECRET_ACCESS_KEY")
-        .or_else(|_| std::env::var("MINIO_ROOT_PASSWORD"))
-        .unwrap_or_else(|_| "admin123".to_string());
-    let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
-    let root_prefix =
-        std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-starrocks-table-tests".to_string());
-    let run_id = format!(
-        "mysql_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    let root_prefix = root_prefix.trim_matches('/');
-    let warehouse_uri = if root_prefix.is_empty() {
-        format!("s3://{bucket}/{run_id}")
-    } else {
-        format!("s3://{bucket}/{root_prefix}/{run_id}")
-    };
-
+fn write_legacy_starrocks_table_config(mysql_port: u16) -> (TempDir, PathBuf) {
     let config_dir = TempDir::new().expect("create StarRocks table config dir");
     let config_path = config_dir.path().join("novarocks.toml");
     std::fs::write(
@@ -278,26 +212,18 @@ path = "meta/catalog.db"
 [standalone_server]
 mysql_port = {mysql_port}
 user = "root"
-warehouse_uri = "{warehouse_uri}"
+warehouse_uri = "s3://novarocks/legacy-starrocks-table"
 
 [standalone_server.object_store]
-endpoint = "{endpoint}"
-access_key_id = "{access_key_id}"
-access_key_secret = "{access_key_secret}"
+endpoint = "http://127.0.0.1:9000"
+access_key_id = "admin"
+access_key_secret = "admin123"
 enable_path_style_access = true
 "#
         ),
     )
     .expect("write StarRocks table config");
-    Some((config_dir, config_path))
-}
-
-fn metadata_path_for_starrocks_table_config(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .expect("StarRocks table config path has parent")
-        .join("meta")
-        .join("catalog.db")
+    (config_dir, config_path)
 }
 
 fn s3_test_value(primary: &str, fallback_env: &str, default: &str) -> String {
@@ -617,11 +543,48 @@ fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
 }
 
 #[test]
-fn standalone_mysql_server_starrocks_table_round_trip() {
+fn standalone_mysql_server_rejects_no_catalog_persistent_table() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
-        return;
-    };
+    let args = vec![
+        "standalone-server".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(port);
+
+    let err = conn
+        .query_drop("create table t_no_catalog (id int)")
+        .expect_err("CREATE TABLE without Iceberg catalog should fail");
+    let err = err.to_string().to_ascii_lowercase();
+    assert!(err.contains("iceberg catalog"), "unexpected error: {err}");
+}
+
+#[test]
+fn standalone_mysql_server_rejects_default_catalog_persistent_table() {
+    let port = alloc_port();
+    let args = vec![
+        "standalone-server".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(port);
+
+    let err = conn
+        .query_drop("create table default_catalog.db1.t_default_catalog (id int)")
+        .expect_err("default_catalog should not be a user table catalog");
+    let err = err.to_string().to_ascii_lowercase();
+    assert!(
+        err.contains("default_catalog") || err.contains("iceberg catalog"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn standalone_mysql_server_rejects_legacy_starrocks_table_config_target() {
+    let port = alloc_port();
+    let (_config_dir, config_path) = write_legacy_starrocks_table_config(port);
 
     let args = vec![
         "standalone-server".to_string(),
@@ -631,67 +594,27 @@ fn standalone_mysql_server_starrocks_table_round_trip() {
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
-    conn.query_drop("create database analytics")
-        .expect("create database");
-    conn.query_drop("use analytics").expect("use analytics");
-    conn.query_drop(
-        "create table orders (k1 int, v1 string) duplicate key(k1) distributed by hash(k1) buckets 2",
-    )
-    .expect("create StarRocks table");
-    conn.query_drop("insert into orders values (1, 'a'), (2, 'b')")
-        .expect("insert rows");
-
-    let rows: Vec<(Option<i32>, Option<String>)> = conn
-        .query("select k1, v1 from orders order by k1")
-        .expect("select inserted rows");
-    assert_eq!(
-        rows,
-        vec![
-            (Some(1), Some("a".to_string())),
-            (Some(2), Some("b".to_string()))
-        ]
-    );
-
-    conn.query_drop("truncate table orders")
-        .expect("truncate StarRocks table");
-    let empty_rows: Vec<(Option<i32>, Option<String>)> = conn
-        .query("select k1, v1 from orders order by k1")
-        .expect("select after truncate");
-    assert!(empty_rows.is_empty(), "rows after truncate: {empty_rows:?}");
-
-    conn.query_drop("insert into orders values (3, 'c')")
-        .expect("insert after truncate");
-    let rows_after_reinsert: Vec<(Option<i32>, Option<String>)> = conn
-        .query("select k1, v1 from orders order by k1")
-        .expect("select after reinsert");
-    assert_eq!(rows_after_reinsert, vec![(Some(3), Some("c".to_string()))]);
-
-    conn.query_drop("drop table orders")
-        .expect("drop StarRocks table");
     let err = conn
-        .query::<(i32,), _>("select k1 from orders")
-        .expect_err("query after StarRocks drop should fail");
-    assert!(
-        err.to_string()
-            .to_ascii_lowercase()
-            .contains("unknown table"),
-        "unexpected error after StarRocks drop: {err}"
-    );
+        .query_drop("create database analytics")
+        .expect_err("legacy StarRocks table config must not enable local CREATE DATABASE");
+    let err = err.to_string().to_ascii_lowercase();
+    assert!(err.contains("iceberg catalog"), "unexpected error: {err}");
+
+    let err = conn
+        .query_drop(
+            "create table orders (k1 int, v1 string) duplicate key(k1) distributed by hash(k1) buckets 2",
+        )
+        .expect_err("legacy StarRocks table config must not enable local CREATE TABLE");
+    let err = err.to_string().to_ascii_lowercase();
+    assert!(err.contains("iceberg catalog"), "unexpected error: {err}");
 }
 
 #[test]
 fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
-        return;
-    };
+    let (_config_dir, args) = standalone_server_args_with_metadata(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_happy");
 
-    let args = vec![
-        "standalone-server".to_string(),
-        "--config".to_string(),
-        config_path.display().to_string(),
-    ];
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -699,12 +622,17 @@ fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
         .expect("create iceberg catalog");
     conn.query_drop("create database ice.ns")
         .expect("create iceberg namespace");
-    conn.query_drop("create table ice.ns.orders (k1 int, v2 bigint)")
-        .expect("create iceberg orders");
-    conn.query_drop("insert into ice.ns.orders values (1, 10), (2, 20), (3, 50)")
+    conn.query_drop("set catalog ice").expect("set catalog");
+    conn.query_drop("use ns").expect("use namespace");
+    conn.query_drop(
+        r#"create table orders (k1 int, v2 bigint)
+           TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true")"#,
+    )
+    .expect("create iceberg orders");
+    conn.query_drop("insert into orders values (1, 10), (2, 20), (3, 50)")
         .expect("seed iceberg rows");
     let base_rows: Vec<(Option<i32>, Option<i64>)> = conn
-        .query("select k1, v2 from ice.ns.orders order by k1")
+        .query("select k1, v2 from orders order by k1")
         .expect("select base rows");
     assert_eq!(
         base_rows,
@@ -715,13 +643,10 @@ fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
         ]
     );
 
-    conn.query_drop("create database analytics")
-        .expect("create analytics db");
-    conn.query_drop("use analytics").expect("use analytics");
     conn.query_drop(
         "create materialized view orders_mv \
          distributed by hash(k1) buckets 2 \
-         as select k1, v2 from ice.ns.orders",
+         as select k1, v2 from orders",
     )
     .expect("create mv");
 
@@ -744,7 +669,7 @@ fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
         ]
     );
 
-    conn.query_drop("insert into ice.ns.orders values (4, 70)")
+    conn.query_drop("insert into orders values (4, 70)")
         .expect("second iceberg write");
     let stable: Vec<(Option<i32>, Option<i64>)> = conn
         .query("select k1, v2 from orders_mv order by k1")
@@ -786,7 +711,11 @@ fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
             || err
                 .to_string()
                 .to_ascii_lowercase()
-                .contains("does not exist"),
+                .contains("does not exist")
+            || err
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("no metadata files"),
         "unexpected error after mv drop: {err}"
     );
 }
@@ -794,16 +723,9 @@ fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
 #[test]
 fn standalone_mysql_server_mv_incremental_refresh_noops_when_snapshot_unchanged() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
-        return;
-    };
+    let (_config_dir, args) = standalone_server_args_with_metadata(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_incremental_noop");
 
-    let args = vec![
-        "standalone-server".to_string(),
-        "--config".to_string(),
-        config_path.display().to_string(),
-    ];
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -811,18 +733,20 @@ fn standalone_mysql_server_mv_incremental_refresh_noops_when_snapshot_unchanged(
         .expect("create iceberg catalog");
     conn.query_drop("create database ice.ns")
         .expect("create iceberg namespace");
-    conn.query_drop("create table ice.ns.orders (k1 int, v2 bigint)")
-        .expect("create iceberg orders");
-    conn.query_drop("insert into ice.ns.orders values (1, 10), (2, 20)")
+    conn.query_drop("set catalog ice").expect("set catalog");
+    conn.query_drop("use ns").expect("use namespace");
+    conn.query_drop(
+        r#"create table orders (k1 int, v2 bigint)
+           TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true")"#,
+    )
+    .expect("create iceberg orders");
+    conn.query_drop("insert into orders values (1, 10), (2, 20)")
         .expect("seed iceberg rows");
 
-    conn.query_drop("create database analytics")
-        .expect("create analytics db");
-    conn.query_drop("use analytics").expect("use analytics");
     conn.query_drop(
         "create materialized view orders_mv \
          distributed by hash(k1) buckets 2 \
-         as select k1, v2 from ice.ns.orders where v2 >= 10",
+         as select k1, v2 from orders where v2 >= 10",
     )
     .expect("create mv");
 
@@ -840,16 +764,9 @@ fn standalone_mysql_server_mv_incremental_refresh_noops_when_snapshot_unchanged(
 #[test]
 fn standalone_mysql_server_mv_incremental_refresh_appends_only_new_rows() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
-        return;
-    };
+    let (_config_dir, args) = standalone_server_args_with_metadata(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_incremental_append");
 
-    let args = vec![
-        "standalone-server".to_string(),
-        "--config".to_string(),
-        config_path.display().to_string(),
-    ];
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -857,24 +774,26 @@ fn standalone_mysql_server_mv_incremental_refresh_appends_only_new_rows() {
         .expect("create iceberg catalog");
     conn.query_drop("create database ice.ns")
         .expect("create iceberg namespace");
-    conn.query_drop("create table ice.ns.orders (k1 int, v2 bigint)")
-        .expect("create iceberg orders");
-    conn.query_drop("insert into ice.ns.orders values (1, 10), (2, 20)")
+    conn.query_drop("set catalog ice").expect("set catalog");
+    conn.query_drop("use ns").expect("use namespace");
+    conn.query_drop(
+        r#"create table orders (k1 int, v2 bigint)
+           TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true")"#,
+    )
+    .expect("create iceberg orders");
+    conn.query_drop("insert into orders values (1, 10), (2, 20)")
         .expect("seed iceberg rows");
 
-    conn.query_drop("create database analytics")
-        .expect("create analytics db");
-    conn.query_drop("use analytics").expect("use analytics");
     conn.query_drop(
         "create materialized view orders_mv \
          distributed by hash(k1) buckets 2 \
-         as select k1, v2 from ice.ns.orders where v2 >= 20",
+         as select k1, v2 from orders where v2 >= 20",
     )
     .expect("create mv");
 
     conn.query_drop("refresh materialized view orders_mv")
         .expect("first refresh mv");
-    conn.query_drop("insert into ice.ns.orders values (3, 30), (4, 5)")
+    conn.query_drop("insert into orders values (3, 30), (4, 5)")
         .expect("append iceberg rows");
     conn.query_drop("refresh materialized view orders_mv")
         .expect("second refresh mv");
@@ -888,16 +807,9 @@ fn standalone_mysql_server_mv_incremental_refresh_appends_only_new_rows() {
 #[test]
 fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
-        return;
-    };
+    let (_config_dir, args) = standalone_server_args_with_metadata(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_show");
 
-    let args = vec![
-        "standalone-server".to_string(),
-        "--config".to_string(),
-        config_path.display().to_string(),
-    ];
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -905,27 +817,29 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
         .expect("create iceberg catalog");
     conn.query_drop("create database ice.ns")
         .expect("create iceberg namespace");
-    conn.query_drop("create table ice.ns.orders (k1 int, v2 bigint)")
-        .expect("create iceberg orders");
-    conn.query_drop("create database analytics")
-        .expect("create analytics db");
-    conn.query_drop("use analytics").expect("use analytics");
+    conn.query_drop("set catalog ice").expect("set catalog");
+    conn.query_drop("use ns").expect("use namespace");
+    conn.query_drop(
+        r#"create table orders (k1 int, v2 bigint)
+           TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true")"#,
+    )
+    .expect("create iceberg orders");
     conn.query_drop(
         "create materialized view orders_mv \
          distributed by hash(k1) buckets 2 \
-         as select k1 from ice.ns.orders",
+         as select k1 from orders",
     )
     .expect("create mv");
 
     let rows: Vec<Row> = conn
-        .query("show materialized views from analytics")
+        .query("show materialized views from ns")
         .expect("show mvs");
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
     assert_eq!(row.len(), 15);
     assert_eq!(row.get::<String, _>(0), Some("orders_mv".to_string()));
-    assert_eq!(row.get::<String, _>(1), Some("analytics".to_string()));
-    assert_eq!(row.get::<String, _>(2), Some("starrocks".to_string()));
+    assert_eq!(row.get::<String, _>(1), Some("ns".to_string()));
+    assert_eq!(row.get::<String, _>(2), Some("iceberg".to_string()));
     assert_eq!(row.get::<String, _>(3), Some("DEFERRED_MANUAL".to_string()));
     assert_eq!(row.get::<Option<String>, _>(4), Some(None));
     assert_eq!(row.get::<Option<String>, _>(5), Some(None));
@@ -948,16 +862,9 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
 #[test]
 fn standalone_mysql_server_mv_refresh_policy_ddl_updates_show_metadata() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
-        return;
-    };
+    let (_config_dir, args) = standalone_server_args_with_metadata(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_refresh_policy_ddl");
 
-    let args = vec![
-        "standalone-server".to_string(),
-        "--config".to_string(),
-        config_path.display().to_string(),
-    ];
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -965,21 +872,23 @@ fn standalone_mysql_server_mv_refresh_policy_ddl_updates_show_metadata() {
         .expect("create iceberg catalog");
     conn.query_drop("create database ice.ns")
         .expect("create iceberg namespace");
-    conn.query_drop("create table ice.ns.orders (k1 int, v2 bigint)")
-        .expect("create iceberg orders");
-    conn.query_drop("create database analytics")
-        .expect("create analytics db");
-    conn.query_drop("use analytics").expect("use analytics");
+    conn.query_drop("set catalog ice").expect("set catalog");
+    conn.query_drop("use ns").expect("use namespace");
+    conn.query_drop(
+        r#"create table orders (k1 int, v2 bigint)
+           TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true")"#,
+    )
+    .expect("create iceberg orders");
     conn.query_drop(
         "create materialized view orders_mv \
          distributed by hash(k1) buckets 2 \
          refresh async every interval 5 minute \
-         as select k1 from ice.ns.orders",
+         as select k1 from orders",
     )
     .expect("create mv with refresh policy");
 
     let created: Vec<Row> = conn
-        .query("show materialized views from analytics")
+        .query("show materialized views from ns")
         .expect("show mvs after create");
     assert_eq!(created.len(), 1);
     assert_eq!(
@@ -991,7 +900,7 @@ fn standalone_mysql_server_mv_refresh_policy_ddl_updates_show_metadata() {
     conn.query_drop("alter materialized view orders_mv pause refresh")
         .expect("pause refresh");
     let paused: Vec<Row> = conn
-        .query("show materialized views from analytics")
+        .query("show materialized views from ns")
         .expect("show mvs after pause");
     assert_eq!(
         paused[0].get::<String, _>(3),
@@ -1004,7 +913,7 @@ fn standalone_mysql_server_mv_refresh_policy_ddl_updates_show_metadata() {
     conn.query_drop("alter materialized view orders_mv resume refresh")
         .expect("resume refresh");
     let resumed: Vec<Row> = conn
-        .query("show materialized views from analytics")
+        .query("show materialized views from ns")
         .expect("show mvs after resume");
     assert_eq!(
         resumed[0].get::<String, _>(3),
@@ -1015,56 +924,48 @@ fn standalone_mysql_server_mv_refresh_policy_ddl_updates_show_metadata() {
 }
 
 #[test]
-fn standalone_mysql_server_mv_create_rejects_non_iceberg_base_table() {
+fn standalone_mysql_server_mv_create_rejects_starrocks_storage_engine() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
-        return;
-    };
+    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let iceberg_warehouse = unique_iceberg_warehouse("mv_reject_starrocks");
 
-    let args = vec![
-        "standalone-server".to_string(),
-        "--config".to_string(),
-        config_path.display().to_string(),
-    ];
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
-    conn.query_drop("create database analytics")
-        .expect("create analytics db");
-    conn.query_drop("use analytics").expect("use analytics");
+    conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
+        .expect("create iceberg catalog");
+    conn.query_drop("create database ice.ns")
+        .expect("create iceberg namespace");
+    conn.query_drop("set catalog ice").expect("set catalog");
+    conn.query_drop("use ns").expect("use namespace");
     conn.query_drop(
-        "create table base_table (k1 int, v2 bigint) \
-         duplicate key(k1) distributed by hash(k1) buckets 2",
+        r#"create table base_table (k1 int, v2 bigint)
+           TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true")"#,
     )
-    .expect("create StarRocks table");
+    .expect("create iceberg base table");
 
     let err = conn
         .query_drop(
             "create materialized view mv1 \
              distributed by hash(k1) buckets 2 \
+             properties ('storage_engine'='starrocks') \
              as select k1 from base_table",
         )
-        .expect_err("should reject non-Iceberg base table");
+        .expect_err("should reject StarRocks MV storage engine");
     assert!(
-        err.to_string().to_ascii_lowercase().contains("iceberg"),
+        err.to_string()
+            .to_ascii_lowercase()
+            .contains("storage_engine='starrocks'"),
         "unexpected error: {err}"
     );
 }
 
 #[test]
-fn standalone_mysql_server_mv_reopen_recovers_after_crashed_refresh() {
+fn standalone_mysql_server_mv_reopen_preserves_iceberg_mv() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
-        return;
-    };
+    let (_config_dir, args) = standalone_server_args_with_metadata(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_reopen");
-    let metadata_path = metadata_path_for_starrocks_table_config(&config_path);
 
-    let args = vec![
-        "standalone-server".to_string(),
-        "--config".to_string(),
-        config_path.display().to_string(),
-    ];
     {
         let mut server = ServerGuard::spawn(&args);
         let mut conn = server.connect_root(port);
@@ -1072,17 +973,19 @@ fn standalone_mysql_server_mv_reopen_recovers_after_crashed_refresh() {
             .expect("create iceberg catalog");
         conn.query_drop("create database ice.ns")
             .expect("create iceberg namespace");
-        conn.query_drop("create table ice.ns.orders (k1 int)")
-            .expect("create iceberg orders");
-        conn.query_drop("insert into ice.ns.orders values (1), (2)")
+        conn.query_drop("set catalog ice").expect("set catalog");
+        conn.query_drop("use ns").expect("use namespace");
+        conn.query_drop(
+            r#"create table orders (k1 int)
+               TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true")"#,
+        )
+        .expect("create iceberg orders");
+        conn.query_drop("insert into orders values (1), (2)")
             .expect("seed iceberg rows");
-        conn.query_drop("create database analytics")
-            .expect("create analytics db");
-        conn.query_drop("use analytics").expect("use analytics");
         conn.query_drop(
             "create materialized view orders_mv \
              distributed by hash(k1) buckets 1 \
-             as select k1 from ice.ns.orders",
+             as select k1 from orders",
         )
         .expect("create mv");
         conn.query_drop("refresh materialized view orders_mv")
@@ -1090,53 +993,13 @@ fn standalone_mysql_server_mv_reopen_recovers_after_crashed_refresh() {
     }
 
     {
-        let provider = SqliteMetaStoreProvider::open(&metadata_path).expect("open provider");
-        let mut write = provider
-            .begin_write("inject creating mv refresh partition")
-            .expect("begin metadata write");
-        let repo = StarRocksTableMetaRepository::default();
-        let snapshot = repo
-            .load_snapshot(write.as_ref())
-            .expect("load StarRocks metadata");
-        let table = snapshot
-            .tables
-            .iter()
-            .find(|table| table.name == "orders_mv")
-            .cloned()
-            .expect("orders_mv metadata");
-        repo.stage_truncate_partition(
-            write.as_mut(),
-            StageStarRocksTruncateRequest {
-                table_id: table.table_id,
-                db_id: table.db_id,
-                bucket_num: table.bucket_num,
-                partition_name: "p0".to_string(),
-                warehouse_uri: "s3://test/warehouse".to_string(),
-            },
-        )
-        .expect("inject creating partition");
-        write.commit().expect("commit metadata injection");
-    }
-
-    {
         let mut server = ServerGuard::spawn(&args);
         let mut conn = server.connect_root(port);
-        conn.query_drop("use analytics").expect("use analytics");
+        conn.query_drop("set catalog ice").expect("set catalog");
+        conn.query_drop("use ns").expect("use namespace");
         let rows: Vec<(Option<i32>,)> = conn
             .query("select k1 from orders_mv order by k1")
             .expect("select after reopen");
         assert_eq!(rows, vec![(Some(1),), (Some(2),)]);
-
-        let provider = SqliteMetaStoreProvider::open(&metadata_path).expect("open provider");
-        let read = provider.begin_read().expect("begin metadata read");
-        let snapshot = StarRocksTableMetaRepository::default()
-            .load_snapshot(read.as_ref())
-            .expect("load StarRocks metadata");
-        assert!(
-            !snapshot
-                .partitions
-                .iter()
-                .any(|partition| partition.state == StarRocksPartitionState::Creating)
-        );
     }
 }

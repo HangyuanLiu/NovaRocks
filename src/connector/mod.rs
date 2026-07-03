@@ -35,11 +35,8 @@ pub(crate) use iceberg::catalog::{
 pub(crate) use iceberg::changes::plan_changes as plan_iceberg_changes;
 #[cfg(not(test))]
 pub(crate) use iceberg::compact::spawn_optimize_worker as spawn_iceberg_optimize_worker;
-pub(crate) use starrocks::table::ddl::truncate_starrocks_table;
-pub(crate) use starrocks::table::erase::spawn_erase_worker as spawn_starrocks_table_erase_worker;
 #[cfg(test)]
 pub(crate) use starrocks::table::model::IcebergTableRef;
-pub(crate) use starrocks::table::txn::{insert_into_starrocks_table, publish_tablets_at_version};
 pub(crate) use starrocks::table::{
     StarRocksTableCatalog, StarRocksTableConfig, register_starrocks_tables_in_catalog,
     runtime_registered,
@@ -331,24 +328,11 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
         connectors.register_table_sink(Arc::new(iceberg::catalog::IcebergTableSink::new(
             Arc::clone(&iceberg_catalogs),
         )));
-
-        connectors.register_catalog_backend(Arc::new(
-            starrocks::table::StarRocksTableBackend::new(state),
-        ));
-        connectors
-            .register_table_source(Arc::new(starrocks::table::StarRocksTableSource::new(state)));
-        connectors.register_table_sink(Arc::new(starrocks::table::StarRocksTableSink::new(state)));
-        connectors.register_scan_planner(Arc::new(
-            starrocks::table::StarRocksTableScanPlanner::new(state),
-        ));
         connectors.register_scan_planner(Arc::new(
             iceberg::IcebergConnectorScanPlanner::with_catalog_registry(Arc::clone(
                 &iceberg_catalogs,
             )),
         ));
-        connectors.register_mv_backend(Arc::new(starrocks::table::StarRocksTableMvBackend::new(
-            state,
-        )));
         connectors.register_mv_backend(Arc::new(
             crate::engine::mv::iceberg_backend::IcebergMvBackend::new(state),
         ));

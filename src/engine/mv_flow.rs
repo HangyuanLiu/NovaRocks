@@ -253,23 +253,31 @@ mod lifecycle_tests {
     }
 }
 
-fn default_mv_storage_engine(state: &Arc<StandaloneState>) -> &str {
-    state
-        .starrocks_table_config
-        .as_ref()
-        .map(|config| config.mv_default_storage_engine.as_str())
-        .unwrap_or("starrocks")
+fn default_mv_storage_engine(_state: &Arc<StandaloneState>) -> &str {
+    "iceberg"
 }
 
 fn storage_engine_for_create(
     state: &Arc<StandaloneState>,
     stmt: &CreateMaterializedViewStmt,
 ) -> Result<MvStorageEngine, String> {
-    let resolved = crate::connector::starrocks::table::mv_ddl::resolve_mv_storage_engine(
-        &stmt.properties,
-        default_mv_storage_engine(state),
-    )?;
-    MvStorageEngine::from_sql_str(resolved.as_sql_str())
+    let raw = stmt
+        .properties
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("storage_engine"))
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_else(|| default_mv_storage_engine(state))
+        .trim();
+    match raw.to_ascii_lowercase().as_str() {
+        "iceberg" => Ok(MvStorageEngine::Iceberg),
+        "starrocks" => Err(
+            "storage_engine='starrocks' is no longer supported for standalone materialized views; use storage_engine='iceberg'"
+                .to_string(),
+        ),
+        _ => Err(format!(
+            "unknown materialized view storage_engine `{raw}`"
+        )),
+    }
 }
 
 fn existing_mv_storage_engine_by_target(
@@ -351,44 +359,25 @@ fn load_definition_for_alter(
     db: &str,
     name: &crate::sql::parser::ast::ObjectName,
 ) -> Result<StoredMvDefinition, String> {
-    if current_catalog.is_some() {
-        let target =
-            crate::engine::mv::iceberg_refresh::resolve_refresh_target(current_catalog, db, name)?;
-        if let Some(definition) = state
-            .mv_repo
-            .find_by_target(txn, &target.catalog, &target.namespace, &target.table)
-            .map_err(|e| format!("load MV definition by target failed: {e}"))?
-            && MvStorageEngine::from_sql_str(&definition.storage_engine)?
-                == MvStorageEngine::Iceberg
-        {
-            return Ok(definition);
-        }
-    }
-
-    let (database, mv_name) =
-        crate::connector::starrocks::table::mv_ddl::resolve_mv_name(name, db)?;
-    let runtime = {
-        let starrocks = state
-            .starrocks_table
-            .read()
-            .expect("standalone StarRocks table read lock");
-        starrocks.table(&database, &mv_name).ok().cloned()
-    };
-    let Some(runtime) = runtime else {
+    let target =
+        crate::engine::mv::iceberg_refresh::resolve_refresh_target(current_catalog, db, name)?;
+    let Some(definition) = state
+        .mv_repo
+        .find_by_target(txn, &target.catalog, &target.namespace, &target.table)
+        .map_err(|e| format!("load MV definition by target failed: {e}"))?
+    else {
         return Err(format!(
-            "materialized view does not exist: {database}.{mv_name}"
+            "materialized view does not exist: {}.{}.{}",
+            target.catalog, target.namespace, target.table
         ));
     };
-    if runtime.table.kind
-        != crate::connector::starrocks::table::model::StarRocksTableKind::MaterializedView
-    {
-        return Err(format!("`{database}.{mv_name}` is not a materialized view"));
+    if MvStorageEngine::from_sql_str(&definition.storage_engine)? != MvStorageEngine::Iceberg {
+        return Err(
+            "ALTER MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
+                .to_string(),
+        );
     }
-    state
-        .mv_repo
-        .load_by_id(txn, runtime.table.table_id)
-        .map_err(|e| format!("load MV definition failed: {e}"))?
-        .ok_or_else(|| format!("MV definition {} not found", runtime.table.table_id))
+    Ok(definition)
 }
 
 fn refresh_error_with_rollback(
@@ -467,22 +456,20 @@ pub(crate) fn drop_mv(
     db: &str,
     stmt: &DropMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    if current_catalog.is_some() {
-        let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
-            current_catalog,
-            db,
-            &stmt.name,
-        )?;
-        if existing_mv_storage_engine_by_target(state, &target)? == Some(MvStorageEngine::Iceberg) {
-            backend_by_engine(state, MvStorageEngine::Iceberg)?.drop_mv(DropMvRequest {
-                stmt: stmt.clone(),
-                current_catalog: current_catalog.map(str::to_string),
-                current_database: db.to_string(),
-            })?;
-            return Ok(StatementResult::Ok);
-        }
+    let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
+        current_catalog,
+        db,
+        &stmt.name,
+    )?;
+    if let Some(engine) = existing_mv_storage_engine_by_target(state, &target)?
+        && engine != MvStorageEngine::Iceberg
+    {
+        return Err(
+            "DROP MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
+                .to_string(),
+        );
     }
-    backend_by_engine(state, MvStorageEngine::StarRocks)?.drop_mv(DropMvRequest {
+    backend_by_engine(state, MvStorageEngine::Iceberg)?.drop_mv(DropMvRequest {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
         current_database: db.to_string(),
@@ -582,48 +569,36 @@ pub(crate) fn refresh_mv(
     db: &str,
     stmt: &RefreshMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    let (target, engine) = if current_catalog.is_some() {
-        let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
-            current_catalog,
-            db,
-            &stmt.name,
-        )?;
-        let engine = existing_mv_storage_engine_by_target(state, &target)?
-            .unwrap_or(MvStorageEngine::StarRocks);
-        (
-            MvTarget {
-                catalog: current_catalog.map(str::to_string),
-                database: target.namespace.clone(),
-                name: target.table.clone(),
-            },
-            engine,
+    let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
+        current_catalog,
+        db,
+        &stmt.name,
+    )?;
+    let engine = existing_mv_storage_engine_by_target(state, &target)?.ok_or_else(|| {
+        format!(
+            "materialized view does not exist: {}.{}.{}",
+            target.catalog, target.namespace, target.table
         )
-    } else {
-        let (database, name) =
-            crate::connector::starrocks::table::mv_ddl::resolve_mv_name(&stmt.name, db)?;
-        (
-            MvTarget {
-                catalog: None,
-                database,
-                name,
-            },
-            MvStorageEngine::StarRocks,
-        )
+    })?;
+    if engine != MvStorageEngine::Iceberg {
+        return Err(
+            "REFRESH MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
+                .to_string(),
+        );
     };
-    let requested_object = match engine {
-        MvStorageEngine::Iceberg => crate::engine::mv::dependency::iceberg_mv_dependency_ref(
-            target
-                .catalog
-                .as_deref()
-                .ok_or_else(|| "iceberg MV refresh target missing catalog".to_string())?,
-            &target.database,
-            &target.name,
-        ),
-        MvStorageEngine::StarRocks => crate::engine::mv::dependency::starrocks_mv_dependency_ref(
-            &target.database,
-            &target.name,
-        ),
+    let target = MvTarget {
+        catalog: Some(target.catalog),
+        database: target.namespace,
+        name: target.table,
     };
+    let requested_object = crate::engine::mv::dependency::iceberg_mv_dependency_ref(
+        target
+            .catalog
+            .as_deref()
+            .ok_or_else(|| "iceberg MV refresh target missing catalog".to_string())?,
+        &target.database,
+        &target.name,
+    );
     let steps =
         crate::engine::mv::dependency::build_upstream_refresh_steps(state, &requested_object)?;
     for step in steps {
@@ -667,15 +642,7 @@ pub(crate) fn list_mvs(
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
     };
-    let mut rows = Vec::new();
-    let backends = state
-        .connectors
-        .read()
-        .expect("connector registry read")
-        .mv_backends();
-    for backend in backends {
-        rows.extend(backend.list_mvs(req.clone())?);
-    }
+    let mut rows = backend_by_engine(state, MvStorageEngine::Iceberg)?.list_mvs(req)?;
     rows.sort_by(|left, right| {
         left.database
             .cmp(&right.database)

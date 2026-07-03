@@ -1200,19 +1200,6 @@ fn start_standalone_grpc_server(
             let app = Router::new()
                 .route_service(&grpc_path, grpc_service)
                 .route(
-                    "/api/:db/:table/_stream_load",
-                    put(stream_load_http::handle_stream_load),
-                )
-                .route(
-                    "/api/transaction/load",
-                    put(stream_load_http::handle_transaction_load),
-                )
-                .route(
-                    "/api/transaction/:txn_op",
-                    post(stream_load_http::handle_transaction_op)
-                        .put(stream_load_http::handle_transaction_op),
-                )
-                .route(
                     "/api/_load_tracking/:hi/:lo",
                     get(load_tracking_http::handle_load_tracking_log),
                 )

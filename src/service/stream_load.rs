@@ -265,31 +265,6 @@ fn parse_format(headers: &HttpHeaders) -> Result<TFileFormatType, ApiError> {
     ))
 }
 
-fn standalone_stream_load_format_from_thrift(
-    format: TFileFormatType,
-) -> crate::engine::StandaloneStreamLoadFormat {
-    match format {
-        TFileFormatType::FORMAT_JSON => crate::engine::StandaloneStreamLoadFormat::Json,
-        TFileFormatType::FORMAT_CSV_PLAIN => crate::engine::StandaloneStreamLoadFormat::CsvPlain,
-        TFileFormatType::FORMAT_CSV_GZ => {
-            crate::engine::StandaloneStreamLoadFormat::Unsupported("FORMAT_CSV_GZ")
-        }
-        TFileFormatType::FORMAT_CSV_BZ2 => {
-            crate::engine::StandaloneStreamLoadFormat::Unsupported("FORMAT_CSV_BZ2")
-        }
-        TFileFormatType::FORMAT_CSV_LZ4_FRAME => {
-            crate::engine::StandaloneStreamLoadFormat::Unsupported("FORMAT_CSV_LZ4_FRAME")
-        }
-        TFileFormatType::FORMAT_CSV_DEFLATE => {
-            crate::engine::StandaloneStreamLoadFormat::Unsupported("FORMAT_CSV_DEFLATE")
-        }
-        TFileFormatType::FORMAT_CSV_ZSTD => {
-            crate::engine::StandaloneStreamLoadFormat::Unsupported("FORMAT_CSV_ZSTD")
-        }
-        _ => crate::engine::StandaloneStreamLoadFormat::Unsupported("unsupported"),
-    }
-}
-
 fn parse_partial_update_mode(
     headers: &HttpHeaders,
 ) -> Result<Option<TPartialUpdateMode>, ApiError> {
@@ -842,55 +817,6 @@ fn ensure_txn_extensions_supported(options: &LoadHeaderOptions) -> Result<(), Ap
     Ok(())
 }
 
-fn ensure_standalone_stream_load_supported(options: &LoadHeaderOptions) -> Result<(), ApiError> {
-    if options.where_clause.is_some() {
-        return Err(ApiError::new(
-            TStatusCode::NOT_IMPLEMENTED_ERROR,
-            "standalone stream load does not support `where`",
-        ));
-    }
-    if options.partitions.is_some() || options.is_temp_partition.unwrap_or(false) {
-        return Err(ApiError::new(
-            TStatusCode::NOT_IMPLEMENTED_ERROR,
-            "standalone stream load does not support partition routing",
-        ));
-    }
-    if options.negative.unwrap_or(false) {
-        return Err(ApiError::new(
-            TStatusCode::NOT_IMPLEMENTED_ERROR,
-            "standalone stream load does not support `negative=true`",
-        ));
-    }
-    if options.partial_update.unwrap_or(false)
-        || options.partial_update_mode.is_some()
-        || options.merge_condition.is_some()
-    {
-        return Err(ApiError::new(
-            TStatusCode::NOT_IMPLEMENTED_ERROR,
-            "standalone stream load does not support partial update or merge condition yet",
-        ));
-    }
-    if options.transmission_compression_type.is_some() || options.payload_compression_type.is_some()
-    {
-        return Err(ApiError::new(
-            TStatusCode::NOT_IMPLEMENTED_ERROR,
-            "standalone stream load does not support compressed payloads",
-        ));
-    }
-    if options.load_dop.is_some()
-        || options.prepared_timeout.is_some()
-        || options.idle_transaction_timeout.is_some()
-        || options.channel_id.is_some()
-        || options.warehouse.is_some()
-    {
-        return Err(ApiError::new(
-            TStatusCode::NOT_IMPLEMENTED_ERROR,
-            "standalone stream load does not support FE-only load options",
-        ));
-    }
-    Ok(())
-}
-
 fn with_txn_context_for_update<T>(
     label: &str,
     f: impl FnOnce(&mut TxnContext) -> Result<T, ApiError>,
@@ -1122,72 +1048,6 @@ pub(crate) fn handle_stream_load(
     };
     let label = options.label.clone().unwrap_or_else(generate_label);
     let mut stats = LoadStats::default();
-
-    if let Some(engine) = crate::engine::current_stream_load_engine()
-        && engine.has_local_table(&db, &table)
-    {
-        if let Err(err) = ensure_standalone_stream_load_supported(&options) {
-            return stream_load_response(
-                err.code,
-                &err.message,
-                &db,
-                &table,
-                &label,
-                0,
-                &stats,
-                err.existing_job_status.as_deref(),
-            );
-        }
-
-        let local_started = Instant::now();
-        let request = crate::engine::StandaloneStreamLoadRequest {
-            database: db.clone(),
-            table: table.clone(),
-            format_type: standalone_stream_load_format_from_thrift(options.format_type),
-            columns: options.columns.clone(),
-            column_separator: options.column_separator.clone(),
-            row_delimiter: options.row_delimiter.clone(),
-            skip_header: options.skip_header,
-            trim_space: options.trim_space,
-            enclose: options.enclose,
-            escape: options.escape,
-            jsonpaths: options.jsonpaths.clone(),
-            strip_outer_array: options.strip_outer_array,
-            payload: body.clone(),
-        };
-        match engine.stream_load_starrocks_table(request) {
-            Ok(result) => {
-                stats.number_total_rows = result.loaded_rows;
-                stats.number_loaded_rows = result.loaded_rows;
-                stats.load_bytes = result.loaded_bytes;
-                stats.stream_load_plan_time_ms = local_started.elapsed().as_millis() as i64;
-                stats.load_time_ms = started.elapsed().as_millis() as i64;
-                return stream_load_response(
-                    TStatusCode::OK,
-                    "OK",
-                    &db,
-                    &table,
-                    &label,
-                    0,
-                    &stats,
-                    None,
-                );
-            }
-            Err(err) => {
-                stats.load_time_ms = started.elapsed().as_millis() as i64;
-                return stream_load_response(
-                    TStatusCode::INVALID_ARGUMENT,
-                    &err,
-                    &db,
-                    &table,
-                    &label,
-                    0,
-                    &stats,
-                    None,
-                );
-            }
-        }
-    }
 
     let mut txn_id = 0_i64;
     let mut begin_ok = false;

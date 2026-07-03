@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use crate::connector::truncate_starrocks_table as truncate_starrocks_table_fn;
 use crate::engine::catalog::normalize_identifier;
 use crate::engine::name_resolve::resolve_local_table_name;
 use crate::engine::{
@@ -846,25 +845,16 @@ pub(crate) fn execute_create_table_statement(
 ) -> Result<StatementResult, String> {
     let legacy_range_partitions = stmt.legacy_range_partitions.clone();
     // CTAS dispatch: when the statement carries an AS SELECT clause, route
-    // StarRocks table targets to the StarRocks table CTAS helper and iceberg targets
-    // to the iceberg helper. The parser already rejected
-    // non-iceberg-compatible CTAS forms (branch target / format-version=2 /
-    // explicit columns / etc.).
+    // targets to the iceberg helper. The parser already rejected non-iceberg-
+    // compatible CTAS forms (branch target / format-version=2 / explicit
+    // columns / etc.).
     if stmt.as_select.is_some() {
-        let target = crate::engine::backend_resolver::resolve_table_target(
+        crate::engine::backend_resolver::resolve_table_target(
             state,
             &stmt.name,
             current_catalog,
             current_database,
         )?;
-        if target.backend_name == "starrocks" {
-            return crate::engine::starrocks_table_ctas::execute_starrocks_table_ctas(
-                state,
-                stmt,
-                current_catalog,
-                current_database,
-            );
-        }
         return crate::engine::iceberg_ctas::execute_iceberg_ctas(
             state,
             stmt,
@@ -881,16 +871,6 @@ pub(crate) fn execute_create_table_statement(
             partition_fields,
             properties,
         } => {
-            if current_catalog.is_none()
-                && stmt.name.parts.len() <= 2
-                && state.starrocks_table_config.is_none()
-            {
-                return Err(
-                    "StarRocks table is not configured; set `warehouse_uri` to run CREATE TABLE"
-                        .to_string(),
-                );
-            }
-
             // BITMAP / HLL columns cannot be used as distribution keys —
             // they are opaque blobs with no hash semantics that match a
             // scalar column. Reject the CREATE TABLE before any catalog
@@ -941,17 +921,7 @@ pub(crate) fn execute_create_table_statement(
                 partition_fields,
                 properties,
             })?;
-            if !legacy_range_partitions.is_empty() && target.backend_name == "starrocks" {
-                state
-                    .catalog
-                    .write()
-                    .expect("standalone catalog write lock")
-                    .set_legacy_range_partitions(
-                        &target.namespace,
-                        &target.table,
-                        legacy_range_partitions,
-                    )?;
-            }
+            let _ = legacy_range_partitions;
             if target.backend_name == "iceberg" {
                 persist_iceberg_table_if_needed(
                     state,
@@ -1223,34 +1193,6 @@ pub(crate) fn execute_truncate_table_statement(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
-    // StarRocks table check only applies to local (1- or 2-part) names with no
-    // active external catalog. Three-part names (catalog.db.table) are always
-    // routed to the iceberg backend resolver below.
-    if current_catalog.is_none() && name.parts.len() <= 2 {
-        let resolved = resolve_local_table_name(name, current_database)?;
-        if state
-            .starrocks_table
-            .read()
-            .expect("standalone StarRocks table read lock")
-            .contains_table(&resolved.database, &resolved.table)?
-        {
-            if target_ref != "main" {
-                return Err(format!(
-                    "TRUNCATE TABLE: branch target `{target_ref}` is only supported for iceberg tables"
-                ));
-            }
-            let result = truncate_starrocks_table_fn(state, &resolved.database, &resolved.table)?;
-            crate::engine::dictionary::maintenance::mark_starrocks_table_stale(
-                state,
-                &resolved.database,
-                &resolved.table,
-            )?;
-            return Ok(result);
-        }
-    }
-
-    // Fall through to iceberg backend resolution (handles 1-, 2-, and 3-part
-    // names, including catalog.db.table three-part form).
     let target = crate::engine::backend_resolver::resolve_existing_table_target(
         state,
         name,
@@ -1259,7 +1201,7 @@ pub(crate) fn execute_truncate_table_statement(
     )?;
     if target.backend_name != "iceberg" {
         return Err(format!(
-            "TRUNCATE TABLE only supports StarRocks table or iceberg tables: {}.{}",
+            "TRUNCATE TABLE only supports iceberg tables: {}.{}",
             target.namespace, target.table
         ));
     }

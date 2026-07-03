@@ -30,11 +30,11 @@ impl StarRocksTableConfig {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("starrocks")
+            .unwrap_or("iceberg")
             .to_string();
-        if mv_default_storage_engine != "starrocks" && mv_default_storage_engine != "iceberg" {
+        if mv_default_storage_engine != "iceberg" {
             return Err(format!(
-                "invalid mv_default_storage_engine `{mv_default_storage_engine}`; allowed: starrocks, iceberg"
+                "invalid mv_default_storage_engine `{mv_default_storage_engine}`; allowed: iceberg"
             ));
         }
         Ok(Self {
@@ -82,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn starrocks_table_config_defaults_storage_engine_to_starrocks() {
+    fn starrocks_table_config_defaults_storage_engine_to_iceberg() {
         let app = StandaloneStarRocksTableConfig {
             warehouse_uri: "s3://bucket/wh/".to_string(),
             endpoint: "http://localhost:9000".to_string(),
@@ -93,7 +93,7 @@ mod tests {
             mv_default_storage_engine: None,
         };
         let cfg = StarRocksTableConfig::from_app_config(app).expect("config");
-        assert_eq!(cfg.mv_default_storage_engine, "starrocks");
+        assert_eq!(cfg.mv_default_storage_engine, "iceberg");
     }
 
     #[test]
@@ -109,6 +109,21 @@ mod tests {
         };
         let err = StarRocksTableConfig::from_app_config(app).unwrap_err();
         assert!(err.contains("duckdb"), "err={err}");
+        assert!(err.contains("iceberg"), "err={err}");
+    }
+
+    #[test]
+    fn starrocks_table_config_rejects_starrocks_storage_engine() {
+        let app = StandaloneStarRocksTableConfig {
+            warehouse_uri: "s3://bucket/wh/".to_string(),
+            endpoint: "http://localhost:9000".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            region: None,
+            enable_path_style_access: Some(true),
+            mv_default_storage_engine: Some("starrocks".to_string()),
+        };
+        let err = StarRocksTableConfig::from_app_config(app).unwrap_err();
         assert!(err.contains("starrocks"), "err={err}");
         assert!(err.contains("iceberg"), "err={err}");
     }

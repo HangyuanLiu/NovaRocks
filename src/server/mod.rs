@@ -177,7 +177,6 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
         Some(cfg) => StandaloneNovaRocks::open_with_config(opts, cfg)?,
         None => StandaloneNovaRocks::open(opts)?,
     };
-    crate::engine::register_stream_load_engine(engine.clone());
     let _refresh_coordinator = crate::engine::mv_scheduler::start_refresh_coordinator_for_server(
         &engine,
         resolved.refresh_coordinator.clone(),
