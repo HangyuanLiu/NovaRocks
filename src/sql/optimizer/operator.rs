@@ -217,9 +217,8 @@ pub(crate) struct ScanOp {
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<ScalarId>,
     pub required_columns: Option<Vec<String>>,
-    /// Per-scan dictionary plan hints. Populated by the Task 7
-    /// `LowCardinalityDictionaryRewrite` rule on the logical side and
-    /// propagated to `ScanOp` by `ScanToPhysical`.
+    /// Per-scan dictionary plan hints propagated from logical scan planning
+    /// to `ScanOp` by `ScanToPhysical`.
     pub dict_columns: Vec<ScanDictionaryColumn>,
     /// Synthetic typed columns materialized from variant paths during scan.
     /// Populated by `VariantPathPushdownRule` and propagated to
@@ -512,9 +511,9 @@ pub(crate) struct AssertOneRowOp {
 }
 
 /// Logical dictionary-decode operator. Maps dictionary-encoded child columns
-/// back to their string form. Produced exclusively by the dictionary-rewrite
-/// rule (Task 7); the implementation rule `DecodeToPhysical` lowers it to
-/// `DecodeOp`.
+/// back to their string form. This native decode-boundary infrastructure is
+/// still present during the R0 cleanup; the implementation rule
+/// `DecodeToPhysical` lowers logical decode boundaries to `PhysicalDecode`.
 ///
 /// `output_columns` mirrors the input group's output columns with each
 /// `dict_column` swapped for its `string_column`. Without it

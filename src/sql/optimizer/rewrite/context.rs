@@ -112,20 +112,6 @@ pub(crate) struct RewriteContext {
     /// rewrite phase (mirrors `column_ref_factory`); rules that inspect or
     /// build scalars go through this. Unwrapped into `Memo.scalars` at convert.
     scalar_arena: Option<Rc<RefCell<ScalarArena>>>,
-    /// Accumulating set of (lowercased) column names that the
-    /// low-cardinality dictionary rewrite must NOT dict-encode, because
-    /// they are consumed somewhere in the plan in a position the rewriter
-    /// does not retarget to the dict slot (e.g. a filter predicate, a
-    /// non-allowlisted aggregate, a function argument). The collector
-    /// seeds this from the FULL plan on the rule's first (outermost)
-    /// `apply` invocation; the `TopDown` driver then re-fires the rule on
-    /// every subtree (including bare `Scan`s), where the consumer context
-    /// is no longer visible — so the decision must persist here.
-    /// Monotonic (only grows): blocklisting a column is always
-    /// conservative (it loses an optimization, never correctness), so a
-    /// stale-but-superset blocklist is safe. Lives for one query's rewrite
-    /// run only (the context is rebuilt per query).
-    dict_rewrite_blocklist: std::collections::BTreeSet<String>,
 }
 
 impl RewriteContext {
@@ -141,7 +127,6 @@ impl RewriteContext {
             dictionary_provider: None,
             column_ref_factory: None,
             scalar_arena: None,
-            dict_rewrite_blocklist: std::collections::BTreeSet::new(),
         }
     }
 
@@ -214,22 +199,6 @@ impl RewriteContext {
 
     pub(crate) fn dictionary_provider(&self) -> Option<&Arc<dyn QueryDictionaryProvider>> {
         self.dictionary_provider.as_ref()
-    }
-
-    /// Merge `columns` (already lowercased) into the persistent
-    /// dictionary-rewrite blocklist. Used by the low-cardinality dict
-    /// collector so a column found unsafe on the full-plan pass stays
-    /// blocked when the `TopDown` driver re-fires the rule on a bare
-    /// subtree that no longer shows the unsafe consumer.
-    pub(crate) fn extend_dict_rewrite_blocklist(
-        &mut self,
-        columns: impl IntoIterator<Item = String>,
-    ) {
-        self.dict_rewrite_blocklist.extend(columns);
-    }
-
-    pub(crate) fn dict_rewrite_blocklist(&self) -> &std::collections::BTreeSet<String> {
-        &self.dict_rewrite_blocklist
     }
 
     pub(crate) fn set_column_ref_factory(&mut self, factory: Rc<RefCell<ColumnRefFactory>>) {

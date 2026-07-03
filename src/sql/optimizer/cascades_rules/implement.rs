@@ -375,8 +375,8 @@ impl Rule for ScanToPhysical {
                 columns: op.columns.clone(),
                 predicates: op.predicates.clone(),
                 required_columns: op.required_columns.clone(),
-                // Propagated from the logical scan. Populated by Task 7
-                // `LowCardinalityDictionaryRewrite`; empty otherwise.
+                // Propagated from the logical scan. Empty when no scan
+                // dictionary planning selected this scan.
                 dict_columns: op.dict_columns.clone(),
                 // Propagated from the logical scan. Populated by
                 // `VariantPathPushdown`; empty otherwise.

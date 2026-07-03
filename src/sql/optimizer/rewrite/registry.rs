@@ -220,9 +220,6 @@ mod tests {
         assert!(!is_known_rewrite_rule_name(""));
         assert!(is_known_rewrite_rule_name("AggregatePushdown"));
         assert!(is_known_rewrite_rule_name("PushDownPredicateProject"));
-        assert!(!is_known_rewrite_rule_name(
-            "LowCardinalityDictionaryRewrite"
-        ));
         assert!(is_known_rewrite_rule_name("TagRequiredColumns"));
         assert!(is_known_rewrite_rule_name("VariantPathPushdown"));
         assert!(!is_known_rewrite_rule_name("PushFilterThroughProject"));
