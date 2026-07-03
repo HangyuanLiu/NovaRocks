@@ -481,8 +481,13 @@ impl RuntimeProfile {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let counters = self
-            .counter_snapshots()
+        let mut counter_snapshots = self.counter_snapshots();
+        counter_snapshots.sort_by(|left, right| {
+            left.parent_name
+                .cmp(&right.parent_name)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        let counters = counter_snapshots
             .into_iter()
             .map(counter_snapshot_to_proto)
             .collect();

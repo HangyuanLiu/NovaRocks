@@ -17,6 +17,11 @@ fn runtime_profile_tree_survives_proto_roundtrip() {
     root.set_metadata(10);
     root.add_info_string("query_id", "q-1");
 
+    let z_root = root.add_unit_counter("ZRoot");
+    z_root.set(300);
+    let none_counter = root.add_child_counter("NoUnitCounter", metrics::TUnit::NONE, "ZRoot");
+    none_counter.set(0);
+
     let total_time = root.add_timer("TotalTime");
     total_time.set(123);
     total_time.set_min(100);
@@ -50,7 +55,27 @@ fn runtime_profile_tree_survives_proto_roundtrip() {
         decoded_root.info_strings.get("query_id"),
         Some(&"q-1".to_string())
     );
-    assert_eq!(decoded_root.children.len(), 2);
+    assert_eq!(
+        decoded_root
+            .children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["SCAN (plan_node_id=1)", "EXCHANGE (plan_node_id=2)"]
+    );
+    assert_eq!(
+        decoded_root
+            .counters
+            .iter()
+            .map(|counter| (counter.parent_name.as_str(), counter.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("", "TotalTime"),
+            ("", "ZRoot"),
+            ("TotalTime", "ScanTime"),
+            ("ZRoot", "NoUnitCounter"),
+        ]
+    );
 
     let root_total = decoded_root
         .counters
@@ -72,6 +97,14 @@ fn runtime_profile_tree_survives_proto_roundtrip() {
     assert_eq!(root_scan_time.unit, novarocks::ProfileUnit::TimeNs as i32);
     assert_eq!(root_scan_time.min_value, Some(60));
     assert_eq!(root_scan_time.max_value, Some(90));
+
+    let no_unit_counter = decoded_root
+        .counters
+        .iter()
+        .find(|c| c.name == "NoUnitCounter")
+        .expect("NoUnitCounter counter");
+    assert_eq!(no_unit_counter.parent_name, "ZRoot");
+    assert_eq!(no_unit_counter.unit, novarocks::ProfileUnit::None as i32);
 
     let scan_node = decoded_root
         .children
