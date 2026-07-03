@@ -37,9 +37,10 @@ use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::common::failpoint;
+use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
 use crate::exec::node::aggregate::{AggFunction, TopNRuntimeFilterSpec};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -47,7 +48,7 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::runtime_filter::min_max::RuntimeMinMaxFilter;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 
-use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
+use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::runtime::mem_tracker::MemTracker;
@@ -104,6 +105,121 @@ pub(super) fn align_schema_with_arrays(
 
 pub(super) fn is_compatible_aggregate_data_type(expected: &DataType, actual: &DataType) -> bool {
     expected == actual
+}
+
+pub(super) fn is_compatible_aggregate_group_data_type(
+    expected: &DataType,
+    actual: &DataType,
+) -> bool {
+    if matches!(
+        (expected, actual),
+        (
+            DataType::Utf8,
+            DataType::Dictionary(key, value)
+        ) if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8
+    ) {
+        return true;
+    }
+    if matches!(
+        (expected, actual),
+        (
+            DataType::LargeUtf8,
+            DataType::Dictionary(key, value)
+        ) if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::LargeUtf8
+    ) {
+        return true;
+    }
+    expected == actual
+}
+
+pub(super) fn aggregate_accepts_encoded_group_column(
+    arena: &ExprArena,
+    group_by: &[ExprId],
+    functions: &[AggFunction],
+    slot_id: SlotId,
+    data_type: &DataType,
+) -> bool {
+    if group_by.len() != 1 {
+        return false;
+    }
+    if !matches!(
+        data_type,
+        DataType::Dictionary(key, value)
+            if key.as_ref() == &DataType::Int32
+                && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8)
+    ) {
+        return false;
+    }
+    if !matches!(arena.node(group_by[0]), Some(ExprNode::SlotId(group_slot)) if *group_slot == slot_id)
+    {
+        return false;
+    }
+    !functions.iter().any(|function| {
+        function
+            .inputs
+            .iter()
+            .any(|expr| expr_references_slot(arena, *expr, slot_id))
+    })
+}
+
+fn expr_references_slot(arena: &ExprArena, expr: ExprId, slot_id: SlotId) -> bool {
+    let Some(node) = arena.node(expr) else {
+        return false;
+    };
+    match node {
+        ExprNode::Literal(_) => false,
+        ExprNode::SlotId(slot) => *slot == slot_id,
+        ExprNode::ArrayExpr { elements } | ExprNode::StructExpr { fields: elements } => elements
+            .iter()
+            .any(|child| expr_references_slot(arena, *child, slot_id)),
+        ExprNode::LambdaFunction {
+            body,
+            common_sub_exprs,
+            ..
+        } => {
+            expr_references_slot(arena, *body, slot_id)
+                || common_sub_exprs
+                    .iter()
+                    .any(|(_, child)| expr_references_slot(arena, *child, slot_id))
+        }
+        ExprNode::DictDecode { child, .. }
+        | ExprNode::Cast(child)
+        | ExprNode::CastTime(child)
+        | ExprNode::CastTimeFromDatetime(child)
+        | ExprNode::Not(child)
+        | ExprNode::IsNull(child)
+        | ExprNode::IsNotNull(child)
+        | ExprNode::Clone(child) => expr_references_slot(arena, *child, slot_id),
+        ExprNode::Add(left, right)
+        | ExprNode::Sub(left, right)
+        | ExprNode::Mul(left, right)
+        | ExprNode::Div(left, right)
+        | ExprNode::Mod(left, right)
+        | ExprNode::Eq(left, right)
+        | ExprNode::EqForNull(left, right)
+        | ExprNode::Ne(left, right)
+        | ExprNode::Lt(left, right)
+        | ExprNode::Le(left, right)
+        | ExprNode::Gt(left, right)
+        | ExprNode::Ge(left, right)
+        | ExprNode::And(left, right)
+        | ExprNode::Or(left, right) => {
+            expr_references_slot(arena, *left, slot_id)
+                || expr_references_slot(arena, *right, slot_id)
+        }
+        ExprNode::In { child, values, .. } => {
+            expr_references_slot(arena, *child, slot_id)
+                || values
+                    .iter()
+                    .any(|value| expr_references_slot(arena, *value, slot_id))
+        }
+        ExprNode::Case { children, .. } => children
+            .iter()
+            .any(|child| expr_references_slot(arena, *child, slot_id)),
+        ExprNode::FunctionCall { args, .. } => args
+            .iter()
+            .any(|child| expr_references_slot(arena, *child, slot_id)),
+    }
 }
 
 /// Factory that constructs aggregate processors backed by group-key hash tables and aggregate kernels.
@@ -478,23 +594,13 @@ impl AggregateProcessorOperator {
                     let view = key_views
                         .first()
                         .ok_or_else(|| "one string key view missing".to_string())?;
-                    let GroupKeyArrayView::Utf8(arr) = view else {
-                        return Err("one string key expects Utf8 view".to_string());
-                    };
                     let hashes = key_table
                         .build_group_hashes(&key_views, num_rows)
                         .map_err(|e| e.to_string())?;
                     for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
-                        let lookup = if arr.is_null(row) {
-                            key_table
-                                .find_or_insert_one_string(view, row, None, hash)
-                                .map_err(|e| e.to_string())?
-                        } else {
-                            let key = arr.value(row);
-                            key_table
-                                .find_or_insert_one_string(view, row, Some(key), hash)
-                                .map_err(|e| e.to_string())?
-                        };
+                        let lookup = key_table
+                            .find_or_insert_one_string_like(view, row, hash)
+                            .map_err(|e| e.to_string())?;
                         self.ensure_group_state(&lookup)
                             .map_err(|e| e.to_string())?;
                         group_ids.push(lookup.group_id);
@@ -740,6 +846,16 @@ impl ProcessorOperator for AggregateProcessorOperator {
             self.finished = true;
         }
         Ok(())
+    }
+
+    fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
+        aggregate_accepts_encoded_group_column(
+            &self.arena,
+            &self.group_by,
+            &self.functions,
+            slot_id,
+            data_type,
+        )
     }
 }
 
@@ -1038,7 +1154,7 @@ impl AggregateProcessorOperator {
         }
         for (idx, (expected_type, array)) in expected.iter().zip(arrays.iter()).enumerate() {
             let actual_type = array.data_type();
-            if !is_compatible_aggregate_data_type(expected_type, actual_type) {
+            if !is_compatible_aggregate_group_data_type(expected_type, actual_type) {
                 return Err(format!(
                     "group by type mismatch at {}: expected {:?}, got {:?}",
                     idx, expected_type, actual_type
@@ -1173,7 +1289,7 @@ impl Drop for AggregateProcessorOperator {
 mod tests {
     use arrow::datatypes::DataType;
 
-    use super::is_compatible_aggregate_data_type;
+    use super::{is_compatible_aggregate_data_type, is_compatible_aggregate_group_data_type};
 
     #[test]
     fn aggregate_rejects_decimal_precision_drift() {
@@ -1188,6 +1304,114 @@ mod tests {
         assert!(is_compatible_aggregate_data_type(
             &DataType::Decimal128(10, 2),
             &DataType::Decimal128(10, 2)
+        ));
+    }
+
+    #[test]
+    fn aggregate_accepts_dictionary_runtime_type_for_utf8_group_key() {
+        assert!(is_compatible_aggregate_group_data_type(
+            &DataType::Utf8,
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        ));
+        assert!(is_compatible_aggregate_group_data_type(
+            &DataType::LargeUtf8,
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeUtf8)),
+        ));
+        assert!(!is_compatible_aggregate_group_data_type(
+            &DataType::Utf8,
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeUtf8)),
+        ));
+        assert!(!is_compatible_aggregate_group_data_type(
+            &DataType::Utf8,
+            &DataType::Dictionary(Box::new(DataType::Int64), Box::new(DataType::Utf8)),
+        ));
+        assert!(!is_compatible_aggregate_data_type(
+            &DataType::Utf8,
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        ));
+    }
+
+    #[test]
+    fn aggregate_encoded_gate_accepts_only_single_direct_group_slot() {
+        use crate::common::ids::SlotId;
+        use crate::exec::expr::{ExprArena, ExprNode};
+        use crate::exec::node::aggregate::AggFunction;
+
+        let slot = SlotId::new(7);
+        let other_slot = SlotId::new(8);
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let large_dict_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeUtf8));
+        let binary_dict_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary));
+
+        let mut arena = ExprArena::default();
+        let group_expr = arena.push_typed(ExprNode::SlotId(slot), DataType::Utf8);
+        assert!(super::aggregate_accepts_encoded_group_column(
+            &arena,
+            &[group_expr],
+            &[],
+            slot,
+            &dict_type,
+        ));
+        assert!(super::aggregate_accepts_encoded_group_column(
+            &arena,
+            &[group_expr],
+            &[],
+            slot,
+            &large_dict_type,
+        ));
+        assert!(!super::aggregate_accepts_encoded_group_column(
+            &arena,
+            &[group_expr],
+            &[],
+            other_slot,
+            &dict_type,
+        ));
+        assert!(!super::aggregate_accepts_encoded_group_column(
+            &arena,
+            &[group_expr],
+            &[],
+            slot,
+            &binary_dict_type,
+        ));
+        assert!(!super::aggregate_accepts_encoded_group_column(
+            &arena,
+            &[group_expr],
+            &[],
+            slot,
+            &DataType::Utf8,
+        ));
+
+        let cast_expr = arena.push_typed(ExprNode::Cast(group_expr), DataType::Utf8);
+        assert!(!super::aggregate_accepts_encoded_group_column(
+            &arena,
+            &[cast_expr],
+            &[],
+            slot,
+            &dict_type,
+        ));
+
+        let other_group = arena.push_typed(ExprNode::SlotId(other_slot), DataType::Utf8);
+        assert!(!super::aggregate_accepts_encoded_group_column(
+            &arena,
+            &[group_expr, other_group],
+            &[],
+            slot,
+            &dict_type,
+        ));
+
+        let function_using_group_slot = AggFunction {
+            name: "min".to_string(),
+            inputs: vec![group_expr],
+            ..Default::default()
+        };
+        assert!(!super::aggregate_accepts_encoded_group_column(
+            &arena,
+            &[group_expr],
+            &[function_using_group_slot],
+            slot,
+            &dict_type,
         ));
     }
 

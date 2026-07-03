@@ -38,6 +38,24 @@ struct KeyEntry {
     hash: u64,
 }
 
+#[derive(Default)]
+struct DictKeyMap {
+    values_ptr: Option<usize>,
+    code_to_group: Vec<Option<usize>>,
+}
+
+impl DictKeyMap {
+    fn reset_for(&mut self, values_ptr: usize, values_len: usize) {
+        if self.values_ptr != Some(values_ptr) {
+            self.values_ptr = Some(values_ptr);
+            self.code_to_group.clear();
+        }
+        if self.code_to_group.len() < values_len {
+            self.code_to_group.resize(values_len, None);
+        }
+    }
+}
+
 pub(crate) struct KeyLookup {
     pub(crate) group_id: usize,
     pub(crate) is_new: bool,
@@ -52,6 +70,7 @@ pub(crate) struct KeyTable {
     compressed_table: RawTable<KeyEntry>,
     one_number_table: RawTable<KeyEntry>,
     one_string_null: Option<usize>,
+    dict_key_map: DictKeyMap,
     row_storage: RowStorage,
     varlen_keys: Vec<RowKey>,
     compressed_ctx: Option<CompressedKeyContext>,
@@ -103,6 +122,7 @@ impl KeyTable {
             compressed_table: RawTable::new(),
             one_number_table: RawTable::new(),
             one_string_null: None,
+            dict_key_map: DictKeyMap::default(),
             row_storage: RowStorage::new(64 * 1024),
             varlen_keys: Vec::new(),
             compressed_ctx: None,
@@ -329,65 +349,76 @@ impl KeyTable {
         key: Option<&str>,
         hash: u64,
     ) -> Result<KeyLookup, String> {
-        let GroupKeyArrayView::Utf8(arr) = view else {
+        if !matches!(view, GroupKeyArrayView::Utf8(_)) {
             return Err("one string key expects Utf8 view".to_string());
+        }
+        self.find_or_insert_one_string_value(view, row, key, hash)
+    }
+
+    pub(crate) fn find_or_insert_one_string_like(
+        &mut self,
+        view: &GroupKeyArrayView<'_>,
+        row: usize,
+        hash: u64,
+    ) -> Result<KeyLookup, String> {
+        match view {
+            GroupKeyArrayView::Utf8(arr) => {
+                let key = (!arr.is_null(row)).then(|| arr.value(row));
+                self.find_or_insert_one_string_value(view, row, key, hash)
+            }
+            GroupKeyArrayView::Dictionary(dict) => {
+                let Some(code) = dict.code_at(row)? else {
+                    return self.find_or_insert_one_string_value(view, row, None, hash);
+                };
+                self.dict_key_map
+                    .reset_for(dict.values_ptr(), dict.values_len());
+                if let Some(Some(group_id)) = self.dict_key_map.code_to_group.get(code).copied() {
+                    let col = self
+                        .key_columns
+                        .first()
+                        .ok_or_else(|| "one string key column missing".to_string())?;
+                    if col.value_equals(group_id, view, row)? {
+                        return Ok(KeyLookup {
+                            group_id,
+                            is_new: false,
+                        });
+                    }
+                }
+                let key = dict.value_str_for_code(code)?;
+                let lookup = self.find_or_insert_one_string_value(view, row, Some(key), hash)?;
+                let slot = self
+                    .dict_key_map
+                    .code_to_group
+                    .get_mut(code)
+                    .ok_or_else(|| "dictionary group key code out of bounds".to_string())?;
+                *slot = Some(lookup.group_id);
+                Ok(lookup)
+            }
+            _ => Err("one string key expects Utf8 or Dictionary view".to_string()),
+        }
+    }
+
+    fn find_or_insert_one_string_value(
+        &mut self,
+        view: &GroupKeyArrayView<'_>,
+        row: usize,
+        key: Option<&str>,
+        hash: u64,
+    ) -> Result<KeyLookup, String> {
+        let row_is_null = match view {
+            GroupKeyArrayView::Utf8(arr) => arr.is_null(row),
+            GroupKeyArrayView::Dictionary(dict) => dict.is_null(row),
+            _ => return Err("one string key expects Utf8 or Dictionary view".to_string()),
         };
         match key {
             Some(key) => {
-                if arr.is_null(row) {
+                if row_is_null {
                     return Err("one string key requires non-null row".to_string());
                 }
-                let mut error = None;
-                let key_bytes = key.as_bytes();
-                let result = {
-                    let keys = &self.varlen_keys;
-                    let table = &mut self.varlen_table;
-                    table.find_or_find_insert_slot(
-                        hash,
-                        |entry| match keys.get(entry.group_id) {
-                            Some(stored) => stored.as_slice() == key_bytes,
-                            None => {
-                                error = Some("group key index out of bounds".to_string());
-                                false
-                            }
-                        },
-                        |entry| entry.hash,
-                    )
-                };
-                if let Some(err) = error {
-                    return Err(err);
-                }
-                match result {
-                    Ok(bucket) => Ok(KeyLookup {
-                        group_id: unsafe { bucket.as_ref().group_id },
-                        is_new: false,
-                    }),
-                    Err(slot) => {
-                        let col = self
-                            .key_columns
-                            .get_mut(0)
-                            .ok_or_else(|| "one string key column missing".to_string())?;
-                        col.push_value_from_view(view, row)?;
-                        let group_id = self.alloc_group()?;
-                        let stored_key = self.row_storage.alloc_copy(key_bytes);
-                        if let Some(slot_key) = self.varlen_keys.get_mut(group_id) {
-                            *slot_key = stored_key;
-                        } else {
-                            return Err("group key index out of bounds".to_string());
-                        }
-                        let entry = KeyEntry { group_id, hash };
-                        unsafe {
-                            self.varlen_table.insert_in_slot(hash, slot, entry);
-                        }
-                        Ok(KeyLookup {
-                            group_id,
-                            is_new: true,
-                        })
-                    }
-                }
+                self.find_or_insert_one_string_non_null(view, row, key, hash)
             }
             None => {
-                if !arr.is_null(row) {
+                if !row_is_null {
                     return Err("one string key null requires null row".to_string());
                 }
                 if let Some(group_id) = self.one_string_null {
@@ -403,6 +434,63 @@ impl KeyTable {
                 col.push_value_from_view(view, row)?;
                 let group_id = self.alloc_group()?;
                 self.one_string_null = Some(group_id);
+                Ok(KeyLookup {
+                    group_id,
+                    is_new: true,
+                })
+            }
+        }
+    }
+
+    fn find_or_insert_one_string_non_null(
+        &mut self,
+        view: &GroupKeyArrayView<'_>,
+        row: usize,
+        key: &str,
+        hash: u64,
+    ) -> Result<KeyLookup, String> {
+        let mut error = None;
+        let key_bytes = key.as_bytes();
+        let result = {
+            let keys = &self.varlen_keys;
+            let table = &mut self.varlen_table;
+            table.find_or_find_insert_slot(
+                hash,
+                |entry| match keys.get(entry.group_id) {
+                    Some(stored) => stored.as_slice() == key_bytes,
+                    None => {
+                        error = Some("group key index out of bounds".to_string());
+                        false
+                    }
+                },
+                |entry| entry.hash,
+            )
+        };
+        if let Some(err) = error {
+            return Err(err);
+        }
+        match result {
+            Ok(bucket) => Ok(KeyLookup {
+                group_id: unsafe { bucket.as_ref().group_id },
+                is_new: false,
+            }),
+            Err(slot) => {
+                let col = self
+                    .key_columns
+                    .get_mut(0)
+                    .ok_or_else(|| "one string key column missing".to_string())?;
+                col.push_value_from_view(view, row)?;
+                let group_id = self.alloc_group()?;
+                let stored_key = self.row_storage.alloc_copy(key_bytes);
+                if let Some(slot_key) = self.varlen_keys.get_mut(group_id) {
+                    *slot_key = stored_key;
+                } else {
+                    return Err("group key index out of bounds".to_string());
+                }
+                let entry = KeyEntry { group_id, hash };
+                unsafe {
+                    self.varlen_table.insert_in_slot(hash, slot, entry);
+                }
                 Ok(KeyLookup {
                     group_id,
                     is_new: true,
@@ -677,4 +765,139 @@ fn keys_equal(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
+    use arrow::array::{ArrayRef, DictionaryArray};
+    use arrow::datatypes::{DataType, Int32Type};
+    use std::sync::Arc;
+
+    fn dict_utf8(values: Vec<Option<&str>>) -> ArrayRef {
+        Arc::new(values.into_iter().collect::<DictionaryArray<Int32Type>>())
+    }
+
+    #[test]
+    fn dictionary_cache_resets_when_values_ptr_changes() {
+        let mut table = KeyTable::new(vec![DataType::Utf8], true).expect("table");
+
+        let first = dict_utf8(vec![Some("A"), Some("B")]);
+        let first_arrays = [first];
+        let first_views = build_group_key_views(&first_arrays).expect("first views");
+        let first_hashes = table
+            .build_group_hashes(&first_views, 2)
+            .expect("first hashes");
+        let a = table
+            .find_or_insert_one_string_like(&first_views[0], 0, first_hashes[0])
+            .expect("insert A");
+        let b = table
+            .find_or_insert_one_string_like(&first_views[0], 1, first_hashes[1])
+            .expect("insert B");
+        assert_ne!(a.group_id, b.group_id);
+
+        let second = dict_utf8(vec![Some("B"), Some("A")]);
+        let second_arrays = [second];
+        let second_views = build_group_key_views(&second_arrays).expect("second views");
+        let second_hashes = table
+            .build_group_hashes(&second_views, 2)
+            .expect("second hashes");
+        let b_again = table
+            .find_or_insert_one_string_like(&second_views[0], 0, second_hashes[0])
+            .expect("lookup B after values ptr change");
+        let a_again = table
+            .find_or_insert_one_string_like(&second_views[0], 1, second_hashes[1])
+            .expect("lookup A after values ptr change");
+
+        assert_eq!(b_again.group_id, b.group_id);
+        assert_eq!(a_again.group_id, a.group_id);
+        assert_eq!(table.group_count(), 2);
+    }
+
+    #[test]
+    fn dictionary_cache_reuses_same_values_identity_for_duplicate_code() {
+        let mut table = KeyTable::new(vec![DataType::Utf8], true).expect("table");
+
+        let dict = dict_utf8(vec![Some("A"), Some("B"), Some("A")]);
+        let arrays = [dict];
+        let views = build_group_key_views(&arrays).expect("views");
+        let hashes = table.build_group_hashes(&views, 3).expect("hashes");
+        let a = table
+            .find_or_insert_one_string_like(&views[0], 0, hashes[0])
+            .expect("insert A");
+        let b = table
+            .find_or_insert_one_string_like(&views[0], 1, hashes[1])
+            .expect("insert B");
+        let a_again = table
+            .find_or_insert_one_string_like(&views[0], 2, hashes[2])
+            .expect("lookup A");
+
+        assert_ne!(a.group_id, b.group_id);
+        assert_eq!(a_again.group_id, a.group_id);
+        assert!(!a_again.is_new);
+        assert_eq!(table.group_count(), 2);
+    }
+
+    #[test]
+    fn dictionary_cache_verifies_stale_entry_before_returning() {
+        let mut table = KeyTable::new(vec![DataType::Utf8], true).expect("table");
+
+        let first = dict_utf8(vec![Some("A"), Some("B")]);
+        let first_arrays = [first];
+        let first_views = build_group_key_views(&first_arrays).expect("first views");
+        let first_hashes = table
+            .build_group_hashes(&first_views, 2)
+            .expect("first hashes");
+        let a = table
+            .find_or_insert_one_string_like(&first_views[0], 0, first_hashes[0])
+            .expect("insert A");
+        let b = table
+            .find_or_insert_one_string_like(&first_views[0], 1, first_hashes[1])
+            .expect("insert B");
+
+        let second = dict_utf8(vec![Some("B"), Some("A")]);
+        let second_arrays = [second];
+        let second_views = build_group_key_views(&second_arrays).expect("second views");
+        let second_hashes = table
+            .build_group_hashes(&second_views, 2)
+            .expect("second hashes");
+        let GroupKeyArrayView::Dictionary(dict) = &second_views[0] else {
+            panic!("expected dictionary view");
+        };
+        table.dict_key_map.values_ptr = Some(dict.values_ptr());
+        table.dict_key_map.code_to_group = vec![Some(a.group_id), Some(b.group_id)];
+
+        let b_again = table
+            .find_or_insert_one_string_like(&second_views[0], 0, second_hashes[0])
+            .expect("lookup B with stale code cache");
+
+        assert_eq!(b_again.group_id, b.group_id);
+        assert!(!b_again.is_new);
+        assert_eq!(table.dict_key_map.code_to_group[0], Some(b.group_id));
+    }
+
+    #[test]
+    fn dictionary_null_key_reuses_existing_null_group() {
+        let mut table = KeyTable::new(vec![DataType::Utf8], true).expect("table");
+
+        let dict = dict_utf8(vec![None, Some("A"), None]);
+        let arrays = [dict];
+        let views = build_group_key_views(&arrays).expect("views");
+        let hashes = table.build_group_hashes(&views, 3).expect("hashes");
+        let null = table
+            .find_or_insert_one_string_like(&views[0], 0, hashes[0])
+            .expect("insert null");
+        let a = table
+            .find_or_insert_one_string_like(&views[0], 1, hashes[1])
+            .expect("insert A");
+        let null_again = table
+            .find_or_insert_one_string_like(&views[0], 2, hashes[2])
+            .expect("lookup null");
+
+        assert_ne!(null.group_id, a.group_id);
+        assert_eq!(null_again.group_id, null.group_id);
+        assert!(!null_again.is_new);
+        assert_eq!(table.group_count(), 2);
+    }
 }
