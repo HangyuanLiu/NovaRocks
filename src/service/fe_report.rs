@@ -259,18 +259,36 @@ pub(crate) fn report_fragment_done(
                 instance.query_mem_tracker.as_ref(),
                 include_runtime_filters,
             );
-            let report = exec_status_report::build_native_report(ExecStatusReportInput {
+            let report = match exec_status_report::build_native_report(ExecStatusReportInput {
                 finst_id,
                 query_id: instance.query_id,
                 backend_num: instance.backend_num,
-                status,
+                status: status.clone(),
                 profile: None,
                 done: true,
                 tracking_url: None,
                 load_channel_profile: None,
                 load_datacache_metrics: None,
                 native_profile,
-            });
+            }) {
+                Ok(report) => report,
+                Err(err) => {
+                    warn!(
+                        target: "novarocks::report",
+                        finst_id = %finst_id,
+                        query_id = %instance.query_id,
+                        error = %err,
+                        "failed to build native final reportExecStatus"
+                    );
+                    native_error_report(
+                        instance.query_id,
+                        finst_id,
+                        instance.backend_num,
+                        true,
+                        format!("failed to build native reportExecStatus: {err}"),
+                    )
+                }
+            };
             enqueue_standalone_final_report(StandaloneExecStateReportTask {
                 finst_id,
                 query_id: instance.query_id,
@@ -344,18 +362,30 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
                 instance.query_mem_tracker.as_ref(),
                 false,
             );
-            let report = exec_status_report::build_native_report(ExecStatusReportInput {
+            let report = match exec_status_report::build_native_report(ExecStatusReportInput {
                 finst_id,
                 query_id: instance.query_id,
                 backend_num: instance.backend_num,
-                status,
+                status: status.clone(),
                 profile: None,
                 done: false,
                 tracking_url: None,
                 load_channel_profile: None,
                 load_datacache_metrics: None,
                 native_profile,
-            });
+            }) {
+                Ok(report) => report,
+                Err(err) => {
+                    warn!(
+                        target: "novarocks::report",
+                        finst_id = %finst_id,
+                        query_id = %instance.query_id,
+                        error = %err,
+                        "failed to build native non-final reportExecStatus"
+                    );
+                    return;
+                }
+            };
             enqueue_standalone_non_final_report(StandaloneExecStateReportTask {
                 finst_id,
                 query_id: instance.query_id,
@@ -524,6 +554,36 @@ fn build_load_datacache_metrics(
         Some(count),
         build_datacache_runtime_metrics(),
     ))
+}
+
+fn native_error_report(
+    query_id: QueryId,
+    finst_id: UniqueId,
+    backend_num: i32,
+    done: bool,
+    message: String,
+) -> novarocks::ExecStatusReport {
+    novarocks::ExecStatusReport {
+        query_id: Some(crate::proto::common::UniqueId {
+            hi: query_id.hi,
+            lo: query_id.lo,
+        }),
+        fragment_instance_id: Some(crate::proto::common::UniqueId {
+            hi: finst_id.hi,
+            lo: finst_id.lo,
+        }),
+        backend_num,
+        status: Some(crate::proto::common::Status {
+            code: status_code::TStatusCode::INTERNAL_ERROR.0,
+            message,
+        }),
+        done,
+        iceberg_commits: Vec::new(),
+        loaded_rows: 0,
+        sink_load_bytes: 0,
+        filtered_rows: 0,
+        profile: None,
+    }
 }
 
 fn build_profile_tree(

@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use crate::common::types::UniqueId;
-use crate::novarocks_logging::{debug, warn};
+use crate::novarocks_logging::debug;
 use crate::proto::{common, novarocks};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::sink_commit;
@@ -126,30 +126,24 @@ pub(crate) fn build_report_params(
     )
 }
 
-pub(crate) fn build_native_report(input: ExecStatusReportInput) -> novarocks::ExecStatusReport {
+pub(crate) fn build_native_report(
+    input: ExecStatusReportInput,
+) -> Result<novarocks::ExecStatusReport, String> {
     let sink_commit_infos = sink_commit::list(input.finst_id);
     let (loaded_rows, sink_load_bytes, filtered_rows) =
         load_stats_for_report(input.finst_id, &sink_commit_infos);
-    let iceberg_commits = sink_commit_infos
-        .into_iter()
-        .filter(|info| info.iceberg_data_file.is_some())
-        .filter_map(
-            |info| match sink_commit_wire::sink_commit_info_to_native(info) {
-                Ok(native) => Some(native),
-                Err(err) => {
-                    warn!(
-                        target: "novarocks::sink_commit",
-                        finst_id = %input.finst_id,
-                        error = %err,
-                        "failed to convert sink commit info to native report"
-                    );
-                    None
-                }
-            },
-        )
-        .collect();
+    let mut iceberg_commits = Vec::new();
+    for info in sink_commit_infos {
+        if info.hive_file_info.is_some() && info.iceberg_data_file.is_none() {
+            continue;
+        }
+        iceberg_commits.push(
+            sink_commit_wire::sink_commit_info_to_native(info)
+                .map_err(|err| format!("failed to convert sink commit info to native: {err}"))?,
+        );
+    }
 
-    novarocks::ExecStatusReport {
+    Ok(novarocks::ExecStatusReport {
         query_id: Some(common::UniqueId {
             hi: input.query_id.hi,
             lo: input.query_id.lo,
@@ -174,7 +168,7 @@ pub(crate) fn build_native_report(input: ExecStatusReportInput) -> novarocks::Ex
         sink_load_bytes,
         filtered_rows,
         profile: input.native_profile,
-    }
+    })
 }
 
 fn load_stats_for_report(
@@ -423,7 +417,8 @@ mod tests {
             load_channel_profile: None,
             load_datacache_metrics: None,
             native_profile: Some(RuntimeProfile::new("FragmentRoot").to_proto()),
-        });
+        })
+        .expect("native report");
 
         assert_eq!(
             native.query_id.expect("query id"),
@@ -465,6 +460,39 @@ mod tests {
                 .values[0]
                 .datum_bytes,
             Some(b"us".to_vec())
+        );
+        sink_commit::unregister(finst_id);
+    }
+
+    #[test]
+    fn native_builder_fails_when_sink_commit_cannot_convert_to_native() {
+        let finst_id = UniqueId { hi: 193, lo: 194 };
+        sink_commit::register(finst_id);
+        sink_commit::add(
+            finst_id,
+            types::TSinkCommitInfo {
+                is_overwrite: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let err = build_native_report(ExecStatusReportInput {
+            finst_id,
+            query_id: QueryId { hi: 183, lo: 184 },
+            backend_num: 7,
+            status: ok_status(),
+            done: true,
+            profile: None,
+            tracking_url: None,
+            load_channel_profile: None,
+            load_datacache_metrics: None,
+            native_profile: None,
+        })
+        .expect_err("native report must fail instead of dropping malformed commit metadata");
+
+        assert!(
+            err.contains("missing iceberg_data_file"),
+            "unexpected error: {err}"
         );
         sink_commit::unregister(finst_id);
     }

@@ -562,6 +562,29 @@ fn handle_native_standalone_report_exec_status(
             }
         }
         crate::runtime::write_coordinator::WriterReportLookup::UnknownWriter { query_id } => {
+            if !report.iceberg_commits.is_empty() {
+                let message = format!(
+                    "unknown writer report with write metadata for query {}/{}, fragment {}/{}, backend {}",
+                    query_id.hi,
+                    query_id.lo,
+                    report
+                        .fragment_instance_id
+                        .as_ref()
+                        .map(|id| id.hi)
+                        .unwrap_or_default(),
+                    report
+                        .fragment_instance_id
+                        .as_ref()
+                        .map(|id| id.lo)
+                        .unwrap_or_default(),
+                    report.backend_num,
+                );
+                crate::runtime::write_coordinator::mark_query_failed(&query_id, message.clone());
+                return Err(EngineError::distributed_write_output_mismatch(
+                    "reportExecStatus",
+                    message,
+                ));
+            }
             if let Some(failure) = failure {
                 crate::runtime::write_coordinator::mark_query_failed(
                     &query_id,
@@ -1624,6 +1647,45 @@ mod pr3_tests {
             .expect("write coordinator lock")
             .commit_input()
             .expect("writer report should still commit");
+    }
+
+    #[tokio::test]
+    async fn report_exec_status_rejects_unknown_writer_with_write_metadata() {
+        let mut guard = crate::runtime::write_coordinator::write_registry_test_guard();
+        let query = types::TUniqueId::new(714, 814);
+        let writer_finst = types::TUniqueId::new(715, 815);
+        let unknown_writer_finst = types::TUniqueId::new(716, 816);
+        let coord = guard
+            .register_query(
+                query.clone(),
+                vec![crate::runtime::write_coordinator::WriterKey {
+                    query_id: query.clone(),
+                    fragment_instance_id: writer_finst,
+                    backend_num: 0,
+                }],
+            )
+            .expect("register write coordinator");
+        let report = write_report(query, unknown_writer_finst);
+        let svc = GrpcService::default();
+        let req = Request::new(ReportExecStatusRequest {
+            report: Some(report),
+        });
+        let resp = svc
+            .report_exec_status(req)
+            .await
+            .expect("RPC level success");
+        let body = resp.into_inner();
+        assert_ne!(body.status_code, 0);
+        assert_eq!(body.error_code, "DistributedWriteOutputMismatch");
+        assert!(
+            body.message.contains("unknown writer"),
+            "unexpected message: {}",
+            body.message
+        );
+        assert!(
+            coord.lock().expect("write coordinator lock").has_failed(),
+            "unknown writer commit metadata must fail the registered write query"
+        );
     }
 
     #[tokio::test]
