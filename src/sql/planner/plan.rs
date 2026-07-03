@@ -13,7 +13,6 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 pub(crate) use crate::sql::common::{ApplyKind, ChangeStreamBranchKind, ScanVariantColumn};
-use crate::sql::optimizer::property::HashSource;
 use crate::sql::planner::{AggMode, AggregateOutputLayout, JoinDistribution, TopNPhase};
 
 // ---------------------------------------------------------------------------
@@ -554,7 +553,7 @@ pub(crate) enum RedistributeMode {
     Gather,
     Hash {
         cols: Vec<ColumnId>,
-        source: HashSource,
+        source: crate::sql::optimizer::property::HashSource,
     },
     Broadcast,
 }

@@ -10,7 +10,6 @@ use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, Typed
 use crate::sql::catalog;
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
-use crate::sql::optimizer::property::HashSource;
 use crate::sql::parser::ast::SqlType;
 use crate::sql::planner::plan::{
     ExchangeFlavor, PhysicalPlanKind, PlanSetOpKind, RedistributeMode,
@@ -1643,10 +1642,14 @@ fn encode_sort_topn_type(src: crate::exec::node::sort::SortTopNType) -> i32 {
     }
 }
 
-fn encode_hash_source(src: HashSource) -> i32 {
+fn encode_hash_source(src: crate::sql::optimizer::property::HashSource) -> i32 {
     match src {
-        HashSource::ShuffleAgg => plan::HashSource::ShuffleAgg as i32,
-        HashSource::ShuffleJoin => plan::HashSource::ShuffleJoin as i32,
+        crate::sql::optimizer::property::HashSource::ShuffleAgg => {
+            plan::HashSource::ShuffleAgg as i32
+        }
+        crate::sql::optimizer::property::HashSource::ShuffleJoin => {
+            plan::HashSource::ShuffleJoin as i32
+        }
     }
 }
 
