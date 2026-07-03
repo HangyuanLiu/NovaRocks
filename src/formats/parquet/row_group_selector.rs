@@ -18,7 +18,9 @@
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 
-use crate::common::scan_predicate::{ScanPredicate, ScanPredicateDomain};
+use crate::common::scan_predicate::{
+    ColumnStats, ScanLayer, ScanPredicate, ScanPredicateDomainKind, ScanPruner, UnitId, prune_units,
+};
 use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::debug;
 
@@ -26,6 +28,144 @@ use super::{
     BoundVariantPathPruningPredicate, MinMaxPredicate, MinMaxPredicateValue,
     variant_residual_value_all_null_for_row_group,
 };
+
+#[cfg(test)]
+const FORCE_ROW_GROUP_PRUNER_ERROR_COLUMN: &str = "__force_row_group_pruner_error";
+
+struct ParquetRowGroupPruner<'a> {
+    metadata: &'a ParquetMetaData,
+    units: Vec<UnitId>,
+    columns: &'a [String],
+    case_sensitive: bool,
+}
+
+impl<'a> ParquetRowGroupPruner<'a> {
+    fn new(
+        metadata: &'a ParquetMetaData,
+        units: Vec<UnitId>,
+        columns: &'a [String],
+        case_sensitive: bool,
+    ) -> Self {
+        Self {
+            metadata,
+            units,
+            columns,
+            case_sensitive,
+        }
+    }
+}
+
+impl ScanPruner for ParquetRowGroupPruner<'_> {
+    fn layer(&self) -> ScanLayer {
+        ScanLayer::RowGroup
+    }
+
+    fn accepts_domain(&self, kind: ScanPredicateDomainKind) -> bool {
+        matches!(
+            kind,
+            ScanPredicateDomainKind::Range | ScanPredicateDomainKind::DiscreteSet
+        )
+    }
+
+    fn units(&self) -> &[UnitId] {
+        &self.units
+    }
+
+    fn column_stats<'a>(&'a self, column: &str, unit: UnitId) -> Option<Box<dyn ColumnStats + 'a>> {
+        #[cfg(test)]
+        if column == FORCE_ROW_GROUP_PRUNER_ERROR_COLUMN {
+            return Some(Box::new(ForcedErrorColumnStats));
+        }
+
+        let col_idx = column.parse::<usize>().ok()?;
+        let col_name = self.columns.get(col_idx)?;
+        let row_group = self.metadata.row_groups().get(unit)?;
+        let chunk = row_group.columns().iter().find(|candidate| {
+            let path_str = candidate.column_path().string();
+            if self.case_sensitive {
+                path_str == *col_name
+            } else {
+                path_str.eq_ignore_ascii_case(col_name)
+            }
+        })?;
+        Some(Box::new(ParquetRowGroupColumnStats { column: chunk }))
+    }
+}
+
+#[cfg(test)]
+struct ForcedErrorColumnStats;
+
+#[cfg(test)]
+impl ColumnStats for ForcedErrorColumnStats {
+    fn may_satisfy_range(
+        &self,
+        _op: crate::common::min_max_predicate::MinMaxPredicateOp,
+        _value: &MinMaxPredicateValue,
+    ) -> Result<Option<bool>, String> {
+        Err("forced row group pruning error".to_string())
+    }
+
+    fn may_satisfy_discrete_set(
+        &self,
+        _values: &[MinMaxPredicateValue],
+        _min: &MinMaxPredicateValue,
+        _max: &MinMaxPredicateValue,
+    ) -> Result<Option<bool>, String> {
+        Err("forced row group pruning error".to_string())
+    }
+}
+
+struct ParquetRowGroupColumnStats<'a> {
+    column: &'a ColumnChunkMetaData,
+}
+
+impl ColumnStats for ParquetRowGroupColumnStats<'_> {
+    fn may_satisfy_range(
+        &self,
+        op: crate::common::min_max_predicate::MinMaxPredicateOp,
+        value: &MinMaxPredicateValue,
+    ) -> Result<Option<bool>, String> {
+        let predicate =
+            min_max_predicate_from_parts("__scan_pruner".to_string(), op, value.clone());
+        column_stats_satisfy_predicate(self.column, &predicate).map(Some)
+    }
+
+    fn may_satisfy_discrete_set(
+        &self,
+        values: &[MinMaxPredicateValue],
+        _min: &MinMaxPredicateValue,
+        _max: &MinMaxPredicateValue,
+    ) -> Result<Option<bool>, String> {
+        let Some(stats) = self.column.statistics() else {
+            return Ok(None);
+        };
+        discrete_set_stats_may_satisfy(stats, values).map(Some)
+    }
+}
+
+fn min_max_predicate_from_parts(
+    column: String,
+    op: crate::common::min_max_predicate::MinMaxPredicateOp,
+    value: MinMaxPredicateValue,
+) -> MinMaxPredicate {
+    match op {
+        crate::common::min_max_predicate::MinMaxPredicateOp::Le => {
+            MinMaxPredicate::Le { column, value }
+        }
+        crate::common::min_max_predicate::MinMaxPredicateOp::Ge => {
+            MinMaxPredicate::Ge { column, value }
+        }
+        crate::common::min_max_predicate::MinMaxPredicateOp::Lt => {
+            MinMaxPredicate::Lt { column, value }
+        }
+        crate::common::min_max_predicate::MinMaxPredicateOp::Gt => {
+            MinMaxPredicate::Gt { column, value }
+        }
+        crate::common::min_max_predicate::MinMaxPredicateOp::Eq => {
+            MinMaxPredicate::Eq { column, value }
+        }
+    }
+}
 
 pub(crate) fn select_row_groups_for_range(
     metadata: &ParquetMetaData,
@@ -44,55 +184,45 @@ pub(crate) fn select_row_groups_for_range(
         return None;
     }
 
-    let split_start = range.offset;
-    let mut split_end = split_start.saturating_add(range.length);
-    if range.file_len > 0 && split_end > range.file_len {
-        split_end = range.file_len;
-    }
-    if range.length == 0 && range.file_len == 0 {
-        split_end = u64::MAX;
-    }
+    let candidate_row_groups = candidate_row_groups_for_range(metadata, range)?;
 
     let mut row_groups = Vec::new();
     let mut filtered_count = 0;
 
-    for (idx, row_group) in metadata.row_groups().iter().enumerate() {
-        let rg_start = row_group_start_offset(row_group)?;
-        if rg_start >= split_start && rg_start < split_end {
-            if !physical_predicates.is_empty() || !variant_predicates.is_empty() {
-                match should_read_row_group(
-                    row_group,
-                    physical_predicates,
-                    variant_predicates,
-                    columns,
-                    case_sensitive,
-                ) {
-                    Ok(true) => {
-                        // Passed pruning.
-                    }
-                    Ok(false) => {
-                        // Pruned out.
+    for idx in candidate_row_groups {
+        let row_group = metadata.row_group(idx);
+        if !physical_predicates.is_empty() {
+            let pruner = ParquetRowGroupPruner::new(metadata, vec![idx], columns, case_sensitive);
+            match prune_units(&pruner, physical_predicates) {
+                Ok(result) => {
+                    if !result.kept_units.contains(&idx) {
                         filtered_count += 1;
                         continue;
                     }
-                    Err(e) => {
-                        // On error, conservatively keep the row group.
-                        debug!("error checking row group predicates: {}", e);
+                }
+                Err(e) => {
+                    debug!("error checking row group scan predicates: {}", e);
+                    if !keep_row_group(&mut row_groups, &mut remaining_rows, idx, row_group) {
+                        break;
                     }
+                    continue;
                 }
             }
+        }
 
-            row_groups.push(idx);
-            if let Some(rows_left) = remaining_rows.as_mut() {
-                let rg_rows = row_group.num_rows().max(0) as usize;
-                if rg_rows >= *rows_left {
-                    break;
-                }
-                *rows_left = rows_left.saturating_sub(rg_rows);
-                if *rows_left == 0 {
-                    break;
-                }
+        match variant_predicates_may_satisfy_row_group(row_group, variant_predicates) {
+            Ok(true) => {}
+            Ok(false) => {
+                filtered_count += 1;
+                continue;
             }
+            Err(e) => {
+                debug!("error checking variant row group predicates: {}", e);
+            }
+        }
+
+        if !keep_row_group(&mut row_groups, &mut remaining_rows, idx, row_group) {
+            break;
         }
     }
 
@@ -107,40 +237,53 @@ pub(crate) fn select_row_groups_for_range(
     Some(row_groups)
 }
 
-fn should_read_row_group(
+fn keep_row_group(
+    row_groups: &mut Vec<usize>,
+    remaining_rows: &mut Option<usize>,
+    idx: usize,
     row_group: &RowGroupMetaData,
-    predicates: &[ScanPredicate],
-    variant_predicates: &[BoundVariantPathPruningPredicate],
-    columns: &[String],
-    case_sensitive: bool,
-) -> Result<bool, String> {
-    for pred in predicates {
-        let col_idx_str = pred.column();
-        let Ok(col_idx) = col_idx_str.parse::<usize>() else {
-            continue;
-        };
-
-        if col_idx >= columns.len() {
-            continue;
+) -> bool {
+    row_groups.push(idx);
+    if let Some(rows_left) = remaining_rows.as_mut() {
+        let rg_rows = row_group.num_rows().max(0) as usize;
+        if rg_rows >= *rows_left {
+            return false;
         }
-        let col_name = &columns[col_idx];
-
-        let chunk = row_group.columns().iter().find(|c| {
-            let path_str = c.column_path().string();
-            if case_sensitive {
-                path_str == *col_name
-            } else {
-                path_str.eq_ignore_ascii_case(col_name)
-            }
-        });
-
-        if let Some(chunk) = chunk
-            && !column_stats_satisfy_scan_predicate(chunk, pred)?
-        {
-            return Ok(false);
+        *rows_left = rows_left.saturating_sub(rg_rows);
+        if *rows_left == 0 {
+            return false;
         }
     }
+    true
+}
 
+fn candidate_row_groups_for_range(
+    metadata: &ParquetMetaData,
+    range: &FileScanRange,
+) -> Option<Vec<usize>> {
+    let split_start = range.offset;
+    let mut split_end = split_start.saturating_add(range.length);
+    if range.file_len > 0 && split_end > range.file_len {
+        split_end = range.file_len;
+    }
+    if range.length == 0 && range.file_len == 0 {
+        split_end = u64::MAX;
+    }
+
+    let mut row_groups = Vec::new();
+    for (idx, row_group) in metadata.row_groups().iter().enumerate() {
+        let rg_start = row_group_start_offset(row_group)?;
+        if rg_start >= split_start && rg_start < split_end {
+            row_groups.push(idx);
+        }
+    }
+    Some(row_groups)
+}
+
+fn variant_predicates_may_satisfy_row_group(
+    row_group: &RowGroupMetaData,
+    variant_predicates: &[BoundVariantPathPruningPredicate],
+) -> Result<bool, String> {
     for pred in variant_predicates {
         if !variant_residual_value_all_null_for_row_group(row_group, pred) {
             continue;
@@ -154,30 +297,6 @@ fn should_read_row_group(
     }
 
     Ok(true)
-}
-
-fn column_stats_satisfy_scan_predicate(
-    column: &ColumnChunkMetaData,
-    pred: &ScanPredicate,
-) -> Result<bool, String> {
-    match pred.domain() {
-        ScanPredicateDomain::Range { .. } => {
-            let min_max = pred.to_min_max_predicates();
-            for predicate in &min_max {
-                if !column_stats_satisfy_predicate(column, predicate)? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        ScanPredicateDomain::DiscreteSet { values, .. } => {
-            if let Some(stats) = column.statistics() {
-                discrete_set_stats_may_satisfy(stats, values)
-            } else {
-                Ok(true)
-            }
-        }
-    }
 }
 
 fn discrete_set_stats_may_satisfy(
@@ -668,6 +787,10 @@ mod tests {
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use parquet::file::statistics::ValueStatistics;
 
+    use crate::common::scan_predicate::{
+        MembershipPredicate, ScanLayer, ScanPredicate, ScanPredicateDomain,
+        ScanPredicateDomainKind, ScanPredicateSource, ScanPruner, prune_units,
+    };
     use crate::formats::parquet::BoundVariantPathPruningPredicate;
 
     fn test_scan_range() -> FileScanRange {
@@ -773,6 +896,79 @@ mod tests {
                 value: MinMaxPredicateValue::Int64(value),
             },
         }
+    }
+
+    #[test]
+    fn candidate_row_groups_for_range_preserves_split_bounds() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
+        let first_start =
+            row_group_start_offset(metadata.row_group(0)).expect("first row group start");
+        let mut range = test_scan_range();
+        range.offset = 0;
+        if first_start == 0 {
+            range.file_len = 1;
+            range.length = 0;
+        } else {
+            range.length = first_start;
+        }
+
+        let candidates = candidate_row_groups_for_range(&metadata, &range).expect("candidates");
+        assert!(!candidates.contains(&0));
+
+        range.length = first_start + 1;
+        let candidates = candidate_row_groups_for_range(&metadata, &range).expect("candidates");
+        assert_eq!(candidates, vec![0]);
+    }
+
+    #[test]
+    fn row_group_pruning_keeps_all_for_unsupported_membership_domain() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
+        let predicate = ScanPredicate::new(
+            "0".to_string(),
+            ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                values: vec![MinMaxPredicateValue::Int64(2)],
+            }),
+            ScanPredicateSource::RuntimeMembership,
+        );
+
+        let selected = select_row_groups_for_range(
+            &metadata,
+            &test_scan_range(),
+            None,
+            &[predicate],
+            &[],
+            &["a".to_string()],
+            true,
+        )
+        .expect("row groups selected");
+
+        assert_eq!(selected, vec![0, 1]);
+    }
+
+    #[test]
+    fn row_group_pruning_physical_error_keeps_group_before_variant_and_limit() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
+        let physical_predicate = ScanPredicate::from_min_max_predicate(
+            MinMaxPredicate::Gt {
+                column: FORCE_ROW_GROUP_PRUNER_ERROR_COLUMN.to_string(),
+                value: MinMaxPredicateValue::Int64(99),
+            },
+            ScanPredicateSource::Static,
+        );
+        let variant_predicate = variant_gt_i64_predicate(0, 5);
+
+        let selected = select_row_groups_for_range(
+            &metadata,
+            &test_scan_range(),
+            Some(1),
+            &[physical_predicate],
+            &[variant_predicate],
+            &["a".to_string()],
+            true,
+        )
+        .expect("row groups selected");
+
+        assert_eq!(selected, vec![0]);
     }
 
     #[test]
@@ -907,5 +1103,55 @@ mod tests {
 
         assert!(check_max_satisfies_gt(&stats, &predicate).expect("compare decimal stats"));
         assert!(!check_min_satisfies_lt(&stats, &predicate).expect("compare decimal stats"));
+    }
+
+    #[test]
+    fn parquet_row_group_pruner_declares_existing_capabilities() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
+        let columns = vec!["a".to_string()];
+        let pruner = ParquetRowGroupPruner::new(&metadata, vec![0, 1], &columns, true);
+
+        assert_eq!(pruner.layer(), ScanLayer::RowGroup);
+        assert!(pruner.accepts_domain(ScanPredicateDomainKind::Range));
+        assert!(pruner.accepts_domain(ScanPredicateDomainKind::DiscreteSet));
+        assert!(!pruner.accepts_domain(ScanPredicateDomainKind::Membership));
+    }
+
+    #[test]
+    fn parquet_row_group_pruner_keeps_only_discrete_set_overlapping_groups() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
+        let columns = vec!["a".to_string()];
+        let pruner = ParquetRowGroupPruner::new(&metadata, vec![0, 1], &columns, true);
+        let predicate = ScanPredicate::discrete_set(
+            "0".to_string(),
+            vec![
+                MinMaxPredicateValue::Int64(2),
+                MinMaxPredicateValue::Int64(99),
+            ],
+            ScanPredicateSource::RuntimeIn,
+        )
+        .expect("discrete predicate");
+
+        let result = prune_units(&pruner, &[predicate]).expect("prune row groups");
+        assert_eq!(result.kept_units, vec![0]);
+        assert_eq!(result.skipped_units, vec![1]);
+    }
+
+    #[test]
+    fn parquet_row_group_pruner_keeps_all_when_stats_are_missing() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::None);
+        let columns = vec!["a".to_string()];
+        let pruner = ParquetRowGroupPruner::new(&metadata, vec![0, 1], &columns, true);
+        let predicate = ScanPredicate::from_min_max_predicate(
+            MinMaxPredicate::Gt {
+                column: "0".to_string(),
+                value: MinMaxPredicateValue::Int64(99),
+            },
+            ScanPredicateSource::Static,
+        );
+
+        let result = prune_units(&pruner, &[predicate]).expect("prune row groups");
+        assert_eq!(result.kept_units, vec![0, 1]);
+        assert!(result.skipped_units.is_empty());
     }
 }
