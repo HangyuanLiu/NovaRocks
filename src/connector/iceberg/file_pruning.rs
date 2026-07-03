@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue};
-use crate::common::scan_predicate::{ScanPredicate, ScanPredicateDomain, ScanPredicateSource};
+use crate::common::scan_predicate::{
+    MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
+};
 use crate::fs::scan_context::FileScanRange;
 use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo, IcebergPartitionValue};
 
@@ -159,7 +161,9 @@ fn partition_value_may_satisfy_predicate(
         ScanPredicateDomain::DiscreteSet { values, .. } => {
             partition_value_may_satisfy_discrete_set(partition_value, values)
         }
-        ScanPredicateDomain::Membership(_) => PredicateDecision::Unsupported,
+        ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe { values }) => {
+            partition_value_may_satisfy_discrete_set(partition_value, values)
+        }
     }
 }
 
@@ -622,7 +626,9 @@ mod tests {
     use thrift::OrderedFloat;
 
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
-    use crate::common::scan_predicate::{ScanPredicate, ScanPredicateSource};
+    use crate::common::scan_predicate::{
+        MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
+    };
     use crate::connector::iceberg::file_pruning_wire::{
         iceberg_file_pruning_metadata_from_thrift, iceberg_file_pruning_metadata_to_thrift,
     };
@@ -829,6 +835,53 @@ mod tests {
         assert_eq!(counters.files_selected, 1);
         assert_eq!(counters.partition_evaluated, 1);
         assert_eq!(counters.unsupported, 0);
+    }
+
+    #[test]
+    fn membership_identity_partition_skips_non_matching_point() {
+        let file = data_file_with_identity_i64_partition("k1", 7);
+        let predicate = ScanPredicate::new(
+            "k1".to_string(),
+            ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                values: vec![
+                    MinMaxPredicateValue::Int64(1),
+                    MinMaxPredicateValue::Int64(2),
+                ],
+            }),
+            ScanPredicateSource::RuntimeMembership,
+        );
+        let mut counters = IcebergFilePruningCounters::default();
+
+        assert!(!file_may_satisfy_scan_predicates(
+            &file,
+            &[predicate],
+            &mut counters
+        ));
+        assert_eq!(counters.files_pruned, 1);
+        assert_eq!(counters.partition_evaluated, 1);
+        assert_eq!(counters.unsupported, 0);
+    }
+
+    #[test]
+    fn membership_file_stats_keep_when_contains_is_unavailable() {
+        let file = data_file_with_i64_stats("k1", 100, 200);
+        let predicate = ScanPredicate::new(
+            "k1".to_string(),
+            ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                values: vec![MinMaxPredicateValue::Int64(1)],
+            }),
+            ScanPredicateSource::RuntimeMembership,
+        );
+        let mut counters = IcebergFilePruningCounters::default();
+
+        assert!(file_may_satisfy_scan_predicates(
+            &file,
+            &[predicate],
+            &mut counters
+        ));
+        assert_eq!(counters.files_selected, 1);
+        assert_eq!(counters.stats_evaluated, 0);
+        assert_eq!(counters.unsupported, 1);
     }
 
     #[test]
