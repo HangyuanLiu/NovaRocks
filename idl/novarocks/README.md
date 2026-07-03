@@ -16,8 +16,6 @@ is the NIDL-0 baseline; later NIDL tasks add the staged packages below.
 - `novarocks.expr` (expr.proto) — recursive Expr. [NIDL-3]
 - `novarocks.plan` (plan.proto) — DistributedPlan/PlanFragment/PlanNode. [NIDL-3]
 - `novarocks.filter` (filter.proto) — runtime filter / lookup. [NIDL-2]
-- `novarocks.spike` (spike.proto) — TEMPORARY conversion-layer probe. Deleted at
-  NIDL-3. Do not build on it.
 
 ## Tag discipline
 

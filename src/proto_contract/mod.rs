@@ -3,3 +3,5 @@
 //! NIDL-0 spike). One submodule per proto file; expr/plan added in later PRs.
 
 mod common;
+mod expr;
+mod plan;

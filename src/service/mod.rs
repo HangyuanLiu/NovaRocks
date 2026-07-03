@@ -34,8 +34,6 @@ pub(crate) mod internal_rpc_client;
 pub mod internal_service;
 pub mod load_tracking_http;
 pub(crate) mod metrics_http;
-#[cfg(test)]
-mod proto_spike;
 pub mod report_worker;
 pub(crate) mod standalone_exec_state_reporter;
 pub mod stream_load;
