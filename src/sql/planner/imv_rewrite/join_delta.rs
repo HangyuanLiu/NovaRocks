@@ -1387,7 +1387,6 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
         LogicalPlanKind::CTEAnchor(_) => plan_output_columns(plan.child(1))?,
         LogicalPlanKind::CTEProduce(produce) => produce.output_columns.clone(),
         LogicalPlanKind::CTEConsume(consume) => consume.output_columns.clone(),
-        LogicalPlanKind::Decode(decode) => decode.output_columns.clone(),
         LogicalPlanKind::Apply(apply) => {
             let mut out = plan_output_columns(plan.left())?;
             out.push(apply.output_column.clone());

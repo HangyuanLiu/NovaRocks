@@ -653,7 +653,6 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
         LogicalPlanKind::CTEAnchor(_) => plan_output_columns(plan.child(1)),
         LogicalPlanKind::CTEProduce(node) => Ok(node.output_columns.clone()),
         LogicalPlanKind::CTEConsume(node) => Ok(node.output_columns.clone()),
-        LogicalPlanKind::Decode(node) => Ok(node.output_columns.clone()),
         LogicalPlanKind::Apply(node) => {
             let mut columns = plan_output_columns(plan.left())?;
             columns.push(node.output_column.clone());

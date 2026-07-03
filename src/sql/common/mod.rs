@@ -19,5 +19,5 @@ pub(crate) use expr::{
     BinOp, JoinKind, LambdaParam, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType,
 };
 pub(crate) use imv::{ImvVersionRef, ImvVersionRole};
-pub(crate) use plan_hints::{ApplyKind, DecodeMapping, ScanVariantColumn};
+pub(crate) use plan_hints::{ApplyKind, ScanVariantColumn};
 pub(crate) use schema::{CteId, OutputColumn};

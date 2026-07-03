@@ -1487,18 +1487,7 @@ mod is_known_rule_name_tests {
         opt_expr_to_logical_plan(opt_result, &arena)
     }
 
-    fn contains_decode(plan: &LogicalPlanNode) -> bool {
-        match &plan.kind {
-            LogicalPlanKind::Decode(_) => true,
-            _ => plan.children.iter().any(contains_decode),
-        }
-    }
-
     fn assert_no_native_dict_rewrite(rewritten: &LogicalPlanNode, context: &str) {
-        assert!(
-            !contains_decode(rewritten),
-            "{context}: no Decode boundary expected after legacy rewrite removal"
-        );
         let LogicalPlanKind::Aggregate(_) = &rewritten.kind else {
             panic!("{context}: expected aggregate root, got {rewritten:?}")
         };

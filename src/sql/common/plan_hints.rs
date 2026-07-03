@@ -2,14 +2,6 @@ use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DecodeMapping {
-    pub source_column_id: ColumnId,
-    pub output_column_id: ColumnId,
-    pub dict_column: String,
-    pub string_column: String,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyKind {
     Scalar,

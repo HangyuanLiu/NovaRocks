@@ -614,7 +614,6 @@ mod typed_legacy {
             LogicalPlanKind::Union(u) => u.output_columns.iter().map(|c| c.column_id).collect(),
             LogicalPlanKind::Intersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
             LogicalPlanKind::Except(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
-            LogicalPlanKind::Decode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
             LogicalPlanKind::Values(v) => v.columns.iter().map(|c| c.column_id).collect(),
             LogicalPlanKind::GenerateSeries(g) => {
                 if g.output_column_id == ColumnId::UNSET {

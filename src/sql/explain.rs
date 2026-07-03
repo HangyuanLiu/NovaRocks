@@ -201,12 +201,6 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
         LogicalPlanKind::CTEConsume(node) => {
             out.push(format!("{pad}CTE_CONSUME(cte_id={})", node.cte_id));
         }
-        LogicalPlanKind::Decode(_) => {
-            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
-                .expect("Decode is a shared explain node");
-            out.push(format!("{pad}{body}"));
-            format_node(plan.unary_input(), level, indent + 1, out);
-        }
         LogicalPlanKind::Apply(node) => {
             let kind = match node.kind {
                 ApplyKind::Scalar => "SCALAR",
@@ -307,14 +301,6 @@ pub(crate) fn format_shared_plan_node_header(
             Some(format!("WINDOW [{}]", fns.join("; ")))
         }
         LogicalPlanKind::Values(node) => Some(format!("VALUES ({} rows)", node.rows.len())),
-        LogicalPlanKind::Decode(node) => {
-            let pairs = node
-                .mappings
-                .iter()
-                .map(|m| format!("{}->{}", m.dict_column, m.string_column))
-                .collect::<Vec<_>>();
-            Some(format!("DECODE [{}]", pairs.join(", ")))
-        }
         LogicalPlanKind::Repeat(node) => Some(format!(
             "REPEAT ({} grouping sets)",
             node.grouping_ids.len()

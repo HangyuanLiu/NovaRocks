@@ -99,7 +99,7 @@ fn collect_table_ids_inner(plan: &OptExpr, out: &mut Vec<TableIdentity>) {
         }
     } else {
         // Nodes not reachable through a WinMagic-eligible plan (Limit, Union,
-        // CTEAnchor/Produce/Consume, Values, Repeat, Decode, IMV markers, …)
+        // CTEAnchor/Produce/Consume, Values, Repeat, IMV markers, ...)
         // contribute no Scan children. The operator whitelist (a later task)
         // rejects any plan containing them before these helpers are called.
     }
@@ -146,7 +146,7 @@ fn collect_scan_column_map_inner(
         }
     } else {
         // Nodes not reachable through a WinMagic-eligible plan (Limit, Union,
-        // CTEAnchor/Produce/Consume, Values, Repeat, Decode, IMV markers, …)
+        // CTEAnchor/Produce/Consume, Values, Repeat, IMV markers, ...)
         // contribute no Scan children. The operator whitelist (a later task)
         // rejects any plan containing them before these helpers are called.
     }

@@ -103,10 +103,6 @@ pub(crate) fn lower_distributed_plan(
             &lowered.scope,
             &fragment.output_columns,
         )?;
-        let query_global_dicts = state
-            .query_global_dicts_per_fragment
-            .remove(&fragment.fragment_id)
-            .filter(|dicts| !dicts.is_empty());
         prepared_fragments.push((
             fragment,
             lowered,
@@ -114,7 +110,6 @@ pub(crate) fn lower_distributed_plan(
             output_exprs,
             output_columns,
             root_node_id,
-            query_global_dicts,
         ));
     }
 
@@ -127,15 +122,8 @@ pub(crate) fn lower_distributed_plan(
     )?;
 
     let mut fragment_results = Vec::with_capacity(prepared_fragments.len());
-    for (
-        fragment,
-        lowered,
-        output_sink,
-        output_exprs,
-        output_columns,
-        root_node_id,
-        query_global_dicts,
-    ) in prepared_fragments
+    for (fragment, lowered, output_sink, output_exprs, output_columns, root_node_id) in
+        prepared_fragments
     {
         let boundary_schemas = vec![result_root_boundary_schema_report(
             fragment.fragment_id,
@@ -154,7 +142,7 @@ pub(crate) fn lower_distributed_plan(
             boundary_schemas,
             cte_id: fragment.cte_id,
             cte_exchange_nodes: fragment.cte_exchange_nodes.clone(),
-            query_global_dicts,
+            query_global_dicts: None,
             query_global_dict_exprs: None,
         });
     }
@@ -1091,11 +1079,6 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     fn desc_builder(&mut self) -> &mut DescriptorTableBuilder;
     fn scan_tables(&mut self) -> &mut Vec<nodes::PlannedScanTable>;
     fn fragment_stack(&self) -> &[FragmentId];
-    fn query_global_dicts_per_fragment(
-        &mut self,
-    ) -> &mut HashMap<FragmentId, Vec<crate::thrift::data::TGlobalDict>>;
-    fn slot_to_global_dict(&self) -> &HashMap<i32, crate::thrift::data::TGlobalDict>;
-    fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::thrift::data::TGlobalDict>;
     fn rf_probe_targets(&mut self) -> &mut HashMap<i32, Vec<RfProbeTarget>>;
     fn rf_all_filters(
         &mut self,
@@ -1131,36 +1114,6 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     fn refresh_scan_table_for_codegen(&self, table: &TableDef) -> Result<TableDef, String> {
         refresh_scan_table_for_codegen(self.mv_refresh_ctx(), table)
     }
-
-    fn propagate_dict_to_slot(&mut self, source_slot_id: i32, new_slot_id: i32) {
-        if source_slot_id == new_slot_id {
-            return;
-        }
-        let Some(source_dict) = self.slot_to_global_dict().get(&source_slot_id).cloned() else {
-            return;
-        };
-        let new_dict = crate::thrift::data::TGlobalDict::new(
-            Some(new_slot_id),
-            source_dict.strings.clone(),
-            source_dict.ids.clone(),
-            source_dict.version,
-        );
-        let fragments: Vec<FragmentId> = if self.fragment_stack().is_empty() {
-            self.current_fragment_id()
-                .ok()
-                .map(|fragment_id| vec![fragment_id])
-                .unwrap_or_default()
-        } else {
-            self.fragment_stack().to_vec()
-        };
-        for fragment_id in fragments {
-            self.query_global_dicts_per_fragment()
-                .entry(fragment_id)
-                .or_default()
-                .push(new_dict.clone());
-        }
-        self.slot_to_global_dict_mut().insert(new_slot_id, new_dict);
-    }
 }
 
 pub(crate) struct OwnedLoweringState<'a> {
@@ -1170,8 +1123,6 @@ pub(crate) struct OwnedLoweringState<'a> {
     scan_tables: Vec<nodes::PlannedScanTable>,
     next_slot_id: Rc<RefCell<i32>>,
     fragment_stack: Vec<FragmentId>,
-    query_global_dicts_per_fragment: HashMap<FragmentId, Vec<crate::thrift::data::TGlobalDict>>,
-    slot_to_global_dict: HashMap<i32, crate::thrift::data::TGlobalDict>,
     rf_probe_targets: HashMap<i32, Vec<RfProbeTarget>>,
     rf_all_filters: HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>,
     rf_build_targets: Vec<(i32, i32, FragmentId)>,
@@ -1206,8 +1157,6 @@ impl<'a> OwnedLoweringState<'a> {
             scan_tables: Vec::new(),
             next_slot_id: Rc::new(RefCell::new(1)),
             fragment_stack: Vec::new(),
-            query_global_dicts_per_fragment: HashMap::new(),
-            slot_to_global_dict: HashMap::new(),
             rf_probe_targets: HashMap::new(),
             rf_all_filters: HashMap::new(),
             rf_build_targets: Vec::new(),
@@ -1319,20 +1268,6 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
 
     fn fragment_stack(&self) -> &[FragmentId] {
         &self.fragment_stack
-    }
-
-    fn query_global_dicts_per_fragment(
-        &mut self,
-    ) -> &mut HashMap<FragmentId, Vec<crate::thrift::data::TGlobalDict>> {
-        &mut self.query_global_dicts_per_fragment
-    }
-
-    fn slot_to_global_dict(&self) -> &HashMap<i32, crate::thrift::data::TGlobalDict> {
-        &self.slot_to_global_dict
-    }
-
-    fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::thrift::data::TGlobalDict> {
-        &mut self.slot_to_global_dict
     }
 
     fn rf_probe_targets(&mut self) -> &mut HashMap<i32, Vec<RfProbeTarget>> {
@@ -1511,14 +1446,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             crate::sql::planner::DistributedPayload::Physical(
                 crate::sql::planner::plan::PhysicalPlanKind::AssertOneRow(assert_one_row),
             ) => self.lower_assert_one_row_node(node, assert_one_row)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Decode(_),
-            ) => {
-                return Err(
-                    "native distributed Decode plans are retired before codegen lowering"
-                        .to_string(),
-                );
-            }
             crate::sql::planner::DistributedPayload::Physical(
                 crate::sql::planner::plan::PhysicalPlanKind::Repeat(repeat),
             ) => self.lower_repeat_node(node, repeat)?,
@@ -3076,17 +3003,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             if !unqualified_display.eq_ignore_ascii_case(&name) {
                 let _ = unqualified_display;
             }
-
-            // Propagate the dict registration on a ColumnRef passthrough:
-            // the new slot inherits the source slot's dict, so a parent
-            // fragment's Decode (post-exchange) finds the matching dict
-            // in its own `query_global_dicts`.
-            if let ExprKind::ColumnRef { column_id, .. } = item.expr.kind
-                && let Some(child_binding) = child_scope.resolve_by_id(column_id)
-            {
-                let source_slot_id = child_binding.slot_id;
-                state.propagate_dict_to_slot(source_slot_id, slot_id);
-            }
         }
 
         state.desc_builder().add_tuple(project_tuple_id, None);
@@ -3147,18 +3063,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             } = gb_expr.kind
             {
                 let _ = (q, column, binding);
-            }
-            // Propagate dict registration through the aggregate's group-
-            // by output: when the group-by is a passthrough ColumnRef of
-            // a dict-encoded source slot, the new agg output slot also
-            // carries dict ids. Re-register the TGlobalDict on the new
-            // slot so a downstream Decode (in this or a parent fragment
-            // post-exchange) resolves its `dict_id_to_string_ids` key.
-            if let ExprKind::ColumnRef { column_id, .. } = gb_expr.kind
-                && let Some(child_binding) = child_scope.resolve_by_id(column_id)
-            {
-                let source_slot_id = child_binding.slot_id;
-                state.propagate_dict_to_slot(source_slot_id, slot_id);
             }
             grouping_exprs.push(texpr);
         }

@@ -25,11 +25,10 @@ mod common_tests {
 
     use super::column_id::ColumnId;
     use super::common::{
-        ApplyKind, BinOp, CteId, DecodeMapping, DictionaryOwner, DictionarySnapshot,
-        DictionaryState, DictionaryValue, DictionaryWatermark, ImvVersionRef, ImvVersionRole,
-        JoinKind, LambdaParam, LiteralValue, OutputColumn, QueryDictionarySelection,
-        ScanVariantColumn, StarRocksTabletWatermark, UnOp, WindowBound, WindowFrame,
-        WindowFrameType,
+        ApplyKind, BinOp, CteId, DictionaryOwner, DictionarySnapshot, DictionaryState,
+        DictionaryValue, DictionaryWatermark, ImvVersionRef, ImvVersionRole, JoinKind, LambdaParam,
+        LiteralValue, OutputColumn, QueryDictionarySelection, ScanVariantColumn,
+        StarRocksTabletWatermark, UnOp, WindowBound, WindowFrame, WindowFrameType,
     };
 
     #[test]
@@ -66,13 +65,6 @@ mod common_tests {
         assert_eq!(BinOp::EqForNull, BinOp::EqForNull);
         assert_eq!(UnOp::BitwiseNot, UnOp::BitwiseNot);
 
-        let mapping = DecodeMapping {
-            source_column_id: ColumnId::new_for_test(2),
-            output_column_id: ColumnId::new_for_test(3),
-            dict_column: "k_dict".to_string(),
-            string_column: "k".to_string(),
-        };
-        assert_eq!(mapping.dict_column, "k_dict");
         assert_eq!(
             ApplyKind::In { negated: true },
             ApplyKind::In { negated: true }

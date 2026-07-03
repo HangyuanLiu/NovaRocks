@@ -23,16 +23,12 @@ use crate::sql::planner::plan::{
     LogicalUnionNode, LogicalValuesNode, LogicalWindowNode,
 };
 
-const RETIRED_LOGICAL_DECODE_ERROR: &str =
-    "native logical Decode plans are retired before optimizer bridge";
-
 /// Bridge 1: convert a `LogicalPlanNode` tree into an `OptExpr` tree, interning
 /// all scalars into the provided `ScalarArena`. No Memo groups are minted here.
 pub(crate) fn try_logical_plan_to_opt_expr(
     plan: &LogicalPlanNode,
     scalars: &mut ScalarArena,
 ) -> Result<OptExpr, String> {
-    reject_retired_logical_decode(plan)?;
     Ok(logical_plan_to_opt_expr_unchecked(plan, scalars))
 }
 
@@ -41,16 +37,6 @@ pub(crate) fn logical_plan_to_opt_expr(
     scalars: &mut ScalarArena,
 ) -> OptExpr {
     try_logical_plan_to_opt_expr(plan, scalars).expect("invalid logical plan stage")
-}
-
-fn reject_retired_logical_decode(plan: &LogicalPlanNode) -> Result<(), String> {
-    if matches!(&plan.kind, LogicalPlanKind::Decode(_)) {
-        return Err(RETIRED_LOGICAL_DECODE_ERROR.to_string());
-    }
-    for child in &plan.children {
-        reject_retired_logical_decode(child)?;
-    }
-    Ok(())
 }
 
 fn aggregate_output_layout_from_plan(
@@ -336,10 +322,6 @@ fn logical_plan_to_opt_expr_unchecked(
             OptExpr::new(op, vec![child])
         }
 
-        LogicalPlanKind::Decode(_) => {
-            panic!("native optimizer Decode plans are retired before optimizer bridge")
-        }
-
         LogicalPlanKind::AssertOneRow(node) => {
             let child = logical_plan_to_opt_expr_unchecked(plan.unary_input(), scalars);
             let op = Operator::LogicalAssertOneRow(AssertOneRowOp {
@@ -581,7 +563,6 @@ mod tests {
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::common::DecodeMapping;
     use crate::sql::optimizer::cascades_rules::implement::ScanToPhysical;
     use crate::sql::optimizer::memo::{GroupId, Memo};
     use crate::sql::optimizer::memo_copy::opt_expr_to_memo;
@@ -647,61 +628,6 @@ mod tests {
             vec![],
             None,
         )
-    }
-
-    fn decode_over_values_for_test() -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanKind::Decode(PlanDecodeNode {
-                mappings: vec![DecodeMapping {
-                    source_column_id: ColumnId::new_for_test(1),
-                    output_column_id: ColumnId::new_for_test(2),
-                    dict_column: "id_dict".to_string(),
-                    string_column: "id".to_string(),
-                }],
-                output_columns: vec![test_output_column(2, "id")],
-            }),
-            vec![values_with_columns(vec![test_output_column(1, "id_dict")])],
-            None,
-        )
-    }
-
-    #[test]
-    fn try_logical_plan_to_opt_expr_rejects_root_decode() {
-        let decode = decode_over_values_for_test();
-        let mut scalars = ScalarArena::new();
-
-        let err = try_logical_plan_to_opt_expr(&decode, &mut scalars)
-            .expect_err("root Decode should be rejected");
-
-        assert!(
-            err.contains("native logical Decode plans are retired before optimizer bridge"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn try_logical_plan_to_opt_expr_rejects_nested_decode() {
-        let sort = LogicalPlanNode::new(
-            LogicalPlanKind::Sort(LogicalSortNode {
-                items: vec![],
-                analytic_partition_by: vec![],
-                output_columns: vec![test_output_column(2, "id")],
-                offset: None,
-                partition_limit: None,
-                topn_type: None,
-            }),
-            vec![decode_over_values_for_test()],
-            None,
-        );
-        let mut scalars = ScalarArena::new();
-
-        let err = try_logical_plan_to_opt_expr(&sort, &mut scalars)
-            .expect_err("nested Decode should be rejected");
-
-        assert!(
-            err.contains("native logical Decode plans are retired before optimizer bridge"),
-            "unexpected error: {err}"
-        );
     }
 
     #[test]

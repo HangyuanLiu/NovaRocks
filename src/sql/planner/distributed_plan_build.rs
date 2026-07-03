@@ -217,10 +217,6 @@ impl DistributedPlanBuilder {
                 let tuple_ids = child.tuple_ids.clone();
                 Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]))
             }
-            PhysicalPlanKind::Decode(_) => Err(
-                "native distributed Decode plans are retired before distributed plan build"
-                    .to_string(),
-            ),
             PhysicalPlanKind::Repeat(repeat) => {
                 expect_child_count(node, 1)?;
                 let child = self.visit(&node.children[0])?;
@@ -1102,7 +1098,6 @@ fn physical_kind_name(kind: &PhysicalPlanKind) -> &'static str {
         PhysicalPlanKind::Sort(_) => "Sort",
         PhysicalPlanKind::Limit(_) => "Limit",
         PhysicalPlanKind::Values(_) => "Values",
-        PhysicalPlanKind::Decode(_) => "Decode",
         PhysicalPlanKind::Repeat(_) => "Repeat",
         PhysicalPlanKind::Window(_) => "Window",
         PhysicalPlanKind::GenerateSeries(_) => "GenerateSeries",
@@ -1146,8 +1141,8 @@ mod tests {
         LogicalCTEConsumeNode, LogicalCTEProduceNode, PhysicalHashAggregateNode,
         PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
         PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PhysicalTopNNode,
-        PlanAssertOneRowNode, PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode,
-        PlanLimitNode, PlanProjectNode, PlanRepeatNode, PlanScanNode, PlanSetOpKind, PlanSortNode,
+        PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode,
+        PlanProjectNode, PlanRepeatNode, PlanScanNode, PlanSetOpKind, PlanSortNode,
         PlanTableFunctionNode, PlanValuesNode, PlanWindowNode, RedistributeMode, RedistributeNode,
         WindowExpr,
     };
@@ -1745,29 +1740,6 @@ mod tests {
         assert_eq!(root.node_id, 2);
         assert_eq!(root.tuple_ids, vec![1]);
         assert_eq!(root.children[0].node_id, 1);
-    }
-
-    #[test]
-    fn build_distributed_plan_decode_fails_fast() {
-        let scan = scan_node(1, "k");
-        let decode = PhysicalPlanNode {
-            kind: PhysicalPlanKind::Decode(PlanDecodeNode {
-                mappings: vec![],
-                output_columns: vec![output_col(2, "decoded", DataType::Utf8, false)],
-            }),
-            children: vec![scan],
-            output_columns: vec![output_col(2, "decoded", DataType::Utf8, false)],
-            stats: stats(),
-            probe_runtime_filters: vec![],
-        };
-
-        let err = build_distributed_plan(&decode).expect_err("Decode must fail fast");
-        assert!(
-            err.contains(
-                "native distributed Decode plans are retired before distributed plan build"
-            ),
-            "unexpected error: {err}"
-        );
     }
 
     #[test]
