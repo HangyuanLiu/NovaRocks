@@ -231,7 +231,7 @@ fn main() {
     println!("cargo:rerun-if-changed=idl/proto/lake_types.proto");
     println!("cargo:rerun-if-changed=idl/proto/lake_service.proto");
     println!("cargo:rerun-if-changed=idl/proto/tablet_schema.proto");
-    println!("cargo:rerun-if-changed=idl/proto/starust_grpc.proto");
+    println!("cargo:rerun-if-changed=idl/novarocks/service.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/starlet.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/manager.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/service.proto");
@@ -526,11 +526,18 @@ static C++ runtime is required.",
         std::env::set_var("PROTOC", protoc);
     }
 
+    // NIDL-0: novarocks service.proto lives in idl/novarocks/. It still
+    // imports internal_service.proto (and the load-bearing lake_service.proto)
+    // from idl/proto/, so both dirs are include roots. idl/novarocks first so
+    // its files win on any future name overlap.
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
-        .compile_protos(&["idl/proto/starust_grpc.proto"], &["idl/proto"])
-        .expect("compile novarocks_grpc.proto");
+        .compile_protos(
+            &["idl/novarocks/service.proto"],
+            &["idl/novarocks", "idl/proto"],
+        )
+        .expect("compile novarocks service proto");
 
     tonic_build::configure()
         .build_client(true)
