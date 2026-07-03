@@ -186,6 +186,12 @@ pub mod proto {
         tonic::include_proto!("novarocks");
     }
 
+    // NIDL-0 spike: temporary conversion-layer ergonomics probe.
+    // TOMBSTONE: delete with idl/novarocks/spike.proto at NIDL-3.
+    pub mod spike {
+        tonic::include_proto!("novarocks.spike");
+    }
+
     pub mod starrocks {
         #![allow(clippy::doc_lazy_continuation, clippy::len_without_is_empty)]
         tonic::include_proto!("starrocks");
@@ -231,7 +237,8 @@ fn main() {
     println!("cargo:rerun-if-changed=idl/proto/lake_types.proto");
     println!("cargo:rerun-if-changed=idl/proto/lake_service.proto");
     println!("cargo:rerun-if-changed=idl/proto/tablet_schema.proto");
-    println!("cargo:rerun-if-changed=idl/proto/starust_grpc.proto");
+    println!("cargo:rerun-if-changed=idl/novarocks/service.proto");
+    println!("cargo:rerun-if-changed=idl/novarocks/spike.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/starlet.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/manager.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/service.proto");
@@ -526,11 +533,18 @@ static C++ runtime is required.",
         std::env::set_var("PROTOC", protoc);
     }
 
+    // NIDL-0: novarocks service.proto lives in idl/novarocks/. It still
+    // imports internal_service.proto (and the load-bearing lake_service.proto)
+    // from idl/proto/, so both dirs are include roots. idl/novarocks first so
+    // its files win on any future name overlap.
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
-        .compile_protos(&["idl/proto/starust_grpc.proto"], &["idl/proto"])
-        .expect("compile novarocks_grpc.proto");
+        .compile_protos(
+            &["idl/novarocks/service.proto", "idl/novarocks/spike.proto"],
+            &["idl/novarocks", "idl/proto"],
+        )
+        .expect("compile novarocks service + spike protos");
 
     tonic_build::configure()
         .build_client(true)
