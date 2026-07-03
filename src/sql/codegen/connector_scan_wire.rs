@@ -74,7 +74,10 @@ fn build_iceberg_scan_ranges(
     let mut ranges = Vec::new();
     for split in splits {
         let file = &iceberg_split(split)?.data_file;
-        if !crate::sql::codegen::nodes::file_may_satisfy_min_max(file, &ctx.min_max_predicates) {
+        if !crate::connector::iceberg::file_pruning::file_may_satisfy_min_max(
+            file,
+            &ctx.min_max_predicates,
+        ) {
             continue;
         }
         ranges.extend(build_hdfs_scan_range_params_for_file(
