@@ -250,6 +250,8 @@ impl FragmentDispatcher for RemoteDispatcher {
         let resp = client
             .blocking_submit_fragment(SubmitFragmentRequest {
                 exec_plan_fragment_params_thrift: payload,
+                plan: None,
+                instance_params: None,
             })
             .map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
         if resp.status_code != 0 {
