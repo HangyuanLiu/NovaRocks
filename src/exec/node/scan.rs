@@ -323,6 +323,8 @@ pub trait ScanOp: Send + Sync {
         self.build_morsels()
     }
 
+    fn flush_morsel_materialization_profile(&self, _profile: &RuntimeProfile) {}
+
     /// Load Iceberg v2 position-delete files attached to `morsel` and collect
     /// the row positions they retire for the morsel's data file. Returns
     /// `Ok(None)` when the morsel has no delete files (the common case);
@@ -603,7 +605,7 @@ impl ScanNode {
     }
 
     pub fn materialize_morsels_after_runtime_filters(&self) -> bool {
-        self.op.materialize_morsels_after_runtime_filters()
+        !self.runtime_filter_specs.is_empty() && self.op.materialize_morsels_after_runtime_filters()
     }
 
     pub(crate) fn build_morsels_with_runtime_filters(
@@ -614,6 +616,10 @@ impl ScanNode {
         let mut morsels = self.op.build_morsels_with_runtime_filters(decision)?;
         morsels.ensure_non_empty(self.accept_empty_scan_ranges);
         Ok(morsels)
+    }
+
+    pub(crate) fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
+        self.op.flush_morsel_materialization_profile(profile);
     }
 
     pub fn load_iceberg_position_deletes(

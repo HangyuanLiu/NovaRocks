@@ -372,6 +372,10 @@ impl ScanSourceOperator {
         let runtime_filter_probe = self.runtime_filter_probe.clone();
         let runtime_filters_expected = self.runtime_filters_expected;
         let runtime_filter_decision = self.state.runtime_filter_decision.clone();
+        let materialization_profile = self
+            .profiles
+            .as_ref()
+            .map(|profiles| profiles.common.clone());
         let dispatch_result = self
             .state
             .dispatch
@@ -386,7 +390,11 @@ impl ScanSourceOperator {
                     None
                 };
                 let morsels = if materialize_after_runtime_filters {
-                    scan.build_morsels_with_runtime_filters(acquired.as_ref())?
+                    let morsels = scan.build_morsels_with_runtime_filters(acquired.as_ref())?;
+                    if let Some(profile) = materialization_profile.as_ref() {
+                        scan.flush_morsel_materialization_profile(profile);
+                    }
+                    morsels
                 } else {
                     scan.build_morsels()?
                 };

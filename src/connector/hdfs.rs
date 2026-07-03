@@ -16,7 +16,7 @@
 // under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use crate::common::ids::SlotId;
 use crate::common::runtime_scan_predicate::{
@@ -95,6 +95,7 @@ pub struct HdfsScanOp {
     row_position_scan: bool,
     next_scan_range_id: Arc<AtomicI32>,
     iceberg_runtime_pruning_counters: Arc<HdfsIcebergRuntimePruningCounters>,
+    iceberg_runtime_pruning_profile_flushed: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -204,6 +205,7 @@ impl HdfsScanOp {
             row_position_scan,
             next_scan_range_id: Arc::new(AtomicI32::new(next_scan_range_id)),
             iceberg_runtime_pruning_counters: Arc::new(HdfsIcebergRuntimePruningCounters::default()),
+            iceberg_runtime_pruning_profile_flushed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -277,12 +279,22 @@ impl HdfsScanOp {
     }
 
     fn has_iceberg_file_pruning_metadata(&self) -> bool {
-        self.cfg.iceberg_runtime_pruning.is_some()
-            && self
-                .cfg
-                .ranges
-                .iter()
-                .any(|range| range.iceberg_file_pruning.is_some())
+        self.cfg
+            .ranges
+            .iter()
+            .any(|range| range.iceberg_file_pruning.is_some())
+    }
+
+    fn has_iceberg_runtime_pruning_bindings(pruning_cfg: &HdfsIcebergRuntimePruningConfig) -> bool {
+        !pruning_cfg.slot_to_column.is_empty() || !pruning_cfg.min_max_filter_columns.is_empty()
+    }
+
+    fn can_materialize_iceberg_runtime_file_pruning(&self) -> bool {
+        self.cfg
+            .iceberg_runtime_pruning
+            .as_ref()
+            .is_some_and(Self::has_iceberg_runtime_pruning_bindings)
+            && self.has_iceberg_file_pruning_metadata()
     }
 
     fn build_morsels_from_ordered_ranges(
@@ -310,6 +322,13 @@ impl HdfsScanOp {
     }
 
     fn flush_iceberg_runtime_pruning_profile(&self, profile: &RuntimeProfile) {
+        if self
+            .iceberg_runtime_pruning_profile_flushed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         let snapshot = self.iceberg_runtime_pruning_counters.snapshot();
         profile.counter_set(
             "IcebergRuntimeFilePruning/FilesTotal",
@@ -400,7 +419,6 @@ impl ScanOp for HdfsScanOp {
                 format!("{}", self.cfg.original_range_count),
             );
             profile.add_info_string("RangeCount", format!("{}", scan.ranges.len()));
-            self.flush_iceberg_runtime_pruning_profile(profile);
         }
         let current_delete_files = scan
             .ranges
@@ -435,7 +453,7 @@ impl ScanOp for HdfsScanOp {
     }
 
     fn materialize_morsels_after_runtime_filters(&self) -> bool {
-        self.has_iceberg_file_pruning_metadata()
+        self.can_materialize_iceberg_runtime_file_pruning()
     }
 
     fn build_morsels_with_runtime_filters(
@@ -445,6 +463,9 @@ impl ScanOp for HdfsScanOp {
         let Some(pruning_cfg) = self.cfg.iceberg_runtime_pruning.as_ref() else {
             return self.build_morsels();
         };
+        if !Self::has_iceberg_runtime_pruning_bindings(pruning_cfg) {
+            return self.build_morsels();
+        }
         if !self.has_iceberg_file_pruning_metadata() {
             self.iceberg_runtime_pruning_counters
                 .record_missing_metadata(self.cfg.ranges.len());
@@ -486,6 +507,10 @@ impl ScanOp for HdfsScanOp {
         self.iceberg_runtime_pruning_counters
             .record_file_counters(&file_counters);
         self.build_morsels_from_ordered_ranges(ranges)
+    }
+
+    fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
+        self.flush_iceberg_runtime_pruning_profile(profile);
     }
 
     fn supports_incremental_scan_ranges(&self) -> bool {
@@ -802,17 +827,27 @@ mod tests {
     };
     use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
     use crate::exec::chunk::ChunkSchema;
+    use crate::exec::expr::{ExprArena, ExprId};
+    use crate::exec::node::RuntimeFilterProbeSpec;
     use crate::exec::node::scan::{
-        HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange, ScanMorsel, ScanOp,
-        ScanRuntimeFilterDecision,
+        HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange, ScanMorsel, ScanNode,
+        ScanOp, ScanRuntimeFilterDecision,
     };
-    use crate::exec::runtime_filter::RuntimeInFilter;
+    use crate::exec::operators::scan::ScanSourceFactory;
+    use crate::exec::pipeline::dependency::DependencyManager;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::exec::runtime_filter::{
+        RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeEmptyFilter, RuntimeFilterType, RuntimeInFilter,
+        RuntimeMembershipFilter, RuntimeMinMaxFilter,
+    };
     use crate::formats::parquet::{
         ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind, VariantPathPruningPredicate,
     };
     use crate::fs::scan_context::FileScanRange;
+    use crate::runtime::profile::{OperatorProfiles, RuntimeProfile};
     use crate::runtime::runtime_filter_hub::{
-        AcquiredRuntimeFilters, RuntimeFilterSnapshot, RuntimeFilterUnavailableReason,
+        AcquiredRuntimeFilters, RuntimeFilterHub, RuntimeFilterSnapshot,
+        RuntimeFilterUnavailableReason,
     };
     use crate::sql::catalog::IcebergColumnStats;
 
@@ -951,6 +986,34 @@ mod tests {
         }
     }
 
+    fn hdfs_cfg_with_all_pruned_iceberg_files_for_test() -> HdfsScanConfig {
+        HdfsScanConfig {
+            ranges: vec![
+                iceberg_file_range_for_runtime_pruning_test(
+                    "s3://bucket/path/miss-a.parquet",
+                    Some(iceberg_file_pruning_metadata_for_i32_range("k1", 1, 10)),
+                ),
+                iceberg_file_range_for_runtime_pruning_test(
+                    "s3://bucket/path/miss-b.parquet",
+                    Some(iceberg_file_pruning_metadata_for_i32_range("k1", 20, 30)),
+                ),
+            ],
+            original_range_count: 2,
+            has_more: false,
+            limit: None,
+            profile_label: None,
+            format: None,
+            object_store_config: None,
+            iceberg_table_locations: std::collections::HashMap::new(),
+            query_global_dicts: Default::default(),
+            iceberg_runtime_pruning: Some(HdfsIcebergRuntimePruningConfig {
+                slot_to_column: HashMap::from([(SlotId::new(3), "k1".to_string())]),
+                min_max_filter_columns: HashMap::new(),
+                discrete_set_max_values: 256,
+            }),
+        }
+    }
+
     fn hdfs_cfg_with_two_iceberg_files_without_metadata_for_test() -> HdfsScanConfig {
         HdfsScanConfig {
             ranges: vec![
@@ -973,16 +1036,89 @@ mod tests {
         }
     }
 
+    fn runtime_in_filter_for_test(
+        filter_id: i32,
+        slot_id: SlotId,
+        values: &[i32],
+    ) -> RuntimeInFilter {
+        let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
+        let mut filter = RuntimeInFilter::new_for_test(filter_id, slot_id, &DataType::Int32)
+            .expect("create runtime in filter");
+        filter.insert_array_for_test(&array).expect("insert values");
+        filter
+    }
+
+    fn runtime_membership_filter_for_test(
+        filter_id: i32,
+        slot_id: SlotId,
+        values: &[i32],
+    ) -> RuntimeMembershipFilter {
+        let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
+        let min_max = RuntimeMinMaxFilter::from_arrays(RuntimeFilterType::Int32, &[array])
+            .expect("membership min/max filter");
+        RuntimeMembershipFilter::Empty(RuntimeEmptyFilter::new(
+            filter_id,
+            slot_id,
+            RuntimeFilterType::Int32,
+            false,
+            RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+            0,
+            min_max,
+        ))
+    }
+
     fn snapshot_with_runtime_in_filter_for_test(
         filter_id: i32,
         slot_id: SlotId,
         values: &[i32],
     ) -> RuntimeFilterSnapshot {
-        let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
-        let mut filter = RuntimeInFilter::new_for_test(filter_id, slot_id, &DataType::Int32)
-            .expect("create runtime in filter");
-        filter.insert_array_for_test(&array).expect("insert values");
-        RuntimeFilterSnapshot::from_filters(vec![filter], Vec::new())
+        RuntimeFilterSnapshot::from_filters(
+            vec![runtime_in_filter_for_test(filter_id, slot_id, values)],
+            Vec::new(),
+        )
+    }
+
+    fn runtime_filter_probe_spec_for_test(
+        filter_id: i32,
+        slot_id: SlotId,
+    ) -> RuntimeFilterProbeSpec {
+        RuntimeFilterProbeSpec {
+            filter_id,
+            expr_id: ExprId(0),
+            slot_id,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn hdfs_scan_node_for_runtime_pruning_test(
+        op: Arc<HdfsScanOp>,
+        runtime_filter_specs: Vec<RuntimeFilterProbeSpec>,
+    ) -> ScanNode {
+        ScanNode::new(op)
+            .with_node_id(77)
+            .with_runtime_filter_specs(runtime_filter_specs)
+            .with_connector_io_tasks_per_scan_operator(Some(1))
+            .with_accept_empty_scan_ranges(true)
+    }
+
+    fn hdfs_scan_source_for_runtime_pruning_test(
+        scan: ScanNode,
+        runtime_filter_hub: Arc<RuntimeFilterHub>,
+        driver_id: i32,
+        profile: RuntimeProfile,
+    ) -> Box<dyn crate::exec::pipeline::operator::Operator> {
+        let factory =
+            ScanSourceFactory::new(scan, runtime_filter_hub, Arc::new(ExprArena::default()));
+        let mut source = factory.create(1, driver_id);
+        source.set_profiles(OperatorProfiles::new(profile));
+        source.prepare().expect("prepare scan source");
+        source
+    }
+
+    fn runtime_filter_hub_for_test() -> Arc<RuntimeFilterHub> {
+        let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+        hub.set_wait_timeouts(Some(std::time::Duration::from_secs(5)), None);
+        hub
     }
 
     #[test]
@@ -1010,6 +1146,135 @@ mod tests {
         assert_eq!(counters.predicates, 1);
         assert_eq!(counters.unsupported, 0);
         assert_eq!(counters.unavailable, 0);
+    }
+
+    #[test]
+    fn all_pruned_runtime_file_pruning_flushes_profile_without_morsels() {
+        let op = Arc::new(HdfsScanOp::new(
+            hdfs_cfg_with_all_pruned_iceberg_files_for_test(),
+        ));
+        let scan = hdfs_scan_node_for_runtime_pruning_test(
+            Arc::clone(&op),
+            vec![runtime_filter_probe_spec_for_test(1, SlotId::new(3))],
+        );
+        let filter = runtime_membership_filter_for_test(1, SlotId::new(3), &[100_i32]);
+        let hub = runtime_filter_hub_for_test();
+        let profile = RuntimeProfile::new("hdfs-scan");
+        let mut source =
+            hdfs_scan_source_for_runtime_pruning_test(scan, Arc::clone(&hub), 0, profile.clone());
+        hub.publish_filters(&[], &[filter]);
+
+        assert!(
+            !source
+                .as_processor_mut()
+                .expect("scan source processor")
+                .has_output()
+        );
+
+        let common = profile.child("CommonMetrics");
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/FilesTotal"),
+            Some(2)
+        );
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/FilesSelected"),
+            Some(0)
+        );
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/FilesPruned"),
+            Some(2)
+        );
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/Predicates"),
+            Some(2)
+        );
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/Unsupported"),
+            Some(0)
+        );
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/Unavailable"),
+            Some(0)
+        );
+        let counters = op.iceberg_runtime_pruning_counter_snapshot_for_test();
+        assert_eq!(counters.files_total, 2);
+        assert_eq!(counters.files_selected, 0);
+        assert_eq!(counters.files_pruned, 2);
+    }
+
+    #[test]
+    fn iceberg_runtime_pruning_without_planned_filters_does_not_defer_or_count_unavailable() {
+        let op = Arc::new(HdfsScanOp::new(hdfs_cfg_with_two_iceberg_files_for_test()));
+        let scan = hdfs_scan_node_for_runtime_pruning_test(Arc::clone(&op), Vec::new());
+
+        assert!(!scan.materialize_morsels_after_runtime_filters());
+        let morsels = scan.build_morsels().expect("build static morsels");
+        assert_eq!(morsels.morsels.len(), 2);
+
+        let counters = op.iceberg_runtime_pruning_counter_snapshot_for_test();
+        assert_eq!(counters.unavailable, 0);
+        assert_eq!(counters.files_total, 0);
+        assert_eq!(counters.files_selected, 0);
+        assert_eq!(counters.files_pruned, 0);
+    }
+
+    #[test]
+    fn runtime_file_pruning_profile_flush_is_not_duplicated_across_drivers() {
+        let op = Arc::new(HdfsScanOp::new(
+            hdfs_cfg_with_all_pruned_iceberg_files_for_test(),
+        ));
+        let scan = hdfs_scan_node_for_runtime_pruning_test(
+            Arc::clone(&op),
+            vec![runtime_filter_probe_spec_for_test(1, SlotId::new(3))],
+        );
+        let filter = runtime_membership_filter_for_test(1, SlotId::new(3), &[100_i32]);
+        let hub = runtime_filter_hub_for_test();
+        let factory =
+            ScanSourceFactory::new(scan, Arc::clone(&hub), Arc::new(ExprArena::default()));
+        let profile_a = RuntimeProfile::new("hdfs-scan-a");
+        let profile_b = RuntimeProfile::new("hdfs-scan-b");
+        let mut source_a = factory.create(2, 0);
+        source_a.set_profiles(OperatorProfiles::new(profile_a.clone()));
+        source_a.prepare().expect("prepare source a");
+        let mut source_b = factory.create(2, 1);
+        source_b.set_profiles(OperatorProfiles::new(profile_b.clone()));
+        source_b.prepare().expect("prepare source b");
+        hub.publish_filters(&[], &[filter]);
+
+        let _ = source_a
+            .as_processor_mut()
+            .expect("source a processor")
+            .has_output();
+        let _ = source_b
+            .as_processor_mut()
+            .expect("source b processor")
+            .has_output();
+
+        let files_total_a = profile_a
+            .child("CommonMetrics")
+            .counter_value("IcebergRuntimeFilePruning/FilesTotal")
+            .unwrap_or(0);
+        let files_total_b = profile_b
+            .child("CommonMetrics")
+            .counter_value("IcebergRuntimeFilePruning/FilesTotal")
+            .unwrap_or(0);
+        assert_eq!(files_total_a + files_total_b, 2);
+        assert!(
+            (files_total_a == 2 && files_total_b == 0)
+                || (files_total_a == 0 && files_total_b == 2)
+        );
+
+        let profile_c = RuntimeProfile::new("hdfs-scan-c");
+        ScanOp::flush_morsel_materialization_profile(
+            op.as_ref(),
+            &profile_c.child("CommonMetrics"),
+        );
+        assert_eq!(
+            profile_c
+                .child("CommonMetrics")
+                .counter_value("IcebergRuntimeFilePruning/FilesTotal"),
+            None
+        );
     }
 
     #[test]
