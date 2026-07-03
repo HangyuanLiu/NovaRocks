@@ -18,6 +18,7 @@
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 
+use crate::common::scan_predicate::{ScanPredicate, ScanPredicateDomain};
 use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::debug;
 
@@ -30,14 +31,14 @@ pub(crate) fn select_row_groups_for_range(
     metadata: &ParquetMetaData,
     range: &FileScanRange,
     mut remaining_rows: Option<usize>,
-    min_max_predicates: &[MinMaxPredicate],
+    physical_predicates: &[ScanPredicate],
     variant_predicates: &[BoundVariantPathPruningPredicate],
     columns: &[String],
     case_sensitive: bool,
 ) -> Option<Vec<usize>> {
     if range.length == 0
         && remaining_rows.is_none()
-        && min_max_predicates.is_empty()
+        && physical_predicates.is_empty()
         && variant_predicates.is_empty()
     {
         return None;
@@ -58,10 +59,10 @@ pub(crate) fn select_row_groups_for_range(
     for (idx, row_group) in metadata.row_groups().iter().enumerate() {
         let rg_start = row_group_start_offset(row_group)?;
         if rg_start >= split_start && rg_start < split_end {
-            if !min_max_predicates.is_empty() || !variant_predicates.is_empty() {
+            if !physical_predicates.is_empty() || !variant_predicates.is_empty() {
                 match should_read_row_group(
                     row_group,
-                    min_max_predicates,
+                    physical_predicates,
                     variant_predicates,
                     columns,
                     case_sensitive,
@@ -108,19 +109,13 @@ pub(crate) fn select_row_groups_for_range(
 
 fn should_read_row_group(
     row_group: &RowGroupMetaData,
-    predicates: &[MinMaxPredicate],
+    predicates: &[ScanPredicate],
     variant_predicates: &[BoundVariantPathPruningPredicate],
     columns: &[String],
     case_sensitive: bool,
 ) -> Result<bool, String> {
     for pred in predicates {
-        let col_idx_str = match pred {
-            MinMaxPredicate::Le { column, .. }
-            | MinMaxPredicate::Ge { column, .. }
-            | MinMaxPredicate::Lt { column, .. }
-            | MinMaxPredicate::Gt { column, .. }
-            | MinMaxPredicate::Eq { column, .. } => column.as_str(),
-        };
+        let col_idx_str = pred.column();
         let Ok(col_idx) = col_idx_str.parse::<usize>() else {
             continue;
         };
@@ -140,7 +135,7 @@ fn should_read_row_group(
         });
 
         if let Some(chunk) = chunk
-            && !column_stats_satisfy_predicate(chunk, pred)?
+            && !column_stats_satisfy_scan_predicate(chunk, pred)?
         {
             return Ok(false);
         }
@@ -159,6 +154,102 @@ fn should_read_row_group(
     }
 
     Ok(true)
+}
+
+fn column_stats_satisfy_scan_predicate(
+    column: &ColumnChunkMetaData,
+    pred: &ScanPredicate,
+) -> Result<bool, String> {
+    match pred.domain() {
+        ScanPredicateDomain::Range { .. } => {
+            let min_max = pred.to_min_max_predicates();
+            for predicate in &min_max {
+                if !column_stats_satisfy_predicate(column, predicate)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        ScanPredicateDomain::DiscreteSet { values, .. } => {
+            if let Some(stats) = column.statistics() {
+                discrete_set_stats_may_satisfy(stats, values)
+            } else {
+                Ok(true)
+            }
+        }
+    }
+}
+
+fn discrete_set_stats_may_satisfy(
+    stats: &Statistics,
+    values: &[MinMaxPredicateValue],
+) -> Result<bool, String> {
+    match stats {
+        Statistics::Int32(s) => {
+            let Some(min) = s.min_opt() else {
+                return Ok(true);
+            };
+            let Some(max) = s.max_opt() else {
+                return Ok(true);
+            };
+            Ok(values
+                .iter()
+                .any(|value| value.as_i32().is_some_and(|v| *min <= v && v <= *max)))
+        }
+        Statistics::Int64(s) => {
+            let Some(min) = s.min_opt() else {
+                return Ok(true);
+            };
+            let Some(max) = s.max_opt() else {
+                return Ok(true);
+            };
+            Ok(values
+                .iter()
+                .any(|value| value.as_i64().is_some_and(|v| *min <= v && v <= *max)))
+        }
+        Statistics::Boolean(s) => {
+            let Some(min) = s.min_opt() else {
+                return Ok(true);
+            };
+            let Some(max) = s.max_opt() else {
+                return Ok(true);
+            };
+            Ok(values
+                .iter()
+                .any(|value| value.as_bool().is_some_and(|v| *min <= v && v <= *max)))
+        }
+        Statistics::ByteArray(s) => {
+            let Some(min) = s.min_opt() else {
+                return Ok(true);
+            };
+            let Some(max) = s.max_opt() else {
+                return Ok(true);
+            };
+            Ok(values.iter().any(|value| {
+                value
+                    .as_bytes()
+                    .is_some_and(|v| min.data() <= v && v <= max.data())
+            }))
+        }
+        Statistics::FixedLenByteArray(s) => {
+            let Some(min) = s
+                .min_opt()
+                .and_then(|min| decode_signed_be_i128(min.data()))
+            else {
+                return Ok(true);
+            };
+            let Some(max) = s
+                .max_opt()
+                .and_then(|max| decode_signed_be_i128(max.data()))
+            else {
+                return Ok(true);
+            };
+            Ok(values.iter().any(|value| {
+                fixed_len_predicate_value_as_i128(value).is_some_and(|v| min <= v && v <= max)
+            }))
+        }
+        _ => Ok(true),
+    }
 }
 
 fn column_stats_satisfy_predicate(

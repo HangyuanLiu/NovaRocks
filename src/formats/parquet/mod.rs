@@ -51,6 +51,7 @@ use std::sync::Arc;
 use crate::cache::{CachedRangeReader, DataCacheContext};
 use crate::common::config;
 use crate::common::ids::SlotId;
+use crate::common::scan_predicate::{ScanPredicate, ScanPredicateSource};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::cast_with_special_rules;
 use crate::exec::node::BoxedExecIter;
@@ -212,15 +213,47 @@ fn top_level_parquet_column_index(
         })
 }
 
-fn runtime_filters_to_min_max_predicates(
+const PARQUET_DISCRETE_SET_MAX_VALUES: usize = 256;
+
+fn min_max_predicates_to_scan_predicates(
+    predicates: &[MinMaxPredicate],
+    source: ScanPredicateSource,
+) -> Vec<ScanPredicate> {
+    predicates
+        .iter()
+        .cloned()
+        .map(|predicate| ScanPredicate::from_min_max_predicate(predicate, source))
+        .collect()
+}
+
+fn scan_predicates_to_min_max_predicates(predicates: &[ScanPredicate]) -> Vec<MinMaxPredicate> {
+    predicates
+        .iter()
+        .flat_map(ScanPredicate::to_min_max_predicates)
+        .collect()
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScanPredicateCounters {
+    range: u128,
+    discrete_set: u128,
+    envelope_fallback: u128,
+    unsupported: u128,
+}
+
+fn runtime_filters_to_scan_predicates_with_counters(
     cfg: &ParquetScanConfig,
     runtime_filters: &RuntimeFilterContext,
-) -> Result<Vec<MinMaxPredicate>, String> {
+    counters: &mut ScanPredicateCounters,
+) -> Result<Vec<ScanPredicate>, String> {
     let snapshot = runtime_filters.snapshot();
     if snapshot.is_empty() {
         return Ok(Vec::new());
     }
     if cfg.chunk_schema.slot_ids().is_empty() || cfg.columns.is_empty() {
+        counters.unsupported += snapshot.in_filters().len() as u128;
+        counters.unsupported += snapshot.membership_filters().len() as u128;
+        counters.unsupported += snapshot.min_max_filters().len() as u128;
         return Ok(Vec::new());
     }
 
@@ -245,8 +278,25 @@ fn runtime_filters_to_min_max_predicates(
     let mut preds = Vec::new();
     for rf in snapshot.in_filters() {
         let Some(column) = slot_to_index.get(&rf.slot_id()) else {
+            counters.unsupported += 1;
             continue;
         };
+        if let Some(values) = rf.scan_predicate_values(PARQUET_DISCRETE_SET_MAX_VALUES)? {
+            match ScanPredicate::discrete_set(
+                column.clone(),
+                values,
+                ScanPredicateSource::RuntimeIn,
+            ) {
+                Ok(predicate) => {
+                    preds.push(predicate);
+                    counters.discrete_set += 1;
+                    continue;
+                }
+                Err(_) => {
+                    // Fall through to the envelope path below.
+                }
+            }
+        }
         let Some((min_value, max_value)) = rf.min_max_predicate_values().map_err(|e| {
             format!(
                 "parquet runtime in-filter min/max conversion failed (slot_id={}): {}",
@@ -255,19 +305,28 @@ fn runtime_filters_to_min_max_predicates(
             )
         })?
         else {
+            counters.unsupported += 1;
             continue;
         };
-        preds.push(MinMaxPredicate::Ge {
-            column: column.clone(),
-            value: min_value,
-        });
-        preds.push(MinMaxPredicate::Le {
-            column: column.clone(),
-            value: max_value,
-        });
+        counters.envelope_fallback += 1;
+        preds.push(ScanPredicate::from_min_max_predicate(
+            MinMaxPredicate::Ge {
+                column: column.clone(),
+                value: min_value,
+            },
+            ScanPredicateSource::RuntimeIn,
+        ));
+        preds.push(ScanPredicate::from_min_max_predicate(
+            MinMaxPredicate::Le {
+                column: column.clone(),
+                value: max_value,
+            },
+            ScanPredicateSource::RuntimeIn,
+        ));
     }
     for rf in snapshot.membership_filters() {
         let Some(column) = slot_to_index.get(&rf.slot_id()) else {
+            counters.unsupported += 1;
             continue;
         };
         let Some((min_value, max_value)) =
@@ -279,18 +338,60 @@ fn runtime_filters_to_min_max_predicates(
                 )
             })?
         else {
+            counters.unsupported += 1;
             continue;
         };
-        preds.push(MinMaxPredicate::Ge {
-            column: column.clone(),
-            value: min_value,
-        });
-        preds.push(MinMaxPredicate::Le {
-            column: column.clone(),
-            value: max_value,
-        });
+        counters.range += 2;
+        preds.push(ScanPredicate::from_min_max_predicate(
+            MinMaxPredicate::Ge {
+                column: column.clone(),
+                value: min_value,
+            },
+            ScanPredicateSource::RuntimeMembership,
+        ));
+        preds.push(ScanPredicate::from_min_max_predicate(
+            MinMaxPredicate::Le {
+                column: column.clone(),
+                value: max_value,
+            },
+            ScanPredicateSource::RuntimeMembership,
+        ));
+    }
+    for (filter_id, filter) in snapshot.min_max_filters() {
+        let Some(column_name) = cfg.runtime_min_max_filter_columns.get(filter_id) else {
+            counters.unsupported += 1;
+            continue;
+        };
+        let Some(idx) = find_column_index_by_name(&cfg.columns, column_name, cfg.case_sensitive)
+        else {
+            counters.unsupported += 1;
+            continue;
+        };
+        let min_max_predicates = filter.to_min_max_predicates(&idx.to_string())?;
+        if min_max_predicates.is_empty() {
+            counters.unsupported += 1;
+            continue;
+        }
+        for predicate in min_max_predicates {
+            preds.push(ScanPredicate::from_min_max_predicate(
+                predicate,
+                ScanPredicateSource::RuntimeMinMax,
+            ));
+            counters.range += 1;
+        }
     }
     Ok(preds)
+}
+
+fn runtime_filters_to_scan_predicates(
+    cfg: &ParquetScanConfig,
+    runtime_filters: &RuntimeFilterContext,
+) -> Result<Vec<ScanPredicate>, String> {
+    runtime_filters_to_scan_predicates_with_counters(
+        cfg,
+        runtime_filters,
+        &mut ScanPredicateCounters::default(),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -328,6 +429,7 @@ pub struct ParquetScanConfig {
     pub case_sensitive: bool,
     pub enable_page_index: bool,
     pub min_max_predicates: Vec<MinMaxPredicate>,
+    pub runtime_min_max_filter_columns: HashMap<i32, String>,
     pub variant_path_predicates: Vec<VariantPathPruningPredicate>,
     pub batch_size: Option<usize>,
     pub datacache: DataCacheContext,
@@ -556,8 +658,9 @@ struct ParquetScanIter {
 
 #[derive(Clone, Debug, Default)]
 struct CurrentPruningPredicates {
-    physical: Vec<MinMaxPredicate>,
+    physical: Vec<ScanPredicate>,
     variant: Vec<VariantPathPruningPredicate>,
+    counters: ScanPredicateCounters,
 }
 
 impl ParquetScanIter {
@@ -687,18 +790,32 @@ impl ParquetScanIter {
             return Ok(CurrentPruningPredicates {
                 physical: Vec::new(),
                 variant: self.cfg.variant_path_predicates.clone(),
+                counters: ScanPredicateCounters::default(),
             });
         }
+        let mut counters = ScanPredicateCounters {
+            range: self.cfg.min_max_predicates.len() as u128,
+            ..Default::default()
+        };
         let mut predicates = CurrentPruningPredicates {
-            physical: self.cfg.min_max_predicates.clone(),
+            physical: min_max_predicates_to_scan_predicates(
+                &self.cfg.min_max_predicates,
+                ScanPredicateSource::Static,
+            ),
             variant: self.cfg.variant_path_predicates.clone(),
+            counters: ScanPredicateCounters::default(),
         };
         if let Some(filters) = self.runtime_filters.as_ref() {
-            let mut runtime_preds = runtime_filters_to_min_max_predicates(&self.cfg, filters)?;
+            let mut runtime_preds = runtime_filters_to_scan_predicates_with_counters(
+                &self.cfg,
+                filters,
+                &mut counters,
+            )?;
             if !runtime_preds.is_empty() {
                 predicates.physical.append(&mut runtime_preds);
             }
         }
+        predicates.counters = counters;
         Ok(predicates)
     }
 
@@ -1135,6 +1252,28 @@ impl ParquetScanIter {
 
             let metadata = builder.metadata().clone();
             let predicates = self.current_pruning_predicates()?;
+            if let Some(profile) = self.profile.as_ref() {
+                profile.counter_add(
+                    "ParquetScanPredicatesRange",
+                    metrics::TUnit::UNIT,
+                    clamp_u128_to_i64(predicates.counters.range),
+                );
+                profile.counter_add(
+                    "ParquetScanPredicatesDiscreteSet",
+                    metrics::TUnit::UNIT,
+                    clamp_u128_to_i64(predicates.counters.discrete_set),
+                );
+                profile.counter_add(
+                    "ParquetScanPredicatesEnvelopeFallback",
+                    metrics::TUnit::UNIT,
+                    clamp_u128_to_i64(predicates.counters.envelope_fallback),
+                );
+                profile.counter_add(
+                    "ParquetScanPredicatesUnsupported",
+                    metrics::TUnit::UNIT,
+                    clamp_u128_to_i64(predicates.counters.unsupported),
+                );
+            }
             let bound_variant_predicates = bind_variant_path_pruning_predicates(
                 &metadata,
                 &self.cfg.variant_path_columns,
@@ -1227,10 +1366,12 @@ impl ParquetScanIter {
                 }
                 continue;
             }
+            let page_min_max_predicates =
+                scan_predicates_to_min_max_predicates(&predicates.physical);
             let use_name_based_projection = !self.has_iceberg_schema_evolution();
             let active_projection_columns = if use_name_based_projection {
                 build_active_projection_columns(
-                    &predicates.physical,
+                    &page_min_max_predicates,
                     &self.cfg.columns,
                     self.cfg.case_sensitive,
                 )
@@ -1261,7 +1402,7 @@ impl ParquetScanIter {
                 &cached_reader,
                 &metadata,
                 &row_groups,
-                &predicates.physical,
+                &page_min_max_predicates,
                 &bound_variant_predicates,
             )? {
                 DelayedReaderDecision::Use(reader) => {
@@ -1294,7 +1435,7 @@ impl ParquetScanIter {
                 builder,
                 &metadata,
                 &row_groups,
-                &predicates.physical,
+                &page_min_max_predicates,
                 &bound_variant_predicates,
             )?;
             let reader_init_ns = reader_init_start.elapsed().as_nanos();
@@ -1532,19 +1673,6 @@ fn find_column_index_by_name(
 }
 
 #[cfg(test)]
-fn predicate_column_name<'a>(
-    predicate: &MinMaxPredicate,
-    projected_columns: &'a [String],
-) -> Option<&'a str> {
-    let idx = predicate.column().parse::<usize>().ok()?;
-    let col_name = projected_columns.get(idx)?;
-    if col_name == "___count___" {
-        return None;
-    }
-    Some(col_name.as_str())
-}
-
-#[cfg(test)]
 fn find_column_index_in_schema(
     schema: &Schema,
     col_name: &str,
@@ -1557,6 +1685,19 @@ fn find_column_index_in_schema(
         .fields()
         .iter()
         .position(|f| f.name().eq_ignore_ascii_case(col_name))
+}
+
+#[cfg(test)]
+fn predicate_column_name<'a>(
+    predicate: &MinMaxPredicate,
+    projected_columns: &'a [String],
+) -> Option<&'a str> {
+    let idx = predicate.column().parse::<usize>().ok()?;
+    let col_name = projected_columns.get(idx)?;
+    if col_name == "___count___" {
+        return None;
+    }
+    Some(col_name.as_str())
 }
 
 #[cfg(test)]
@@ -2426,12 +2567,13 @@ mod tests {
 
     use super::{
         MinMaxPredicate, MinMaxPredicateValue, ParquetReadCachePolicy, ParquetScanConfig,
-        ParquetScanIter, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
-        bind_variant_path_pruning_predicates, build_active_projection_columns,
-        build_delayed_output_sources, build_delayed_projection_plan, build_parquet_iter,
-        build_row_selection_for_row_groups, collect_parquet_coalesce_io_ranges,
-        evaluate_batch_predicate_mask, reader::ParquetCachedReader,
-        runtime_filters_to_min_max_predicates, select_row_groups_for_range,
+        ParquetScanIter, ParquetSlotKind, ScanPredicate, ScanPredicateSource,
+        VariantPathPruningPredicate, VariantPathSpec, bind_variant_path_pruning_predicates,
+        build_active_projection_columns, build_delayed_output_sources,
+        build_delayed_projection_plan, build_parquet_iter, build_row_selection_for_row_groups,
+        collect_parquet_coalesce_io_ranges, evaluate_batch_predicate_mask,
+        reader::ParquetCachedReader, runtime_filters_to_scan_predicates,
+        select_row_groups_for_range,
     };
 
     fn field_id_meta(field_id: i32) -> HashMap<String, String> {
@@ -2488,6 +2630,7 @@ mod tests {
             case_sensitive: true,
             enable_page_index: false,
             min_max_predicates: Vec::new(),
+            runtime_min_max_filter_columns: HashMap::new(),
             variant_path_predicates: Vec::new(),
             batch_size: Some(1024),
             datacache: test_datacache_context(),
@@ -2673,6 +2816,7 @@ mod tests {
             case_sensitive: true,
             enable_page_index: false,
             min_max_predicates: Vec::new(),
+            runtime_min_max_filter_columns: HashMap::new(),
             variant_path_predicates: if enable_variant_pruning {
                 vec![variant_path_predicate(Some(10))]
             } else {
@@ -2877,6 +3021,7 @@ mod tests {
             case_sensitive: true,
             enable_page_index: false,
             min_max_predicates: Vec::new(),
+            runtime_min_max_filter_columns: HashMap::new(),
             variant_path_predicates: Vec::new(),
             batch_size: Some(1024),
             datacache: test_datacache_context(),
@@ -2944,6 +3089,7 @@ mod tests {
                 column: "0".to_string(),
                 value: MinMaxPredicateValue::Int32(5),
             }],
+            runtime_min_max_filter_columns: HashMap::new(),
             variant_path_predicates: vec![variant_path_predicate(Some(10))],
             batch_size: Some(1024),
             datacache: test_datacache_context(),
@@ -2994,18 +3140,22 @@ mod tests {
         assert_eq!(
             predicates.physical,
             vec![
-                MinMaxPredicate::Gt {
-                    column: "0".to_string(),
-                    value: MinMaxPredicateValue::Int32(5),
-                },
-                MinMaxPredicate::Ge {
-                    column: "0".to_string(),
-                    value: MinMaxPredicateValue::Int32(10),
-                },
-                MinMaxPredicate::Le {
-                    column: "0".to_string(),
-                    value: MinMaxPredicateValue::Int32(20),
-                },
+                ScanPredicate::from_min_max_predicate(
+                    MinMaxPredicate::Gt {
+                        column: "0".to_string(),
+                        value: MinMaxPredicateValue::Int32(5),
+                    },
+                    ScanPredicateSource::Static,
+                ),
+                ScanPredicate::discrete_set(
+                    "0".to_string(),
+                    vec![
+                        MinMaxPredicateValue::Int32(10),
+                        MinMaxPredicateValue::Int32(20),
+                    ],
+                    ScanPredicateSource::RuntimeIn,
+                )
+                .expect("runtime in scan predicate"),
             ]
         );
         assert_eq!(predicates.variant, vec![variant_path_predicate(Some(10))]);
@@ -3039,6 +3189,7 @@ mod tests {
             case_sensitive: true,
             enable_page_index: false,
             min_max_predicates: Vec::new(),
+            runtime_min_max_filter_columns: HashMap::new(),
             variant_path_predicates: Vec::new(),
             batch_size: Some(1024),
             datacache: test_datacache_context(),
@@ -3095,19 +3246,20 @@ mod tests {
         );
 
         let predicates =
-            runtime_filters_to_min_max_predicates(&cfg, &runtime_filters).expect("predicates");
+            runtime_filters_to_scan_predicates(&cfg, &runtime_filters).expect("predicates");
 
         assert_eq!(
             predicates,
             vec![
-                MinMaxPredicate::Ge {
-                    column: "0".to_string(),
-                    value: MinMaxPredicateValue::Int32(10),
-                },
-                MinMaxPredicate::Le {
-                    column: "0".to_string(),
-                    value: MinMaxPredicateValue::Int32(20),
-                },
+                ScanPredicate::discrete_set(
+                    "0".to_string(),
+                    vec![
+                        MinMaxPredicateValue::Int32(10),
+                        MinMaxPredicateValue::Int32(20),
+                    ],
+                    ScanPredicateSource::RuntimeIn,
+                )
+                .expect("runtime in scan predicate")
             ]
         );
     }
@@ -4023,6 +4175,7 @@ mod tests {
             case_sensitive: true,
             enable_page_index: false,
             min_max_predicates: Vec::new(),
+            runtime_min_max_filter_columns: HashMap::new(),
             variant_path_predicates: Vec::new(),
             batch_size: Some(1024),
             datacache: test_datacache_context(),
@@ -4062,6 +4215,80 @@ mod tests {
             Vec::new(),
         );
         crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+    }
+
+    fn runtime_min_max_filter_ctx_for_i32(
+        filter_id: i32,
+        min: i32,
+        max: i32,
+    ) -> crate::exec::node::scan::RuntimeFilterContext {
+        use crate::exec::runtime_filter::{
+            RuntimeFilterType, RuntimeMinMaxFilter, min_max::MinMaxValue,
+        };
+
+        let mut snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
+            Vec::new(),
+            Vec::new(),
+        );
+        snapshot.min_max_filters.push((
+            filter_id,
+            Arc::new(RuntimeMinMaxFilter::new(
+                RuntimeFilterType::Int32,
+                true,
+                MinMaxValue::Int32(min),
+                MinMaxValue::Int32(max),
+            )),
+        ));
+        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+    }
+
+    fn runtime_membership_filter_ctx_for_i32(
+        min: i32,
+        max: i32,
+    ) -> crate::exec::node::scan::RuntimeFilterContext {
+        use crate::exec::runtime_filter::{
+            RuntimeEmptyFilter, RuntimeFilterType, RuntimeMembershipFilter, RuntimeMinMaxFilter,
+            min_max::MinMaxValue,
+        };
+
+        let min_max = RuntimeMinMaxFilter::new(
+            RuntimeFilterType::Int32,
+            true,
+            MinMaxValue::Int32(min),
+            MinMaxValue::Int32(max),
+        );
+        let membership = RuntimeMembershipFilter::Empty(RuntimeEmptyFilter::new(
+            77,
+            SlotId::new(1),
+            RuntimeFilterType::Int32,
+            false,
+            0,
+            2,
+            min_max,
+        ));
+        let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
+            Vec::new(),
+            vec![membership],
+        );
+        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+    }
+
+    #[test]
+    fn runtime_membership_filter_min_max_records_range_predicates() {
+        let cfg = runtime_filter_row_group_scan_cfg();
+        let runtime_filters = runtime_membership_filter_ctx_for_i32(0, 99);
+        let mut counters = super::ScanPredicateCounters::default();
+
+        let predicates = super::runtime_filters_to_scan_predicates_with_counters(
+            &cfg,
+            &runtime_filters,
+            &mut counters,
+        )
+        .expect("runtime scan predicates");
+
+        assert_eq!(predicates.len(), 2);
+        assert_eq!(counters.range, 2);
+        assert_eq!(counters.unsupported, 0);
     }
 
     /// Opens a `ParquetScanIter` over the whole fixture file with the given
@@ -4104,6 +4331,85 @@ mod tests {
             Some(runtime_filters),
         )
         .expect("runtime filter scan iter")
+    }
+
+    #[test]
+    fn parquet_direct_min_max_filter_uses_column_binding() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("rf_direct_min_max.parquet");
+        write_runtime_filter_row_group_fixture(&file_path);
+
+        let runtime_filters = runtime_min_max_filter_ctx_for_i32(99, 0, 99);
+        let profile = crate::runtime::profile::RuntimeProfile::new("rf_direct_min_max_test");
+        let mut cfg = runtime_filter_row_group_scan_cfg();
+        cfg.runtime_min_max_filter_columns
+            .insert(99, "id".to_string());
+
+        let file_len = fs::metadata(&file_path)
+            .expect("fixture file metadata")
+            .len();
+        let temp_dir_path = file_path.parent().expect("fixture parent dir");
+        let op =
+            build_fs_operator(temp_dir_path.to_str().expect("temp dir path")).expect("fs operator");
+        let factory = OpendalRangeReaderFactory::from_operator(op)
+            .expect("reader factory")
+            .with_profile(Some(profile.clone()));
+        let range = FileScanRange {
+            path: file_path.file_name().unwrap().to_string_lossy().to_string(),
+            file_len,
+            offset: 0,
+            length: file_len,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+        };
+        let mut iter = ParquetScanIter::new(
+            cfg,
+            vec![range],
+            factory,
+            None,
+            Some(profile.clone()),
+            Some(runtime_filters),
+        )
+        .expect("scan iter");
+
+        for item in &mut iter {
+            item.expect("chunk");
+        }
+
+        assert_eq!(
+            profile
+                .counter_value("ParquetRowGroupsSelected")
+                .expect("selected counter"),
+            1
+        );
+    }
+
+    #[test]
+    fn parquet_direct_min_max_filter_without_binding_is_storage_noop() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("rf_direct_min_max_unbound.parquet");
+        write_runtime_filter_row_group_fixture(&file_path);
+
+        let runtime_filters = runtime_min_max_filter_ctx_for_i32(99, 0, 99);
+        let profile =
+            crate::runtime::profile::RuntimeProfile::new("rf_direct_min_max_unbound_test");
+        let mut iter = open_runtime_filter_scan_iter(&file_path, runtime_filters, profile.clone());
+
+        for item in &mut iter {
+            item.expect("chunk");
+        }
+
+        assert_eq!(
+            profile
+                .counter_value("ParquetRowGroupsSelected")
+                .expect("selected counter"),
+            RUNTIME_FILTER_ROW_GROUP_COUNT as i64
+        );
     }
 
     fn collect_id_values(chunks: &[arrow::record_batch::RecordBatch]) -> Vec<i32> {
@@ -4168,6 +4474,102 @@ mod tests {
         assert_eq!(
             pruned, total,
             "every row group must be pruned when the runtime filter range is disjoint"
+        );
+    }
+
+    #[test]
+    fn runtime_filter_sparse_in_set_prunes_middle_row_groups() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("rf_sparse_in.parquet");
+        let metadata = write_runtime_filter_row_group_fixture(&file_path);
+        assert_eq!(
+            metadata.num_row_groups(),
+            RUNTIME_FILTER_ROW_GROUP_COUNT as usize
+        );
+
+        // Envelope [0, 999] overlaps every row group. The exact sparse set only
+        // intersects the first and last row groups.
+        let runtime_filters = runtime_filter_ctx_for_keys(vec![0, 999]);
+        let profile = crate::runtime::profile::RuntimeProfile::new("rf_sparse_in_test");
+        let mut iter = open_runtime_filter_scan_iter(&file_path, runtime_filters, profile.clone());
+
+        let mut rf_on_batches = Vec::new();
+        for item in &mut iter {
+            rf_on_batches.push(item.expect("scan chunk").batch);
+        }
+        let values = collect_id_values(&rf_on_batches);
+
+        let selected = profile
+            .counter_value("ParquetRowGroupsSelected")
+            .expect("ParquetRowGroupsSelected counter recorded");
+        let pruned = profile
+            .counter_value("ParquetRowGroupsPruned")
+            .expect("ParquetRowGroupsPruned counter recorded");
+
+        assert_eq!(
+            selected, 2,
+            "sparse IN should keep first and last row groups"
+        );
+        assert_eq!(
+            pruned,
+            RUNTIME_FILTER_ROW_GROUP_COUNT as i64 - 2,
+            "sparse IN should prune every middle row group"
+        );
+        assert!(
+            !values.is_empty(),
+            "surviving row groups should still emit their rows"
+        );
+        assert_eq!(
+            values.len(),
+            2 * RUNTIME_FILTER_ROW_GROUP_ROWS as usize,
+            "row-group pruning should emit both selected row groups in full"
+        );
+        let last_group_start = (RUNTIME_FILTER_ROW_GROUP_COUNT - 1) * RUNTIME_FILTER_ROW_GROUP_ROWS;
+        let last_group_end = RUNTIME_FILTER_ROW_GROUP_COUNT * RUNTIME_FILTER_ROW_GROUP_ROWS;
+        assert!(
+            values.iter().all(|&value| {
+                (0..RUNTIME_FILTER_ROW_GROUP_ROWS).contains(&value)
+                    || (last_group_start..last_group_end).contains(&value)
+            }),
+            "sparse IN row-group pruning should keep only first and last row groups"
+        );
+        assert!(values.contains(&0), "first boundary key should be present");
+        assert!(
+            values.contains(&(last_group_end - 1)),
+            "last boundary key should be present"
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetScanPredicatesDiscreteSet")
+                .expect("discrete set counter"),
+            1
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetScanPredicatesEnvelopeFallback")
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn oversized_in_filter_records_envelope_fallback() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("rf_large_in.parquet");
+        write_runtime_filter_row_group_fixture(&file_path);
+
+        let runtime_filters = runtime_filter_ctx_for_keys((0..300).collect());
+        let profile = crate::runtime::profile::RuntimeProfile::new("rf_large_in_test");
+        let mut iter = open_runtime_filter_scan_iter(&file_path, runtime_filters, profile.clone());
+        for item in &mut iter {
+            item.expect("chunk");
+        }
+
+        assert_eq!(
+            profile
+                .counter_value("ParquetScanPredicatesEnvelopeFallback")
+                .expect("envelope fallback counter"),
+            1
         );
     }
 
