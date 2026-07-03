@@ -868,4 +868,23 @@ mod plan_tests {
             "Exchange belongs to DistributedPlan, not PhysicalPlanKind"
         );
     }
+
+    #[test]
+    fn redistribute_mode_variants_are_frozen() {
+        fn _exhaustive(mode: &RedistributeMode) {
+            match mode {
+                RedistributeMode::Gather => {}
+                RedistributeMode::Hash { .. } => {}
+                RedistributeMode::Broadcast => {}
+            }
+        }
+    }
+
+    #[test]
+    fn physical_plan_kind_has_no_exchange_variant() {
+        assert!(
+            !PhysicalPlanKind::variant_names_for_test().contains(&"Exchange"),
+            "Exchange must not be a PhysicalPlanKind variant"
+        );
+    }
 }
