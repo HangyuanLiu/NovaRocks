@@ -312,35 +312,27 @@ fn receive_total_runtime_filter(
     hub.receive_remote_filter(filter_id, payload)
 }
 
-pub(crate) fn handle_lookup(
-    req: proto::starrocks::PLookUpRequest,
-) -> proto::starrocks::PLookUpResponse {
-    let mut response = proto::starrocks::PLookUpResponse {
-        status: Some(ok_status()),
+pub(crate) fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter::LookupResponse {
+    let mut response = proto::filter::LookupResponse {
+        status: Some(ok_common_status()),
         columns: Vec::new(),
     };
 
     let Some(query_id) = req.query_id.as_ref() else {
-        response.status = Some(error_status("missing query_id for lookup"));
+        response.status = Some(error_common_status("missing query_id for lookup"));
         return response;
     };
     let query_id = QueryId {
         hi: query_id.hi,
         lo: query_id.lo,
     };
-    let Some(tuple_id) = req.request_tuple_id else {
-        response.status = Some(error_status("missing request_tuple_id for lookup"));
-        return response;
-    };
+    let tuple_id = req.request_tuple_id;
 
     let mut request_columns = HashMap::new();
     for col in req.request_columns {
-        let Some(slot_id) = col.slot_id else {
-            response.status = Some(error_status("lookup request column missing slot_id"));
-            return response;
-        };
-        if col.data.as_ref().is_none_or(|data| data.is_empty()) {
-            response.status = Some(error_status(format!(
+        let slot_id = col.slot_id;
+        if col.data.is_empty() {
+            response.status = Some(error_common_status(format!(
                 "lookup request column {} missing data",
                 slot_id
             )));
@@ -349,18 +341,14 @@ pub(crate) fn handle_lookup(
         let slot_id = match SlotId::try_from(slot_id) {
             Ok(v) => v,
             Err(err) => {
-                response.status = Some(error_status(err));
+                response.status = Some(error_common_status(err));
                 return response;
             }
         };
-        let data = col
-            .data
-            .as_ref()
-            .expect("checked non-empty request column data");
-        let array = match decode_column_ipc(data) {
+        let array = match decode_column_ipc(&col.data) {
             Ok(arr) => arr,
             Err(err) => {
-                response.status = Some(error_status(err));
+                response.status = Some(error_common_status(err));
                 return response;
             }
         };
@@ -373,22 +361,94 @@ pub(crate) fn handle_lookup(
                 let data = match encode_column_ipc(&array) {
                     Ok(v) => v,
                     Err(err) => {
-                        response.status = Some(error_status(err));
+                        response.status = Some(error_common_status(err));
                         return response;
                     }
                 };
-                response.columns.push(proto::starrocks::PColumn {
-                    slot_id: Some(slot_id.as_u32() as i32),
-                    data_size: Some(data.len() as i64),
-                    data: Some(data),
+                response.columns.push(proto::filter::Column {
+                    slot_id: slot_id.as_u32() as i32,
+                    data_size: data.len() as i64,
+                    data,
                 });
             }
         }
         Err(err) => {
-            response.status = Some(error_status(err));
+            response.status = Some(error_common_status(err));
         }
     }
     response
+}
+
+#[cfg(feature = "compat")]
+pub(crate) fn handle_lookup_compat(
+    req: proto::starrocks::PLookUpRequest,
+) -> proto::starrocks::PLookUpResponse {
+    let mut request_columns = Vec::with_capacity(req.request_columns.len());
+    let Some(tuple_id) = req.request_tuple_id else {
+        return proto::starrocks::PLookUpResponse {
+            status: Some(error_status("missing request_tuple_id for lookup")),
+            columns: Vec::new(),
+        };
+    };
+
+    for col in req.request_columns {
+        let Some(slot_id) = col.slot_id else {
+            return proto::starrocks::PLookUpResponse {
+                status: Some(error_status("lookup request column missing slot_id")),
+                columns: Vec::new(),
+            };
+        };
+        let data = col.data.unwrap_or_default();
+        if data.is_empty() {
+            return proto::starrocks::PLookUpResponse {
+                status: Some(error_status(format!(
+                    "lookup request column {} missing data",
+                    slot_id
+                ))),
+                columns: Vec::new(),
+            };
+        }
+        let data_size = col.data_size.unwrap_or(data.len() as i64);
+        request_columns.push(proto::filter::Column {
+            slot_id,
+            data_size,
+            data,
+        });
+    }
+
+    let native = proto::filter::LookupRequest {
+        query_id: req
+            .query_id
+            .as_ref()
+            .map(|query_id| proto::common::UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            }),
+        lookup_node_id: req.lookup_node_id.unwrap_or_default(),
+        request_tuple_id: tuple_id,
+        request_columns,
+    };
+    let response = handle_lookup(native);
+    let status = response.status.map(|status| proto::starrocks::StatusPb {
+        status_code: status.code,
+        error_msgs: if status.message.is_empty() {
+            Vec::new()
+        } else {
+            vec![status.message]
+        },
+    });
+    proto::starrocks::PLookUpResponse {
+        status,
+        columns: response
+            .columns
+            .into_iter()
+            .map(|col| proto::starrocks::PColumn {
+                slot_id: Some(col.slot_id),
+                data_size: Some(col.data_size),
+                data: Some(col.data),
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -407,12 +467,12 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use tempfile::tempdir;
 
-    #[cfg(feature = "compat")]
-    use super::handle_transmit_runtime_filter_compat;
     use super::{
         decode_column_ipc, encode_column_ipc, handle_lookup, handle_transmit_chunk,
         handle_transmit_runtime_filter, receive_total_runtime_filter,
     };
+    #[cfg(feature = "compat")]
+    use super::{handle_lookup_compat, handle_transmit_runtime_filter_compat};
     use crate::cache::CacheOptions;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
@@ -1133,7 +1193,126 @@ mod tests {
             .expect("encode scan_range_id column");
         let row_id = encode_column_ipc(&(Arc::new(Int64Array::from(vec![1])) as ArrayRef))
             .expect("encode row_id column");
-        let response = handle_lookup(proto::starrocks::PLookUpRequest {
+        let response = handle_lookup(proto::filter::LookupRequest {
+            query_id: Some(common_unique_id(query_id.hi, query_id.lo)),
+            lookup_node_id: 77,
+            request_tuple_id: tuple_id,
+            request_columns: vec![
+                proto::filter::Column {
+                    slot_id: 2,
+                    data_size: scan_range.len() as i64,
+                    data: scan_range,
+                },
+                proto::filter::Column {
+                    slot_id: 3,
+                    data_size: row_id.len() as i64,
+                    data: row_id,
+                },
+            ],
+        });
+
+        assert!(ok_common_status(response.status.as_ref()));
+        assert_eq!(response.columns.len(), 1);
+        assert_eq!(response.columns[0].slot_id, 4);
+        let data = &response.columns[0].data;
+        let values = decode_column_ipc(data).expect("decode lookup response column");
+        let values = values
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 lookup response");
+        assert_eq!(values.values(), &[20]);
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn test_handle_lookup_compat_returns_encoded_columns() {
+        let query_id = QueryId { hi: 510, lo: 610 };
+        let tuple_id = 1;
+        query_context_manager()
+            .ensure_context(
+                query_id,
+                false,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+            .expect("ensure query context");
+        query_context_manager()
+            .set_cache_options(
+                query_id,
+                CacheOptions::from_query_options(None).expect("default cache options"),
+            )
+            .expect("set cache options");
+        query_context_manager()
+            .with_context_mut(query_id, |ctx| {
+                let desc_tbl = lookup_desc_tbl(tuple_id);
+                let snapshot =
+                    descriptor_snapshot_from_thrift(&desc_tbl).expect("descriptor snapshot");
+                ctx.desc_tbl = Some(desc_tbl);
+                ctx.desc_snapshot = Some(Arc::new(snapshot));
+                Ok(())
+            })
+            .expect("set descriptor table");
+        query_context_manager()
+            .register_row_pos_descs(
+                query_id,
+                HashMap::from([(
+                    tuple_id,
+                    RowPositionDescriptor {
+                        row_position_type: RowPositionType::Iceberg,
+                        row_source_slot: SlotId::new(1),
+                        fetch_ref_slots: vec![SlotId::new(2), SlotId::new(3)],
+                        lookup_ref_slots: Vec::new(),
+                    },
+                )]),
+            )
+            .expect("register row position descriptors");
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("lookup-compat.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef],
+        )
+        .expect("build parquet batch");
+        let file = std::fs::File::create(&path).expect("create parquet file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+        writer.write(&batch).expect("write parquet batch");
+        writer.close().expect("close parquet writer");
+
+        query_context_manager()
+            .register_glm_scan_ranges(
+                query_id,
+                SlotId::new(1),
+                RowPositionScanConfig {
+                    file_format: HdfsScanFileFormat::Parquet,
+                    case_sensitive: true,
+                    batch_size: Some(1024),
+                    enable_file_metacache: false,
+                    enable_file_pagecache: false,
+                    oss_config: None,
+                },
+                vec![FileScanRange {
+                    path: path.to_string_lossy().to_string(),
+                    file_len: std::fs::metadata(&path).expect("metadata").len(),
+                    offset: 0,
+                    length: std::fs::metadata(&path).expect("metadata").len(),
+                    scan_range_id: 9,
+                    first_row_id: Some(0),
+                    data_sequence_number: None,
+                    ivm_change_op: None,
+                    included_positions: None,
+                    external_datacache: None,
+                    delete_files: Vec::new(),
+                }],
+            )
+            .expect("register glm scan ranges");
+
+        let scan_range = encode_column_ipc(&(Arc::new(Int32Array::from(vec![9])) as ArrayRef))
+            .expect("encode scan_range_id column");
+        let row_id = encode_column_ipc(&(Arc::new(Int64Array::from(vec![1])) as ArrayRef))
+            .expect("encode row_id column");
+        let response = handle_lookup_compat(proto::starrocks::PLookUpRequest {
             query_id: Some(unique_id(query_id.hi, query_id.lo)),
             lookup_node_id: Some(77),
             request_tuple_id: Some(tuple_id),
@@ -1159,11 +1338,73 @@ mod tests {
             .data
             .as_ref()
             .expect("lookup response column data");
-        let values = decode_column_ipc(data).expect("decode lookup response column");
+        let values = decode_column_ipc(data).expect("decode compat lookup response column");
         let values = values
             .as_any()
             .downcast_ref::<Int32Array>()
-            .expect("int32 lookup response");
+            .expect("int32 compat lookup response");
         assert_eq!(values.values(), &[20]);
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn test_handle_lookup_compat_rejects_missing_request_tuple_id() {
+        let response = handle_lookup_compat(proto::starrocks::PLookUpRequest {
+            query_id: Some(unique_id(1, 2)),
+            lookup_node_id: Some(77),
+            request_tuple_id: None,
+            request_columns: Vec::new(),
+            lookup_slots: Vec::new(),
+        });
+
+        assert!(!ok_status(response.status.as_ref()));
+        assert_eq!(
+            error_status_message(response.status.as_ref()),
+            "missing request_tuple_id for lookup"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn test_handle_lookup_compat_rejects_missing_slot_id() {
+        let response = handle_lookup_compat(proto::starrocks::PLookUpRequest {
+            query_id: Some(unique_id(1, 2)),
+            lookup_node_id: Some(77),
+            request_tuple_id: Some(1),
+            request_columns: vec![proto::starrocks::PColumn {
+                slot_id: None,
+                data_size: Some(1),
+                data: Some(vec![1]),
+            }],
+            lookup_slots: Vec::new(),
+        });
+
+        assert!(!ok_status(response.status.as_ref()));
+        assert_eq!(
+            error_status_message(response.status.as_ref()),
+            "lookup request column missing slot_id"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn test_handle_lookup_compat_rejects_empty_data() {
+        let response = handle_lookup_compat(proto::starrocks::PLookUpRequest {
+            query_id: Some(unique_id(1, 2)),
+            lookup_node_id: Some(77),
+            request_tuple_id: Some(1),
+            request_columns: vec![proto::starrocks::PColumn {
+                slot_id: Some(2),
+                data_size: Some(0),
+                data: Some(Vec::new()),
+            }],
+            lookup_slots: Vec::new(),
+        });
+
+        assert!(!ok_status(response.status.as_ref()));
+        assert_eq!(
+            error_status_message(response.status.as_ref()),
+            "lookup request column 2 missing data"
+        );
     }
 }

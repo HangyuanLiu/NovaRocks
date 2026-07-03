@@ -266,8 +266,8 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
 
     async fn lookup(
         &self,
-        request: tonic::Request<proto::starrocks::PLookUpRequest>,
-    ) -> Result<tonic::Response<proto::starrocks::PLookUpResponse>, tonic::Status> {
+        request: tonic::Request<proto::filter::LookupRequest>,
+    ) -> Result<tonic::Response<proto::filter::LookupResponse>, tonic::Status> {
         self.require_local_execution("Lookup")?;
         Ok(tonic::Response::new(internal_rpc::handle_lookup(
             request.into_inner(),

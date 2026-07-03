@@ -201,20 +201,77 @@ pub fn transmit_runtime_filter(
 pub fn lookup(
     dest_host: &str,
     dest_port: u16,
-    params: proto::starrocks::PLookUpRequest,
-) -> Result<proto::starrocks::PLookUpResponse, String> {
+    params: proto::filter::LookupRequest,
+) -> Result<proto::filter::LookupResponse, String> {
     #[cfg(test)]
     if let Some(result) = maybe_lookup_hook(dest_host, dest_port, params.clone()) {
         return result;
     }
 
-    call_unary(
+    let compat_request = proto::starrocks::PLookUpRequest {
+        query_id: params
+            .query_id
+            .as_ref()
+            .map(|query_id| proto::starrocks::PUniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            }),
+        lookup_node_id: Some(params.lookup_node_id),
+        request_tuple_id: Some(params.request_tuple_id),
+        request_columns: params
+            .request_columns
+            .into_iter()
+            .map(|col| proto::starrocks::PColumn {
+                slot_id: Some(col.slot_id),
+                data_size: Some(col.data_size),
+                data: Some(col.data),
+            })
+            .collect(),
+        lookup_slots: Vec::new(),
+    };
+
+    #[cfg(test)]
+    let response: proto::starrocks::PLookUpResponse = if let Some(result) =
+        maybe_lookup_wire_hook(dest_host, dest_port, compat_request.clone())
+    {
+        result?
+    } else {
+        call_unary(
+            dest_host,
+            dest_port,
+            compat_request,
+            "lookup",
+            novarocks_compat_lookup,
+        )?
+    };
+    #[cfg(not(test))]
+    let response: proto::starrocks::PLookUpResponse = call_unary(
         dest_host,
         dest_port,
-        params,
+        compat_request,
         "lookup",
         novarocks_compat_lookup,
-    )
+    )?;
+
+    let status = response.status.map(|status| proto::common::Status {
+        code: status.status_code,
+        message: status.error_msgs.join("; "),
+    });
+    let mut columns = Vec::with_capacity(response.columns.len());
+    for col in response.columns {
+        let slot_id = col
+            .slot_id
+            .ok_or_else(|| "lookup response column missing slot_id".to_string())?;
+        let data = col
+            .data
+            .ok_or_else(|| "lookup response column missing data".to_string())?;
+        columns.push(proto::filter::Column {
+            slot_id,
+            data_size: col.data_size.unwrap_or(data.len() as i64),
+            data,
+        });
+    }
+    Ok(proto::filter::LookupResponse { status, columns })
 }
 
 #[cfg(test)]
@@ -241,6 +298,13 @@ type TransmitRuntimeFilterHook = std::sync::Arc<
 
 #[cfg(test)]
 type LookupHook = std::sync::Arc<
+    dyn Fn(&str, u16, proto::filter::LookupRequest) -> Result<proto::filter::LookupResponse, String>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+type LookupWireHook = std::sync::Arc<
     dyn Fn(
             &str,
             u16,
@@ -267,6 +331,13 @@ fn transmit_runtime_filter_hook() -> &'static std::sync::Mutex<Option<TransmitRu
 #[cfg(test)]
 fn lookup_hook() -> &'static std::sync::Mutex<Option<LookupHook>> {
     static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<LookupHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn lookup_wire_hook() -> &'static std::sync::Mutex<Option<LookupWireHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<LookupWireHook>>> =
         std::sync::OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
@@ -307,9 +378,22 @@ fn maybe_transmit_runtime_filter_hook(
 fn maybe_lookup_hook(
     host: &str,
     port: u16,
+    params: proto::filter::LookupRequest,
+) -> Option<Result<proto::filter::LookupResponse, String>> {
+    let hook = lookup_hook().lock().expect("lookup hook lock").clone();
+    hook.map(|hook| hook(host, port, params))
+}
+
+#[cfg(test)]
+fn maybe_lookup_wire_hook(
+    host: &str,
+    port: u16,
     params: proto::starrocks::PLookUpRequest,
 ) -> Option<Result<proto::starrocks::PLookUpResponse, String>> {
-    let hook = lookup_hook().lock().expect("lookup hook lock").clone();
+    let hook = lookup_wire_hook()
+        .lock()
+        .expect("lookup wire hook lock")
+        .clone();
     hook.map(|hook| hook(host, port, params))
 }
 
@@ -327,6 +411,7 @@ pub(crate) fn clear_test_hooks() {
         .lock()
         .expect("transmit_runtime_filter hook lock") = None;
     *lookup_hook().lock().expect("lookup hook lock") = None;
+    *lookup_wire_hook().lock().expect("lookup wire hook lock") = None;
 }
 
 #[cfg(test)]
@@ -367,6 +452,17 @@ where
 #[cfg(test)]
 pub(crate) fn set_lookup_hook<F>(hook: F)
 where
+    F: Fn(&str, u16, proto::filter::LookupRequest) -> Result<proto::filter::LookupResponse, String>
+        + Send
+        + Sync
+        + 'static,
+{
+    *lookup_hook().lock().expect("lookup hook lock") = Some(std::sync::Arc::new(hook));
+}
+
+#[cfg(test)]
+fn set_lookup_wire_hook<F>(hook: F)
+where
     F: Fn(
             &str,
             u16,
@@ -376,5 +472,80 @@ where
         + Sync
         + 'static,
 {
-    *lookup_hook().lock().expect("lookup hook lock") = Some(std::sync::Arc::new(hook));
+    *lookup_wire_hook().lock().expect("lookup wire hook lock") = Some(std::sync::Arc::new(hook));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[test]
+    fn test_lookup_accepts_native_request_and_maps_starrocks_wire_response() {
+        let _hook_guard = test_hook_lock();
+        clear_test_hooks();
+
+        let captured = Arc::new(Mutex::new(None));
+        let captured_hook = Arc::clone(&captured);
+        set_lookup_wire_hook(move |host, port, req| {
+            *captured_hook.lock().expect("captured lock") = Some((host.to_string(), port, req));
+            Ok(proto::starrocks::PLookUpResponse {
+                status: Some(proto::starrocks::StatusPb {
+                    status_code: 0,
+                    error_msgs: Vec::new(),
+                }),
+                columns: vec![proto::starrocks::PColumn {
+                    slot_id: Some(4),
+                    data_size: Some(3),
+                    data: Some(vec![7, 8, 9]),
+                }],
+            })
+        });
+
+        let response = lookup(
+            "compat-host",
+            9911,
+            proto::filter::LookupRequest {
+                query_id: Some(proto::common::UniqueId { hi: 10, lo: 20 }),
+                lookup_node_id: 77,
+                request_tuple_id: 3,
+                request_columns: vec![proto::filter::Column {
+                    slot_id: 2,
+                    data_size: 3,
+                    data: vec![1, 2, 3],
+                }],
+            },
+        )
+        .expect("lookup should map through compat wire hook");
+
+        assert_eq!(
+            response.status,
+            Some(proto::common::Status {
+                code: 0,
+                message: String::new(),
+            })
+        );
+        assert_eq!(response.columns.len(), 1);
+        assert_eq!(response.columns[0].slot_id, 4);
+        assert_eq!(response.columns[0].data_size, 3);
+        assert_eq!(response.columns[0].data, vec![7, 8, 9]);
+
+        let captured = captured.lock().expect("captured lock");
+        let (host, port, request) = captured.as_ref().expect("captured request");
+        assert_eq!(host, "compat-host");
+        assert_eq!(*port, 9911);
+        assert_eq!(
+            request.query_id,
+            Some(proto::starrocks::PUniqueId { hi: 10, lo: 20 })
+        );
+        assert_eq!(request.lookup_node_id, Some(77));
+        assert_eq!(request.request_tuple_id, Some(3));
+        assert_eq!(request.request_columns.len(), 1);
+        assert_eq!(request.request_columns[0].slot_id, Some(2));
+        assert_eq!(request.request_columns[0].data, Some(vec![1, 2, 3]));
+        assert!(request.lookup_slots.is_empty());
+
+        clear_test_hooks();
+    }
 }

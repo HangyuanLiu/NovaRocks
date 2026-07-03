@@ -343,7 +343,7 @@ pub extern "C" fn novarocks_rs_lookup(
         out_resp,
         out_err,
         "lookup",
-        internal_rpc::handle_lookup,
+        internal_rpc::handle_lookup_compat,
     )
 }
 
@@ -910,6 +910,49 @@ mod tests {
             ptr: std::ptr::null_mut(),
             len: 0,
         }
+    }
+
+    fn take_ffi_buf(buf: &mut NovaRocksRustBuf) -> Vec<u8> {
+        let bytes = if buf.ptr.is_null() || buf.len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(buf.ptr, buf.len) }.to_vec()
+        };
+        if !buf.ptr.is_null() {
+            novarocks_rs_free_buf(buf.ptr, buf.len);
+            buf.ptr = std::ptr::null_mut();
+            buf.len = 0;
+        }
+        bytes
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn ffi_lookup_smoke_encodes_starrocks_error_response() {
+        let request = PLookUpRequest {
+            query_id: Some(crate::proto::starrocks::PUniqueId { hi: 1, lo: 2 }),
+            lookup_node_id: Some(77),
+            request_tuple_id: None,
+            request_columns: Vec::new(),
+            lookup_slots: Vec::new(),
+        };
+        let request = request.encode_to_vec();
+        let mut response = empty_buf();
+        let mut err = empty_buf();
+
+        let rc = novarocks_rs_lookup(request.as_ptr(), request.len(), &mut response, &mut err);
+
+        assert_eq!(rc, 0);
+        assert!(err.ptr.is_null());
+        let response_bytes = take_ffi_buf(&mut response);
+        let response =
+            PLookUpResponse::decode(response_bytes.as_slice()).expect("decode lookup ffi response");
+        let status = response.status.as_ref().expect("lookup status");
+        assert_eq!(status.status_code, 1);
+        assert_eq!(
+            status.error_msgs,
+            vec!["missing request_tuple_id for lookup"]
+        );
     }
 
     #[test]

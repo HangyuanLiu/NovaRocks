@@ -10,8 +10,8 @@ package novarocks;
 
 import "common.proto";
 import "filter.proto";
-// internal_service.proto (package starrocks) still provides PLookUp* used by
-// Lookup. Keep this import until Lookup moves to novarocks.filter in Task 3.
+// LOAD-BEARING import, NOT dead. Lookup is native in novarocks.filter, but this
+// import still anchors starrocks protobuf messages used by non-service code.
 import "internal_service.proto";
 // LOAD-BEARING import, NOT dead. No `lake.`/`starrocks.` type from this file is
 // referenced syntactically here, but this import is the SOLE anchor that pulls
@@ -36,8 +36,9 @@ service NovaRocksGrpc {
   // Runtime-filter propagation.
   rpc TransmitRuntimeFilter(novarocks.filter.TransmitRuntimeFilterRequest)
       returns (novarocks.filter.TransmitRuntimeFilterResponse);
-  // Point lookup (fetch-by-key). Task 3 retypes this to novarocks.filter.
-  rpc Lookup(starrocks.PLookUpRequest) returns (starrocks.PLookUpResponse);
+  // Point lookup (fetch-by-key).
+  rpc Lookup(novarocks.filter.LookupRequest)
+      returns (novarocks.filter.LookupResponse);
 
   // Coordinator -> BE fragment submission. payload is a thrift-encoded
   // TExecPlanFragmentParams today; NIDL-4 adds native plan + instance_params.

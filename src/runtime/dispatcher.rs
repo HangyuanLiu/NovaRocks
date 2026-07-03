@@ -384,6 +384,7 @@ mod tests {
 
     use crate::proto;
     use arrow::array::Int32Array;
+    use proto::filter::{LookupRequest, LookupResponse};
     use proto::filter::{TransmitRuntimeFilterRequest, TransmitRuntimeFilterResponse};
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
     use proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc;
@@ -393,7 +394,6 @@ mod tests {
         HeartbeatRequest, HeartbeatResponse, ReportExecStatusRequest, ReportExecStatusResponse,
         SubmitFragmentRequest, SubmitFragmentResponse,
     };
-    use proto::starrocks::{PLookUpRequest, PLookUpResponse};
     use tonic::{Request, Response, Status, Streaming};
 
     fn make_finst_id(hi: i64, lo: i64) -> types::TUniqueId {
@@ -553,8 +553,8 @@ mod tests {
 
         async fn lookup(
             &self,
-            _request: Request<PLookUpRequest>,
-        ) -> Result<Response<PLookUpResponse>, Status> {
+            _request: Request<LookupRequest>,
+        ) -> Result<Response<LookupResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }
 
