@@ -1128,9 +1128,7 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::codegen::{FragmentEdgeKind, FragmentStreamKind};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{
-        AggMode, AggregateOutputLayout, JoinDistribution, TopNPhase,
-    };
+    use crate::sql::optimizer::operator::{AggMode, AggregateOutputLayout, JoinDistribution};
     use crate::sql::optimizer::property::HashSource;
     use crate::sql::planner::distributed_fragment::{DataSink, PartitionKind};
     use crate::sql::planner::distributed_node::DistributedPayload;
@@ -1146,7 +1144,7 @@ mod tests {
     };
     use crate::sql::planner::{
         JoinExecutionMode, PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate,
-        RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+        RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
     };
     use crate::thrift::partitions::TPartitionType;
 
