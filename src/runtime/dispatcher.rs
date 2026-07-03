@@ -87,6 +87,19 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
         params: internal_service::TExecPlanFragmentParams,
     ) -> Result<(), String>;
 
+    /// Submit a fragment with optional NovaRocks-native sidecar payloads.
+    ///
+    /// Existing in-process and test dispatchers can keep implementing only the
+    /// legacy thrift method; the remote dispatcher overrides this to preserve
+    /// the legacy payload while attaching native plan/instance parameters.
+    fn submit_fragment_submission(
+        &self,
+        backend_idx: usize,
+        submission: FragmentSubmission,
+    ) -> Result<(), String> {
+        self.submit_fragment(backend_idx, submission.into_thrift_params())
+    }
+
     /// Poll for the next result chunk from the root fragment on the given
     /// backend.
     fn fetch_result(
@@ -148,6 +161,52 @@ fn serialize_thrift_binary<T: TSerializable>(value: &T) -> Result<Vec<u8>, Strin
                 capacity = capacity.saturating_mul(2).min(MAX_CAPACITY);
             }
         }
+    }
+}
+
+pub(crate) struct FragmentSubmission {
+    thrift_params: internal_service::TExecPlanFragmentParams,
+    native_plan: Option<crate::proto::plan::PlanFragment>,
+    native_instance_params: Option<crate::proto::novarocks::InstanceParams>,
+}
+
+impl FragmentSubmission {
+    pub(crate) fn thrift_only(params: internal_service::TExecPlanFragmentParams) -> Self {
+        Self {
+            thrift_params: params,
+            native_plan: None,
+            native_instance_params: None,
+        }
+    }
+
+    pub(crate) fn with_native(
+        params: internal_service::TExecPlanFragmentParams,
+        native_plan: crate::proto::plan::PlanFragment,
+        native_instance_params: crate::proto::novarocks::InstanceParams,
+    ) -> Self {
+        Self {
+            thrift_params: params,
+            native_plan: Some(native_plan),
+            native_instance_params: Some(native_instance_params),
+        }
+    }
+
+    pub(crate) fn thrift_params(&self) -> &internal_service::TExecPlanFragmentParams {
+        &self.thrift_params
+    }
+
+    pub(crate) fn into_thrift_params(self) -> internal_service::TExecPlanFragmentParams {
+        self.thrift_params
+    }
+
+    fn into_submit_fragment_request(self) -> Result<SubmitFragmentRequest, String> {
+        let payload = serialize_thrift_binary(&self.thrift_params)
+            .map_err(|e| format!("serialize fragment params for remote submit failed: {e}"))?;
+        Ok(SubmitFragmentRequest {
+            exec_plan_fragment_params_thrift: payload,
+            plan: self.native_plan,
+            instance_params: self.native_instance_params,
+        })
     }
 }
 
@@ -234,6 +293,14 @@ impl FragmentDispatcher for RemoteDispatcher {
         backend_idx: usize,
         params: internal_service::TExecPlanFragmentParams,
     ) -> Result<(), String> {
+        self.submit_fragment_submission(backend_idx, FragmentSubmission::thrift_only(params))
+    }
+
+    fn submit_fragment_submission(
+        &self,
+        backend_idx: usize,
+        submission: FragmentSubmission,
+    ) -> Result<(), String> {
         let (client, addr) = self.client_and_addr(backend_idx)?;
         // Counter increments only after a successful check_idx, so only valid-index
         // calls are counted — matches the fault-injection test assumptions.
@@ -245,14 +312,9 @@ impl FragmentDispatcher for RemoteDispatcher {
             let _ = std::io::Write::flush(&mut std::io::stdout());
             return Err(format!("debug submit fault injected on call {call_index}"));
         }
-        let payload = serialize_thrift_binary(&params)
-            .map_err(|e| format!("serialize fragment params for remote submit failed: {e}"))?;
+        let request = submission.into_submit_fragment_request()?;
         let resp = client
-            .blocking_submit_fragment(SubmitFragmentRequest {
-                exec_plan_fragment_params_thrift: payload,
-                plan: None,
-                instance_params: None,
-            })
+            .blocking_submit_fragment(request)
             .map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
         if resp.status_code != 0 {
             return Err(format!(
@@ -501,6 +563,45 @@ mod tests {
             None::<bool>,
             None::<bool>, // novarocks_generated_plan
         )
+    }
+
+    #[test]
+    fn fragment_submission_thrift_only_request_has_no_native_sidecars() {
+        let request = FragmentSubmission::thrift_only(make_noop_sink_params(1, 2))
+            .into_submit_fragment_request()
+            .expect("serialize thrift-only request");
+
+        assert!(!request.exec_plan_fragment_params_thrift.is_empty());
+        assert!(request.plan.is_none());
+        assert!(request.instance_params.is_none());
+    }
+
+    #[test]
+    fn fragment_submission_proto_sidecar_retains_legacy_thrift_bytes() {
+        let request = FragmentSubmission::with_native(
+            make_noop_sink_params(1, 2),
+            crate::proto::plan::PlanFragment {
+                fragment_id: 9,
+                ..Default::default()
+            },
+            crate::proto::novarocks::InstanceParams {
+                backend_num: 3,
+                ..Default::default()
+            },
+        )
+        .into_submit_fragment_request()
+        .expect("serialize proto sidecar request");
+
+        assert!(!request.exec_plan_fragment_params_thrift.is_empty());
+        assert_eq!(request.plan.as_ref().expect("native plan").fragment_id, 9);
+        assert_eq!(
+            request
+                .instance_params
+                .as_ref()
+                .expect("native instance params")
+                .backend_num,
+            3
+        );
     }
 
     #[derive(Clone)]

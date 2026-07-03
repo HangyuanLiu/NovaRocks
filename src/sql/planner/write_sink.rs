@@ -95,6 +95,7 @@ pub(crate) mod test_support {
                     initial_default: None,
                     write_default: None,
                     initial_default_json: None,
+                    write_default_json: None,
                     children: Vec::new(),
                 }],
             },

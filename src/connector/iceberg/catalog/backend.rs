@@ -781,12 +781,20 @@ fn iceberg_field_def(field: &iceberg::spec::NestedField) -> IcebergSchemaFieldDe
             .ok()
             .map(|json| json.to_string())
     });
+    let write_default_json = field.write_default.as_ref().and_then(|literal| {
+        literal
+            .clone()
+            .try_into_json(field.field_type.as_ref())
+            .ok()
+            .map(|json| json.to_string())
+    });
     IcebergSchemaFieldDef {
         field_id: field.id,
         name: field.name.clone(),
         initial_default: field.initial_default.clone(),
         write_default: field.write_default.clone(),
         initial_default_json,
+        write_default_json,
         children: iceberg_type_children(field.field_type.as_ref()),
     }
 }

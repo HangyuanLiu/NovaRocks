@@ -277,6 +277,7 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
         )?;
         let crate::engine::PlannedIcebergChangeStreamWrite {
             build_result,
+            distributed_plan,
             commit_plan,
             ..
         } = planned;
@@ -286,6 +287,7 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
             .expect("change-stream commit plan lock poisoned") = Some(commit_plan);
         crate::engine::execute_planned_iceberg_change_stream_write(
             build_result,
+            distributed_plan,
             build_input.query_opts.clone(),
         )
     }

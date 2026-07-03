@@ -1076,6 +1076,7 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
         )?;
         let crate::engine::PlannedIcebergChangeStreamWrite {
             build_result,
+            distributed_plan,
             commit_plan,
             #[cfg(test)]
             topology,
@@ -1088,8 +1089,11 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
         if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&topology) {
             return Ok(result);
         }
-        let result =
-            crate::engine::execute_planned_iceberg_change_stream_write(build_result, None)?;
+        let result = crate::engine::execute_planned_iceberg_change_stream_write(
+            build_result,
+            distributed_plan,
+            None,
+        )?;
         if let Some(commit) = result.write_commit.as_ref()
             && !write_commit_has_files(commit)
         {
@@ -1147,6 +1151,7 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
         )?;
         let crate::engine::PlannedIcebergChangeStreamWrite {
             build_result,
+            distributed_plan,
             commit_plan,
             #[cfg(test)]
             topology,
@@ -1159,8 +1164,11 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
         if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&topology) {
             return Ok(result);
         }
-        let result =
-            crate::engine::execute_planned_iceberg_change_stream_write(build_result, None)?;
+        let result = crate::engine::execute_planned_iceberg_change_stream_write(
+            build_result,
+            distributed_plan,
+            None,
+        )?;
         if let Some(commit) = result.write_commit.as_ref()
             && !write_commit_has_files(commit)
         {

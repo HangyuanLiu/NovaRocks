@@ -110,6 +110,9 @@ pub struct IcebergSchemaFieldDef {
     /// alone in `descriptors::to_thrift_iceberg_schema_field`.
     /// `None` falls back to the type-blind serializer.
     pub initial_default_json: Option<String>,
+    /// Spec-compliant JSON encoding of `write_default`, for the same reason as
+    /// `initial_default_json`.
+    pub write_default_json: Option<String>,
     pub children: Vec<IcebergSchemaFieldDef>,
 }
 
@@ -525,12 +528,14 @@ mod tests {
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
+                write_default_json: None,
                 children: vec![IcebergSchemaFieldDef {
                     field_id: 11,
                     name: "nested".to_string(),
                     initial_default: None,
                     write_default: None,
                     initial_default_json: None,
+                    write_default_json: None,
                     children: vec![],
                 }],
             }],

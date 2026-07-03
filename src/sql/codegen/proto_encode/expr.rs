@@ -179,7 +179,7 @@ fn encode_exprs(values: &[TypedExpr]) -> Result<Vec<expr::Expr>, String> {
     values.iter().map(encode_expr).collect()
 }
 
-fn encode_sort_items(values: &[SortItem]) -> Result<Vec<expr::SortItem>, String> {
+pub(super) fn encode_sort_items(values: &[SortItem]) -> Result<Vec<expr::SortItem>, String> {
     values
         .iter()
         .map(|item| {
@@ -192,7 +192,7 @@ fn encode_sort_items(values: &[SortItem]) -> Result<Vec<expr::SortItem>, String>
         .collect()
 }
 
-fn encode_window_frame(frame: &WindowFrame) -> Result<expr::WindowFrame, String> {
+pub(super) fn encode_window_frame(frame: &WindowFrame) -> Result<expr::WindowFrame, String> {
     Ok(expr::WindowFrame {
         frame_type: match frame.frame_type {
             WindowFrameType::Rows => expr::WindowFrameType::Rows as i32,
@@ -203,7 +203,7 @@ fn encode_window_frame(frame: &WindowFrame) -> Result<expr::WindowFrame, String>
     })
 }
 
-fn encode_window_bound(bound: &WindowBound) -> expr::WindowBound {
+pub(super) fn encode_window_bound(bound: &WindowBound) -> expr::WindowBound {
     use expr::window_bound::Bound;
 
     expr::WindowBound {

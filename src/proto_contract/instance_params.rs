@@ -51,6 +51,9 @@ fn hdfs_scan_range() -> novarocks::ScanRange {
                 use_iceberg_jni_metadata_reader: true,
             },
         )),
+        volume_id: None,
+        empty: None,
+        has_more: None,
     }
 }
 
@@ -69,6 +72,9 @@ fn internal_scan_range() -> novarocks::ScanRange {
                 skip_disk_cache: true,
             },
         )),
+        volume_id: None,
+        empty: None,
+        has_more: None,
     }
 }
 

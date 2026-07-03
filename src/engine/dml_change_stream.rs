@@ -569,6 +569,7 @@ pub(crate) fn execute_dml_change_stream_write(
 ) -> Result<DmlChangeStreamWriteExecution, String> {
     let crate::engine::PlannedIcebergChangeStreamWrite {
         build_result,
+        distributed_plan,
         commit_plan,
         #[cfg(test)]
         topology,
@@ -579,6 +580,7 @@ pub(crate) fn execute_dml_change_stream_write(
     }
     let result = crate::engine::execute_planned_iceberg_change_stream_write(
         build_result,
+        distributed_plan,
         query_opts.cloned(),
     )?;
     dml_change_stream_write_execution(result, commit_plan)
@@ -599,13 +601,22 @@ pub(crate) fn plan_dml_change_stream_write(
     )?;
     let crate::engine::PlannedIcebergChangeStreamWrite {
         mut build_result,
+        distributed_plan,
         commit_plan,
         #[cfg(test)]
         topology,
     } = planned;
     inject_dml_pre_expand_keyed_assert(&mut build_result, plan.pre_expand_keyed_assert.as_ref())?;
+    // The keyed assert is a post-codegen thrift mutation; the native
+    // DistributedPlan cannot represent it yet, so proto mode must fail fast.
+    let distributed_plan = if plan.pre_expand_keyed_assert.is_some() {
+        None
+    } else {
+        distributed_plan
+    };
     Ok(crate::engine::PlannedIcebergChangeStreamWrite {
         build_result,
+        distributed_plan,
         commit_plan,
         #[cfg(test)]
         topology,

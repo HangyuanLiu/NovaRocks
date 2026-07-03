@@ -111,6 +111,9 @@ message ScanRange {
     HdfsScanRange hdfs = 1;
     InternalScanRange internal = 2;
   }
+  optional int32 volume_id = 3; // TScanRangeParams.volume_id wrapper value.
+  optional bool empty = 4;      // TScanRangeParams.empty continuation marker.
+  optional bool has_more = 5;   // TScanRangeParams.has_more continuation marker.
 }
 
 // THdfsScanRange consumed subset.
