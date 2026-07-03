@@ -199,12 +199,6 @@ pub mod proto {
         tonic::include_proto!("novarocks");
     }
 
-    // NIDL-0 spike: temporary conversion-layer ergonomics probe.
-    // TOMBSTONE: delete with idl/novarocks/spike.proto at NIDL-3.
-    pub mod spike {
-        tonic::include_proto!("novarocks.spike");
-    }
-
     pub mod starrocks {
         #![allow(clippy::doc_lazy_continuation, clippy::len_without_is_empty)]
         tonic::include_proto!("starrocks");
@@ -254,7 +248,6 @@ fn main() {
     println!("cargo:rerun-if-changed=idl/novarocks/expr.proto");
     println!("cargo:rerun-if-changed=idl/novarocks/plan.proto");
     println!("cargo:rerun-if-changed=idl/novarocks/service.proto");
-    println!("cargo:rerun-if-changed=idl/novarocks/spike.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/starlet.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/manager.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/service.proto");
@@ -562,11 +555,10 @@ static C++ runtime is required.",
                 "idl/novarocks/expr.proto",
                 "idl/novarocks/plan.proto",
                 "idl/novarocks/service.proto",
-                "idl/novarocks/spike.proto",
             ],
             &["idl/novarocks", "idl/proto"],
         )
-        .expect("compile novarocks common + service + spike protos");
+        .expect("compile novarocks common + expr + plan + service protos");
 
     tonic_build::configure()
         .build_client(true)
