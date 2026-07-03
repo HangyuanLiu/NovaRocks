@@ -190,6 +190,10 @@ pub mod proto {
         tonic::include_proto!("novarocks.expr");
     }
 
+    pub mod filter {
+        tonic::include_proto!("novarocks.filter");
+    }
+
     pub mod plan {
         tonic::include_proto!("novarocks.plan");
     }
@@ -246,6 +250,7 @@ fn main() {
     println!("cargo:rerun-if-changed=idl/proto/tablet_schema.proto");
     println!("cargo:rerun-if-changed=idl/novarocks/common.proto");
     println!("cargo:rerun-if-changed=idl/novarocks/expr.proto");
+    println!("cargo:rerun-if-changed=idl/novarocks/filter.proto");
     println!("cargo:rerun-if-changed=idl/novarocks/plan.proto");
     println!("cargo:rerun-if-changed=idl/novarocks/service.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/starlet.proto");
@@ -553,12 +558,13 @@ static C++ runtime is required.",
             &[
                 "idl/novarocks/common.proto",
                 "idl/novarocks/expr.proto",
+                "idl/novarocks/filter.proto",
                 "idl/novarocks/plan.proto",
                 "idl/novarocks/service.proto",
             ],
             &["idl/novarocks", "idl/proto"],
         )
-        .expect("compile novarocks common + expr + plan + service protos");
+        .expect("compile novarocks common + expr + filter + plan + service protos");
 
     tonic_build::configure()
         .build_client(true)
