@@ -255,8 +255,8 @@ mod tests {
     use crate::sql::optimizer;
     use crate::sql::optimizer::operator::{
         GenerateSeriesOp, JoinDistribution, LimitOp, Operator, PhysicalDistributionOp,
-        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ProjectOp, ScanDictionaryColumn, ScanOp,
-        ScanVariantColumn, SortOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ProjectOp, ScanOp, ScanVariantColumn,
+        SortOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::physical_tree::{
         JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
@@ -1464,7 +1464,6 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: Some(vec!["id".to_string()]),
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1602,7 +1601,6 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1640,7 +1638,6 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1680,7 +1677,6 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1724,7 +1720,6 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![intern_typed(&mut scalars, &id_eq_literal(12))],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1770,7 +1765,6 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![intern_typed(&mut scalars, &id_eq_literal(12))],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1814,7 +1808,6 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1858,7 +1851,6 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -3830,89 +3822,6 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // Task 6: codegen dictionary plan interface
-    // -------------------------------------------------------------------
-
-    fn dict_snapshot_a_b() -> std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot> {
-        use crate::engine::dictionary::model::{
-            DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue,
-            DictionaryWatermark,
-        };
-        std::sync::Arc::new(DictionarySnapshot {
-            dictionary_id: 1,
-            owner: DictionaryOwner::StarRocksTable {
-                database: "default".to_string(),
-                table: "starrocks_t".to_string(),
-                db_id: 11,
-                table_id: 22,
-            },
-            column_id: None,
-            column_name: "id".to_string(),
-            data_type: DataType::Int32,
-            version: 1,
-            watermark: DictionaryWatermark::StarRocks {
-                schema_id: 33,
-                tablets: vec![],
-            },
-            values: vec![
-                DictionaryValue {
-                    id: 1,
-                    bytes: b"a".to_vec(),
-                },
-                DictionaryValue {
-                    id: 2,
-                    bytes: b"b".to_vec(),
-                },
-            ],
-            null_id: 0,
-            state: DictionaryState::Active,
-            order_preserving: true,
-        })
-    }
-
-    fn dict_snapshot_x_y_z() -> std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>
-    {
-        use crate::engine::dictionary::model::{
-            DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue,
-            DictionaryWatermark,
-        };
-        std::sync::Arc::new(DictionarySnapshot {
-            dictionary_id: 2,
-            owner: DictionaryOwner::StarRocksTable {
-                database: "default".to_string(),
-                table: "starrocks_t".to_string(),
-                db_id: 11,
-                table_id: 22,
-            },
-            column_id: None,
-            column_name: "name".to_string(),
-            data_type: DataType::Int32,
-            version: 3,
-            watermark: DictionaryWatermark::StarRocks {
-                schema_id: 33,
-                tablets: vec![],
-            },
-            values: vec![
-                DictionaryValue {
-                    id: 10,
-                    bytes: b"x".to_vec(),
-                },
-                DictionaryValue {
-                    id: 11,
-                    bytes: b"y".to_vec(),
-                },
-                DictionaryValue {
-                    id: 12,
-                    bytes: b"z".to_vec(),
-                },
-            ],
-            null_id: 0,
-            state: DictionaryState::Active,
-            order_preserving: true,
-        })
-    }
-
     /// Look up the slot id of a slot by its column name in `desc_tbl`.
     /// Panics if no such slot exists — the caller is asserting that the
     /// builder produced a slot with the expected name.
@@ -3924,9 +3833,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no slot named `{}` in desc_tbl", column_name))
     }
 
-    /// Optional variant for tests that need to assert ABSENCE of a slot
-    /// (e.g. Bug B regression: a dict-rewritten scan must NOT emit a
-    /// separate source-string slot alongside its dict slot).
+    /// Optional variant for tests that need to assert ABSENCE of a slot.
     fn slot_id_by_name_opt(
         desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
         column_name: &str,
@@ -3951,451 +3858,6 @@ mod tests {
                 version: 7,
             }],
         }
-    }
-
-    #[test]
-    fn scan_dict_column_emits_query_global_dict() {
-        let layout = starrocks_layout();
-        let plan = attach_test_scalar_arena(OptimizerPhysicalNode {
-            op: Operator::PhysicalScan(ScanOp {
-                database: "default".to_string(),
-                table: TableDef {
-                    name: "starrocks_t".to_string(),
-                    columns: vec![
-                        ColumnDef {
-                            name: "id".to_string(),
-                            data_type: DataType::Utf8,
-                            nullable: false,
-                            write_default: None,
-                            logical_type: None,
-                        },
-                        ColumnDef {
-                            name: "name".to_string(),
-                            data_type: DataType::Utf8,
-                            nullable: false,
-                            write_default: None,
-                            logical_type: None,
-                        },
-                    ],
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 11,
-                        table_id: 22,
-                    },
-                },
-                alias: None,
-                stats_ref: None,
-                columns: vec![
-                    output_col_for_test(8101, "id", DataType::Utf8, false),
-                    output_col_for_test(8102, "name", DataType::Utf8, false),
-                ],
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![
-                    ScanDictionaryColumn {
-                        source_column: "id".to_string(),
-                        dict_column: "id_dict".to_string(),
-                        dictionary: dict_snapshot_a_b(),
-                    },
-                    ScanDictionaryColumn {
-                        source_column: "name".to_string(),
-                        dict_column: "name_dict".to_string(),
-                        dictionary: dict_snapshot_x_y_z(),
-                    },
-                ],
-                variant_columns: vec![],
-                mv_rewritten_from: None,
-            }),
-            children: vec![],
-            stats: stats(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: vec![
-                output_col_for_test(8101, "id", DataType::Utf8, false),
-                output_col_for_test(8102, "name", DataType::Utf8, false),
-            ],
-            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-        });
-
-        let registry = mock_starrocks_registry(&layout);
-        let catalog = StarRocksCatalog { layout };
-        let build = build_fragments_from_optimizer_for_database_for_test(
-            &plan, &catalog, &registry, "default",
-        )
-        .expect("build");
-
-        let root = build
-            .fragment_results
-            .iter()
-            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
-            .expect("root fragment");
-
-        // Bug B regression: the scan must emit exactly ONE slot per dict
-        // column. The slot keeps the SOURCE column's name (so the lake
-        // scan finds the storage column by name) but its declared type
-        // is Int32 (the BE encodes string -> dict id at read time using
-        // the per-slot TGlobalDict). Emitting BOTH a source string slot
-        // AND a separate dict int slot would let the BE's
-        // `lake_scan.rs::dict_int_to_string` swap collapse them onto the
-        // same storage slot id, producing `duplicate slot id <N> in
-        // chunk schema contract` at runtime.
-        let id_slot = slot_id_by_name(&root.desc_tbl, "id");
-        let name_slot = slot_id_by_name(&root.desc_tbl, "name");
-        assert_ne!(id_slot, name_slot, "scan slots must be distinct");
-        // The dict_column NAMES (`id_dict`, `name_dict`) must NOT appear
-        // as slot descriptor `col_name`s. The dict_column lives only in
-        // the FE codegen scope as an alias for the source slot — the BE
-        // never sees a column named `id_dict` in the tablet schema.
-        assert!(
-            slot_id_by_name_opt(&root.desc_tbl, "id_dict").is_none(),
-            "dict_column name must not surface as a slot descriptor col_name"
-        );
-        assert!(
-            slot_id_by_name_opt(&root.desc_tbl, "name_dict").is_none(),
-            "dict_column name must not surface as a slot descriptor col_name"
-        );
-        // The dict slot type is Int32 (so the BE knows to encode).
-        let id_slot_desc = root
-            .desc_tbl
-            .slot_descriptors
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .find(|s| s.id == Some(id_slot))
-            .expect("id slot desc");
-        assert_eq!(
-            id_slot_desc
-                .slot_type
-                .as_ref()
-                .and_then(|t| t.types.as_ref())
-                .and_then(|tys| tys.first())
-                .and_then(|tn| tn.scalar_type.as_ref())
-                .map(|st| st.type_),
-            Some(crate::thrift::types::TPrimitiveType::INT),
-            "dict slot type must be INT (Int32) — see build_scan_schema_for_global_dict_encoding"
-        );
-        // The tuple itself should contain exactly the two dict slots.
-        let scan_tuple_id = root
-            .desc_tbl
-            .tuple_descriptors
-            .first()
-            .and_then(|t| t.id)
-            .expect("scan tuple id");
-        let scan_slots: Vec<i32> = root
-            .desc_tbl
-            .slot_descriptors
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|s| s.parent == Some(scan_tuple_id))
-            .filter_map(|s| s.id)
-            .collect();
-        assert_eq!(
-            scan_slots.len(),
-            2,
-            "scan tuple must contain exactly two slots (one per dict column), got {scan_slots:?}"
-        );
-
-        // The fragment should carry two TGlobalDicts, one per source column.
-        let dicts = root
-            .query_global_dicts
-            .as_ref()
-            .expect("query_global_dicts populated");
-        assert!(
-            dicts.len() >= 2,
-            "at least one TGlobalDict per source column; got {}",
-            dicts.len()
-        );
-
-        // Match each TGlobalDict back to its slot id and check payload.
-        let id_dict = dicts
-            .iter()
-            .find(|d| d.column_id == Some(id_slot))
-            .expect("TGlobalDict for id slot");
-        assert_eq!(id_dict.ids.as_deref(), Some(&[1, 2][..]));
-        assert_eq!(
-            id_dict.strings.as_deref(),
-            Some(&[b"a".to_vec(), b"b".to_vec()][..])
-        );
-        let name_dict = dicts
-            .iter()
-            .find(|d| d.column_id == Some(name_slot))
-            .expect("TGlobalDict for name slot");
-        assert_eq!(name_dict.ids.as_deref(), Some(&[10, 11, 12][..]));
-        assert_eq!(
-            name_dict.strings.as_deref(),
-            Some(&[b"x".to_vec(), b"y".to_vec(), b"z".to_vec()][..])
-        );
-        // Distinct column_ids on the two TGlobalDicts.
-        assert_ne!(id_dict.column_id, name_dict.column_id);
-
-        // StarRocks scan's TLakeScanNode carries the
-        // `dict_string_id_to_int_ids` map. Under the Bug B fix this is a
-        // SELF-map (slot -> same slot): the BE's layout rewrite at
-        // `src/lower/node/lake_scan.rs` replaces every dict int slot
-        // with its mapped string slot, and with the dict slot now
-        // occupying the storage column's tuple position the self-map
-        // keeps the layout swap a no-op — which is exactly what avoids
-        // the duplicate-slot-id error.
-        let scan_node = root
-            .plan
-            .nodes
-            .iter()
-            .find(|node| node.node_type == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE)
-            .expect("lake scan node");
-        let lake = scan_node
-            .lake_scan_node
-            .as_ref()
-            .expect("lake scan payload");
-        let mapping = lake
-            .dict_string_id_to_int_ids
-            .as_ref()
-            .expect("dict_string_id_to_int_ids populated");
-        assert_eq!(mapping.len(), 2);
-        assert_eq!(
-            mapping.get(&id_slot).copied(),
-            Some(id_slot),
-            "id slot must self-map"
-        );
-        assert_eq!(
-            mapping.get(&name_slot).copied(),
-            Some(name_slot),
-            "name slot must self-map"
-        );
-    }
-
-    #[test]
-    fn scan_emits_single_slot_per_dict_column() {
-        // Direct Bug B regression: build a single-column StarRocks scan
-        // where the rewriter has produced a `ScanDictionaryColumn` for
-        // `s` and renamed the OutputColumn to `__nr_dict_t_s` (Int32).
-        // Mirrors the post-rewriter shape that the FE actually emits
-        // after `rewrite_scan`. The scan tuple must contain exactly one
-        // slot: a single Int32 slot named after the SOURCE column `s`
-        // (so the BE lake scan finds the storage column by name) with
-        // the dict_column name (`__nr_dict_t_s`) registered as a scope
-        // alias for the same slot. The LakeScanNode's
-        // `dict_string_id_to_int_ids` must self-map that slot id, so
-        // the BE layout swap is a no-op rather than collapsing two
-        // distinct slots onto one storage slot id.
-        let layout = starrocks_layout();
-        let plan = attach_test_scalar_arena(OptimizerPhysicalNode {
-            op: Operator::PhysicalScan(ScanOp {
-                database: "default".to_string(),
-                table: TableDef {
-                    name: "t".to_string(),
-                    columns: vec![ColumnDef {
-                        name: "s".to_string(),
-                        data_type: DataType::Utf8,
-                        nullable: false,
-                        write_default: None,
-                        logical_type: None,
-                    }],
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 11,
-                        table_id: 22,
-                    },
-                },
-                alias: None,
-                stats_ref: None,
-                columns: vec![output_col_for_test(
-                    8301,
-                    "__nr_dict_t_s",
-                    DataType::Int32,
-                    false,
-                )],
-                predicates: vec![],
-                required_columns: Some(vec!["__nr_dict_t_s".to_string()]),
-                dict_columns: vec![ScanDictionaryColumn {
-                    source_column: "s".to_string(),
-                    dict_column: "__nr_dict_t_s".to_string(),
-                    dictionary: dict_snapshot_a_b(),
-                }],
-                variant_columns: vec![],
-                mv_rewritten_from: None,
-            }),
-            children: vec![],
-            stats: stats(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: vec![output_col_for_test(
-                8301,
-                "__nr_dict_t_s",
-                DataType::Int32,
-                false,
-            )],
-            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-        });
-
-        let registry = mock_starrocks_registry(&layout);
-        let catalog = StarRocksCatalog { layout };
-        let build = build_fragments_from_optimizer_for_database_for_test(
-            &plan, &catalog, &registry, "default",
-        )
-        .expect("build");
-        let root = build
-            .fragment_results
-            .iter()
-            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
-            .expect("root fragment");
-
-        // The scan tuple must contain exactly one slot: the dict slot.
-        let scan_tuple_id = root
-            .desc_tbl
-            .tuple_descriptors
-            .first()
-            .and_then(|t| t.id)
-            .expect("scan tuple id");
-        let scan_slots: Vec<&crate::thrift::descriptors::TSlotDescriptor> = root
-            .desc_tbl
-            .slot_descriptors
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|s| s.parent == Some(scan_tuple_id))
-            .collect();
-        assert_eq!(
-            scan_slots.len(),
-            1,
-            "scan tuple must contain exactly the dict slot, got {} slots",
-            scan_slots.len()
-        );
-        let dict_slot = &scan_slots[0];
-        // The slot keeps the SOURCE column's name `s` so the BE finds
-        // the storage column in the tablet schema by name. The dict
-        // column name lives only in the FE codegen scope.
-        assert_eq!(dict_slot.col_name.as_deref(), Some("s"));
-        assert_eq!(
-            dict_slot
-                .slot_type
-                .as_ref()
-                .and_then(|t| t.types.as_ref())
-                .and_then(|tys| tys.first())
-                .and_then(|tn| tn.scalar_type.as_ref())
-                .map(|st| st.type_),
-            Some(crate::thrift::types::TPrimitiveType::INT),
-            "dict slot type must be INT (Int32)"
-        );
-        let dict_slot_id = dict_slot.id.expect("dict slot id");
-
-        // LakeScanNode's dict_string_id_to_int_ids must self-map
-        // (dict_slot -> dict_slot). The BE swaps each int slot with its
-        // mapped string slot in the layout; with the dict slot at the
-        // source column's storage position, the self-map keeps the
-        // layout one slot wide, avoiding the duplicate-slot-id error.
-        let scan_node = root
-            .plan
-            .nodes
-            .iter()
-            .find(|node| node.node_type == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE)
-            .expect("lake scan node");
-        let lake = scan_node
-            .lake_scan_node
-            .as_ref()
-            .expect("lake scan payload");
-        let mapping = lake
-            .dict_string_id_to_int_ids
-            .as_ref()
-            .expect("dict_string_id_to_int_ids populated");
-        assert_eq!(mapping.len(), 1, "exactly one dict slot mapping");
-        assert_eq!(
-            mapping.get(&dict_slot_id).copied(),
-            Some(dict_slot_id),
-            "dict slot must self-map (FE emits single slot per dict column)"
-        );
-    }
-
-    #[test]
-    fn scan_dict_column_on_iceberg_scan_is_supported() {
-        use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
-
-        // Build an Iceberg scan (non-StarRocks ScanSource) carrying a
-        // dict_columns entry. With Option A landed, iceberg/HDFS scans now
-        // support dict_columns: the dicts flow via query_global_dicts in
-        // lowering rather than via TLakeScanNode.dict_string_id_to_int_ids.
-        // visit_scan must succeed (the thrift node is left untouched).
-        let iceberg_table_info = IcebergTableInfo {
-            catalog: "ice".to_string(),
-            namespace: "ns".to_string(),
-            table: "t".to_string(),
-            table_uuid: None,
-            current_snapshot_id: None,
-            schema_id: 0,
-            location: "s3://b/t".to_string(),
-            schema: IcebergSchemaDef { fields: vec![] },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        };
-        let plan = attach_test_scalar_arena(OptimizerPhysicalNode {
-            op: Operator::PhysicalScan(ScanOp {
-                database: "default".to_string(),
-                table: TableDef {
-                    name: "ice_t".to_string(),
-                    columns: vec![ColumnDef {
-                        name: "id".to_string(),
-                        data_type: DataType::Utf8,
-                        nullable: false,
-                        write_default: None,
-                        logical_type: None,
-                    }],
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::IcebergDataFiles {
-                        table: iceberg_table_info,
-                        files: vec![],
-                        cloud_properties: std::collections::BTreeMap::new(),
-                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
-                    },
-                },
-                alias: None,
-                stats_ref: None,
-                columns: vec![output_col_for_test(8401, "id", DataType::Utf8, false)],
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![ScanDictionaryColumn {
-                    source_column: "id".to_string(),
-                    dict_column: "id_dict".to_string(),
-                    dictionary: dict_snapshot_a_b(),
-                }],
-                variant_columns: vec![],
-                mv_rewritten_from: None,
-            }),
-            children: vec![],
-            stats: stats(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: vec![output_col_for_test(8401, "id", DataType::Utf8, false)],
-            execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-        });
-
-        // Use an iceberg-only catalog (returns None for physical_layout) so
-        // codegen routes the scan through the HDFS-style scan node instead of
-        // the StarRocks lake scan path. visit_scan must now succeed: the HDFS
-        // node is left untouched and the dict flows via query_global_dicts.
-        struct IcebergCatalog;
-        impl CatalogProvider for IcebergCatalog {
-            fn get_table(&self, _database: &str, _table: &str) -> Result<TableDef, String> {
-                Err("not used".to_string())
-            }
-            fn get_physical_layout(
-                &self,
-                _database: &str,
-                _table: &str,
-            ) -> Result<Option<PhysicalTableLayout>, String> {
-                Ok(None)
-            }
-        }
-        let catalog = IcebergCatalog;
-        build_fragments_from_optimizer_for_database_for_test(
-            &plan,
-            &catalog,
-            &mock_iceberg_registry(),
-            "default",
-        )
-        .expect("iceberg scan with dict_columns must now succeed (Option A)");
     }
 
     #[test]
@@ -4432,7 +3894,6 @@ mod tests {
                 columns: vec![output_col_for_test(8402, "id", DataType::Int32, false)],
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -4708,7 +4169,6 @@ mod tests {
                 columns: vec![source_column.clone(), synthetic_column.clone()],
                 predicates: vec![],
                 required_columns: Some(vec![synthetic_column.name.clone()]),
-                dict_columns: vec![],
                 variant_columns: vec![ScanVariantColumn {
                     source_column_id,
                     source_column: source_column.name.clone(),

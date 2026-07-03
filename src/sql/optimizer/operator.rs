@@ -12,7 +12,7 @@ use crate::sql::common::{ApplyKind, CteId, ImvVersionRef, JoinKind, OutputColumn
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarId, SortKey};
 use crate::sql::optimizer::stats_input::StatsRef;
 
-pub(crate) use crate::sql::common::{ScanDictionaryColumn, ScanVariantColumn};
+pub(crate) use crate::sql::common::ScanVariantColumn;
 
 // ---------------------------------------------------------------------------
 // Physical decision enums
@@ -215,9 +215,6 @@ pub(crate) struct ScanOp {
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<ScalarId>,
     pub required_columns: Option<Vec<String>>,
-    /// Per-scan dictionary plan hints propagated from logical scan planning
-    /// to `ScanOp` by `ScanToPhysical`.
-    pub dict_columns: Vec<ScanDictionaryColumn>,
     /// Synthetic typed columns materialized from variant paths during scan.
     /// Populated by `VariantPathPushdownRule` and propagated to
     /// `ScanOp` by `ScanToPhysical`.

@@ -57,7 +57,6 @@ impl BridgeCtx<'_> {
                 columns: op.columns.clone(),
                 predicates: materialize_exprs(self.scalars, &op.predicates),
                 required_columns: op.required_columns.clone(),
-                dict_columns: op.dict_columns.clone(),
                 variant_columns: op.variant_columns.clone(),
                 mv_rewritten_from: op.mv_rewritten_from.clone(),
             })),

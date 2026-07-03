@@ -43,8 +43,7 @@ use crate::sql::codegen::{
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::operator::{
-    AggMode, AssertOneRowOp, GenerateSeriesOp, JoinDistribution, RepeatOp, ScanDictionaryColumn,
-    TopNPhase,
+    AggMode, AssertOneRowOp, GenerateSeriesOp, JoinDistribution, RepeatOp, TopNPhase,
 };
 use crate::sql::optimizer::property::OrderingSpec;
 use crate::sql::planner::optimizer_bridge::property::{
@@ -2778,55 +2777,15 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 .add_table_for_scan(table_id, &op.database, &table);
         }
 
-        // Build a quick lookup so the column registration loop below can
-        // recognise base-table columns that the dict rewriter retargeted
-        // to a hidden `__nr_dict_<t>_<c>` Int32 slot. For those columns
-        // we allocate ONE slot (at the source column's storage position)
-        // named after the dict column and typed Int32 — keeping the
-        // single-slot-per-column contract the StarRocks lake scan
-        // expects (see `src/lower/node/lake_scan.rs`'s
-        // `dict_int_to_string` self-map handling).
-        let dict_source_to_target: HashMap<String, &ScanDictionaryColumn> = op
-            .dict_columns
-            .iter()
-            .map(|dc| (dc.source_column.to_ascii_lowercase(), dc))
-            .collect();
-        // Track dict slot ids by source column so the second loop over
-        // `op.dict_columns` doesn't re-allocate a slot for the same
-        // column. Also accumulates the `(dict_slot_id, dict_col)` pairs
-        // that feed the TGlobalDict / dict_string_id_to_int_ids payload
-        // construction further down.
-        let mut dict_slot_for_source: HashMap<String, i32> = HashMap::new();
-        let mut dict_slot_to_dict: Vec<(i32, &ScanDictionaryColumn)> = Vec::new();
         let mut physical_slot_by_column: HashMap<String, i32> = HashMap::new();
         for (idx, col) in table.columns.iter().enumerate() {
-            // The dict rewriter renames the source string column to the
-            // dict column name in `op.columns` / `op.required_columns`,
-            // so check membership using BOTH names when a dict mapping
-            // exists for this base column.
-            let dict_target = dict_source_to_target.get(&col.name.to_lowercase());
             if let Some(ref req) = required {
-                let keep = req.contains(&col.name.to_lowercase())
-                    || dict_target
-                        .map(|dc| req.contains(&dc.dict_column.to_lowercase()))
-                        .unwrap_or(false);
-                if !keep {
+                if !req.contains(&col.name.to_lowercase()) {
                     continue;
                 }
             }
             let slot_id = state.alloc_slot();
-            // Bug B contract: slot keeps the SOURCE column's storage
-            // name (so the lake scan finds the column by name in the
-            // tablet schema) and Int32 type (the BE reads it as Utf8 via
-            // `build_scan_schema_for_global_dict_encoding` when a
-            // TGlobalDict is registered for the slot, then encodes
-            // string -> dict id). The dict_column NAME is exposed only
-            // in the FE codegen scope below, NOT in the slot descriptor
-            // — the BE never sees `__nr_dict_t_s` as a column name.
-            let slot_type = match dict_target {
-                Some(_) => DataType::Int32,
-                None => col.data_type.clone(),
-            };
+            let slot_type = col.data_type.clone();
             let nullable = col.nullable;
             let field_id = iceberg_field_id_for_column(&table, &col.name);
             state.desc_builder().add_slot_with_field_id(
@@ -2852,15 +2811,11 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             // what lets the optimizer's `DistributionSpec::HashPartitioned`
             // (which is now a `Vec<ColumnId>`) resolve directly against the
             // scan's child scope without having to round-trip through the
-            // display name. The dict-renamed `OutputColumn` carries the
-            // source column's id so the lookup still hits.
-            let output_column = op.columns.iter().find(|oc| {
-                let lc = oc.name.to_ascii_lowercase();
-                lc == col.name.to_ascii_lowercase()
-                    || dict_target
-                        .map(|dc| lc == dc.dict_column.to_ascii_lowercase())
-                        .unwrap_or(false)
-            });
+            // display name.
+            let output_column = op
+                .columns
+                .iter()
+                .find(|oc| oc.name.eq_ignore_ascii_case(&col.name));
             let col_id = output_column
                 .map(|oc| oc.column_id)
                 .unwrap_or(crate::sql::column_id::ColumnId::UNSET);
@@ -2873,22 +2828,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 col.name.clone(),
                 binding.clone(),
             );
-            // Also register the dict column name in the scope so the
-            // post-rewrite `ColumnRef("__nr_dict_t_s")` resolves to this
-            // same slot. The scan tuple holds a SINGLE slot for this
-            // column; both names refer to it.
-            if let Some(dict_col) = dict_target {
-                scope.add_column_with_id(
-                    col_id,
-                    qualifier.map(|s| s.to_string()),
-                    dict_col.dict_column.clone(),
-                    binding.clone(),
-                );
-            }
-            if let Some(dict_col) = dict_target {
-                dict_slot_for_source.insert(col.name.to_ascii_lowercase(), slot_id);
-                dict_slot_to_dict.push((slot_id, *dict_col));
-            }
         }
 
         // Iceberg metadata pseudo-columns: register in ExprScope and emit as
@@ -3027,39 +2966,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             conjuncts
         };
 
-        // Dict-encoded scan columns (Task 5/7/8 plan hints). The slot for
-        // each dict column was already allocated in the table-column loop
-        // above (where its storage `col_pos` is recorded). Here we just
-        // build the BE-facing payload: a self-map `dict_slot → dict_slot`
-        // for `TLakeScanNode.dict_string_id_to_int_ids` (the BE replaces
-        // the dict slot in the scan layout with this id, so the storage
-        // reader keeps the same slot) and a TGlobalDict for each. The
-        // dict_columns hint is still consulted later to detect a planning
-        // bug on non-StarRocks scans. `dict_columns` is empty in all
-        // production paths today.
-        let mut string_to_dict_slot: BTreeMap<i32, i32> = BTreeMap::new();
-        for dict_col in &op.dict_columns {
-            let dict_slot_id = dict_slot_for_source
-                .get(&dict_col.source_column.to_ascii_lowercase())
-                .copied()
-                .ok_or_else(|| {
-                    format!(
-                        "scan `{}.{}` dict_columns references unknown source column `{}`",
-                        op.database, table.name, dict_col.source_column
-                    )
-                })?;
-            // Self-map: the BE's `lake_scan.rs` rewrites every dict int
-            // slot in the layout to its mapped string slot before issuing
-            // the storage read. With the FE-only fix the FE no longer
-            // emits a separate string slot — the dict slot itself is the
-            // storage slot, declared Int32 in desc_tbl but read as Utf8
-            // via the query global dict path (see
-            // `build_scan_schema_for_global_dict_encoding`). A self-map
-            // keeps the BE's layout swap a no-op while preserving the
-            // "dict-encoded" semantics on the FE/wire contract.
-            string_to_dict_slot.insert(dict_slot_id, dict_slot_id);
-        }
-
         let resolved = ResolvedTable {
             database: op.database.clone(),
             table: table.clone(),
@@ -3094,76 +3000,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     op.database, table.name
                 ));
             }
-        }
-
-        // StarRocks lake scans carry the dict slot self-map on the wire via
-        // `TLakeScanNode.dict_string_id_to_int_ids`. Iceberg/HDFS scans have no
-        // such thrift field and don't need one: the dict slot is already an
-        // Int32 storage slot, and the per-fragment `TGlobalDict` payloads
-        // emitted below feed `lower_hdfs_scan_node`'s encode map directly
-        // (the parquet reader reads Utf8 and encodes to dict ids). So for an
-        // iceberg `hdfs_scan_node` we leave the thrift node untouched. Any
-        // other scan kind receiving dict_columns is a planning bug.
-        if !string_to_dict_slot.is_empty() {
-            if let Some(lake) = scan_plan_node.lake_scan_node.as_mut() {
-                lake.dict_string_id_to_int_ids = Some(string_to_dict_slot);
-            } else if scan_plan_node.hdfs_scan_node.is_some() {
-                // iceberg/HDFS: dicts flow via query_global_dicts in lowering.
-            } else {
-                return Err(format!(
-                    "scan `{}.{}` has dict_columns but is neither a StarRocks lake scan nor an iceberg/HDFS scan",
-                    op.database, op.table.name,
-                ));
-            }
-        }
-
-        // Emit per-dict-column TGlobalDict payloads onto EVERY fragment in
-        // the current stack (the leaf scan's fragment plus every parent
-        // fragment that consumes its output through an exchange). The
-        // dict slot id is consistent across fragments, so a Decode
-        // operator inserted above the exchange — which lives in a parent
-        // fragment — must also receive the TGlobalDict via its own
-        // fragment's `query_global_dicts`. Without this, the BE's
-        // `lower_decode_node` fails with `missing query global dict for
-        // encoded slot_id=<N>` (each fragment builds its own
-        // QueryGlobalDictMap from its own TGlobalDict list).
-        let current_frag = state.current_fragment_id()?;
-        let dict_fragments: Vec<FragmentId> = if state.fragment_stack().is_empty() {
-            vec![current_frag]
-        } else {
-            state.fragment_stack().to_vec()
-        };
-        for (dict_slot_id, dict_col) in &dict_slot_to_dict {
-            let snapshot = dict_col.dictionary.as_ref();
-            let mut ids = Vec::with_capacity(snapshot.values.len());
-            let mut strings = Vec::with_capacity(snapshot.values.len());
-            for value in &snapshot.values {
-                ids.push(value.id);
-                strings.push(value.bytes.clone());
-            }
-            let global_dict = crate::thrift::data::TGlobalDict::new(
-                Some(*dict_slot_id),
-                Some(strings),
-                Some(ids),
-                Some(snapshot.version),
-            );
-            for fragment_id in &dict_fragments {
-                state
-                    .query_global_dicts_per_fragment()
-                    .entry(*fragment_id)
-                    .or_default()
-                    .push(global_dict.clone());
-            }
-            // Track the slot -> dict association so any operator that
-            // allocates a new slot inheriting this slot's values
-            // (Aggregate group-by, Project column ref, etc.) can
-            // re-register the dict on the new slot id. The downstream
-            // `Decode` resolves by NAME against the new slot, then the
-            // BE's `lower_decode_node` needs a TGlobalDict keyed by that
-            // new slot id — registered via `propagate_dict_to_slot`.
-            state
-                .slot_to_global_dict_mut()
-                .insert(*dict_slot_id, global_dict);
         }
 
         state.scan_tables().push(nodes::PlannedScanTable {
@@ -6827,7 +6663,6 @@ mod tests {
                 columns: vec![k.clone()],
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),

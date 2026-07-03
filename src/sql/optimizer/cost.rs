@@ -1291,7 +1291,6 @@ mod tests {
             predicates: vec![],
             required_columns: required_columns
                 .map(|columns| columns.into_iter().map(str::to_string).collect()),
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         })
@@ -1314,7 +1313,6 @@ mod tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         })
@@ -3236,7 +3234,6 @@ mod tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         });
@@ -3580,7 +3577,6 @@ mod tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         });

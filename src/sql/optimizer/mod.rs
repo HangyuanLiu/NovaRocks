@@ -343,7 +343,6 @@ fn optimizer_rejects_unbound_scan_stats() {
         }],
         predicates: vec![],
         required_columns: None,
-        dict_columns: vec![],
         variant_columns: vec![],
         mv_rewritten_from: None,
     }));
@@ -1243,7 +1242,6 @@ mod is_known_rule_name_tests {
                 columns: vec![base_a.clone(), base_b.clone(), base_v.clone()],
                 predicates: vec![query_predicate],
                 required_columns: Some(vec!["a".to_string(), "b".to_string()]),
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             },
@@ -1289,7 +1287,6 @@ mod is_known_rule_name_tests {
                 columns: vec![mv_a.clone(), mv_b.clone(), mv_v.clone()],
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             },
@@ -1425,7 +1422,6 @@ mod is_known_rule_name_tests {
                 columns: vec![s_col.clone()],
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1506,16 +1502,12 @@ mod is_known_rule_name_tests {
         let LogicalPlanKind::Aggregate(_) = &rewritten.kind else {
             panic!("{context}: expected aggregate root, got {rewritten:?}")
         };
-        let LogicalPlanKind::Scan(scan) = &rewritten.unary_input().kind else {
+        let LogicalPlanKind::Scan(_) = &rewritten.unary_input().kind else {
             panic!(
                 "{context}: expected scan child, got {:?}",
                 rewritten.unary_input()
             )
         };
-        assert!(
-            scan.dict_columns.is_empty(),
-            "{context}: no scan dict_columns expected after legacy rewrite removal"
-        );
     }
 
     #[test]

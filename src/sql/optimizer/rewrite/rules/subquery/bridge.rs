@@ -43,7 +43,6 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             columns: op.columns.clone(),
             predicates: materialize_exprs(arena, &op.predicates),
             required_columns: op.required_columns.clone(),
-            dict_columns: op.dict_columns.clone(),
             variant_columns: op.variant_columns.clone(),
             mv_rewritten_from: None,
         }),

@@ -375,9 +375,6 @@ impl Rule for ScanToPhysical {
                 columns: op.columns.clone(),
                 predicates: op.predicates.clone(),
                 required_columns: op.required_columns.clone(),
-                // Propagated from the logical scan. Empty when no scan
-                // dictionary planning selected this scan.
-                dict_columns: op.dict_columns.clone(),
                 // Propagated from the logical scan. Populated by
                 // `VariantPathPushdown`; empty otherwise.
                 variant_columns: op.variant_columns.clone(),
@@ -1554,7 +1551,6 @@ mod join_demotion_tests {
                 columns: output_columns.clone(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),

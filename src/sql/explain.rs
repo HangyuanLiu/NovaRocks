@@ -6,9 +6,7 @@ use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr, UnOp,
 };
 use crate::sql::catalog::ScanSource;
-use crate::sql::planner::plan::{
-    ApplyKind, LogicalPlanKind, LogicalPlanNode, ScanDictionaryColumn,
-};
+use crate::sql::planner::plan::{ApplyKind, LogicalPlanKind, LogicalPlanNode};
 
 /// Detail level for EXPLAIN output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,10 +284,9 @@ pub(crate) fn format_shared_plan_node_header(
                 .as_deref()
                 .map(|a| format!(" (alias={a})"))
                 .unwrap_or_default();
-            let dict = format_scan_dict_suffix(&node.dict_columns);
             Some(format!(
-                "SCAN {}.{}{}{}",
-                node.database, node.table.name, alias, dict
+                "SCAN {}.{}{}",
+                node.database, node.table.name, alias
             ))
         }
         LogicalPlanKind::Filter(_) => Some("FILTER".to_string()),
@@ -340,19 +337,6 @@ pub(crate) fn format_shared_plan_node_header(
         }),
         _ => None,
     }
-}
-
-pub(crate) fn format_scan_dict_suffix(dict_columns: &[ScanDictionaryColumn]) -> String {
-    if dict_columns.is_empty() {
-        return String::new();
-    }
-
-    let mut cols: Vec<&str> = dict_columns
-        .iter()
-        .map(|d| d.source_column.as_str())
-        .collect();
-    cols.sort_unstable();
-    format!(" dict=[{}]", cols.join(", "))
 }
 
 pub(crate) fn format_shared_plan_node_detail_lines(
@@ -696,7 +680,6 @@ mod tests {
                 columns: vec![output_column(1, "k", DataType::Int64, false)],
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -723,64 +706,6 @@ mod tests {
             data_type: DataType::Int64,
             nullable: false,
         }
-    }
-
-    fn dict_snapshot_for_test() -> std::sync::Arc<crate::sql::common::DictionarySnapshot> {
-        use crate::engine::dictionary::model::{
-            DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue,
-            DictionaryWatermark,
-        };
-        std::sync::Arc::new(DictionarySnapshot {
-            dictionary_id: 1,
-            owner: DictionaryOwner::StarRocksTable {
-                database: "db".to_string(),
-                table: "t".to_string(),
-                db_id: 1,
-                table_id: 2,
-            },
-            column_id: Some(10),
-            column_name: "s".to_string(),
-            data_type: DataType::Utf8,
-            version: 1,
-            watermark: DictionaryWatermark::Iceberg {
-                snapshot_id: None,
-                schema_id: 0,
-            },
-            values: vec![DictionaryValue {
-                id: 1,
-                bytes: b"a".to_vec(),
-            }],
-            null_id: 0,
-            state: DictionaryState::Active,
-            order_preserving: true,
-        })
-    }
-
-    #[test]
-    fn logical_explain_scan_shows_dict_encoded_columns() {
-        use crate::sql::common::ScanDictionaryColumn;
-        let scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
-                database: "db".to_string(),
-                table: test_table_def(),
-                alias: None,
-                columns: vec![output_column(1, "s", DataType::Utf8, false)],
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![ScanDictionaryColumn {
-                    source_column: "s".to_string(),
-                    dict_column: "__nr_dict_t_s".to_string(),
-                    dictionary: dict_snapshot_for_test(),
-                }],
-                variant_columns: vec![],
-                mv_rewritten_from: None,
-            }),
-            vec![],
-            None,
-        );
-        let text = explain_plan(&scan, ExplainLevel::Normal).join("\n");
-        assert!(text.contains("SCAN db.t"), "{text}");
-        assert!(text.contains("dict=[s]"), "{text}");
     }
 
     #[test]
@@ -920,7 +845,6 @@ mod tests {
                 columns: scan_columns,
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),

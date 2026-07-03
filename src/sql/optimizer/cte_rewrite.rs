@@ -407,7 +407,6 @@ mod tests {
             }],
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         }))

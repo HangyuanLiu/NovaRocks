@@ -1108,7 +1108,6 @@ mod tests {
             ],
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         }))
@@ -2584,7 +2583,6 @@ mod tests {
                 columns: vec![make_output_column(ColumnId::new_for_test(1), "a")],
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }))],

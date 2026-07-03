@@ -20,18 +20,16 @@ pub(crate) use parser::ast::{
 
 #[cfg(test)]
 mod common_tests {
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-
     use arrow::datatypes::DataType;
+    use std::collections::BTreeMap;
 
     use super::column_id::ColumnId;
     use super::common::{
         ApplyKind, BinOp, CteId, DecodeMapping, DictionaryOwner, DictionarySnapshot,
         DictionaryState, DictionaryValue, DictionaryWatermark, ImvVersionRef, ImvVersionRole,
         JoinKind, LambdaParam, LiteralValue, OutputColumn, QueryDictionarySelection,
-        ScanDictionaryColumn, ScanVariantColumn, StarRocksTabletWatermark, UnOp, WindowBound,
-        WindowFrame, WindowFrameType,
+        ScanVariantColumn, StarRocksTabletWatermark, UnOp, WindowBound, WindowFrame,
+        WindowFrameType,
     };
 
     #[test]
@@ -115,13 +113,6 @@ mod common_tests {
             state: DictionaryState::Active,
             order_preserving: false,
         };
-
-        let scan_dictionary = ScanDictionaryColumn {
-            source_column: "k".to_string(),
-            dict_column: "k_dict".to_string(),
-            dictionary: Arc::new(snapshot.clone()),
-        };
-        assert_eq!(scan_dictionary.dictionary.dictionary_id, 42);
 
         let variant = ScanVariantColumn {
             source_column_id: ColumnId::new_for_test(4),

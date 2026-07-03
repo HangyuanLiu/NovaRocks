@@ -13,7 +13,7 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 pub(crate) use crate::sql::common::{
-    ApplyKind, ChangeStreamBranchKind, DecodeMapping, ScanDictionaryColumn, ScanVariantColumn,
+    ApplyKind, ChangeStreamBranchKind, DecodeMapping, ScanVariantColumn,
 };
 use crate::sql::optimizer::operator::{
     AggMode, AggregateOutputLayout, JoinDistribution, TopNPhase,
@@ -135,7 +135,6 @@ pub(crate) struct PlanScanNode {
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<TypedExpr>,
     pub required_columns: Option<Vec<String>>,
-    pub dict_columns: Vec<ScanDictionaryColumn>,
     pub variant_columns: Vec<ScanVariantColumn>,
     pub mv_rewritten_from: Option<String>,
 }
@@ -792,7 +791,6 @@ mod plan_tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: Some("mv_orders_rollup".to_string()),
         });
