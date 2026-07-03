@@ -2223,6 +2223,7 @@ mod tests {
             "scan".to_string(),
             scan,
             dispatch,
+            SharedRuntimeFilterDecision::new(),
             Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
             HashMap::from([(filter_id, expr)]),
             1,
