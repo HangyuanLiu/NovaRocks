@@ -10,7 +10,6 @@ use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, Typed
 use crate::sql::catalog;
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
-use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
 use crate::sql::optimizer::property::HashSource;
 use crate::sql::parser::ast::SqlType;
 use crate::sql::planner::plan::{
@@ -23,8 +22,9 @@ use crate::sql::planner::write_sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
 };
 use crate::sql::planner::{
-    DataPartition, DataSink, DistributedNode, DistributedPayload, DistributedPlan,
-    ExchangeReceiver, IcebergWriteInputBinding, PartitionKind, PlanFragment,
+    AggMode, DataPartition, DataSink, DistributedNode, DistributedPayload, DistributedPlan,
+    ExchangeReceiver, IcebergWriteInputBinding, JoinDistribution, PartitionKind, PlanFragment,
+    TopNPhase,
 };
 
 pub(crate) fn encode_distributed_plan(

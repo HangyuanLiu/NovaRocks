@@ -42,15 +42,13 @@ use crate::sql::codegen::{
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
-use crate::sql::optimizer::operator::{
-    AggMode, AssertOneRowOp, GenerateSeriesOp, JoinDistribution, RepeatOp, TopNPhase,
-};
-use crate::sql::optimizer::property::OrderingSpec;
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
-use crate::sql::planner::{JoinExecutionMode, WiredRuntimeFilterBuild};
+use crate::sql::planner::{
+    AggMode, JoinDistribution, JoinExecutionMode, OrderingSpec, TopNPhase, WiredRuntimeFilterBuild,
+};
 use crate::thrift::data_sinks;
 use crate::thrift::exprs;
 use crate::thrift::partitions;
@@ -1927,8 +1925,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             ));
         }
         let child = self.lower_node(&node.children[0])?;
-        let op = assert_one_row_node_to_physical_op(assert_one_row);
-        let plan_node = self.lower_assert_one_row(node.node_id, &op, &child.tuple_ids);
+        let plan_node = self.lower_assert_one_row(node.node_id, assert_one_row, &child.tuple_ids);
         let mut plan_nodes = vec![plan_node];
         plan_nodes.extend(child.plan_nodes);
         Ok(LoweredDistributedNode {
@@ -1953,14 +1950,13 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             ));
         }
         let child = self.lower_node(&node.children[0])?;
-        let op = repeat_node_to_physical_op(repeat);
         let virtual_tuple_id = repeat.virtual_tuple_id.ok_or_else(|| {
             "distributed Repeat node missing virtual_tuple_id during lowering".to_string()
         })?;
         let (plan_node, scope, tuple_ids, output_columns) = self.lower_repeat(
             node.node_id,
             virtual_tuple_id,
-            &op,
+            repeat,
             child.scope,
             child.tuple_ids,
             child.output_columns,
@@ -2094,8 +2090,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             ));
         }
         let output_tuple_id = first_tuple_id(node, "GenerateSeries")?;
-        let op = generate_series_node_to_physical_op(generate_series);
-        let (plan_nodes, scope) = self.lower_generate_series(node.node_id, output_tuple_id, &op)?;
+        let (plan_nodes, scope) =
+            self.lower_generate_series(node.node_id, output_tuple_id, generate_series)?;
         Ok(LoweredDistributedNode {
             plan_nodes,
             scope,
@@ -3702,7 +3698,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         table_fn_node_id: i32,
         output_tuple_id: i32,
-        op: &GenerateSeriesOp,
+        op: &super::kind::DistributedGenerateSeriesNode,
     ) -> Result<(Vec<plan_nodes::TPlanNode>, ExprScope), String> {
         let derived_param_values_node = table_fn_node_id - 1;
         let derived_param_tuple = output_tuple_id - 1;
@@ -4101,7 +4097,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     pub(crate) fn lower_assert_one_row(
         &mut self,
         assert_node_id: i32,
-        op: &AssertOneRowOp,
+        op: &super::kind::DistributedAssertOneRowNode,
         child_tuple_ids: &[i32],
     ) -> plan_nodes::TPlanNode {
         let mut plan_node = nodes::default_plan_node();
@@ -4127,7 +4123,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         repeat_node_id: i32,
         virtual_tuple_id: i32,
-        op: &RepeatOp,
+        op: &super::kind::DistributedRepeatNode,
         child_scope: ExprScope,
         child_tuple_ids: Vec<i32>,
         child_output_columns: Vec<AnalysisOutputColumn>,
@@ -4825,41 +4821,6 @@ fn apply_ignore_nulls_to_root_fn(texpr: &mut exprs::TExpr, ignore_nulls: bool) {
         && let Some(fn_) = root.fn_.as_mut()
     {
         fn_.ignore_nulls = Some(true);
-    }
-}
-
-fn assert_one_row_node_to_physical_op(
-    kind: &super::kind::DistributedAssertOneRowNode,
-) -> AssertOneRowOp {
-    AssertOneRowOp {
-        subquery_text: kind.subquery_text.clone(),
-    }
-}
-
-fn repeat_node_to_physical_op(kind: &super::kind::DistributedRepeatNode) -> RepeatOp {
-    RepeatOp {
-        repeat_column_ref_list: kind.repeat_column_ref_list.clone(),
-        repeat_column_ref_ids: kind.repeat_column_ref_ids.clone(),
-        grouping_ids: kind.grouping_ids.clone(),
-        all_rollup_columns: kind.all_rollup_columns.clone(),
-        all_rollup_column_ids: kind.all_rollup_column_ids.clone(),
-        grouping_key_aliases: kind.grouping_key_aliases.clone(),
-        grouping_fn_args: kind.grouping_fn_args.clone(),
-        grouping_fn_arg_ids: kind.grouping_fn_arg_ids.clone(),
-        grouping_fn_ids: kind.grouping_fn_ids.clone(),
-    }
-}
-
-fn generate_series_node_to_physical_op(
-    kind: &super::kind::DistributedGenerateSeriesNode,
-) -> GenerateSeriesOp {
-    GenerateSeriesOp {
-        start: kind.start,
-        end: kind.end,
-        step: kind.step,
-        column_name: kind.column_name.clone(),
-        alias: kind.alias.clone(),
-        output_column_id: kind.output_column_id,
     }
 }
 
