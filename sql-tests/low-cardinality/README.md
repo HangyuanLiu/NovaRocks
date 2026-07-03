@@ -1,37 +1,29 @@
 # low-cardinality
 
-End-to-end coverage for the low-cardinality dictionary rewrite pipeline.
-Cases here exercise:
+End-to-end coverage for low-cardinality dictionary metadata and carrier
+compatibility after R0. Cases here exercise:
 
-- `ANALYZE FULL TABLE` populates a `dictionary.snapshot` for string-typed
-  columns and the optimizer rewrites group-by / equi-join / order-preserving
-  sort to operate on dict ids;
-- write paths (INSERT / UPDATE / MERGE / TRUNCATE / DELETE) flip the snapshot
-  to STALE so subsequent queries fall back to plain string operators;
+- `ANALYZE FULL TABLE` populates `dictionary.snapshot` metadata for
+  string-typed columns, while standalone SQL results continue to follow plain
+  string semantics;
+- write paths (INSERT / UPDATE / MERGE / TRUNCATE / DELETE) advance table
+  snapshots so stale dictionary metadata does not affect query correctness;
 - DROP TABLE / DROP DATABASE remove dictionary metadata;
-- `SET disable_optimizer_rules = 'LowCardinalityDictionaryRewrite'`
-  unconditionally suppresses the rewrite.
+- runtime filters stay value-domain correct over low-cardinality string data.
 
-Plan-shape assertions go through `EXPLAIN VERBOSE` + `@result_contains=DECODE`
-(uppercase). `EXPLAIN COSTS` is **not** suitable in standalone mode —
+R0 retired the standalone native low-cardinality rewrite path. Standalone SQL
+plans should not contain FE-compatible `DECODE` nodes or scan dictionary hints;
+cases that need plan-shape protection use `@explain_not_contains` on the query
+under test. `EXPLAIN COSTS` is **not** suitable in standalone mode —
 `try_explain_costs` short-circuits to an ESTIMATE / cardinality summary and
 never renders the physical plan tree.
-
-Background: this rewrite landed in PR #191; the rewriter and codegen are wired
-together (Tasks 3–8 of `docs/design/plans/2026-05-26-low-cardinality-dictionary-rewrite.md`)
-but the runtime integration plus the bulk of regression cases live here so
-they can evolve independently of the optimizer suite.
 
 ## Storage (Iceberg v3)
 
 All cases here run on **Iceberg v3** via `init.sql`'s
-`lowcard_cat_${suite_uuid0}` external catalog — they validate the dictionary
-rewrite + execution end-to-end on Iceberg-backed tables (Option A: iceberg/HDFS
-scan dict-encode execution,
-`docs/design/plans/2026-05-31-iceberg-scan-dict-execution-option-a.md`).
-`ANALYZE FULL` builds the iceberg dictionary; a subsequent write advances the
-table snapshot and the dictionary's snapshot watermark no longer matches, so
-the rewrite is skipped (see `stale`).
+`lowcard_cat_${suite_uuid0}` external catalog. `ANALYZE FULL` builds Iceberg
+dictionary metadata; a subsequent write advances the table snapshot so stale
+metadata must not change the rows returned by standalone SQL (see `stale`).
 
 The legacy 128-bit `LARGEINT` compressed-key cases that cannot be represented
 on Iceberg (`LARGEINT -> DECIMAL(38,0)` would lose the 128-bit range) live in

@@ -1,6 +1,6 @@
 -- @tags=low-cardinality,dictionary,runtime-filter
--- C5: runtime filters keep value-domain semantics while scan-side dictionary
--- probe columns are folded to dictionary-key acceptance masks.
+-- Runtime filters keep value-domain semantics over low-cardinality string data
+-- without relying on standalone native dictionary rewrites.
 
 CREATE TABLE ${case_db}.dict_rf_probe_t (
   id INT,
@@ -41,7 +41,6 @@ JOIN ${case_db}.dict_rf_build_t b ON p.status = b.status
 WHERE b.flag = 'Y';
 
 SET disable_optimizer_rules = '';
--- @explain_contains=dict=[status]
 -- @explain_contains=build runtime filters:
 -- @explain_contains=probe runtime filters:
 SELECT 'rf_on' AS mode, COUNT(*) AS c, COALESCE(SUM(p.payload), 0) AS payload_sum
