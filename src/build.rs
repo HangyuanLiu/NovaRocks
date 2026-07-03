@@ -187,6 +187,7 @@ pub mod proto {
     }
 
     pub mod novarocks {
+        use super::common;
         tonic::include_proto!("novarocks");
     }
 

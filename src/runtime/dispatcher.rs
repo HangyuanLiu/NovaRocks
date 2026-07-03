@@ -43,8 +43,9 @@ use crate::exec::chunk::Chunk;
 #[cfg(test)]
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::chunk::ChunkSchemaRef;
+use crate::proto::common::UniqueId;
 use crate::proto::novarocks::{
-    CancelFragmentRequest, FetchResultRequest, PUniqueId, SubmitFragmentRequest,
+    CancelFragmentRequest, FetchResultRequest, SubmitFragmentRequest,
     fetch_result_response::Status as FetchStatus,
 };
 use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
@@ -280,7 +281,7 @@ impl FragmentDispatcher for RemoteDispatcher {
         }
         let resp = client
             .blocking_fetch_result(FetchResultRequest {
-                finst_id: Some(PUniqueId {
+                finst_id: Some(UniqueId {
                     hi: finst_id.hi,
                     lo: finst_id.lo,
                 }),
@@ -328,7 +329,7 @@ impl FragmentDispatcher for RemoteDispatcher {
         let req = CancelFragmentRequest {
             finst_ids: finst_ids
                 .iter()
-                .map(|id| PUniqueId {
+                .map(|id| UniqueId {
                     hi: id.hi,
                     lo: id.lo,
                 })
