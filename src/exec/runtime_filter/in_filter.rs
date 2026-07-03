@@ -1078,6 +1078,28 @@ impl RuntimeInFilter {
     }
 }
 
+#[cfg(test)]
+impl RuntimeInFilter {
+    pub(crate) fn new_for_test(
+        filter_id: i32,
+        slot_id: crate::common::ids::SlotId,
+        data_type: &arrow::datatypes::DataType,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            filter_id,
+            slot_id,
+            values: RuntimeInFilterValues::new(data_type)?,
+        })
+    }
+
+    pub(crate) fn insert_array_for_test(
+        &mut self,
+        array: &arrow::array::ArrayRef,
+    ) -> Result<(), String> {
+        self.values.insert_array(array)
+    }
+}
+
 impl LocalRuntimeInFilterSet {
     pub(crate) fn new(
         specs: &[JoinRuntimeFilterSpec],

@@ -29,6 +29,7 @@ pub mod memory_limit;
 pub mod min_max_predicate;
 pub mod network;
 pub mod percentile;
+pub(crate) mod runtime_scan_predicate;
 pub mod scan_predicate;
 pub mod sketch_hash;
 pub mod thrift;
