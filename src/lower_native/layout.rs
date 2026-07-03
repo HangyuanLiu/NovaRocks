@@ -16,3 +16,7 @@
 // under the License.
 
 //! Proto layout lowering placeholder.
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Layout;
