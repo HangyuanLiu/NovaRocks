@@ -1,10 +1,10 @@
 //! Planner-owned physical execution vocabulary.
 //!
 //! Aggregate phase / TopN phase / join distribution fallback / aggregate output
-//! layout, expressed as planner-owned types so `PhysicalPlanNode` payloads carry
-//! no `crate::sql::optimizer::*` type. The optimizer keeps its own equivalents;
-//! `optimizer_bridge::physical` is the only converter. Enforced by
-//! `tests/architecture_guard.rs`.
+//! layout, expressed as planner-owned types. These types are intended to support
+//! planner-owned `PhysicalPlanNode` payloads without direct
+//! `crate::sql::optimizer::*` dependencies as bridge wiring and architecture
+//! guards land in follow-up tasks.
 
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::OutputColumn;
@@ -43,6 +43,16 @@ pub(crate) struct AggregateOutputLayout {
 }
 
 impl AggregateOutputLayout {
+    pub(crate) fn new(
+        group_key_columns: Vec<OutputColumn>,
+        aggregate_columns: Vec<OutputColumn>,
+    ) -> Self {
+        Self {
+            group_key_columns,
+            aggregate_columns,
+        }
+    }
+
     pub(crate) fn full_output_columns(&self) -> Vec<OutputColumn> {
         self.group_key_columns
             .iter()
