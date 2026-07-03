@@ -26,7 +26,6 @@ use crate::common::ids::SlotId;
 use crate::exec::expr::function::{FunctionKind, function_metadata, lookup_function};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::proto::{common, expr};
-use crate::thrift::types;
 
 #[allow(dead_code)]
 pub(crate) fn lower_proto_expr(
@@ -279,15 +278,15 @@ fn lower_cast(
         }
     }
 
-    let target_primitive = thrift_primitive_from_type_desc(target, "Cast.target")?;
+    let target_primitive = scalar_primitive_from_type_desc(target, "Cast.target")?;
     let source_primitive = operand
         .r#type
         .as_ref()
-        .map(|desc| thrift_primitive_from_type_desc(desc, "Cast.operand"))
+        .map(|desc| scalar_primitive_from_type_desc(desc, "Cast.operand"))
         .transpose()?
         .flatten();
-    let node = if target_primitive == Some(types::TPrimitiveType::TIME) {
-        if source_primitive == Some(types::TPrimitiveType::DATETIME) {
+    let node = if target_primitive == Some(common::PrimitiveType::Time) {
+        if source_primitive == Some(common::PrimitiveType::Datetime) {
             ExprNode::CastTimeFromDatetime(child)
         } else {
             ExprNode::CastTime(child)
@@ -337,6 +336,9 @@ fn lower_between(
     input_layout: &Layout,
     data_type: DataType,
 ) -> Result<ExprId, String> {
+    if !matches!(data_type, DataType::Boolean) {
+        return Err(format!("Between must return Boolean, got {data_type:?}"));
+    }
     let operand = lower_required_child(&between.operand, "Between.operand", arena, input_layout)?;
     let low = lower_required_child(&between.low, "Between.low", arena, input_layout)?;
     let high = lower_required_child(&between.high, "Between.high", arena, input_layout)?;
@@ -458,48 +460,19 @@ fn is_encoded_variant_payload_source(data_type: &DataType) -> bool {
     )
 }
 
-fn thrift_primitive_from_type_desc(
+fn scalar_primitive_from_type_desc(
     desc: &common::TypeDesc,
     context: &str,
-) -> Result<Option<types::TPrimitiveType>, String> {
+) -> Result<Option<common::PrimitiveType>, String> {
     let Some(common::type_desc::Kind::Scalar(scalar)) = desc.kind.as_ref() else {
         return Ok(None);
     };
     let primitive = common::PrimitiveType::try_from(scalar.r#type)
         .map_err(|_| format!("{context} has unknown primitive type {}", scalar.r#type))?;
-    let thrift = match primitive {
-        common::PrimitiveType::Unspecified => {
-            return Err(format!("{context} primitive type is unspecified"));
-        }
-        common::PrimitiveType::NullType => types::TPrimitiveType::NULL_TYPE,
-        common::PrimitiveType::Boolean => types::TPrimitiveType::BOOLEAN,
-        common::PrimitiveType::Tinyint => types::TPrimitiveType::TINYINT,
-        common::PrimitiveType::Smallint => types::TPrimitiveType::SMALLINT,
-        common::PrimitiveType::Int => types::TPrimitiveType::INT,
-        common::PrimitiveType::Bigint => types::TPrimitiveType::BIGINT,
-        common::PrimitiveType::Largeint => types::TPrimitiveType::LARGEINT,
-        common::PrimitiveType::Float => types::TPrimitiveType::FLOAT,
-        common::PrimitiveType::Double => types::TPrimitiveType::DOUBLE,
-        common::PrimitiveType::Decimal32 => types::TPrimitiveType::DECIMAL32,
-        common::PrimitiveType::Decimal64 => types::TPrimitiveType::DECIMAL64,
-        common::PrimitiveType::Decimal128 => types::TPrimitiveType::DECIMAL128,
-        common::PrimitiveType::Decimal256 => types::TPrimitiveType::DECIMAL256,
-        common::PrimitiveType::Date => types::TPrimitiveType::DATE,
-        common::PrimitiveType::Datetime => types::TPrimitiveType::DATETIME,
-        common::PrimitiveType::Time => types::TPrimitiveType::TIME,
-        common::PrimitiveType::Varchar => types::TPrimitiveType::VARCHAR,
-        common::PrimitiveType::Char => types::TPrimitiveType::CHAR,
-        common::PrimitiveType::Varbinary => types::TPrimitiveType::VARBINARY,
-        common::PrimitiveType::Binary => types::TPrimitiveType::BINARY,
-        common::PrimitiveType::Json => types::TPrimitiveType::JSON,
-        common::PrimitiveType::Hll => types::TPrimitiveType::HLL,
-        common::PrimitiveType::Bitmap | common::PrimitiveType::Object => {
-            types::TPrimitiveType::OBJECT
-        }
-        common::PrimitiveType::Percentile => types::TPrimitiveType::PERCENTILE,
-        common::PrimitiveType::Variant => types::TPrimitiveType::VARIANT,
-    };
-    Ok(Some(thrift))
+    if primitive == common::PrimitiveType::Unspecified {
+        return Err(format!("{context} primitive type is unspecified"));
+    }
+    Ok(Some(primitive))
 }
 
 fn validate_function_arity(name: &str, kind: FunctionKind, arg_count: usize) -> Result<(), String> {
@@ -1078,6 +1051,24 @@ mod tests {
         };
         assert!(matches!(arena.node(*left), Some(ExprNode::Lt(_, _))));
         assert!(matches!(arena.node(*right), Some(ExprNode::Gt(_, _))));
+    }
+
+    #[test]
+    fn between_requires_boolean_result_type() {
+        for negated in [false, true] {
+            let between = scalar_expr(
+                DataType::Int64,
+                expr::expr::Kind::Between(Box::new(expr::BetweenExpr {
+                    operand: Some(Box::new(col(1, DataType::Int64))),
+                    low: Some(Box::new(int_lit(10))),
+                    high: Some(Box::new(int_lit(20))),
+                    negated,
+                })),
+            );
+
+            let err = lower_err_with_slots(&between, &[1]);
+            assert!(err.contains("Between must return Boolean"), "{err}");
+        }
     }
 
     #[test]
