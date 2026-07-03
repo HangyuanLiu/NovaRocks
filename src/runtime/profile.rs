@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use crate::proto::novarocks;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::thrift::{metrics, runtime_profile};
 
@@ -345,6 +346,12 @@ impl RuntimeProfile {
         runtime_profile::TRuntimeProfileTree::new(nodes)
     }
 
+    pub(crate) fn to_proto(&self) -> novarocks::RuntimeProfileTree {
+        novarocks::RuntimeProfileTree {
+            root: Some(self.to_proto_node()),
+        }
+    }
+
     pub fn merge_isomorphic_profiles(profiles: &[RuntimeProfile]) -> RuntimeProfile {
         let first = profiles
             .first()
@@ -467,6 +474,33 @@ impl RuntimeProfile {
         }
     }
 
+    fn to_proto_node(&self) -> novarocks::ProfileNode {
+        let info_strings = self
+            .inner
+            .info_strings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let counters = self
+            .counter_snapshots()
+            .into_iter()
+            .map(counter_snapshot_to_proto)
+            .collect();
+        let children = self
+            .children()
+            .into_iter()
+            .map(|child| child.to_proto_node())
+            .collect();
+
+        novarocks::ProfileNode {
+            name: self.name(),
+            node_id: metadata_to_proto_node_id(self.metadata()),
+            counters,
+            info_strings: info_strings.into_iter().collect(),
+            children,
+        }
+    }
+
     fn counter_snapshot(&self, name: &str) -> Option<CounterSnapshot> {
         let guard = self
             .inner
@@ -511,6 +545,39 @@ impl RuntimeProfile {
                 }
             })
             .collect()
+    }
+}
+
+fn metadata_to_proto_node_id(metadata: i64) -> i32 {
+    match i32::try_from(metadata) {
+        Ok(value) => value,
+        Err(_) if metadata.is_negative() => i32::MIN,
+        Err(_) => i32::MAX,
+    }
+}
+
+fn counter_snapshot_to_proto(snapshot: CounterSnapshot) -> novarocks::Counter {
+    novarocks::Counter {
+        name: snapshot.name,
+        parent_name: snapshot.parent_name,
+        unit: unit_to_proto(snapshot.unit) as i32,
+        value: snapshot.value,
+        min_value: snapshot.min_value,
+        max_value: snapshot.max_value,
+    }
+}
+
+fn unit_to_proto(unit: metrics::TUnit) -> novarocks::ProfileUnit {
+    use novarocks::ProfileUnit as P;
+
+    match unit {
+        metrics::TUnit::UNIT => P::Unit,
+        metrics::TUnit::CPU_TICKS => P::CpuTicks,
+        metrics::TUnit::BYTES => P::Bytes,
+        metrics::TUnit::TIME_NS => P::TimeNs,
+        metrics::TUnit::TIME_MS => P::TimeMs,
+        metrics::TUnit::TIME_S => P::TimeS,
+        _ => P::None,
     }
 }
 

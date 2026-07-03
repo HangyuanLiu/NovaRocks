@@ -5,3 +5,4 @@
 mod common;
 mod expr;
 mod plan;
+mod report;

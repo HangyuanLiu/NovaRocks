@@ -134,6 +134,46 @@ message HeartbeatResponse {
   int32 status_code = 4;   // 0 == healthy
 }
 
+// Native recursive runtime profile. Replaces the flat thrift
+// TRuntimeProfileNode list plus num_children encoding for NovaRocks-native
+// control-plane consumers. Producer: src/runtime/profile.rs. Consumer:
+// src/service/fe_report.rs for multi-fragment merge and EXPLAIN ANALYZE paths.
+message RuntimeProfileTree {
+  ProfileNode root = 1;  // root profile node for one fragment profile tree
+}
+
+// One runtime profile node with native recursive children.
+message ProfileNode {
+  string name = 1;                         // display name of the profile node
+  int32 node_id = 2;                       // plan node id; was TRuntimeProfileNode.metadata
+  repeated Counter counters = 3;           // counters owned by this profile node
+  map<string, string> info_strings = 4;    // informational key/value strings
+  repeated ProfileNode children = 5;       // child profile nodes in display order
+}
+
+// Runtime counter value and display hierarchy metadata.
+message Counter {
+  string name = 1;          // counter display name
+  string parent_name = 2;   // empty string means this is a root-level counter
+  ProfileUnit unit = 3;     // counter value unit
+  int64 value = 4;          // current counter value
+  optional int64 min_value = 5;  // merged minimum value, if available
+  optional int64 max_value = 6;  // merged maximum value, if available
+}
+
+// Runtime profile counter units. Mirrors thrift metrics.TUnit values used by
+// src/runtime/profile.rs, with an explicit unspecified zero value for proto3.
+enum ProfileUnit {
+  PROFILE_UNIT_UNSPECIFIED = 0;
+  PROFILE_UNIT_UNIT = 1;
+  PROFILE_UNIT_CPU_TICKS = 2;
+  PROFILE_UNIT_BYTES = 3;
+  PROFILE_UNIT_TIME_NS = 4;
+  PROFILE_UNIT_TIME_MS = 5;
+  PROFILE_UNIT_TIME_S = 6;
+  PROFILE_UNIT_NONE = 7;
+}
+
 // BE -> coordinator exec-status report. Thrift payload today; NIDL-1 replaces
 // with a native novarocks message.
 message ReportExecStatusRequest {

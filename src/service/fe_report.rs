@@ -28,6 +28,7 @@ use crate::common::network;
 use crate::common::types::UniqueId;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::{debug, warn};
+use crate::proto::novarocks;
 use crate::runtime::load_tracking;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
@@ -491,6 +492,47 @@ fn build_profile_tree(
     query_mem_tracker: Option<&Arc<MemTracker>>,
     include_runtime_filters: bool,
 ) -> Option<runtime_profile::TRuntimeProfileTree> {
+    let merged = build_merged_profile_for_report(
+        query_id,
+        enable_profile,
+        profiler,
+        mem_tracker,
+        query_mem_tracker,
+        include_runtime_filters,
+    )?;
+    let mut tree = merged.to_thrift_tree();
+    normalize_profile_tree_for_fe(&mut tree);
+    Some(tree)
+}
+
+#[allow(dead_code)] // Task 3 wires native report requests to this helper.
+pub(crate) fn build_native_profile_tree(
+    query_id: QueryId,
+    enable_profile: bool,
+    profiler: Option<&Profiler>,
+    mem_tracker: Option<&Arc<MemTracker>>,
+    query_mem_tracker: Option<&Arc<MemTracker>>,
+    include_runtime_filters: bool,
+) -> Option<novarocks::RuntimeProfileTree> {
+    build_merged_profile_for_report(
+        query_id,
+        enable_profile,
+        profiler,
+        mem_tracker,
+        query_mem_tracker,
+        include_runtime_filters,
+    )
+    .map(|merged| merged.to_proto())
+}
+
+fn build_merged_profile_for_report(
+    query_id: QueryId,
+    enable_profile: bool,
+    profiler: Option<&Profiler>,
+    mem_tracker: Option<&Arc<MemTracker>>,
+    query_mem_tracker: Option<&Arc<MemTracker>>,
+    include_runtime_filters: bool,
+) -> Option<Profiler> {
     if !enable_profile {
         return None;
     }
@@ -524,9 +566,7 @@ fn build_profile_tree(
             tracker.peak(),
         );
     }
-    let mut tree = merged.to_thrift_tree();
-    normalize_profile_tree_for_fe(&mut tree);
-    Some(tree)
+    Some(merged)
 }
 
 pub(crate) fn merge_pipeline_profiles_for_fe(profiler: &Profiler) -> Profiler {
