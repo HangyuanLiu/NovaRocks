@@ -282,6 +282,38 @@ mod tests {
     }
 
     #[test]
+    fn invalid_decimal_type_widths_are_rejected() {
+        let err = encode_type(&DataType::Decimal128(39, 0))
+            .expect_err("Decimal128 precision above 38 must fail");
+        assert!(err.contains("Decimal128"));
+        assert!(err.contains("precision"));
+
+        let err = encode_type(&DataType::Decimal256(77, 0))
+            .expect_err("Decimal256 precision above 76 must fail");
+        assert!(err.contains("Decimal256"));
+        assert!(err.contains("precision"));
+    }
+
+    #[test]
+    fn invalid_decimal_literal_widths_are_rejected() {
+        let decimal128 = literal_expr(
+            LiteralValue::Decimal("1".to_string()),
+            DataType::Decimal128(39, 0),
+        );
+        let err = encode_expr(&decimal128).expect_err("Decimal128 literal width must fail");
+        assert!(err.contains("Decimal128"));
+        assert!(err.contains("precision"));
+
+        let decimal256 = literal_expr(
+            LiteralValue::Decimal("1".to_string()),
+            DataType::Decimal256(77, 0),
+        );
+        let err = encode_expr(&decimal256).expect_err("Decimal256 literal width must fail");
+        assert!(err.contains("Decimal256"));
+        assert!(err.contains("precision"));
+    }
+
+    #[test]
     fn typed_expr_variants_encode_to_expected_oneof_arms() {
         let col = column_expr(7, "a", DataType::Int64);
         let lit = int_expr(2);
@@ -495,6 +527,81 @@ mod tests {
     }
 
     #[test]
+    fn representative_nested_expr_fields_are_preserved() {
+        let col = column_expr(7, "amount", DataType::Int64);
+
+        let cast = TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(col.clone()),
+                target: DataType::Float64,
+            },
+            data_type: DataType::Float64,
+            nullable: true,
+        };
+        let Some(expr::expr::Kind::Cast(cast)) = encode_expr(&cast).expect("encode cast").kind
+        else {
+            panic!("expected cast");
+        };
+        assert_eq!(
+            scalar_primitive(cast.target.as_ref().expect("target type")),
+            common::PrimitiveType::Double
+        );
+
+        let lambda_param = TypedExpr {
+            kind: ExprKind::LambdaParamRef {
+                name: "x".to_string(),
+                slot_id: 3,
+            },
+            data_type: DataType::Int64,
+            nullable: true,
+        };
+        let Some(expr::expr::Kind::LambdaParamRef(param)) = encode_expr(&lambda_param)
+            .expect("encode lambda param")
+            .kind
+        else {
+            panic!("expected lambda param");
+        };
+        assert_eq!(param.slot_id, 3);
+        assert_eq!(param.name.as_deref(), Some("x"));
+
+        let sort_item = SortItem {
+            expr: col.clone(),
+            asc: false,
+            nulls_first: true,
+        };
+        let window = TypedExpr {
+            kind: ExprKind::WindowCall {
+                name: "rank".to_string(),
+                args: vec![],
+                distinct: false,
+                partition_by: vec![col],
+                order_by: vec![sort_item],
+                window_frame: Some(WindowFrame {
+                    frame_type: WindowFrameType::Rows,
+                    start: WindowBound::UnboundedPreceding,
+                    end: WindowBound::CurrentRow,
+                }),
+                ignore_nulls: false,
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let Some(expr::expr::Kind::WindowCall(window)) =
+            encode_expr(&window).expect("encode window").kind
+        else {
+            panic!("expected window call");
+        };
+        assert_eq!(window.function_name, "rank");
+        assert_eq!(window.order_by.len(), 1);
+        assert!(!window.order_by[0].asc);
+        assert!(window.order_by[0].nulls_first);
+        assert_eq!(
+            window.frame.as_ref().expect("window frame").frame_type,
+            expr::WindowFrameType::Rows as i32
+        );
+    }
+
+    #[test]
     fn subquery_placeholder_is_rejected_by_expr_encoder() {
         let subquery = TypedExpr {
             kind: ExprKind::SubqueryPlaceholder {
@@ -528,5 +635,13 @@ mod tests {
             .expect_err("second timestamp rejected");
 
         assert!(err.contains("unsupported timestamp unit"));
+    }
+
+    #[test]
+    fn unsupported_time64_unit_reports_clear_error() {
+        let err = encode_type(&DataType::Time64(TimeUnit::Nanosecond))
+            .expect_err("nanosecond Time64 rejected");
+
+        assert!(err.contains("unsupported Time64 unit"));
     }
 }

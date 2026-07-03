@@ -2,6 +2,7 @@ use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
 use super::types::encode_type;
+use crate::common::largeint;
 use crate::proto::{common, expr};
 use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 use crate::sql::common::{BinOp, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType};
@@ -232,7 +233,9 @@ fn encode_literal(
                 Value::Date32Value(value)
             }
             LiteralValue::Int(value) => Value::IntValue(*value),
-            LiteralValue::LargeInt(value) => Value::LargeintValue(value.to_be_bytes().to_vec()),
+            LiteralValue::LargeInt(value) => {
+                Value::LargeintValue(largeint::i128_to_be_bytes(*value).to_vec())
+            }
             LiteralValue::Float(value) => Value::FloatValue(*value),
             LiteralValue::Decimal(value) => {
                 Value::DecimalValue(encode_decimal_literal(value, data_type)?)
@@ -249,12 +252,12 @@ fn encode_decimal_literal(
 ) -> Result<common::DecimalLiteral, String> {
     let (precision, scale, bytes) = match data_type {
         DataType::Decimal128(precision, scale) => {
-            validate_decimal_literal_scale(*precision, *scale)?;
+            validate_decimal_literal(*precision, *scale, 38, "Decimal128")?;
             let unscaled = parse_decimal_unscaled_i128(value, *precision, *scale)?;
             (*precision, *scale, unscaled.to_be_bytes().to_vec())
         }
         DataType::Decimal256(precision, scale) => {
-            validate_decimal_literal_scale(*precision, *scale)?;
+            validate_decimal_literal(*precision, *scale, 76, "Decimal256")?;
             let unscaled = parse_decimal_unscaled_i256(value, *precision, *scale)?;
             (*precision, *scale, unscaled.to_be_bytes().to_vec())
         }
@@ -271,10 +274,20 @@ fn encode_decimal_literal(
     })
 }
 
-fn validate_decimal_literal_scale(precision: u8, scale: i8) -> Result<(), String> {
+fn validate_decimal_literal(
+    precision: u8,
+    scale: i8,
+    max_precision: u8,
+    label: &str,
+) -> Result<(), String> {
+    if precision == 0 || precision > max_precision {
+        return Err(format!(
+            "{label} precision {precision} must be between 1 and {max_precision}"
+        ));
+    }
     if scale < 0 || i32::from(scale) > i32::from(precision) {
         return Err(format!(
-            "decimal literal scale {scale} must be between 0 and precision {precision}"
+            "{label} scale {scale} must be between 0 and precision {precision}"
         ));
     }
     Ok(())

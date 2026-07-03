@@ -1,10 +1,20 @@
+//! Native FE TypeDesc encoding. `TypeDesc` is a SQL type contract, not a full
+//! Arrow schema round-trip: top-level Arrow field names/nullability are outside
+//! this boundary, and logical SQL markers require `Field` metadata.
+
+#[cfg(test)]
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+#[cfg(test)]
+use arrow::datatypes::Fields;
+use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use crate::proto::common;
-use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
+#[cfg(test)]
+use crate::types::logical::field_with_logical_type;
+use crate::types::logical::{LogicalType, logical_type_of_field};
 
+#[cfg(test)]
 const TIME_UNIT_MICROS: i32 = 2;
 const TIME_UNIT_NANOS: i32 = 3;
 
@@ -16,11 +26,13 @@ pub(crate) fn encode_field_type(field: &Field) -> Result<common::TypeDesc, Strin
     encode_type_inner(field.data_type(), Some(field))
 }
 
-pub(crate) fn decode_type(desc: &common::TypeDesc) -> Result<DataType, String> {
+#[cfg(test)]
+pub(super) fn decode_type(desc: &common::TypeDesc) -> Result<DataType, String> {
     decode_type_inner(desc)
 }
 
-pub(crate) fn decode_field_type(
+#[cfg(test)]
+pub(super) fn decode_field_type(
     name: &str,
     nullable: bool,
     desc: &common::TypeDesc,
@@ -108,7 +120,7 @@ fn encode_scalar_type(dt: &DataType) -> Result<common::TypeDesc, String> {
         DataType::Float32 => (PrimitiveType::Float, None, None, None),
         DataType::Float64 => (PrimitiveType::Double, None, None, None),
         DataType::Decimal128(precision, scale) => {
-            validate_decimal(*precision, *scale)?;
+            validate_decimal(*precision, *scale, 38, "Decimal128")?;
             (
                 PrimitiveType::Decimal128,
                 Some(i32::from(*precision)),
@@ -117,7 +129,7 @@ fn encode_scalar_type(dt: &DataType) -> Result<common::TypeDesc, String> {
             )
         }
         DataType::Decimal256(precision, scale) => {
-            validate_decimal(*precision, *scale)?;
+            validate_decimal(*precision, *scale, 76, "Decimal256")?;
             (
                 PrimitiveType::Decimal256,
                 Some(i32::from(*precision)),
@@ -138,7 +150,12 @@ fn encode_scalar_type(dt: &DataType) -> Result<common::TypeDesc, String> {
             };
             (PrimitiveType::Datetime, None, None, time_unit)
         }
-        DataType::Time64(_) => (PrimitiveType::Time, None, None, None),
+        DataType::Time64(TimeUnit::Microsecond) => (PrimitiveType::Time, None, None, None),
+        DataType::Time64(unit) => {
+            return Err(format!(
+                "unsupported Time64 unit {unit:?}; only Microsecond supported"
+            ));
+        }
         DataType::Utf8 | DataType::LargeUtf8 => (PrimitiveType::Varchar, None, None, None),
         DataType::Binary => (PrimitiveType::Varbinary, None, None, None),
         DataType::LargeBinary => (PrimitiveType::Variant, None, None, None),
@@ -170,6 +187,7 @@ fn scalar_desc(
     }
 }
 
+#[cfg(test)]
 fn decode_type_inner(desc: &common::TypeDesc) -> Result<DataType, String> {
     use common::type_desc::Kind;
 
@@ -208,6 +226,7 @@ fn decode_type_inner(desc: &common::TypeDesc) -> Result<DataType, String> {
     }
 }
 
+#[cfg(test)]
 fn decode_scalar_type(scalar: &common::ScalarType) -> Result<DataType, String> {
     use common::PrimitiveType;
 
@@ -254,6 +273,7 @@ fn decode_scalar_type(scalar: &common::ScalarType) -> Result<DataType, String> {
     }
 }
 
+#[cfg(test)]
 fn decode_decimal_type(
     primitive: common::PrimitiveType,
     scalar: &common::ScalarType,
@@ -266,7 +286,14 @@ fn decode_decimal_type(
         .scale
         .ok_or_else(|| "decimal scale missing".to_string())
         .and_then(|v| i8::try_from(v).map_err(|_| format!("invalid decimal scale {v}")))?;
-    validate_decimal(precision, scale)?;
+    let (max_precision, label) = match primitive {
+        common::PrimitiveType::Decimal32 => (9, "Decimal32"),
+        common::PrimitiveType::Decimal64 => (18, "Decimal64"),
+        common::PrimitiveType::Decimal128 => (38, "Decimal128"),
+        common::PrimitiveType::Decimal256 => (76, "Decimal256"),
+        _ => unreachable!(),
+    };
+    validate_decimal(precision, scale, max_precision, label)?;
     if primitive == common::PrimitiveType::Decimal256 || precision > 38 {
         Ok(DataType::Decimal256(precision, scale))
     } else {
@@ -274,13 +301,20 @@ fn decode_decimal_type(
     }
 }
 
-fn validate_decimal(precision: u8, scale: i8) -> Result<(), String> {
-    if precision == 0 {
-        return Err("decimal precision must be positive".to_string());
+fn validate_decimal(
+    precision: u8,
+    scale: i8,
+    max_precision: u8,
+    label: &str,
+) -> Result<(), String> {
+    if precision == 0 || precision > max_precision {
+        return Err(format!(
+            "{label} precision {precision} must be between 1 and {max_precision}"
+        ));
     }
     if scale < 0 || i32::from(scale) > i32::from(precision) {
         return Err(format!(
-            "decimal scale {scale} must be between 0 and precision {precision}"
+            "{label} scale {scale} must be between 0 and precision {precision}"
         ));
     }
     Ok(())
@@ -296,6 +330,7 @@ fn logical_primitive(logical_type: LogicalType) -> common::PrimitiveType {
     }
 }
 
+#[cfg(test)]
 fn logical_type_from_desc(desc: &common::TypeDesc) -> Option<LogicalType> {
     let common::type_desc::Kind::Scalar(scalar) = desc.kind.as_ref()? else {
         return None;
