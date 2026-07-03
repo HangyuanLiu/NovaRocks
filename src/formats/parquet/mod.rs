@@ -227,6 +227,9 @@ fn min_max_predicates_to_scan_predicates(
 }
 
 fn scan_predicates_to_min_max_predicates(predicates: &[ScanPredicate]) -> Vec<MinMaxPredicate> {
+    // A3a keeps page-index pruning byte-identical by letting page selection consume only
+    // min/max-compatible predicates. A3b replaces this boundary with a page ScanPruner
+    // that can accept DiscreteSet directly.
     predicates
         .iter()
         .flat_map(ScanPredicate::to_min_max_predicates)
@@ -2560,6 +2563,7 @@ mod tests {
         CacheOptions, CachedRangeReader, DataCacheManager, DataCachePageCacheOptions,
     };
     use crate::common::ids::SlotId;
+    use crate::common::scan_predicate::{MembershipPredicate, ScanPredicateDomain};
     use crate::exec::chunk::ChunkSchema;
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
     use crate::fs::scan_context::{FileScanContext, FileScanRange};
@@ -2573,7 +2577,7 @@ mod tests {
         build_delayed_projection_plan, build_parquet_iter, build_row_selection_for_row_groups,
         collect_parquet_coalesce_io_ranges, evaluate_batch_predicate_mask,
         reader::ParquetCachedReader, runtime_filters_to_scan_predicates,
-        select_row_groups_for_range,
+        scan_predicates_to_min_max_predicates, select_row_groups_for_range,
     };
 
     fn field_id_meta(field_id: i32) -> HashMap<String, String> {
@@ -2668,6 +2672,46 @@ mod tests {
         let factory = OpendalRangeReaderFactory::from_operator(op).expect("reader factory");
         ParquetScanIter::new(cfg, Vec::new(), factory, None, None, runtime_filters)
             .expect("scan iter")
+    }
+
+    #[test]
+    fn page_min_max_conversion_keeps_discrete_set_envelope_for_a3a() {
+        let predicate = ScanPredicate::discrete_set(
+            "0".to_string(),
+            vec![
+                MinMaxPredicateValue::Int64(100),
+                MinMaxPredicateValue::Int64(1),
+            ],
+            ScanPredicateSource::RuntimeIn,
+        )
+        .expect("discrete predicate");
+
+        assert_eq!(
+            scan_predicates_to_min_max_predicates(&[predicate]),
+            vec![
+                MinMaxPredicate::Ge {
+                    column: "0".to_string(),
+                    value: MinMaxPredicateValue::Int64(1),
+                },
+                MinMaxPredicate::Le {
+                    column: "0".to_string(),
+                    value: MinMaxPredicateValue::Int64(100),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn page_min_max_conversion_drops_membership_without_fallback_for_a3a() {
+        let predicate = ScanPredicate::new(
+            "0".to_string(),
+            ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                values: vec![MinMaxPredicateValue::Int64(1)],
+            }),
+            ScanPredicateSource::RuntimeMembership,
+        );
+
+        assert!(scan_predicates_to_min_max_predicates(&[predicate]).is_empty());
     }
 
     fn variant_row_group_metadata(stats: EnabledStatistics) -> ParquetMetaData {
