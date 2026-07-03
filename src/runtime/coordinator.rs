@@ -1366,7 +1366,10 @@ impl Drop for StandaloneQueryFailureGuard {
 #[derive(Default)]
 struct StandaloneQueryProfileRegistry {
     active: BTreeSet<(i64, i64)>,
-    profiles: BTreeMap<(i64, i64), Vec<crate::thrift::runtime_profile::TRuntimeProfileTree>>,
+    profiles: BTreeMap<
+        (i64, i64),
+        BTreeMap<(i64, i64), crate::thrift::runtime_profile::TRuntimeProfileTree>,
+    >,
 }
 
 fn standalone_query_profiles() -> &'static Mutex<StandaloneQueryProfileRegistry> {
@@ -1397,7 +1400,49 @@ pub(crate) fn record_standalone_query_profile_report(
         && status.status_code == crate::thrift::status_code::TStatusCode::OK
         && let Some(profile) = params.profile.as_ref()
     {
-        guard.profiles.entry(key).or_default().push(profile.clone());
+        let finst_id = params
+            .fragment_instance_id
+            .as_ref()
+            .ok_or_else(|| "TReportExecStatusParams missing fragment_instance_id".to_string())?;
+        guard
+            .profiles
+            .entry(key)
+            .or_default()
+            .insert(query_failure_key(finst_id), profile.clone());
+    }
+    Ok(true)
+}
+
+pub(crate) fn record_native_standalone_query_profile_report(
+    report: &crate::proto::novarocks::ExecStatusReport,
+) -> Result<bool, String> {
+    let Some(query_id) = report.query_id.as_ref() else {
+        return Ok(false);
+    };
+    let key = (query_id.hi, query_id.lo);
+    let mut guard = standalone_query_profiles()
+        .lock()
+        .expect("standalone query profile registry lock");
+    if !guard.active.contains(&key) {
+        return Ok(false);
+    }
+
+    let Some(status) = report.status.as_ref() else {
+        return Err("ExecStatusReport missing status".to_string());
+    };
+    if report.done
+        && status.code == 0
+        && let Some(profile) = report.profile.as_ref()
+    {
+        let Some(finst_id) = report.fragment_instance_id.as_ref() else {
+            return Err("ExecStatusReport missing fragment_instance_id".to_string());
+        };
+        let thrift = crate::runtime::profile::native_profile_tree_to_thrift(profile)?;
+        guard
+            .profiles
+            .entry(key)
+            .or_default()
+            .insert((finst_id.hi, finst_id.lo), thrift);
     }
     Ok(true)
 }
@@ -1408,7 +1453,7 @@ fn standalone_query_profile_count(query_id: &types::TUniqueId) -> usize {
         .expect("standalone query profile registry lock")
         .profiles
         .get(&query_failure_key(query_id))
-        .map(Vec::len)
+        .map(BTreeMap::len)
         .unwrap_or(0)
 }
 
@@ -1420,6 +1465,7 @@ fn take_standalone_query_profiles(
         .expect("standalone query profile registry lock")
         .profiles
         .remove(&query_failure_key(query_id))
+        .map(|profiles| profiles.into_values().collect())
         .unwrap_or_default()
 }
 
@@ -3427,6 +3473,69 @@ mod tests {
         assert_eq!(result.fragment_profiles.len(), 1);
         assert!(result.write_commit.is_none());
         assert!(result.write_abort.is_none());
+    }
+
+    #[test]
+    fn duplicate_profile_reports_for_same_fragment_count_once() {
+        let query_id = id(788, 1);
+        let finst_id = id(788, 10);
+        let _guard = StandaloneQueryProfileGuard::register(&query_id);
+        let params = profile_report_params(
+            query_id.clone(),
+            finst_id.clone(),
+            profile_tree_for_plan_node(2),
+        );
+
+        assert!(
+            record_standalone_query_profile_report(&params).expect("first thrift profile report")
+        );
+        assert!(
+            record_standalone_query_profile_report(&params)
+                .expect("duplicate thrift profile report")
+        );
+        assert_eq!(
+            standalone_query_profile_count(&query_id),
+            1,
+            "duplicate thrift profile reports from the same finst must be idempotent"
+        );
+
+        let taken = take_standalone_query_profiles(&query_id);
+        assert_eq!(taken.len(), 1);
+
+        let native_report = crate::proto::novarocks::ExecStatusReport {
+            query_id: Some(crate::proto::common::UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            }),
+            fragment_instance_id: Some(crate::proto::common::UniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            }),
+            backend_num: 0,
+            status: Some(crate::proto::common::Status {
+                code: 0,
+                message: String::new(),
+            }),
+            done: true,
+            iceberg_commits: Vec::new(),
+            loaded_rows: 0,
+            sink_load_bytes: 0,
+            filtered_rows: 0,
+            profile: Some(crate::runtime::profile::RuntimeProfile::new("FragmentRoot").to_proto()),
+        };
+        assert!(
+            record_native_standalone_query_profile_report(&native_report)
+                .expect("first native profile report")
+        );
+        assert!(
+            record_native_standalone_query_profile_report(&native_report)
+                .expect("duplicate native profile report")
+        );
+        assert_eq!(
+            standalone_query_profile_count(&query_id),
+            1,
+            "duplicate native profile reports from the same finst must be idempotent"
+        );
     }
 
     #[test]

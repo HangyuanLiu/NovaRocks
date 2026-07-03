@@ -88,28 +88,31 @@ message SubmitFragmentResponse {
 
 // Coordinator long-poll request for one fragment instance result stream.
 message FetchResultRequest {
+  reserved 3;
+  reserved "typed_result";
+
   novarocks.common.UniqueId finst_id = 1;  // instance to poll
   int64 max_wait_ms = 2;                   // server-side long-poll budget
-  bool typed_result = 3;                   // request typed (Arrow) result path
 }
 
-// FetchResult response containing readiness state plus one optional payload.
+// FetchResult response containing readiness state plus one optional Arrow IPC payload.
 message FetchResultResponse {
-  // NOTE(NIDL-0 debt): READY = 0 makes a missing/default-decoded status read as
-  // "ready". NIDL-1 fixes this to a *_UNSPECIFIED = 0 first value when it
-  // single-tracks FetchResult. Do not depend on the zero value meaning READY.
   enum Status {
-    READY = 0;
-    NOT_READY = 1;
-    EOF = 2;
-    ERROR = 3;
+    RESULT_STATUS_UNSPECIFIED = 0;  // NIDL-1: fixes former READY = 0 default hazard
+    reserved 1 to 3;                // retired NIDL-0 READY/NOT_READY/EOF values
+    READY = 4;
+    NOT_READY = 5;
+    EOF = 6;
+    ERROR = 7;
   }
-  Status status = 1;  // result lifecycle state for this poll
-  // Thrift-binary-encoded TResultBatch payload. NIDL-1 drops this (Arrow-only).
-  bytes result_batch_thrift = 2;
-  string message = 3;      // error detail when status == ERROR
-  // NovaRocks-private NRX1-framed Arrow IPC payload.
-  bytes result_arrow_ipc = 4;
+  reserved 2;
+  reserved "result_batch_thrift";
+
+  Status status = 1;             // result lifecycle state for this poll
+  string message = 3;            // error detail when status == ERROR
+  bytes result_arrow_ipc = 4;    // NRX1-framed Arrow IPC (sole data track)
+  int64 packet_seq = 5;          // was carried in the FetchResult struct
+  bool eos = 6;                  // end-of-stream marker
 }
 
 // Coordinator cancellation request for active fragment instances.
@@ -138,10 +141,139 @@ message HeartbeatResponse {
   int32 status_code = 4;   // 0 == healthy
 }
 
-// BE -> coordinator exec-status report. Thrift payload today; NIDL-1 replaces
-// with a native novarocks message.
+// Native recursive runtime profile. Replaces the flat thrift
+// TRuntimeProfileNode list plus num_children encoding for NovaRocks-native
+// control-plane consumers. Producer: src/runtime/profile.rs. Consumer:
+// src/service/fe_report.rs for multi-fragment merge and EXPLAIN ANALYZE paths.
+message RuntimeProfileTree {
+  ProfileNode root = 1;  // root profile node for one fragment profile tree
+}
+
+// One runtime profile node with native recursive children.
+message ProfileNode {
+  string name = 1;                         // display name of the profile node
+  int32 node_id = 2;                       // plan node id; was TRuntimeProfileNode.metadata
+  repeated Counter counters = 3;           // counters owned by this profile node
+  map<string, string> info_strings = 4;    // informational key/value strings
+  repeated ProfileNode children = 5;       // child profile nodes in display order
+}
+
+// Runtime counter value and display hierarchy metadata.
+message Counter {
+  string name = 1;          // counter display name
+  string parent_name = 2;   // empty string means this is a root-level counter
+  ProfileUnit unit = 3;     // counter value unit
+  int64 value = 4;          // current counter value
+  optional int64 min_value = 5;  // merged minimum value, if available
+  optional int64 max_value = 6;  // merged maximum value, if available
+}
+
+// Runtime profile counter units. Mirrors thrift metrics.TUnit values used by
+// src/runtime/profile.rs, with an explicit unspecified zero value for proto3.
+enum ProfileUnit {
+  PROFILE_UNIT_UNSPECIFIED = 0;
+  PROFILE_UNIT_UNIT = 1;
+  PROFILE_UNIT_CPU_TICKS = 2;
+  PROFILE_UNIT_BYTES = 3;
+  PROFILE_UNIT_TIME_NS = 4;
+  PROFILE_UNIT_TIME_MS = 5;
+  PROFILE_UNIT_TIME_S = 6;
+  PROFILE_UNIT_NONE = 7;
+}
+
+// Optional list wrappers preserve the thrift distinction between an absent list
+// field and a present-but-empty list field for Iceberg commit metadata.
+message Int64List {
+  repeated int64 values = 1;
+}
+
+message Int32List {
+  repeated int32 values = 1;
+}
+
+// Native Iceberg file content enum. Mirrors TIcebergFileContent values carried
+// in the FE-compatible thrift path.
+enum IcebergFileContent {
+  ICEBERG_FILE_CONTENT_UNSPECIFIED = 0;
+  DATA = 1;
+  POSITION_DELETES = 2;
+  EQUALITY_DELETES = 3;
+}
+
+// Native Iceberg column statistics for one data/delete file.
+message IcebergColumnStats {
+  map<int32, int64> column_sizes = 1;
+  map<int32, int64> value_counts = 2;
+  map<int32, int64> null_value_counts = 3;
+  map<int32, int64> nan_value_counts = 4;
+  map<int32, bytes> lower_bounds = 5;
+  map<int32, bytes> upper_bounds = 6;
+}
+
+// One serialized Iceberg partition value. datum_bytes is optional because empty
+// bytes can be a real encoded value distinct from thrift absence.
+message IcebergPartitionValue {
+  optional bool is_null = 1;
+  optional bytes datum_bytes = 2;
+}
+
+// Native Iceberg partition descriptor used by the writer->coordinator report.
+message IcebergPartitionDescriptor {
+  repeated IcebergPartitionValue values = 1;
+}
+
+// Native Iceberg data/delete file commit metadata. This mirrors the
+// NovaRocks-internal TIcebergDataFile fields needed by pure-mode commits.
+message IcebergDataFile {
+  optional string path = 1;
+  optional string format = 2;
+  optional int64 record_count = 3;
+  optional int64 file_size_in_bytes = 4;
+  optional string partition_path = 5;
+  Int64List split_offsets = 6;
+  IcebergColumnStats column_stats = 7;
+  optional string partition_null_fingerprint = 8;
+  IcebergFileContent file_content = 9;
+  optional string referenced_data_file = 10;
+  optional int64 first_row_id = 11;
+  Int32List equality_ids = 12;
+  optional bytes key_metadata = 13;
+  optional int32 partition_spec_id = 14;
+  IcebergPartitionDescriptor partition_values_descriptor = 15;
+  optional int64 content_offset = 16;
+  optional int64 content_size_in_bytes = 17;
+  optional int64 cardinality = 18;
+}
+
+// Native sink commit info for pure NovaRocks report path. Hive/tablet/load-only
+// fields stay on the StarRocksFrontend thrift compatibility path.
+message IcebergCommitInfo {
+  IcebergDataFile iceberg_data_file = 1;
+  optional bool is_overwrite = 2;
+  optional bool is_rewrite = 3;
+}
+
+// Native BE -> coordinator exec-status report. Used only on the pure
+// NovaRocksCoordinator gRPC path; StarRocksFrontend compatibility keeps thrift.
+message ExecStatusReport {
+  novarocks.common.UniqueId query_id = 1;
+  novarocks.common.UniqueId fragment_instance_id = 2;
+  int32 backend_num = 3;
+  novarocks.common.Status status = 4;
+  bool done = 5;
+  repeated IcebergCommitInfo iceberg_commits = 6;
+  int64 loaded_rows = 7;
+  int64 sink_load_bytes = 8;
+  int64 filtered_rows = 9;
+  RuntimeProfileTree profile = 10;  // absent unless ANALYZE/profile enabled
+}
+
+// BE -> coordinator exec-status report.
 message ReportExecStatusRequest {
-  bytes report_exec_status_params_thrift = 1;  // serialized TReportExecStatusParams
+  reserved 1;
+  reserved "report_exec_status_params_thrift";
+
+  ExecStatusReport report = 2;
 }
 
 // Result for one exec-status report accepted by the coordinator.
@@ -153,7 +285,10 @@ message ReportExecStatusResponse {
 
 // Batched exec-status reports from one BE to the coordinator.
 message BatchReportExecStatusRequest {
-  repeated bytes report_exec_status_params_thrift = 1;  // serialized TReportExecStatusParams list
+  reserved 1;
+  reserved "report_exec_status_params_thrift";
+
+  repeated ExecStatusReport reports = 2;
 }
 
 // Aggregate result for a batch of exec-status reports.

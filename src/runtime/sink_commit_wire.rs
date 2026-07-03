@@ -9,6 +9,7 @@ use crate::connector::iceberg::write_descriptor::{
     IcebergPartitionDescriptor, IcebergPartitionValueDescriptor, IcebergWriteDescriptorError,
     encode_partition_descriptor,
 };
+use crate::proto::novarocks;
 use crate::thrift::types;
 
 pub(crate) fn partition_descriptor_to_thrift(
@@ -53,6 +54,187 @@ pub(crate) fn partition_descriptor_from_thrift(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(IcebergPartitionDescriptor { values }))
+}
+
+pub(crate) fn sink_commit_info_to_native(
+    info: types::TSinkCommitInfo,
+) -> Result<novarocks::IcebergCommitInfo, String> {
+    let df = info
+        .iceberg_data_file
+        .ok_or_else(|| "TSinkCommitInfo missing iceberg_data_file".to_string())?;
+    Ok(novarocks::IcebergCommitInfo {
+        iceberg_data_file: Some(data_file_to_native(df)),
+        is_overwrite: info.is_overwrite,
+        is_rewrite: info.is_rewrite,
+    })
+}
+
+pub(crate) fn sink_commit_info_from_native(
+    info: novarocks::IcebergCommitInfo,
+) -> Result<types::TSinkCommitInfo, String> {
+    let df = info
+        .iceberg_data_file
+        .ok_or_else(|| "IcebergCommitInfo missing iceberg_data_file".to_string())?;
+    Ok(types::TSinkCommitInfo {
+        iceberg_data_file: Some(data_file_from_native(df)?),
+        hive_file_info: None,
+        is_overwrite: info.is_overwrite,
+        staging_dir: None,
+        is_rewrite: info.is_rewrite,
+    })
+}
+
+fn data_file_to_native(df: types::TIcebergDataFile) -> novarocks::IcebergDataFile {
+    novarocks::IcebergDataFile {
+        path: df.path,
+        format: df.format,
+        record_count: df.record_count,
+        file_size_in_bytes: df.file_size_in_bytes,
+        partition_path: df.partition_path,
+        split_offsets: df
+            .split_offsets
+            .map(|values| novarocks::Int64List { values }),
+        column_stats: df.column_stats.map(column_stats_to_native),
+        partition_null_fingerprint: df.partition_null_fingerprint,
+        file_content: df
+            .file_content
+            .map(file_content_to_native)
+            .unwrap_or(novarocks::IcebergFileContent::Unspecified) as i32,
+        referenced_data_file: df.referenced_data_file,
+        first_row_id: df.first_row_id,
+        equality_ids: df
+            .equality_ids
+            .map(|values| novarocks::Int32List { values }),
+        key_metadata: df.key_metadata,
+        partition_spec_id: df.partition_spec_id,
+        partition_values_descriptor: df
+            .partition_values_descriptor
+            .map(partition_descriptor_to_native),
+        content_offset: df.content_offset,
+        content_size_in_bytes: df.content_size_in_bytes,
+        cardinality: df.cardinality,
+    }
+}
+
+fn data_file_from_native(
+    df: novarocks::IcebergDataFile,
+) -> Result<types::TIcebergDataFile, String> {
+    Ok(types::TIcebergDataFile {
+        path: df.path,
+        format: df.format,
+        record_count: df.record_count,
+        file_size_in_bytes: df.file_size_in_bytes,
+        partition_path: df.partition_path,
+        split_offsets: df.split_offsets.map(|values| values.values),
+        column_stats: df.column_stats.map(column_stats_from_native),
+        partition_null_fingerprint: df.partition_null_fingerprint,
+        file_content: Some(file_content_from_native_proto(df.file_content)?),
+        referenced_data_file: df.referenced_data_file,
+        first_row_id: df.first_row_id,
+        equality_ids: df.equality_ids.map(|values| values.values),
+        key_metadata: df.key_metadata,
+        partition_spec_id: df.partition_spec_id,
+        partition_values_descriptor: df
+            .partition_values_descriptor
+            .map(partition_descriptor_from_native)
+            .transpose()?,
+        content_offset: df.content_offset,
+        content_size_in_bytes: df.content_size_in_bytes,
+        cardinality: df.cardinality,
+    })
+}
+
+fn column_stats_to_native(stats: types::TIcebergColumnStats) -> novarocks::IcebergColumnStats {
+    novarocks::IcebergColumnStats {
+        column_sizes: stats.column_sizes.unwrap_or_default().into_iter().collect(),
+        value_counts: stats.value_counts.unwrap_or_default().into_iter().collect(),
+        null_value_counts: stats
+            .null_value_counts
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        nan_value_counts: stats
+            .nan_value_counts
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        lower_bounds: stats.lower_bounds.unwrap_or_default().into_iter().collect(),
+        upper_bounds: stats.upper_bounds.unwrap_or_default().into_iter().collect(),
+    }
+}
+
+fn column_stats_from_native(stats: novarocks::IcebergColumnStats) -> types::TIcebergColumnStats {
+    types::TIcebergColumnStats {
+        column_sizes: non_empty(stats.column_sizes.into_iter().collect()),
+        value_counts: non_empty(stats.value_counts.into_iter().collect()),
+        null_value_counts: non_empty(stats.null_value_counts.into_iter().collect()),
+        nan_value_counts: non_empty(stats.nan_value_counts.into_iter().collect()),
+        lower_bounds: non_empty(stats.lower_bounds.into_iter().collect()),
+        upper_bounds: non_empty(stats.upper_bounds.into_iter().collect()),
+    }
+}
+
+fn partition_descriptor_to_native(
+    desc: types::TIcebergPartitionDescriptor,
+) -> novarocks::IcebergPartitionDescriptor {
+    novarocks::IcebergPartitionDescriptor {
+        values: desc
+            .values
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| novarocks::IcebergPartitionValue {
+                is_null: value.is_null,
+                datum_bytes: value.datum_bytes,
+            })
+            .collect(),
+    }
+}
+
+fn partition_descriptor_from_native(
+    desc: novarocks::IcebergPartitionDescriptor,
+) -> Result<types::TIcebergPartitionDescriptor, String> {
+    Ok(types::TIcebergPartitionDescriptor {
+        values: Some(
+            desc.values
+                .into_iter()
+                .map(|value| types::TIcebergPartitionValue {
+                    is_null: value.is_null,
+                    datum_bytes: value.datum_bytes,
+                })
+                .collect(),
+        ),
+    })
+}
+
+fn file_content_to_native(content: types::TIcebergFileContent) -> novarocks::IcebergFileContent {
+    match content {
+        types::TIcebergFileContent::DATA => novarocks::IcebergFileContent::Data,
+        types::TIcebergFileContent::POSITION_DELETES => {
+            novarocks::IcebergFileContent::PositionDeletes
+        }
+        types::TIcebergFileContent::EQUALITY_DELETES => {
+            novarocks::IcebergFileContent::EqualityDeletes
+        }
+        _ => novarocks::IcebergFileContent::Unspecified,
+    }
+}
+
+fn file_content_from_native_proto(value: i32) -> Result<types::TIcebergFileContent, String> {
+    match novarocks::IcebergFileContent::try_from(value) {
+        Ok(novarocks::IcebergFileContent::Data) => Ok(types::TIcebergFileContent::DATA),
+        Ok(novarocks::IcebergFileContent::PositionDeletes) => {
+            Ok(types::TIcebergFileContent::POSITION_DELETES)
+        }
+        Ok(novarocks::IcebergFileContent::EqualityDeletes) => {
+            Ok(types::TIcebergFileContent::EQUALITY_DELETES)
+        }
+        Ok(novarocks::IcebergFileContent::Unspecified) => {
+            Err("IcebergDataFile missing file_content".to_string())
+        }
+        Err(_) => Err(format!(
+            "unknown IcebergFileContent value {value} in native sink commit info"
+        )),
+    }
 }
 
 pub(crate) fn writer_report_to_sink_commit_info(
@@ -572,6 +754,43 @@ mod tests {
         assert_eq!(df.content_offset, Some(4));
         assert_eq!(df.content_size_in_bytes, Some(12));
         assert_eq!(df.cardinality, Some(3));
+    }
+
+    #[test]
+    fn native_sink_commit_roundtrip_preserves_iceberg_metadata() {
+        let metadata = test_string_partition_metadata(7);
+        let mut thrift = writer_report_to_sink_commit_info(
+            partitioned_writer_report(&metadata, "west"),
+            &metadata,
+        )
+        .expect("wire encode");
+        let data_file = thrift
+            .iceberg_data_file
+            .as_mut()
+            .expect("iceberg data file");
+        data_file.split_offsets = Some(vec![4, 8]);
+        data_file.column_stats = Some(types::TIcebergColumnStats {
+            column_sizes: Some([(1, 100)].into_iter().collect()),
+            value_counts: Some([(1, 2)].into_iter().collect()),
+            null_value_counts: Some([(1, 0)].into_iter().collect()),
+            nan_value_counts: Some([(1, 0)].into_iter().collect()),
+            lower_bounds: Some([(1, b"a".to_vec())].into_iter().collect()),
+            upper_bounds: Some([(1, b"z".to_vec())].into_iter().collect()),
+        });
+        data_file.referenced_data_file = Some("s3://warehouse/t/base.parquet".to_string());
+        data_file.first_row_id = Some(17);
+        data_file.equality_ids = Some(vec![1, 2]);
+        data_file.key_metadata = Some(vec![0xaa, 0xbb]);
+        data_file.content_offset = Some(5);
+        data_file.content_size_in_bytes = Some(12);
+        data_file.cardinality = Some(3);
+        thrift.is_overwrite = Some(true);
+        thrift.is_rewrite = Some(false);
+
+        let native = sink_commit_info_to_native(thrift.clone()).expect("native encode");
+        let decoded = sink_commit_info_from_native(native).expect("native decode");
+
+        assert_eq!(decoded, thrift);
     }
 
     #[test]
