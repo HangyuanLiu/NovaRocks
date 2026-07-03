@@ -326,7 +326,7 @@ pub extern "C" fn novarocks_rs_transmit_runtime_filter(
         out_resp,
         out_err,
         "transmit_runtime_filter",
-        internal_rpc::handle_transmit_runtime_filter,
+        internal_rpc::handle_transmit_runtime_filter_compat,
     )
 }
 

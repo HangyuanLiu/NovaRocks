@@ -41,15 +41,18 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::{JoinDistributionMode, JoinRuntimeFilterSpec, JoinType};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+#[cfg(not(feature = "compat"))]
+use crate::exec::runtime_filter::arrow_type_to_common_type_desc;
+#[cfg(feature = "compat")]
+use crate::exec::runtime_filter::arrow_type_to_proto_type_desc;
 use crate::exec::runtime_filter::{
     LocalRuntimeFilterSet, LocalRuntimeInFilterSet, MAX_RUNTIME_IN_FILTER_CONDITIONS,
     PartialRuntimeInFilterMerger, RUNTIME_FILTER_JOIN_MODE_BROADCAST,
     RUNTIME_FILTER_JOIN_MODE_PARTITIONED, RuntimeBloomFilter, RuntimeEmptyFilter,
     RuntimeFilterMergeDropCounters, RuntimeFilterType, RuntimeInFilter,
     RuntimeMembershipBuildOptions, RuntimeMembershipFilter, RuntimeMembershipFilterBuildParam,
-    RuntimeMinMaxFilter, arrow_type_to_proto_type_desc, encode_starrocks_bitset_filter,
-    encode_starrocks_bloom_filter, encode_starrocks_empty_filter,
-    maybe_build_runtime_bitset_filter,
+    RuntimeMinMaxFilter, encode_starrocks_bitset_filter, encode_starrocks_bloom_filter,
+    encode_starrocks_empty_filter, maybe_build_runtime_bitset_filter,
 };
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
@@ -737,6 +740,7 @@ impl HashJoinBuildSinkOperator {
             return Ok(());
         }
         let build_be_number = state.backend_num().unwrap_or(0);
+        #[cfg(feature = "compat")]
         let finst_id = state.fragment_instance_id().map(|id| {
             crate::service::grpc_client::proto::starrocks::PUniqueId {
                 hi: id.hi,
@@ -818,6 +822,19 @@ impl HashJoinBuildSinkOperator {
                     if !seen_hosts.insert(addr.host.clone()) {
                         continue;
                     }
+                    #[cfg(not(feature = "compat"))]
+                    let req = crate::proto::filter::TransmitRuntimeFilterRequest {
+                        is_partial: true,
+                        query_id: Some(crate::proto::common::UniqueId {
+                            hi: query_id.hi,
+                            lo: query_id.lo,
+                        }),
+                        filter_id: filter.filter_id(),
+                        data: data.clone(),
+                        build_be_number,
+                        column_type: arrow_type_to_common_type_desc(&spec.build_data_type),
+                    };
+                    #[cfg(feature = "compat")]
                     let req =
                         crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams {
                             is_partial: Some(true),
@@ -826,7 +843,7 @@ impl HashJoinBuildSinkOperator {
                                 lo: query_id.lo,
                             }),
                             filter_id: Some(filter.filter_id()),
-                            finst_id,
+                            finst_id: finst_id.clone(),
                             build_be_number: Some(build_be_number),
                             column_type: arrow_type_to_proto_type_desc(&spec.build_data_type),
                             data: Some(data.clone()),
@@ -861,6 +878,19 @@ impl HashJoinBuildSinkOperator {
                     if !seen_hosts.insert(addr.hostname.clone()) {
                         continue;
                     }
+                    #[cfg(not(feature = "compat"))]
+                    let req = crate::proto::filter::TransmitRuntimeFilterRequest {
+                        is_partial: false,
+                        query_id: Some(crate::proto::common::UniqueId {
+                            hi: query_id.hi,
+                            lo: query_id.lo,
+                        }),
+                        filter_id: filter.filter_id(),
+                        data: data.clone(),
+                        build_be_number: 0,
+                        column_type: None,
+                    };
+                    #[cfg(feature = "compat")]
                     let req =
                         crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams {
                             is_partial: Some(false),
@@ -869,10 +899,10 @@ impl HashJoinBuildSinkOperator {
                                 lo: query_id.lo,
                             }),
                             filter_id: Some(filter.filter_id()),
-                            finst_id,
+                            finst_id: finst_id.clone(),
                             data: Some(data.clone()),
                             ..Default::default()
-                    };
+                        };
                     let dest_port = addr.port as u16;
                     if !recorded_sent {
                         self.record_sent_lifecycle(query_id, filter.filter_id(), data.len());

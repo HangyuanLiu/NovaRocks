@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use crate::common::failpoint::{self, FailPointMode};
 use crate::common::ids::SlotId;
-use crate::exec::runtime_filter::arrow_type_from_proto_type_desc;
+use crate::exec::runtime_filter::arrow_type_from_common_type_desc;
 use crate::novarocks_logging::warn;
 use crate::proto;
 use crate::runtime::exchange;
@@ -36,6 +36,20 @@ fn error_status(message: impl Into<String>) -> proto::starrocks::StatusPb {
     proto::starrocks::StatusPb {
         status_code: 1,
         error_msgs: vec![message.into()],
+    }
+}
+
+fn ok_common_status() -> proto::common::Status {
+    proto::common::Status {
+        code: 0,
+        message: String::new(),
+    }
+}
+
+fn error_common_status(message: impl Into<String>) -> proto::common::Status {
+    proto::common::Status {
+        code: 1,
+        message: message.into(),
     }
 }
 
@@ -156,23 +170,18 @@ pub(crate) fn handle_transmit_chunk(
 }
 
 pub(crate) fn handle_transmit_runtime_filter(
-    params: proto::starrocks::PTransmitRuntimeFilterParams,
-) -> proto::starrocks::PTransmitRuntimeFilterResult {
-    let Some(filter_id) = params.filter_id else {
-        return proto::starrocks::PTransmitRuntimeFilterResult {
-            status: Some(error_status(
-                "missing filter_id for transmit_runtime_filter",
-            )),
-            filter_id: Some(0),
-        };
-    };
-    let mut response = proto::starrocks::PTransmitRuntimeFilterResult {
-        status: Some(ok_status()),
-        filter_id: Some(filter_id),
+    params: proto::filter::TransmitRuntimeFilterRequest,
+) -> proto::filter::TransmitRuntimeFilterResponse {
+    let filter_id = params.filter_id;
+    let mut response = proto::filter::TransmitRuntimeFilterResponse {
+        status: Some(ok_common_status()),
+        filter_id,
     };
 
     let Some(query_id) = params.query_id.as_ref() else {
-        response.status = Some(error_status("missing query_id for transmit_runtime_filter"));
+        response.status = Some(error_common_status(
+            "missing query_id for transmit_runtime_filter",
+        ));
         return response;
     };
     let query_id = QueryId {
@@ -180,15 +189,9 @@ pub(crate) fn handle_transmit_runtime_filter(
         lo: query_id.lo,
     };
 
-    let Some(payload) = params.data.as_ref() else {
-        response.status = Some(error_status(format!(
-            "missing runtime filter payload: query_id={} filter_id={}",
-            query_id, filter_id
-        )));
-        return response;
-    };
+    let payload = params.data.as_slice();
     if payload.is_empty() {
-        response.status = Some(error_status(format!(
+        response.status = Some(error_common_status(format!(
             "runtime filter payload is empty: query_id={} filter_id={}",
             query_id, filter_id
         )));
@@ -198,9 +201,9 @@ pub(crate) fn handle_transmit_runtime_filter(
     let build_data_type = params
         .column_type
         .as_ref()
-        .and_then(arrow_type_from_proto_type_desc);
+        .and_then(arrow_type_from_common_type_desc);
 
-    if params.is_partial.unwrap_or(false) {
+    if params.is_partial {
         let Some(worker) = query_context_manager().get_or_create_runtime_filter_worker(query_id)
         else {
             let (delivery_expire, query_expire) = query_expire_durations(None);
@@ -213,13 +216,13 @@ pub(crate) fn handle_transmit_runtime_filter(
             let _ = query_context_manager().enqueue_pending_runtime_filter(
                 query_id,
                 filter_id,
-                params.build_be_number.unwrap_or(0),
-                payload.to_vec(),
+                params.build_be_number,
+                params.data,
                 build_data_type,
             );
             return response;
         };
-        let build_be_number = params.build_be_number.unwrap_or(0);
+        let build_be_number = params.build_be_number;
         if let Err(err) =
             worker.receive_partial(filter_id, payload, build_be_number, build_data_type)
         {
@@ -227,7 +230,7 @@ pub(crate) fn handle_transmit_runtime_filter(
                 "receive_partial_runtime_filter failed: query_id={} filter_id={} err={}",
                 query_id, filter_id, err
             );
-            response.status = Some(error_status(err));
+            response.status = Some(error_common_status(err));
         }
         return response;
     }
@@ -238,20 +241,66 @@ pub(crate) fn handle_transmit_runtime_filter(
             "receive_total_runtime_filter failed: query_id={} filter_id={} err={}",
             query_id, filter_id, err
         );
-        response.status = Some(error_status(err));
+        response.status = Some(error_common_status(err));
     }
     response
+}
+
+#[cfg(feature = "compat")]
+pub(crate) fn handle_transmit_runtime_filter_compat(
+    params: proto::starrocks::PTransmitRuntimeFilterParams,
+) -> proto::starrocks::PTransmitRuntimeFilterResult {
+    let Some(filter_id) = params.filter_id else {
+        return proto::starrocks::PTransmitRuntimeFilterResult {
+            status: Some(error_status(
+                "missing filter_id for transmit_runtime_filter",
+            )),
+            filter_id: None,
+        };
+    };
+    let column_type = params.column_type.as_ref().and_then(|desc| {
+        crate::exec::runtime_filter::arrow_type_from_proto_type_desc(desc).and_then(|data_type| {
+            crate::exec::runtime_filter::arrow_type_to_common_type_desc(&data_type)
+        })
+    });
+    let native = proto::filter::TransmitRuntimeFilterRequest {
+        is_partial: params.is_partial.unwrap_or(false),
+        query_id: params
+            .query_id
+            .as_ref()
+            .map(|query_id| proto::common::UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            }),
+        filter_id,
+        data: params.data.unwrap_or_default(),
+        build_be_number: params.build_be_number.unwrap_or_default(),
+        column_type,
+    };
+    let response = handle_transmit_runtime_filter(native);
+    let status = response.status.map(|status| proto::starrocks::StatusPb {
+        status_code: status.code,
+        error_msgs: if status.message.is_empty() {
+            Vec::new()
+        } else {
+            vec![status.message]
+        },
+    });
+    proto::starrocks::PTransmitRuntimeFilterResult {
+        status,
+        filter_id: Some(response.filter_id),
+    }
 }
 
 fn receive_total_runtime_filter(
     query_id: QueryId,
     filter_id: i32,
-    is_partial: Option<bool>,
+    is_partial: bool,
     payload: &[u8],
 ) -> Result<(), String> {
     // Complete-only contract (P0a section 5.4): the prober install path only handles
     // TOTAL filters. Partial filters must be routed to the merge node above.
-    if is_partial.unwrap_or(false) {
+    if is_partial {
         return Err(
             "runtime filter contract violation: partial filter reached prober install path"
                 .to_string(),
@@ -358,6 +407,8 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use tempfile::tempdir;
 
+    #[cfg(feature = "compat")]
+    use super::handle_transmit_runtime_filter_compat;
     use super::{
         decode_column_ipc, encode_column_ipc, handle_lookup, handle_transmit_chunk,
         handle_transmit_runtime_filter, receive_total_runtime_filter,
@@ -387,8 +438,24 @@ mod tests {
         proto::starrocks::PUniqueId { hi, lo }
     }
 
+    fn common_unique_id(hi: i64, lo: i64) -> proto::common::UniqueId {
+        proto::common::UniqueId { hi, lo }
+    }
+
     fn ok_status(status: Option<&proto::starrocks::StatusPb>) -> bool {
         status.map(|s| s.status_code).unwrap_or_default() == 0
+    }
+
+    fn ok_common_status(status: Option<&proto::common::Status>) -> bool {
+        status.map(|s| s.code).unwrap_or_default() == 0
+    }
+
+    #[cfg(feature = "compat")]
+    fn error_status_message(status: Option<&proto::starrocks::StatusPb>) -> String {
+        status
+            .and_then(|s| s.error_msgs.first())
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn int_type_desc() -> types::TTypeDesc {
@@ -555,6 +622,26 @@ mod tests {
 
     #[test]
     #[cfg(feature = "compat")]
+    fn test_handle_transmit_runtime_filter_compat_rejects_missing_filter_id() {
+        let response =
+            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
+                is_partial: Some(false),
+                query_id: Some(unique_id(10, 20)),
+                filter_id: None,
+                data: Some(vec![1]),
+                ..Default::default()
+            });
+
+        assert!(!ok_status(response.status.as_ref()));
+        assert_eq!(
+            error_status_message(response.status.as_ref()),
+            "missing filter_id for transmit_runtime_filter"
+        );
+        assert_eq!(response.filter_id, None);
+    }
+
+    #[test]
+    #[cfg(feature = "compat")]
     fn test_handle_transmit_runtime_filter_partial_merge_broadcasts_on_completion() {
         let _hook_guard = internal_rpc_client::test_hook_lock();
         internal_rpc_client::clear_test_hooks();
@@ -610,7 +697,7 @@ mod tests {
         let payload = encode_starrocks_in_filter(&filter).expect("encode runtime filter");
 
         let first =
-            handle_transmit_runtime_filter(proto::starrocks::PTransmitRuntimeFilterParams {
+            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
                 is_partial: Some(true),
                 query_id: Some(unique_id(query_id.hi, query_id.lo)),
                 filter_id: Some(7),
@@ -619,7 +706,7 @@ mod tests {
                 ..Default::default()
             });
         let second =
-            handle_transmit_runtime_filter(proto::starrocks::PTransmitRuntimeFilterParams {
+            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
                 is_partial: Some(true),
                 query_id: Some(unique_id(query_id.hi, query_id.lo)),
                 filter_id: Some(7),
@@ -697,7 +784,7 @@ mod tests {
         let payload = encode_starrocks_in_filter(&filter).expect("encode runtime filter");
 
         let first =
-            handle_transmit_runtime_filter(proto::starrocks::PTransmitRuntimeFilterParams {
+            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
                 is_partial: Some(true),
                 query_id: Some(unique_id(query_id.hi, query_id.lo)),
                 filter_id: Some(9),
@@ -707,7 +794,7 @@ mod tests {
                 ..Default::default()
             });
         let second =
-            handle_transmit_runtime_filter(proto::starrocks::PTransmitRuntimeFilterParams {
+            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
                 is_partial: Some(true),
                 query_id: Some(unique_id(query_id.hi, query_id.lo)),
                 filter_id: Some(9),
@@ -773,7 +860,7 @@ mod tests {
         let payload = encode_starrocks_in_filter(&filter).expect("encode runtime filter");
 
         let first =
-            handle_transmit_runtime_filter(proto::starrocks::PTransmitRuntimeFilterParams {
+            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
                 is_partial: Some(true),
                 query_id: Some(unique_id(query_id.hi, query_id.lo)),
                 filter_id: Some(10),
@@ -818,7 +905,7 @@ mod tests {
         );
 
         let second =
-            handle_transmit_runtime_filter(proto::starrocks::PTransmitRuntimeFilterParams {
+            handle_transmit_runtime_filter_compat(proto::starrocks::PTransmitRuntimeFilterParams {
                 is_partial: Some(true),
                 query_id: Some(unique_id(query_id.hi, query_id.lo)),
                 filter_id: Some(10),
@@ -872,7 +959,7 @@ mod tests {
         hub.register_probe_specs(
             88,
             &[RuntimeFilterProbeSpec {
-                filter_id: 7,
+                filter_id: 0,
                 expr_id: ExprId(0),
                 slot_id: SlotId::new(11),
                 data_type: arrow::datatypes::DataType::Int32,
@@ -887,25 +974,26 @@ mod tests {
             .expect("install runtime filter hub");
 
         let filter =
-            RuntimeInFilter::empty(7, SlotId::new(11), &DataType::Int32).expect("empty in filter");
+            RuntimeInFilter::empty(0, SlotId::new(11), &DataType::Int32).expect("empty in filter");
         let payload = encode_starrocks_in_filter(&filter).expect("encode runtime filter");
         let response =
-            handle_transmit_runtime_filter(proto::starrocks::PTransmitRuntimeFilterParams {
-                is_partial: Some(false),
-                query_id: Some(unique_id(query_id.hi, query_id.lo)),
-                filter_id: Some(7),
-                data: Some(payload),
-                ..Default::default()
+            handle_transmit_runtime_filter(proto::filter::TransmitRuntimeFilterRequest {
+                is_partial: false,
+                query_id: Some(common_unique_id(query_id.hi, query_id.lo)),
+                filter_id: 0,
+                data: payload,
+                build_be_number: 0,
+                column_type: None,
             });
 
-        assert!(ok_status(response.status.as_ref()));
+        assert!(ok_common_status(response.status.as_ref()));
         let snapshot = probe.snapshot();
         assert_eq!(snapshot.in_filters().len(), 1);
-        assert_eq!(snapshot.in_filters()[0].filter_id(), 7);
+        assert_eq!(snapshot.in_filters()[0].filter_id(), 0);
         let lifecycle = registry
             .snapshot(query_key)
             .expect("query lifecycle snapshot");
-        let filter = lifecycle.filters.get(&7).expect("filter lifecycle");
+        let filter = lifecycle.filters.get(&0).expect("filter lifecycle");
         assert!(filter.delivered);
         registry.remove_query(query_key);
     }
@@ -944,7 +1032,7 @@ mod tests {
         let filter =
             RuntimeInFilter::empty(7, SlotId::new(11), &DataType::Int32).expect("empty in filter");
         let payload = encode_starrocks_in_filter(&filter).expect("encode runtime filter");
-        let err = receive_total_runtime_filter(query_id, 7, Some(true), &payload)
+        let err = receive_total_runtime_filter(query_id, 7, true, &payload)
             .expect_err("partial must not be installed on the prober path");
 
         assert!(

@@ -16,6 +16,7 @@
 // under the License.
 use arrow::datatypes::{DataType, TimeUnit};
 
+use crate::proto::common::{PrimitiveType, ScalarType, TypeDesc, type_desc::Kind};
 use crate::service::grpc_client::proto::starrocks::{PScalarType, PTypeDesc, PTypeNode};
 
 const TYPE_NODE_SCALAR: i32 = 0;
@@ -156,6 +157,74 @@ pub(crate) fn arrow_type_from_proto_type_desc(desc: &PTypeDesc) -> Option<DataTy
     }
 }
 
+pub(crate) fn arrow_type_to_common_type_desc(data_type: &DataType) -> Option<TypeDesc> {
+    let (primitive, len, precision, scale) = match data_type {
+        DataType::Boolean => (PrimitiveType::Boolean, None, None, None),
+        DataType::Int8 => (PrimitiveType::Tinyint, None, None, None),
+        DataType::Int16 => (PrimitiveType::Smallint, None, None, None),
+        DataType::Int32 => (PrimitiveType::Int, None, None, None),
+        DataType::Int64 => (PrimitiveType::Bigint, None, None, None),
+        DataType::Float32 => (PrimitiveType::Float, None, None, None),
+        DataType::Float64 => (PrimitiveType::Double, None, None, None),
+        DataType::Date32 => (PrimitiveType::Date, None, None, None),
+        DataType::Timestamp(_, _) => (PrimitiveType::Datetime, None, None, None),
+        DataType::Utf8 => (PrimitiveType::Varchar, None, None, None),
+        DataType::Decimal128(precision, scale) => {
+            if !is_valid_decimal128(*precision, *scale) {
+                return None;
+            }
+            (
+                PrimitiveType::Decimal128,
+                None,
+                Some(i32::from(*precision)),
+                Some(i32::from(*scale)),
+            )
+        }
+        _ => return None,
+    };
+
+    Some(TypeDesc {
+        kind: Some(Kind::Scalar(ScalarType {
+            r#type: primitive as i32,
+            len,
+            precision,
+            scale,
+            time_unit: None,
+        })),
+    })
+}
+
+pub(crate) fn arrow_type_from_common_type_desc(desc: &TypeDesc) -> Option<DataType> {
+    let scalar = match desc.kind.as_ref()? {
+        Kind::Scalar(scalar) => scalar,
+        _ => return None,
+    };
+    let primitive = PrimitiveType::try_from(scalar.r#type).ok()?;
+    match primitive {
+        PrimitiveType::Boolean => Some(DataType::Boolean),
+        PrimitiveType::Tinyint => Some(DataType::Int8),
+        PrimitiveType::Smallint => Some(DataType::Int16),
+        PrimitiveType::Int => Some(DataType::Int32),
+        PrimitiveType::Bigint => Some(DataType::Int64),
+        PrimitiveType::Float => Some(DataType::Float32),
+        PrimitiveType::Double => Some(DataType::Float64),
+        PrimitiveType::Date => Some(DataType::Date32),
+        PrimitiveType::Datetime => Some(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        PrimitiveType::Varchar | PrimitiveType::Char => Some(DataType::Utf8),
+        PrimitiveType::Decimal128 => {
+            let precision = scalar.precision?;
+            let scale = scalar.scale?;
+            if !(1..=38).contains(&precision) || scale < 0 || scale > precision {
+                return None;
+            }
+            let precision = u8::try_from(precision).ok()?;
+            let scale = i8::try_from(scale).ok()?;
+            Some(DataType::Decimal128(precision, scale))
+        }
+        _ => None,
+    }
+}
+
 fn is_valid_decimal128(precision: u8, scale: i8) -> bool {
     (1..=38).contains(&precision) && scale >= 0 && i32::from(scale) <= i32::from(precision)
 }
@@ -164,7 +233,11 @@ fn is_valid_decimal128(precision: u8, scale: i8) -> bool {
 mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
 
-    use super::{TYPE_NODE_SCALAR, arrow_type_from_proto_type_desc, arrow_type_to_proto_type_desc};
+    use super::{
+        TYPE_NODE_SCALAR, arrow_type_from_common_type_desc, arrow_type_from_proto_type_desc,
+        arrow_type_to_common_type_desc, arrow_type_to_proto_type_desc,
+    };
+    use crate::proto::common::{PrimitiveType, type_desc::Kind};
     use crate::service::grpc_client::proto::starrocks::{PScalarType, PTypeDesc, PTypeNode};
     use crate::thrift::types::TPrimitiveType;
 
@@ -197,6 +270,45 @@ mod tests {
     #[test]
     fn unsupported_runtime_filter_type_has_no_proto_type_desc() {
         assert!(arrow_type_to_proto_type_desc(&DataType::Binary).is_none());
+    }
+
+    #[test]
+    fn common_type_desc_round_trips_supported_runtime_filter_types() {
+        let cases = [
+            (DataType::Boolean, PrimitiveType::Boolean),
+            (DataType::Int8, PrimitiveType::Tinyint),
+            (DataType::Int16, PrimitiveType::Smallint),
+            (DataType::Int32, PrimitiveType::Int),
+            (DataType::Int64, PrimitiveType::Bigint),
+            (DataType::Float32, PrimitiveType::Float),
+            (DataType::Float64, PrimitiveType::Double),
+            (DataType::Date32, PrimitiveType::Date),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                PrimitiveType::Datetime,
+            ),
+            (DataType::Utf8, PrimitiveType::Varchar),
+            (DataType::Decimal128(18, 2), PrimitiveType::Decimal128),
+            (DataType::Decimal128(38, 9), PrimitiveType::Decimal128),
+        ];
+
+        for (data_type, primitive) in cases {
+            let desc = arrow_type_to_common_type_desc(&data_type)
+                .unwrap_or_else(|| panic!("missing common type desc for {data_type:?}"));
+            let scalar = match desc.kind.as_ref() {
+                Some(Kind::Scalar(scalar)) => scalar,
+                other => panic!("expected scalar common type desc, got {other:?}"),
+            };
+            assert_eq!(scalar.r#type, primitive as i32);
+            let decoded = arrow_type_from_common_type_desc(&desc)
+                .unwrap_or_else(|| panic!("missing Arrow type for {data_type:?}"));
+            assert_eq!(decoded, data_type);
+        }
+    }
+
+    #[test]
+    fn unsupported_runtime_filter_type_has_no_common_type_desc() {
+        assert!(arrow_type_to_common_type_desc(&DataType::Binary).is_none());
     }
 
     #[test]

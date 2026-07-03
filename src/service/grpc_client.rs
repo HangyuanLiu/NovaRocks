@@ -333,7 +333,7 @@ pub fn send_chunks(
 pub fn transmit_runtime_filter(
     dest_host: &str,
     dest_port: u16,
-    params: proto::starrocks::PTransmitRuntimeFilterParams,
+    params: proto::filter::TransmitRuntimeFilterRequest,
 ) -> Result<(), String> {
     let dest_host = dest_host.to_string();
     let port = dest_port;
@@ -355,11 +355,11 @@ pub fn transmit_runtime_filter(
         match cli.transmit_runtime_filter(params).await {
             Ok(resp) => {
                 if let Some(status) = resp.get_ref().status.as_ref()
-                    && status.status_code != 0
+                    && status.code != 0
                 {
                     error!(
-                        "runtime filter send failed: dest={}:{} code={} msgs={:?}",
-                        dest_host, port, status.status_code, status.error_msgs
+                        "runtime filter send failed: dest={}:{} code={} message={}",
+                        dest_host, port, status.code, status.message
                     );
                 }
             }

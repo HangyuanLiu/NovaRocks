@@ -93,7 +93,7 @@ pub fn send_runtime_filter(
 pub fn send_runtime_filter(
     dest_host: &str,
     dest_port: u16,
-    params: crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams,
+    params: crate::proto::filter::TransmitRuntimeFilterRequest,
 ) -> Result<(), String> {
     crate::service::grpc_client::transmit_runtime_filter(dest_host, dest_port, params)
 }

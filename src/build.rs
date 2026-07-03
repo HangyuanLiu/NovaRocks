@@ -200,6 +200,7 @@ pub mod proto {
 
     pub mod novarocks {
         use super::common;
+        use super::filter;
         tonic::include_proto!("novarocks");
     }
 

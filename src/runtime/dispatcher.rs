@@ -384,6 +384,7 @@ mod tests {
 
     use crate::proto;
     use arrow::array::Int32Array;
+    use proto::filter::{TransmitRuntimeFilterRequest, TransmitRuntimeFilterResponse};
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
     use proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc;
     use proto::novarocks::{
@@ -392,9 +393,7 @@ mod tests {
         HeartbeatRequest, HeartbeatResponse, ReportExecStatusRequest, ReportExecStatusResponse,
         SubmitFragmentRequest, SubmitFragmentResponse,
     };
-    use proto::starrocks::{
-        PLookUpRequest, PLookUpResponse, PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult,
-    };
+    use proto::starrocks::{PLookUpRequest, PLookUpResponse};
     use tonic::{Request, Response, Status, Streaming};
 
     fn make_finst_id(hi: i64, lo: i64) -> types::TUniqueId {
@@ -547,8 +546,8 @@ mod tests {
 
         async fn transmit_runtime_filter(
             &self,
-            _request: Request<PTransmitRuntimeFilterParams>,
-        ) -> Result<Response<PTransmitRuntimeFilterResult>, Status> {
+            _request: Request<TransmitRuntimeFilterRequest>,
+        ) -> Result<Response<TransmitRuntimeFilterResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }
 
