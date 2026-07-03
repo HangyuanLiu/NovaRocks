@@ -33,7 +33,6 @@ use crate::runtime::runtime_filter_observability::{
     QueryKey, RfDropReason, RfLifecycleRecorder, RuntimeFilterLifecycleRegistry,
 };
 use crate::service::exchange_sender;
-use crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams;
 
 pub(crate) struct RuntimeFilterWorker {
     query_id: QueryId,
@@ -271,15 +270,16 @@ impl RuntimeFilterWorker {
             if !seen_hosts.insert(prober.hostname().to_string()) {
                 continue;
             }
-            let req = PTransmitRuntimeFilterParams {
-                is_partial: Some(false),
-                query_id: Some(crate::service::grpc_client::proto::starrocks::PUniqueId {
+            let req = crate::proto::filter::TransmitRuntimeFilterRequest {
+                is_partial: false,
+                query_id: Some(crate::proto::common::UniqueId {
                     hi: self.query_id.hi,
                     lo: self.query_id.lo,
                 }),
-                filter_id: Some(filter_id),
-                data: Some(data.clone()),
-                ..Default::default()
+                filter_id,
+                data: data.clone(),
+                build_be_number: 0,
+                column_type: None,
             };
             let dest_port = prober.port() as u16;
             if let Err(e) = send_final_runtime_filter(prober.hostname(), dest_port, req) {
@@ -299,18 +299,27 @@ impl RuntimeFilterWorker {
 fn send_final_runtime_filter(
     hostname: &str,
     port: u16,
-    req: PTransmitRuntimeFilterParams,
+    req: crate::proto::filter::TransmitRuntimeFilterRequest,
 ) -> Result<(), String> {
     exchange_sender::send_runtime_filter(hostname, port, req)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "compat")))]
 fn send_final_runtime_filter(
     hostname: &str,
     port: u16,
-    req: PTransmitRuntimeFilterParams,
+    req: crate::proto::filter::TransmitRuntimeFilterRequest,
 ) -> Result<(), String> {
     tests::send_final_runtime_filter_for_test(hostname, port, req)
+}
+
+#[cfg(all(test, feature = "compat"))]
+fn send_final_runtime_filter(
+    hostname: &str,
+    port: u16,
+    req: crate::proto::filter::TransmitRuntimeFilterRequest,
+) -> Result<(), String> {
+    exchange_sender::send_runtime_filter(hostname, port, req)
 }
 
 #[derive(Clone)]
@@ -426,7 +435,7 @@ fn encode_membership_filter(filter: &RuntimeMembershipFilter) -> Result<Vec<u8>,
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "compat")))]
 mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -447,8 +456,10 @@ mod tests {
         QueryKey, RfDropReason, RuntimeFilterLifecycleRegistry,
     };
 
-    type SendHook =
-        Box<dyn Fn(&str, u16, PTransmitRuntimeFilterParams) -> Result<(), String> + 'static>;
+    type SendHook = Box<
+        dyn Fn(&str, u16, crate::proto::filter::TransmitRuntimeFilterRequest) -> Result<(), String>
+            + 'static,
+    >;
 
     thread_local! {
         static FINAL_SEND_HOOK: RefCell<Option<SendHook>> = const { RefCell::new(None) };
@@ -457,7 +468,7 @@ mod tests {
     pub(super) fn send_final_runtime_filter_for_test(
         hostname: &str,
         port: u16,
-        params: PTransmitRuntimeFilterParams,
+        params: crate::proto::filter::TransmitRuntimeFilterRequest,
     ) -> Result<(), String> {
         FINAL_SEND_HOOK.with(|hook| {
             if let Some(hook) = hook.borrow().as_ref() {
@@ -489,7 +500,7 @@ mod tests {
     struct CapturedFinalRuntimeFilterSend {
         hostname: String,
         port: u16,
-        params: PTransmitRuntimeFilterParams,
+        params: crate::proto::filter::TransmitRuntimeFilterRequest,
     }
 
     struct LifecycleQueryGuard {
@@ -596,13 +607,15 @@ mod tests {
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].hostname, "127.0.0.1");
         assert_eq!(sends[0].port, 18030);
-        assert_eq!(sends[0].params.is_partial, Some(false));
-        assert_eq!(sends[0].params.filter_id, Some(filter_id));
+        assert!(!sends[0].params.is_partial);
+        assert_eq!(sends[0].params.filter_id, filter_id);
         assert_eq!(
             sends[0].params.query_id.as_ref().map(|id| (id.hi, id.lo)),
             Some((123, 456))
         );
-        assert!(sends[0].params.data.is_some());
+        assert!(!sends[0].params.data.is_empty());
+        assert_eq!(sends[0].params.build_be_number, 0);
+        assert!(sends[0].params.column_type.is_none());
     }
 
     #[test]
@@ -667,15 +680,11 @@ mod tests {
 
         let sends = sends.lock().expect("captured runtime filter sends lock");
         assert_eq!(sends.len(), 1);
-        assert_eq!(sends[0].params.is_partial, Some(false));
-        assert_eq!(sends[0].params.filter_id, Some(filter_id));
-        assert!(
-            sends[0]
-                .params
-                .data
-                .as_ref()
-                .is_some_and(|data| !data.is_empty())
-        );
+        assert!(!sends[0].params.is_partial);
+        assert_eq!(sends[0].params.filter_id, filter_id);
+        assert!(!sends[0].params.data.is_empty());
+        assert_eq!(sends[0].params.build_be_number, 0);
+        assert!(sends[0].params.column_type.is_none());
     }
 
     #[test]

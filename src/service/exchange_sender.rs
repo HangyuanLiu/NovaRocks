@@ -80,21 +80,18 @@ pub struct ExchangeSendTask {
     pub tracker: Arc<ExchangeSendTracker>,
 }
 
-#[cfg(feature = "compat")]
 pub fn send_runtime_filter(
     dest_host: &str,
     dest_port: u16,
-    params: crate::service::internal_rpc_client::proto::starrocks::PTransmitRuntimeFilterParams,
+    params: crate::proto::filter::TransmitRuntimeFilterRequest,
 ) -> Result<(), String> {
-    crate::service::internal_rpc_client::transmit_runtime_filter(dest_host, dest_port, params)
-}
-
-#[cfg(not(feature = "compat"))]
-pub fn send_runtime_filter(
-    dest_host: &str,
-    dest_port: u16,
-    params: crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams,
-) -> Result<(), String> {
+    #[cfg(feature = "compat")]
+    {
+        return crate::service::internal_rpc_client::transmit_runtime_filter(
+            dest_host, dest_port, params,
+        );
+    }
+    #[cfg(not(feature = "compat"))]
     crate::service::grpc_client::transmit_runtime_filter(dest_host, dest_port, params)
 }
 

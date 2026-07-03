@@ -37,14 +37,12 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::row_position::RowPositionDescriptor;
-use crate::proto as internal_proto;
+use crate::proto;
 use crate::runtime::descriptor_snapshot_thrift::{
     LookupNodeInfo, LookupNodesInfo, is_lake_row_position,
 };
-#[cfg(feature = "compat")]
-use crate::runtime::lookup::decode_column_ipc;
 use crate::runtime::lookup::{
-    encode_column_ipc, execute_lake_lookup_request, execute_lookup_request,
+    decode_column_ipc, encode_column_ipc, execute_lake_lookup_request, execute_lookup_request,
 };
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
@@ -163,8 +161,8 @@ impl FetchProcessor {
 
         let mut fetched_columns: HashMap<SlotId, ArrayRef> = HashMap::new();
         for (tuple_id, row_pos_desc) in &self.row_pos_descs {
-            let lookup_slots = snapshot.lookup_output_slots(*tuple_id, row_pos_desc);
-            if lookup_slots.is_empty() {
+            let output_slots = snapshot.lookup_output_slots(*tuple_id, row_pos_desc);
+            if output_slots.is_empty() {
                 continue;
             }
             let fetch_ref_slots = &row_pos_desc.fetch_ref_slots;
@@ -213,7 +211,7 @@ impl FetchProcessor {
                 for (slot, array) in response_columns {
                     response_map.insert(slot, array);
                 }
-                for slot in &lookup_slots {
+                for slot in &output_slots {
                     if !response_map.contains_key(slot) {
                         return Err(format!("lookup response missing slot {}", slot));
                     }
@@ -224,7 +222,7 @@ impl FetchProcessor {
             let scatter_indices = build_scatter_indices(&groups, chunk.len());
             let scatter_array = UInt32Array::from(scatter_indices);
 
-            for slot in &lookup_slots {
+            for slot in &output_slots {
                 let mut chunks = Vec::new();
                 for result in &group_results {
                     let array = result
@@ -275,57 +273,45 @@ impl FetchProcessor {
             .as_ref()
             .and_then(|info| find_node(info, backend_id))
             .ok_or_else(|| format!("node info not found for backend_id {}", backend_id))?;
-        let mut req = internal_proto::starrocks::PLookUpRequest {
-            query_id: Some(internal_proto::starrocks::PUniqueId {
+        let mut req = proto::filter::LookupRequest {
+            query_id: Some(proto::common::UniqueId {
                 hi: query_id.hi,
                 lo: query_id.lo,
             }),
-            lookup_node_id: Some(self.target_node_id),
-            request_tuple_id: Some(tuple_id),
-            ..Default::default()
+            lookup_node_id: self.target_node_id,
+            request_tuple_id: tuple_id,
+            request_columns: Vec::with_capacity(request_columns.len()),
         };
         for (slot_id, array) in request_columns {
             let data = encode_column_ipc(array)?;
-            req.request_columns
-                .push(internal_proto::starrocks::PColumn {
-                    slot_id: Some(slot_id.as_u32() as i32),
-                    data_size: Some(data.len() as i64),
-                    data: Some(data),
-                });
+            req.request_columns.push(proto::filter::Column {
+                slot_id: slot_id.as_u32() as i32,
+                data_size: data.len() as i64,
+                data,
+            });
         }
-        #[cfg(not(feature = "compat"))]
-        {
-            let _ = (&node_info, req);
-            Err("lookup requires compat feature (brpc)".to_string())
-        }
+        let port = lookup_async_internal_port(node_info)?;
 
+        #[cfg(not(feature = "compat"))]
+        let resp = crate::service::grpc_client::lookup(&node_info.host, port, req)?;
         #[cfg(feature = "compat")]
+        let resp = crate::service::internal_rpc_client::lookup(&node_info.host, port, req)?;
+
+        if let Some(status) = resp.status.as_ref()
+            && status.code != 0
         {
-            let resp = crate::service::internal_rpc_client::lookup(
-                &node_info.host,
-                node_info.async_internal_port as u16,
-                req,
-            )?;
-            if let Some(status) = resp.status.as_ref()
-                && status.status_code != 0
-            {
-                return Err(format!("lookup failed: {:?}", status.error_msgs));
-            }
-            let mut out = Vec::new();
-            for col in resp.columns {
-                let Some(slot_id) = col.slot_id else {
-                    return Err("lookup response column missing slot_id".to_string());
-                };
-                let slot_id = SlotId::try_from(slot_id)?;
-                let data = col
-                    .data
-                    .as_ref()
-                    .ok_or_else(|| "lookup response column missing data".to_string())?;
-                let array = decode_column_ipc(data)?;
-                out.push((slot_id, array));
-            }
-            Ok(out)
+            return Err(format!("lookup failed: {}", status.message));
         }
+        let mut out = Vec::new();
+        for col in resp.columns {
+            let slot_id = SlotId::try_from(col.slot_id)?;
+            if col.data.is_empty() {
+                return Err("lookup response column missing data".to_string());
+            }
+            let array = decode_column_ipc(&col.data)?;
+            out.push((slot_id, array));
+        }
+        Ok(out)
     }
 }
 
@@ -335,7 +321,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::FetchProcessor;
-    use crate::proto as internal_proto;
+    use crate::proto;
     use crate::runtime::descriptor_snapshot_thrift::test_lookup_nodes_info;
     use crate::runtime::query_context::QueryId;
     use crate::service::internal_rpc_client;
@@ -347,12 +333,12 @@ mod tests {
 
         let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_hook = std::sync::Arc::clone(&captured);
-        internal_rpc_client::set_lookup_hook(move |host, port, _req| {
-            *captured_hook.lock().expect("captured lock") = Some((host.to_string(), port));
-            Ok(internal_proto::starrocks::PLookUpResponse {
-                status: Some(internal_proto::starrocks::StatusPb {
-                    status_code: 0,
-                    error_msgs: Vec::new(),
+        internal_rpc_client::set_lookup_hook(move |host, port, req| {
+            *captured_hook.lock().expect("captured lock") = Some((host.to_string(), port, req));
+            Ok(proto::filter::LookupResponse {
+                status: Some(proto::common::Status {
+                    code: 0,
+                    message: String::new(),
                 }),
                 columns: Vec::new(),
             })
@@ -371,11 +357,127 @@ mod tests {
 
         let result = processor.lookup_remote(QueryId { hi: 1, lo: 2 }, 3, &HashMap::new(), 9);
         assert!(result.is_ok());
-        assert_eq!(
-            *captured.lock().expect("captured lock"),
-            Some(("remote-host".to_string(), 9911))
-        );
+        let captured = captured.lock().expect("captured lock");
+        let (host, port, req) = captured.as_ref().expect("captured lookup request");
+        assert_eq!(host, "remote-host");
+        assert_eq!(*port, 9911);
+        assert_eq!(req.query_id, Some(proto::common::UniqueId { hi: 1, lo: 2 }));
+        assert_eq!(req.lookup_node_id, 2);
+        assert_eq!(req.request_tuple_id, 3);
         internal_rpc_client::clear_test_hooks();
+    }
+}
+
+#[cfg(all(test, not(feature = "compat")))]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use arrow::array::{ArrayRef, Int32Array};
+
+    use super::FetchProcessor;
+    use crate::common::ids::SlotId;
+    use crate::proto;
+    use crate::runtime::query_context::QueryId;
+    use crate::service::grpc_client;
+    use crate::thrift::descriptors;
+
+    #[test]
+    fn test_lookup_remote_uses_native_grpc_lookup_in_pure_mode() {
+        let _hook_guard = grpc_client::test_hook_lock();
+        grpc_client::clear_test_hooks();
+
+        let captured = Arc::new(Mutex::new(None));
+        let captured_hook = Arc::clone(&captured);
+        grpc_client::set_lookup_hook(move |host, port, req| {
+            *captured_hook.lock().expect("captured lock") = Some((host.to_string(), port, req));
+            Ok(proto::filter::LookupResponse {
+                status: Some(proto::common::Status {
+                    code: 0,
+                    message: String::new(),
+                }),
+                columns: Vec::new(),
+            })
+        });
+
+        let processor = FetchProcessor {
+            name: "FETCH (test)".to_string(),
+            node_id: 1,
+            target_node_id: 2,
+            row_pos_descs: HashMap::new(),
+            nodes_info: Some(descriptors::TNodesInfo::new(
+                1,
+                vec![descriptors::TNodeInfo::new(
+                    9,
+                    0,
+                    "remote-host".to_string(),
+                    9911,
+                )],
+            )),
+            pending_output: None,
+            finishing: false,
+            output_chunk_schema: Arc::new(crate::exec::chunk::ChunkSchema::empty()),
+        };
+        let request_columns = HashMap::from([(
+            SlotId::new(2),
+            Arc::new(Int32Array::from(vec![9])) as ArrayRef,
+        )]);
+
+        let result = processor.lookup_remote(QueryId { hi: 1, lo: 2 }, 3, &request_columns, 9);
+
+        assert!(result.is_ok());
+        let captured = captured.lock().expect("captured lock");
+        let (host, port, req) = captured.as_ref().expect("captured lookup request");
+        assert_eq!(host, "remote-host");
+        assert_eq!(*port, 9911);
+        assert_eq!(req.query_id, Some(proto::common::UniqueId { hi: 1, lo: 2 }));
+        assert_eq!(req.lookup_node_id, 2);
+        assert_eq!(req.request_tuple_id, 3);
+        assert_eq!(req.request_columns.len(), 1);
+        assert_eq!(req.request_columns[0].slot_id, 2);
+        assert!(!req.request_columns[0].data.is_empty());
+        grpc_client::clear_test_hooks();
+    }
+}
+
+#[cfg(test)]
+mod common_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::FetchProcessor;
+    use crate::runtime::query_context::QueryId;
+    use crate::thrift::descriptors;
+
+    #[test]
+    fn test_lookup_remote_rejects_async_internal_port_out_of_u16_range() {
+        let processor = FetchProcessor {
+            name: "FETCH (test)".to_string(),
+            node_id: 1,
+            target_node_id: 2,
+            row_pos_descs: HashMap::new(),
+            nodes_info: Some(descriptors::TNodesInfo::new(
+                1,
+                vec![descriptors::TNodeInfo::new(
+                    9,
+                    0,
+                    "remote-host".to_string(),
+                    70_000,
+                )],
+            )),
+            pending_output: None,
+            finishing: false,
+            output_chunk_schema: Arc::new(crate::exec::chunk::ChunkSchema::empty()),
+        };
+
+        let err = processor
+            .lookup_remote(QueryId { hi: 1, lo: 2 }, 3, &HashMap::new(), 9)
+            .expect_err("out-of-range async_internal_port must fail before lookup rpc");
+
+        assert!(
+            err.contains("async_internal_port") && err.contains("out of u16 range"),
+            "unexpected error: {err}"
+        );
     }
 }
 
@@ -418,4 +520,13 @@ fn find_node(nodes_info: &LookupNodesInfo, backend_id: i32) -> Option<&LookupNod
         .nodes
         .iter()
         .find(|node| node.id == backend_id as i64)
+}
+
+fn lookup_async_internal_port(node_info: &LookupNodeInfo) -> Result<u16, String> {
+    u16::try_from(node_info.async_internal_port).map_err(|_| {
+        format!(
+            "lookup async_internal_port {} for backend_id {} is out of u16 range",
+            node_info.async_internal_port, node_info.id
+        )
+    })
 }

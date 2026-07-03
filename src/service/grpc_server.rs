@@ -256,9 +256,8 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
 
     async fn transmit_runtime_filter(
         &self,
-        request: tonic::Request<proto::starrocks::PTransmitRuntimeFilterParams>,
-    ) -> Result<tonic::Response<proto::starrocks::PTransmitRuntimeFilterResult>, tonic::Status>
-    {
+        request: tonic::Request<proto::filter::TransmitRuntimeFilterRequest>,
+    ) -> Result<tonic::Response<proto::filter::TransmitRuntimeFilterResponse>, tonic::Status> {
         self.require_local_execution("TransmitRuntimeFilter")?;
         Ok(tonic::Response::new(
             internal_rpc::handle_transmit_runtime_filter(request.into_inner()),
@@ -267,8 +266,8 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
 
     async fn lookup(
         &self,
-        request: tonic::Request<proto::starrocks::PLookUpRequest>,
-    ) -> Result<tonic::Response<proto::starrocks::PLookUpResponse>, tonic::Status> {
+        request: tonic::Request<proto::filter::LookupRequest>,
+    ) -> Result<tonic::Response<proto::filter::LookupResponse>, tonic::Status> {
         self.require_local_execution("Lookup")?;
         Ok(tonic::Response::new(internal_rpc::handle_lookup(
             request.into_inner(),

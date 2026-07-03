@@ -64,6 +64,8 @@ pub(crate) use merger::{
     RuntimeMembershipFilterBuildParam,
 };
 pub(crate) use min_max::RuntimeMinMaxFilter;
+pub(crate) use proto_type::{arrow_type_from_common_type_desc, arrow_type_to_common_type_desc};
+#[allow(unused_imports)]
 pub(crate) use proto_type::{arrow_type_from_proto_type_desc, arrow_type_to_proto_type_desc};
 // Staged export for the B3 internal type model; follow-up tasks add production consumers.
 #[allow(unused_imports)]

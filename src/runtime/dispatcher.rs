@@ -389,6 +389,8 @@ mod tests {
 
     use crate::proto;
     use arrow::array::Int32Array;
+    use proto::filter::{LookupRequest, LookupResponse};
+    use proto::filter::{TransmitRuntimeFilterRequest, TransmitRuntimeFilterResponse};
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
     use proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc;
     use proto::novarocks::{
@@ -396,9 +398,6 @@ mod tests {
         ExchangeRequest, ExchangeResponse, FetchResultRequest, FetchResultResponse,
         HeartbeatRequest, HeartbeatResponse, ReportExecStatusRequest, ReportExecStatusResponse,
         SubmitFragmentRequest, SubmitFragmentResponse,
-    };
-    use proto::starrocks::{
-        PLookUpRequest, PLookUpResponse, PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult,
     };
     use tonic::{Request, Response, Status, Streaming};
 
@@ -552,15 +551,15 @@ mod tests {
 
         async fn transmit_runtime_filter(
             &self,
-            _request: Request<PTransmitRuntimeFilterParams>,
-        ) -> Result<Response<PTransmitRuntimeFilterResult>, Status> {
+            _request: Request<TransmitRuntimeFilterRequest>,
+        ) -> Result<Response<TransmitRuntimeFilterResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }
 
         async fn lookup(
             &self,
-            _request: Request<PLookUpRequest>,
-        ) -> Result<Response<PLookUpResponse>, Status> {
+            _request: Request<LookupRequest>,
+        ) -> Result<Response<LookupResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }
 
