@@ -9,7 +9,8 @@ use crate::connector::starrocks::table::scan_planner::{
     StarRocksScanHandle, StarRocksSplit, starrocks_scan_handle, starrocks_split,
 };
 use crate::sql::catalog::{
-    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
+    ColumnDef, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
+    IcebergDeleteFileInfo,
 };
 use crate::thrift::{descriptors, exprs, internal_service, partitions, plan_nodes, types};
 
@@ -28,6 +29,7 @@ pub(crate) struct ThriftScanContext {
     pub(crate) min_max_predicates: Vec<MinMaxPredicate>,
     pub(crate) change_op_slot: Option<types::TSlotId>,
     pub(crate) cloud_properties: BTreeMap<String, String>,
+    pub(crate) columns: Vec<ColumnDef>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,7 +61,7 @@ fn iceberg_to_thrift_scan(
 ) -> Result<ThriftScanPlan, String> {
     validate_split_connectors(scan, splits)?;
     let scan = iceberg_scan_handle(scan)?;
-    let scan_ranges = build_iceberg_scan_ranges(splits, &ctx)?;
+    let scan_ranges = build_iceberg_scan_ranges(scan, splits, &ctx)?;
     let node = build_iceberg_hdfs_scan_node(scan, &ctx);
     Ok(ThriftScanPlan {
         node: Some(node),
@@ -68,21 +70,47 @@ fn iceberg_to_thrift_scan(
 }
 
 fn build_iceberg_scan_ranges(
+    scan: &IcebergScanHandle,
     splits: &[Split],
     ctx: &ThriftScanContext,
 ) -> Result<Vec<internal_service::TScanRangeParams>, String> {
     let mut ranges = Vec::new();
+    let scan_predicates =
+        crate::connector::iceberg::file_pruning::min_max_predicates_to_scan_predicates(
+            &ctx.min_max_predicates,
+        );
+    let mut pruning_counters =
+        crate::connector::iceberg::file_pruning::IcebergFilePruningCounters::default();
+    let pruning_columns = pruning_columns_for_scan(scan, &ctx.columns);
     for split in splits {
         let file = &iceberg_split(split)?.data_file;
-        if !crate::sql::codegen::nodes::file_may_satisfy_min_max(file, &ctx.min_max_predicates) {
+        if !crate::connector::iceberg::file_pruning::file_may_satisfy_scan_predicates(
+            file,
+            &scan_predicates,
+            &mut pruning_counters,
+        ) {
             continue;
         }
         ranges.extend(build_hdfs_scan_range_params_for_file(
             file,
             ctx.change_op_slot,
+            &pruning_columns,
         )?);
     }
     Ok(ranges)
+}
+
+fn pruning_columns_for_scan(scan: &IcebergScanHandle, columns: &[ColumnDef]) -> Vec<ColumnDef> {
+    scan.table
+        .column_names
+        .iter()
+        .filter_map(|column_name| {
+            columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(column_name))
+                .cloned()
+        })
+        .collect()
 }
 
 fn build_iceberg_hdfs_scan_node(
@@ -152,9 +180,14 @@ fn build_iceberg_hdfs_scan_node(
 fn build_hdfs_scan_range_params_for_file(
     file: &IcebergDataFileInfo,
     change_op_slot: Option<types::TSlotId>,
+    columns: &[ColumnDef],
 ) -> Result<Vec<internal_service::TScanRangeParams>, String> {
     validate_iceberg_delete_apply_cost(&file.path, &file.delete_files)?;
     let splits = plan_hdfs_file_splits(file);
+    let iceberg_file_pruning =
+        crate::connector::iceberg::file_pruning::iceberg_file_pruning_metadata_to_thrift(
+            file, columns,
+        );
     splits
         .into_iter()
         .map(|(offset, length)| {
@@ -169,6 +202,7 @@ fn build_hdfs_scan_range_params_for_file(
                 file.included_positions.as_ref(),
                 change_op_slot,
                 &file.delete_files,
+                iceberg_file_pruning.clone(),
             )
         })
         .collect()
@@ -241,6 +275,7 @@ pub(crate) fn build_hdfs_scan_range_params(
     included_positions: Option<&Vec<i64>>,
     change_op_slot: Option<types::TSlotId>,
     delete_files: &[IcebergDeleteFileInfo],
+    iceberg_file_pruning: Option<BTreeMap<i32, exprs::TExprMinMaxValue>>,
 ) -> Result<internal_service::TScanRangeParams, String> {
     let mut parquet_delete_files = Vec::new();
     let mut deletion_vector_descriptor = None;
@@ -341,7 +376,7 @@ pub(crate) fn build_hdfs_scan_range_params(
         None::<String>,
         None::<i64>,
         None::<bool>,
-        None::<BTreeMap<i32, exprs::TExprMinMaxValue>>,
+        iceberg_file_pruning,
         None::<i32>,
         first_row_id,
         data_sequence_number,
@@ -489,6 +524,8 @@ fn build_starrocks_lake_scan_node(
 mod tests {
     use std::any::Any;
 
+    use arrow::datatypes::DataType;
+
     use super::*;
     use crate::connector::iceberg::IcebergConnectorScanPlanner;
     use crate::connector::scan_planning::{
@@ -497,7 +534,7 @@ mod tests {
     use crate::connector::starrocks::table::scan_planner::{
         StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle,
     };
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
+    use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergSchemaDef, IcebergTableInfo};
 
     #[derive(Debug)]
     struct DummyScanHandle;
@@ -547,6 +584,26 @@ mod tests {
             delete_files: vec![],
             manifest_path: None,
             partition_values: vec![],
+        }
+    }
+
+    fn column(name: &str, data_type: DataType) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        }
+    }
+
+    fn stats(lower: Vec<u8>, upper: Vec<u8>) -> IcebergColumnStats {
+        IcebergColumnStats {
+            null_count: None,
+            value_count: None,
+            column_size: None,
+            lower_bound: Some(lower),
+            upper_bound: Some(upper),
         }
     }
 
@@ -638,7 +695,7 @@ mod tests {
         file.size = ICEBERG_SCAN_SPLIT_TARGET_BYTES + 1;
         file.included_positions = Some(vec![3, 9, 11]);
 
-        let ranges = build_hdfs_scan_range_params_for_file(&file, None).expect("scan ranges");
+        let ranges = build_hdfs_scan_range_params_for_file(&file, None, &[]).expect("scan ranges");
 
         assert_eq!(ranges.len(), 1);
         let hdfs_range = ranges[0]
@@ -649,6 +706,59 @@ mod tests {
         assert_eq!(hdfs_range.offset, Some(0));
         assert_eq!(hdfs_range.length, Some(file.size));
         assert_eq!(hdfs_range.included_positions, Some(vec![3, 9, 11]));
+    }
+
+    #[test]
+    fn iceberg_scan_range_min_max_values_bridge_numeric_stats_only() {
+        let mut file = dummy_iceberg_file();
+        file.column_stats = Some(std::collections::HashMap::from([
+            ("flag".to_string(), stats(vec![0], vec![1])),
+            (
+                "id".to_string(),
+                stats(10_i64.to_le_bytes().to_vec(), 20_i64.to_le_bytes().to_vec()),
+            ),
+            (
+                "score".to_string(),
+                stats(
+                    1.5_f64.to_le_bytes().to_vec(),
+                    9.25_f64.to_le_bytes().to_vec(),
+                ),
+            ),
+            ("name".to_string(), stats(b"a".to_vec(), b"z".to_vec())),
+        ]));
+        let columns = vec![
+            column("flag", DataType::Boolean),
+            column("id", DataType::Int64),
+            column("score", DataType::Float64),
+            column("name", DataType::Utf8),
+        ];
+
+        let ranges =
+            build_hdfs_scan_range_params_for_file(&file, None, &columns).expect("scan ranges");
+        let hdfs = ranges[0]
+            .scan_range
+            .hdfs_scan_range
+            .as_ref()
+            .expect("hdfs scan range");
+        let values = hdfs.min_max_values.as_ref().expect("min max values");
+
+        assert_eq!(values.len(), 3);
+        let flag = values.get(&0).expect("flag stats");
+        assert_eq!(flag.type_, exprs::TExprNodeType::BOOL_LITERAL);
+        assert_eq!(flag.min_int_value, Some(0));
+        assert_eq!(flag.max_int_value, Some(1));
+
+        let id = values.get(&1).expect("id stats");
+        assert_eq!(id.type_, exprs::TExprNodeType::INT_LITERAL);
+        assert_eq!(id.min_int_value, Some(10));
+        assert_eq!(id.max_int_value, Some(20));
+
+        let score = values.get(&2).expect("score stats");
+        assert_eq!(score.type_, exprs::TExprNodeType::FLOAT_LITERAL);
+        assert_eq!(score.min_float_value.map(|v| v.0), Some(1.5));
+        assert_eq!(score.max_float_value.map(|v| v.0), Some(9.25));
+
+        assert!(!values.contains_key(&3), "string stats must not be bridged");
     }
 
     #[test]

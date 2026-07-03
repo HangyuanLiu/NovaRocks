@@ -13,9 +13,7 @@ use crate::thrift::types;
 
 use super::resolve::ResolvedTable;
 
-use crate::sql::catalog::{
-    IcebergColumnStats, IcebergDataFileInfo, IcebergPartitionValue, ScanSource,
-};
+use crate::sql::catalog::ScanSource;
 
 // ---------------------------------------------------------------------------
 // Scan node
@@ -93,6 +91,7 @@ pub(crate) fn build_scan_node(
                     min_max_predicates,
                     change_op_slot,
                     cloud_properties: cloud_properties.clone(),
+                    columns: resolved.table.columns.clone(),
                 },
             )?;
             plan.node.ok_or_else(|| {
@@ -1024,6 +1023,7 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
                             min_max_predicates: scan_file_min_max_predicates(planned),
                             change_op_slot: planned_change_op_slot(planned),
                             cloud_properties: cloud_properties.clone(),
+                            columns: resolved.table.columns.clone(),
                             ..ThriftScanContext::default()
                         },
                     )?;
@@ -1161,6 +1161,7 @@ fn build_iceberg_scan_ranges_from_source(
             min_max_predicates: scan_file_min_max_predicates(planned),
             change_op_slot: planned_change_op_slot(planned),
             cloud_properties: cloud_properties.clone(),
+            columns: planned.resolved.table.columns.clone(),
             ..ThriftScanContext::default()
         },
     )?;
@@ -1310,254 +1311,6 @@ pub(crate) fn planned_change_op_slot_from_state(
                 column.eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
             })
         })
-}
-
-pub(crate) fn file_may_satisfy_min_max(
-    file: &IcebergDataFileInfo,
-    predicates: &[MinMaxPredicate],
-) -> bool {
-    if predicates.is_empty() {
-        return true;
-    }
-    let column_stats = file.column_stats.as_ref();
-    predicates.iter().all(|predicate| {
-        if let Some(may_satisfy) = partition_may_satisfy_predicate(file, predicate) {
-            return may_satisfy;
-        }
-        let Some(column_stats) = column_stats else {
-            return true;
-        };
-        let Some(stats) = find_column_stats(column_stats, predicate.column()) else {
-            return true;
-        };
-        stats_may_satisfy_predicate(stats, predicate)
-    })
-}
-
-fn partition_may_satisfy_predicate(
-    file: &IcebergDataFileInfo,
-    predicate: &MinMaxPredicate,
-) -> Option<bool> {
-    let partition = file.partition_values.iter().find(|value| {
-        value.transform.eq_ignore_ascii_case("identity")
-            && value.source_column.eq_ignore_ascii_case(predicate.column())
-    })?;
-    let Some(value) = partition.value.as_ref() else {
-        return Some(false);
-    };
-    partition_value_may_satisfy_predicate(value, predicate)
-}
-
-fn partition_value_may_satisfy_predicate(
-    partition_value: &IcebergPartitionValue,
-    predicate: &MinMaxPredicate,
-) -> Option<bool> {
-    let value = predicate.value();
-    match partition_value {
-        IcebergPartitionValue::Boolean(v) => {
-            let value = value.as_bool()?;
-            let left = i64::from(*v);
-            let right = i64::from(value);
-            Some(point_may_satisfy_i64(left, predicate, right))
-        }
-        IcebergPartitionValue::Int32(v) => {
-            let value = value.as_i64()?;
-            Some(point_may_satisfy_i64(i64::from(*v), predicate, value))
-        }
-        IcebergPartitionValue::Int64(v) => {
-            let value = value.as_i64()?;
-            Some(point_may_satisfy_i64(*v, predicate, value))
-        }
-        IcebergPartitionValue::Float(v) => {
-            let value = value.as_f64()?;
-            Some(point_may_satisfy_f64(f64::from(*v), predicate, value))
-        }
-        IcebergPartitionValue::Double(v) => {
-            let value = value.as_f64()?;
-            Some(point_may_satisfy_f64(*v, predicate, value))
-        }
-        IcebergPartitionValue::String(v) => {
-            let value = value.as_bytes()?;
-            Some(point_may_satisfy_bytes(v.as_bytes(), predicate, value))
-        }
-        IcebergPartitionValue::Binary(v) => {
-            let value = value.as_bytes()?;
-            Some(point_may_satisfy_bytes(v.as_slice(), predicate, value))
-        }
-    }
-}
-
-fn find_column_stats<'a>(
-    column_stats: &'a HashMap<String, IcebergColumnStats>,
-    column: &str,
-) -> Option<&'a IcebergColumnStats> {
-    column_stats.get(column).or_else(|| {
-        column_stats
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(column))
-            .map(|(_, stats)| stats)
-    })
-}
-
-fn stats_may_satisfy_predicate(stats: &IcebergColumnStats, predicate: &MinMaxPredicate) -> bool {
-    let value = predicate.value();
-    if let Some(value) = value.as_bool() {
-        return stats_may_satisfy_bool(stats, predicate, value);
-    }
-    if let Some(value) = value.as_i64() {
-        return stats_may_satisfy_i64(stats, predicate, value);
-    }
-    if let Some(value) = value.as_f64() {
-        return stats_may_satisfy_f64(stats, predicate, value);
-    }
-    if let Some(value) = value.as_bytes() {
-        return stats_may_satisfy_bytes(stats, predicate, value);
-    }
-    true
-}
-
-fn stats_may_satisfy_bool(
-    stats: &IcebergColumnStats,
-    predicate: &MinMaxPredicate,
-    value: bool,
-) -> bool {
-    let Some(lower) = stats.lower_bound.as_deref().and_then(decode_bool_bound) else {
-        return true;
-    };
-    let Some(upper) = stats.upper_bound.as_deref().and_then(decode_bool_bound) else {
-        return true;
-    };
-    let value = i64::from(value);
-    range_may_satisfy_i64(i64::from(lower), i64::from(upper), predicate, value)
-}
-
-fn stats_may_satisfy_i64(
-    stats: &IcebergColumnStats,
-    predicate: &MinMaxPredicate,
-    value: i64,
-) -> bool {
-    let Some(lower) = stats.lower_bound.as_deref().and_then(decode_i64_bound) else {
-        return true;
-    };
-    let Some(upper) = stats.upper_bound.as_deref().and_then(decode_i64_bound) else {
-        return true;
-    };
-    range_may_satisfy_i64(lower, upper, predicate, value)
-}
-
-fn stats_may_satisfy_f64(
-    stats: &IcebergColumnStats,
-    predicate: &MinMaxPredicate,
-    value: f64,
-) -> bool {
-    let Some(lower) = stats.lower_bound.as_deref().and_then(decode_f64_bound) else {
-        return true;
-    };
-    let Some(upper) = stats.upper_bound.as_deref().and_then(decode_f64_bound) else {
-        return true;
-    };
-    range_may_satisfy_f64(lower, upper, predicate, value)
-}
-
-fn stats_may_satisfy_bytes(
-    stats: &IcebergColumnStats,
-    predicate: &MinMaxPredicate,
-    value: &[u8],
-) -> bool {
-    let Some(lower) = stats.lower_bound.as_deref() else {
-        return true;
-    };
-    let Some(upper) = stats.upper_bound.as_deref() else {
-        return true;
-    };
-    range_may_satisfy_bytes(lower, upper, predicate, value)
-}
-
-fn point_may_satisfy_i64(point: i64, predicate: &MinMaxPredicate, value: i64) -> bool {
-    range_may_satisfy_i64(point, point, predicate, value)
-}
-
-fn point_may_satisfy_f64(point: f64, predicate: &MinMaxPredicate, value: f64) -> bool {
-    range_may_satisfy_f64(point, point, predicate, value)
-}
-
-fn point_may_satisfy_bytes(point: &[u8], predicate: &MinMaxPredicate, value: &[u8]) -> bool {
-    range_may_satisfy_bytes(point, point, predicate, value)
-}
-
-fn range_may_satisfy_i64(lower: i64, upper: i64, predicate: &MinMaxPredicate, value: i64) -> bool {
-    match predicate {
-        MinMaxPredicate::Le { .. } => lower <= value,
-        MinMaxPredicate::Ge { .. } => upper >= value,
-        MinMaxPredicate::Lt { .. } => lower < value,
-        MinMaxPredicate::Gt { .. } => upper > value,
-        MinMaxPredicate::Eq { .. } => lower <= value && value <= upper,
-    }
-}
-
-fn range_may_satisfy_f64(lower: f64, upper: f64, predicate: &MinMaxPredicate, value: f64) -> bool {
-    if lower.is_nan() || upper.is_nan() || value.is_nan() {
-        return true;
-    }
-    match predicate {
-        MinMaxPredicate::Le { .. } => lower <= value,
-        MinMaxPredicate::Ge { .. } => upper >= value,
-        MinMaxPredicate::Lt { .. } => lower < value,
-        MinMaxPredicate::Gt { .. } => upper > value,
-        MinMaxPredicate::Eq { .. } => lower <= value && value <= upper,
-    }
-}
-
-fn range_may_satisfy_bytes(
-    lower: &[u8],
-    upper: &[u8],
-    predicate: &MinMaxPredicate,
-    value: &[u8],
-) -> bool {
-    match predicate {
-        MinMaxPredicate::Le { .. } => lower <= value,
-        MinMaxPredicate::Ge { .. } => upper >= value,
-        MinMaxPredicate::Lt { .. } => lower < value,
-        MinMaxPredicate::Gt { .. } => upper > value,
-        MinMaxPredicate::Eq { .. } => lower <= value && value <= upper,
-    }
-}
-
-fn decode_bool_bound(bytes: &[u8]) -> Option<bool> {
-    match bytes {
-        [0] => Some(false),
-        [1] => Some(true),
-        _ => None,
-    }
-}
-
-fn decode_i64_bound(bytes: &[u8]) -> Option<i64> {
-    match bytes.len() {
-        1 => bytes.first().copied().map(i64::from),
-        4 => {
-            let arr: [u8; 4] = bytes.try_into().ok()?;
-            Some(i64::from(i32::from_le_bytes(arr)))
-        }
-        8 => {
-            let arr: [u8; 8] = bytes.try_into().ok()?;
-            Some(i64::from_le_bytes(arr))
-        }
-        _ => None,
-    }
-}
-
-fn decode_f64_bound(bytes: &[u8]) -> Option<f64> {
-    match bytes.len() {
-        4 => {
-            let arr: [u8; 4] = bytes.try_into().ok()?;
-            Some(f64::from(f32::from_le_bytes(arr)))
-        }
-        8 => {
-            let arr: [u8; 8] = bytes.try_into().ok()?;
-            Some(f64::from_le_bytes(arr))
-        }
-        _ => None,
-    }
 }
 
 pub(crate) fn build_starrocks_scan_ranges_from_planned_scan(
@@ -1746,6 +1499,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .expect("tagged file without __change_op projection should scan ordinary columns");
 
@@ -1765,6 +1519,7 @@ mod tests {
             None,
             Some(9),
             &[],
+            None,
         )
         .expect("tagged file with __change_op projection should emit metadata");
 

@@ -1288,6 +1288,7 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
             included_positions: None,
             external_datacache: None,
             delete_files: Vec::new(),
+            iceberg_file_pruning: None,
         });
         for delete_file in &data_file.delete_files {
             let delete_len_i64 = delete_file.length.unwrap_or(0);
@@ -1306,6 +1307,7 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
                 included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
+                iceberg_file_pruning: None,
             });
         }
 
@@ -1408,6 +1410,7 @@ fn load_delete_visibility_from_data_files(
             included_positions: None,
             external_datacache: None,
             delete_files: Vec::new(),
+            iceberg_file_pruning: None,
         });
         for delete_file in &data_file.delete_files {
             let delete_len_i64 = delete_file.length.unwrap_or(0);
@@ -1426,6 +1429,7 @@ fn load_delete_visibility_from_data_files(
                 included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
+                iceberg_file_pruning: None,
             });
         }
 

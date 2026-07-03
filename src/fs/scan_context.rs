@@ -42,6 +42,11 @@ pub struct FileScanRange {
     /// append-only scans. Populated by HDFS scan lowering and standalone
     /// write-side visibility planning.
     pub delete_files: Vec<IcebergDeleteFileSpec>,
+    /// Per-file Iceberg statistics carried across the thrift/HDFS range
+    /// boundary for later file-level pruning. None for non-Iceberg scans or
+    /// files whose manifest stats are unavailable/unsupported.
+    pub iceberg_file_pruning:
+        Option<crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata>,
 }
 
 #[derive(Clone)]
@@ -109,7 +114,11 @@ impl FileScanContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
     use crate::fs::access::FsScheme;
+    use crate::sql::catalog::IcebergColumnStats;
 
     fn range(path: &str) -> FileScanRange {
         FileScanRange {
@@ -124,6 +133,22 @@ mod tests {
             included_positions: None,
             external_datacache: None,
             delete_files: Vec::new(),
+            iceberg_file_pruning: None,
+        }
+    }
+
+    fn metadata() -> IcebergFilePruningMetadata {
+        IcebergFilePruningMetadata {
+            columns: HashMap::from([(
+                "id".to_string(),
+                IcebergColumnStats {
+                    null_count: None,
+                    value_count: None,
+                    column_size: None,
+                    lower_bound: Some(10_i64.to_le_bytes().to_vec()),
+                    upper_bound: Some(20_i64.to_le_bytes().to_vec()),
+                },
+            )]),
         }
     }
 
@@ -139,6 +164,26 @@ mod tests {
         assert_eq!(ctx.ranges.len(), 1);
         assert_eq!(ctx.ranges[0].path, "a.parquet");
         assert_eq!(ctx.scheme, FsScheme::Local);
+    }
+
+    #[test]
+    fn build_local_scan_context_preserves_iceberg_file_pruning_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.parquet");
+        std::fs::write(&file, b"data").expect("write fixture");
+        let mut range = range(file.to_string_lossy().as_ref());
+        range.iceberg_file_pruning = Some(metadata());
+
+        let ctx = FileScanContext::build(vec![range], None, None).expect("build scan context");
+
+        let pruning = ctx.ranges[0]
+            .iceberg_file_pruning
+            .as_ref()
+            .expect("iceberg metadata");
+        assert_eq!(
+            pruning.columns["id"].lower_bound,
+            Some(10_i64.to_le_bytes().to_vec())
+        );
     }
 
     #[test]

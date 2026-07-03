@@ -133,6 +133,7 @@ fn test_iceberg_connector_module() {
             included_positions: None,
             external_datacache: None,
             delete_files: Vec::new(),
+            iceberg_file_pruning: None,
         }],
         original_range_count: 1,
         has_more: false,
@@ -142,6 +143,7 @@ fn test_iceberg_connector_module() {
         object_store_config: None,
         iceberg_table_locations: std::collections::HashMap::new(),
         query_global_dicts: Default::default(),
+        iceberg_runtime_pruning: None,
     };
     let _scan = novarocks::novarocks_connector_iceberg::HdfsScanOp::new(config.clone());
     assert_eq!(config.ranges.len(), 1);

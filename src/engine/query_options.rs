@@ -25,6 +25,8 @@ pub(crate) struct StandaloneQueryOptions {
     pub enable_profile: bool,
     pub exec_mem_limit: Option<i64>,
     pub connector_io_tasks_per_scan_operator: Option<i32>,
+    pub runtime_filter_scan_wait_time_ms: Option<i64>,
+    pub runtime_filter_wait_timeout_ms: Option<i32>,
     pub allow_throw_exception: bool,
     pub group_concat_max_len: Option<i64>,
     pub spill: Option<SpillConfig>,

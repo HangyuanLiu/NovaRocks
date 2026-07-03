@@ -29,7 +29,7 @@ use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, Runt
 use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::warn;
 use crate::runtime::profile::RuntimeProfile;
-use crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot;
+use crate::runtime::runtime_filter_hub::{AcquiredRuntimeFilters, RuntimeFilterSnapshot};
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {
@@ -50,6 +50,8 @@ pub enum ScanMorsel {
         /// Iceberg v2 position-delete files that apply to this data file.
         /// Empty for append-only tables and for v1 scans.
         delete_files: Vec<IcebergDeleteFileSpec>,
+        iceberg_file_pruning:
+            Option<crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata>,
     },
     StarRocksRange {
         index: usize,
@@ -81,8 +83,9 @@ impl ScanMorsel {
                 included_positions,
                 external_datacache,
                 delete_files,
+                iceberg_file_pruning,
             } => format!(
-                "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} data_sequence_number={:?} ivm_change_op={:?} included_positions={} external_datacache={:?} delete_files={}",
+                "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} data_sequence_number={:?} ivm_change_op={:?} included_positions={} external_datacache={:?} delete_files={} iceberg_file_pruning={}",
                 path,
                 file_len,
                 offset,
@@ -93,7 +96,8 @@ impl ScanMorsel {
                 ivm_change_op,
                 included_positions.as_ref().map(|v| v.len()).unwrap_or(0),
                 external_datacache,
-                delete_files.len()
+                delete_files.len(),
+                iceberg_file_pruning.is_some()
             ),
             ScanMorsel::StarRocksRange { index, tablet_id } => {
                 format!("starrocks_range_index={index} tablet_id={tablet_id}")
@@ -268,6 +272,21 @@ impl std::fmt::Debug for RuntimeFilterContext {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct ScanRuntimeFilterDecision<'a> {
+    acquired: Option<&'a AcquiredRuntimeFilters>,
+}
+
+impl<'a> ScanRuntimeFilterDecision<'a> {
+    pub(crate) fn from_acquired(acquired: Option<&'a AcquiredRuntimeFilters>) -> Self {
+        Self { acquired }
+    }
+
+    pub(crate) fn acquired(&self) -> Option<&'a AcquiredRuntimeFilters> {
+        self.acquired
+    }
+}
+
 pub trait ScanOp: Send + Sync {
     fn execute_iter(
         &self,
@@ -292,6 +311,19 @@ pub trait ScanOp: Send + Sync {
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String>;
+
+    fn materialize_morsels_after_runtime_filters(&self) -> bool {
+        false
+    }
+
+    fn build_morsels_with_runtime_filters(
+        &self,
+        _decision: ScanRuntimeFilterDecision<'_>,
+    ) -> Result<ScanMorsels, String> {
+        self.build_morsels()
+    }
+
+    fn flush_morsel_materialization_profile(&self, _profile: &RuntimeProfile) {}
 
     /// Load Iceberg v2 position-delete files attached to `morsel` and collect
     /// the row positions they retire for the morsel's data file. Returns
@@ -570,6 +602,24 @@ impl ScanNode {
         let mut morsels = self.op.build_morsels()?;
         morsels.ensure_non_empty(self.accept_empty_scan_ranges);
         Ok(morsels)
+    }
+
+    pub fn materialize_morsels_after_runtime_filters(&self) -> bool {
+        !self.runtime_filter_specs.is_empty() && self.op.materialize_morsels_after_runtime_filters()
+    }
+
+    pub(crate) fn build_morsels_with_runtime_filters(
+        &self,
+        acquired: Option<&AcquiredRuntimeFilters>,
+    ) -> Result<ScanMorsels, String> {
+        let decision = ScanRuntimeFilterDecision::from_acquired(acquired);
+        let mut morsels = self.op.build_morsels_with_runtime_filters(decision)?;
+        morsels.ensure_non_empty(self.accept_empty_scan_ranges);
+        Ok(morsels)
+    }
+
+    pub(crate) fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
+        self.op.flush_morsel_materialization_profile(profile);
     }
 
     pub fn load_iceberg_position_deletes(

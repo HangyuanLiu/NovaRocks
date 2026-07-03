@@ -309,6 +309,7 @@ impl ScanOp for FileLoadScanOp {
                 included_positions: r.included_positions.clone(),
                 external_datacache: r.external_datacache.clone(),
                 delete_files: r.delete_files.clone(),
+                iceberg_file_pruning: None,
             });
         }
         Ok(ScanMorsels::new(morsels, self.cfg.has_more))
@@ -495,6 +496,7 @@ pub(crate) fn lower_file_scan_node(
                 included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
+                iceberg_file_pruning: None,
             });
             next_scan_range_id = next_scan_range_id.saturating_add(1);
         }

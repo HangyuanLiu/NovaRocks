@@ -58,6 +58,18 @@ pub struct IcebergPartitionFieldValue {
     pub value: Option<IcebergPartitionValue>,
 }
 
+#[cfg(test)]
+impl IcebergPartitionFieldValue {
+    pub(crate) fn identity_int64_for_test(source_column: &str, value: i64) -> Self {
+        Self {
+            source_column: source_column.to_string(),
+            field_name: source_column.to_string(),
+            transform: "identity".to_string(),
+            value: Some(crate::sql::catalog::IcebergPartitionValue::Int64(value)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IcebergDeleteFileFormat {
     Parquet,
@@ -273,6 +285,27 @@ pub struct IcebergDataFileInfo {
     /// Partition values decoded from the Iceberg DataFile partition struct.
     /// Currently used for conservative identity-partition pruning.
     pub partition_values: Vec<IcebergPartitionFieldValue>,
+}
+
+#[cfg(test)]
+impl IcebergDataFileInfo {
+    pub(crate) fn for_test(path: &str, size: i64, row_count: i64) -> Self {
+        Self {
+            path: path.to_string(),
+            size,
+            row_count: Some(row_count),
+            column_stats: None,
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: Vec::new(),
+            manifest_path: None,
+            partition_values: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

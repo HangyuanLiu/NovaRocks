@@ -25,6 +25,7 @@ pub(crate) mod data_writer;
 pub(crate) mod default_value;
 pub mod delete_file;
 pub mod equality_delete;
+pub(crate) mod file_pruning;
 pub(crate) mod fs_io;
 pub mod metadata;
 pub(crate) mod metadata_read;
