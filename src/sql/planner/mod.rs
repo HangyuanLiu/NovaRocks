@@ -34,7 +34,9 @@ pub(crate) use distributed_plan_build::{
 #[allow(unused_imports)]
 pub(crate) use ordering::{OrderingSpec, SortKey};
 #[allow(unused_imports)]
-pub(crate) use physical_vocab::{AggMode, AggregateOutputLayout, JoinDistribution, TopNPhase};
+pub(crate) use physical_vocab::{
+    AggMode, AggregateOutputLayout, HashSource, JoinDistribution, TopNPhase,
+};
 pub(crate) use runtime_filter::{
     JoinExecutionMode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };

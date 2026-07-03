@@ -13,10 +13,10 @@ use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, DistinctValueCount};
 use crate::sql::planner::plan::*;
 use crate::sql::planner::{
-    AggMode, AggregateOutputLayout, JoinDistribution, JoinExecutionMode, PhysicalPlanKind,
-    PhysicalPlanNode, PhysicalPlanStats, PlannerBroadcastDecision, PlannerColumnStatistic,
-    PlannerConfidence, PlannerCostEstimate, RedistributeMode, RedistributeNode,
-    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
+    AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
+    PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlannerBroadcastDecision,
+    PlannerColumnStatistic, PlannerConfidence, PlannerCostEstimate, RedistributeMode,
+    RedistributeNode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
 };
 
 struct BridgeCtx<'a> {
@@ -442,6 +442,14 @@ fn map_join_distribution(
     }
 }
 
+fn map_hash_source(source: crate::sql::optimizer::property::HashSource) -> HashSource {
+    use crate::sql::optimizer::property::HashSource as O;
+    match source {
+        O::ShuffleAgg => HashSource::ShuffleAgg,
+        O::ShuffleJoin => HashSource::ShuffleJoin,
+    }
+}
+
 fn map_aggregate_output_layout(
     layout: &crate::sql::optimizer::operator::AggregateOutputLayout,
 ) -> AggregateOutputLayout {
@@ -479,7 +487,7 @@ fn redistribute_mode(op: &PhysicalDistributionOp) -> Result<RedistributeMode, St
         DistributionSpec::Broadcast => Ok(RedistributeMode::Broadcast),
         DistributionSpec::HashPartitioned { cols, source } => Ok(RedistributeMode::Hash {
             cols: cols.clone(),
-            source: *source,
+            source: map_hash_source(*source),
         }),
         DistributionSpec::Any => Err(
             "Bridge 2a cannot convert PhysicalDistribution with DistributionSpec::Any".to_string(),
@@ -614,7 +622,9 @@ mod tests {
         ValuesOp,
     };
     use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
-    use crate::sql::optimizer::property::{DistributionSpec, HashSource, PhysicalPropertySet};
+    use crate::sql::optimizer::property::{
+        DistributionSpec, HashSource as OptimizerHashSource, PhysicalPropertySet,
+    };
     use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::{Confidence, CostEstimate, Statistics};
@@ -769,7 +779,7 @@ mod tests {
         let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
             spec: DistributionSpec::HashPartitioned {
                 cols: vec![ColumnId::new_for_test(7)],
-                source: HashSource::ShuffleJoin,
+                source: OptimizerHashSource::ShuffleJoin,
             },
         }));
         node.output_columns = vec![output_column(7, "parent_k")];
@@ -829,7 +839,7 @@ mod tests {
         let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
             spec: DistributionSpec::HashPartitioned {
                 cols: vec![ColumnId::new_for_test(7)],
-                source: HashSource::ShuffleAgg,
+                source: OptimizerHashSource::ShuffleAgg,
             },
         }));
         node.output_columns = vec![group_column];
@@ -883,7 +893,7 @@ mod tests {
         let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
             spec: DistributionSpec::HashPartitioned {
                 cols: vec![ColumnId::new_for_test(8)],
-                source: HashSource::ShuffleAgg,
+                source: OptimizerHashSource::ShuffleAgg,
             },
         }));
         node.output_columns = vec![group_column];

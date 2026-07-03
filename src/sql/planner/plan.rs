@@ -553,7 +553,7 @@ pub(crate) enum RedistributeMode {
     Gather,
     Hash {
         cols: Vec<ColumnId>,
-        source: crate::sql::optimizer::property::HashSource,
+        source: crate::sql::planner::HashSource,
     },
     Broadcast,
 }

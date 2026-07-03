@@ -36,6 +36,12 @@ pub(crate) enum JoinDistribution {
     Colocate,
 }
 
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+pub(crate) enum HashSource {
+    ShuffleAgg,
+    ShuffleJoin,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AggregateOutputLayout {
     pub group_key_columns: Vec<OutputColumn>,

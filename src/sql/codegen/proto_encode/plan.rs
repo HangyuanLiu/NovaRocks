@@ -22,8 +22,8 @@ use crate::sql::planner::write_sink::{
 };
 use crate::sql::planner::{
     AggMode, DataPartition, DataSink, DistributedNode, DistributedPayload, DistributedPlan,
-    ExchangeReceiver, IcebergWriteInputBinding, JoinDistribution, PartitionKind, PlanFragment,
-    TopNPhase,
+    ExchangeReceiver, HashSource, IcebergWriteInputBinding, JoinDistribution, PartitionKind,
+    PlanFragment, TopNPhase,
 };
 
 pub(crate) fn encode_distributed_plan(
@@ -1642,14 +1642,10 @@ fn encode_sort_topn_type(src: crate::exec::node::sort::SortTopNType) -> i32 {
     }
 }
 
-fn encode_hash_source(src: crate::sql::optimizer::property::HashSource) -> i32 {
+fn encode_hash_source(src: HashSource) -> i32 {
     match src {
-        crate::sql::optimizer::property::HashSource::ShuffleAgg => {
-            plan::HashSource::ShuffleAgg as i32
-        }
-        crate::sql::optimizer::property::HashSource::ShuffleJoin => {
-            plan::HashSource::ShuffleJoin as i32
-        }
+        HashSource::ShuffleAgg => plan::HashSource::ShuffleAgg as i32,
+        HashSource::ShuffleJoin => plan::HashSource::ShuffleJoin as i32,
     }
 }
 
