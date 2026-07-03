@@ -13,9 +13,10 @@ use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, DistinctValueCount};
 use crate::sql::planner::plan::*;
 use crate::sql::planner::{
-    JoinExecutionMode, PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats,
-    PlannerBroadcastDecision, PlannerColumnStatistic, PlannerConfidence, PlannerCostEstimate,
-    RedistributeMode, RedistributeNode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+    AggMode, AggregateOutputLayout, JoinDistribution, JoinExecutionMode, PhysicalPlanKind,
+    PhysicalPlanNode, PhysicalPlanStats, PlannerBroadcastDecision, PlannerColumnStatistic,
+    PlannerConfidence, PlannerCostEstimate, RedistributeMode, RedistributeNode,
+    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
 };
 
 struct BridgeCtx<'a> {
@@ -408,6 +409,46 @@ fn join_execution_mode(
         JoinExecutionDistribution::Partitioned => JoinExecutionMode::Partitioned,
         JoinExecutionDistribution::Colocate => JoinExecutionMode::Colocate,
     })
+}
+
+fn map_agg_mode(mode: crate::sql::optimizer::operator::AggMode) -> AggMode {
+    use crate::sql::optimizer::operator::AggMode as O;
+    match mode {
+        O::Single => AggMode::Single,
+        O::Local => AggMode::Local,
+        O::Global => AggMode::Global,
+        O::DistinctGlobal => AggMode::DistinctGlobal,
+        O::DistinctLocal => AggMode::DistinctLocal,
+    }
+}
+
+fn map_topn_phase(phase: crate::sql::optimizer::operator::TopNPhase) -> TopNPhase {
+    use crate::sql::optimizer::operator::TopNPhase as O;
+    match phase {
+        O::Partial => TopNPhase::Partial,
+        O::Final => TopNPhase::Final,
+    }
+}
+
+fn map_join_distribution(
+    distribution: crate::sql::optimizer::operator::JoinDistribution,
+) -> JoinDistribution {
+    use crate::sql::optimizer::operator::JoinDistribution as O;
+    match distribution {
+        O::Unknown => JoinDistribution::Unknown,
+        O::Shuffle => JoinDistribution::Shuffle,
+        O::Broadcast => JoinDistribution::Broadcast,
+        O::Colocate => JoinDistribution::Colocate,
+    }
+}
+
+fn map_aggregate_output_layout(
+    layout: &crate::sql::optimizer::operator::AggregateOutputLayout,
+) -> AggregateOutputLayout {
+    AggregateOutputLayout::new(
+        layout.group_key_columns.clone(),
+        layout.aggregate_columns.clone(),
+    )
 }
 
 fn runtime_filter_execution_mode(
