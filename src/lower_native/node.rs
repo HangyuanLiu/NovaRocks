@@ -52,7 +52,7 @@ use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::union_all::UnionAllNode;
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{common, expr, plan};
+use crate::proto::{common, expr, novarocks, plan};
 use crate::runtime::exchange::ExchangeKey;
 use crate::sql::codegen::expr_compiler::infer_agg_function_types;
 use crate::sql::common::ChangeStreamBranchKind;
@@ -68,6 +68,8 @@ pub(crate) struct LoweredNode {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct NodeLoweringContext {
     exchange_sender_counts: HashMap<ExchangeKey, usize>,
+    scan_ranges: HashMap<i32, Vec<novarocks::ScanRange>>,
+    connectors: Option<Arc<crate::connector::ConnectorRegistry>>,
     fragment_instance_hi: i64,
     fragment_instance_lo: i64,
 }
@@ -84,6 +86,38 @@ impl NodeLoweringContext {
     pub(crate) fn with_exchange_sender_count(mut self, key: ExchangeKey, count: usize) -> Self {
         self.exchange_sender_counts.insert(key, count);
         self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_scan_ranges(
+        mut self,
+        node_id: i32,
+        ranges: Vec<novarocks::ScanRange>,
+    ) -> Self {
+        self.scan_ranges.insert(node_id, ranges);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_connector_registry(
+        mut self,
+        connectors: Arc<crate::connector::ConnectorRegistry>,
+    ) -> Self {
+        self.connectors = Some(connectors);
+        self
+    }
+
+    pub(crate) fn scan_ranges(&self, node_id: i32) -> &[novarocks::ScanRange] {
+        self.scan_ranges
+            .get(&node_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn connectors(&self) -> Result<&crate::connector::ConnectorRegistry, String> {
+        self.connectors.as_deref().ok_or_else(|| {
+            "native ScanNode requires ConnectorRegistry in NodeLoweringContext".to_string()
+        })
     }
 
     fn exchange_key(&self, node_id: i32) -> ExchangeKey {
@@ -126,7 +160,7 @@ fn lower_physical_node(
     physical: &plan::PlanNode,
     children: Vec<LoweredNode>,
     arena: &mut ExprArena,
-    _ctx: &NodeLoweringContext,
+    ctx: &NodeLoweringContext,
 ) -> Result<LoweredNode, String> {
     let kind = physical
         .kind
@@ -149,7 +183,9 @@ fn lower_physical_node(
         plan::plan_node::Kind::AssertOneRow(assert) => {
             lower_assert_one_row_node(node, assert, children)
         }
-        plan::plan_node::Kind::Scan(_) => unsupported("Scan"),
+        plan::plan_node::Kind::Scan(scan) => {
+            super::scan::lower_scan_node(node, physical, scan, ctx, arena)
+        }
         plan::plan_node::Kind::HashAggregate(aggregate) => {
             lower_hash_aggregate_node(node, physical, aggregate, children, arena)
         }
@@ -2447,7 +2483,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_scan_and_union_distinct() {
+    fn rejects_scan_without_context_and_union_distinct() {
         let scan = physical_node(
             50,
             plan::plan_node::Kind::Scan(plan::ScanNode::default()),
@@ -2457,7 +2493,7 @@ mod tests {
         let mut arena = ExprArena::default();
         let err = lower_proto_node(&scan, &mut arena, &NodeLoweringContext::default()).unwrap_err();
         assert!(err.contains("Scan"));
-        assert!(err.contains("not implemented"));
+        assert!(err.contains("table missing"));
 
         let union_distinct = physical_node(
             60,

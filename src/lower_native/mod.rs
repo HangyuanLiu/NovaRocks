@@ -21,6 +21,7 @@ mod expr;
 mod fragment;
 mod layout;
 mod node;
+mod scan;
 
 #[allow(unused_imports)]
 pub(crate) use crate::sql::codegen::proto_encode::types::{decode_field_type, decode_type};
