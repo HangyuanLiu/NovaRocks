@@ -1387,11 +1387,12 @@ mod tests {
 #[cfg(test)]
 mod pr3_tests {
     use super::GrpcService;
+    use super::proto::common::UniqueId as ProtoUniqueId;
     use super::proto::novarocks::fetch_result_response::Status as FetchStatus;
     use super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
     use super::proto::novarocks::{
-        CancelFragmentRequest, FetchResultRequest, HeartbeatRequest, PUniqueId,
-        ReportExecStatusRequest, SubmitFragmentRequest,
+        CancelFragmentRequest, FetchResultRequest, HeartbeatRequest, ReportExecStatusRequest,
+        SubmitFragmentRequest,
     };
     use crate::common::thrift::thrift_binary_serialize;
     use crate::thrift::{frontend_service, status, status_code, types};
@@ -1547,7 +1548,7 @@ mod pr3_tests {
     async fn cancel_fragment_is_idempotent() {
         let svc = GrpcService::default();
         let req = Request::new(CancelFragmentRequest {
-            finst_ids: vec![PUniqueId { hi: 1, lo: 2 }],
+            finst_ids: vec![ProtoUniqueId { hi: 1, lo: 2 }],
             reason: "test".to_string(),
             start_epoch: 0,
         });
@@ -1555,7 +1556,7 @@ mod pr3_tests {
         assert_eq!(resp.into_inner().status_code, super::CANCEL_FRAGMENT_OK);
 
         let req2 = Request::new(CancelFragmentRequest {
-            finst_ids: vec![PUniqueId { hi: 1, lo: 2 }],
+            finst_ids: vec![ProtoUniqueId { hi: 1, lo: 2 }],
             reason: "test-2".to_string(),
             start_epoch: 0,
         });
@@ -1564,8 +1565,9 @@ mod pr3_tests {
     }
 
     mod cancel_epoch_tests {
+        use super::super::proto::common::UniqueId as ProtoUniqueId;
+        use super::super::proto::novarocks::CancelFragmentRequest;
         use super::super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
-        use super::super::proto::novarocks::{CancelFragmentRequest, PUniqueId};
         use super::super::{CANCEL_FRAGMENT_IGNORED_STALE_EPOCH, GrpcService};
         use crate::common::types::UniqueId;
         use crate::runtime::exchange::{
@@ -1584,7 +1586,7 @@ mod pr3_tests {
         #[tokio::test]
         async fn cancel_with_mismatched_epoch_is_ignored() {
             let svc = GrpcService::default();
-            let finst = PUniqueId { hi: 6201, lo: 6202 };
+            let finst = ProtoUniqueId { hi: 6201, lo: 6202 };
             let key = ExchangeKey {
                 finst_id_hi: finst.hi,
                 finst_id_lo: finst.lo,
@@ -1891,7 +1893,7 @@ mod pr3_tests {
 
         let svc = GrpcService::default();
         let req = Request::new(FetchResultRequest {
-            finst_id: Some(PUniqueId {
+            finst_id: Some(ProtoUniqueId {
                 hi: finst_id.hi,
                 lo: finst_id.lo,
             }),
@@ -1935,7 +1937,7 @@ mod pr3_tests {
 
         let svc = GrpcService::default();
         let req = Request::new(FetchResultRequest {
-            finst_id: Some(PUniqueId {
+            finst_id: Some(ProtoUniqueId {
                 hi: finst_id.hi,
                 lo: finst_id.lo,
             }),
@@ -1966,7 +1968,7 @@ mod pr3_tests {
 
         let svc = GrpcService::default();
         let req = Request::new(FetchResultRequest {
-            finst_id: Some(PUniqueId {
+            finst_id: Some(ProtoUniqueId {
                 hi: finst_id.hi,
                 lo: finst_id.lo,
             }),
@@ -1992,7 +1994,7 @@ mod pr3_tests {
 
         let svc = GrpcService::default();
         let req = Request::new(FetchResultRequest {
-            finst_id: Some(PUniqueId {
+            finst_id: Some(ProtoUniqueId {
                 hi: finst_id.hi,
                 lo: finst_id.lo,
             }),
@@ -2024,7 +2026,7 @@ mod pr3_tests {
 
         let svc = GrpcService::default();
         let req = Request::new(FetchResultRequest {
-            finst_id: Some(PUniqueId {
+            finst_id: Some(ProtoUniqueId {
                 hi: finst_id.hi,
                 lo: finst_id.lo,
             }),

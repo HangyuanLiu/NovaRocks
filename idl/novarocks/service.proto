@@ -8,6 +8,7 @@ syntax = "proto3";
 // RPC/message owner paths where applicable.
 package novarocks;
 
+import "common.proto";
 // internal_service.proto (package starrocks) provides PTransmitRuntimeFilter*
 // and PLookUp* used by the two RPCs below. NIDL-2 replaces those signatures with
 // novarocks.filter messages and drops this import.
@@ -85,18 +86,11 @@ message SubmitFragmentResponse {
   string message = 2;      // human-readable rejection detail
 }
 
-// Fragment-instance id. Mirrors starrocks.PUniqueId but lives in novarocks to
-// avoid a cross-package name collision.
-message PUniqueId {
-  int64 hi = 1;  // high 64 bits of the id
-  int64 lo = 2;  // low 64 bits of the id
-}
-
 // Coordinator long-poll request for one fragment instance result stream.
 message FetchResultRequest {
-  PUniqueId finst_id = 1;  // instance to poll
-  int64 max_wait_ms = 2;   // server-side long-poll budget
-  bool typed_result = 3;   // request typed (Arrow) result path
+  novarocks.common.UniqueId finst_id = 1;  // instance to poll
+  int64 max_wait_ms = 2;                   // server-side long-poll budget
+  bool typed_result = 3;                   // request typed (Arrow) result path
 }
 
 // FetchResult response containing readiness state plus one optional payload.
@@ -120,9 +114,9 @@ message FetchResultResponse {
 
 // Coordinator cancellation request for active fragment instances.
 message CancelFragmentRequest {
-  repeated PUniqueId finst_ids = 1;  // instances to cancel
-  string reason = 2;                 // cancellation reason for logging
-  uint64 start_epoch = 3;            // guard: ignore if BE restarted past epoch
+  repeated novarocks.common.UniqueId finst_ids = 1;  // instances to cancel
+  string reason = 2;                                // cancellation reason for logging
+  uint64 start_epoch = 3;                           // guard: ignore if BE restarted past epoch
 }
 
 // Cancellation result returned after local cancellation handling.
