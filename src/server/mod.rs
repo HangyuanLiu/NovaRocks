@@ -814,6 +814,24 @@ fn parse_set_pipeline_dop(query: &str) -> Option<i32> {
     parse_set_non_negative_integer(query, "pipeline_dop").and_then(|v| i32::try_from(v).ok())
 }
 
+fn parse_set_non_negative_i64(query: &str, keyword: &str) -> Result<Option<i64>, String> {
+    let Some(value) = parse_set_non_negative_integer(query, keyword) else {
+        return Ok(None);
+    };
+    i64::try_from(value)
+        .map(Some)
+        .map_err(|_| format!("{keyword} value {value} is out of range"))
+}
+
+fn parse_set_non_negative_i32(query: &str, keyword: &str) -> Result<Option<i32>, String> {
+    let Some(value) = parse_set_non_negative_integer(query, keyword) else {
+        return Ok(None);
+    };
+    i32::try_from(value)
+        .map(Some)
+        .map_err(|_| format!("{keyword} value {value} is out of range"))
+}
+
 /// Parse `SET group_concat_max_len = N` and `SET group_concat_max_len=N`.
 /// `N` must be a non-negative integer and is clamped later by FE-compatible
 /// lowering rules.
@@ -1045,13 +1063,17 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
-    if let Some(v) = parse_set_non_negative_integer(trimmed, "runtime_filter_scan_wait_time") {
-        shim.runtime_filter_scan_wait_time_ms = i64::try_from(v).ok();
+    if let Some(v) = parse_set_non_negative_i64(trimmed, "runtime_filter_scan_wait_time")
+        .map_err(|err| (ErrorKind::ER_WRONG_VALUE, err))?
+    {
+        shim.runtime_filter_scan_wait_time_ms = Some(v);
         return Ok(StatementResult::Ok);
     }
 
-    if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_wait_timeout") {
-        shim.runtime_filter_wait_timeout_ms = i32::try_from(v).ok();
+    if let Some(v) = parse_set_non_negative_i32(trimmed, "global_runtime_filter_wait_timeout")
+        .map_err(|err| (ErrorKind::ER_WRONG_VALUE, err))?
+    {
+        shim.runtime_filter_wait_timeout_ms = Some(v);
         return Ok(StatementResult::Ok);
     }
 
@@ -2359,18 +2381,36 @@ mod tests {
     #[test]
     fn parse_runtime_filter_wait_vars() {
         assert_eq!(
-            parse_set_non_negative_integer(
+            parse_set_non_negative_i64(
                 "SET runtime_filter_scan_wait_time = 10000",
                 "runtime_filter_scan_wait_time"
             ),
-            Some(10000)
+            Ok(Some(10000))
         );
         assert_eq!(
-            parse_set_non_negative_integer(
+            parse_set_non_negative_i32(
                 "SET global_runtime_filter_wait_timeout = 10000",
                 "global_runtime_filter_wait_timeout"
             ),
-            Some(10000)
+            Ok(Some(10000))
+        );
+    }
+
+    #[test]
+    fn parse_runtime_filter_wait_vars_reject_out_of_range_values() {
+        assert!(
+            parse_set_non_negative_i64(
+                "SET runtime_filter_scan_wait_time = 18446744073709551615",
+                "runtime_filter_scan_wait_time"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_set_non_negative_i32(
+                "SET global_runtime_filter_wait_timeout = 2147483648",
+                "global_runtime_filter_wait_timeout"
+            )
+            .is_err()
         );
     }
 
