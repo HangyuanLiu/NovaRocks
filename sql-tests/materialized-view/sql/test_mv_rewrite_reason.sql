@@ -16,7 +16,7 @@ CREATE TABLE t1(
     c3 int,
     c4 string
 )
-PARTITION BY date_trunc('DAY', c1);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 INSERT INTO t1 VALUES ('1988-07-01', 1, 1, 'a');

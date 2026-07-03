@@ -4,7 +4,8 @@
 -- Source: dev/test/sql/test_materialized_view/T/test_materialized_view_rewrite
 
 -- query 1
-create table empty_tbl(time date, user_id int not null, user_name varchar(20), tag_id int) partition by range (time)  (partition p1 values less than MAXVALUE) distributed by hash(time) buckets 3 properties('replication_num' = '1');
+create table empty_tbl(time date, user_id int not null, user_name varchar(20), tag_id int)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 create materialized view empty_tbl_with_mv distributed by hash(user_id)
@@ -62,16 +63,7 @@ CREATE TABLE orders (
     revenue int NOT NULL,
     state tinyint NOT NULL
 )
-PRIMARY KEY (dt, order_id)
-PARTITION BY RANGE(dt) (
-    PARTITION p20210820 VALUES [('2021-08-20'), ('2021-08-21')),
-    PARTITION p20210821 VALUES [('2021-08-21'), ('2021-08-22'))
-)
-DISTRIBUTED BY HASH(order_id) BUCKETS 4
-PROPERTIES (
-    "replication_num" = "1",
-    "enable_persistent_index" = "true"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 17
 CREATE MATERIALIZED VIEW order_mv2

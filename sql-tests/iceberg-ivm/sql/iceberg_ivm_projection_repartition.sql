@@ -28,10 +28,9 @@ CREATE TABLE ice_ivm_repart_${uuid0}.ns_${uuid0}.orders (
   region STRING,
   amount BIGINT,
   category STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_repart_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW pf_repart_mv_${uuid0}
@@ -130,10 +129,9 @@ ORDER BY region;
 CREATE TABLE ice_ivm_repart_${uuid0}.ns_${uuid0}.customers (
   customer_id BIGINT NOT NULL,
   region STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 INSERT INTO ice_ivm_repart_${uuid0}.ns_${uuid0}.customers VALUES
   (10, 'east'),
   (20, 'west'),
@@ -142,10 +140,9 @@ CREATE TABLE ice_ivm_repart_${uuid0}.ns_${uuid0}.join_orders (
   id BIGINT NOT NULL,
   customer_id BIGINT,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 INSERT INTO ice_ivm_repart_${uuid0}.ns_${uuid0}.join_orders VALUES
   (101, 10, 100),
   (102, 20, 200),
@@ -181,10 +178,9 @@ CREATE TABLE ice_ivm_repart_${uuid0}.ns_${uuid0}.orders_extra (
   region STRING,
   amount BIGINT,
   category STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 INSERT INTO ice_ivm_repart_${uuid0}.ns_${uuid0}.orders_extra VALUES
   (201, 'east', 11, 'books'),
   (202, 'west', 22, 'games');

@@ -14,13 +14,8 @@ CREATE TABLE `t1` (
   `id` int(11) NULL,
   `pt` date NOT NULL,
   `gmv` int(11) NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`id`)
-PARTITION BY date_trunc('day', pt)
-DISTRIBUTED BY HASH(`pt`)
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 insert into t1 values(2,'2023-03-07',1), (2,'2023-03-08',3), (2,'2023-03-11',10);

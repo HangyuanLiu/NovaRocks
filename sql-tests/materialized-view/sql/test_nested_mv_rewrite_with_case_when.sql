@@ -9,15 +9,8 @@ ffund_union string,
  famt bigint,
   fuser_id string,
   fdate bigint
-)PARTITION BY range(fdate) (
-    PARTITION p1 VALUES LESS THAN ("20230703"),
-    PARTITION p2 VALUES LESS THAN ("20230706"),
-    PARTITION p3 VALUES LESS THAN ("20230716")
- )
-  DISTRIBUTED BY HASH(fuser_id)
-  PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 insert into  dal_aaaa (ffund_union,famt,fuser_id,fdate)
@@ -33,25 +26,16 @@ create table dal_bbb(
     famt bigint,
     fuser_id string,
     fdate bigint
-)PARTITION BY range(fdate) (
-    PARTITION p1 VALUES LESS THAN ("20230703"),
-    PARTITION p2 VALUES LESS THAN ("20230706"),
-    PARTITION p3 VALUES LESS THAN ("20230716")
- )
- DISTRIBUTED BY HASH(fuser_id)
- PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 create table dim_ccc(
      fdate bigint,
      `lvl1` string,
      `ffund_union`  string
-) DISTRIBUTED BY HASH(ffund_union)
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 6
 create MATERIALIZED VIEW join_mv1

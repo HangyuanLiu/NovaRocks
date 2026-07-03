@@ -11,12 +11,8 @@ CREATE TABLE `t1` (
 `v4` bigint NULL COMMENT "",
 `v5` bigint NULL COMMENT "",
 `v6` bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`v4`, `v5`, v6)
-DISTRIBUTED BY HASH(`v4`) BUCKETS 3
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 INSERT INTO `t1` (`v4`, `v5`, `v6`) VALUES (1, 10, 100);
@@ -38,12 +34,8 @@ CREATE TABLE `t2` (
 `c4` bigint NULL COMMENT "",
 `c5` bigint NULL COMMENT "",
 `c6` bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c4`, `c5`, c6)
-DISTRIBUTED BY HASH(`c4`) BUCKETS 3
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 INSERT INTO `t2` (`c4`, `c5`, `c6`) VALUES (1, 1009, 10009);

@@ -18,19 +18,8 @@ CREATE TABLE `t1` (
   `v6` float NULL COMMENT "",
   `v7` double NULL COMMENT "",
   `v8` decimal(27, 9) NULL COMMENT ""
-) ENGINE=OLAP
-UNIQUE KEY(`k1`, `k2`, `k3`, `k4`, `k5`)
-COMMENT "OLAP"
-PARTITION BY RANGE(`k1`)
-(
-  PARTITION p1 VALUES [("0000-01-01"), ("2020-01-01")),
-  PARTITION p2 VALUES [("2020-01-01"), ("2023-01-01")),
-  PARTITION p3 VALUES [("2023-01-01"), ("2025-01-01"))
 )
-DISTRIBUTED BY HASH(`k1`, `k2`, `k3`, `k4`, `k5`)
-PROPERTIES (
-  "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 insert into t1 values ('2020-01-01', '2020-01-01 01:00:00', '1', '1', 1, 1, 1, 1, 1, 1, 1, 1, 1.0);

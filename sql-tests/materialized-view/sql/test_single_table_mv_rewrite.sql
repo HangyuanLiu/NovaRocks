@@ -4,7 +4,8 @@
 -- Source: dev/test/sql/test_materialized_view/T/test_materialized_view_rewrite
 
 -- query 1
-create table user_tags (time date, user_id int, user_name varchar(20), tag_id int) partition by range (time)  (partition p1 values less than MAXVALUE) distributed by hash(time) buckets 3 properties('replication_num' = '1');
+create table user_tags (time date, user_id int, user_name varchar(20), tag_id int)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 insert into user_tags values('2023-04-13', 1, 'a', 1);
@@ -55,17 +56,8 @@ CREATE TABLE `user_tags_2` (
   `user_id` int(11) NULL COMMENT "",
   `user_name` varchar(20) NULL COMMENT "",
   `tag_id` int(11) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`time`, `user_id`, `user_name`)
-PARTITION BY RANGE(`time`)
-(PARTITION p1 VALUES [("0000-01-01"), (MAXVALUE)))
-DISTRIBUTED BY HASH(`time`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1",
-"enable_persistent_index" = "true",
-"replicated_storage" = "true",
-"compression" = "LZ4"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 13
 insert into user_tags_2 values('2023-04-13', 1, 'a', 1);

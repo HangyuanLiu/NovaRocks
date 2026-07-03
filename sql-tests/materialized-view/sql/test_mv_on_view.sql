@@ -11,10 +11,12 @@ create database db_mv_on_view;
 use db_mv_on_view;
 
 -- query 3
-CREATE TABLE ss( event_day DATE, pv BIGINT) DUPLICATE KEY(event_day) DISTRIBUTED BY HASH(event_day) BUCKETS 8 PROPERTIES("replication_num" = "1");
+CREATE TABLE ss( event_day DATE, pv BIGINT)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
-CREATE TABLE jj( event_day DATE, pv BIGINT) DUPLICATE KEY(event_day) DISTRIBUTED BY HASH(event_day) BUCKETS 8 PROPERTIES("replication_num" = "1");
+CREATE TABLE jj( event_day DATE, pv BIGINT)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 insert into ss values('2020-01-14', 2);

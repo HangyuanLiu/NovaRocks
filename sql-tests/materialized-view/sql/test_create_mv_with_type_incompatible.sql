@@ -4,7 +4,8 @@
 -- Source: dev/test/sql/test_materialized_view/T/test_create_mv_with_type_incompatible
 
 -- query 1
-CREATE TABLE t1 (dt date, val int, col1 char(8), col2 varchar(8)) PARTITION BY date_trunc('day', dt);
+CREATE TABLE t1 (dt date, val int, col1 char(8), col2 varchar(8))
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 insert into t1 values

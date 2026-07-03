@@ -22,19 +22,8 @@ CREATE TABLE IF NOT EXISTS `lineorder` (
     `lo_tax` int(11) NOT NULL COMMENT "",
     `lo_commitdate` int(11) NOT NULL COMMENT "",
     `lo_shipmode` varchar(11) NOT NULL COMMENT ""
-    ) ENGINE=OLAP
-    DUPLICATE KEY(`lo_orderkey`)
-    COMMENT "OLAP"
-    PARTITION BY RANGE(`lo_orderdate`)
-(
-    PARTITION p1 VALUES [("1992-01-01"), ("1993-01-01")),
-    PARTITION p2 VALUES [("1993-01-01"), ("1994-01-01")),
-    PARTITION p3 VALUES [("1994-01-01"), ("1995-01-01")),
-    PARTITION p4 VALUES [("1995-01-01"), ("1996-01-01")),
-    PARTITION p5 VALUES [("1996-01-01"), ("1997-01-01")),
-    PARTITION p6 VALUES [("1997-01-01"), ("1998-01-01")),
-    PARTITION p7 VALUES [("1998-01-01"), ("1999-01-01"))
-) DISTRIBUTED BY HASH(`lo_orderkey`) BUCKETS 48;
+    )
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 CREATE TABLE IF NOT EXISTS `customer` (
@@ -46,10 +35,8 @@ CREATE TABLE IF NOT EXISTS `customer` (
     `c_region` varchar(13) NOT NULL COMMENT "",
     `c_phone` varchar(16) NOT NULL COMMENT "",
     `c_mktsegment` varchar(11) NOT NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`c_custkey`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`c_custkey`) BUCKETS 12;
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 CREATE TABLE IF NOT EXISTS `dates` (
@@ -70,10 +57,8 @@ CREATE TABLE IF NOT EXISTS `dates` (
     `d_lastdayinmonthfl` int(11) NOT NULL COMMENT "",
     `d_holidayfl` int(11) NOT NULL COMMENT "",
     `d_weekdayfl` int(11) NOT NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`d_datekey`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`d_datekey`) BUCKETS 1;
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 CREATE TABLE IF NOT EXISTS `supplier` (
@@ -84,10 +69,8 @@ CREATE TABLE IF NOT EXISTS `supplier` (
     `s_nation` varchar(16) NOT NULL COMMENT "",
     `s_region` varchar(13) NOT NULL COMMENT "",
     `s_phone` varchar(16) NOT NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`s_suppkey`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`s_suppkey`) BUCKETS 12;
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 CREATE TABLE IF NOT EXISTS `part` (
@@ -100,10 +83,8 @@ CREATE TABLE IF NOT EXISTS `part` (
     `p_type` varchar(26) NOT NULL COMMENT "",
     `p_size` int(11) NOT NULL COMMENT "",
     `p_container` varchar(11) NOT NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`p_partkey`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`p_partkey`) BUCKETS 12;
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 6
 INSERT INTO lineorder (lo_orderkey, lo_linenumber, lo_custkey, lo_partkey, lo_suppkey
@@ -545,14 +526,8 @@ CREATE TABLE `test_pt8` (
   `pt` date NOT NULL COMMENT "",
   `gmv` bigint(20) NULL COMMENT "gmv",
   `gmv2` bigint(20) NULL COMMENT "gmv2"
-) ENGINE=OLAP
-DUPLICATE KEY(`id`)
-COMMENT "OLAP"
-PARTITION BY date_trunc('day', pt)
-DISTRIBUTED BY HASH(`pt`)
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 106
 insert into test_pt8 values(1,'20241126',1,2);
@@ -562,14 +537,8 @@ CREATE TABLE `test_pt9` (
   `id` bigint(20) NULL COMMENT "id",
   `pt` date NOT NULL COMMENT "",
   `name` varchar(20) NULL COMMENT "gmv"
-) ENGINE=OLAP
-DUPLICATE KEY(`id`)
-COMMENT "OLAP"
-PARTITION BY date_trunc('day', pt)
-DISTRIBUTED BY HASH(`pt`)
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 108
 insert into test_pt9 values(1,'20241126','a');

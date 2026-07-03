@@ -16,8 +16,7 @@ CREATE TABLE `t1` (
 `k2` int,
 `k3` int
 )
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 3;
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- db2
@@ -29,8 +28,7 @@ CREATE TABLE db_${uuid0}_2.t1 (
 `k2` int,
 `k3` int
 )
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 3;
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 6
 INSERT INTO t1 VALUES (1,1,1);

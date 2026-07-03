@@ -13,10 +13,12 @@ create database db_${uuid0};
 use db_${uuid0};
 
 -- query 4
-CREATE TABLE ss( event_day DATE, pv BIGINT) DUPLICATE KEY(event_day) DISTRIBUTED BY HASH(event_day) BUCKETS 8 PROPERTIES("replication_num" = "1");
+CREATE TABLE ss( event_day DATE, pv BIGINT)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
-CREATE TABLE jj( event_day DATE, pv BIGINT) DUPLICATE KEY(event_day) DISTRIBUTED BY HASH(event_day) BUCKETS 8 PROPERTIES("replication_num" = "1");
+CREATE TABLE jj( event_day DATE, pv BIGINT)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 6
 insert into ss values('2020-01-14', 2);

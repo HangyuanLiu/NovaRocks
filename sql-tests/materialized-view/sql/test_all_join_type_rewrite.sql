@@ -11,34 +11,22 @@ CREATE TABLE emps (
     commission INT NOT NULL,
     name VARCHAR(20) NOT NULL,
     salary DECIMAL(18, 2)
-) ENGINE=OLAP
-DUPLICATE KEY(`empid`)
-DISTRIBUTED BY HASH(`empid`) BUCKETS 12
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 CREATE TABLE depts(
     deptno INT NOT NULL,
     name VARCHAR(20)
-) ENGINE=OLAP
-DUPLICATE KEY(`deptno`)
-DISTRIBUTED BY HASH(`deptno`) BUCKETS 12
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 CREATE TABLE dependents(
     empid INT NOT NULL,
     name VARCHAR(20)
-) ENGINE=OLAP
-DUPLICATE KEY(`empid`)
-DISTRIBUTED BY HASH(`empid`) BUCKETS 12
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 insert into emps values(1, 1, 1, 10, "emp_name1", 1000);

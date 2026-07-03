@@ -15,12 +15,7 @@ CREATE TABLE t1 (
     k2 int,
     k3 int
 )
-DUPLICATE KEY(k1)
-COMMENT "OLAP"
-PARTITION BY (k1, k2)
-PROPERTIES (
-    "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 INSERT INTO t1 VALUES ('2020-06-02',1,1),('2020-06-02',2,2),('2020-07-02',3,3);

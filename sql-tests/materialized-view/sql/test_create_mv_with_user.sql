@@ -44,7 +44,8 @@ EXECUTE AS mv_creator@'%' with no revert;
 
 -- query 12
 -- create & use materialized view
-create table t1(c1 int, c2 int);
+create table t1(c1 int, c2 int)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 13
 insert into t1 values(1,1);
@@ -138,7 +139,8 @@ EXECUTE AS mv_multi_role_user@'%' with no revert;
 SET ROLE role_with_refresh;
 
 -- query 39
-CREATE TABLE test_mv_table(id int, name varchar(20), value int);
+CREATE TABLE test_mv_table(id int, name varchar(20), value int)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 40
 INSERT INTO test_mv_table VALUES (1, 'test1', 100), (2, 'test2', 200);
@@ -171,7 +173,8 @@ SET DEFAULT ROLE role_with_refresh TO mv_multi_role_user@'%';
 SET ROLE role_with_refresh;
 
 -- query 48
-CREATE TABLE test_mv_table2(id int, name varchar(20), value int);
+CREATE TABLE test_mv_table2(id int, name varchar(20), value int)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 49
 INSERT INTO test_mv_table2 VALUES (1, 'test1', 100), (2, 'test2', 200);
@@ -201,7 +204,8 @@ SET DEFAULT ROLE role_without_refresh TO mv_multi_role_user@'%';
 SET ROLE role_with_refresh;
 
 -- query 56
-CREATE TABLE test_mv_table3(id int, name varchar(20), value int);
+CREATE TABLE test_mv_table3(id int, name varchar(20), value int)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 57
 INSERT INTO test_mv_table3 VALUES (1, 'test1', 100), (2, 'test2', 200);
@@ -241,7 +245,8 @@ EXECUTE AS mv_multi_role_user@'%' with no revert;
 SET ROLE role_without_refresh;
 
 -- query 67
-CREATE TABLE test_mv_table4(id int, name varchar(20), value int);
+CREATE TABLE test_mv_table4(id int, name varchar(20), value int)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 68
 CREATE MATERIALIZED VIEW test_mv_async4 REFRESH DEFERRED MANUAL AS

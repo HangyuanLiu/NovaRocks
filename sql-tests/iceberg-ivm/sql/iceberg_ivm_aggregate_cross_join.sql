@@ -22,17 +22,15 @@ CREATE DATABASE ice_ivm_xjoin_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_xjoin_${uuid0}.ns_${uuid0}.regions (
   id BIGINT NOT NULL,
   region STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 CREATE TABLE ice_ivm_xjoin_${uuid0}.ns_${uuid0}.amounts (
   id BIGINT NOT NULL,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_xjoin_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW xjoin_mv_${uuid0}

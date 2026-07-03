@@ -1,6 +1,8 @@
 -- Test Objective:
--- 1. Validate refresh and rewrite remain correct when MV partitions map many-to-many or one-to-many to base-table partitions.
--- 2. Cover partitioned MV refresh after incremental inserts and filtered rewrite on partition ranges.
+-- 1. Validate refresh and rewrite remain correct over Iceberg append base tables
+--    when rows span month/day MV expression boundaries.
+-- 2. Cover manual MV refresh after incremental inserts and filtered rewrite on
+--    date ranges.
 
 -- query 1
 create database db_${uuid0};
@@ -9,22 +11,13 @@ create database db_${uuid0};
 use db_${uuid0};
 
 -- query 3
--- Scenario 1: month-partitioned MV over finer-grained base partitions exercises many-to-many partition mapping.
+-- Scenario 1: month-granularity MV expression over append-table rows spanning multiple months.
 CREATE TABLE mock_tbl_many (
   k1 date,
   k2 int,
   v1 int
 )
-ENGINE=OLAP
-PARTITION BY RANGE(k1)
-(
-  PARTITION p0 VALUES [('2021-07-23'),('2021-07-26')),
-  PARTITION p1 VALUES [('2021-07-26'),('2021-07-29')),
-  PARTITION p2 VALUES [('2021-07-29'),('2021-08-02')),
-  PARTITION p3 VALUES [('2021-08-02'),('2021-08-04'))
-)
-DISTRIBUTED BY HASH(k2) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 insert into mock_tbl_many values
@@ -81,21 +74,13 @@ drop materialized view mv_many_to_many;
 drop table mock_tbl_many;
 
 -- query 16
--- Scenario 2: day-partitioned MV over month-partitioned base data exercises one-to-many partition mapping.
+-- Scenario 2: day-granularity MV expression over append-table rows spanning multiple days.
 CREATE TABLE mock_tbl_one (
   k1 date,
   k2 int,
   v1 int
 )
-ENGINE=OLAP
-PARTITION BY RANGE(k1)
-(
-  PARTITION p0 VALUES [('2021-07-01'),('2021-08-01')),
-  PARTITION p1 VALUES [('2021-08-01'),('2021-09-01')),
-  PARTITION p2 VALUES [('2021-09-01'),('2021-10-01'))
-)
-DISTRIBUTED BY HASH(k2) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 17
 insert into mock_tbl_one values

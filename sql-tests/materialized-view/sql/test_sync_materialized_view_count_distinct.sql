@@ -51,8 +51,7 @@ CREATE TABLE user_event (
     column_36   varchar(256)    DEFAULT NULL,
     column_37   varchar(256)    DEFAULT NULL
 )
-partition by date_trunc("day", ds)
-distributed by hash(id);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- ----- CASE0: NO DATA

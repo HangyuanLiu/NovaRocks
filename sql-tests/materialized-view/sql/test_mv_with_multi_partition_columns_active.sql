@@ -9,8 +9,7 @@ CREATE TABLE t1 (
     k2 date,
     k3 string
 )
-DUPLICATE KEY(k1)
-PARTITION BY date_trunc("day", k2), k3;
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 INSERT INTO t1 VALUES (1,'2020-06-02','BJ'),(3,'2020-06-02','SZ'),(2,'2020-07-02','SH');

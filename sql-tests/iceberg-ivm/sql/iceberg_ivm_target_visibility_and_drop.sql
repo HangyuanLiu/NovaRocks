@@ -22,10 +22,9 @@ CREATE DATABASE ice_ivm_target_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_target_${uuid0}.ns_${uuid0}.base_orders (
   order_id INT,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 INSERT INTO ice_ivm_target_${uuid0}.ns_${uuid0}.base_orders VALUES
   (1, 10),
   (2, 20);

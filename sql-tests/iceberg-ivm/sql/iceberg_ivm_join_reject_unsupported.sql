@@ -21,24 +21,21 @@ CREATE DATABASE ice_ivm_join_reject_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_left_${uuid0} (
   id BIGINT NOT NULL,
   rid BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 CREATE TABLE ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_right_${uuid0} (
   id BIGINT NOT NULL,
   rid BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 CREATE TABLE ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_extra_${uuid0} (
   id BIGINT NOT NULL,
   rid BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_join_reject_${uuid0};
 USE ns_${uuid0};
 

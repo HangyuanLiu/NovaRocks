@@ -53,17 +53,8 @@ CREATE TABLE `sales_data` (
   `loyalty_program_c` boolean NULL,
   `category_partition_key` varchar(1048576) NULL,
   `load_timestamp` datetime NULL
-) ENGINE=OLAP
-PRIMARY KEY(`customer_id`, `order_id`, `line_item`, `order_date`)
-PARTITION BY date_trunc('day', order_date)
-DISTRIBUTED BY HASH(`customer_id`) BUCKETS 12
-ORDER BY(`brand`, `category_l1`)
-PROPERTIES (
-"colocate_with" = "sales_data_orders",
-"compression" = "LZ4",
-"enable_persistent_index" = "true",
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 INSERT INTO `sales_data` (

@@ -17,7 +17,8 @@ CREATE TABLE t1 (
   c10  DOUBLE,
   c11  DOUBLE,
   c12  DOUBLE
-) PARTITION BY (c3);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 INSERT INTO t1 VALUES
@@ -46,7 +47,8 @@ CREATE TABLE t2 (
   c17 VARCHAR(256),
   c18 ARRAY<VARCHAR(64)>,
   c19 ARRAY<INT>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 INSERT INTO t2 VALUES (

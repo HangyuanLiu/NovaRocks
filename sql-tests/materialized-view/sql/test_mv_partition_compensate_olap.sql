@@ -1,6 +1,7 @@
 -- Test Objective:
--- 1. Validate partition compensation rewrite on local OLAP base tables.
--- 2. Cover exact-match, range, IN-list, and UNION compensation plans.
+-- 1. Validate partition compensation rewrite on lake-native Iceberg base tables.
+-- 2. Cover exact-match, range, IN-list, and UNION compensation plans without
+--    depending on StarRocks OLAP table storage hints.
 -- Source: dev/test/sql/test_materialized_view/T/test_mv_partition_compensate_olap
 
 -- query 1
@@ -20,23 +21,7 @@ CREATE TABLE t1 (
   num int,
   dt date
 )
-DUPLICATE KEY(`num`)
-PARTITION BY RANGE(`dt`)
-(
-  PARTITION p20200615 VALUES [("2020-06-15 00:00:00"), ("2020-06-16 00:00:00")),
-  PARTITION p20200618 VALUES [("2020-06-18 00:00:00"), ("2020-06-19 00:00:00")),
-  PARTITION p20200621 VALUES [("2020-06-21 00:00:00"), ("2020-06-22 00:00:00")),
-  PARTITION p20200624 VALUES [("2020-06-24 00:00:00"), ("2020-06-25 00:00:00")),
-  PARTITION p20200702 VALUES [("2020-07-02 00:00:00"), ("2020-07-03 00:00:00")),
-  PARTITION p20200705 VALUES [("2020-07-05 00:00:00"), ("2020-07-06 00:00:00")),
-  PARTITION p20200708 VALUES [("2020-07-08 00:00:00"), ("2020-07-09 00:00:00")),
-  PARTITION p20200716 VALUES [("2020-07-16 00:00:00"), ("2020-07-17 00:00:00")),
-  PARTITION p20200719 VALUES [("2020-07-19 00:00:00"), ("2020-07-20 00:00:00")),
-  PARTITION p20200722 VALUES [("2020-07-22 00:00:00"), ("2020-07-23 00:00:00")),
-  PARTITION p20200725 VALUES [("2020-07-25 00:00:00"), ("2020-07-26 00:00:00")),
-  PARTITION p20200711 VALUES [("2020-07-11 00:00:00"), ("2020-07-12 00:00:00"))
-)
-DISTRIBUTED BY HASH(`num`);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 INSERT INTO t1 VALUES
@@ -52,23 +37,7 @@ CREATE TABLE t2 (
   num int,
   dt datetime
 )
-DUPLICATE KEY(`num`)
-PARTITION BY RANGE(`dt`)
-(
-  PARTITION p20200615 VALUES [("2020-06-15 00:00:00"), ("2020-06-16 00:00:00")),
-  PARTITION p20200618 VALUES [("2020-06-18 00:00:00"), ("2020-06-19 00:00:00")),
-  PARTITION p20200621 VALUES [("2020-06-21 00:00:00"), ("2020-06-22 00:00:00")),
-  PARTITION p20200624 VALUES [("2020-06-24 00:00:00"), ("2020-06-25 00:00:00")),
-  PARTITION p20200702 VALUES [("2020-07-02 00:00:00"), ("2020-07-03 00:00:00")),
-  PARTITION p20200705 VALUES [("2020-07-05 00:00:00"), ("2020-07-06 00:00:00")),
-  PARTITION p20200708 VALUES [("2020-07-08 00:00:00"), ("2020-07-09 00:00:00")),
-  PARTITION p20200716 VALUES [("2020-07-16 00:00:00"), ("2020-07-17 00:00:00")),
-  PARTITION p20200719 VALUES [("2020-07-19 00:00:00"), ("2020-07-20 00:00:00")),
-  PARTITION p20200722 VALUES [("2020-07-22 00:00:00"), ("2020-07-23 00:00:00")),
-  PARTITION p20200725 VALUES [("2020-07-25 00:00:00"), ("2020-07-26 00:00:00")),
-  PARTITION p20200711 VALUES [("2020-07-11 00:00:00"), ("2020-07-12 00:00:00"))
-)
-DISTRIBUTED BY HASH(`num`);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 7
 INSERT INTO t2 VALUES
@@ -84,9 +53,7 @@ CREATE TABLE t3 (
   num int,
   dt datetime
 )
-DUPLICATE KEY(`num`)
-PARTITION BY  date_trunc('day', dt)
-DISTRIBUTED BY HASH(`num`);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 INSERT INTO t3 VALUES
@@ -326,7 +293,7 @@ SELECT dt,sum(num) FROM t1 where dt between '2020-06-15' and '2020-07-01' GROUP 
 SELECT dt,sum(num) FROM t1 GROUP BY dt order by dt;
 
 -- query 65
-drop materialized view default_catalog.db_${uuid0}.test_mv1;
+drop materialized view db_${uuid0}.test_mv1;
 
 -- query 66
 -- Test partition compensate with partition expression
@@ -558,7 +525,7 @@ SELECT dt,sum(num) FROM t2 where dt between '2020-06-15' and '2020-07-01' GROUP 
 SELECT dt,sum(num) FROM t2 GROUP BY dt order by dt;
 
 -- query 121
-drop materialized view default_catalog.db_${uuid0}.test_mv1;
+drop materialized view db_${uuid0}.test_mv1;
 
 -- query 122
 -- Test partition compensate with partition expression
@@ -790,7 +757,7 @@ SELECT dt,sum(num) FROM t2 where dt between '2020-06-15' and '2020-07-01' GROUP 
 SELECT dt,sum(num) FROM t2 GROUP BY dt order by dt;
 
 -- query 177
-drop materialized view default_catalog.db_${uuid0}.test_mv1;
+drop materialized view db_${uuid0}.test_mv1;
 
 -- query 178
 -- Test partition compensate with partition expression
@@ -1023,7 +990,7 @@ SELECT dt,sum(num) FROM t2 where dt between '2020-06-15' and '2020-07-01' GROUP 
 SELECT dt,sum(num) FROM t2 GROUP BY dt order by dt;
 
 -- query 233
-drop materialized view default_catalog.db_${uuid0}.test_mv1;
+drop materialized view db_${uuid0}.test_mv1;
 
 -- query 234
 -- Test partition compensate with partition expression
@@ -1255,7 +1222,7 @@ SELECT dt,sum(num) FROM t3 where dt between '2020-06-15' and '2020-07-01' GROUP 
 SELECT dt,sum(num) FROM t3 GROUP BY dt order by dt;
 
 -- query 289
-drop materialized view default_catalog.db_${uuid0}.test_mv1;
+drop materialized view db_${uuid0}.test_mv1;
 
 -- query 290
 -- Test partition compensate with partition expression
@@ -1488,7 +1455,7 @@ SELECT dt,sum(num) FROM t3 where dt between '2020-06-15' and '2020-07-01' GROUP 
 SELECT dt,sum(num) FROM t3 GROUP BY dt order by dt;
 
 -- query 345
-drop materialized view default_catalog.db_${uuid0}.test_mv1;
+drop materialized view db_${uuid0}.test_mv1;
 
 -- query 346
 drop table t1 force;

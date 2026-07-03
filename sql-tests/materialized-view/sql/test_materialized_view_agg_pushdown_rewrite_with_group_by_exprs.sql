@@ -16,16 +16,7 @@ CREATE TABLE fact_event_requests
     location_path             ARRAY<VARCHAR(12)>               ,
     channel                   VARCHAR(8)
 )
-ENGINE = olap
-PARTITION BY RANGE (event_date)
-(
-    START ("20251001") END ("20251101") EVERY (INTERVAL 1 DAY)
-)
-DISTRIBUTED BY HASH(channel, request_id) BUCKETS 16
-PROPERTIES
-(
-    "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 insert into fact_event_requests values('20251001', '1', '20251001', 'SUCCESS', 1, 1, 'TYPE_A', ['1234567890'], 'mobile'),
@@ -44,11 +35,7 @@ CREATE TABLE dim_location_area
     geohash              VARCHAR(12),
     area_name            VARCHAR(64)
 )
-DISTRIBUTED BY HASH(geohash) BUCKETS 8
-PROPERTIES
-(
-    "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 INSERT INTO dim_location_area values('1234567890', 'Zone-1'),

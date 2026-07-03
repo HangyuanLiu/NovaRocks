@@ -8,14 +8,14 @@ CREATE TABLE t1 (
                 k1 int,
                 k2 int not null
             )
-            DUPLICATE KEY(k1);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 CREATE TABLE t2 (
                 a int,
                 b int not null
             )
-            DUPLICATE KEY(a);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 INSERT INTO t1 VALUES (1,1),(3,2),(null,1);

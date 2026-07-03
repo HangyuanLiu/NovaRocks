@@ -7,7 +7,8 @@
 admin set frontend config('alter_scheduler_interval_millisecond' = '100');
 
 -- query 2
-create table user_tags (time date, user_id int, user_name varchar(20), tag_id int) partition by range (time)  (partition p1 values less than MAXVALUE) distributed by hash(time) buckets 3 properties('colocate_with' = 'colocate_gorup1', 'replicated_storage' = 'true');
+create table user_tags (time date, user_id int, user_name varchar(20), tag_id int)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 insert into user_tags values('2023-04-13', 1, 'a', 1), ('2023-04-13', 1, 'b', 2), ('2023-04-13', 1, 'c', 3), ('2023-04-13', 1, 'd', 4), ('2023-04-13', 1, 'e', 5), ('2023-04-13', 2, 'e', 5), ('2023-04-13', 3, 'e', 6);

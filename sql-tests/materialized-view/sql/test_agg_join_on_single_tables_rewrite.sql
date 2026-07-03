@@ -8,8 +8,7 @@ CREATE TABLE t1 (
                     k1 INT,
                     v1 INT,
                     v2 INT)
-                DUPLICATE KEY(k1)
-                DISTRIBUTED BY HASH(k1);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 insert into t1 values (1,1,1),(2,1,1),(3,1,1),(1,2,3),(2,2,3),(3,2,3);

@@ -31,9 +31,8 @@ CREATE TABLE `store_sales` (
   `ss_net_paid` decimal(7, 2) NULL COMMENT "",
   `ss_net_paid_inc_tax` decimal(7, 2) NULL COMMENT "",
   `ss_net_profit` decimal(7, 2) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`ss_item_sk`, `ss_ticket_number`, `ss_sold_date_sk`)
-DISTRIBUTED BY RANDOM;
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 INSERT INTO `store_sales` (

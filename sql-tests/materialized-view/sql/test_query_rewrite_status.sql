@@ -10,7 +10,8 @@ create database db_${uuid0};
 use db_${uuid0};
 
 -- query 3
-create table t1(c1 int, c2 int, c3 int) ;
+create table t1(c1 int, c2 int, c3 int)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 create materialized view mv1 refresh manual as select * from t1;

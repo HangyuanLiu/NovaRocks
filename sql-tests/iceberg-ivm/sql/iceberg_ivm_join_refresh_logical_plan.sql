@@ -22,17 +22,15 @@ CREATE TABLE ice_ivm_join_logical_${uuid0}.ns_${uuid0}.w9_left_${uuid0} (
   id BIGINT,
   region STRING,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 CREATE TABLE ice_ivm_join_logical_${uuid0}.ns_${uuid0}.w9_right_${uuid0} (
   id BIGINT NOT NULL,
   category STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_join_logical_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_w9_join_refresh_logical_${uuid0}

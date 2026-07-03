@@ -23,8 +23,7 @@ CREATE TABLE `t1` (
     `k13` decimal128(27, 9) NULL COMMENT "",
     INDEX idx1 (`k6`) USING BITMAP
 )
-DUPLICATE KEY(`k1`, `k2`, `k3`, `k4`, `k5`)
-DISTRIBUTED BY HASH(`k1`, `k2`, `k3`) BUCKETS 3;
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- add duplicated rows

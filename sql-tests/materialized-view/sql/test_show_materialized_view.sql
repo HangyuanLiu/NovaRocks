@@ -19,7 +19,8 @@ create database test_show_materialized_view;
 use test_show_materialized_view;
 
 -- query 6
-create table user_tags (time date, user_id int, user_name varchar(20), tag_id int) partition by range (time)  (partition p1 values less than MAXVALUE) distributed by hash(time) buckets 3 properties('replication_num' = '1');
+create table user_tags (time date, user_id int, user_name varchar(20), tag_id int)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 7
 create materialized view user_tags_mv1

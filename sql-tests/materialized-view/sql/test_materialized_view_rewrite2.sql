@@ -11,11 +11,7 @@ CREATE TABLE test_empty_partition_tbl(
   `col3` bigint(20) DEFAULT NULL,
   `error_code` varchar(1048576) DEFAULT NULL
 )
-DUPLICATE KEY (dt, col1)
-PARTITION BY date_trunc('day', dt)
-PROPERTIES (
-"replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 CREATE MATERIALIZED VIEW  test_empty_partition_mv1
@@ -100,23 +96,8 @@ CREATE TABLE IF NOT EXISTS `lineorder` (
     `lo_tax` int(11) NOT NULL COMMENT "",
     `lo_commitdate` int(11) NOT NULL COMMENT "",
     `lo_shipmode` varchar(11) NOT NULL COMMENT ""
-    ) ENGINE=OLAP
-    DUPLICATE KEY(`lo_orderkey`)
-    COMMENT "OLAP"
-    PARTITION BY RANGE(`lo_orderdate`)
-(
-    PARTITION p1 VALUES [("1992-01-01 00:00:00"), ("1993-01-01 00:00:00")),
-    PARTITION p2 VALUES [("1993-01-01 00:00:00"), ("1994-01-01 00:00:00")),
-    PARTITION p3 VALUES [("1994-01-01 00:00:00"), ("1995-01-01 00:00:00")),
-    PARTITION p4 VALUES [("1995-01-01 00:00:00"), ("1996-01-01 00:00:00")),
-    PARTITION p5 VALUES [("1996-01-01 00:00:00"), ("1997-01-01 00:00:00")),
-    PARTITION p6 VALUES [("1997-01-01 00:00:00"), ("1998-01-01 00:00:00")),
-    PARTITION p7 VALUES [("1998-01-01 00:00:00"), ("1999-01-01 00:00:00"))
-)
-DISTRIBUTED BY HASH(`lo_orderkey`) BUCKETS 4
-PROPERTIES (
-    "replication_num" = "1"
-);
+    )
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 17
 INSERT INTO lineorder (lo_orderkey, lo_linenumber, lo_custkey, lo_partkey, lo_suppkey

@@ -12,14 +12,7 @@ CREATE TABLE test_pk_tbl1 (
     col3 string,
     flag string
 )
-PRIMARY KEY(dt_hour, col1)
-PARTITION BY RANGE(`dt_hour`) (
-    PARTITION p20230817 VALUES LESS THAN ('2023-08-17')
-)
-DISTRIBUTED BY HASH(col1) BUCKETS 16
-PROPERTIES (
-    "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 insert into test_pk_tbl1 values ('2023-08-16', 'a', '0', 'a', 'b', '1'),  ('2023-08-16', 'b', '0', 'a', 'b', '3');

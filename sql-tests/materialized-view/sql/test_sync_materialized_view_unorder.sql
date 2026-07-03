@@ -14,8 +14,7 @@ CREATE TABLE t1 (
     k4 DATE NOT NULL,
     v1 BIGINT sum DEFAULT "0"
 )
-AGGREGATE KEY(k1,  k2, k3,  k4)
-DISTRIBUTED BY HASH(k4);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 insert into t1 values ('200', 'a', 11.00, '2024-08-06', 1), ('100', NULL, NULL, '2024-08-08', 2), ('200', 'a', 11.00, '2024-08-06', 1);

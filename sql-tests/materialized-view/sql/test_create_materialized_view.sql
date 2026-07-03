@@ -1,6 +1,6 @@
 -- Test Objective:
 -- 1. Validate CREATE MATERIALIZED VIEW DDL variants and basic metadata correctness.
--- 2. Cover common create/drop flows on local OLAP tables.
+-- 2. Cover common create/drop flows on Iceberg base tables.
 -- Source: dev/test/sql/test_materialized_view/T/test_create
 
 -- query 1
@@ -15,9 +15,7 @@ CREATE TABLE `t_hash` (
   `v1` int(11) NULL COMMENT "",
   `v2` int(11) NULL COMMENT ""
 )
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY hash(k1) BUCKETS 64
-PROPERTIES ( "replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 CREATE TABLE `t_random` (
@@ -25,45 +23,23 @@ CREATE TABLE `t_random` (
   `v1` int(11) NULL COMMENT "",
   `v2` int(11) NULL COMMENT ""
 )
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY RANDOM BUCKETS 64
-PROPERTIES ( "replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 CREATE TABLE `t1` (
   `k1` int(11) NULL COMMENT "",
   `v1` int(11) NULL COMMENT "",
   `v2` int(11) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-COMMENT "OLAP"
-PARTITION BY RANGE(`k1`) (
-    PARTITION p2 VALUES [("202301"), ("202302")),
-    PARTITION p3 VALUES [("202302"), ("202303")),
-    PARTITION p4 VALUES [("202303"), ("202304")),
-    PARTITION p5 VALUES [("202304"), ("202305")),
-    PARTITION p6 VALUES [("202305"), ("202306"))
 )
-DISTRIBUTED BY HASH(`k1`) BUCKETS 2
-PROPERTIES ( "replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 6
 CREATE TABLE `t2` (
   `k1` int(11) NULL COMMENT "",
   `v1` int(11) NULL COMMENT "",
   `v2` int(11) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-COMMENT "OLAP"
-PARTITION BY RANGE(`k1`) (
-    PARTITION p2 VALUES [("202301"), ("202302")),
-    PARTITION p3 VALUES [("202302"), ("202303")),
-    PARTITION p4 VALUES [("202303"), ("202304")),
-    PARTITION p5 VALUES [("202304"), ("202305")),
-    PARTITION p6 VALUES [("202305"), ("202306"))
 )
-DISTRIBUTED BY HASH(`k1`) BUCKETS 2
-PROPERTIES ( "replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 7
 -- verify the CREATE & REFRESH clause

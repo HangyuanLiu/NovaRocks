@@ -10,8 +10,7 @@ CREATE TABLE IF NOT EXISTS t1 (
     cabin_class VARCHAR(1) NOT NULL,
     observation_date DATE NOT NULL
 )
-DUPLICATE KEY(leg_id, cabin_class)
-PARTITION BY date_trunc('day', observation_date);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 CREATE TABLE IF NOT EXISTS t2 (
@@ -19,8 +18,7 @@ CREATE TABLE IF NOT EXISTS t2 (
     cabin_class VARCHAR(1) NOT NULL,
     observation_date DATE NOT NULL
 )
-DUPLICATE KEY(leg_id, cabin_class)
-PARTITION BY date_trunc('day', observation_date);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 CREATE TABLE IF NOT EXISTS t3 (
@@ -28,8 +26,7 @@ CREATE TABLE IF NOT EXISTS t3 (
     cabin_class VARCHAR(1) NOT NULL,
     observation_date DATE NOT NULL
 )
-DUPLICATE KEY(leg_id, cabin_class)
-PARTITION BY date_trunc('month', observation_date);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 CREATE TABLE IF NOT EXISTS t4 (
@@ -37,12 +34,7 @@ CREATE TABLE IF NOT EXISTS t4 (
     cabin_class VARCHAR(1) NOT NULL,
     observation_date DATE NOT NULL
 )
-DUPLICATE KEY(leg_id, cabin_class)
-PARTITION BY RANGE(observation_date) (
-  PARTITION p0 VALUES LESS THAN ('2024-03-01'),
-  PARTITION p1 VALUES LESS THAN ('2024-03-02'),
-  PARTITION p2 VALUES LESS THAN ('2024-04-02')
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 insert into t1 (leg_id, cabin_class, observation_date) values

@@ -14,7 +14,7 @@ CREATE TABLE t1 (
     __time datetime,
     c1 int
 )
-PARTITION BY date_trunc('DAY', __time);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 INSERT INTO t1 VALUES

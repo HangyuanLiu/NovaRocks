@@ -11,24 +11,21 @@ CREATE TABLE t1(
     t1_name varchar(20) not null,
     t1_age INT not null
 )
-DUPLICATE KEY(t1_id)
-DISTRIBUTED BY HASH(t1_id);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 CREATE TABLE t2(
     t2_id INT,
     t2_name varchar(20) not null
 )
-DUPLICATE KEY(t2_id)
-DISTRIBUTED BY HASH(t2_id);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 CREATE TABLE t3(
     t3_id INT not null,
     t3_name varchar(20) not null
 )
-DUPLICATE KEY(t3_id)
-DISTRIBUTED BY HASH(t3_id);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 INSERT INTO t1 VALUES (1,1,1,"jack",18), (2,2,2,"nacy",18);

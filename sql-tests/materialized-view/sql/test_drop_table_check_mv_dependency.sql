@@ -12,7 +12,8 @@ use db_drop_table_check_mv_dependency;
 
 -- query 3
 -- mv on table
-create table t1 (c1 int, c2 string);
+create table t1 (c1 int, c2 string)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 create materialized view mv1 refresh async as select * from t1;

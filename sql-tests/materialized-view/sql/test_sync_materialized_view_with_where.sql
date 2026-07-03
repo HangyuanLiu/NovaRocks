@@ -20,11 +20,7 @@ CREATE TABLE `duplicate_tbl` (
     `k13` decimal128(27, 9) NULL COMMENT "",
     INDEX idx1 (`k6`) USING BITMAP
 )
-ENGINE=OLAP DUPLICATE KEY(`k1`, `k2`, `k3`, `k4`, `k5`)
-DISTRIBUTED BY HASH(`k1`, `k2`, `k3`) BUCKETS 3
-PROPERTIES (
-    "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 insert into duplicate_tbl values

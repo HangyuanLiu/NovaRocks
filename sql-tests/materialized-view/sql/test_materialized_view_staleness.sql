@@ -10,10 +10,8 @@ drop table if exists t1;
 CREATE TABLE t1 (
     k1 int,
     k2 int
-) DUPLICATE KEY(k1)
-properties (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 INSERT INTO t1 VALUES (1,1),(1,2),(null,null);

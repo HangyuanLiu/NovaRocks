@@ -24,17 +24,15 @@ CREATE TABLE ice_ivm_join_a11_type_${uuid0}.ns_${uuid0}.join_left_${uuid0} (
   id INT NOT NULL,
   rid INT,
   amount INT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 CREATE TABLE ice_ivm_join_a11_type_${uuid0}.ns_${uuid0}.join_right_${uuid0} (
   rid INT NOT NULL,
   label STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 INSERT INTO ice_ivm_join_a11_type_${uuid0}.ns_${uuid0}.join_left_${uuid0} VALUES
   (1, 10, 100),
   (2, 20, 200);

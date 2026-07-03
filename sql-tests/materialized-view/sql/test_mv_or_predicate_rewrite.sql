@@ -16,10 +16,7 @@ CREATE TABLE lineorder (
   lo_quantity int,
   lo_revenue int
 )
-ENGINE=OLAP
-DUPLICATE KEY(lo_orderkey)
-DISTRIBUTED BY HASH(lo_orderkey) BUCKETS 2
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 insert into lineorder values

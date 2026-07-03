@@ -25,10 +25,9 @@ CREATE DATABASE ice_ivm_pday_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_pday_${uuid0}.ns_${uuid0}.orders (
   ts DATE,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_pday_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW pday_mv_${uuid0}

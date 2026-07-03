@@ -11,9 +11,7 @@ use db_${uuid0};
 
 -- query 3
 create table user_tags (time date, user_id int, user_name varchar(20), tag_id int)
-partition by date_trunc('day', time)
-distributed by hash(time) buckets 3
-properties('replication_num' = '1');
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 insert into user_tags values('2023-04-13', 1, 'a', 1);

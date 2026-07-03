@@ -28,10 +28,9 @@ CREATE TABLE mv_ivm_pk_${uuid0}.ns_${uuid0}.orders (
   customer STRING,
   amount DOUBLE,
   tags ARRAY<STRING>
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 INSERT INTO mv_ivm_pk_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 'A', 100.0, ['x']),
   (2, 'B', 200.0, ['y']);

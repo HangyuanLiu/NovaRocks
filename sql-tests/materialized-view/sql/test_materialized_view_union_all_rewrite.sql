@@ -1,6 +1,6 @@
 -- Test Objective:
 -- 1. Validate UNION ALL queries can rewrite through materialized views when eligible.
--- 2. Cover union-all rewrite correctness on local OLAP tables.
+-- 2. Cover union-all rewrite correctness on Iceberg base tables.
 -- Source: dev/test/sql/test_materialized_view/T/test_materialized_view_union_all_rewrite
 
 -- query 1
@@ -9,17 +9,8 @@ CREATE TABLE `mt1` (
  k2 string,
  v1 INT,
  v2 INT
-) ENGINE=OLAP
-PARTITION BY RANGE(`k1`)
-(
-  PARTITION `p1` VALUES LESS THAN ('3'),
-  PARTITION `p2` VALUES LESS THAN ('6'),
-  PARTITION `p3` VALUES LESS THAN ('9')
 )
-DISTRIBUTED BY HASH(`k1`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 INSERT INTO mt1 values (1,'a',1,1), (2,'aa',1,2),  (3,'a',1,3), (4,'aa',1,4), (5,'aa',1,5), (6,'aa',1,6);

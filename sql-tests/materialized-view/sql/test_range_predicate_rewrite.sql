@@ -18,13 +18,8 @@ CREATE TABLE `t0` (
   `float_col_2` float NOT NULL COMMENT "",
   `varchar_col` varchar(255) NOT NULL COMMENT "",
   `tinyint_col` tinyint(4) NOT NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`date_col`, `id`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`id`)
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 CREATE TABLE `t1` (
@@ -33,13 +28,8 @@ CREATE TABLE `t1` (
   `varchar_col_2` varchar(255) NOT NULL COMMENT "",
   `int_col_1` int(11) NOT NULL COMMENT "",
   `tinyint_col_1` tinyint(4) NOT NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`id_1`, `varchar_col_1`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`id_1`)
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 INSERT INTO `t0` VALUES

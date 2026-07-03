@@ -11,12 +11,8 @@ CREATE TABLE `test_sort_key_tbl1` (
   `cost` decimal64(18, 0) NULL COMMENT "",
   `price` double NULL COMMENT "",
   `pt` varchar(255) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`order_number`, `date`, `sku_number`)
-DISTRIBUTED BY HASH(`order_number`)
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 CREATE TABLE `TEST_SORT_KEY_TBL2` (
@@ -26,12 +22,8 @@ CREATE TABLE `TEST_SORT_KEY_TBL2` (
   `COST` decimal64(18, 0) NULL COMMENT "",
   `PRICE` double NULL COMMENT "",
   `PT` varchar(255) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`order_number`, `date`, `sku_number`)
-DISTRIBUTED BY HASH(`order_number`)
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 insert into test_sort_key_tbl1 values (1, '2023-10-01', 'a1', 1.0, 100.00, '20231001'), (1, '2023-10-02', 'a1', 1.0, 100.00, '20231001'), (1, '2023-10-01', 'a1', 2.0, 1010.00, '20231001');
