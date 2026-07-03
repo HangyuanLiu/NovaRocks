@@ -24,6 +24,6 @@ pub(crate) mod type_lowering;
 pub(crate) mod thrift {
     pub(crate) use super::layout;
     pub(crate) use super::node::hdfs_scan::cache_iceberg_table_locations;
-    pub(crate) use super::node::{Lowered, lower_plan};
+    pub(crate) use super::node::{Lowered, PlanOrigin, lower_plan};
     pub(crate) use super::type_lowering;
 }

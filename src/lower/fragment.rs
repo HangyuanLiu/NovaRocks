@@ -39,7 +39,7 @@ use crate::exec::pipeline::executor::{
     execute_plan_with_pipeline, execute_plan_with_pipeline_with_root_sink_dop,
 };
 use crate::lower::layout::{build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots};
-use crate::lower::thrift::{Lowered, lower_plan};
+use crate::lower::thrift::{Lowered, PlanOrigin, lower_plan};
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
@@ -168,6 +168,7 @@ pub(crate) fn execute_fragment(
     backend_num: Option<i32>,
     mem_tracker: Option<std::sync::Arc<crate::runtime::mem_tracker::MemTracker>>,
     typed_result_sink: bool,
+    plan_origin: PlanOrigin,
 ) -> Result<FragmentOutput, String> {
     let mut query_opts = query_opts.cloned();
     if let Some(opts) = query_opts.as_mut() {
@@ -279,6 +280,7 @@ pub(crate) fn execute_fragment(
                 &layout_hints,
                 last_query_id,
                 fe_addr,
+                plan_origin,
             )?
         };
 
@@ -818,6 +820,7 @@ mod tests {
             None,
             None,
             false,
+            crate::lower::thrift::PlanOrigin::StarRocksFeCompatible,
         )
         .expect_err("missing router payload must fail");
 
@@ -863,6 +866,7 @@ mod tests {
             None,
             None,
             false,
+            crate::lower::thrift::PlanOrigin::StarRocksFeCompatible,
         )
         .expect_err("duplicate branch kind must fail");
 

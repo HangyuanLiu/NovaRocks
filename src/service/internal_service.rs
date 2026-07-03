@@ -92,6 +92,21 @@ fn choose_nonempty_str<'a>(primary: Option<&'a str>, fallback: Option<&'a str>) 
     }
 }
 
+fn plan_origin_from_request(
+    one: &internal_service::TExecPlanFragmentParams,
+    common: Option<&internal_service::TExecPlanFragmentParams>,
+) -> crate::lower::thrift::PlanOrigin {
+    let generated = one
+        .novarocks_generated_plan
+        .or_else(|| common.and_then(|c| c.novarocks_generated_plan))
+        .unwrap_or(false);
+    if generated {
+        crate::lower::thrift::PlanOrigin::NovaRocksGenerated
+    } else {
+        crate::lower::thrift::PlanOrigin::StarRocksFeCompatible
+    }
+}
+
 fn validate_network_address(
     addr: Option<&types::TNetworkAddress>,
     missing_msg: &str,
@@ -1011,6 +1026,7 @@ fn spawn_exec_fragment(
     fe_addr: Option<types::TNetworkAddress>,
     mem_tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
     typed_result_sink: bool,
+    plan_origin: crate::lower::thrift::PlanOrigin,
     mgr: Arc<QueryContextManager>,
 ) {
     let uses_fetch_result_buffer = matches!(
@@ -1050,6 +1066,7 @@ fn spawn_exec_fragment(
                 backend_num,
                 mem_tracker,
                 typed_result_sink,
+                plan_origin,
             )
         }))
         .unwrap_or_else(|payload| {
@@ -1327,6 +1344,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         let query_opts = query_opts.cloned();
         let mut exec_params = exec_params.clone();
         let fragment = fragment.clone();
+        let plan_origin = plan_origin_from_request(one, common);
         backfill_per_node_scan_ranges(&mut exec_params);
         validate_internal_addresses(&exec_params, Some(&fragment))?;
         if let Some(params) = exec_params.runtime_filter_params.clone() {
@@ -1349,6 +1367,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             coord.cloned(),
             Some(fragment_mem_tracker),
             typed_result_sink,
+            plan_origin,
             Arc::clone(&mgr),
         );
         created += 1;
@@ -1494,6 +1513,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
 
     let mut params = params.clone();
     let fragment = fragment.clone();
+    let plan_origin = plan_origin_from_request(&one, None);
     backfill_per_node_scan_ranges(&mut params);
     validate_internal_addresses(&params, Some(&fragment))?;
     if let Some(rf_params) = params.runtime_filter_params.clone() {
@@ -1516,6 +1536,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
         coord.cloned(),
         Some(fragment_mem_tracker),
         typed_result_sink,
+        plan_origin,
         Arc::clone(&mgr),
     );
     Ok(())
@@ -1579,6 +1600,7 @@ pub(crate) fn execute_plan_fragment_sync(
     let typed_result_sink = one.novarocks_typed_result_sink.unwrap_or(false);
     let mut params = params.clone();
     let fragment = fragment.clone();
+    let plan_origin = plan_origin_from_request(&one, None);
     backfill_per_node_scan_ranges(&mut params);
     validate_internal_addresses(&params, Some(&fragment))?;
     if let Some(rf_params) = params.runtime_filter_params.clone() {
@@ -1600,6 +1622,7 @@ pub(crate) fn execute_plan_fragment_sync(
         one.backend_num,
         Some(fragment_mem_tracker),
         typed_result_sink,
+        plan_origin,
     );
     exchange::remove_fragment(finst_id.hi, finst_id.lo);
     mgr.finish_fragment(query_id);
@@ -1681,7 +1704,7 @@ mod tests {
 
     use super::{
         build_fetch_result_batch_for_chunk, mark_query_failed_from_report,
-        validate_internal_addresses,
+        plan_origin_from_request, validate_internal_addresses,
     };
     use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
@@ -2019,6 +2042,88 @@ mod tests {
             query_global_dict_exprs: None,
             group_execution_param: None,
         }
+    }
+
+    fn minimal_exec_plan_fragment_params_for_test() -> internal_service::TExecPlanFragmentParams {
+        internal_service::TExecPlanFragmentParams::new(
+            internal_service::InternalServiceVersion::V1,
+            Some(fragment(9050, 9060)),
+            Some(descriptors::TDescriptorTable::new(
+                vec![],
+                vec![],
+                vec![],
+                false,
+            )),
+            Some(exec_params(None, None)),
+            None::<types::TNetworkAddress>,
+            Some(0),
+            None::<internal_service::TQueryGlobals>,
+            None::<internal_service::TQueryOptions>,
+            None::<bool>,
+            None::<types::TResourceInfo>,
+            None::<String>,
+            None::<String>,
+            None::<i64>,
+            None::<internal_service::TLoadErrorHubInfo>,
+            Some(true),
+            Some(1),
+            None::<BTreeMap<types::TPlanNodeId, i32>>,
+            None::<crate::thrift::work_group::TWorkGroup>,
+            None::<bool>,
+            None::<i32>,
+            None::<bool>,
+            None::<bool>,
+            None::<internal_service::TAdaptiveDopParam>,
+            None::<i32>,
+            None::<internal_service::TPredicateTreeParams>,
+            None::<Vec<i32>>,
+            None::<i32>,
+            None::<types::TNetworkAddress>,
+            None::<bool>,
+            None::<bool>, // novarocks_generated_plan
+        )
+    }
+
+    #[test]
+    fn plan_origin_defaults_to_starrocks_fe_compatible() {
+        let mut params = minimal_exec_plan_fragment_params_for_test();
+        params.novarocks_generated_plan = None;
+
+        assert_eq!(
+            plan_origin_from_request(&params, None),
+            crate::lower::thrift::PlanOrigin::StarRocksFeCompatible
+        );
+    }
+
+    #[test]
+    fn plan_origin_uses_novarocks_generated_marker_from_unique_or_common() {
+        let mut unique = minimal_exec_plan_fragment_params_for_test();
+        unique.novarocks_generated_plan = Some(true);
+        assert_eq!(
+            plan_origin_from_request(&unique, None),
+            crate::lower::thrift::PlanOrigin::NovaRocksGenerated
+        );
+
+        unique.novarocks_generated_plan = None;
+        let mut common = minimal_exec_plan_fragment_params_for_test();
+        common.novarocks_generated_plan = Some(true);
+        assert_eq!(
+            plan_origin_from_request(&unique, Some(&common)),
+            crate::lower::thrift::PlanOrigin::NovaRocksGenerated
+        );
+    }
+
+    #[test]
+    fn plan_origin_unique_marker_overrides_common_marker() {
+        let mut unique = minimal_exec_plan_fragment_params_for_test();
+        unique.novarocks_generated_plan = Some(false);
+        let mut common = minimal_exec_plan_fragment_params_for_test();
+        common.novarocks_generated_plan = Some(true);
+
+        assert_eq!(
+            plan_origin_from_request(&unique, Some(&common)),
+            crate::lower::thrift::PlanOrigin::StarRocksFeCompatible
+        );
     }
 
     #[test]

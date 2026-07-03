@@ -32,7 +32,7 @@ use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::{Layout, chunk_schema_for_layout, slot_arrow_type_lookup};
-use crate::lower::node::Lowered;
+use crate::lower::node::{Lowered, PlanOrigin};
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::novarocks_logging::info;
 use crate::thrift::{data, descriptors, exprs, plan_nodes, types};
@@ -108,10 +108,33 @@ pub(crate) fn build_query_global_dict_map(
             ));
         }
         let mut dict_values = HashMap::with_capacity(ids.len());
+        let mut value_to_id = HashMap::<Vec<u8>, i32>::with_capacity(strings.len());
         for (id, value) in ids.iter().zip(strings.iter()) {
-            dict_values.insert(*id, value.clone());
+            if let Some(existing) = dict_values.insert(*id, value.clone())
+                && existing != *value
+            {
+                return Err(format!(
+                    "query_global_dict column_id={} duplicate id {} maps to different strings",
+                    column_id, id
+                ));
+            }
+            if let Some(existing_id) = value_to_id.insert(value.clone(), *id)
+                && existing_id != *id
+            {
+                return Err(format!(
+                    "query_global_dict column_id={} duplicate string maps to different ids: existing_id={}, new_id={}",
+                    column_id, existing_id, id
+                ));
+            }
         }
-        out.insert(column_id, Arc::new(dict_values));
+        if let Some(existing) = out.insert(column_id, Arc::new(dict_values)) {
+            return Err(format!(
+                "query_global_dict column_id={} appears more than once in the same fragment (existing_size={}, new_size={})",
+                column_id,
+                existing.len(),
+                ids.len()
+            ));
+        }
     }
 
     // FE may send derived dictionary expressions in `query_global_dict_exprs`, where target
@@ -588,6 +611,23 @@ fn supports_dict_decode_input_type(data_type: &DataType) -> bool {
     }
 }
 
+fn dict_decode_input_supported_for_origin(
+    encoded_slot_id: types::TSlotId,
+    encoded_type: &DataType,
+    plan_origin: PlanOrigin,
+) -> Result<bool, String> {
+    if supports_dict_decode_input_type(encoded_type) {
+        return Ok(true);
+    }
+    if plan_origin == PlanOrigin::StarRocksFeCompatible {
+        return Err(format!(
+            "DECODE_NODE encoded slot_id={} has non-integer input type {:?} in FE-compatible global dict path",
+            encoded_slot_id, encoded_type
+        ));
+    }
+    Ok(false)
+}
+
 pub(crate) fn lower_decode_node(
     child: Lowered,
     node: &plan_nodes::TPlanNode,
@@ -595,6 +635,7 @@ pub(crate) fn lower_decode_node(
     arena: &mut ExprArena,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     query_global_dict_map: &QueryGlobalDictMap,
+    plan_origin: PlanOrigin,
 ) -> Result<Lowered, String> {
     let decode = node
         .decode_node
@@ -650,10 +691,9 @@ pub(crate) fn lower_decode_node(
                         encoded_tuple_id, encoded_slot_id
                     )
                 })?;
-            let encoded_expr = arena.push_typed(ExprNode::SlotId(encoded_slot), encoded_type);
-            if arena
-                .data_type(encoded_expr)
-                .is_some_and(supports_dict_decode_input_type)
+            let encoded_expr =
+                arena.push_typed(ExprNode::SlotId(encoded_slot), encoded_type.clone());
+            if dict_decode_input_supported_for_origin(*encoded_slot_id, &encoded_type, plan_origin)?
             {
                 arena.push_typed(
                     ExprNode::DictDecode {
@@ -691,4 +731,94 @@ pub(crate) fn lower_decode_node(
         },
         layout: out_layout,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict(column_id: i32, strings: Vec<&str>, ids: Vec<i32>) -> data::TGlobalDict {
+        data::TGlobalDict::new(
+            Some(column_id),
+            Some(strings.into_iter().map(|s| s.as_bytes().to_vec()).collect()),
+            Some(ids),
+            None,
+        )
+    }
+
+    #[test]
+    fn fe_compatible_decode_rejects_non_integer_encoded_input() {
+        let err = dict_decode_input_supported_for_origin(
+            7,
+            &DataType::Utf8,
+            crate::lower::node::PlanOrigin::StarRocksFeCompatible,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("DECODE_NODE encoded slot_id=7"), "{err}");
+        assert!(err.contains("FE-compatible"), "{err}");
+        assert!(err.contains("Utf8"), "{err}");
+    }
+
+    #[test]
+    fn native_decode_keeps_existing_noop_behavior_for_non_integer_input() {
+        let supported = dict_decode_input_supported_for_origin(
+            7,
+            &DataType::Utf8,
+            crate::lower::node::PlanOrigin::NovaRocksGenerated,
+        )
+        .unwrap();
+
+        assert!(!supported);
+    }
+
+    #[test]
+    fn query_global_dict_rejects_duplicate_id_with_different_value() {
+        let err = build_query_global_dict_map(Some(&[dict(7, vec!["a", "b"], vec![1, 1])]), None)
+            .unwrap_err();
+        assert!(
+            err.contains("duplicate id") && err.contains("column_id=7"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn query_global_dict_rejects_duplicate_value_with_different_id() {
+        let err = build_query_global_dict_map(Some(&[dict(7, vec!["a", "a"], vec![1, 2])]), None)
+            .unwrap_err();
+        assert!(
+            err.contains("duplicate string") && err.contains("column_id=7"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn query_global_dict_rejects_duplicate_column_id_in_same_fragment() {
+        let err = build_query_global_dict_map(
+            Some(&[dict(7, vec!["a"], vec![1]), dict(7, vec!["b"], vec![2])]),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("column_id=7") && err.contains("appears more than once"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn query_global_dict_accepts_consistent_payload() {
+        let out = build_query_global_dict_map(Some(&[dict(7, vec!["a", "b"], vec![1, 2])]), None)
+            .expect("dict");
+        assert_eq!(out.get(&7).unwrap().get(&1).unwrap(), b"a");
+        assert_eq!(out.get(&7).unwrap().get(&2).unwrap(), b"b");
+    }
+
+    #[test]
+    fn query_global_dict_accepts_consistent_duplicate_entry() {
+        let out = build_query_global_dict_map(Some(&[dict(7, vec!["a", "a"], vec![1, 1])]), None)
+            .expect("dict");
+        let values = out.get(&7).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values.get(&1).unwrap(), b"a");
+    }
 }

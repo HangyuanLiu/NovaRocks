@@ -83,6 +83,7 @@ pub(crate) fn build_exec_plan_fragment_params(
         None::<i32>,                               // arrow_flight_sql_version
         options.novarocks_report_addr,
         options.novarocks_typed_result_sink.then_some(true),
+        Some(true), // novarocks_generated_plan
     )
 }
 
@@ -412,6 +413,27 @@ mod tests {
     }
 
     #[test]
+    fn build_exec_params_marks_novarocks_generated_plan() {
+        let fr = empty_fragment_build_result(1, 2);
+        let thrift_fragment = noop_thrift_fragment();
+        let exec_params = fr.exec_params.clone();
+        let params = build_exec_plan_fragment_params(
+            &fr,
+            thrift_fragment,
+            exec_params,
+            None,
+            1,
+            ExecPlanFragmentParamOptions {
+                backend_num: Some(0),
+                novarocks_report_addr: None,
+                novarocks_typed_result_sink: false,
+            },
+        );
+
+        assert_eq!(params.novarocks_generated_plan, Some(true));
+    }
+
+    #[test]
     fn novarocks_report_addr_uses_private_thrift_field_id() {
         let idl = include_str!("../../idl/thrift/InternalService.thrift");
         let struct_body = idl
@@ -439,6 +461,10 @@ mod tests {
         assert!(
             struct_body.contains("10002: optional bool novarocks_typed_result_sink;"),
             "novarocks_typed_result_sink must use a NovaRocks-private high field id"
+        );
+        assert!(
+            struct_body.contains("10003: optional bool novarocks_generated_plan;"),
+            "novarocks_generated_plan must use a NovaRocks-private high field id"
         );
     }
 }

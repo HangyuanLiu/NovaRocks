@@ -40,6 +40,7 @@ mod schema_scan;
 mod select;
 mod set_op;
 mod sort;
+mod starrocks_scan;
 mod table_function;
 mod union;
 
@@ -84,6 +85,7 @@ pub(crate) use schema_scan::lower_schema_scan_node;
 pub(crate) use select::lower_select_node;
 pub(crate) use set_op::{lower_except_node, lower_intersect_node};
 pub(crate) use sort::lower_sort_node;
+pub(crate) use starrocks_scan::lower_starrocks_scan_node;
 pub(crate) use table_function::lower_table_function_node;
 pub(crate) use union::lower_union_node;
 
@@ -91,6 +93,12 @@ pub(crate) use union::lower_union_node;
 pub(crate) struct Lowered {
     pub(crate) node: ExecNode,
     pub(crate) layout: Layout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlanOrigin {
+    StarRocksFeCompatible,
+    NovaRocksGenerated,
 }
 
 #[cfg(test)]
@@ -216,6 +224,7 @@ pub(crate) fn lower_plan(
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
+    plan_origin: PlanOrigin,
 ) -> Result<Lowered, String> {
     let mut idx = 0usize;
     let global_common_slot_map = collect_global_common_slot_map(&plan.nodes);
@@ -242,6 +251,7 @@ pub(crate) fn lower_plan(
         &global_common_slot_map,
         last_query_id,
         fe_addr,
+        plan_origin,
     )?;
     if idx != plan.nodes.len() {
         // best-effort: ignore trailing nodes
@@ -293,6 +303,7 @@ fn lower_node(
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
+    plan_origin: PlanOrigin,
 ) -> Result<Lowered, String> {
     let root_index = *idx;
     let root_node = nodes
@@ -336,6 +347,7 @@ fn lower_node(
             global_common_slot_map,
             last_query_id,
             fe_addr,
+            plan_origin,
         )?;
         if let Some(parent) = stack.last_mut() {
             parent.children.push(lowered);
@@ -362,6 +374,7 @@ fn lower_node_with_children(
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
+    plan_origin: PlanOrigin,
 ) -> Result<Lowered, String> {
     let mut out_layout = layout_for_row_tuples(&node.row_tuples, tuple_slots);
     // Some plan nodes carry multiple tuples in `row_tuples` (e.g. aggregate intermediate vs output).
@@ -461,6 +474,7 @@ fn lower_node_with_children(
                 arena,
                 desc_tbl,
                 query_global_dict_map,
+                plan_origin,
             )?
         }
         t if t == plan_nodes::TPlanNodeType::UNION_NODE => lower_union_node(
@@ -574,12 +588,17 @@ fn lower_node_with_children(
             db_name,
             fe_addr,
         )?,
-        t if t == plan_nodes::TPlanNodeType::OLAP_SCAN_NODE => {
-            return Err(
-                "OLAP_SCAN_NODE is not supported in novarocks yet. Phase 1 only supports shared-data LAKE_SCAN_NODE queries"
-                    .to_string(),
-            );
-        }
+        t if t == plan_nodes::TPlanNodeType::OLAP_SCAN_NODE => lower_starrocks_scan_node(
+            node,
+            desc_tbl,
+            tuple_slots,
+            layout_hints,
+            exec_params,
+            query_opts,
+            connectors,
+            query_global_dict_map,
+            plan_origin,
+        )?,
         t if t == plan_nodes::TPlanNodeType::AGGREGATION_NODE => {
             if children.len() != 1 {
                 return Err(format!(
@@ -784,6 +803,7 @@ fn is_scan_node_type(t: plan_nodes::TPlanNodeType) -> bool {
     matches!(
         t,
         plan_nodes::TPlanNodeType::MYSQL_SCAN_NODE
+            | plan_nodes::TPlanNodeType::OLAP_SCAN_NODE
             | plan_nodes::TPlanNodeType::FILE_SCAN_NODE
             | plan_nodes::TPlanNodeType::JDBC_SCAN_NODE
             | plan_nodes::TPlanNodeType::HDFS_SCAN_NODE
