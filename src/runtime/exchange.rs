@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, ArrayRef, Int8Array};
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -987,6 +987,51 @@ fn normalize_exchange_batch_for_schema(
     })
 }
 
+fn validate_exchange_dictionary_batch(batch: &RecordBatch) -> Result<(), String> {
+    for (idx, (field, column)) in batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .enumerate()
+    {
+        let field_type = field.data_type();
+        let column_type = column.data_type();
+        if !matches!(field_type, DataType::Dictionary(_, _))
+            && !matches!(column_type, DataType::Dictionary(_, _))
+        {
+            continue;
+        }
+        if field_type != column_type {
+            return Err(format!(
+                "exchange dictionary schema mismatch at column {idx} field {}: field_type={field_type:?} column_type={column_type:?}",
+                field.name()
+            ));
+        }
+        match field_type {
+            DataType::Dictionary(key_type, value_type)
+                if key_type.as_ref() == &DataType::Int32
+                    && matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) => {}
+            other => {
+                return Err(format!(
+                    "exchange dictionary column {idx} field {} has unsupported dictionary type {other:?}",
+                    field.name()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_exchange_dictionary_carrier_for_expected(expected: &DataType, actual: &DataType) -> bool {
+    match (expected, actual) {
+        (DataType::Utf8 | DataType::LargeUtf8, DataType::Dictionary(key_type, value_type)) => {
+            key_type.as_ref() == &DataType::Int32 && value_type.as_ref() == expected
+        }
+        _ => false,
+    }
+}
+
 fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
     if chunks.is_empty() {
         return Ok(vec![]);
@@ -1013,9 +1058,7 @@ fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("failed to create Arrow IPC writer: {e}"))?;
 
     for batch in batches {
-        #[cfg(debug_assertions)]
-        crate::exec::chunk::assert_no_dictionary(&batch)
-            .expect("dict must not cross exchange in C0");
+        validate_exchange_dictionary_batch(&batch)?;
         writer
             .write(&batch)
             .map_err(|e| format!("failed to write batch: {e}"))?;
@@ -1172,23 +1215,26 @@ fn materialize_chunk_for_wire_meta(
         if field.data_type() != expected_arrow_type {
             let root = format!("slot {}", expected_slot.slot_id());
             check_exchange_data_type(expected_arrow_type, field.data_type(), &root)?;
-            out_column = crate::exec::chunk::type_compatibility::retag_column(
-                batch.column(idx),
-                expected_arrow_type,
-            )
-            .map_err(|m| {
-                format!(
-                    "exchange decoded arrow type mismatch at index {} for slot {}: batch={:?} expected={:?} ({:?})",
-                    idx, slot_id, field.data_type(), expected_arrow_type, m.kind
+            if !is_exchange_dictionary_carrier_for_expected(expected_arrow_type, field.data_type())
+            {
+                out_column = crate::exec::chunk::type_compatibility::retag_column(
+                    batch.column(idx),
+                    expected_arrow_type,
                 )
-            })?;
-            out_field = arrow::datatypes::Field::new(
-                field.name(),
-                expected_arrow_type.clone(),
-                field.is_nullable(),
-            )
-            .with_metadata(field.metadata().clone());
-            any_materialized = true;
+                .map_err(|m| {
+                    format!(
+                        "exchange decoded arrow type mismatch at index {} for slot {}: batch={:?} expected={:?} ({:?})",
+                        idx, slot_id, field.data_type(), expected_arrow_type, m.kind
+                    )
+                })?;
+                out_field = arrow::datatypes::Field::new(
+                    field.name(),
+                    expected_arrow_type.clone(),
+                    field.is_nullable(),
+                )
+                .with_metadata(field.metadata().clone());
+                any_materialized = true;
+            }
         }
 
         // Use the expected schema's slot ID (not the wire ID) so the decoded
@@ -1343,9 +1389,10 @@ pub fn decode_chunks_for_sender(
 #[cfg(test)]
 mod tests {
     use arrow::array::{
-        Array, ArrayRef, Decimal128Array, Int32Array, Int64Array, StringArray, make_array,
+        Array, ArrayRef, Decimal128Array, DictionaryArray, Int32Array, Int64Array, StringArray,
+        make_array,
     };
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
     use arrow::record_batch::RecordBatchOptions;
     use std::sync::Arc;
@@ -1357,7 +1404,7 @@ mod tests {
     };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::schema_thrift::chunk_slot_schema_from_type_desc;
-    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
     use crate::thrift::types;
 
     const EXCHANGE_TEST_SLOT_IDS: [SlotId; 4] = [
@@ -1449,6 +1496,183 @@ mod tests {
             None,
             None,
         )])
+    }
+
+    fn dictionary_status_chunk(
+        slot_id: SlotId,
+        keys: Vec<Option<i32>>,
+        values: Vec<&str>,
+    ) -> Chunk {
+        let dict = DictionaryArray::<Int32Type>::new(
+            Int32Array::from(keys),
+            Arc::new(StringArray::from(values)),
+        );
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                slot_id,
+                Field::new("status", DataType::Utf8, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        Chunk::try_new_with_columns(schema, vec![Arc::new(dict) as ArrayRef])
+            .expect("dictionary chunk")
+    }
+
+    fn logical_status_schema(slot_id: SlotId) -> ChunkSchemaRef {
+        Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                slot_id,
+                Field::new("status", DataType::Utf8, true),
+                None,
+                None,
+            )])
+            .expect("logical status schema"),
+        )
+    }
+
+    fn dictionary_chunk_with_type(slot_id: SlotId, data_type: DataType, column: ArrayRef) -> Chunk {
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                slot_id,
+                Field::new("bad_dict", data_type, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        Chunk::try_new_with_columns(schema, vec![column]).expect("dictionary chunk")
+    }
+
+    fn logical_utf8_values(array: &ArrayRef) -> Vec<Option<String>> {
+        let flat =
+            arrow::compute::cast(array.as_ref(), &DataType::Utf8).expect("cast dictionary to utf8");
+        let strings = flat
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 array");
+        (0..strings.len())
+            .map(|idx| {
+                if strings.is_null(idx) {
+                    None
+                } else {
+                    Some(strings.value(idx).to_string())
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn encode_chunks_round_trips_dictionary_batches_with_replaced_values() {
+        let first = dictionary_status_chunk(
+            SlotId::new(71),
+            vec![Some(0), Some(1), None, Some(0)],
+            vec!["PAID", "NEW"],
+        );
+        let second = dictionary_status_chunk(
+            SlotId::new(71),
+            vec![Some(0), Some(1), Some(0), None],
+            vec!["CANCELLED", "PAID"],
+        );
+
+        let bytes = encode_chunks(&[first, second], true).expect("encode dictionary chunks");
+        let decoded = decode_chunks(&bytes).expect("decode dictionary chunks");
+
+        assert_eq!(decoded.len(), 2);
+        assert!(matches!(
+            decoded[0].columns()[0].data_type(),
+            DataType::Dictionary(_, _)
+        ));
+        assert!(matches!(
+            decoded[1].columns()[0].data_type(),
+            DataType::Dictionary(_, _)
+        ));
+        assert_eq!(
+            logical_utf8_values(&decoded[0].columns()[0]),
+            vec![
+                Some("PAID".to_string()),
+                Some("NEW".to_string()),
+                None,
+                Some("PAID".to_string()),
+            ]
+        );
+        assert_eq!(
+            logical_utf8_values(&decoded[1].columns()[0]),
+            vec![
+                Some("CANCELLED".to_string()),
+                Some("PAID".to_string()),
+                Some("CANCELLED".to_string()),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_chunks_for_sender_preserves_dictionary_carrier_with_logical_expected_schema() {
+        let key = ExchangeKey {
+            finst_id_hi: 1701,
+            finst_id_lo: 1702,
+            node_id: 77,
+        };
+        let chunk = dictionary_status_chunk(
+            SlotId::new(72),
+            vec![Some(0), Some(1), Some(0)],
+            vec!["SHIPPED", "PAID"],
+        );
+        register_expected_chunk_schema(key, 1, logical_status_schema(SlotId::new(72)))
+            .expect("register schema");
+
+        let payload = encode_chunks(&[chunk], true).expect("encode dictionary payload");
+        let decoded = decode_chunks_for_sender(key, 9, 1, &payload).expect("decode sender payload");
+
+        assert_eq!(decoded.len(), 1);
+        assert!(matches!(
+            decoded[0].columns()[0].data_type(),
+            DataType::Dictionary(_, _)
+        ));
+        assert_eq!(
+            logical_utf8_values(&decoded[0].columns()[0]),
+            vec![
+                Some("SHIPPED".to_string()),
+                Some("PAID".to_string()),
+                Some("SHIPPED".to_string()),
+            ]
+        );
+
+        cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn encode_chunks_rejects_dictionary_with_non_int32_key() {
+        let dict = arrow::array::DictionaryArray::<arrow::datatypes::Int8Type>::new(
+            arrow::array::Int8Array::from(vec![Some(0_i8), Some(1_i8)]),
+            Arc::new(StringArray::from(vec!["PAID", "NEW"])),
+        );
+        let data_type = dict.data_type().clone();
+        let chunk =
+            dictionary_chunk_with_type(SlotId::new(73), data_type, Arc::new(dict) as ArrayRef);
+
+        let err = encode_chunks(&[chunk], true).expect_err("unsupported key type");
+
+        assert!(err.contains("unsupported dictionary type"), "err={err}");
+        assert!(err.contains("Int8"), "err={err}");
+    }
+
+    #[test]
+    fn encode_chunks_rejects_dictionary_with_non_string_values() {
+        let dict = DictionaryArray::<Int32Type>::new(
+            Int32Array::from(vec![Some(0), Some(1)]),
+            Arc::new(Int32Array::from(vec![10, 20])),
+        );
+        let data_type = dict.data_type().clone();
+        let chunk =
+            dictionary_chunk_with_type(SlotId::new(74), data_type, Arc::new(dict) as ArrayRef);
+
+        let err = encode_chunks(&[chunk], true).expect_err("unsupported value type");
+
+        assert!(err.contains("unsupported dictionary type"), "err={err}");
+        assert!(err.contains("Int32"), "err={err}");
     }
 
     #[test]
