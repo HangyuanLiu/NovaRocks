@@ -9,7 +9,8 @@ CREATE TABLE ${case_db}.decimal_main_test (
     category VARCHAR(10),
     d50_15 DECIMAL(50,15),
     d76_20 DECIMAL(76,20)
-) PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Create secondary test table for joins
 CREATE TABLE ${case_db}.decimal_secondary_test (
@@ -17,7 +18,8 @@ CREATE TABLE ${case_db}.decimal_secondary_test (
     ref_category VARCHAR(10),
     threshold_d50 DECIMAL(50,15),
     threshold_d76 DECIMAL(76,20)
-) PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert test data into main table - using decimal256 values beyond decimal128 range
 INSERT INTO ${case_db}.decimal_main_test VALUES

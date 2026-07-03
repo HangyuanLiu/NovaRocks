@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_empty_input_null_semantics;
 CREATE TABLE ${case_db}.t_agg_empty_input_null_semantics (
     g INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_empty_input_null_semantics VALUES
     (1, 10),

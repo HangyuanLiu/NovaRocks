@@ -13,7 +13,8 @@ CREATE TABLE ${case_db}.t_agg_statistic_null_window (
     no INT,
     k DECIMAL(10, 2),
     v DECIMAL(10, 2)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_statistic_null_window VALUES
     (1, 10, NULL),

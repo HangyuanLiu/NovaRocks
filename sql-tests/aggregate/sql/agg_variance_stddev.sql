@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_variance_stddev;
 CREATE TABLE ${case_db}.t_agg_variance_stddev (
     g INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_variance_stddev VALUES
     (1, 10),

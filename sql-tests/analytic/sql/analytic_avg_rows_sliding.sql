@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_analytic_avg_rows_sliding (
     grp VARCHAR(10),
     ts INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_avg_rows_sliding VALUES
     ('A', 1, 10),

@@ -23,12 +23,8 @@ CREATE TABLE `t_without_null` (
   `c_date` DATE NOT NULL,
   `c_datetime` DATETIME NOT NULL,
   `c_decimal` DECIMAL64(9,3) NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c_id`)
-DISTRIBUTED BY HASH(`c_id`) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

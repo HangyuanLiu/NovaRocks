@@ -15,12 +15,8 @@ CREATE TABLE ${case_db}.`t_decimal_precision_overflow` (
   `c_d64_max` decimal64(18,9) NOT NULL,
   `c_d128_large` decimal128(30,10) NOT NULL,
   `c_d128_max` decimal128(38,15) NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c_id`)
-DISTRIBUTED BY HASH(`c_id`) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert test data that will definitely cause precision overflow when multiplied
 -- decimal64(18,9) * decimal64(18,9) = precision 36, scale 18 (fits in decimal128)

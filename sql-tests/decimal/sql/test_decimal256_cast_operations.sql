@@ -23,12 +23,8 @@ CREATE TABLE ${case_db}.cast_test_source (
     -- regular decimal columns for comparison (precision <= 38)
     decimal_38_10 decimal(38,10),     -- 38 digits total, 10 after decimal
     decimal_20_5 decimal(20,5)        -- 20 digits total, 5 after decimal
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert comprehensive test data with correct digit limits
 INSERT INTO ${case_db}.cast_test_source VALUES
@@ -121,12 +117,8 @@ CREATE TABLE ${case_db}.cast_test_target (
     target_decimal256 decimal(76,20),
     target_decimal38 decimal(38,10),
     target_int bigint
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.cast_test_target VALUES
 (1, 12345678901234567890123456789012345678901234567890123456.12345678901234567890, 1234567890123456789012345678.1234567890, 9223372036854775807),

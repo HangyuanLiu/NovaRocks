@@ -18,13 +18,8 @@ CREATE TABLE `t0` (
   `c0` bigint DEFAULT NULL,
   `c1` bigint DEFAULT NULL,
   `c2` bigint DEFAULT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c0`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`c0`) BUCKETS 2
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
@@ -125,13 +120,8 @@ CREATE TABLE `t1` (
   `c0` string DEFAULT NULL,
   `c1` bigint DEFAULT NULL,
   `c2` bigint DEFAULT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c0`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`c0`) BUCKETS 96
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 27
 -- @skip_result_check=true
@@ -162,13 +152,8 @@ CREATE TABLE `t2` (
   `c0` string DEFAULT NULL,
   `c1` bigint DEFAULT NULL,
   `c2` bigint DEFAULT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c0`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`c0`) BUCKETS 96
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 33
 -- @skip_result_check=true

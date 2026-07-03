@@ -13,7 +13,8 @@ create table t0 (
     c0 DATE,
     c1 INT,
     c2 BIGINT
-) DUPLICATE key (c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -84,13 +85,8 @@ USE ${case_db};
 create table t1 (
     c0 DATE,
     c1 INT
-) DUPLICATE key (c0)
-PARTITION BY RANGE(c0) (
-    PARTITION p202401 VALUES [("2024-01-01"), ("2024-02-01")),
-    PARTITION p202402 VALUES [("2024-02-01"), ("2024-03-01"))
 )
-DISTRIBUTED BY HASH(c1) BUCKETS 3
-PROPERTIES('replication_num' = '1');
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 19
 -- @skip_result_check=true
@@ -141,7 +137,8 @@ select min(c0), max(c0), min(c1), max(c1) from t1 TEMPORARY PARTITION(tp202403);
 USE ${case_db};
 create table t2 (
     c0 INT
-) DUPLICATE key (c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 30
 -- @skip_result_check=true

@@ -16,7 +16,8 @@ CREATE TABLE ${case_db}.t_agg_percentile_semantics (
     d DATE,
     dt DATETIME,
     dbl DOUBLE
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_percentile_semantics VALUES
     (1, 10, 1, '2018-01-01', '2018-01-01 00:00:01', 11.1),

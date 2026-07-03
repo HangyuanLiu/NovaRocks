@@ -13,7 +13,8 @@ CREATE TABLE ${case_db}.t_dg (
     g INT,
     x INT,
     a BIGINT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

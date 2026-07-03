@@ -13,12 +13,7 @@ CREATE TABLE aggtest(
                         no int,
                         k decimal(10,2) ,
                         v decimal(10,2))
-                        DUPLICATE KEY (no)
-                        DISTRIBUTED BY HASH (no)
-                        PROPERTIES (
-                        "replication_num" = "1",
-                        "storage_format" = "v2"
-                    );
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 USE ${case_db};
@@ -87,12 +82,7 @@ CREATE TABLE aggtest(
                         no int,
                         k decimal(10,2) ,
                         v decimal(10,2))
-                        DUPLICATE KEY (no)
-                        DISTRIBUTED BY HASH (no)
-                        PROPERTIES (
-                        "replication_num" = "1",
-                        "storage_format" = "v2"
-                    );
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 18
 USE ${case_db};
@@ -161,12 +151,7 @@ CREATE TABLE aggtest(
                         no int,
                         k decimal(10,2) ,
                         v decimal(10,2))
-                        DUPLICATE KEY (no)
-                        DISTRIBUTED BY HASH (no)
-                        PROPERTIES (
-                        "replication_num" = "1",
-                        "storage_format" = "v2"
-                    );
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 33
 USE ${case_db};

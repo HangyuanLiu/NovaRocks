@@ -15,12 +15,14 @@ CREATE TABLE ${case_db}.t_agg_sum_map_basic (
     m_int MAP<INT, INT>,
     m_str MAP<STRING, BIGINT>,
     m_double MAP<INT, DOUBLE>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE ${case_db}.t_agg_sum_map_nullable (
     id INT,
     m_nullable MAP<INT, INT>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_sum_map_basic VALUES
     (1, map{1:10, 2:20, 3:30}, map{'a':100, 'b':200}, map{1:1.5, 2:2.5}),

@@ -17,7 +17,8 @@ CREATE TABLE ${case_db}.decimal_window_test (
     d50_15 DECIMAL(50,15),    -- 35 integer digits + 15 decimal digits
     d76_20 DECIMAL(76,20),    -- 56 integer digits + 20 decimal digits
     d76_0 DECIMAL(76,0)       -- 76 integer digits + 0 decimal digits
-) PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert test data - using values beyond decimal128 range (>38 digits)
 -- Each category has multiple rows for proper window function testing

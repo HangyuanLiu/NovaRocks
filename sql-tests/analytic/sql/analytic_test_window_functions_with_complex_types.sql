@@ -38,9 +38,8 @@ c25 json,
 c26 varbinary,
 c27 map<varchar(1048576),varchar(1048576)>,
 c28 struct<col1 array<varchar(1048576)>>,
-c29 array<varchar(100)>) DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1)
-PROPERTIES (  "replication_num" = "1");
+c29 array<varchar(100)>)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t1 VALUES
 (
   '2024-01-01',                    -- k1

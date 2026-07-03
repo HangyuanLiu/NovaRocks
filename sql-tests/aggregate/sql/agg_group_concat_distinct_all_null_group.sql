@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_group_concat_distinct_all_null_group;
 CREATE TABLE ${case_db}.t_agg_group_concat_distinct_all_null_group (
     g INT,
     s STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_group_concat_distinct_all_null_group VALUES
     (1, NULL),

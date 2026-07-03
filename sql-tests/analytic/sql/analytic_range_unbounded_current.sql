@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_analytic_range_unbounded_current (
     grp VARCHAR(10),
     ord_key INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_range_unbounded_current VALUES
     ('A', 1, 10),

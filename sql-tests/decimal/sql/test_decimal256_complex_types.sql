@@ -19,7 +19,8 @@ CREATE TABLE ${case_db}.decimal_array_test (
     decimal_array_50 ARRAY<DECIMAL(50,15)>,
     decimal_array_76 ARRAY<DECIMAL(76,20)>,
     simple_decimals ARRAY<DECIMAL(40,10)>
-) PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert test data for arrays - using decimal256 values beyond decimal128 range
 INSERT INTO ${case_db}.decimal_array_test VALUES
@@ -48,7 +49,8 @@ CREATE TABLE ${case_db}.decimal_map_test (
     decimal_map_50 MAP<STRING, DECIMAL(50,15)>,
     decimal_map_76 MAP<STRING, DECIMAL(76,0)>,
     key_decimal_map MAP<DECIMAL(40,10), STRING>
-) PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert test data for maps - using decimal256 values beyond decimal128 range
 INSERT INTO ${case_db}.decimal_map_test VALUES
@@ -91,7 +93,8 @@ CREATE TABLE ${case_db}.decimal_struct_test (
             last_transaction DECIMAL(40,10)
         >
     >
-) PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert test data for structs - using decimal256 values beyond decimal128 range
 INSERT INTO ${case_db}.decimal_struct_test VALUES
@@ -123,7 +126,8 @@ CREATE TABLE ${case_db}.complex_nested_test (
         metadata MAP<STRING, DECIMAL(40,10)>
     >>,
     risk_metrics MAP<STRING, ARRAY<DECIMAL(76,20)>>
-) PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert test data for complex nested structures - using decimal256 values beyond decimal128 range
 INSERT INTO ${case_db}.complex_nested_test VALUES

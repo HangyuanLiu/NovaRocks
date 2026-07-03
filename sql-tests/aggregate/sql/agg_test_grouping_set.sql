@@ -14,15 +14,8 @@ CREATE TABLE `t0` (
   `v2` bigint(20) NULL COMMENT "",
   `v3` bigint(20) NULL COMMENT "",
   `v4` varchar NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`, `v2`, `v3`)
-DISTRIBUTED BY HASH(`v1`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1",
-"enable_persistent_index" = "true",
-"replicated_storage" = "true",
-"compression" = "LZ4"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_analytic_range_unbounded_following_full_partition (
     grp VARCHAR(10),
     ord_key INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_range_unbounded_following_full_partition VALUES
     ('A', 1, 10),

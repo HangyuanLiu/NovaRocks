@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_analytic_row_rank_dense (
     grp VARCHAR(10),
     id INT,
     score INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_row_rank_dense VALUES
     ('A', 1, 100),

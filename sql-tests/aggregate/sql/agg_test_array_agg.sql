@@ -16,15 +16,8 @@ CREATE TABLE `ss` (
   `score` int(11) NULL COMMENT "",
    arr array<int>,
    mmap map<int,varchar(20)>
-) ENGINE=OLAP
-DUPLICATE KEY(`id`)
-DISTRIBUTED BY HASH(`id`) BUCKETS 4
-PROPERTIES (
-"replication_num" = "1",
-"enable_persistent_index" = "true",
-"replicated_storage" = "true",
-"compression" = "LZ4"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -1243,8 +1236,8 @@ create table test_array_agg (
     col_array ARRAY<INT>,
     col_map MAP<STRING, INT>,
     col_struct STRUCT<f1 INT, f2 STRING>
-) DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 293
 -- @skip_result_check=true

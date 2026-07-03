@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_agg_group_concat_empty_separator (
     g INT,
     ord INT,
     s STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_group_concat_empty_separator VALUES
     (1, 1, 'a'),

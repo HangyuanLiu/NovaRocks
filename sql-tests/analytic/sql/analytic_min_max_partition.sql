@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_analytic_min_max_partition (
     grp VARCHAR(10),
     id INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_min_max_partition VALUES
     ('A', 1, 9),

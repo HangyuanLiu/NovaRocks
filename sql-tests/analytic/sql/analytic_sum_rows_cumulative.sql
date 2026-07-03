@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_analytic_sum_rows_cumulative (
     grp VARCHAR(10),
     ts INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_sum_rows_cumulative VALUES
     ('A', 1, 2),

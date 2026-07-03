@@ -16,15 +16,18 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.powers_of_2 (
     power_250 DECIMAL(76, 0)
-) PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- pow(2, 250)
 insert into ${case_db}.powers_of_2 select 1809251394333065553493296640760748560207343510400633813116524750123642650624;
 
-create table ${case_db}.test_256max_result(d1 decimal(76, 0)) PROPERTIES("replication_num"="1");
+create table ${case_db}.test_256max_result(d1 decimal(76, 0))
+TBLPROPERTIES ("format-version" = "3");
 insert into ${case_db}.test_256max_result select 1496577676626844588240573307387100039795808514605057;
 
-create table ${case_db}.test_256min_result(d1 decimal(76, 0), d2 decimal(76, 0)) PROPERTIES("replication_num"="1");
+create table ${case_db}.test_256min_result(d1 decimal(76, 0), d2 decimal(76, 0))
+TBLPROPERTIES ("format-version" = "3");
 insert into ${case_db}.test_256min_result select 340282366920938463463374607431768211456, -170141183460469231731687303715884105728;
 
 CREATE TABLE ${case_db}.test_decimal_multiply_overflow (
@@ -36,7 +39,8 @@ CREATE TABLE ${case_db}.test_decimal_multiply_overflow (
     d76_38 DECIMAL(76, 38),
     d50_0  DECIMAL(50, 0),
     d38_0  DECIMAL(38, 0)
-) PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.test_decimal_multiply_overflow VALUES
 -- 1. Small values
@@ -83,7 +87,8 @@ CREATE TABLE ${case_db}.test_boundary_values (
     val_19_0 DECIMAL(19, 0),
     val_25_0 DECIMAL(25, 0),
     val_high_scale DECIMAL(76, 50)
-) PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.test_boundary_values VALUES
 -- 1. Near 76-digit decimal maximum
@@ -122,7 +127,8 @@ CREATE TABLE ${case_db}.test_progressive_boundary (
     id INT,
     digits INT,
     test_val DECIMAL(76, 0)
-) PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.test_progressive_boundary VALUES
 (1, 10, 9999999999),

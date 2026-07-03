@@ -17,7 +17,8 @@ CREATE TABLE ${case_db}.t_agg_topk_extrema_misc (
     flag BOOLEAN,
     big_v BIGINT,
     w BIGINT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_topk_extrema_misc VALUES
     (1, 1, 10, 'delta', TRUE, 10000000, 3),

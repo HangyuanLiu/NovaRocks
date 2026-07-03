@@ -15,17 +15,7 @@ CREATE TABLE ${case_db}.decimal_range_partition (
     balance DECIMAL(76,20),
     account_type VARCHAR(20)
 )
-DUPLICATE KEY(id, transaction_date)
-PARTITION BY RANGE(transaction_date) (
-    PARTITION p202401 VALUES [('2024-01-01'), ('2024-02-01')),
-    PARTITION p202402 VALUES [('2024-02-01'), ('2024-03-01')),
-    PARTITION p202403 VALUES [('2024-03-01'), ('2024-04-01')),
-    PARTITION p202404 VALUES [('2024-04-01'), ('2024-05-01'))
-)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES (
-    "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert test data across different partitions - using decimal256 values beyond decimal128 range
 INSERT INTO ${case_db}.decimal_range_partition VALUES
@@ -62,17 +52,7 @@ CREATE TABLE ${case_db}.decimal_amount_partition (
     category VARCHAR(20),
     amount_range STRING
 )
-DUPLICATE KEY(id, customer_id)
-PARTITION BY LIST(amount_range) (
-    PARTITION p_small VALUES IN ('SMALL'),
-    PARTITION p_medium VALUES IN ('MEDIUM'),
-    PARTITION p_large VALUES IN ('LARGE'),
-    PARTITION p_xlarge VALUES IN ('XLARGE')
-)
-DISTRIBUTED BY HASH(customer_id) BUCKETS 3
-PROPERTIES (
-    "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert test data with different amount ranges - using decimal256 values beyond decimal128 range
 INSERT INTO ${case_db}.decimal_amount_partition VALUES

@@ -14,10 +14,7 @@ CREATE TABLE tbinary_ndv_test (
     data VARBINARY,
     category INT
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id)
-BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -82,10 +79,7 @@ CREATE TABLE tbinary_ndv_null_test (
     data VARBINARY,
     category INT
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id)
-BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 16
 -- @skip_result_check=true
@@ -124,10 +118,7 @@ CREATE TABLE tbinary_ndv_dup_test (
     id INT,
     data VARBINARY
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id)
-BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 22
 -- @skip_result_check=true
@@ -159,10 +150,7 @@ CREATE TABLE tbinary_multi_distinct_test (
     data3 VARBINARY,
     category INT
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id)
-BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 26
 -- @skip_result_check=true
@@ -294,10 +282,7 @@ CREATE TABLE tbinary_multi_null_test (
     data2 VARBINARY,
     category INT
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id)
-BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 39
 -- @skip_result_check=true

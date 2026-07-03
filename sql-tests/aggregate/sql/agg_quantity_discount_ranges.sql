@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_quantity_discount_ranges;
 CREATE TABLE ${case_db}.t_agg_quantity_discount_ranges (
     lo_quantity INT,
     lo_discount INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_quantity_discount_ranges VALUES
     (1, 0),

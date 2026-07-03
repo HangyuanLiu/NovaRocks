@@ -10,10 +10,10 @@
 CREATE TABLE ${case_db}.test_ignore_nulls_page_uv (
     page_id INT NOT NULL,
     visit_date datetime NOT NULL,
-    visit_users BITMAP BITMAP_UNION NOT NULL,
-    click_times hll hll_union
-) AGGREGATE KEY(page_id, visit_date)
-DISTRIBUTED BY HASH(page_id) BUCKETS 3;
+    visit_users BITMAP NOT NULL,
+    click_times hll
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.test_ignore_nulls_page_uv VALUES (1, '2020-06-23 01:30:30', to_bitmap(1001), hll_hash(5));
 INSERT INTO ${case_db}.test_ignore_nulls_page_uv VALUES (1, '2020-06-23 01:30:30', to_bitmap(1001), hll_hash(5));

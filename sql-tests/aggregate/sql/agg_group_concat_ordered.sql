@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_group_concat_ordered;
 CREATE TABLE ${case_db}.t_agg_group_concat_ordered (
     k INT,
     s STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_group_concat_ordered VALUES
     (1, 'b'),

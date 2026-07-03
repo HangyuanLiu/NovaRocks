@@ -24,10 +24,7 @@ CREATE TABLE t1 (
     c12 map<double, double>,
     c13 struct<a bigint, b double>
     )
-DUPLICATE KEY(c1)
-DISTRIBUTED BY HASH(c1)
-BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -459,13 +456,8 @@ USE ${case_db};
 CREATE TABLE `t2` (
   `k` int(11) NULL COMMENT "",
   `v` int(11) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`k`, `v`)
-PARTITION BY (`k`)
-DISTRIBUTED BY RANDOM
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 105
 -- @skip_result_check=true
@@ -559,14 +551,7 @@ CREATE TABLE `test_sorted_streaming_agg_percentile_weighted`
     `id_int` int(11) NOT NULL COMMENT "",
     `value` double NOT NULL COMMENT ""
 )
-ENGINE=OLAP
-DUPLICATE KEY(`id_int`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`id_int`)
-BUCKETS 1
-PROPERTIES (
-"replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 125
 -- @skip_result_check=true
@@ -592,15 +577,8 @@ CREATE TABLE `t0_convert_to_serialize_format` (
   `v1` bigint(20) NULL COMMENT "",
   `v2` bigint(20) NULL COMMENT "",
   `v3` bigint(20) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`, `v2`, `v3`)
-DISTRIBUTED BY HASH(`v1`) BUCKETS 3
-PROPERTIES (
-"compression" = "LZ4",
-"fast_schema_evolution" = "true",
-"replicated_storage" = "true",
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 130
 -- @skip_result_check=true
@@ -609,15 +587,8 @@ CREATE TABLE `t1_convert_to_serialize_format` (
   `v4` bigint(20) NULL COMMENT "",
   `v5` bigint(20) NULL COMMENT "",
   `v6` bigint(20) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`v4`, `v5`, `v6`)
-DISTRIBUTED BY HASH(`v4`) BUCKETS 3
-PROPERTIES (
-"compression" = "LZ4",
-"fast_schema_evolution" = "true",
-"replicated_storage" = "true",
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 131
 -- @skip_result_check=true

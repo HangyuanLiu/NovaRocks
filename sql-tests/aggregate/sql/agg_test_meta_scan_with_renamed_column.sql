@@ -5,7 +5,8 @@
 USE ${case_db};
 create table t2 (
     c0 INT
-) DUPLICATE key (c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 USE ${case_db};

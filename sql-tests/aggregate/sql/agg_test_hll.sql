@@ -13,10 +13,7 @@ CREATE TABLE t1 (
     c1 int,
     c2 int
     )
-DUPLICATE KEY(c1)
-DISTRIBUTED BY HASH(c1)
-BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

@@ -13,7 +13,8 @@ USE ${case_db};
 create table t0(
     c0 INT,
     c1 BIGINT
-) DUPLICATE KEY(c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -54,7 +55,8 @@ USE ${case_db};
 create table t1 (
     c0 INT,
     c1 BIGINT
-) DUPLICATE KEY(c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true

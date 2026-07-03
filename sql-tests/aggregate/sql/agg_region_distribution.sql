@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_region_distribution;
 CREATE TABLE ${case_db}.t_agg_region_distribution (
     c_custkey INT,
     c_region VARCHAR(32)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_region_distribution VALUES
     (1, 'AFRICA'),

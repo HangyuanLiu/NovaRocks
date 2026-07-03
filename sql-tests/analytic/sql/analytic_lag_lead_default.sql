@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_analytic_lag_lead_default (
     grp VARCHAR(10),
     ts INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_lag_lead_default VALUES
     ('A', 1, 10),

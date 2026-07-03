@@ -16,12 +16,14 @@ CREATE TABLE ${case_db}.t_agg_sketch_bitmap_source (
     id_int INT,
     name STRING,
     vb VARBINARY
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE ${case_db}.t_agg_ds_hll_state (
     grp INT,
     ds_vb BINARY
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_sketch_bitmap_source VALUES
     (1, 1, 'alpha', to_binary('alpha', 'utf8')),

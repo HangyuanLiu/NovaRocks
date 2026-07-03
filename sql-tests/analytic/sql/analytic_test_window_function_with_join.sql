@@ -1,7 +1,7 @@
 -- Migrated from: dev/test/sql/test_window_function/T/test_window_function_with_join
 -- Test Objective:
--- 1. Validate max() window function with CTEs when join type is bucket, broadcast, shuffle, and colocate.
--- 2. Confirm result is consistent regardless of join hint.
+-- 1. Validate max() window function with CTEs across legacy bracketed join hints.
+-- 2. Confirm result consistency for hint parsing without asserting distribution or placement semantics.
 
 -- query 1
 -- @skip_result_check=true
@@ -9,14 +9,8 @@ CREATE TABLE ${case_db}.`nt0` (
   `c0` bigint DEFAULT NULL,
   `c1` bigint DEFAULT NULL,
   `c2` bigint DEFAULT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c0`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`c0`) BUCKETS 48
-PROPERTIES (
-"colocate_with" = "nt0",
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.nt0 SELECT generate_series %4096, 4096 - generate_series, generate_series %4096 FROM TABLE(generate_series(1, 8192));
 INSERT INTO ${case_db}.nt0 SELECT * FROM ${case_db}.nt0;
@@ -28,14 +22,8 @@ CREATE TABLE ${case_db}.`nt3` (
   `c0` bigint DEFAULT NULL,
   `c1` bigint DEFAULT NULL,
   `c2` bigint DEFAULT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c0`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`c0`) BUCKETS 48
-PROPERTIES (
-"colocate_with" = "nt0",
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.nt3 SELECT * FROM ${case_db}.nt0;
 

@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_agg_map_agg_extract (
     g INT,
     k VARCHAR(10),
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_map_agg_extract VALUES
     (1, 'a', 10),

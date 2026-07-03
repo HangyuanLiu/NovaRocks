@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_group_sum_count_avg;
 CREATE TABLE ${case_db}.t_agg_group_sum_count_avg (
     g INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_group_sum_count_avg VALUES
     (1, 10),

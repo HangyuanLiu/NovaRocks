@@ -12,11 +12,16 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_count_dates;
 DROP TABLE IF EXISTS ${case_db}.t_agg_count_lineorder;
 DROP TABLE IF EXISTS ${case_db}.t_agg_count_part;
 DROP TABLE IF EXISTS ${case_db}.t_agg_count_supplier;
-CREATE TABLE ${case_db}.t_agg_count_customer (id INT);
-CREATE TABLE ${case_db}.t_agg_count_dates (id INT);
-CREATE TABLE ${case_db}.t_agg_count_lineorder (id INT);
-CREATE TABLE ${case_db}.t_agg_count_part (id INT);
-CREATE TABLE ${case_db}.t_agg_count_supplier (id INT);
+CREATE TABLE ${case_db}.t_agg_count_customer (id INT)
+TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t_agg_count_dates (id INT)
+TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t_agg_count_lineorder (id INT)
+TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t_agg_count_part (id INT)
+TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t_agg_count_supplier (id INT)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_count_customer VALUES
     (1),

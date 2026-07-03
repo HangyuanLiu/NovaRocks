@@ -13,15 +13,8 @@ CREATE TABLE `t1` (
   `v1` varchar(65533) NULL COMMENT "",
   `v2` bigint(20) NULL COMMENT "",
   `v3` bigint(20) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`)
-DISTRIBUTED BY HASH(`v1`) BUCKETS 8
-PROPERTIES (
-"compression" = "LZ4",
-"fast_schema_evolution" = "true",
-"replicated_storage" = "true",
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

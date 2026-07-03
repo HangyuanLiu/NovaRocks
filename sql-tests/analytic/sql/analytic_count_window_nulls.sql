@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_analytic_count_window_nulls (
     grp VARCHAR(10),
     ts INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_count_window_nulls VALUES
     ('A', 1, 10),

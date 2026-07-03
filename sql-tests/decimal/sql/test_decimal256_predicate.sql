@@ -14,12 +14,8 @@ CREATE TABLE ${case_db}.decimal_test (
     big_decimal decimal(50,15),
     huge_decimal decimal(76,20),
     max_decimal decimal(76,0)
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert test data with strict precision limits
 INSERT INTO ${case_db}.decimal_test VALUES

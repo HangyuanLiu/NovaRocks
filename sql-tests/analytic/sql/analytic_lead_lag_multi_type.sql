@@ -15,10 +15,8 @@ CREATE TABLE ${case_db}.t_ll_types (
   c4 FLOAT,
   c5 DECIMAL128(38, 20) NOT NULL,
   c6 DATE NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(c0, c1, c2)
-DISTRIBUTED BY HASH(c0, c1, c2) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_ll_types VALUES
   (1, 1, 'a', 'b', 1.23, 3.33, '2021-11-11'),

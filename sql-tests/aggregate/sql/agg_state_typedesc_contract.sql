@@ -5,7 +5,8 @@ CREATE TABLE ${case_db}.agg_state_typedesc_contract (
     k INT,
     v BIGINT,
     d DOUBLE
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.agg_state_typedesc_contract VALUES
     (1, 10, 10, 0.10),
     (1, 11, 20, 0.20),

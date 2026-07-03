@@ -20,7 +20,8 @@ CREATE TABLE ${case_db}.t_agg_collection_string_dict (
     city_null STRING,
     city_array ARRAY<STRING>,
     city_array_null ARRAY<STRING>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_collection_string_dict VALUES
     (1, 1, 'Tom', 90, [90, 90], ['a', 'b'], 'beijing', 'beijing', ['beijing', 'shanghai'], NULL),

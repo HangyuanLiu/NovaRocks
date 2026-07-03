@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_agg_count_if_nullable_composite (
     g INT,
     x INT,
     y INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_count_if_nullable_composite VALUES
     (1, 3, 1),

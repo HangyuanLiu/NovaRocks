@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_analytic_filter_topn_with_window (
     grp VARCHAR(10),
     id INT,
     score INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_filter_topn_with_window VALUES
     ('A', 1, 70),

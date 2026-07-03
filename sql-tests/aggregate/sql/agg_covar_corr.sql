@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_agg_covar_corr (
     g INT,
     x INT,
     y INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_covar_corr VALUES
     (1, 1, 2),

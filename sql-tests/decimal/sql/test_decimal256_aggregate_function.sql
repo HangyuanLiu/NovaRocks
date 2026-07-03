@@ -16,7 +16,8 @@ CREATE TABLE ${case_db}.decimal256_agg_test (
     p50s15 DECIMAL(50,15),
     p76s20 DECIMAL(76,20),
     p76s0 DECIMAL(76,0)
-) properties("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.decimal256_agg_test VALUES
 (1, 'A', 100.1234567890, 100.123456789012345, 100.12345678901234567890, 100),

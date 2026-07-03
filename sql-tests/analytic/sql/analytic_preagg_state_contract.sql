@@ -5,7 +5,8 @@ CREATE TABLE ${case_db}.analytic_preagg_state_contract (
     score INT,
     v BIGINT,
     d DOUBLE
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.analytic_preagg_state_contract VALUES
     (1, 100, 10, 0.10),
     (1, 90, 20, 0.20),

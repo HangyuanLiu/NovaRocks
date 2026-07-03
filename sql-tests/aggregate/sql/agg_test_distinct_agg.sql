@@ -16,16 +16,8 @@ CREATE TABLE `skew_agg` (
   `c3` bigint DEFAULT NULL,
   `c4` varchar(100) DEFAULT NULL,
   `c5` varchar(100) DEFAULT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c0`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`c0`, `c1`) BUCKETS 6
-PROPERTIES (
-"replication_num" = "1",
-"enable_persistent_index" = "true",
-"replicated_storage" = "true",
-"compression" = "LZ4"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

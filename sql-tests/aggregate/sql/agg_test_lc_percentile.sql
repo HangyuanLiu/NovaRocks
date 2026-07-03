@@ -17,15 +17,8 @@ CREATE TABLE `test_pc` (
   `name` varchar(255) NULL COMMENT "",
   `subject` varchar(255) NULL COMMENT "",
   `score` int(11) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`date`)
-DISTRIBUTED BY HASH(`id`) BUCKETS 4
-PROPERTIES (
-"replication_num" = "1",
-"enable_persistent_index" = "true",
-"replicated_storage" = "true",
-"compression" = "LZ4"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

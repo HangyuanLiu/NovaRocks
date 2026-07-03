@@ -14,13 +14,8 @@ CREATE TABLE `t1` (
   `c1` bigint DEFAULT NULL,
   `c2` bigint DEFAULT NULL,
   `c3` bigint DEFAULT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c0`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`c0`) BUCKETS 4
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 USE ${case_db};

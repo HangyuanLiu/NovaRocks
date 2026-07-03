@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_having_threshold;
 CREATE TABLE ${case_db}.t_agg_having_threshold (
     g INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_having_threshold VALUES
     (1, 5),

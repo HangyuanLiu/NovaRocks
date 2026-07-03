@@ -23,12 +23,8 @@ CREATE TABLE `t_without_null` (
   `c_date` DATE NOT NULL,
   `c_datetime` DATETIME NOT NULL,
   `c_decimal` DECIMAL64(9,3) NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c_id`)
-DISTRIBUTED BY HASH(`c_id`) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -311,12 +307,8 @@ CREATE TABLE `t_with_null` (
   `c_date` DATE NULL,
   `c_datetime` DATETIME NULL,
   `c_decimal` DECIMAL64(9,3) NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c_id`)
-DISTRIBUTED BY HASH(`c_id`) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 53
 -- @skip_result_check=true
@@ -668,12 +660,8 @@ CREATE TABLE `t_partition` (
   `c_date` DATE NULL,
   `c_datetime` DATETIME NULL,
   `c_decimal` DECIMAL64(9,3) NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c_id`)
-DISTRIBUTED BY HASH(`c_id`) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 119
 -- @skip_result_check=true
@@ -912,12 +900,8 @@ CREATE TABLE `t_bool` (
   `c_id` INT(11) NOT NULL,
   `c_partition` INT(11) NOT NULL,
   `c_bool` BOOLEAN NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c_id`)
-DISTRIBUTED BY HASH(`c_id`) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 164
 -- @skip_result_check=true
@@ -1015,9 +999,7 @@ CREATE TABLE lineitem (
     L_RETURNFLAG CHAR(1),
     L_LINENUMBER INT
 )
-DUPLICATE KEY(L_RETURNFLAG, L_LINENUMBER)
-DISTRIBUTED BY HASH(L_RETURNFLAG, L_LINENUMBER) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO lineitem
 SELECT 'A', 1 FROM TABLE(generate_series(1, 9))
 UNION ALL SELECT 'A', 2 FROM TABLE(generate_series(1, 8))

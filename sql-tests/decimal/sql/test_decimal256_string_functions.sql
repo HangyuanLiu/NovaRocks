@@ -10,7 +10,8 @@ CREATE TABLE ${case_db}.decimal_string_test (
     d76_20 DECIMAL(76,20),
     d76_0 DECIMAL(76,0),
     category VARCHAR(10)
-) PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert test data with various decimal patterns - using values that exceed decimal128 range
 INSERT INTO ${case_db}.decimal_string_test VALUES

@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_analytic_rows_following_empty_frame (
     grp VARCHAR(10),
     ts INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_rows_following_empty_frame VALUES
     ('A', 1, 10),

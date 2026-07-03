@@ -10,12 +10,8 @@ CREATE TABLE ${case_db}.`t0` (
   `v1` int(11) NULL,
   `v2` int(11) NULL,
   `v3` int(11) NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`)
-DISTRIBUTED BY HASH(`v1`) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.`t0` (v1, v2, v3) values
     (1, 1, 1),
@@ -113,12 +109,8 @@ CREATE TABLE ${case_db}.`t_all_null` (
   `v1` int(11) NULL,
   `v2` int(11) NULL,
   `v3` int(11) NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`)
-DISTRIBUTED BY HASH(`v1`) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.`t_all_null` (v1, v2, v3) values
     (1, 1, NULL),

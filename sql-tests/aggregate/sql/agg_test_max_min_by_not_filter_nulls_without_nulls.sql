@@ -13,15 +13,8 @@ CREATE TABLE IF NOT EXISTS t0
   c1 INT NOT NULL,
   c2 DECIMAL128(7, 2) NOT NULL,
   c3 VARCHAR(10) NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`c0`, `c1`, `c2`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`c0`, `c1`) BUCKETS 32
-PROPERTIES(
-  "replication_num" = "1",
-  "in_memory" = "false",
-  "storage_format" = "default"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO t0
 (c0, c1, c2, c3)
 VALUES

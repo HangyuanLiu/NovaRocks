@@ -14,17 +14,13 @@ CREATE TABLE ${case_db}.t1 (
     c2 INT NOT NULL,
     c3 INT NOT NULL
 )
-DUPLICATE KEY(c1)
-DISTRIBUTED BY HASH(c1) BUCKETS 10
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t2 (
     c4 INT NOT NULL,
     c5 INT NOT NULL,
     c6 INT NOT NULL
 )
-DUPLICATE KEY(c4)
-DISTRIBUTED BY HASH(c4) BUCKETS 10
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t1 (c1, c2, c3) VALUES
 (1, 1, 1), (2, 1, 11), (3, 1, 111),
 (4, 2, 2), (5, 2, 22), (6, 2, 222);
@@ -87,9 +83,7 @@ CREATE TABLE ${case_db}.t_rank_bitmap_crash (
     ts INT,
     uid BIGINT NULL
 )
-DUPLICATE KEY(k, ts)
-DISTRIBUTED BY HASH(k) BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_rank_bitmap_crash VALUES
 (1, 100, 1), (1, 90, 2), (1, 80, NULL), (1, 70, 3),
 (2, 100, 4), (2, 90, NULL), (2, 80, 5);

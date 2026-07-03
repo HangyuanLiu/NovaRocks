@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_analytic_session_number_gap;
 CREATE TABLE ${case_db}.t_analytic_session_number_gap (
     grp VARCHAR(10),
     ts INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_session_number_gap VALUES
     ('A', 1),
