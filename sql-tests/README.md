@@ -2,9 +2,10 @@
 
 `sql-tests/` is the standalone SQL regression suite for NovaRocks.
 
-## Hard Prerequisite
+## Object Store Prerequisite
 
-StarRocks table SQL tests require a reachable MinIO-compatible object store at `http://127.0.0.1:9000`.
+Only Iceberg REST, managed-lake, and other object-store-backed suites require a
+reachable MinIO-compatible object store at `http://127.0.0.1:9000`.
 
 Default credentials (matching the standalone-server defaults):
 
@@ -12,7 +13,8 @@ Default credentials (matching the standalone-server defaults):
 - secret key: `admin123`
 - bucket: `novarocks`
 
-If MinIO is not running, the default standalone sql-tests flow fails fast before any suite starts:
+If a selected suite declares an object-store warehouse and MinIO is not running,
+the runner fails fast before executing that suite:
 
 ```
 MinIO at http://127.0.0.1:9000 is unreachable.
@@ -42,16 +44,17 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --suite filter --mode verify
 ```
 
-The runner now prefers `tests/sql-test-runner/conf/standalone_starrocks_table.conf`
-by default (StarRocks table). If you need the legacy StarRocks-style connection
-config, pass `--config tests/sql-test-runner/conf/sr.conf`.
+The runner defaults to `tests/sql-test-runner/conf/sr.conf` when no explicit
+`--config` is provided. Suites that need an Iceberg/managed-lake fixture should
+pass the generated environment config or an explicit fixture config.
 
-## Explicit StarRocks Table Config
+## Explicit Iceberg Config
 
-If you want a persistent standalone metadata DB / warehouse root, start the
-server with:
+For Docker-backed Iceberg suites, prefer the generated fixture config:
 
 ```bash
-NO_PROXY=127.0.0.1,localhost cargo run -- standalone-server --config \
-  tests/sql-test-runner/conf/standalone_starrocks_table.toml
+source docker/iceberg-rest/runtime/current/env.sh
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite materialized-view --mode verify
 ```

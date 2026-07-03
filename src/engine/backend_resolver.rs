@@ -7,9 +7,7 @@
 use std::sync::Arc;
 
 use crate::engine::StandaloneState;
-use crate::engine::name_resolve::{
-    resolve_iceberg_namespace_name, resolve_iceberg_table_name, resolve_local_table_name,
-};
+use crate::engine::name_resolve::{resolve_iceberg_namespace_name, resolve_iceberg_table_name};
 use crate::sql::parser::ast::ObjectName;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,55 +18,49 @@ pub(crate) struct TargetBackend {
     pub(crate) table: String,
 }
 
-const DEFAULT_CATALOG_SENTINEL: &str = "default_catalog";
+const DEFAULT_CATALOG_NAME: &str = "default_catalog";
 
-/// StarRocks-compat shorthand: `default_catalog.<db>.<tbl>` is a fully-qualified
-/// reference to the local (standalone) catalog. Strip the prefix and surface a
-/// 2-part name so the downstream resolver routes through the local catalog
-/// path instead of being treated as an iceberg table reference.
-fn strip_default_catalog(name: &ObjectName) -> Option<ObjectName> {
-    if name.parts.len() == 3 && name.parts[0].eq_ignore_ascii_case(DEFAULT_CATALOG_SENTINEL) {
-        Some(ObjectName {
-            parts: name.parts[1..].to_vec(),
-        })
-    } else {
-        None
+fn is_default_catalog(value: &str) -> bool {
+    value.eq_ignore_ascii_case(DEFAULT_CATALOG_NAME)
+}
+
+fn default_catalog_error() -> String {
+    "default_catalog is not a user table catalog; create an external Iceberg catalog and SET catalog before using persistent tables".to_string()
+}
+
+fn missing_current_catalog_error(kind: &str) -> String {
+    format!(
+        "{kind} requires an Iceberg catalog; create an external Iceberg catalog and SET catalog before using persistent tables"
+    )
+}
+
+fn reject_default_catalog_reference(
+    name: &ObjectName,
+    current_catalog: Option<&str>,
+) -> Result<(), String> {
+    if current_catalog.is_some_and(is_default_catalog)
+        || name
+            .parts
+            .first()
+            .is_some_and(|part| is_default_catalog(part))
+    {
+        return Err(default_catalog_error());
     }
+    Ok(())
 }
 
 pub(crate) fn resolve_table_target(
-    state: &Arc<StandaloneState>,
+    _state: &Arc<StandaloneState>,
     name: &ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<TargetBackend, String> {
-    let stripped = strip_default_catalog(name);
-    let effective_name = stripped.as_ref().unwrap_or(name);
-    let effective_catalog = if stripped.is_some() {
-        None
-    } else {
-        current_catalog
-    };
-
-    if effective_catalog.is_none() && effective_name.parts.len() <= 2 {
-        let resolved = resolve_local_table_name(effective_name, current_database)?;
-        let starrocks_exists = state
-            .starrocks_table
-            .read()
-            .expect("standalone StarRocks table read lock")
-            .contains_table(&resolved.database, &resolved.table)?;
-        if starrocks_exists || state.starrocks_table_config.is_some() || stripped.is_some() {
-            return Ok(TargetBackend {
-                backend_name: "starrocks",
-                catalog: String::new(),
-                namespace: resolved.database,
-                table: resolved.table,
-            });
-        }
+    reject_default_catalog_reference(name, current_catalog)?;
+    if current_catalog.is_none() && name.parts.len() <= 2 {
+        return Err(missing_current_catalog_error("CREATE TABLE"));
     }
 
-    let resolved =
-        resolve_iceberg_table_name(effective_name.clone(), effective_catalog, current_database)?;
+    let resolved = resolve_iceberg_table_name(name.clone(), current_catalog, current_database)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,
@@ -78,38 +70,17 @@ pub(crate) fn resolve_table_target(
 }
 
 pub(crate) fn resolve_existing_table_target(
-    state: &Arc<StandaloneState>,
+    _state: &Arc<StandaloneState>,
     name: &ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<TargetBackend, String> {
-    let stripped = strip_default_catalog(name);
-    let effective_name = stripped.as_ref().unwrap_or(name);
-    let effective_catalog = if stripped.is_some() {
-        None
-    } else {
-        current_catalog
-    };
-
-    if effective_catalog.is_none() && effective_name.parts.len() <= 2 {
-        let resolved = resolve_local_table_name(effective_name, current_database)?;
-        let starrocks_exists = state
-            .starrocks_table
-            .read()
-            .expect("standalone StarRocks table read lock")
-            .contains_table(&resolved.database, &resolved.table)?;
-        if starrocks_exists || stripped.is_some() {
-            return Ok(TargetBackend {
-                backend_name: "starrocks",
-                catalog: String::new(),
-                namespace: resolved.database,
-                table: resolved.table,
-            });
-        }
+    reject_default_catalog_reference(name, current_catalog)?;
+    if current_catalog.is_none() && name.parts.len() <= 2 {
+        return Err(missing_current_catalog_error("Table operation"));
     }
 
-    let resolved =
-        resolve_iceberg_table_name(effective_name.clone(), effective_catalog, current_database)?;
+    let resolved = resolve_iceberg_table_name(name.clone(), current_catalog, current_database)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,
@@ -119,21 +90,16 @@ pub(crate) fn resolve_existing_table_target(
 }
 
 pub(crate) fn resolve_namespace_target(
-    state: &Arc<StandaloneState>,
+    _state: &Arc<StandaloneState>,
     name: &ObjectName,
     current_catalog: Option<&str>,
 ) -> Result<TargetBackend, String> {
+    reject_default_catalog_reference(name, current_catalog)?;
     if current_catalog.is_none() && name.parts.len() == 1 {
-        return Ok(TargetBackend {
-            backend_name: "starrocks",
-            catalog: String::new(),
-            namespace: crate::engine::catalog::normalize_identifier(name.leaf())?,
-            table: String::new(),
-        });
+        return Err(missing_current_catalog_error("CREATE DATABASE"));
     }
 
     let resolved = resolve_iceberg_namespace_name(name.clone(), current_catalog)?;
-    let _ = state;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,

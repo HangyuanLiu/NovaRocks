@@ -65,7 +65,6 @@ pub(crate) mod query_options_wire;
 pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod sql_expr;
-pub(crate) mod starrocks_table_ctas;
 pub(crate) mod statement;
 pub(crate) mod statistics;
 pub(crate) mod stream_load;
@@ -97,9 +96,6 @@ use self::statement::{
     parse_alter_table_remove_orphan_files_sql, parse_alter_table_rewrite_manifests_sql,
     parse_show_alter_table_optimize_sql, parse_show_create_table,
 };
-use self::stream_load::{
-    parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
-};
 use crate::engine::procedure::{looks_like_call_procedure, parse_call_procedure_sql};
 use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
 
@@ -112,27 +108,11 @@ pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::catalog::LegacyRangePartition;
 pub use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
 
-fn stream_load_engine_cell() -> &'static OnceLock<StandaloneNovaRocks> {
-    static ENGINE: OnceLock<StandaloneNovaRocks> = OnceLock::new();
-    &ENGINE
-}
-
-pub(crate) fn register_stream_load_engine(engine: StandaloneNovaRocks) {
-    let _ = stream_load_engine_cell().set(engine);
-}
-
-pub(crate) fn current_stream_load_engine() -> Option<StandaloneNovaRocks> {
-    stream_load_engine_cell().get().cloned()
-}
-
 pub(crate) fn recover_starrocks_tablet_paths_from_current_engine(
     table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
     tablet_ids: &[i64],
 ) -> Result<HashMap<i64, String>, String> {
-    let Some(engine) = current_stream_load_engine() else {
-        return recover_starrocks_tablet_paths_from_installed_config(table, tablet_ids);
-    };
-    recover_starrocks_tablet_paths_from_state(&engine.inner, table, tablet_ids)
+    recover_starrocks_tablet_paths_from_installed_config(table, tablet_ids)
 }
 
 pub(crate) fn recover_starrocks_tablet_paths_from_installed_config(
@@ -344,36 +324,6 @@ pub struct StandaloneStarRocksTableInfo {
     pub bucket_num: i64,
     pub visible_version: i64,
     pub tablets: Vec<StandaloneStarRocksTabletInfo>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StandaloneStreamLoadFormat {
-    Json,
-    CsvPlain,
-    Unsupported(&'static str),
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct StandaloneStreamLoadRequest {
-    pub database: String,
-    pub table: String,
-    pub format_type: StandaloneStreamLoadFormat,
-    pub columns: Option<String>,
-    pub column_separator: Option<String>,
-    pub row_delimiter: Option<String>,
-    pub skip_header: Option<i64>,
-    pub trim_space: Option<bool>,
-    pub enclose: Option<i8>,
-    pub escape: Option<i8>,
-    pub jsonpaths: Option<String>,
-    pub strip_outer_array: Option<bool>,
-    pub payload: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct StandaloneStreamLoadResult {
-    pub loaded_rows: i64,
-    pub loaded_bytes: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -603,7 +553,6 @@ impl StandaloneNovaRocks {
             .as_ref()
             .map(open_metadata_provider)
             .transpose()?;
-        let starrocks_table_config = resolve_starrocks_table_config()?;
         let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits()?;
         let catalog = Arc::new(RwLock::new(InMemoryCatalog::default()));
         let mut catalog_mgr = catalog_mgr::CatalogMgr::new();
@@ -614,10 +563,8 @@ impl StandaloneNovaRocks {
         let inner = Arc::new(StandaloneState {
             catalog,
             catalog_mgr: RwLock::new(catalog_mgr),
-            starrocks_table: RwLock::new(StarRocksTableCatalog::empty(
-                starrocks_table_config.clone(),
-            )),
-            starrocks_table_config,
+            starrocks_table: RwLock::new(StarRocksTableCatalog::empty(None)),
+            starrocks_table_config: None,
             mv_refresh_pruning_limits,
             metadata_provider,
             backend_repo: BackendMetaRepository,
@@ -636,9 +583,6 @@ impl StandaloneNovaRocks {
         if role == crate::common::app_config::ClusterRole::Fe {
             backend_ops::ensure_backend_registry(&inner)?;
             backend_ops::wait_for_configured_backends_live(&inner)?;
-        }
-        if inner.starrocks_table_config.is_some() && inner.metadata_provider.is_some() {
-            crate::connector::spawn_starrocks_table_erase_worker(Arc::clone(&inner));
         }
         #[cfg(not(test))]
         if inner.metadata_provider.is_some() {
@@ -762,13 +706,6 @@ impl StandaloneNovaRocks {
             .read()
             .expect("standalone catalog read lock");
         guard.get(&database_name, &table_name).is_ok()
-    }
-
-    pub(crate) fn stream_load_starrocks_table(
-        &self,
-        request: StandaloneStreamLoadRequest,
-    ) -> Result<StandaloneStreamLoadResult, String> {
-        stream_load_starrocks_table(&self.inner, request)
     }
 }
 
@@ -2371,17 +2308,6 @@ fn open_metadata_provider(
     }
 }
 
-fn resolve_starrocks_table_config() -> Result<Option<StarRocksTableConfig>, String> {
-    let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
-    let Some(standalone) = cfg.standalone_server.as_ref() else {
-        return Ok(None);
-    };
-    let app_cfg = standalone.starrocks_table_config()?;
-    app_cfg
-        .map(StarRocksTableConfig::from_app_config)
-        .transpose()
-}
-
 fn resolve_mv_refresh_pruning_limits() -> Result<MvRefreshPruningLimits, String> {
     let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
     Ok(cfg
@@ -2406,7 +2332,6 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
 }
 
 fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
-    restore_starrocks_table(state)?;
     restore_iceberg_catalogs(state)?;
     // W4 statelessness: rediscover lake-native Iceberg MV packages that are
     // present on the lake but missing from a fresh `[metadata]` (SQLite) cache,
@@ -2463,149 +2388,6 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
     for table in &tables {
         let entry = guard.get(&table.catalog)?;
         register_existing_iceberg_table(&entry, &table.namespace, &table.table)?;
-    }
-    Ok(())
-}
-
-fn restore_starrocks_table(state: &Arc<StandaloneState>) -> Result<(), String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(());
-    };
-    reconcile_starrocks_table_on_open_from_repositories(state)?;
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open StarRocks table metadata read transaction failed: {e}"))?;
-    let starrocks_table_snapshot = state
-        .starrocks_table_repo
-        .load_snapshot(read.as_ref())
-        .map_err(|e| format!("load StarRocks table metadata failed: {e}"))?;
-    let rebuilt = StarRocksTableCatalog::rebuild_from_repository(
-        state.starrocks_table_config.clone(),
-        starrocks_table_snapshot.clone(),
-    )?;
-    {
-        let mut catalog = state
-            .catalog
-            .write()
-            .expect("standalone catalog write lock");
-        for database in &starrocks_table_snapshot.databases {
-            catalog.create_database(&database.name)?;
-        }
-        register_starrocks_tables_in_catalog(&mut catalog, &rebuilt)?;
-    }
-    rebuilt.re_register_active_tablet_runtimes()?;
-    let mut guard = state
-        .starrocks_table
-        .write()
-        .expect("standalone StarRocks table write lock");
-    *guard = rebuilt;
-    Ok(())
-}
-
-fn reconcile_starrocks_table_on_open_from_repositories(
-    state: &Arc<StandaloneState>,
-) -> Result<(), String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(());
-    };
-    {
-        let mut txn = provider
-            .begin_write("reconcile StarRocks table open metadata")
-            .map_err(|e| format!("open StarRocks table reconcile write transaction failed: {e}"))?;
-        state
-            .starrocks_table_repo
-            .fail_creating_tables(txn.as_mut())
-            .map_err(|e| format!("fail creating StarRocks tables during open failed: {e}"))?;
-        state
-            .starrocks_table_repo
-            .delete_all_creating_partitions(txn.as_mut())
-            .map_err(|e| format!("delete creating StarRocks partitions during open failed: {e}"))?;
-        txn.commit()
-            .map_err(|e| format!("commit StarRocks table open reconciliation failed: {e}"))?;
-    }
-
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open StarRocks table txn read transaction failed: {e}"))?;
-    let txns = state
-        .starrocks_txn_repo
-        .list_all(read.as_ref())
-        .map_err(|e| format!("load StarRocks table txns during open failed: {e}"))?;
-    drop(read);
-
-    for starrocks_txn in txns {
-        match starrocks_txn.state {
-            crate::meta::repository::starrocks_txn::StarRocksTxnState::Prepared => {
-                let mut write = provider
-                    .begin_write("abort prepared StarRocks table txn on open")
-                    .map_err(|e| {
-                        format!("open StarRocks txn abort write transaction failed: {e}")
-                    })?;
-                state
-                    .starrocks_txn_repo
-                    .mark_aborted(write.as_mut(), starrocks_txn.txn_id)
-                    .map_err(|e| {
-                        format!(
-                            "abort prepared StarRocks txn {} during open failed: {e}",
-                            starrocks_txn.txn_id
-                        )
-                    })?;
-                write
-                    .commit()
-                    .map_err(|e| format!("commit StarRocks txn abort failed: {e}"))?;
-            }
-            crate::meta::repository::starrocks_txn::StarRocksTxnState::Written => {
-                let read = provider.begin_read().map_err(|e| {
-                    format!("open StarRocks table replay read transaction failed: {e}")
-                })?;
-                let snapshot = state
-                    .starrocks_table_repo
-                    .load_snapshot(read.as_ref())
-                    .map_err(|e| format!("load StarRocks table replay snapshot failed: {e}"))?;
-                let tablet_ids = snapshot
-                    .tablets
-                    .iter()
-                    .filter(|tablet| {
-                        snapshot.indexes.iter().any(|index| {
-                            index.index_id == tablet.index_id
-                                && index.table_id == starrocks_txn.table_id
-                                && index.partition_id == starrocks_txn.partition_id
-                        })
-                    })
-                    .map(|tablet| tablet.tablet_id)
-                    .collect::<Vec<_>>();
-                drop(read);
-                crate::connector::publish_tablets_at_version(
-                    tablet_ids,
-                    starrocks_txn.txn_id,
-                    starrocks_txn.base_version,
-                    starrocks_txn.commit_version,
-                )?;
-                let mut write = provider
-                    .begin_write("mark replayed StarRocks table txn visible")
-                    .map_err(|e| {
-                        format!("open StarRocks txn visible write transaction failed: {e}")
-                    })?;
-                state
-                    .starrocks_txn_repo
-                    .mark_visible(
-                        &state.starrocks_table_repo,
-                        write.as_mut(),
-                        starrocks_txn.txn_id,
-                    )
-                    .map_err(|e| {
-                        format!(
-                            "mark replayed StarRocks txn {} visible during open failed: {e}",
-                            starrocks_txn.txn_id
-                        )
-                    })?;
-                write
-                    .commit()
-                    .map_err(|e| format!("commit replayed StarRocks txn visible failed: {e}"))?;
-            }
-            crate::meta::repository::starrocks_txn::StarRocksTxnState::Visible
-            | crate::meta::repository::starrocks_txn::StarRocksTxnState::Aborted => {}
-        }
     }
     Ok(())
 }
@@ -4548,78 +4330,6 @@ fn parse_explain_refresh_materialized_view(
         }
     }
     None
-}
-
-// ---------------------------------------------------------------------------
-// StarRocks table stream-load entrypoint
-// ---------------------------------------------------------------------------
-
-/// HTTP stream-load entrypoint for StarRocks tables. Parses CSV / JSON
-/// payloads via the neutral helpers in `engine::stream_load` and hands the
-/// resulting rows to `insert_into_starrocks_table`, so every stream-load
-/// target goes through the same path as a plain `INSERT INTO ... VALUES`.
-fn stream_load_starrocks_table(
-    state: &Arc<StandaloneState>,
-    request: StandaloneStreamLoadRequest,
-) -> Result<StandaloneStreamLoadResult, String> {
-    let database = normalize_identifier(&request.database)?;
-    let table = normalize_identifier(&request.table)?;
-    let is_starrocks_table = state
-        .starrocks_table
-        .read()
-        .expect("standalone StarRocks table read lock")
-        .contains_table(&database, &table)?;
-    if !is_starrocks_table {
-        return Err(format!(
-            "standalone stream load only supports StarRocks tables, got {}.{}",
-            database, table
-        ));
-    }
-
-    let table_def = {
-        let guard = state.catalog.read().expect("standalone catalog read lock");
-        guard.get(&database, &table)?
-    };
-    let insert_columns = parse_stream_load_columns(request.columns.as_deref(), &table_def)?;
-    let rows = match request.format_type {
-        StandaloneStreamLoadFormat::Json => parse_json_stream_load_rows(
-            &request.payload,
-            &insert_columns,
-            request.jsonpaths.as_deref(),
-            request.strip_outer_array.unwrap_or(false),
-        )?,
-        StandaloneStreamLoadFormat::CsvPlain => parse_csv_stream_load_rows(
-            &request.payload,
-            &insert_columns,
-            request.column_separator.as_deref(),
-            request.row_delimiter.as_deref(),
-            request.skip_header.unwrap_or(0),
-            request.trim_space.unwrap_or(false),
-            request.enclose,
-            request.escape,
-        )?,
-        StandaloneStreamLoadFormat::Unsupported(format_name) => {
-            return Err(format!(
-                "standalone stream load only supports CSV/JSON, got {format_name}",
-            ));
-        }
-    };
-    let object_name = crate::sql::parser::ast::ObjectName {
-        parts: vec![database.clone(), table.clone()],
-    };
-    let loaded_rows = rows.len() as i64;
-    let loaded_bytes = request.payload.len() as i64;
-    crate::connector::insert_into_starrocks_table(
-        state,
-        &object_name,
-        &insert_columns,
-        &crate::sql::parser::ast::InsertSource::Values(rows),
-        &database,
-    )?;
-    Ok(StandaloneStreamLoadResult {
-        loaded_rows,
-        loaded_bytes,
-    })
 }
 
 // ---------------------------------------------------------------------------

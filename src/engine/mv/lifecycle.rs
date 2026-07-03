@@ -32,7 +32,10 @@ impl MvStorageEngine {
 
     pub(crate) fn from_sql_str(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().as_str() {
-            "starrocks" => Ok(Self::StarRocks),
+            "starrocks" => Err(
+                "materialized view storage_engine='starrocks' is no longer supported; use storage_engine='iceberg'"
+                    .to_string(),
+            ),
             "iceberg" => Ok(Self::Iceberg),
             _ => Err(format!(
                 "unknown materialized view storage_engine `{value}`"
@@ -286,10 +289,8 @@ mod tests {
         assert_eq!(MvStorageEngine::StarRocks.backend_name(), "starrocks");
         assert_eq!(MvStorageEngine::Iceberg.as_sql_str(), "iceberg");
         assert_eq!(MvStorageEngine::Iceberg.backend_name(), "iceberg");
-        assert_eq!(
-            MvStorageEngine::from_sql_str("starrocks").unwrap(),
-            MvStorageEngine::StarRocks
-        );
+        let err = MvStorageEngine::from_sql_str("starrocks").unwrap_err();
+        assert!(err.contains("storage_engine='starrocks'"), "err={err}");
         assert_eq!(
             MvStorageEngine::from_sql_str("iceberg").unwrap(),
             MvStorageEngine::Iceberg

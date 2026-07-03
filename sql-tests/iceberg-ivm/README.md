@@ -11,15 +11,12 @@ Scope:
 - metadata-only / no-op refresh behavior
 - target catalog visibility and DROP cleanup
 
-StarRocks table materialized views over Iceberg base tables remain in
-`sql-tests/mv-on-iceberg`. Keeping the suites separate makes the Iceberg-backed
-MV target path usable as a clean regression gate for Iceberg-backed MV work.
-
 Recommended invocation:
 
 ```bash
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-ivm \
-  --config tests/sql-test-runner/conf/standalone_starrocks_table.conf \
   --mode verify
 ```

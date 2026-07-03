@@ -29,9 +29,6 @@ pub(crate) mod schema_adapter;
 pub(crate) mod state_codec;
 pub(crate) mod txn;
 
-pub(crate) use backend::{
-    StarRocksTableBackend, StarRocksTableMvBackend, StarRocksTableSink, StarRocksTableSource,
-};
 pub(crate) use catalog::{
     StarRocksTableCatalog, register_starrocks_tables_in_catalog, runtime_registered,
 };

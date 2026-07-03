@@ -35,17 +35,6 @@ pub fn strip_optional_quotes(raw: &str) -> String {
 }
 
 pub fn detect_default_config(base_dir: &Path) -> Option<PathBuf> {
-    // Prefer the StarRocks table conf when present so every suite runs through
-    // the single remaining backend by default.
-    let starrocks_conf = base_dir
-        .join("tests")
-        .join("sql-test-runner")
-        .join("conf")
-        .join("standalone_starrocks_table.conf");
-    if starrocks_conf.exists() {
-        return Some(starrocks_conf);
-    }
-
     let sr_conf = base_dir
         .join("tests")
         .join("sql-test-runner")

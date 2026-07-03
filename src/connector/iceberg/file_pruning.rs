@@ -364,6 +364,7 @@ fn partition_value_may_satisfy_predicate(
         ScanPredicateDomain::DiscreteSet { values, .. } => {
             partition_value_may_satisfy_discrete_set(partition_value, values)
         }
+        ScanPredicateDomain::Membership(_) => PredicateDecision::Unsupported,
     }
 }
 
@@ -517,6 +518,7 @@ fn stats_may_satisfy_predicate(
         ScanPredicateDomain::DiscreteSet { values, .. } => {
             stats_may_satisfy_discrete_set(stats, values)
         }
+        ScanPredicateDomain::Membership(_) => PredicateDecision::Unsupported,
     }
 }
 

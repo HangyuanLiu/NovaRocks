@@ -347,32 +347,6 @@ fn endpoint_reachable(endpoint: &str) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
 }
 
-/// When the runner config declares a StarRocks table warehouse, fail fast if the
-/// object-store endpoint is not reachable. Without this probe, the first
-/// `CREATE TABLE` in a suite would timeout deep inside the standalone server.
-fn ensure_starrocks_table_prereqs(runner_config: &RunnerConfig) -> Result<()> {
-    if !runner_config
-        .values
-        .contains_key("starrocks_table_warehouse")
-    {
-        return Ok(());
-    }
-    let endpoint = runner_config
-        .values
-        .get("oss_endpoint")
-        .cloned()
-        .unwrap_or_else(|| env_or_default("AWS_S3_ENDPOINT", "http://127.0.0.1:9000"));
-    if endpoint_reachable(&endpoint) {
-        return Ok(());
-    }
-    bail!(
-        "MinIO at {} is unreachable.\n\
-         hint: start it with:\n  \
-         mkdir -p ~/minio-data && minio server ~/minio-data --console-address :9001 &",
-        endpoint
-    );
-}
-
 /// When the runner config declares a managed-lake warehouse, fail fast if the
 /// object-store endpoint is not reachable. Without this probe, the first
 /// `CREATE TABLE` in a suite would timeout deep inside the standalone server.
@@ -2305,7 +2279,6 @@ fn run() -> Result<i32> {
         return Ok(1);
     }
 
-    ensure_starrocks_table_prereqs(&runner_config)?;
     ensure_managed_lake_prereqs(&runner_config)?;
 
     let suite_configs = build_suite_configs(&base_dir)?;

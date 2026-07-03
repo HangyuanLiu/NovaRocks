@@ -573,42 +573,8 @@ impl StandaloneServerConfig {
     pub fn starrocks_table_config(
         &self,
     ) -> std::result::Result<Option<StandaloneStarRocksTableConfig>, String> {
-        let Some(warehouse_uri) = self
-            .warehouse_uri
-            .as_ref()
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-        else {
-            return Ok(None);
-        };
-
-        let object_store = self.object_store.as_ref().ok_or_else(|| {
-            "standalone StarRocks table requires [standalone_server.object_store]".to_string()
-        })?;
-        let endpoint = object_store.endpoint.as_deref().unwrap_or_default();
-        let access_key_id = object_store.access_key_id.as_deref().unwrap_or_default();
-        let access_key_secret = object_store
-            .access_key_secret
-            .as_deref()
-            .unwrap_or_default();
-        let credentials = crate::fs::object_store_credentials::ObjectStoreCredentials::from_parts(
-            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::StandaloneConfig,
-            endpoint,
-            access_key_id,
-            access_key_secret,
-            object_store.region.as_deref(),
-            object_store.enable_path_style_access,
-        )?;
-
-        Ok(Some(StandaloneStarRocksTableConfig {
-            warehouse_uri: warehouse_uri.to_string(),
-            endpoint: credentials.endpoint,
-            access_key_id: credentials.access_key_id,
-            access_key_secret: credentials.access_key_secret,
-            region: credentials.region,
-            enable_path_style_access: credentials.enable_path_style_access,
-            mv_default_storage_engine: self.mv_default_storage_engine.clone(),
-        }))
+        let _ = self;
+        Ok(None)
     }
 }
 
@@ -1537,7 +1503,7 @@ mod tests {
 
     use super::{
         DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, RuntimeConfig,
-        StandaloneObjectStoreConfig, StandaloneServerConfig, StandaloneStarRocksTableConfig,
+        StandaloneObjectStoreConfig, StandaloneServerConfig,
     };
 
     #[test]
@@ -1743,26 +1709,6 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn test_standalone_starrocks_table_fixture_loads() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/sql-test-runner/conf/standalone_starrocks_table.toml");
-        let cfg = NovaRocksConfig::load_from_file(&path).expect("load fixture config");
-        let metadata = cfg.metadata.expect("metadata config");
-        assert_eq!(
-            metadata.path,
-            PathBuf::from("tmp/standalone-starrocks-table.sqlite")
-        );
-
-        let standalone = cfg.standalone_server.expect("standalone config");
-        assert_eq!(
-            standalone.warehouse_uri.as_deref(),
-            Some("s3://novarocks/sql-tests-starrocks-table")
-        );
-        assert_eq!(standalone.mysql_port, 9030);
-        assert!(standalone.object_store.is_some());
-    }
-
-    #[test]
     #[cfg(debug_assertions)]
     fn test_debug_fault_injection_knobs_parse_in_debug_builds() {
         let cfg: NovaRocksConfig = toml::from_str(
@@ -1847,7 +1793,7 @@ user = "root"
     }
 
     #[test]
-    fn test_standalone_server_starrocks_table_config_normalizes_required_fields() {
+    fn test_standalone_server_legacy_starrocks_table_config_is_ignored() {
         let standalone = StandaloneServerConfig {
             warehouse_uri: Some(" s3://novarocks/standalone ".to_string()),
             object_store: Some(StandaloneObjectStoreConfig {
@@ -1863,47 +1809,35 @@ user = "root"
         assert_eq!(
             standalone
                 .starrocks_table_config()
-                .expect("StarRocks table config"),
-            Some(StandaloneStarRocksTableConfig {
-                warehouse_uri: "s3://novarocks/standalone".to_string(),
-                endpoint: "http://127.0.0.1:9000".to_string(),
-                access_key_id: "admin".to_string(),
-                access_key_secret: "admin123".to_string(),
-                region: Some("us-east-1".to_string()),
-                enable_path_style_access: Some(true),
-                mv_default_storage_engine: None,
-            })
+                .expect("legacy StarRocks table config handling"),
+            None
         );
     }
 
     #[test]
-    fn test_standalone_server_starrocks_table_config_uses_shared_credentials() {
+    fn test_standalone_server_legacy_starrocks_table_config_does_not_validate_object_store() {
         let standalone = StandaloneServerConfig {
             warehouse_uri: Some(" s3://novarocks/standalone ".to_string()),
             object_store: Some(StandaloneObjectStoreConfig {
-                endpoint: Some(" http://127.0.0.1:9000 ".to_string()),
-                access_key_id: Some(" admin ".to_string()),
-                access_key_secret: Some(" admin123 ".to_string()),
-                region: Some(" us-east-1 ".to_string()),
+                endpoint: None,
+                access_key_id: None,
+                access_key_secret: None,
+                region: None,
                 enable_path_style_access: Some(true),
             }),
             ..StandaloneServerConfig::default()
         };
 
-        let cfg = standalone
-            .starrocks_table_config()
-            .expect("StarRocks table config")
-            .expect("StarRocks table config should be present");
-
-        assert_eq!(cfg.endpoint, "http://127.0.0.1:9000");
-        assert_eq!(cfg.access_key_id, "admin");
-        assert_eq!(cfg.access_key_secret, "admin123");
-        assert_eq!(cfg.region.as_deref(), Some("us-east-1"));
-        assert_eq!(cfg.enable_path_style_access, Some(true));
+        assert_eq!(
+            standalone
+                .starrocks_table_config()
+                .expect("legacy StarRocks table config handling"),
+            None
+        );
     }
 
     #[test]
-    fn test_standalone_server_starrocks_table_config_propagates_mv_default_storage_engine() {
+    fn test_standalone_server_legacy_mv_default_storage_engine_is_ignored() {
         let standalone = StandaloneServerConfig {
             warehouse_uri: Some("s3://bucket/wh".to_string()),
             object_store: Some(StandaloneObjectStoreConfig {
@@ -1916,11 +1850,12 @@ user = "root"
             mv_default_storage_engine: Some("iceberg".to_string()),
             ..StandaloneServerConfig::default()
         };
-        let cfg = standalone
-            .starrocks_table_config()
-            .expect("ok")
-            .expect("some");
-        assert_eq!(cfg.mv_default_storage_engine.as_deref(), Some("iceberg"));
+        assert_eq!(
+            standalone
+                .starrocks_table_config()
+                .expect("legacy StarRocks table config handling"),
+            None
+        );
     }
 
     #[test]
@@ -1946,7 +1881,8 @@ user = "root"
     }
 
     #[test]
-    fn test_standalone_server_starrocks_table_config_validates_required_object_store_fields() {
+    fn test_standalone_server_legacy_starrocks_table_config_returns_none_with_partial_object_store()
+    {
         let base = StandaloneServerConfig {
             warehouse_uri: Some("s3://novarocks/standalone".to_string()),
             object_store: Some(StandaloneObjectStoreConfig {
@@ -1960,51 +1896,39 @@ user = "root"
         };
 
         let cases = vec![
-            (
-                StandaloneServerConfig {
-                    object_store: None,
-                    ..base.clone()
-                },
-                "standalone StarRocks table requires [standalone_server.object_store]",
-            ),
-            (
-                StandaloneServerConfig {
-                    object_store: Some(StandaloneObjectStoreConfig {
-                        endpoint: None,
-                        ..base.object_store.clone().expect("object store")
-                    }),
-                    ..base.clone()
-                },
-                "standalone_config object-store credentials missing aws.s3.endpoint",
-            ),
-            (
-                StandaloneServerConfig {
-                    object_store: Some(StandaloneObjectStoreConfig {
-                        access_key_id: None,
-                        ..base.object_store.clone().expect("object store")
-                    }),
-                    ..base.clone()
-                },
-                "standalone_config object-store credentials missing aws.s3.access_key",
-            ),
-            (
-                StandaloneServerConfig {
-                    object_store: Some(StandaloneObjectStoreConfig {
-                        access_key_secret: None,
-                        ..base.object_store.clone().expect("object store")
-                    }),
-                    ..base
-                },
-                "standalone_config object-store credentials missing aws.s3.secret_key",
-            ),
+            StandaloneServerConfig {
+                object_store: None,
+                ..base.clone()
+            },
+            StandaloneServerConfig {
+                object_store: Some(StandaloneObjectStoreConfig {
+                    endpoint: None,
+                    ..base.object_store.clone().expect("object store")
+                }),
+                ..base.clone()
+            },
+            StandaloneServerConfig {
+                object_store: Some(StandaloneObjectStoreConfig {
+                    access_key_id: None,
+                    ..base.object_store.clone().expect("object store")
+                }),
+                ..base.clone()
+            },
+            StandaloneServerConfig {
+                object_store: Some(StandaloneObjectStoreConfig {
+                    access_key_secret: None,
+                    ..base.object_store.clone().expect("object store")
+                }),
+                ..base
+            },
         ];
 
-        for (standalone, expected) in cases {
+        for standalone in cases {
             assert_eq!(
                 standalone
                     .starrocks_table_config()
-                    .expect_err("StarRocks table error"),
-                expected
+                    .expect("legacy StarRocks table config handling"),
+                None
             );
         }
     }
