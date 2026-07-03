@@ -1,0 +1,165 @@
+syntax = "proto3";
+
+// NovaRocks-native shared foundation types. Consumed by novarocks (service),
+// novarocks.filter (NIDL-2), and novarocks.{expr,plan} (NIDL-3). This is the
+// single authority for type descriptor / status / id / literal / output column.
+// Discipline: idl/novarocks/README.md.
+package novarocks.common;
+
+// Fragment-instance / query id. Replaces novarocks.PUniqueId (NIDL-0).
+// Owner: produced/consumed by native service RPC envelopes now and future NIDL
+// faces.
+message UniqueId {
+  int64 hi = 1;  // high 64 bits of the id
+  int64 lo = 2;  // low 64 bits of the id
+}
+
+// Execution/RPC status. Replaces starrocks.StatusPb on native faces.
+// Owner: produced/consumed by future native status-bearing faces; not wired in
+// Task 1.
+message Status {
+  int32 code = 1;      // 0 == OK
+  string message = 2;  // human-readable detail when code != 0
+}
+
+// Recursive SQL type descriptor. Replaces the flat thrift TTypeDesc node array
+// (thrift lacked recursion; proto does not). Mirrors the SQL primitive type set,
+// NOT raw Arrow -- Arrow cannot distinguish JSON vs VARCHAR, HLL vs VARBINARY.
+// Owner: produced by future FE/native encode conversion layer and consumed by
+// future BE/native prepare conversion layer. Planner/exec must not import
+// generated proto directly.
+message TypeDesc {
+  oneof kind {
+    ScalarType scalar = 1;  // scalar SQL type
+    ListType list = 2;      // list SQL type
+    MapType map = 3;        // map SQL type
+    StructType strct = 4;   // struct SQL type
+  }
+}
+
+// Scalar SQL type descriptor.
+// Owner: produced by future FE/native encode conversion layer and consumed by
+// future BE/native prepare conversion layer. Planner/exec must not import
+// generated proto directly.
+message ScalarType {
+  PrimitiveType type = 1;   // primitive SQL type
+  optional int32 len = 2;        // CHAR / VARCHAR length
+  optional int32 precision = 3;  // DECIMAL precision
+  optional int32 scale = 4;      // DECIMAL scale
+  // DATETIME time unit. Accepted values are unset or 2 for microseconds, and 3
+  // for nanoseconds, mirroring src/types/arrow_thrift.rs. Conversion boundaries
+  // must reject any other value.
+  optional int32 time_unit = 5;
+}
+
+// List SQL type descriptor.
+// Owner: produced by future FE/native encode conversion layer and consumed by
+// future BE/native prepare conversion layer. Planner/exec must not import
+// generated proto directly.
+message ListType {
+  TypeDesc element = 1;  // element type
+}
+
+// Map SQL type descriptor.
+// Owner: produced by future FE/native encode conversion layer and consumed by
+// future BE/native prepare conversion layer. Planner/exec must not import
+// generated proto directly.
+message MapType {
+  TypeDesc key = 1;    // key type
+  TypeDesc value = 2;  // value type
+}
+
+// Struct SQL type descriptor.
+// Owner: produced by future FE/native encode conversion layer and consumed by
+// future BE/native prepare conversion layer. Planner/exec must not import
+// generated proto directly.
+message StructType {
+  repeated StructField fields = 1;  // ordered struct fields
+}
+
+// Named field inside a struct SQL type.
+// Owner: produced by future FE/native encode conversion layer and consumed by
+// future BE/native prepare conversion layer. Planner/exec must not import
+// generated proto directly.
+message StructField {
+  string name = 1;    // field name
+  TypeDesc type = 2;  // field type
+}
+
+// SQL primitive type set (mirrors the TPrimitiveType subset NovaRocks maps in
+// src/types/arrow_thrift.rs, including logical types). Extend append-only.
+enum PrimitiveType {
+  PRIMITIVE_TYPE_UNSPECIFIED = 0;
+  BOOLEAN = 1;
+  TINYINT = 2;
+  SMALLINT = 3;
+  INT = 4;
+  BIGINT = 5;
+  LARGEINT = 6;
+  FLOAT = 7;
+  DOUBLE = 8;
+  DECIMAL32 = 9;
+  DECIMAL64 = 10;
+  DECIMAL128 = 11;
+  DECIMAL256 = 12;
+  DATE = 13;
+  DATETIME = 14;
+  TIME = 15;
+  VARCHAR = 16;
+  CHAR = 17;
+  VARBINARY = 18;
+  BINARY = 19;
+  JSON = 20;
+  HLL = 21;
+  BITMAP = 22;
+  OBJECT = 23;
+  PERCENTILE = 24;
+  VARIANT = 25;
+  NULL_TYPE = 26;
+}
+
+// Scalar literal. Decimal is structured (analysis-layer decimal-as-string is
+// parsed at the conversion boundary; the wire never carries a decimal string).
+// Owner: produced by future FE/native encode conversion layer and consumed by
+// future BE/native prepare conversion layer. Planner/exec must not import
+// generated proto directly.
+message LiteralValue {
+  oneof value {
+    // True when NULL; type carried by owning Expr. The arm is semantically valid
+    // only when true; conversion boundaries must reject false.
+    bool null_value = 1;
+    bool bool_value = 2;              // boolean literal value
+    int64 int_value = 3;              // signed integer literal value
+    // i128 encoded as exactly 16 signed two's-complement big-endian bytes.
+    bytes largeint_value = 4;
+    double float_value = 5;           // floating-point literal value
+    string string_value = 6;          // UTF-8 string literal value
+    bytes binary_value = 7;           // opaque binary literal value
+    int32 date32_value = 8;           // days since Unix epoch
+    DecimalLiteral decimal_value = 9; // structured decimal literal value
+  }
+}
+
+// Structured decimal literal value.
+// Owner: produced by future FE/native encode conversion layer and consumed by
+// future BE/native prepare conversion layer. Planner/exec must not import
+// generated proto directly.
+message DecimalLiteral {
+  // Unscaled signed two's-complement big-endian integer, 16 or 32 bytes.
+  bytes value = 1;
+  uint32 precision = 2;  // decimal precision
+  sint32 scale = 3;      // decimal scale
+}
+
+// Node-owned output column schema (D3-5). Consumed by plan.proto nodes (NIDL-3)
+// and fragment output (NIDL-4); defined here so all faces share one shape.
+// Owner: produced by future FE/native encode conversion layer for plan/fragment
+// output schema and consumed by future BE/native prepare conversion layer.
+// Planner/exec must not import generated proto directly.
+message OutputColumn {
+  uint32 column_id = 1;  // stable output column id
+  string name = 2;       // output column name
+  TypeDesc type = 3;     // output column SQL type
+  bool nullable = 4;     // true when output column can be NULL
+  bool is_internal = 5;  // true when column is engine-internal
+}
