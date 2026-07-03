@@ -5,7 +5,6 @@ use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 pub(crate) mod aggregate_pushdown;
 pub(crate) mod column_pruning;
 pub(crate) mod derive_join_not_null;
-pub(crate) mod low_cardinality_dict;
 pub(crate) mod predicate_pushdown;
 pub(crate) mod ranking_window_predicate_pushdown;
 pub(crate) mod subquery;
@@ -13,12 +12,6 @@ pub(crate) mod ukfk;
 pub(crate) mod union_distinct_to_aggregate;
 pub(crate) mod utils;
 pub(crate) mod variant_path_pushdown;
-
-pub(crate) fn low_cardinality_dictionary_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
-    vec![Box::new(
-        low_cardinality_dict::LowCardinalityDictionaryRewriteRule,
-    )]
-}
 
 pub(crate) fn column_pruning_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     let mut rules = column_pruning::all_rules();
@@ -63,7 +56,6 @@ pub(crate) fn all_query_rewrite_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     all.extend(column_pruning_rules());
     all.extend(variant_path_pushdown_rules());
     all.extend(aggregate_pushdown::aggregate_pushdown_rules());
-    all.extend(low_cardinality_dictionary_rules());
     all.push(Box::new(derive_join_not_null::DeriveJoinNotNullPredicate));
     all
 }
@@ -76,11 +68,10 @@ mod tests {
     fn registry_contains_expected_rules() {
         let rules = all_query_rewrite_rules();
         // 17 v2 pruning rules + 2 ukfk + 1 VariantPathPushdown
-        // + 1 AggregatePushdown
-        // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules
+        // + 1 AggregatePushdown + 5 predicate pushdown rules
         // + 1 predicate move-around rule + 1 DeriveJoinNotNullPredicate
-        // + 1 UnionDistinctToAggregate = 30
-        assert_eq!(rules.len(), 30);
+        // + 1 UnionDistinctToAggregate = 29
+        assert_eq!(rules.len(), 29);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
@@ -90,7 +81,6 @@ mod tests {
                 "DeriveJoinNotNullPredicate",
                 "EliminateUniqueAggregate",
                 "JoinPredicateMoveAround",
-                "LowCardinalityDictionaryRewrite",
                 "PruneAggregateColumns",
                 "PruneCTEAnchorColumns",
                 "PruneCTEConsumeColumns",
