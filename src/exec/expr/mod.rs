@@ -22,6 +22,7 @@ mod cast;
 mod comparison;
 pub mod decimal;
 mod dict_decode;
+pub(crate) mod dict_peel;
 pub mod function;
 mod in_pred;
 mod literal;
