@@ -286,7 +286,6 @@ impl FragmentDispatcher for RemoteDispatcher {
                     lo: finst_id.lo,
                 }),
                 max_wait_ms,
-                typed_result: true,
             })
             .map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
         let status = FetchStatus::try_from(resp.status).map_err(|_| {
@@ -297,9 +296,12 @@ impl FragmentDispatcher for RemoteDispatcher {
         })?;
         match status {
             FetchStatus::Ready => {
+                if resp.eos {
+                    return Ok(FetchOutcome::Eof);
+                }
                 if resp.result_arrow_ipc.is_empty() {
                     return Err(format!(
-                        "BE[{backend_idx}] ({addr}): typed fetch_result READY without result_arrow_ipc"
+                        "BE[{backend_idx}] ({addr}): fetch_result READY without result_arrow_ipc"
                     ));
                 }
                 let mut chunks = crate::runtime::exchange::decode_root_result_chunks(
@@ -318,6 +320,9 @@ impl FragmentDispatcher for RemoteDispatcher {
             FetchStatus::NotReady => Ok(FetchOutcome::NotReady),
             FetchStatus::Eof => Ok(FetchOutcome::Eof),
             FetchStatus::Error => Ok(FetchOutcome::Err(resp.message)),
+            FetchStatus::ResultStatusUnspecified => Err(format!(
+                "BE[{backend_idx}] ({addr}): remote fetch_result returned unspecified status"
+            )),
         }
     }
 
@@ -503,8 +508,8 @@ mod tests {
     struct MockState {
         submit_code: AtomicI32,
         fetch_status: AtomicI32,
+        fetch_eos: AtomicBool,
         fetch_arrow: Mutex<Vec<u8>>,
-        last_fetch_typed_result: AtomicBool,
         cancel_count: AtomicUsize,
         cancel_delay_ms: AtomicU64,
         report_status_code: AtomicI32,
@@ -516,8 +521,8 @@ mod tests {
             Self {
                 submit_code: AtomicI32::new(0),
                 fetch_status: AtomicI32::new(FetchStatus::Eof as i32),
+                fetch_eos: AtomicBool::new(false),
                 fetch_arrow: Mutex::new(Vec::new()),
-                last_fetch_typed_result: AtomicBool::new(false),
                 cancel_count: AtomicUsize::new(0),
                 cancel_delay_ms: AtomicU64::new(0),
                 report_status_code: AtomicI32::new(0),
@@ -571,16 +576,14 @@ mod tests {
 
         async fn fetch_result(
             &self,
-            request: Request<FetchResultRequest>,
+            _request: Request<FetchResultRequest>,
         ) -> Result<Response<FetchResultResponse>, Status> {
-            self.0
-                .last_fetch_typed_result
-                .store(request.into_inner().typed_result, Ordering::SeqCst);
             Ok(Response::new(FetchResultResponse {
                 status: self.0.fetch_status.load(Ordering::SeqCst),
-                result_batch_thrift: Vec::new(),
-                result_arrow_ipc: self.0.fetch_arrow.lock().expect("fetch arrow lock").clone(),
                 message: "fetch failed".to_string(),
+                packet_seq: 0,
+                eos: self.0.fetch_eos.load(Ordering::SeqCst),
+                result_arrow_ipc: self.0.fetch_arrow.lock().expect("fetch arrow lock").clone(),
             }))
         }
 
@@ -761,7 +764,23 @@ mod tests {
         assert_eq!(chunk.columns().len(), 1);
         assert_eq!(chunk.len(), 1);
         assert_eq!(chunk.columns()[0].data_type(), &DataType::Int32);
-        assert!(state.last_fetch_typed_result.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn remote_dispatcher_fetch_ready_eos_returns_eof() {
+        let state = Arc::new(MockState::default());
+        state
+            .fetch_status
+            .store(FetchStatus::Ready as i32, Ordering::SeqCst);
+        state.fetch_eos.store(true, Ordering::SeqCst);
+        let addr = spawn_mock_server(Arc::clone(&state));
+        let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
+
+        let outcome = dispatcher
+            .fetch_result(0, make_finst_id(1, 2), 0, None)
+            .expect("fetch");
+
+        assert!(matches!(outcome, FetchOutcome::Eof));
     }
 
     #[test]

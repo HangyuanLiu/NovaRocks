@@ -90,26 +90,22 @@ message SubmitFragmentResponse {
 message FetchResultRequest {
   novarocks.common.UniqueId finst_id = 1;  // instance to poll
   int64 max_wait_ms = 2;                   // server-side long-poll budget
-  bool typed_result = 3;                   // request typed (Arrow) result path
 }
 
-// FetchResult response containing readiness state plus one optional payload.
+// FetchResult response containing readiness state plus one optional Arrow IPC payload.
 message FetchResultResponse {
-  // NOTE(NIDL-0 debt): READY = 0 makes a missing/default-decoded status read as
-  // "ready". NIDL-1 fixes this to a *_UNSPECIFIED = 0 first value when it
-  // single-tracks FetchResult. Do not depend on the zero value meaning READY.
   enum Status {
-    READY = 0;
-    NOT_READY = 1;
-    EOF = 2;
-    ERROR = 3;
+    RESULT_STATUS_UNSPECIFIED = 0;  // NIDL-1: fixes former READY = 0 default hazard
+    READY = 1;
+    NOT_READY = 2;
+    EOF = 3;
+    ERROR = 4;
   }
-  Status status = 1;  // result lifecycle state for this poll
-  // Thrift-binary-encoded TResultBatch payload. NIDL-1 drops this (Arrow-only).
-  bytes result_batch_thrift = 2;
-  string message = 3;      // error detail when status == ERROR
-  // NovaRocks-private NRX1-framed Arrow IPC payload.
-  bytes result_arrow_ipc = 4;
+  Status status = 1;             // result lifecycle state for this poll
+  string message = 2;            // error detail when status == ERROR
+  int64 packet_seq = 3;          // was carried in the FetchResult struct
+  bool eos = 4;                  // end-of-stream marker
+  bytes result_arrow_ipc = 5;    // NRX1-framed Arrow IPC (sole data track)
 }
 
 // Coordinator cancellation request for active fragment instances.

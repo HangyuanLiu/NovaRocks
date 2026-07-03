@@ -334,9 +334,10 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 return Ok(tonic::Response::new(
                     proto::novarocks::FetchResultResponse {
                         status: FetchStatus::Error as i32,
-                        result_batch_thrift: vec![],
-                        result_arrow_ipc: vec![],
                         message: "missing finst_id in FetchResultRequest".to_string(),
+                        packet_seq: 0,
+                        eos: false,
+                        result_arrow_ipc: vec![],
                     },
                 ));
             }
@@ -348,108 +349,62 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             return Ok(tonic::Response::new(
                 proto::novarocks::FetchResultResponse {
                     status: FetchStatus::NotReady as i32,
-                    result_batch_thrift: vec![],
-                    result_arrow_ipc: vec![],
                     message: String::new(),
+                    packet_seq: 0,
+                    eos: false,
+                    result_arrow_ipc: vec![],
                 },
             ));
         }
 
-        // wait_fetch uses std::sync::Condvar::wait_timeout, which blocks the OS
-        // thread for up to max_wait_ms. Offload to the blocking thread pool so
-        // tonic worker threads remain free for I/O.
-        use crate::runtime::result_buffer::{
-            TryFetchResult, TryFetchTypedResult, wait_fetch, wait_fetch_typed,
-        };
+        // wait_fetch_typed uses std::sync::Condvar::wait_timeout, which blocks
+        // the OS thread for up to max_wait_ms. Offload to the blocking thread
+        // pool so tonic worker threads remain free for I/O.
+        use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
         let max_wait_ms = req.max_wait_ms;
-        if req.typed_result {
-            let fetch_result =
-                tokio::task::spawn_blocking(move || wait_fetch_typed(finst_id, max_wait_ms))
-                    .await
-                    .map_err(|e| {
-                        tonic::Status::internal(format!("fetch_result handler panicked: {e}"))
-                    })?;
-            return match fetch_result {
-                TryFetchTypedResult::Ready(result) => {
-                    let status = if result.eos {
-                        FetchStatus::Eof
-                    } else {
-                        FetchStatus::Ready
-                    };
-                    emit_grpc_typed_fetch_marker(status as i32);
-                    Ok(tonic::Response::new(
-                        proto::novarocks::FetchResultResponse {
-                            status: status as i32,
-                            result_batch_thrift: vec![],
-                            result_arrow_ipc: result.payload,
-                            message: String::new(),
-                        },
-                    ))
-                }
-                TryFetchTypedResult::NotReady => {
-                    emit_grpc_typed_fetch_marker(FetchStatus::NotReady as i32);
-                    Ok(tonic::Response::new(
-                        proto::novarocks::FetchResultResponse {
-                            status: FetchStatus::NotReady as i32,
-                            result_batch_thrift: vec![],
-                            result_arrow_ipc: vec![],
-                            message: String::new(),
-                        },
-                    ))
-                }
-                TryFetchTypedResult::Error(err) => {
-                    emit_grpc_typed_fetch_marker(FetchStatus::Error as i32);
-                    Ok(tonic::Response::new(
-                        proto::novarocks::FetchResultResponse {
-                            status: FetchStatus::Error as i32,
-                            result_batch_thrift: vec![],
-                            result_arrow_ipc: vec![],
-                            message: err.message,
-                        },
-                    ))
-                }
-            };
-        }
-
-        let fetch_result = tokio::task::spawn_blocking(move || wait_fetch(finst_id, max_wait_ms))
-            .await
-            .map_err(|e| tonic::Status::internal(format!("fetch_result handler panicked: {e}")))?;
+        let fetch_result =
+            tokio::task::spawn_blocking(move || wait_fetch_typed(finst_id, max_wait_ms))
+                .await
+                .map_err(|e| {
+                    tonic::Status::internal(format!("fetch_result handler panicked: {e}"))
+                })?;
         match fetch_result {
-            TryFetchResult::Ready(result) => {
-                let status = if result.eos {
-                    FetchStatus::Eof
-                } else {
-                    FetchStatus::Ready
-                };
-                // Thrift-binary-encode the TResultBatch for transport.
-                // The receiver (PR-4 RemoteDispatcher) deserializes the same bytes.
-                let batch_bytes =
-                    crate::common::thrift::thrift_serialize_result_batch(&result.result_batch);
+            TryFetchTypedResult::Ready(result) => {
+                emit_grpc_typed_fetch_marker(FetchStatus::Ready as i32);
                 Ok(tonic::Response::new(
                     proto::novarocks::FetchResultResponse {
-                        status: status as i32,
-                        result_batch_thrift: batch_bytes,
-                        result_arrow_ipc: vec![],
+                        status: FetchStatus::Ready as i32,
                         message: String::new(),
+                        packet_seq: result.packet_seq,
+                        eos: result.eos,
+                        result_arrow_ipc: result.payload,
                     },
                 ))
             }
-            TryFetchResult::NotReady => Ok(tonic::Response::new(
-                proto::novarocks::FetchResultResponse {
-                    status: FetchStatus::NotReady as i32,
-                    result_batch_thrift: vec![],
-                    result_arrow_ipc: vec![],
-                    message: String::new(),
-                },
-            )),
-            TryFetchResult::Error(err) => Ok(tonic::Response::new(
-                proto::novarocks::FetchResultResponse {
-                    status: FetchStatus::Error as i32,
-                    result_batch_thrift: vec![],
-                    result_arrow_ipc: vec![],
-                    message: err.message,
-                },
-            )),
+            TryFetchTypedResult::NotReady => {
+                emit_grpc_typed_fetch_marker(FetchStatus::NotReady as i32);
+                Ok(tonic::Response::new(
+                    proto::novarocks::FetchResultResponse {
+                        status: FetchStatus::NotReady as i32,
+                        message: String::new(),
+                        packet_seq: 0,
+                        eos: false,
+                        result_arrow_ipc: vec![],
+                    },
+                ))
+            }
+            TryFetchTypedResult::Error(err) => {
+                emit_grpc_typed_fetch_marker(FetchStatus::Error as i32);
+                Ok(tonic::Response::new(
+                    proto::novarocks::FetchResultResponse {
+                        status: FetchStatus::Error as i32,
+                        message: err.message,
+                        packet_seq: 0,
+                        eos: false,
+                        result_arrow_ipc: vec![],
+                    },
+                ))
+            }
         }
     }
 
@@ -1867,7 +1822,6 @@ mod pr3_tests {
         let req = Request::new(FetchResultRequest {
             finst_id: None,
             max_wait_ms: 0,
-            typed_result: false,
         });
         let resp = svc.fetch_result(req).await.expect("RPC level success");
         let body = resp.into_inner();
@@ -1877,8 +1831,10 @@ mod pr3_tests {
             "missing finst_id must return ERROR status"
         );
         assert!(!body.message.is_empty(), "error message must be non-empty");
+        assert_eq!(body.packet_seq, 0);
+        assert!(!body.eos);
         assert!(
-            body.result_batch_thrift.is_empty(),
+            body.result_arrow_ipc.is_empty(),
             "payload must be empty on error"
         );
     }
@@ -1886,10 +1842,10 @@ mod pr3_tests {
     #[tokio::test]
     async fn fetch_result_empty_open_buffer_returns_not_ready_without_wait() {
         use crate::common::types::UniqueId;
-        use crate::runtime::result_buffer::create_sender;
+        use crate::runtime::result_buffer::create_typed_sender;
 
         let finst_id = UniqueId { hi: 8801, lo: 8802 };
-        create_sender(finst_id);
+        create_typed_sender(finst_id);
 
         let svc = GrpcService::default();
         let req = Request::new(FetchResultRequest {
@@ -1898,7 +1854,6 @@ mod pr3_tests {
                 lo: finst_id.lo,
             }),
             max_wait_ms: 0,
-            typed_result: false,
         });
         let resp = svc.fetch_result(req).await.expect("RPC level success");
         let body = resp.into_inner();
@@ -1907,32 +1862,23 @@ mod pr3_tests {
             FetchStatus::NotReady as i32,
             "empty open buffer with max_wait_ms=0 must return NOT_READY"
         );
+        assert_eq!(body.packet_seq, 0);
+        assert!(!body.eos);
+        assert!(body.result_arrow_ipc.is_empty());
     }
 
     #[tokio::test]
-    async fn fetch_result_waits_for_ready_result() {
-        use crate::common::types::{FetchResult, UniqueId};
-        use crate::runtime::result_buffer::{create_sender, insert};
+    async fn fetch_result_waits_for_ready_arrow_ipc_result() {
+        use crate::common::types::UniqueId;
+        use crate::runtime::result_buffer::{create_typed_sender, insert_typed};
 
         let finst_id = UniqueId { hi: 8803, lo: 8804 };
-        create_sender(finst_id);
+        create_typed_sender(finst_id);
 
         // Insert a result from a background thread after 20 ms.
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            insert(
-                finst_id,
-                FetchResult {
-                    packet_seq: 0,
-                    eos: false,
-                    result_batch: crate::thrift::data::TResultBatch::new(
-                        vec![b"hello".to_vec()],
-                        false,
-                        0,
-                        None,
-                    ),
-                },
-            );
+            insert_typed(finst_id, vec![1, 2, 3, 4]).expect("insert typed payload");
         });
 
         let svc = GrpcService::default();
@@ -1942,7 +1888,6 @@ mod pr3_tests {
                 lo: finst_id.lo,
             }),
             max_wait_ms: 1000,
-            typed_result: false,
         });
         let resp = svc.fetch_result(req).await.expect("RPC level success");
         let body = resp.into_inner();
@@ -1951,10 +1896,9 @@ mod pr3_tests {
             FetchStatus::Ready as i32,
             "should return READY after delayed insert with max_wait_ms=1000"
         );
-        assert!(
-            !body.result_batch_thrift.is_empty(),
-            "result_batch_thrift payload must be non-empty"
-        );
+        assert_eq!(body.packet_seq, 0);
+        assert!(!body.eos);
+        assert_eq!(body.result_arrow_ipc, vec![1, 2, 3, 4]);
     }
 
     #[tokio::test]
@@ -1973,23 +1917,23 @@ mod pr3_tests {
                 lo: finst_id.lo,
             }),
             max_wait_ms: 0,
-            typed_result: true,
         });
         let resp = svc.fetch_result(req).await.expect("RPC level success");
         let body = resp.into_inner();
 
         assert_eq!(body.status, FetchStatus::Ready as i32);
+        assert_eq!(body.packet_seq, 0);
+        assert!(!body.eos);
         assert_eq!(body.result_arrow_ipc, vec![1, 2, 3, 4]);
-        assert!(body.result_batch_thrift.is_empty());
     }
 
     #[tokio::test]
     async fn fetch_result_buffer_error_returns_error_status() {
         use crate::common::types::UniqueId;
-        use crate::runtime::result_buffer::{close_error, create_sender};
+        use crate::runtime::result_buffer::{close_error, create_typed_sender};
 
         let finst_id = UniqueId { hi: 8807, lo: 8808 };
-        create_sender(finst_id);
+        create_typed_sender(finst_id);
         close_error(finst_id, "boom".to_string());
 
         let svc = GrpcService::default();
@@ -1999,7 +1943,6 @@ mod pr3_tests {
                 lo: finst_id.lo,
             }),
             max_wait_ms: 0,
-            typed_result: false,
         });
         let resp = svc.fetch_result(req).await.expect("RPC level success");
         let body = resp.into_inner();
@@ -2009,19 +1952,21 @@ mod pr3_tests {
             "close_error buffer must return ERROR status"
         );
         assert_eq!(body.message, "boom", "error message must match");
+        assert_eq!(body.packet_seq, 0);
+        assert!(!body.eos);
         assert!(
-            body.result_batch_thrift.is_empty(),
+            body.result_arrow_ipc.is_empty(),
             "payload must be empty on error"
         );
     }
 
     #[tokio::test]
-    async fn fetch_result_closed_buffer_returns_eof() {
+    async fn fetch_result_closed_buffer_returns_ready_eos() {
         use crate::common::types::UniqueId;
-        use crate::runtime::result_buffer::{close_ok, create_sender};
+        use crate::runtime::result_buffer::{close_ok, create_typed_sender};
 
         let finst_id = UniqueId { hi: 8805, lo: 8806 };
-        create_sender(finst_id);
+        create_typed_sender(finst_id);
         close_ok(finst_id);
 
         let svc = GrpcService::default();
@@ -2031,14 +1976,16 @@ mod pr3_tests {
                 lo: finst_id.lo,
             }),
             max_wait_ms: 0,
-            typed_result: false,
         });
         let resp = svc.fetch_result(req).await.expect("RPC level success");
         let body = resp.into_inner();
         assert_eq!(
             body.status,
-            FetchStatus::Eof as i32,
-            "closed buffer must return EOF"
+            FetchStatus::Ready as i32,
+            "closed buffer must return READY with eos=true"
         );
+        assert_eq!(body.packet_seq, 0);
+        assert!(body.eos);
+        assert!(body.result_arrow_ipc.is_empty());
     }
 }
