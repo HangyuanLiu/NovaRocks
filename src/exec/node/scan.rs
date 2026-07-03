@@ -272,6 +272,21 @@ impl std::fmt::Debug for RuntimeFilterContext {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct ScanRuntimeFilterDecision<'a> {
+    acquired: Option<&'a AcquiredRuntimeFilters>,
+}
+
+impl<'a> ScanRuntimeFilterDecision<'a> {
+    pub(crate) fn from_acquired(acquired: Option<&'a AcquiredRuntimeFilters>) -> Self {
+        Self { acquired }
+    }
+
+    pub(crate) fn acquired(&self) -> Option<&'a AcquiredRuntimeFilters> {
+        self.acquired
+    }
+}
+
 pub trait ScanOp: Send + Sync {
     fn execute_iter(
         &self,
@@ -303,7 +318,7 @@ pub trait ScanOp: Send + Sync {
 
     fn build_morsels_with_runtime_filters(
         &self,
-        _acquired: Option<&AcquiredRuntimeFilters>,
+        _decision: ScanRuntimeFilterDecision<'_>,
     ) -> Result<ScanMorsels, String> {
         self.build_morsels()
     }
@@ -591,11 +606,12 @@ impl ScanNode {
         self.op.materialize_morsels_after_runtime_filters()
     }
 
-    pub fn build_morsels_with_runtime_filters(
+    pub(crate) fn build_morsels_with_runtime_filters(
         &self,
         acquired: Option<&AcquiredRuntimeFilters>,
     ) -> Result<ScanMorsels, String> {
-        let mut morsels = self.op.build_morsels_with_runtime_filters(acquired)?;
+        let decision = ScanRuntimeFilterDecision::from_acquired(acquired);
+        let mut morsels = self.op.build_morsels_with_runtime_filters(decision)?;
         morsels.ensure_non_empty(self.accept_empty_scan_ranges);
         Ok(morsels)
     }

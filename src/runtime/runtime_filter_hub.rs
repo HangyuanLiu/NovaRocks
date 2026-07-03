@@ -50,21 +50,21 @@ struct RuntimeFilterStore {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct RuntimeFilterSnapshot {
+pub(crate) struct RuntimeFilterSnapshot {
     in_filters: Vec<Arc<RuntimeInFilter>>,
     membership_filters: Vec<Arc<RuntimeMembershipFilter>>,
     pub(crate) min_max_filters: Vec<(i32, Arc<RuntimeMinMaxFilter>)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RuntimeFilterUnavailableReason {
+pub(crate) enum RuntimeFilterUnavailableReason {
     NotPlanned,
     Timeout,
     NoWaitConfigured,
 }
 
 #[derive(Clone, Debug)]
-pub enum AcquiredRuntimeFilters {
+pub(crate) enum AcquiredRuntimeFilters {
     Complete(RuntimeFilterSnapshot),
     Unavailable(RuntimeFilterUnavailableReason),
 }
