@@ -1,123 +1,170 @@
 syntax = "proto3";
 
+// NovaRocks-native FE<->BE gRPC contract. Top-level package `novarocks` is the
+// RPC-envelope package (service + envelope messages only). Domain messages move
+// to novarocks.{plan,expr,filter,common} subpackages in NIDL-1/2/3.
+//
+// Discipline: tag numbers are append-only; comments document semantics and
+// RPC/message owner paths where applicable.
 package novarocks;
 
+// internal_service.proto (package starrocks) provides PTransmitRuntimeFilter*
+// and PLookUp* used by the two RPCs below. NIDL-2 replaces those signatures with
+// novarocks.filter messages and drops this import.
 import "internal_service.proto";
+// LOAD-BEARING import, NOT dead. No `lake.`/`starrocks.` type from this file is
+// referenced syntactically here, but this import is the SOLE anchor that pulls
+// lake_service.proto into the non-compat transitive compile, which is what emits
+// proto::starrocks::{TxnInfoPb, TxnLogPb, PublishVersionRequest, ...}. Those are
+// consumed by src/connector/starrocks/lake/** (currently ungated, in the default
+// build). Removing this import breaks the pure build. Real home: NIDL-D1 gates
+// the lake module, after which this anchor moves under the compat compile.
 import "lake_service.proto";
 
+// FE<->BE control + data-plane RPC surface. One service, all cluster-internal
+// traffic. Consumers: src/service/grpc_server.rs (server), src/service/
+// grpc_client.rs + src/runtime/dispatcher.rs + src/runtime/heartbeat_mgr.rs +
+// src/service/standalone_exec_state_reporter.rs (clients).
 service NovaRocksGrpc {
+  // Streaming exchange shuffle: sender streams chunk payloads to a receiver
+  // fragment instance. Producer: src/service/exchange_sender.rs. Consumer:
+  // src/service/grpc_server.rs -> src/runtime/exchange.rs.
   rpc Exchange(stream ExchangeRequest) returns (stream ExchangeResponse);
+  // Single-message exchange path used by the current gRPC sender.
   rpc ExchangeUnary(ExchangeRequest) returns (ExchangeResponse);
+  // Runtime-filter propagation. NIDL-2: retype to novarocks.filter.
   rpc TransmitRuntimeFilter(starrocks.PTransmitRuntimeFilterParams)
       returns (starrocks.PTransmitRuntimeFilterResult);
+  // Point lookup (fetch-by-key). NIDL-2: retype to novarocks.filter.
   rpc Lookup(starrocks.PLookUpRequest) returns (starrocks.PLookUpResponse);
 
-  // D1 distributed execution RPCs (PR-3).
+  // Coordinator -> BE fragment submission. payload is a thrift-encoded
+  // TExecPlanFragmentParams today; NIDL-4 adds native plan + instance_params.
   rpc SubmitFragment(SubmitFragmentRequest) returns (SubmitFragmentResponse);
+  // Coordinator polls a fragment instance for result batches.
   rpc FetchResult(FetchResultRequest) returns (FetchResultResponse);
+  // Coordinator cancels one or more fragment instances.
   rpc CancelFragment(CancelFragmentRequest) returns (CancelFragmentResponse);
-  // D3 cluster heartbeat (FE-pull, unary).
+  // FE-pull cluster heartbeat (unary). Consumer: src/runtime/heartbeat_mgr.rs.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
-  // IW-4 distributed write coordinator report RPCs.
+  // BE -> coordinator exec-status report (distributed write). Producer:
+  // src/service/standalone_exec_state_reporter.rs. Consumer: grpc_server.rs.
   rpc ReportExecStatus(ReportExecStatusRequest)
       returns (ReportExecStatusResponse);
+  // Batched variant of ReportExecStatus.
   rpc BatchReportExecStatus(BatchReportExecStatusRequest)
       returns (BatchReportExecStatusResponse);
 }
 
+// One exchange shuffle chunk in flight from a sender to a receiver instance.
 message ExchangeRequest {
-  int64 finst_id_hi = 1;
-  int64 finst_id_lo = 2;
-  int32 node_id = 3;
-  int32 sender_id = 4;
-  int32 be_number = 5;
-  bool eos = 6;
-  int64 sequence = 7;
-  bytes payload = 8;
+  int64 finst_id_hi = 1;   // receiver fragment-instance id, high 64 bits
+  int64 finst_id_lo = 2;   // receiver fragment-instance id, low 64 bits
+  int32 node_id = 3;       // destination exchange node id within the fragment
+  int32 sender_id = 4;     // sender ordinal (for per-sender EOS tracking)
+  int32 be_number = 5;     // sender BE ordinal
+  bool eos = 6;            // true on this sender's final message
+  int64 sequence = 7;      // monotonic per-sender sequence for ordering/ack
+  bytes payload = 8;       // NRX1-framed Arrow IPC chunk (src/runtime/exchange.rs)
 }
 
+// Ack for one ExchangeRequest.
 message ExchangeResponse {
-  int64 ack_sequence = 1;
+  int64 ack_sequence = 1;  // sequence value accepted for this request
 }
 
-// D1 distributed execution messages (PR-3).
-
+// SubmitFragment payload. Thrift bytes today; NIDL-4 adds native fields.
 message SubmitFragmentRequest {
-  bytes exec_plan_fragment_params_thrift = 1;
+  bytes exec_plan_fragment_params_thrift = 1;  // serialized TExecPlanFragmentParams
 }
 
+// SubmitFragment acceptance result returned by the destination BE.
 message SubmitFragmentResponse {
-  int32 status_code = 1;
-  string message = 2;
+  int32 status_code = 1;   // 0 == accepted; nonzero == rejected
+  string message = 2;      // human-readable rejection detail
 }
 
-// Unique identifier for a fragment instance; mirrors starrocks.PUniqueId but
-// lives in the novarocks package to avoid a cross-package name collision.
+// Fragment-instance id. Mirrors starrocks.PUniqueId but lives in novarocks to
+// avoid a cross-package name collision.
 message PUniqueId {
-  int64 hi = 1;
-  int64 lo = 2;
+  int64 hi = 1;  // high 64 bits of the id
+  int64 lo = 2;  // low 64 bits of the id
 }
 
+// Coordinator long-poll request for one fragment instance result stream.
 message FetchResultRequest {
-  PUniqueId finst_id = 1;
-  int64 max_wait_ms = 2;
-  bool typed_result = 3;
+  PUniqueId finst_id = 1;  // instance to poll
+  int64 max_wait_ms = 2;   // server-side long-poll budget
+  bool typed_result = 3;   // request typed (Arrow) result path
 }
 
+// FetchResult response containing readiness state plus one optional payload.
 message FetchResultResponse {
+  // NOTE(NIDL-0 debt): READY = 0 makes a missing/default-decoded status read as
+  // "ready". NIDL-1 fixes this to a *_UNSPECIFIED = 0 first value when it
+  // single-tracks FetchResult. Do not depend on the zero value meaning READY.
   enum Status {
     READY = 0;
     NOT_READY = 1;
     EOF = 2;
     ERROR = 3;
   }
-  Status status = 1;
-  // Thrift-binary-encoded TResultBatch payload.
+  Status status = 1;  // result lifecycle state for this poll
+  // Thrift-binary-encoded TResultBatch payload. NIDL-1 drops this (Arrow-only).
   bytes result_batch_thrift = 2;
-  string message = 3;
-  // NovaRocks-private exchange-envelope-wrapped Arrow IPC payload.
+  string message = 3;      // error detail when status == ERROR
+  // NovaRocks-private NRX1-framed Arrow IPC payload.
   bytes result_arrow_ipc = 4;
 }
 
+// Coordinator cancellation request for active fragment instances.
 message CancelFragmentRequest {
-  repeated PUniqueId finst_ids = 1;
-  string reason = 2;
-  uint64 start_epoch = 3;
+  repeated PUniqueId finst_ids = 1;  // instances to cancel
+  string reason = 2;                 // cancellation reason for logging
+  uint64 start_epoch = 3;            // guard: ignore if BE restarted past epoch
 }
 
+// Cancellation result returned after local cancellation handling.
 message CancelFragmentResponse {
-  int32 status_code = 1;
+  int32 status_code = 1;  // 0 == cancellation accepted
 }
 
+// FE-pull heartbeat request. Consumer: src/runtime/heartbeat_mgr.rs.
 message HeartbeatRequest {
-  uint32 assigned_be_id = 1;
-  int64 fe_epoch = 2;
+  uint32 assigned_be_id = 1;  // id the FE assigns to this BE
+  int64 fe_epoch = 2;         // FE epoch for split-brain detection
 }
 
+// BE heartbeat state returned to the FE poller.
 message HeartbeatResponse {
-  uint64 start_epoch = 1;
-  string version = 2;
-  uint32 num_cores = 3;
-  int32 status_code = 4;
+  uint64 start_epoch = 1;  // BE process start epoch (restart detection)
+  string version = 2;      // BE build version
+  uint32 num_cores = 3;    // available cores for scheduling
+  int32 status_code = 4;   // 0 == healthy
 }
 
+// BE -> coordinator exec-status report. Thrift payload today; NIDL-1 replaces
+// with a native novarocks message.
 message ReportExecStatusRequest {
-  bytes report_exec_status_params_thrift = 1;
+  bytes report_exec_status_params_thrift = 1;  // serialized TReportExecStatusParams
 }
 
+// Result for one exec-status report accepted by the coordinator.
 message ReportExecStatusResponse {
-  int32 status_code = 1;
-  string message = 2;
-  string error_code = 3;
+  int32 status_code = 1;  // 0 == report accepted
+  string message = 2;     // human-readable status or error detail
+  string error_code = 3;  // machine-readable error code when nonzero
 }
 
+// Batched exec-status reports from one BE to the coordinator.
 message BatchReportExecStatusRequest {
-  repeated bytes report_exec_status_params_thrift = 1;
+  repeated bytes report_exec_status_params_thrift = 1;  // serialized TReportExecStatusParams list
 }
 
+// Aggregate result for a batch of exec-status reports.
 message BatchReportExecStatusResponse {
-  int32 status_code = 1;
-  string message = 2;
-  string error_code = 3;
+  int32 status_code = 1;  // 0 == batch accepted
+  string message = 2;     // human-readable status or error detail
+  string error_code = 3;  // machine-readable error code when nonzero
 }
