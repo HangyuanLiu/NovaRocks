@@ -578,8 +578,17 @@ impl StandaloneServerConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanWireFormat {
+    Thrift,
+    Proto,
+}
+
 #[derive(Clone, Deserialize)]
 pub struct RuntimeConfig {
+    #[serde(default = "default_plan_wire_format")]
+    pub plan_wire_format: PlanWireFormat,
     #[serde(default = "default_exchange_wait_ms")]
     pub exchange_wait_ms: u64,
     #[serde(default = "default_exchange_max_transmit_batched_bytes")]
@@ -814,6 +823,10 @@ fn default_exchange_io_max_inflight_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+fn default_plan_wire_format() -> PlanWireFormat {
+    PlanWireFormat::Thrift
+}
+
 fn default_mem_limit() -> String {
     DEFAULT_MEM_LIMIT_SPEC.to_string()
 }
@@ -1001,6 +1014,7 @@ fn default_object_storage_retry_log_first_n() -> u32 {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            plan_wire_format: default_plan_wire_format(),
             exchange_wait_ms: default_exchange_wait_ms(),
             exchange_max_transmit_batched_bytes: default_exchange_max_transmit_batched_bytes(),
             exchange_io_threads: default_exchange_io_threads(),
@@ -1502,8 +1516,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, RuntimeConfig,
-        StandaloneObjectStoreConfig, StandaloneServerConfig,
+        DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, PlanWireFormat,
+        RuntimeConfig, StandaloneObjectStoreConfig, StandaloneServerConfig,
     };
 
     #[test]
@@ -1963,6 +1977,33 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
             cfg.runtime.olap_sink_max_tablet_write_chunk_bytes,
             67_108_864
         );
+    }
+
+    #[test]
+    fn test_runtime_plan_wire_format_defaults_to_thrift() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.runtime.plan_wire_format, PlanWireFormat::Thrift);
+        assert_eq!(
+            RuntimeConfig::default().plan_wire_format,
+            PlanWireFormat::Thrift
+        );
+    }
+
+    #[test]
+    fn test_runtime_plan_wire_format_can_be_proto() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+plan_wire_format = "proto"
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.runtime.plan_wire_format, PlanWireFormat::Proto);
     }
 
     #[test]

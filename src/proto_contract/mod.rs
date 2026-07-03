@@ -5,6 +5,7 @@
 mod common;
 mod expr;
 mod filter;
+mod instance_params;
 mod plan;
 mod report;
 mod service;

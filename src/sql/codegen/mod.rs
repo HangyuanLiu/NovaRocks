@@ -16,6 +16,7 @@ pub(crate) mod iceberg_change_stream_router_wire;
 pub(crate) mod iceberg_write_sink_wire;
 pub(crate) mod ir;
 pub(crate) mod nodes;
+pub(crate) mod proto_encode;
 pub(crate) mod resolve;
 pub(crate) mod runtime_filter_lowering;
 pub(crate) mod scalar_materialize;

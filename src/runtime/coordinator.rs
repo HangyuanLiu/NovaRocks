@@ -25,11 +25,12 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::common::app_config::PlanWireFormat;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::schema_thrift::chunk_slot_schema_from_type_desc;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::novarocks_logging::debug;
-use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
+use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
 use crate::runtime::exec_params::{ExecPlanFragmentParamOptions, build_exec_plan_fragment_params};
 use crate::runtime::query_state::QueryState;
 use crate::runtime::scheduler::{
@@ -71,6 +72,7 @@ pub(crate) struct CoordinatedQueryResult {
 /// polling the dispatcher for the root fragment's chunks.
 pub(crate) struct ExecutionCoordinator {
     build_result: MultiFragmentBuildResult,
+    native_plan: Option<crate::sql::planner::DistributedPlan>,
     dispatcher: Arc<dyn FragmentDispatcher>,
     scheduler: Arc<FragmentScheduler>,
     query_options: Option<crate::thrift::internal_service::TQueryOptions>,
@@ -85,6 +87,23 @@ impl ExecutionCoordinator {
     ) -> Self {
         Self {
             build_result,
+            native_plan: None,
+            dispatcher,
+            scheduler,
+            query_options,
+        }
+    }
+
+    pub(crate) fn new_with_native_plan(
+        build_result: MultiFragmentBuildResult,
+        native_plan: crate::sql::planner::DistributedPlan,
+        dispatcher: Arc<dyn FragmentDispatcher>,
+        scheduler: Arc<FragmentScheduler>,
+        query_options: Option<crate::thrift::internal_service::TQueryOptions>,
+    ) -> Self {
+        Self {
+            build_result,
+            native_plan: Some(native_plan),
             dispatcher,
             scheduler,
             query_options,
@@ -110,9 +129,13 @@ impl ExecutionCoordinator {
             boundary_schemas: _,
             rf_plan,
         } = self.build_result;
+        let native_plan = self.native_plan;
         let query_options = self.query_options;
         let dispatcher = self.dispatcher;
         let scheduler = self.scheduler;
+        let plan_wire_format = current_plan_wire_format();
+        let native_fragments_by_id =
+            native_fragment_sidecars(plan_wire_format, native_plan.as_ref())?;
         // ---------------------------------------------------------------
         // 1. Allocate query id and run the scheduler.
         // ---------------------------------------------------------------
@@ -286,13 +309,8 @@ impl ExecutionCoordinator {
         // Collect submissions by fragment, then submit consumers before
         // producers. This ensures downstream exchange receivers/result buffers
         // are registered before an upstream producer can fail or send data.
-        let mut submissions_by_fragment: BTreeMap<
-            FragmentId,
-            Vec<(
-                usize,
-                crate::thrift::internal_service::TExecPlanFragmentParams,
-            )>,
-        > = BTreeMap::new();
+        let mut submissions_by_fragment: BTreeMap<FragmentId, Vec<(usize, FragmentSubmission)>> =
+            BTreeMap::new();
         let mut expected_writers = Vec::new();
 
         for (&fragment_id, placements) in &plan.by_fragment {
@@ -320,6 +338,15 @@ impl ExecutionCoordinator {
                      stream fan-out is not supported in standalone coordinator"
                 ));
             }
+            ensure_native_sidecar_sink_supported(
+                plan_wire_format,
+                fragment_id,
+                is_root,
+                is_terminal_write,
+                stream_edge.is_some(),
+                router_edges.is_some(),
+                fr.cte_id.is_some(),
+            )?;
 
             for placement in placements {
                 // Build the output sink for this fragment class.
@@ -478,20 +505,51 @@ impl ExecutionCoordinator {
                     });
                 }
 
+                let submission = match plan_wire_format {
+                    PlanWireFormat::Thrift => FragmentSubmission::thrift_only(params),
+                    PlanWireFormat::Proto => {
+                        let native_fragment =
+                            native_fragments_by_id.get(&fragment_id).cloned().ok_or_else(
+                                || {
+                                    format!(
+                                        "native plan sidecar missing fragment {fragment_id} while plan_wire_format=proto"
+                                    )
+                                },
+                            )?;
+                        let exec = params.params.as_ref().ok_or_else(|| {
+                            format!(
+                                "fragment {fragment_id} missing exec params while plan_wire_format=proto"
+                            )
+                        })?;
+                        let native_instance_params =
+                            crate::sql::codegen::proto_encode::instance::encode_instance_params(
+                                &query_id,
+                                placement,
+                                query_options.as_ref(),
+                                exec.runtime_filter_params.as_ref(),
+                                placement.instance_index as i32,
+                                params.novarocks_report_addr.as_ref(),
+                                params.novarocks_typed_result_sink.unwrap_or(false),
+                            )?;
+                        FragmentSubmission::with_native(
+                            params,
+                            native_fragment,
+                            native_instance_params,
+                        )
+                    }
+                };
+
                 submissions_by_fragment
                     .entry(fragment_id)
                     .or_default()
-                    .push((placement.backend_idx, params));
+                    .push((placement.backend_idx, submission));
             }
         }
 
         if !submissions_by_fragment.contains_key(&execution_root_fragment_id) {
             return Err("root fragment produced no placement".to_string());
         }
-        let mut submissions: Vec<(
-            usize,
-            crate::thrift::internal_service::TExecPlanFragmentParams,
-        )> = Vec::new();
+        let mut submissions: Vec<(usize, FragmentSubmission)> = Vec::new();
         for fragment_id in topological_sort_bottom_up(&fragment_results, &edges)?
             .into_iter()
             .rev()
@@ -1083,15 +1141,12 @@ fn uses_result_buffer_sink(
 }
 
 fn root_uses_result_buffer(
-    submissions: &[(
-        usize,
-        crate::thrift::internal_service::TExecPlanFragmentParams,
-    )],
+    submissions: &[(usize, FragmentSubmission)],
     root_finst_id: &types::TUniqueId,
 ) -> Result<bool, String> {
     let root = submissions
         .iter()
-        .map(|(_, params)| params)
+        .map(|(_, submission)| submission.thrift_params())
         .find(|params| {
             params
                 .params
@@ -1112,15 +1167,12 @@ fn root_uses_result_buffer(
 }
 
 fn root_uses_typed_result_sink(
-    submissions: &[(
-        usize,
-        crate::thrift::internal_service::TExecPlanFragmentParams,
-    )],
+    submissions: &[(usize, FragmentSubmission)],
     root_finst_id: &types::TUniqueId,
 ) -> Result<bool, String> {
     let root = submissions
         .iter()
-        .map(|(_, params)| params)
+        .map(|(_, submission)| submission.thrift_params())
         .find(|params| {
             params
                 .params
@@ -1190,6 +1242,63 @@ fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
     let port =
         crate::service::grpc_server::grpc_server_bound_port().unwrap_or(cfg.server.grpc_port);
     Ok(types::TNetworkAddress::new(host, port as i32))
+}
+
+fn current_plan_wire_format() -> PlanWireFormat {
+    crate::novarocks_config::config()
+        .map(|cfg| cfg.runtime.plan_wire_format)
+        .unwrap_or(PlanWireFormat::Thrift)
+}
+
+fn ensure_native_sidecar_sink_supported(
+    wire_format: PlanWireFormat,
+    fragment_id: FragmentId,
+    is_root: bool,
+    is_terminal_write: bool,
+    has_stream_edge: bool,
+    has_router_edges: bool,
+    has_cte_id: bool,
+) -> Result<(), String> {
+    if wire_format != PlanWireFormat::Proto || is_root || is_terminal_write {
+        return Ok(());
+    }
+
+    let dynamic_sink = if has_stream_edge {
+        "DATA_STREAM_SINK"
+    } else if has_router_edges {
+        "ICEBERG_CHANGE_STREAM_ROUTER_SINK destinations"
+    } else if has_cte_id {
+        "MULTI_CAST_DATA_STREAM_SINK"
+    } else {
+        "dynamic fragment sink"
+    };
+    Err(format!(
+        "plan_wire_format=proto cannot encode {dynamic_sink} for fragment {fragment_id}; \
+         use plan_wire_format=thrift until the native sink contract carries dynamic destinations"
+    ))
+}
+
+fn native_fragment_sidecars(
+    wire_format: PlanWireFormat,
+    native_plan: Option<&crate::sql::planner::DistributedPlan>,
+) -> Result<BTreeMap<FragmentId, crate::proto::plan::PlanFragment>, String> {
+    match wire_format {
+        PlanWireFormat::Thrift => Ok(BTreeMap::new()),
+        PlanWireFormat::Proto => {
+            let native_plan = native_plan.ok_or_else(|| {
+                "plan_wire_format=proto requires a native DistributedPlan, but this execution path only supplied thrift fragments".to_string()
+            })?;
+            let encoded =
+                crate::sql::codegen::proto_encode::plan::encode_distributed_plan(native_plan)?;
+            let mut by_id = BTreeMap::new();
+            for fragment in encoded.fragments {
+                if by_id.insert(fragment.fragment_id, fragment).is_some() {
+                    return Err("native DistributedPlan encoded duplicate fragment ids".to_string());
+                }
+            }
+            Ok(by_id)
+        }
+    }
 }
 
 /// Assemble the per-instance `TRuntimeFilterParams` from scheduler-provided
@@ -1525,10 +1634,7 @@ impl Drop for QueryStateRegistrationGuard {
 pub(crate) fn submit_and_fetch_loop(
     dispatcher: &Arc<dyn FragmentDispatcher>,
     tracker: &mut InFlightTracker,
-    submissions: Vec<(
-        usize,
-        crate::thrift::internal_service::TExecPlanFragmentParams,
-    )>,
+    submissions: Vec<(usize, FragmentSubmission)>,
     root_backend_idx: usize,
     root_finst_id: types::TUniqueId,
     query_id: &types::TUniqueId,
@@ -1549,13 +1655,14 @@ pub(crate) fn submit_and_fetch_loop(
     let _failure_guard = StandaloneQueryFailureGuard::register(query_id);
     let _profile_guard = collect_profiles.then(|| StandaloneQueryProfileGuard::register(query_id));
 
-    for (backend_idx, p) in submissions {
-        let finst_id = p
+    for (backend_idx, submission) in submissions {
+        let finst_id = submission
+            .thrift_params()
             .params
             .as_ref()
             .map(|ep| types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
             .unwrap_or_else(|| types::TUniqueId::new(0, 0));
-        if let Err(e) = dispatcher.submit_fragment(backend_idx, p) {
+        if let Err(e) = dispatcher.submit_fragment_submission(backend_idx, submission) {
             tracker.cancel_all(dispatcher.as_ref());
             return Err(e);
         }
@@ -1877,6 +1984,84 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn native_fragment_sidecars_thrift_allows_missing_native_plan() {
+        let sidecars = native_fragment_sidecars(PlanWireFormat::Thrift, None)
+            .expect("thrift mode must not require native plan");
+
+        assert!(sidecars.is_empty());
+    }
+
+    #[test]
+    fn native_fragment_sidecars_proto_requires_native_plan() {
+        let err = native_fragment_sidecars(PlanWireFormat::Proto, None)
+            .expect_err("proto mode must require native plan");
+
+        assert!(err.contains("plan_wire_format=proto"), "{err}");
+        assert!(err.contains("native DistributedPlan"), "{err}");
+    }
+
+    #[test]
+    fn native_sidecar_sink_support_allows_thrift_dynamic_stream_sink() {
+        ensure_native_sidecar_sink_supported(
+            PlanWireFormat::Thrift,
+            7,
+            false,
+            false,
+            true,
+            false,
+            false,
+        )
+        .expect("thrift mode owns dynamic sink wiring");
+    }
+
+    #[test]
+    fn native_sidecar_sink_support_rejects_proto_dynamic_stream_sink() {
+        let err = ensure_native_sidecar_sink_supported(
+            PlanWireFormat::Proto,
+            7,
+            false,
+            false,
+            true,
+            false,
+            false,
+        )
+        .expect_err("proto mode must reject dynamic stream sinks");
+
+        assert!(err.contains("DATA_STREAM_SINK"), "{err}");
+        assert!(err.contains("dynamic destinations"), "{err}");
+    }
+
+    #[test]
+    fn native_sidecar_sink_support_rejects_proto_router_and_cte_sinks() {
+        let router_err = ensure_native_sidecar_sink_supported(
+            PlanWireFormat::Proto,
+            8,
+            false,
+            false,
+            false,
+            true,
+            false,
+        )
+        .expect_err("proto mode must reject router destinations");
+        assert!(
+            router_err.contains("ICEBERG_CHANGE_STREAM_ROUTER_SINK"),
+            "{router_err}"
+        );
+
+        let cte_err = ensure_native_sidecar_sink_supported(
+            PlanWireFormat::Proto,
+            9,
+            false,
+            false,
+            false,
+            false,
+            true,
+        )
+        .expect_err("proto mode must reject CTE multicast sinks");
+        assert!(cte_err.contains("MULTI_CAST_DATA_STREAM_SINK"), "{cte_err}");
+    }
 
     #[test]
     fn typed_root_alignment_renames_fields_and_widens_runtime_nullability() {
@@ -2816,11 +3001,11 @@ mod tests {
     /// Wrap a list of params as single-backend submissions (backend_idx=0).
     fn single_backend(
         params: Vec<crate::thrift::internal_service::TExecPlanFragmentParams>,
-    ) -> Vec<(
-        usize,
-        crate::thrift::internal_service::TExecPlanFragmentParams,
-    )> {
-        params.into_iter().map(|p| (0usize, p)).collect()
+    ) -> Vec<(usize, FragmentSubmission)> {
+        params
+            .into_iter()
+            .map(|p| (0usize, FragmentSubmission::thrift_only(p)))
+            .collect()
     }
 
     /// Verify that `ExecutionCoordinator::new` accepts `Arc<dyn FragmentDispatcher>`

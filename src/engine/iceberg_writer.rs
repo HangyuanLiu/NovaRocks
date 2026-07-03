@@ -503,6 +503,7 @@ fn row_lineage_iceberg_schema_def_for_codegen(schema: &iceberg::spec::Schema) ->
         initial_default: None,
         write_default: None,
         initial_default_json: None,
+        write_default_json: None,
         children: Vec::new(),
     });
     out.fields.push(IcebergSchemaFieldDef {
@@ -511,6 +512,7 @@ fn row_lineage_iceberg_schema_def_for_codegen(schema: &iceberg::spec::Schema) ->
         initial_default: None,
         write_default: None,
         initial_default_json: None,
+        write_default_json: None,
         children: Vec::new(),
     });
     out

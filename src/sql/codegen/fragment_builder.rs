@@ -429,6 +429,7 @@ mod tests {
             initial_default: None,
             write_default: None,
             initial_default_json: None,
+            write_default_json: None,
             children: vec![],
         }])
     }
@@ -480,6 +481,7 @@ mod tests {
                             initial_default: None,
                             write_default: None,
                             initial_default_json: None,
+                            write_default_json: None,
                             children: vec![],
                         },
                         IcebergSchemaFieldDef {
@@ -488,6 +490,7 @@ mod tests {
                             initial_default: None,
                             write_default: None,
                             initial_default_json: None,
+                            write_default_json: None,
                             children: vec![],
                         },
                     ]),
@@ -1341,6 +1344,7 @@ mod tests {
                     initial_default: None,
                     write_default: None,
                     initial_default_json: None,
+                    write_default_json: None,
                     children: vec![],
                 },
                 IcebergSchemaFieldDef {
@@ -1349,6 +1353,7 @@ mod tests {
                     initial_default: None,
                     write_default: None,
                     initial_default_json: None,
+                    write_default_json: None,
                     children: vec![],
                 },
             ],
@@ -1375,6 +1380,7 @@ mod tests {
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
+                write_default_json: None,
                 children: vec![],
             }],
         );
@@ -1397,6 +1403,7 @@ mod tests {
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
+                write_default_json: None,
                 children: vec![],
             }],
         );
@@ -1416,6 +1423,7 @@ mod tests {
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
+                write_default_json: None,
                 children: vec![],
             },
             IcebergSchemaFieldDef {
@@ -1424,6 +1432,7 @@ mod tests {
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
+                write_default_json: None,
                 children: vec![],
             },
         ];
@@ -3882,6 +3891,7 @@ mod tests {
                             initial_default: None,
                             write_default: None,
                             initial_default_json: None,
+                            write_default_json: None,
                             children: vec![],
                         }]),
                         files: vec![],
@@ -4148,6 +4158,7 @@ mod tests {
                                 initial_default: None,
                                 write_default: None,
                                 initial_default_json: None,
+                                write_default_json: None,
                                 children: vec![],
                             },
                             IcebergSchemaFieldDef {
@@ -4156,6 +4167,7 @@ mod tests {
                                 initial_default: None,
                                 write_default: None,
                                 initial_default_json: None,
+                                write_default_json: None,
                                 children: vec![],
                             },
                         ]),

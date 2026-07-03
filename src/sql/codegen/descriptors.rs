@@ -365,7 +365,9 @@ fn to_thrift_iceberg_schema_field(
     )
 }
 
-fn serialize_iceberg_literal_json(literal: &iceberg::spec::Literal) -> Result<String, String> {
+pub(crate) fn serialize_iceberg_literal_json(
+    literal: &iceberg::spec::Literal,
+) -> Result<String, String> {
     match literal {
         iceberg::spec::Literal::Primitive(prim) => match prim {
             iceberg::spec::PrimitiveLiteral::Boolean(b) => Ok(b.to_string()),
@@ -429,12 +431,14 @@ mod tests {
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
+                write_default_json: None,
                 children: vec![IcebergSchemaFieldDef {
                     field_id: 8,
                     name: "nested".to_string(),
                     initial_default: None,
                     write_default: None,
                     initial_default_json: None,
+                    write_default_json: None,
                     children: vec![],
                 }],
             }],
@@ -504,6 +508,7 @@ mod tests {
             )),
             write_default: None,
             initial_default_json: None,
+            write_default_json: None,
             children: vec![],
         };
         let thrift = to_thrift_iceberg_schema_field(&field);
@@ -521,6 +526,7 @@ mod tests {
             )),
             write_default: None,
             initial_default_json: None,
+            write_default_json: None,
             children: vec![],
         };
         let thrift = to_thrift_iceberg_schema_field(&field);
@@ -540,6 +546,7 @@ mod tests {
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
+                write_default_json: None,
                 children: vec![],
             }],
         });

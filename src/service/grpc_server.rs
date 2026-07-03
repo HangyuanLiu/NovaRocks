@@ -1413,6 +1413,8 @@ mod pr3_tests {
         let svc = GrpcService::default();
         let req = Request::new(SubmitFragmentRequest {
             exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff], // illegal thrift
+            plan: None,
+            instance_params: None,
         });
         let resp = svc.submit_fragment(req).await.expect("RPC level success");
         let body = resp.into_inner();
@@ -1428,6 +1430,8 @@ mod pr3_tests {
         let svc = GrpcService::report_only();
         let req = Request::new(SubmitFragmentRequest {
             exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
+            plan: None,
+            instance_params: None,
         });
         let err = svc
             .submit_fragment(req)

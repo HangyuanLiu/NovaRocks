@@ -2716,8 +2716,9 @@ fn explain_analyze_query(
     let execution_start = std::time::Instant::now();
     let query_opts =
         crate::engine::query_options_wire::standalone_query_options_to_thrift(&query_opts);
-    let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
+    let outcome = crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
         build_result,
+        dp.clone(),
         dispatcher,
         scheduler,
         Some(query_opts),
@@ -3102,8 +3103,9 @@ pub(crate) fn execute_query_as_iceberg_write(
         ),
     )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new(
+    crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
         build_result,
+        dp,
         dispatcher,
         scheduler,
         crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
@@ -3224,6 +3226,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 
 pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) build_result: crate::sql::codegen::MultiFragmentBuildResult,
+    pub(crate) distributed_plan: Option<crate::sql::planner::DistributedPlan>,
     pub(crate) commit_plan:
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan,
     #[cfg(test)]
@@ -3256,9 +3259,11 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         )?;
     let planned_dp =
         crate::sql::planner::with_iceberg_change_stream_write(dp, current_database, dag.clone())?;
+    let distributed_plan = planned_dp.distributed_plan;
+    let topology = planned_dp.topology;
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         crate::sql::codegen::FragmentBuildRequest::result(
-            &planned_dp.distributed_plan,
+            &distributed_plan,
             &catalog_snapshot,
             &connectors_snapshot,
             mv_refresh_ctx,
@@ -3266,29 +3271,44 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     )?;
     let commit_plan =
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_topology(
-            &planned_dp.topology,
+            &topology,
         )?;
     Ok(PlannedIcebergChangeStreamWrite {
         build_result,
+        distributed_plan: Some(distributed_plan),
         commit_plan,
         #[cfg(test)]
-        topology: planned_dp.topology,
+        topology,
     })
 }
 
 pub(crate) fn execute_planned_iceberg_change_stream_write(
     build_result: crate::sql::codegen::MultiFragmentBuildResult,
+    distributed_plan: Option<crate::sql::planner::DistributedPlan>,
     query_opts: Option<StandaloneQueryOptions>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
     let (dispatcher, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new(
-        build_result,
-        dispatcher,
-        scheduler,
+    let query_options =
         crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
             query_opts.as_ref(),
+        );
+    match distributed_plan {
+        Some(distributed_plan) => {
+            crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
+                build_result,
+                distributed_plan,
+                dispatcher,
+                scheduler,
+                query_options,
+            )
+        }
+        None => crate::runtime::coordinator::ExecutionCoordinator::new(
+            build_result,
+            dispatcher,
+            scheduler,
+            query_options,
         ),
-    )
+    }
     .execute_with_write_outcome()
 }
 
@@ -3314,7 +3334,11 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     if let Some(result) = observe_change_stream_write_build_for_test(&planned.topology) {
         return Ok(result);
     }
-    execute_planned_iceberg_change_stream_write(planned.build_result, query_opts)
+    execute_planned_iceberg_change_stream_write(
+        planned.build_result,
+        planned.distributed_plan,
+        query_opts,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3654,8 +3678,9 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         ),
     )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new(
+    crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
         build_result,
+        dp,
         dispatcher,
         scheduler,
         crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
@@ -3716,8 +3741,9 @@ pub(crate) fn execute_logical_plan_with_options(
         ),
     )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new(
+    crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
         build_result,
+        dp,
         dispatcher,
         scheduler,
         crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
@@ -5734,6 +5760,7 @@ enable_path_style_access = true
                                         initial_default: None,
                                         write_default: None,
                                         initial_default_json: None,
+                                        write_default_json: None,
                                         children: Vec::new(),
                                     },
                                     crate::sql::catalog::IcebergSchemaFieldDef {
@@ -5742,6 +5769,7 @@ enable_path_style_access = true
                                         initial_default: None,
                                         write_default: None,
                                         initial_default_json: None,
+                                        write_default_json: None,
                                         children: Vec::new(),
                                     },
                                 ],
