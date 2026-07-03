@@ -8,7 +8,6 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.cume_test;
 CREATE TABLE IF NOT EXISTS ${case_db}.cume_test (
   k1 INT,
   k2 INT,

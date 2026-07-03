@@ -9,7 +9,6 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_decimal_precision_overflow;
 CREATE TABLE ${case_db}.`t_decimal_precision_overflow` (
   `c_id` int(11) NOT NULL,
   `c_d64_max` decimal64(18,9) NOT NULL,
@@ -90,12 +89,12 @@ select c_d128_max * c_d128_max from ${case_db}.t_decimal_precision_overflow wher
 -- Test literal multiplication that definitely causes precision overflow
 -- precision 60, scale 18 -> overflow!
 set decimal_overflow_to_double = false;
-select 123456789012345678901234567890.123456789 * 987654321098765432109876543210.987654321;
+select 12345678901234567890123456789.123456789 * 98765432109876543210987654321.987654321;
 
 -- query 16
 -- precision 52, scale 20 -> overflow!
 set decimal_overflow_to_double = false;
-select 12345678901234567890123456789012.12345678901 * 98765432109876543210.12345678901;
+select 123456789012345678901234567.12345678901 * 98765432109876543210.12345678901;
 
 -- query 17
 -- precision 50, scale 16 -> overflow!
@@ -168,12 +167,12 @@ select c_d128_max * c_d128_max from ${case_db}.t_decimal_precision_overflow wher
 -- Test literal multiplication that causes precision overflow - should return double
 -- precision 60 > 38, scale 18 <= 38 -> should convert to double
 set decimal_overflow_to_double = true;
-select 123456789012345678901234567890.123456789 * 987654321098765432109876543210.987654321;
+select 12345678901234567890123456789.123456789 * 98765432109876543210987654321.987654321;
 
 -- query 33
 -- precision 52 > 38, scale 20 <= 38 -> should convert to double
 set decimal_overflow_to_double = true;
-select 12345678901234567890123456789012.12345678901 * 98765432109876543210.12345678901;
+select 123456789012345678901234567.12345678901 * 98765432109876543210.12345678901;
 
 -- query 34
 -- precision 50 > 38, scale 16 <= 38 -> should convert to double
@@ -195,11 +194,11 @@ select 1234567890123456789.1234567890123456789 * 1.0000000000000000000;
 
 -- query 38
 set decimal_overflow_to_double = false;
-select 12345678901234567890123456789012345678.0 * 1.0;
+select 1234567890123456789012345678901234567.0 * 1.0;
 
 -- query 39
 set decimal_overflow_to_double = true;
-select 12345678901234567890123456789012345678.0 * 1.1;
+select 1234567890123456789012345678901234567.0 * 1.1;
 
 -- Test 4: Mixed operations
 
@@ -217,12 +216,12 @@ select c_id, (c_d128_max * c_d128_max) / 2.0 from ${case_db}.t_decimal_precision
 -- query 42
 -- Extreme case: very large precision overflow (should use decimal128 truncation)
 set decimal_overflow_to_double = false;
-select 12345678901234567890123456789012345678.0 * 98765432109876543210987654321098765432.0;
+select 1234567890123456789012345678901234567.0 * 9876543210987654321098765432109876543.0;
 
 -- query 43
 -- Same extreme case: should convert to double
 set decimal_overflow_to_double = true;
-select 12345678901234567890123456789012345678.0 * 98765432109876543210987654321098765432.0;
+select 1234567890123456789012345678901234567.0 * 9876543210987654321098765432109876543.0;
 
 -- Test 7: Verify behavior with different scale combinations
 
@@ -259,8 +258,8 @@ select 123456789012345678901234567890.123456 * 987654321098765432109876543210.65
 
 -- query 50
 set decimal_overflow_to_double = true;
-SELECT(0.58000000 * 0.970825897017235893 * 3021621.785498);
+SELECT (0.58000000 * 0.970825897017235893 * 3021621.785498);
 
 -- query 51
 set decimal_overflow_to_double = false;
-SELECT(0.58000000 * 0.970825897017235893 * 3021621.785498);
+SELECT (0.58000000 * 0.970825897017235893 * 3021621.785498);

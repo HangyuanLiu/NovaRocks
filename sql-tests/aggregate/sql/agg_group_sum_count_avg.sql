@@ -7,7 +7,6 @@
 -- 1. Create/reset aggregate source table.
 -- 2. Insert deterministic rows across groups with NULLs.
 -- 3. Aggregate by group and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_agg_group_sum_count_avg;
 CREATE TABLE ${case_db}.t_agg_group_sum_count_avg (
     g INT,
     v INT

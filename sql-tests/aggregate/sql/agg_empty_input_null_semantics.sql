@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows.
 -- 3. Aggregate on an empty predicate and assert scalar output.
-DROP TABLE IF EXISTS ${case_db}.t_agg_empty_input_null_semantics;
 CREATE TABLE ${case_db}.t_agg_empty_input_null_semantics (
     g INT,
     v INT

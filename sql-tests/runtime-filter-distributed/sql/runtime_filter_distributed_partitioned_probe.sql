@@ -12,9 +12,6 @@
 -- 3. Prove the crossing does NOT drop rows: RF-on and RF-off must return the
 --    same fingerprint end-to-end under real cross-process BE execution.
 
-DROP TABLE IF EXISTS ${case_db}.rf_dist_part_probe;
-DROP TABLE IF EXISTS ${case_db}.rf_dist_part_build;
-
 CREATE TABLE ${case_db}.rf_dist_part_probe (
     id INT NOT NULL,
     k INT

@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic (x,y) pairs by group.
 -- 3. Compute rounded covar/corr metrics and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_agg_covar_corr;
 CREATE TABLE ${case_db}.t_agg_covar_corr (
     g INT,
     x INT,

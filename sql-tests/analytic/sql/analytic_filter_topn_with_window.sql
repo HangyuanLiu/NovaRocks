@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows per partition.
 -- 3. Apply ROW_NUMBER in subquery and keep top-2 rows per partition.
-DROP TABLE IF EXISTS ${case_db}.t_analytic_filter_topn_with_window;
 CREATE TABLE ${case_db}.t_analytic_filter_topn_with_window (
     grp VARCHAR(10),
     id INT,

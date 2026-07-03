@@ -7,7 +7,6 @@
 -- 1. Create/reset grouped source table.
 -- 2. Insert deterministic rows with one all-NULL group and one mixed group.
 -- 3. Group and assert ordered group_concat outputs.
-DROP TABLE IF EXISTS ${case_db}.t_agg_group_concat_distinct_all_null_group;
 CREATE TABLE ${case_db}.t_agg_group_concat_distinct_all_null_group (
     g INT,
     s STRING

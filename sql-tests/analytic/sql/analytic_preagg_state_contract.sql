@@ -1,5 +1,4 @@
 -- @tags=analytic,p5,typedesc,topn,cross-process
-DROP TABLE IF EXISTS ${case_db}.analytic_preagg_state_contract;
 CREATE TABLE ${case_db}.analytic_preagg_state_contract (
     grp INT,
     score INT,

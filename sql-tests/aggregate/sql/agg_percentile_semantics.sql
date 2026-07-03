@@ -8,7 +8,6 @@
 -- 2. Insert deterministic ordered rows plus one NULL row.
 -- 3. Snapshot percentile outputs and assert representative invalid-argument errors.
 -- query 1
-DROP TABLE IF EXISTS ${case_db}.t_agg_percentile_semantics;
 CREATE TABLE ${case_db}.t_agg_percentile_semantics (
     id INT,
     v INT,

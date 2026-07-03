@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows with duplicate order keys.
 -- 3. Compute RANGE-frame SUM and assert output.
-DROP TABLE IF EXISTS ${case_db}.t_analytic_range_unbounded_current;
 CREATE TABLE ${case_db}.t_analytic_range_unbounded_current (
     grp VARCHAR(10),
     ord_key INT,

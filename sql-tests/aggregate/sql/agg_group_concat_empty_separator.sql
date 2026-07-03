@@ -7,7 +7,6 @@
 -- 1. Create/reset grouped source table.
 -- 2. Insert deterministic ordered rows including NULL values.
 -- 3. Group and assert separator-sensitive concatenation outputs.
-DROP TABLE IF EXISTS ${case_db}.t_agg_group_concat_empty_separator;
 CREATE TABLE ${case_db}.t_agg_group_concat_empty_separator (
     g INT,
     ord INT,

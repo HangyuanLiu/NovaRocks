@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic duplicated and distinct value pairs.
 -- 3. Compute COUNT(DISTINCT a,b) and assert scalar output.
-DROP TABLE IF EXISTS ${case_db}.t_agg_count_distinct_multi_column;
 CREATE TABLE ${case_db}.t_agg_count_distinct_multi_column (
     a INT,
     b VARCHAR(20)

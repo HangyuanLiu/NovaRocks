@@ -1,7 +1,7 @@
 -- Test Objective:
 -- 1. Validate IN/NOT IN predicate with complex types: JSON, ARRAY, MAP, STRUCT.
 -- 2. Cover NULL handling, empty arrays/maps, nested complex types in IN lists.
--- 3. Cover error paths: JSON subquery (not supported), type mismatch for each type.
+-- 3. Cover JSON subquery predicates and type mismatch error paths for each type.
 
 -- query 1
 -- @skip_result_check=true
@@ -76,13 +76,11 @@ select js in (json_object("a", 1),json_object("ab", 12, 'bc',4),json_object("ab"
 select js not in (json_object("a", 1),json_object("ab", 13, 'b',4) ) from ${case_db}.sc2 order by 1;
 
 -- query 16
--- JSON subquery not supported
--- @expect_error=In predicate of JSON does not support subquery
+-- JSON subquery predicate.
 select js not in (select js from ${case_db}.sc2 where v1>3) from ${case_db}.sc2;
 
 -- query 17
--- JSON subquery not supported
--- @expect_error=In predicate of JSON does not support subquery
+-- JSON subquery predicate.
 select js in (select js from ${case_db}.sc2 where v1>3) from ${case_db}.sc2;
 
 -- query 18

@@ -1214,7 +1214,6 @@ select array_agg_distinct(name order by 1), cardinality(array_agg_distinct(arr o
 -- query 291
 -- @skip_result_check=true
 USE ${case_db};
-drop table if exists test_array_agg;
 
 -- query 292
 -- @skip_result_check=true

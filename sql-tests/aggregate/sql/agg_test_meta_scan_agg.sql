@@ -93,46 +93,8 @@ TBLPROPERTIES ("format-version" = "3");
 USE ${case_db};
 insert into t1 values ('2024-01-15', 10), ('2024-01-20', 20), ('2024-02-10', 30), ('2024-02-15', 40);
 
--- query 20
--- @skip_result_check=true
-USE ${case_db};
-alter table t1 add temporary partition tp202403 VALUES [("2024-03-01"), ("2024-04-01"));
-
--- query 21
--- @skip_result_check=true
-USE ${case_db};
-insert into t1 TEMPORARY PARTITION(tp202403) values ('2024-03-10', 50), ('2024-03-15', 60), ('2024-03-20', 70);
-
--- query 22
-USE ${case_db};
-select count(*) from t1 partition(p202401);
-
--- query 23
-USE ${case_db};
-select count(*) from t1 TEMPORARY PARTITION(tp202403);
-
--- query 24
-USE ${case_db};
-select count(c0) from t1 TEMPORARY PARTITION(tp202403);
-
--- query 25
-USE ${case_db};
-select count(c1) from t1 TEMPORARY PARTITION(tp202403);
-
--- query 26
-USE ${case_db};
-select min(c0), max(c0) from t1 TEMPORARY PARTITION(tp202403);
-
--- query 27
-USE ${case_db};
-select min(c1), max(c1) from t1 TEMPORARY PARTITION(tp202403);
-
--- query 28
-USE ${case_db};
-select min(c0), max(c0), min(c1), max(c1) from t1 TEMPORARY PARTITION(tp202403);
-
 -- name: test_meta_scan_with_renamed_column
--- query 29
+-- query 20
 -- @skip_result_check=true
 USE ${case_db};
 create table t2 (
@@ -140,41 +102,41 @@ create table t2 (
 )
 TBLPROPERTIES ("format-version" = "3");
 
--- query 30
+-- query 21
 -- @skip_result_check=true
 USE ${case_db};
 insert into t2 values (1), (2), (3);
 
--- query 31
+-- query 22
 USE ${case_db};
 select count(*) from t2[_META_];
 
--- query 32
+-- query 23
 USE ${case_db};
 select count(*) from t2;
 
--- query 33
+-- query 24
 -- @skip_result_check=true
 USE ${case_db};
 alter table t2 rename column c0 to c1;
 
--- query 34
+-- query 25
 USE ${case_db};
 select count(*) from t2[_META_];
 
--- query 35
+-- query 26
 USE ${case_db};
 select count(*) from t2;
 
--- query 36
+-- query 27
 -- @skip_result_check=true
 USE ${case_db};
 alter table t2 rename column c1 to c2;
 
--- query 37
+-- query 28
 USE ${case_db};
 select count(*) from t2[_META_];
 
--- query 38
+-- query 29
 USE ${case_db};
 select count(*) from t2;

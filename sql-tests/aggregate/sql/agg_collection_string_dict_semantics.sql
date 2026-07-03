@@ -8,7 +8,6 @@
 -- 2. Insert deterministic grouped rows with duplicates and NULLs.
 -- 3. Snapshot grouped collection outputs and dict_merge payloads.
 -- query 1
-DROP TABLE IF EXISTS ${case_db}.t_agg_collection_string_dict;
 CREATE TABLE ${case_db}.t_agg_collection_string_dict (
     g INT,
     id INT,

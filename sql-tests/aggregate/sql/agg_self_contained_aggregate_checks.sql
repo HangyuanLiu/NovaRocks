@@ -7,8 +7,6 @@
 -- 1. Create/reset minimal source tables for customer and lineorder metrics.
 -- 2. Insert deterministic rows that include both filter-hit and filter-miss branches.
 -- 3. Aggregate metrics and order by metric name for stable comparison.
-DROP TABLE IF EXISTS ${case_db}.t_agg_regression_customer_metrics;
-DROP TABLE IF EXISTS ${case_db}.t_agg_regression_lineorder_metrics;
 CREATE TABLE ${case_db}.t_agg_regression_customer_metrics (
     c_custkey INT,
     c_region VARCHAR(32)

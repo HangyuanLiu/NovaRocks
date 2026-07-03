@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic timestamp-like integer sequences by group.
 -- 3. Compute session_number with fixed gap threshold and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_analytic_session_number_gap;
 CREATE TABLE ${case_db}.t_analytic_session_number_gap (
     grp VARCHAR(10),
     ts INT

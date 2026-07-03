@@ -8,8 +8,6 @@
 -- 2. Insert deterministic maps with overlapping keys, empty maps, and NULL maps.
 -- 3. Snapshot global/grouped sum_map outputs and NULL-handling behavior.
 -- query 1
-DROP TABLE IF EXISTS ${case_db}.t_agg_sum_map_basic;
-DROP TABLE IF EXISTS ${case_db}.t_agg_sum_map_nullable;
 CREATE TABLE ${case_db}.t_agg_sum_map_basic (
     g INT,
     m_int MAP<INT, INT>,

@@ -222,6 +222,38 @@ NULL
 1
 1
 
+-- query 16
+js NOT IN (((SELECT js FROM db_sqlt_e256605e5d30a5a8.sc2 WHERE v1 > 3)))
+0
+0
+0
+0
+0
+0
+NULL
+NULL
+NULL
+0
+0
+0
+NULL
+
+-- query 17
+js IN (((SELECT js FROM db_sqlt_e256605e5d30a5a8.sc2 WHERE v1 > 3)))
+1
+1
+1
+1
+1
+1
+NULL
+NULL
+1
+NULL
+NULL
+1
+1
+
 -- query 18
 array1 IN (([]), ([1]))
 NULL
@@ -322,12 +354,12 @@ NULL
 ([]) IN (array1)	([]) NOT IN (array1)	([NULL]) IN (array1)	([NULL]) NOT IN (array1)	([]) IN (array2)	([]) NOT IN (array2)	([NULL]) IN (array2)	([NULL]) NOT IN (array2)	([]) IN (array3)	([]) NOT IN (array3)	([NULL]) IN (array3)	([NULL]) NOT IN (array3)
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
-0	1	0	1	1	0	0	1	0	1	NULL	NULL
-0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
-0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
-0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
 0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
 0	1	0	1	0	1	NULL	NULL	1	0	0	1
+0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
+0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
+0	1	0	1	1	0	0	1	0	1	NULL	NULL
+0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
 0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
 0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
 0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
@@ -341,8 +373,8 @@ NULL	NULL	NULL
 0	0	0
 0	0	1
 0	0	0
-0	0	0
 0	1	0
+0	0	0
 0	0	1
 0	0	1
 0	0	0
@@ -356,11 +388,11 @@ NULL	NULL	NULL
 0	1	1
 0	1	1
 1	1	1
+1	1	1
 1	1	0
 1	1	1
-1	1	1
-1	1	1
 1	0	1
+1	1	1
 1	1	0
 1	1	0
 1	1	1
@@ -417,9 +449,9 @@ NULL	NULL	NULL	NULL	NULL	NULL
 -- query 32
 map1 IN ((map{}))	map1 NOT IN ((map{}))	map2 IN ((map{}))	map2 NOT IN ((map{}))	map3 IN ((map{}))	map3 NOT IN ((map{}))
 NULL	NULL	NULL	NULL	NULL	NULL
-0	1	0	1	0	1
-0	1	0	1	0	1
 0	1	0	1	1	0
+0	1	0	1	0	1
+0	1	0	1	0	1
 0	1	0	1	0	1
 0	1	0	1	0	1
 0	1	0	1	0	1
@@ -465,12 +497,12 @@ NULL	NULL	NULL	NULL	NULL	NULL
 -- query 35
 (map{}) IN (map1)	(map{}) NOT IN (map1)	(map{}) IN (map2)	(map{}) NOT IN (map2)	(map{}) IN (map3)	(map{}) NOT IN (map3)
 NULL	NULL	NULL	NULL	NULL	NULL
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
 0	1	0	1	1	0
-0	1	0	1	0	1
-0	1	0	1	0	1
-0	1	0	1	0	1
-0	1	0	1	0	1
-0	1	0	1	0	1
 0	1	0	1	0	1
 0	1	0	1	0	1
 0	1	0	1	0	1
@@ -481,12 +513,12 @@ NULL	NULL	NULL	NULL	NULL	NULL
 -- query 36
 map1 IN ((map{1:10,2:20,4:40}), (map{}))	map2 IN ((map{2:[2, 3, 4],1:[1, 2, 3]}), (map{2:[2, 3, 4],1:[1, 22, 3]}))	map3 NOT IN ((map{2:row(2, 4),1:row(1, 2)}), (map{2:row(2, 4),1:row(1, 22)}))
 NULL	NULL	NULL
+0	0	1
+0	0	1
+0	0	1
 0	1	0
 0	0	0
-0	0	1
-0	0	1
 0	0	0
-0	0	1
 0	0	1
 0	0	0
 1	0	1
@@ -496,17 +528,17 @@ NULL	NULL	NULL
 
 -- query 37
 map2 NOT IN ((map{2:[2, 3, 4],1:[1, 2, 3]}), NULL)	map3 IN ((map{2:row(2, 4),1:row(1, 2)}), NULL)
-NULL	1
 NULL	NULL
 NULL	NULL
 NULL	NULL
 NULL	NULL
 NULL	1
 NULL	NULL
-NULL	NULL
-NULL	NULL
+NULL	1
 NULL	NULL
 NULL	1
+NULL	NULL
+NULL	NULL
 NULL	1
 0	1
 

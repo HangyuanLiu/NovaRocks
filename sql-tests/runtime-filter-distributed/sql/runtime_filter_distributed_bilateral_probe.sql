@@ -33,10 +33,6 @@
 --    return the identical fingerprint end-to-end under a real cross-process
 --    1FE+3BE cluster.
 
-DROP TABLE IF EXISTS ${case_db}.rf_dist_bi_t1;
-DROP TABLE IF EXISTS ${case_db}.rf_dist_bi_t2;
-DROP TABLE IF EXISTS ${case_db}.rf_dist_bi_t3;
-
 CREATE TABLE ${case_db}.rf_dist_bi_t1 (
     k INT NOT NULL,
     v INT

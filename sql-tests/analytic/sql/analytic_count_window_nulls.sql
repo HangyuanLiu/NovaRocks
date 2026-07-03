@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows with NULL values.
 -- 3. Compute window counts and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_analytic_count_window_nulls;
 CREATE TABLE ${case_db}.t_analytic_count_window_nulls (
     grp VARCHAR(10),
     ts INT,

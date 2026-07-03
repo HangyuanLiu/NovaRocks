@@ -7,7 +7,6 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t1;
 CREATE TABLE ${case_db}.t1 (
     k1 bigint NULL,
     c_tinyint tinyint null,

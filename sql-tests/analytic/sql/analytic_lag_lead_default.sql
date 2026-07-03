@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic ordered rows.
 -- 3. Compute LAG/LEAD and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_analytic_lag_lead_default;
 CREATE TABLE ${case_db}.t_analytic_lag_lead_default (
     grp VARCHAR(10),
     ts INT,

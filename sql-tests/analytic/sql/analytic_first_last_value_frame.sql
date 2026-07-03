@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic ordered rows.
 -- 3. Compute FIRST_VALUE/LAST_VALUE with full frame and assert output.
-DROP TABLE IF EXISTS ${case_db}.t_analytic_first_last_value_frame;
 CREATE TABLE ${case_db}.t_analytic_first_last_value_frame (
     grp VARCHAR(10),
     ts INT,

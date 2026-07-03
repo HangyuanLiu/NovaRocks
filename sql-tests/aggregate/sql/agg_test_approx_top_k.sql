@@ -994,7 +994,6 @@ SELECT c_partition, APPROX_TOP_K(c_bool, 3, 10) OVER(PARTITION BY c_partition) F
 -- query 177
 -- @skip_result_check=true
 USE ${case_db};
-DROP TABLE IF EXISTS lineitem;
 CREATE TABLE lineitem (
     L_RETURNFLAG CHAR(1),
     L_LINENUMBER INT

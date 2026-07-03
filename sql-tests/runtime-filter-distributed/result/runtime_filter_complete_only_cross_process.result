@@ -1,7 +1,7 @@
--- query 10
+-- query 8
 row_count	id_sum
 3	10
 
--- query 12
+-- query 10
 row_count	id_sum
 3	10

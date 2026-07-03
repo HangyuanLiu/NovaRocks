@@ -4,8 +4,8 @@
 -- 2. Validate IGNORE NULLS combined with column default.
 -- 3. Verify FE rejects column expressions (not plain column refs) as default.
 -- 4. Verify FE rejects type-mismatched column default (INT col, VARCHAR default).
--- 5. Validate ARRAY<INT> and VARCHAR column types with column defaults.
--- 6. Validate ARRAY<VARCHAR> column type with column default.
+-- 5. Validate VARCHAR column type with column defaults.
+-- 6. Verify ARRAY column defaults are rejected by the current analyzer contract.
 -- @order_sensitive=true
 
 -- query 1
@@ -115,12 +115,14 @@ SELECT col_1, col_2, LAG(col_2, 2, col_3) OVER (ORDER BY col_1) AS lag_result
 FROM ${case_db}.t_col_varchar_default;
 
 -- query 8
--- ARRAY<INT>: LAG with ARRAY<INT> column as default
+-- ARRAY<INT>: column default is rejected by the current analyzer contract.
+-- @expect_error=The type of the third parameter of LEAD/LAG not match the type UNKNOWN.
 SELECT col_1, arr1, LAG(arr1, 2, arr2) OVER (ORDER BY col_1) AS lag_result
 FROM ${case_db}.t_col_array_int ORDER BY col_1;
 
 -- query 9
--- ARRAY<INT>: LEAD with ARRAY<INT> column as default
+-- ARRAY<INT>: column default is rejected by the current analyzer contract.
+-- @expect_error=The type of the third parameter of LEAD/LAG not match the type UNKNOWN.
 SELECT col_1, arr1, LEAD(arr1, 2, arr2) OVER (ORDER BY col_1) AS lead_result
 FROM ${case_db}.t_col_array_int ORDER BY col_1;
 
@@ -135,11 +137,13 @@ SELECT col_1, v1, LEAD(v1, 2, v2) OVER (ORDER BY col_1) AS lead_result
 FROM ${case_db}.t_col_varchar ORDER BY col_1;
 
 -- query 12
--- ARRAY<VARCHAR>: LAG with ARRAY<VARCHAR> column as default
+-- ARRAY<VARCHAR>: column default is rejected by the current analyzer contract.
+-- @expect_error=The type of the third parameter of LEAD/LAG not match the type UNKNOWN.
 SELECT col_1, arr1, LAG(arr1, 2, arr2) OVER (ORDER BY col_1) AS lag_result
 FROM ${case_db}.t_col_array_varchar ORDER BY col_1;
 
 -- query 13
--- ARRAY<VARCHAR>: LEAD with ARRAY<VARCHAR> column as default
+-- ARRAY<VARCHAR>: column default is rejected by the current analyzer contract.
+-- @expect_error=The type of the third parameter of LEAD/LAG not match the type UNKNOWN.
 SELECT col_1, arr1, LEAD(arr1, 2, arr2) OVER (ORDER BY col_1) AS lead_result
 FROM ${case_db}.t_col_array_varchar ORDER BY col_1;

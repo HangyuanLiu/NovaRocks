@@ -5,7 +5,6 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_dg;
 
 -- query 2
 -- @skip_result_check=true

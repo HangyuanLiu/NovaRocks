@@ -1,5 +1,4 @@
 -- @tags=aggregate,p5,typedesc,intermediate-state,cross-process
-DROP TABLE IF EXISTS ${case_db}.agg_state_typedesc_contract;
 CREATE TABLE ${case_db}.agg_state_typedesc_contract (
     grp INT,
     k INT,

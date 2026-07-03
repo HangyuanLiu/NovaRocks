@@ -9,8 +9,6 @@
 -- 2. Insert deterministic grouped rows with duplicates and NULLs.
 -- 3. Assert exact vs approximate distinct counts, bitmap aggregation, and ds_hll state estimation.
 -- query 1
-DROP TABLE IF EXISTS ${case_db}.t_agg_sketch_bitmap_source;
-DROP TABLE IF EXISTS ${case_db}.t_agg_ds_hll_state;
 CREATE TABLE ${case_db}.t_agg_sketch_bitmap_source (
     grp INT,
     id_int INT,

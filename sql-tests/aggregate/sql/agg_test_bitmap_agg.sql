@@ -48,6 +48,7 @@ USE ${case_db};
 SELECT BITMAP_TO_STRING(BITMAP_AGG(c5)) FROM t1;
 
 -- query 8
+-- @expect_error=bitmap aggregate expects
 USE ${case_db};
 SELECT BITMAP_TO_STRING(BITMAP_AGG(c6)) FROM t1;
 
@@ -72,6 +73,7 @@ USE ${case_db};
 SELECT BITMAP_TO_STRING(BITMAP_UNION(TO_BITMAP(c5))) FROM t1;
 
 -- query 14
+-- @expect_error=to_bitmap expects
 USE ${case_db};
 SELECT BITMAP_TO_STRING(BITMAP_UNION(TO_BITMAP(c6))) FROM t1;
 

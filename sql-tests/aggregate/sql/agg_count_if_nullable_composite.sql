@@ -7,7 +7,6 @@
 -- 1. Create/reset source table with nullable inputs.
 -- 2. Insert rows that yield TRUE/FALSE/NULL predicate outcomes.
 -- 3. Aggregate by group and assert deterministic count_if outputs.
-DROP TABLE IF EXISTS ${case_db}.t_agg_count_if_nullable_composite;
 CREATE TABLE ${case_db}.t_agg_count_if_nullable_composite (
     g INT,
     x INT,

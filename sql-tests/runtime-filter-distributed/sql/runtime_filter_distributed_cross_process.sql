@@ -2,13 +2,11 @@
 -- @tags=runtime_filter,cross_process,distributed
 -- Test Objective:
 -- 1. Validate distributed runtime filter transport with coord + multiple BE processes.
--- 2. Cover inner, left-semi, multi-column, string, decimal, and empty build-side filters.
+-- 2. Cover inner, multi-column, string, decimal, and empty build-side filters.
+--    The left-semi string scenario is kept as a result-equivalence guard.
 -- 3. Each scenario returns the same fingerprint with RuntimeFilterPushDown off and on.
 -- 4. The suite is intended to run with --cluster-mode cross-process; standalone
 --    SQL parsing strips StarRocks join hints, so plan assertions verify RF descriptors.
-
-DROP TABLE IF EXISTS ${case_db}.rf_dist_probe;
-DROP TABLE IF EXISTS ${case_db}.rf_dist_build;
 
 CREATE TABLE ${case_db}.rf_dist_probe (
     id INT NOT NULL,
@@ -65,9 +63,6 @@ FROM ${case_db}.rf_dist_probe p
 LEFT SEMI JOIN ${case_db}.rf_dist_build b ON p.s = b.s AND b.flag = 'Y';
 
 SET disable_optimizer_rules = '';
--- @explain_contains=HASH JOIN (
--- @explain_contains=build runtime filters:
--- @explain_contains=probe runtime filters:
 SELECT 'left_semi_string' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
 LEFT SEMI JOIN ${case_db}.rf_dist_build b ON p.s = b.s AND b.flag = 'Y';

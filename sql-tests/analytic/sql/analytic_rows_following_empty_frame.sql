@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic ordered rows with nullable values.
 -- 3. Compute SUM/COUNT over FOLLOWING frame and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_analytic_rows_following_empty_frame;
 CREATE TABLE ${case_db}.t_analytic_rows_following_empty_frame (
     grp VARCHAR(10),
     ts INT,

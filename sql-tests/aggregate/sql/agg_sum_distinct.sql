@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert duplicated numeric rows per group.
 -- 3. Aggregate with SUM(DISTINCT) and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_agg_sum_distinct;
 CREATE TABLE ${case_db}.t_agg_sum_distinct (
     g INT,
     v INT

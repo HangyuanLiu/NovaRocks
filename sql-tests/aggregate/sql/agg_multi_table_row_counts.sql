@@ -7,11 +7,6 @@
 -- 1. Create/reset five minimal source tables.
 -- 2. Insert deterministic row counts per table.
 -- 3. Union all COUNT(*) metrics and compare ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_agg_count_customer;
-DROP TABLE IF EXISTS ${case_db}.t_agg_count_dates;
-DROP TABLE IF EXISTS ${case_db}.t_agg_count_lineorder;
-DROP TABLE IF EXISTS ${case_db}.t_agg_count_part;
-DROP TABLE IF EXISTS ${case_db}.t_agg_count_supplier;
 CREATE TABLE ${case_db}.t_agg_count_customer (id INT)
 TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_agg_count_dates (id INT)

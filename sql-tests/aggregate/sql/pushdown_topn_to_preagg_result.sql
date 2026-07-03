@@ -5,7 +5,6 @@
 -- 2. Compare the same deterministic GROUP BY city ORDER BY city LIMIT query
 --    with the rule enabled and disabled.
 
-DROP TABLE IF EXISTS ${case_db}.t_pushdown_topn_preagg_result;
 CREATE TABLE ${case_db}.t_pushdown_topn_preagg_result (
     city VARCHAR(16),
     sales INT

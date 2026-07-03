@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic numeric rows for two groups.
 -- 3. Compute rounded variance/stddev metrics and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_agg_variance_stddev;
 CREATE TABLE ${case_db}.t_agg_variance_stddev (
     g INT,
     v INT

@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows with duplicate order keys and NULL value.
 -- 3. Compute COUNT/SUM over full RANGE frame and assert stable output.
-DROP TABLE IF EXISTS ${case_db}.t_analytic_range_unbounded_following_full_partition;
 CREATE TABLE ${case_db}.t_analytic_range_unbounded_following_full_partition (
     grp VARCHAR(10),
     ord_key INT,

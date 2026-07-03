@@ -7,7 +7,6 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows per partition.
 -- 3. Compute cumulative SUM and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_analytic_sum_rows_cumulative;
 CREATE TABLE ${case_db}.t_analytic_sum_rows_cumulative (
     grp VARCHAR(10),
     ts INT,

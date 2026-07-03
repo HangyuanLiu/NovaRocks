@@ -6,7 +6,6 @@
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
-DROP TABLE IF EXISTS t0;
 CREATE TABLE IF NOT EXISTS t0
 (
   c0 INT NULL,
