@@ -5164,8 +5164,7 @@ mod tests {
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggMode, AggregateOutputLayout, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, JoinDistribution,
-        Operator, ProjectOp, ScanOp, ValuesOp,
+        CTEAnchorOp, CTEConsumeOp, CTEProduceOp, Operator, ProjectOp, ScanOp, ValuesOp,
     };
     use crate::sql::optimizer::physical_tree::{
         OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
@@ -5175,7 +5174,8 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
     use crate::sql::planner::plan::{AggregateCall, PhysicalPlanKind};
     use crate::sql::planner::{
-        JoinExecutionMode, PhysicalPlanStats, PlannerConfidence, WiredRuntimeFilterBuild,
+        AggMode, AggregateOutputLayout, JoinDistribution, JoinExecutionMode, PhysicalPlanStats,
+        PlannerConfidence, WiredRuntimeFilterBuild,
     };
     use crate::thrift::plan_nodes::TPlanNodeType;
 
