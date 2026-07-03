@@ -11,6 +11,7 @@ mod distributed_node;
 mod distributed_plan_build;
 pub(crate) mod imv_rewrite;
 pub(crate) mod optimizer_bridge;
+mod ordering;
 pub(crate) mod plan;
 pub(crate) mod runtime_filter;
 pub(crate) mod stats;
@@ -29,6 +30,8 @@ pub(crate) use distributed_node::{DistributedNode, DistributedPayload, ExchangeR
 pub(crate) use distributed_plan_build::{
     build_distributed_plan, union_distinct_must_be_rewritten_error,
 };
+#[allow(unused_imports)]
+pub(crate) use ordering::{OrderingSpec, SortKey};
 pub(crate) use runtime_filter::{
     JoinExecutionMode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };
@@ -51,7 +54,7 @@ use crate::sql::analysis::*;
 use crate::sql::catalog::{IcebergDataFileInfo, IcebergDeleteFileContent};
 use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-use crate::sql::optimizer::property::OrderingSpec;
+use crate::sql::optimizer::property::OrderingSpec as OptimizerOrderingSpec;
 use crate::sql::planner::optimizer_bridge::property::ordering_spec_from_sort_items;
 use plan::*;
 
@@ -1646,7 +1649,7 @@ fn logical_sort_satisfies_window_ordering(
 ) -> bool {
     let required = ordering_spec_from_sort_items(required_items);
     let provided = ordering_spec_from_sort_items(&sort.items);
-    if matches!(required, OrderingSpec::Any) || !provided.satisfies(&required) {
+    if matches!(required, OptimizerOrderingSpec::Any) || !provided.satisfies(&required) {
         return false;
     }
     // A regular ORDER BY Sort gathers globally. That is enough only for
