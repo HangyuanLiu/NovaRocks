@@ -215,3 +215,76 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-rest --mode verify
 ```
+
+## External-Engine MV Read Interop
+
+NovaRocks Iceberg materialized views are readable from other Iceberg-aware
+engines (Spark, Trino, etc.) through this REST catalog, as long as they only
+read. NovaRocks is the sole writer of MV tables; it detects and fails loud on
+external writes (see below).
+
+### MV package: one Iceberg table, one descriptor
+
+Creating `CREATE MATERIALIZED VIEW mv_orders AS SELECT id, name FROM orders`
+against a REST iceberg catalog produces one Iceberg table named `mv_orders`.
+That table is the materialized authority. It holds every public MV output
+column plus NovaRocks internal columns needed to apply refreshes (an apply-key
+column such as `__nova_base_row_id`, and for aggregate MVs, per-aggregate state
+columns). Iceberg table properties carry the apply-key wiring
+(`novarocks.mv.apply-key.column`, `novarocks.mv.apply-key.source`,
+`novarocks.mv.apply-key.field-id`, `novarocks.mv.hidden-columns` when aggregate
+state exists) and the MV descriptor (`novarocks.mv.descriptor.package-id`,
+`novarocks.mv.descriptor.hash`, `novarocks.mv.descriptor.inline`).
+
+The descriptor is the boundary between external read columns and NovaRocks
+internal columns: `visible_columns` lists the public read surface, while
+`hidden_columns` lists implementation columns that external engines should not
+select unless they are debugging or repairing an MV.
+
+Reading the MV table's visible columns means reading already-materialized data
+from the MV table — it is **not** a re-run of the MV's original base-table
+query.
+
+### Reading an MV from an external engine
+
+```sql
+-- Public read contract: select the descriptor's visible columns.
+SELECT id, name FROM <catalog>.<namespace>.<mv_name>;
+
+-- Schema-level contrast: the same table also carries internal columns
+-- (e.g. __nova_base_row_id, and __agg_state_<alias> for aggregate MVs).
+DESCRIBE <catalog>.<namespace>.<mv_name>;
+```
+
+Through this environment's REST catalog, that is `ice_rest.<namespace>.<name>`
+from Spark and `<catalog>.<namespace>.<name>` from NovaRocks, where
+`<catalog>` is whatever alias NovaRocks registered for the same REST
+catalog/warehouse (the two engines see the same physical objects under their
+own catalog aliases).
+
+### External writes are a violation
+
+NovaRocks refreshes validate that the MV table's Iceberg snapshot still
+matches what NovaRocks itself last wrote (`validate_target_snapshot` in
+`src/engine/mv/iceberg_refresh.rs`) before committing the next refresh. If
+another engine committed to the MV table's `main` branch in between, the next
+NovaRocks refresh fails loud with an explicit "modified outside NovaRocks"
+error instead of silently absorbing or overwriting the foreign change.
+
+### Verifying with Spark
+
+`sql-tests/iceberg-compatibility/sql/novarocks_rest_minio_mv_table_read_by_spark.sql`
+is the CI-gated recipe for this contract: NovaRocks creates and refreshes an
+Iceberg MV in the REST `ice_rest`-backed catalog, then two Spark `spark-sql.sh`
+steps read the MV table's visible materialized columns and verify that
+`DESCRIBE` on the same table exposes the internal apply-key column. Run it
+with the rest of the suite:
+
+```bash
+source docker/iceberg-rest/runtime/current/env.sh
+docker/iceberg-rest/up.sh
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg-compatibility --only novarocks_rest_minio_mv_table_read_by_spark \
+  --mode verify
+```

@@ -22799,6 +22799,67 @@ mod tests {
         assert!(join_full_refresh_uses_logical_plan());
     }
 
+    /// W5 external-interop contract for the current single-table lake-native
+    /// MV model: external engines read the MV Iceberg table itself. The table
+    /// physically carries NovaRocks internal columns, while the descriptor
+    /// records which columns form the public read surface.
+    #[test]
+    fn mv_table_descriptor_separates_external_visible_columns_from_hidden_columns() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load MV table by visible target name");
+        let field_names = loaded
+            .table
+            .metadata()
+            .current_schema()
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(field_names.contains(&"id"), "{field_names:?}");
+        assert!(field_names.contains(&"name"), "{field_names:?}");
+        assert!(
+            field_names.contains(&ICEBERG_MV_APPLY_KEY_COLUMN),
+            "{field_names:?}"
+        );
+
+        let descriptor =
+            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
+                .expect("descriptor properties");
+        assert_eq!(descriptor.package_id, "analytics.mv_orders");
+        assert_eq!(
+            descriptor.visible_columns,
+            vec!["id".to_string(), "name".to_string()]
+        );
+        assert_eq!(
+            descriptor.hidden_columns,
+            vec![ICEBERG_MV_APPLY_KEY_COLUMN.to_string()]
+        );
+        for hidden in &descriptor.hidden_columns {
+            assert!(
+                !descriptor.visible_columns.contains(hidden),
+                "hidden column `{hidden}` must not be part of the external visible-column contract"
+            );
+        }
+    }
+
     #[test]
     fn create_iceberg_mv_treats_legacy_prefixed_visible_name_as_target_name() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
