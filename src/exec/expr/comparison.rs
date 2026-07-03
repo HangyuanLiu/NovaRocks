@@ -1094,6 +1094,10 @@ fn normalize_comparison_types(
         return Ok((left, right));
     }
 
+    if let Some(normalized) = normalize_dictionary_comparison_types(left.clone(), right.clone())? {
+        return Ok(normalized);
+    }
+
     // Handle date vs string by casting string to Date32.
     if matches!(left_type, DataType::Date32) && matches!(right_type, DataType::Utf8) {
         let right_date = cast_utf8_to_date32(&right)?;
@@ -1135,6 +1139,67 @@ fn normalize_comparison_types(
             "Cannot compare incompatible types: {:?} vs {:?}",
             left_type, right_type
         )),
+    }
+}
+
+fn is_string_or_null_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Null
+    )
+}
+
+fn c1_dictionary_string_value_type(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        DataType::Dictionary(key_type, value_type)
+            if matches!(key_type.as_ref(), DataType::Int32)
+                && matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            Some(value_type.as_ref().clone())
+        }
+        _ => None,
+    }
+}
+
+fn normalize_dictionary_comparison_types(
+    left: ArrayRef,
+    right: ArrayRef,
+) -> Result<Option<(ArrayRef, ArrayRef)>, String> {
+    let left_value_type = c1_dictionary_string_value_type(left.data_type());
+    let right_value_type = c1_dictionary_string_value_type(right.data_type());
+    match (left_value_type, right_value_type) {
+        (None, None) => Ok(None),
+        (Some(value_type), None) => {
+            if !is_string_or_null_type(right.data_type()) {
+                return Ok(None);
+            }
+            let right = if right.data_type() == &value_type {
+                right
+            } else {
+                cast(&right, &value_type).map_err(|e| e.to_string())?
+            };
+            Ok(Some((left, right)))
+        }
+        (None, Some(value_type)) => {
+            if !is_string_or_null_type(left.data_type()) {
+                return Ok(None);
+            }
+            let left = if left.data_type() == &value_type {
+                left
+            } else {
+                cast(&left, &value_type).map_err(|e| e.to_string())?
+            };
+            Ok(Some((left, right)))
+        }
+        (Some(left_value_type), Some(right_value_type)) => {
+            if left_value_type != right_value_type {
+                return Err(format!(
+                    "Cannot compare dictionary arrays with different value types: {:?} vs {:?}",
+                    left_value_type, right_value_type
+                ));
+            }
+            Ok(Some((left, right)))
+        }
     }
 }
 
@@ -1484,10 +1549,11 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprNode, LiteralValue};
     use arrow::array::{
-        BooleanArray, Decimal128Array, Int32Array, Int32Builder, Int64Array, Int64Builder,
-        ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StructArray,
+        BooleanArray, Decimal128Array, DictionaryArray, Int32Array, Int32Builder, Int64Array,
+        Int64Builder, LargeStringDictionaryBuilder, ListArray, MapArray, MapBuilder, MapFieldNames,
+        PrimitiveDictionaryBuilder, StringArray, StructArray,
     };
-    use arrow::datatypes::{Field, Fields, Schema};
+    use arrow::datatypes::{Field, Fields, Int8Type, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
 
     fn create_test_chunk_int(values: Vec<i64>) -> Chunk {
@@ -1545,6 +1611,63 @@ mod tests {
             .expect("chunk schema");
             Chunk::new_with_chunk_schema(batch, chunk_schema)
         }
+    }
+
+    fn create_test_chunk_dict_status(values: Vec<Option<&str>>) -> Chunk {
+        let array =
+            Arc::new(values.into_iter().collect::<DictionaryArray<Int32Type>>()) as ArrayRef;
+        create_test_chunk_status_array(array)
+    }
+
+    fn create_test_chunk_large_dict_status(values: Vec<Option<&str>>) -> Chunk {
+        let mut builder = LargeStringDictionaryBuilder::<Int32Type>::new();
+        for value in values {
+            match value {
+                Some(value) => {
+                    builder.append(value).unwrap();
+                }
+                None => builder.append_null(),
+            }
+        }
+        create_test_chunk_status_array(Arc::new(builder.finish()) as ArrayRef)
+    }
+
+    fn create_test_chunk_i8_dict_status(values: Vec<Option<&str>>) -> Chunk {
+        let array = Arc::new(values.into_iter().collect::<DictionaryArray<Int8Type>>()) as ArrayRef;
+        create_test_chunk_status_array(array)
+    }
+
+    fn create_test_chunk_i32_dict_i32_status(values: Vec<Option<i32>>) -> Chunk {
+        let mut builder = PrimitiveDictionaryBuilder::<Int32Type, Int32Type>::new();
+        for value in values {
+            match value {
+                Some(value) => builder.append_value(value),
+                None => builder.append_null(),
+            }
+        }
+        create_test_chunk_status_array(Arc::new(builder.finish()) as ArrayRef)
+    }
+
+    fn create_test_chunk_status_array(array: ArrayRef) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            array.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn bool_values(array: &ArrayRef) -> Vec<Option<bool>> {
+        let array = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+        (0..array.len())
+            .map(|idx| (!array.is_null(idx)).then(|| array.value(idx)))
+            .collect()
     }
 
     fn create_test_chunk_list_i64(left: ListArray, right: ListArray, list_type: DataType) -> Chunk {
@@ -1711,6 +1834,180 @@ mod tests {
         assert!(!out.is_null(1));
         assert!(!out.is_null(2));
         assert!(!out.is_null(3));
+    }
+
+    #[test]
+    fn dictionary_utf8_eq_literal_uses_logical_values() {
+        let chunk =
+            create_test_chunk_dict_status(vec![Some("PAID"), Some("PENDING"), None, Some("PAID")]);
+        let mut arena = ExprArena::default();
+        let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let lit = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("PAID".to_string())),
+            DataType::Utf8,
+        );
+        let expr = arena.push_typed(ExprNode::Eq(slot, lit), DataType::Boolean);
+
+        let result = arena.eval(expr, &chunk).expect("dictionary eq");
+
+        assert_eq!(
+            bool_values(&result),
+            vec![Some(true), Some(false), None, Some(true)]
+        );
+    }
+
+    #[test]
+    fn dictionary_utf8_ordering_literal_uses_logical_values() {
+        let chunk = create_test_chunk_dict_status(vec![Some("a"), Some("c"), None, Some("b")]);
+        let mut arena = ExprArena::default();
+        let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let lit = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("b".to_string())),
+            DataType::Utf8,
+        );
+        let expr = arena.push_typed(ExprNode::Lt(slot, lit), DataType::Boolean);
+
+        let result = arena.eval(expr, &chunk).expect("dictionary lt");
+
+        assert_eq!(
+            bool_values(&result),
+            vec![Some(true), Some(false), None, Some(false)]
+        );
+    }
+
+    #[test]
+    fn dictionary_utf8_missing_comparison_operators_use_logical_values() {
+        let cases: [(&str, fn(ExprId, ExprId) -> ExprNode, Vec<Option<bool>>); 4] = [
+            (
+                "ne",
+                ExprNode::Ne,
+                vec![Some(true), Some(true), None, Some(false)],
+            ),
+            (
+                "le",
+                ExprNode::Le,
+                vec![Some(true), Some(false), None, Some(true)],
+            ),
+            (
+                "gt",
+                ExprNode::Gt,
+                vec![Some(false), Some(true), None, Some(false)],
+            ),
+            (
+                "ge",
+                ExprNode::Ge,
+                vec![Some(false), Some(true), None, Some(true)],
+            ),
+        ];
+
+        for (name, make_expr, expected) in cases {
+            let chunk = create_test_chunk_dict_status(vec![Some("a"), Some("c"), None, Some("b")]);
+            let mut arena = ExprArena::default();
+            let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+            let lit = arena.push_typed(
+                ExprNode::Literal(LiteralValue::Utf8("b".to_string())),
+                DataType::Utf8,
+            );
+            let expr = arena.push_typed(make_expr(slot, lit), DataType::Boolean);
+
+            let result = arena
+                .eval(expr, &chunk)
+                .unwrap_or_else(|err| panic!("dictionary {name}: {err}"));
+
+            assert_eq!(bool_values(&result), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn dictionary_utf8_largeutf8_value_type_uses_logical_values() {
+        let chunk = create_test_chunk_large_dict_status(vec![Some("PAID"), Some("PENDING"), None]);
+        let mut arena = ExprArena::default();
+        let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::LargeUtf8);
+        let lit = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("PAID".to_string())),
+            DataType::LargeUtf8,
+        );
+        let expr = arena.push_typed(ExprNode::Eq(slot, lit), DataType::Boolean);
+
+        let result = arena.eval(expr, &chunk).expect("dictionary LargeUtf8 eq");
+
+        assert_eq!(bool_values(&result), vec![Some(true), Some(false), None]);
+    }
+
+    #[test]
+    fn dictionary_utf8_reversed_literal_comparison_uses_logical_values() {
+        let chunk = create_test_chunk_dict_status(vec![Some("a"), Some("c"), None, Some("b")]);
+        let mut arena = ExprArena::default();
+        let lit = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("b".to_string())),
+            DataType::Utf8,
+        );
+        let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let expr = arena.push_typed(ExprNode::Gt(lit, slot), DataType::Boolean);
+
+        let result = arena.eval(expr, &chunk).expect("dictionary reversed gt");
+
+        assert_eq!(
+            bool_values(&result),
+            vec![Some(true), Some(false), None, Some(false)]
+        );
+    }
+
+    #[test]
+    fn dictionary_utf8_numeric_literal_does_not_cast_to_string() {
+        let chunk = create_test_chunk_dict_status(vec![Some("1")]);
+        let mut arena = ExprArena::default();
+        let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let lit = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(1)), DataType::Int32);
+        let expr = arena.push_typed(ExprNode::Eq(slot, lit), DataType::Boolean);
+
+        let err = arena
+            .eval(expr, &chunk)
+            .expect_err("numeric literal should not match C1 path");
+
+        assert!(
+            err.contains("Cannot compare incompatible types"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn dictionary_utf8_non_int32_key_does_not_match_c1_path() {
+        let chunk = create_test_chunk_i8_dict_status(vec![Some("PAID")]);
+        let mut arena = ExprArena::default();
+        let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let lit = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("PAID".to_string())),
+            DataType::Utf8,
+        );
+        let expr = arena.push_typed(ExprNode::Eq(slot, lit), DataType::Boolean);
+
+        let err = arena
+            .eval(expr, &chunk)
+            .expect_err("non-Int32 dictionary key should fall back");
+
+        assert!(
+            err.contains("Cannot compare incompatible types"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn dictionary_utf8_non_string_dictionary_does_not_match_c1_path() {
+        let chunk = create_test_chunk_i32_dict_i32_status(vec![Some(1)]);
+        let mut arena = ExprArena::default();
+        let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let lit = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(1)), DataType::Int32);
+        let expr = arena.push_typed(ExprNode::Eq(slot, lit), DataType::Boolean);
+
+        let err = arena
+            .eval(expr, &chunk)
+            .expect_err("non-string dictionary should fall back");
+
+        assert!(
+            err.contains("Cannot compare incompatible types"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

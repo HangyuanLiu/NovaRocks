@@ -21,10 +21,11 @@ use crate::exec::variant::VariantValue;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal256Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, LargeBinaryArray, ListArray, MapArray, StringArray, StructArray,
+    Int64Array, LargeBinaryArray, ListArray, MapArray, Scalar, StringArray, StructArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray,
 };
+use arrow::compute::cast;
 use arrow::compute::kernels::cmp::eq;
 use arrow::datatypes::{DataType, TimeUnit};
 use serde_json::Value as JsonValue;
@@ -103,12 +104,67 @@ fn row_index(row: usize, len: usize) -> usize {
     if len == 1 { 0 } else { row }
 }
 
+fn is_string_or_null_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Null
+    )
+}
+
+fn c1_dictionary_string_value_type(data_type: &DataType) -> Option<&DataType> {
+    match data_type {
+        DataType::Dictionary(key_type, value_type)
+            if matches!(key_type.as_ref(), DataType::Int32)
+                && matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            Some(value_type.as_ref())
+        }
+        _ => None,
+    }
+}
+
+fn eq_dictionary_input_with_candidate(
+    array: &ArrayRef,
+    candidate: &ArrayRef,
+) -> Result<Option<BooleanArray>, String> {
+    let Some(value_type) = c1_dictionary_string_value_type(array.data_type()) else {
+        return Ok(None);
+    };
+    if !is_string_or_null_type(candidate.data_type()) {
+        return Ok(None);
+    };
+    let candidate = if candidate.data_type() == value_type {
+        candidate.clone()
+    } else {
+        cast(candidate, value_type).map_err(|e| e.to_string())?
+    };
+
+    if candidate.len() == 1 {
+        let scalar = Scalar::new(candidate);
+        return eq(
+            &array.as_ref() as &dyn arrow::array::Datum,
+            &scalar as &dyn arrow::array::Datum,
+        )
+        .map(Some)
+        .map_err(|e| e.to_string());
+    }
+    eq(
+        &array.as_ref() as &dyn arrow::array::Datum,
+        &candidate.as_ref() as &dyn arrow::array::Datum,
+    )
+    .map(Some)
+    .map_err(|e| e.to_string())
+}
+
 fn eq_with_candidate(
     array: &ArrayRef,
     candidate: &ArrayRef,
     lhs_is_literal_like: bool,
     single_candidate: bool,
 ) -> Result<BooleanArray, String> {
+    if let Some(result) = eq_dictionary_input_with_candidate(array, candidate)? {
+        return Ok(result);
+    }
     if matches!(
         candidate.data_type(),
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
@@ -721,9 +777,10 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{
-        Int32Builder, Int64Builder, MapArray, MapBuilder, MapFieldNames, RecordBatch,
+        DictionaryArray, Int32Builder, Int64Builder, LargeStringDictionaryBuilder, MapArray,
+        MapBuilder, MapFieldNames, PrimitiveDictionaryBuilder, RecordBatch,
     };
-    use arrow::datatypes::{Field, Schema};
+    use arrow::datatypes::{Field, Int8Type, Int32Type, Schema};
 
     fn create_test_map_array(rows: &[Option<&[(i32, i64)]>]) -> MapArray {
         let mut builder = MapBuilder::new(
@@ -750,6 +807,63 @@ mod tests {
         builder.finish()
     }
 
+    fn create_test_chunk_dict_status(values: Vec<Option<&str>>) -> Chunk {
+        let array =
+            Arc::new(values.into_iter().collect::<DictionaryArray<Int32Type>>()) as ArrayRef;
+        create_test_chunk_status_array(array)
+    }
+
+    fn create_test_chunk_large_dict_status(values: Vec<Option<&str>>) -> Chunk {
+        let mut builder = LargeStringDictionaryBuilder::<Int32Type>::new();
+        for value in values {
+            match value {
+                Some(value) => {
+                    builder.append(value).unwrap();
+                }
+                None => builder.append_null(),
+            }
+        }
+        create_test_chunk_status_array(Arc::new(builder.finish()) as ArrayRef)
+    }
+
+    fn create_test_chunk_i8_dict_status(values: Vec<Option<&str>>) -> Chunk {
+        let array = Arc::new(values.into_iter().collect::<DictionaryArray<Int8Type>>()) as ArrayRef;
+        create_test_chunk_status_array(array)
+    }
+
+    fn create_test_chunk_i32_dict_i32_status(values: Vec<Option<i32>>) -> Chunk {
+        let mut builder = PrimitiveDictionaryBuilder::<Int32Type, Int32Type>::new();
+        for value in values {
+            match value {
+                Some(value) => builder.append_value(value),
+                None => builder.append_null(),
+            }
+        }
+        create_test_chunk_status_array(Arc::new(builder.finish()) as ArrayRef)
+    }
+
+    fn create_test_chunk_status_array(array: ArrayRef) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            array.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn bool_values(array: &ArrayRef) -> Vec<Option<bool>> {
+        let array = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+        (0..array.len())
+            .map(|idx| (!array.is_null(idx)).then(|| array.value(idx)))
+            .collect()
+    }
+
     #[test]
     fn eq_with_scalar_supports_map_values() {
         let array = Arc::new(create_test_map_array(&[
@@ -763,6 +877,200 @@ mod tests {
         assert!(result.value(0));
         assert!(!result.value(1));
         assert!(result.is_null(2));
+    }
+
+    #[test]
+    fn dictionary_utf8_in_literal_list_uses_logical_values() {
+        let chunk = create_test_chunk_dict_status(vec![
+            Some("PAID"),
+            Some("PENDING"),
+            None,
+            Some("CLOSED"),
+        ]);
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let paid = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("PAID".to_string())),
+            DataType::Utf8,
+        );
+        let closed = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("CLOSED".to_string())),
+            DataType::Utf8,
+        );
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![paid, closed],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+
+        let result = arena.eval(expr, &chunk).expect("dictionary IN");
+
+        assert_eq!(
+            bool_values(&result),
+            vec![Some(true), Some(false), None, Some(true)]
+        );
+    }
+
+    #[test]
+    fn dictionary_utf8_not_in_literal_list_preserves_null_semantics() {
+        let chunk = create_test_chunk_dict_status(vec![Some("PAID"), Some("PENDING"), None]);
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let paid = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("PAID".to_string())),
+            DataType::Utf8,
+        );
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![paid],
+                is_not_in: true,
+            },
+            DataType::Boolean,
+        );
+
+        let result = arena.eval(expr, &chunk).expect("dictionary NOT IN");
+
+        assert_eq!(bool_values(&result), vec![Some(false), Some(true), None]);
+    }
+
+    #[test]
+    fn dictionary_utf8_largeutf8_in_literal_list_uses_logical_values() {
+        let chunk = create_test_chunk_large_dict_status(vec![Some("PAID"), Some("PENDING"), None]);
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::LargeUtf8);
+        let paid = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("PAID".to_string())),
+            DataType::LargeUtf8,
+        );
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![paid],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+
+        let result = arena.eval(expr, &chunk).expect("dictionary LargeUtf8 IN");
+
+        assert_eq!(bool_values(&result), vec![Some(true), Some(false), None]);
+    }
+
+    #[test]
+    fn dictionary_utf8_numeric_candidate_does_not_cast_to_string() {
+        let chunk = create_test_chunk_dict_status(vec![Some("1")]);
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let one = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(1)), DataType::Int32);
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![one],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+
+        let err = arena
+            .eval(expr, &chunk)
+            .expect_err("numeric candidate should not match C1 path");
+
+        assert!(
+            err.contains("Invalid comparison operation")
+                || err.contains("Dictionary")
+                || err.contains("not support")
+                || err.contains("unsupported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn dictionary_utf8_non_int32_key_does_not_match_c1_path() {
+        let chunk = create_test_chunk_i8_dict_status(vec![Some("PAID")]);
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let paid = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("PAID".to_string())),
+            DataType::Utf8,
+        );
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![paid],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+
+        let err = arena
+            .eval(expr, &chunk)
+            .expect_err("non-Int32 dictionary key should fall back");
+
+        assert!(
+            err.contains("failed to downcast IN input to StringArray"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn dictionary_utf8_non_string_dictionary_does_not_match_c1_path() {
+        let chunk = create_test_chunk_i32_dict_i32_status(vec![Some(1)]);
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let one = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("1".to_string())),
+            DataType::Utf8,
+        );
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![one],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+
+        let err = arena
+            .eval(expr, &chunk)
+            .expect_err("non-string dictionary should fall back");
+
+        assert!(
+            err.contains("failed to downcast IN input to StringArray"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn dictionary_utf8_in_and_not_in_null_candidate_preserves_no_match_null() {
+        for (is_not_in, expected) in [
+            (false, vec![None, Some(true), None]),
+            (true, vec![None, Some(false), None]),
+        ] {
+            let chunk = create_test_chunk_dict_status(vec![Some("PENDING"), Some("PAID"), None]);
+            let mut arena = ExprArena::default();
+            let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+            let paid = arena.push_typed(
+                ExprNode::Literal(LiteralValue::Utf8("PAID".to_string())),
+                DataType::Utf8,
+            );
+            let null = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Utf8);
+            let expr = arena.push_typed(
+                ExprNode::In {
+                    child,
+                    values: vec![paid, null],
+                    is_not_in,
+                },
+                DataType::Boolean,
+            );
+
+            let result = arena.eval(expr, &chunk).expect("dictionary IN NULL");
+
+            assert_eq!(bool_values(&result), expected, "is_not_in={is_not_in}");
+        }
     }
 
     #[test]
