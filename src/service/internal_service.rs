@@ -40,12 +40,12 @@ use crate::common::util::{
 use crate::lower::fragment::execute_fragment;
 use crate::lower::thrift::cache_iceberg_table_locations;
 use crate::lower::type_lowering::primitive_type_from_desc;
-use crate::lower_native::{
-    execute_fragment_native, network_address_from_native, query_options_from_native,
-    runtime_filter_params_from_native,
-};
+use crate::lower_native::execute_fragment_native;
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::native_fragment_wire::{
+    network_address_from_native, query_options_from_native, runtime_filter_params_from_native,
+};
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{
     QueryContextManager, QueryId, desc_tbl_is_cached, is_desc_tbl_effectively_empty,

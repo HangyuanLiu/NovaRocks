@@ -17,10 +17,10 @@
 
 //! Proto fragment lowering.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use thrift::OrderedFloat;
 
 use super::node::{NodeLoweringContext, lower_proto_node};
@@ -37,11 +37,11 @@ use crate::exec::pipeline::executor::execute_plan_with_pipeline;
 use crate::exec::spill::QuerySpillManager;
 use crate::lower::fragment::FragmentOutput;
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::native_fragment_wire as native_wire;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::result_buffer;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::thrift::{data_sinks, internal_service, runtime_filter, types};
 use crate::{connector, proto};
 
 pub(crate) fn execute_fragment_native(
@@ -56,7 +56,7 @@ pub(crate) fn execute_fragment_native(
     let query_options = instance_params
         .query_options
         .as_ref()
-        .map(query_options_from_native)
+        .map(native_wire::query_options_from_native)
         .transpose()?;
     let query_options = apply_query_option_overrides(query_options);
     let query_id = instance_params
@@ -72,7 +72,7 @@ pub(crate) fn execute_fragment_native(
     let runtime_filter_params = instance_params
         .runtime_filter_params
         .as_ref()
-        .map(runtime_filter_params_from_native)
+        .map(native_wire::runtime_filter_params_from_native)
         .transpose()?;
     let cache_options = CacheOptions::from_query_options(query_options.as_ref())?;
     let spill_config = crate::exec::spill::query_options_wire::spill_config_from_query_options(
@@ -169,64 +169,9 @@ fn query_id_from_native(src: &proto::common::UniqueId) -> QueryId {
     }
 }
 
-pub(crate) fn query_options_from_native(
-    src: &proto::novarocks::QueryOptions,
-) -> Result<internal_service::TQueryOptions, String> {
-    let mut opts = internal_service::TQueryOptions::default();
-    opts.batch_size = (src.batch_size > 0).then_some(src.batch_size);
-    opts.mem_limit = (src.mem_limit > 0).then_some(src.mem_limit);
-    opts.query_timeout = (src.query_timeout > 0).then_some(src.query_timeout);
-    opts.enable_profile = Some(src.enable_profile);
-    opts.pipeline_dop = (src.pipeline_dop > 0).then_some(src.pipeline_dop);
-    opts.query_mem_limit = (src.query_mem_limit > 0).then_some(src.query_mem_limit);
-    opts.connector_io_tasks_per_scan_operator = (src.connector_io_tasks_per_scan_operator > 0)
-        .then_some(src.connector_io_tasks_per_scan_operator);
-    opts.io_tasks_per_scan_operator = opts.connector_io_tasks_per_scan_operator;
-    opts.runtime_filter_scan_wait_time_ms =
-        (src.runtime_filter_scan_wait_time_ms > 0).then_some(src.runtime_filter_scan_wait_time_ms);
-    opts.runtime_filter_wait_timeout_ms =
-        (src.runtime_filter_wait_timeout_ms > 0).then_some(src.runtime_filter_wait_timeout_ms);
-    opts.allow_throw_exception = Some(src.allow_throw_exception);
-    opts.group_concat_max_len = (src.group_concat_max_len > 0).then_some(src.group_concat_max_len);
-    opts.enable_spill = Some(src.enable_spill);
-    opts.spill_options = src.spill_options.as_ref().map(spill_options_from_native);
-    if let Some(spill_options) = opts.spill_options.as_ref() {
-        opts.spill_mode = spill_options.spill_mode;
-        opts.spill_mem_table_size = spill_options.spill_mem_table_size;
-        opts.spill_mem_table_num = spill_options.spill_mem_table_num;
-        opts.spill_mem_limit_threshold = spill_options.spill_mem_limit_threshold;
-        opts.spill_operator_min_bytes = spill_options.spill_operator_min_bytes;
-        opts.spill_operator_max_bytes = spill_options.spill_operator_max_bytes;
-        opts.spill_encode_level = spill_options.spill_encode_level;
-    } else if src.enable_spill {
-        return Err("native QueryOptions enable_spill=true requires spill_options".to_string());
-    }
-    Ok(opts)
-}
-
-fn spill_options_from_native(
-    src: &proto::novarocks::SpillOptions,
-) -> internal_service::TSpillOptions {
-    let mut opts = internal_service::TSpillOptions::default();
-    opts.spill_mode = (src.spill_mode != 0).then_some(src.spill_mode.into());
-    opts.spill_mem_limit_threshold = (src.spill_mem_limit_threshold > 0.0)
-        .then_some(OrderedFloat(src.spill_mem_limit_threshold));
-    opts.spill_operator_min_bytes =
-        (src.spill_operator_min_bytes > 0).then_some(src.spill_operator_min_bytes);
-    opts.spill_operator_max_bytes =
-        (src.spill_operator_max_bytes > 0).then_some(src.spill_operator_max_bytes);
-    opts.spill_encode_level = (src.spill_encode_level > 0).then_some(src.spill_encode_level);
-    opts.enable_spill_buffer_read = Some(src.enable_spill_buffer_read);
-    opts.max_spill_read_buffer_bytes_per_driver = (src.max_spill_read_buffer_bytes_per_driver > 0)
-        .then_some(src.max_spill_read_buffer_bytes_per_driver);
-    opts.spill_mem_table_size = (src.spill_mem_table_size > 0).then_some(src.spill_mem_table_size);
-    opts.spill_mem_table_num = (src.spill_mem_table_num > 0).then_some(src.spill_mem_table_num);
-    opts
-}
-
 fn apply_query_option_overrides(
-    mut query_options: Option<internal_service::TQueryOptions>,
-) -> Option<internal_service::TQueryOptions> {
+    mut query_options: Option<native_wire::QueryOptions>,
+) -> Option<native_wire::QueryOptions> {
     if let Some(opts) = query_options.as_mut() {
         if let Some(ms) = runtime_filter_scan_wait_time_ms_override() {
             opts.runtime_filter_scan_wait_time_ms = Some(ms);
@@ -238,65 +183,9 @@ fn apply_query_option_overrides(
     query_options
 }
 
-pub(crate) fn runtime_filter_params_from_native(
-    src: &proto::novarocks::RuntimeFilterParams,
-) -> Result<runtime_filter::TRuntimeFilterParams, String> {
-    let id_to_prober_params = src
-        .id_to_prober_params
-        .iter()
-        .map(|(filter_id, list)| {
-            let params = list
-                .params
-                .iter()
-                .map(prober_params_from_native)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((*filter_id, params))
-        })
-        .collect::<Result<BTreeMap<_, _>, String>>()?;
-    let runtime_filter_builder_number = src
-        .runtime_filter_builder_number
-        .iter()
-        .map(|(filter_id, count)| (*filter_id, *count))
-        .collect::<BTreeMap<_, _>>();
-
-    Ok(runtime_filter::TRuntimeFilterParams::new(
-        (!id_to_prober_params.is_empty()).then_some(id_to_prober_params),
-        (!runtime_filter_builder_number.is_empty()).then_some(runtime_filter_builder_number),
-        (src.runtime_filter_max_size > 0).then_some(src.runtime_filter_max_size),
-        None,
-    ))
-}
-
-fn prober_params_from_native(
-    src: &proto::novarocks::ProberParams,
-) -> Result<runtime_filter::TRuntimeFilterProberParams, String> {
-    let fragment_instance_id = src
-        .fragment_instance_id
-        .as_ref()
-        .ok_or_else(|| "native ProberParams missing fragment_instance_id".to_string())?;
-    let fragment_instance_address = network_address_from_native(&src.fragment_instance_address)?;
-    Ok(runtime_filter::TRuntimeFilterProberParams::new(
-        types::TUniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo),
-        fragment_instance_address,
-    ))
-}
-
-pub(crate) fn network_address_from_native(src: &str) -> Result<types::TNetworkAddress, String> {
-    let (host, port) = src
-        .rsplit_once(':')
-        .ok_or_else(|| format!("native network address must be host:port, got '{src}'"))?;
-    if host.is_empty() {
-        return Err(format!("native network address has empty host: '{src}'"));
-    }
-    let port = port
-        .parse::<i32>()
-        .map_err(|e| format!("native network address has invalid port '{src}': {e}"))?;
-    Ok(types::TNetworkAddress::new(host.to_string(), port))
-}
-
 fn node_context_from_instance_params(
     instance_params: &proto::novarocks::InstanceParams,
-    query_options: Option<internal_service::TQueryOptions>,
+    query_options: Option<native_wire::QueryOptions>,
     fragment_instance_id: UniqueId,
 ) -> Result<NodeLoweringContext, String> {
     let mut ctx = NodeLoweringContext::default()
@@ -374,7 +263,7 @@ fn sink_factory_from_native(
             }
             Ok(Box::new(ResultBufferSinkFactory::new(
                 None,
-                Some(data_sinks::TResultSinkType::MYSQL_PROTOCAL),
+                Some(native_wire::ResultSinkType::MYSQL_PROTOCAL),
                 None,
                 None,
                 typed_result_sink,
@@ -456,7 +345,7 @@ mod tests {
 
     #[test]
     fn converts_native_query_options_consumed_subset() {
-        let opts = query_options_from_native(&proto::novarocks::QueryOptions {
+        let opts = native_wire::query_options_from_native(&proto::novarocks::QueryOptions {
             batch_size: 8192,
             enable_profile: true,
             connector_io_tasks_per_scan_operator: 7,
@@ -464,7 +353,7 @@ mod tests {
             allow_throw_exception: true,
             enable_spill: true,
             spill_options: Some(proto::novarocks::SpillOptions {
-                spill_mode: internal_service::TSpillMode::FORCE.0,
+                spill_mode: native_wire::SpillMode::FORCE.0,
                 spill_mem_limit_threshold: 0.5,
                 spill_operator_min_bytes: 1024,
                 spill_mem_table_size: 32,
@@ -482,7 +371,7 @@ mod tests {
         assert_eq!(opts.allow_throw_exception, Some(true));
         assert_eq!(opts.enable_spill, Some(true));
         let spill = opts.spill_options.expect("spill options");
-        assert_eq!(spill.spill_mode, Some(internal_service::TSpillMode::FORCE));
+        assert_eq!(spill.spill_mode, Some(native_wire::SpillMode::FORCE));
         assert_eq!(spill.spill_mem_limit_threshold, Some(OrderedFloat(0.5)));
         assert_eq!(spill.spill_operator_min_bytes, Some(1024));
         assert_eq!(spill.spill_mem_table_size, Some(32));
@@ -490,7 +379,7 @@ mod tests {
 
     #[test]
     fn rejects_native_spill_without_spill_options() {
-        let err = query_options_from_native(&proto::novarocks::QueryOptions {
+        let err = native_wire::query_options_from_native(&proto::novarocks::QueryOptions {
             enable_spill: true,
             ..Default::default()
         })
@@ -501,21 +390,23 @@ mod tests {
 
     #[test]
     fn converts_runtime_filter_params_and_addresses() {
-        let rf = runtime_filter_params_from_native(&proto::novarocks::RuntimeFilterParams {
-            id_to_prober_params: [(
-                3,
-                proto::novarocks::ProberParamsList {
-                    params: vec![proto::novarocks::ProberParams {
-                        fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
-                        fragment_instance_address: "127.0.0.1:9050".to_string(),
-                    }],
-                },
-            )]
-            .into_iter()
-            .collect(),
-            runtime_filter_builder_number: [(3, 2)].into_iter().collect(),
-            runtime_filter_max_size: 4096,
-        })
+        let rf = native_wire::runtime_filter_params_from_native(
+            &proto::novarocks::RuntimeFilterParams {
+                id_to_prober_params: [(
+                    3,
+                    proto::novarocks::ProberParamsList {
+                        params: vec![proto::novarocks::ProberParams {
+                            fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
+                            fragment_instance_address: "127.0.0.1:9050".to_string(),
+                        }],
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                runtime_filter_builder_number: [(3, 2)].into_iter().collect(),
+                runtime_filter_max_size: 4096,
+            },
+        )
         .expect("runtime filter params");
 
         assert_eq!(rf.runtime_filter_max_size, Some(4096));
@@ -523,11 +414,14 @@ mod tests {
         let prober = &rf.id_to_prober_params.unwrap()[&3][0];
         assert_eq!(
             prober.fragment_instance_id,
-            Some(types::TUniqueId::new(1, 2))
+            Some(native_wire::UniqueId::new(1, 2))
         );
         assert_eq!(
             prober.fragment_instance_address,
-            Some(types::TNetworkAddress::new("127.0.0.1".to_string(), 9050))
+            Some(native_wire::NetworkAddress::new(
+                "127.0.0.1".to_string(),
+                9050
+            ))
         );
     }
 
