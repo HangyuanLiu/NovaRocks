@@ -26,3 +26,5 @@ mod node;
 pub(crate) use crate::sql::codegen::proto_encode::types::{decode_field_type, decode_type};
 #[allow(unused_imports)]
 pub(crate) use fragment::execute_fragment_native;
+#[allow(unused_imports)]
+pub(crate) use node::{LoweredNode, NodeLoweringContext, lower_proto_node};
