@@ -129,8 +129,12 @@ pub(crate) fn iceberg_file_pruning_metadata_from_thrift(
 
     let mut columns = HashMap::new();
     for (ordinal, value) in values {
-        let ordinal = usize::try_from(*ordinal).ok()?;
-        let column = column_names.get(ordinal)?;
+        let Ok(ordinal) = usize::try_from(*ordinal) else {
+            continue;
+        };
+        let Some(column) = column_names.get(ordinal) else {
+            continue;
+        };
         let Some(stats) = column_stats_from_thrift_min_max_value(value) else {
             continue;
         };
@@ -776,13 +780,126 @@ fn decode_f64_bound(bytes: &[u8]) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
+
+    use arrow::datatypes::DataType;
+    use thrift::OrderedFloat;
 
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
     use crate::common::scan_predicate::{ScanPredicate, ScanPredicateSource};
-    use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
+    use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+    use crate::thrift::{descriptors, exprs, plan_nodes, types};
 
-    use super::{IcebergFilePruningCounters, file_may_satisfy_scan_predicates};
+    use super::{
+        IcebergFilePruningCounters, file_may_satisfy_scan_predicates,
+        iceberg_file_pruning_metadata_from_thrift, iceberg_file_pruning_metadata_to_thrift,
+    };
+
+    #[test]
+    fn from_thrift_skips_malformed_min_max_entries_and_keeps_valid_entry() {
+        let hdfs_range = hdfs_range_with_min_max_values(Some(BTreeMap::from([
+            (
+                -1,
+                min_max_int_value(exprs::TExprNodeType::INT_LITERAL, Some(1), Some(2)),
+            ),
+            (
+                0,
+                min_max_int_value(exprs::TExprNodeType::INT_LITERAL, Some(10), Some(20)),
+            ),
+            (
+                1,
+                min_max_int_value(exprs::TExprNodeType::BOOL_LITERAL, Some(0), Some(2)),
+            ),
+            (
+                2,
+                min_max_int_value(exprs::TExprNodeType::INT_LITERAL, Some(7), None),
+            ),
+            (
+                3,
+                min_max_int_value(exprs::TExprNodeType::STRING_LITERAL, Some(1), Some(2)),
+            ),
+            (
+                99,
+                min_max_int_value(exprs::TExprNodeType::INT_LITERAL, Some(30), Some(40)),
+            ),
+        ])));
+        let column_names = vec![
+            "valid".to_string(),
+            "bad_bool".to_string(),
+            "missing_bound".to_string(),
+            "unsupported".to_string(),
+        ];
+
+        let metadata = iceberg_file_pruning_metadata_from_thrift(&hdfs_range, &column_names)
+            .expect("valid entry should remain");
+
+        assert_eq!(metadata.columns.len(), 1);
+        let valid = metadata.columns.get("valid").expect("valid stats");
+        assert_eq!(valid.lower_bound, Some(10_i64.to_le_bytes().to_vec()));
+        assert_eq!(valid.upper_bound, Some(20_i64.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn to_thrift_bridges_width_specific_numeric_stats_and_skips_nan_float() {
+        let mut file = IcebergDataFileInfo::for_test("s3://bucket/data.parquet", 10, 1);
+        file.column_stats = Some(HashMap::from([
+            (
+                "tiny".to_string(),
+                stats((-3_i8).to_le_bytes().to_vec(), 4_i8.to_le_bytes().to_vec()),
+            ),
+            (
+                "regular".to_string(),
+                stats(
+                    (-100_i32).to_le_bytes().to_vec(),
+                    200_i32.to_le_bytes().to_vec(),
+                ),
+            ),
+            (
+                "ratio".to_string(),
+                stats(
+                    1.25_f32.to_le_bytes().to_vec(),
+                    9.5_f32.to_le_bytes().to_vec(),
+                ),
+            ),
+            (
+                "bad_float".to_string(),
+                stats(
+                    f32::NAN.to_le_bytes().to_vec(),
+                    1.0_f32.to_le_bytes().to_vec(),
+                ),
+            ),
+        ]));
+        let columns = vec![
+            column("tiny", DataType::Int8),
+            column("regular", DataType::Int32),
+            column("ratio", DataType::Float32),
+            column("bad_float", DataType::Float32),
+        ];
+
+        let values =
+            iceberg_file_pruning_metadata_to_thrift(&file, &columns).expect("min/max values");
+
+        assert_eq!(values.len(), 3);
+        let tiny = values.get(&0).expect("int8 stats");
+        assert_eq!(tiny.type_, exprs::TExprNodeType::INT_LITERAL);
+        assert_eq!(tiny.min_int_value, Some(-3));
+        assert_eq!(tiny.max_int_value, Some(4));
+
+        let regular = values.get(&1).expect("int32 stats");
+        assert_eq!(regular.type_, exprs::TExprNodeType::INT_LITERAL);
+        assert_eq!(regular.min_int_value, Some(-100));
+        assert_eq!(regular.max_int_value, Some(200));
+
+        let ratio = values.get(&2).expect("float32 stats");
+        assert_eq!(ratio.type_, exprs::TExprNodeType::FLOAT_LITERAL);
+        assert_eq!(
+            ratio.min_float_value.map(|v| v.0),
+            Some(f64::from(1.25_f32))
+        );
+        assert_eq!(ratio.max_float_value.map(|v| v.0), Some(f64::from(9.5_f32)));
+
+        assert!(!values.contains_key(&3), "NaN stats must not be bridged");
+    }
 
     #[test]
     fn range_predicate_skips_file_when_stats_do_not_overlap() {
@@ -930,6 +1047,88 @@ mod tests {
             },
         )]));
         file
+    }
+
+    fn stats(lower: Vec<u8>, upper: Vec<u8>) -> IcebergColumnStats {
+        IcebergColumnStats {
+            null_count: None,
+            value_count: None,
+            column_size: None,
+            lower_bound: Some(lower),
+            upper_bound: Some(upper),
+        }
+    }
+
+    fn column(name: &str, data_type: DataType) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        }
+    }
+
+    fn min_max_int_value(
+        type_: exprs::TExprNodeType,
+        min_int_value: Option<i64>,
+        max_int_value: Option<i64>,
+    ) -> exprs::TExprMinMaxValue {
+        exprs::TExprMinMaxValue::new(
+            type_,
+            false,
+            false,
+            min_int_value,
+            max_int_value,
+            None::<OrderedFloat<f64>>,
+            None::<OrderedFloat<f64>>,
+        )
+    }
+
+    fn hdfs_range_with_min_max_values(
+        min_max_values: Option<BTreeMap<i32, exprs::TExprMinMaxValue>>,
+    ) -> plan_nodes::THdfsScanRange {
+        plan_nodes::THdfsScanRange::new(
+            None::<String>,
+            Some(0_i64),
+            Some(100_i64),
+            None::<i64>,
+            Some(256_i64),
+            Some(descriptors::THdfsFileFormat::PARQUET),
+            None::<descriptors::TTextFileDesc>,
+            Some("s3://bucket/path/file.parquet".to_string()),
+            None::<Vec<String>>,
+            None::<bool>,
+            None::<Vec<plan_nodes::TIcebergDeleteFile>>,
+            None::<i64>,
+            None::<bool>,
+            None::<String>,
+            None::<String>,
+            None::<i64>,
+            None::<crate::thrift::data_cache::TDataCacheOptions>,
+            None::<Vec<types::TSlotId>>,
+            None::<bool>,
+            None::<BTreeMap<String, String>>,
+            None::<Vec<types::TSlotId>>,
+            None::<bool>,
+            None::<String>,
+            None::<bool>,
+            None::<String>,
+            None::<String>,
+            None::<plan_nodes::TPaimonDeletionFile>,
+            None::<BTreeMap<types::TSlotId, exprs::TExpr>>,
+            None::<descriptors::THdfsPartition>,
+            None::<types::TTableId>,
+            None::<plan_nodes::TDeletionVectorDescriptor>,
+            None::<String>,
+            None::<i64>,
+            None::<bool>,
+            min_max_values,
+            None::<i32>,
+            None::<i64>,
+            None::<i64>,
+            None::<Vec<i64>>,
+        )
     }
 
     fn data_file_with_identity_i64_partition(column: &str, value: i64) -> IcebergDataFileInfo {
