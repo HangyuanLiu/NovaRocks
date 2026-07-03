@@ -2,19 +2,16 @@
 //! Arrow schema round-trip: top-level Arrow field names/nullability are outside
 //! this boundary, and logical SQL markers require `Field` metadata.
 
-#[cfg(test)]
 use std::sync::Arc;
 
-#[cfg(test)]
 use arrow::datatypes::Fields;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use crate::proto::common;
-#[cfg(test)]
 use crate::types::logical::field_with_logical_type;
 use crate::types::logical::{LogicalType, logical_type_of_field};
 
-#[cfg(test)]
+#[allow(dead_code)]
 const TIME_UNIT_MICROS: i32 = 2;
 const TIME_UNIT_NANOS: i32 = 3;
 
@@ -26,13 +23,13 @@ pub(crate) fn encode_field_type(field: &Field) -> Result<common::TypeDesc, Strin
     encode_type_inner(field.data_type(), Some(field))
 }
 
-#[cfg(test)]
-pub(super) fn decode_type(desc: &common::TypeDesc) -> Result<DataType, String> {
+#[allow(dead_code)]
+pub(crate) fn decode_type(desc: &common::TypeDesc) -> Result<DataType, String> {
     decode_type_inner(desc)
 }
 
-#[cfg(test)]
-pub(super) fn decode_field_type(
+#[allow(dead_code)]
+pub(crate) fn decode_field_type(
     name: &str,
     nullable: bool,
     desc: &common::TypeDesc,
@@ -187,7 +184,7 @@ fn scalar_desc(
     }
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 fn decode_type_inner(desc: &common::TypeDesc) -> Result<DataType, String> {
     use common::type_desc::Kind;
 
@@ -226,7 +223,7 @@ fn decode_type_inner(desc: &common::TypeDesc) -> Result<DataType, String> {
     }
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 fn decode_scalar_type(scalar: &common::ScalarType) -> Result<DataType, String> {
     use common::PrimitiveType;
 
@@ -273,7 +270,7 @@ fn decode_scalar_type(scalar: &common::ScalarType) -> Result<DataType, String> {
     }
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 fn decode_decimal_type(
     primitive: common::PrimitiveType,
     scalar: &common::ScalarType,
@@ -330,7 +327,7 @@ fn logical_primitive(logical_type: LogicalType) -> common::PrimitiveType {
     }
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 fn logical_type_from_desc(desc: &common::TypeDesc) -> Option<LogicalType> {
     let common::type_desc::Kind::Scalar(scalar) = desc.kind.as_ref()? else {
         return None;
