@@ -5,6 +5,7 @@ use thrift::OrderedFloat;
 
 use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue};
 use crate::common::scan_predicate::{ScanPredicate, ScanPredicateDomain, ScanPredicateSource};
+use crate::fs::scan_context::FileScanRange;
 use crate::sql::catalog::{
     ColumnDef, IcebergColumnStats, IcebergDataFileInfo, IcebergPartitionValue,
 };
@@ -78,6 +79,44 @@ pub(crate) fn file_may_satisfy_scan_predicates(
         }
 
         match stats_may_satisfy_predicate(file.column_stats.as_ref(), predicate) {
+            PredicateDecision::Evaluated(may_satisfy) => {
+                counters.stats_evaluated += 1;
+                if !may_satisfy {
+                    counters.files_pruned += 1;
+                    return false;
+                }
+            }
+            PredicateDecision::Unsupported => {
+                counters.unsupported += 1;
+            }
+        }
+    }
+
+    counters.files_selected += 1;
+    true
+}
+
+pub(crate) fn iceberg_range_may_satisfy_scan_predicates(
+    range: &FileScanRange,
+    predicates: &[ScanPredicate],
+    counters: &mut IcebergFilePruningCounters,
+) -> bool {
+    counters.files_total += 1;
+    counters.predicates += predicates.len() as u128;
+
+    if predicates.is_empty() {
+        counters.files_selected += 1;
+        return true;
+    }
+
+    let Some(metadata) = range.iceberg_file_pruning.as_ref() else {
+        counters.unsupported += 1;
+        counters.files_selected += 1;
+        return true;
+    };
+
+    for predicate in predicates {
+        match stats_may_satisfy_predicate(Some(&metadata.columns), predicate) {
             PredicateDecision::Evaluated(may_satisfy) => {
                 counters.stats_evaluated += 1;
                 if !may_satisfy {
@@ -787,12 +826,14 @@ mod tests {
 
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
     use crate::common::scan_predicate::{ScanPredicate, ScanPredicateSource};
+    use crate::fs::scan_context::FileScanRange;
     use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
     use crate::thrift::{descriptors, exprs, plan_nodes, types};
 
     use super::{
-        IcebergFilePruningCounters, file_may_satisfy_scan_predicates,
+        IcebergFilePruningCounters, IcebergFilePruningMetadata, file_may_satisfy_scan_predicates,
         iceberg_file_pruning_metadata_from_thrift, iceberg_file_pruning_metadata_to_thrift,
+        iceberg_range_may_satisfy_scan_predicates,
     };
 
     #[test]
@@ -1012,6 +1053,51 @@ mod tests {
     }
 
     #[test]
+    fn range_predicate_uses_attached_file_stats() {
+        let range = range_with_i64_stats("k1", 100, 200);
+        let predicate = ScanPredicate::discrete_set(
+            "k1".to_string(),
+            vec![
+                MinMaxPredicateValue::Int64(1),
+                MinMaxPredicateValue::Int64(2),
+            ],
+            ScanPredicateSource::RuntimeIn,
+        )
+        .expect("discrete set");
+        let mut counters = IcebergFilePruningCounters::default();
+
+        assert!(!iceberg_range_may_satisfy_scan_predicates(
+            &range,
+            &[predicate],
+            &mut counters
+        ));
+        assert_eq!(counters.files_total, 1);
+        assert_eq!(counters.files_pruned, 1);
+        assert_eq!(counters.stats_evaluated, 1);
+    }
+
+    #[test]
+    fn range_predicate_missing_metadata_keeps_range() {
+        let range = range_without_metadata();
+        let predicate = ScanPredicate::from_min_max_predicate(
+            MinMaxPredicate::Eq {
+                column: "k1".to_string(),
+                value: MinMaxPredicateValue::Int64(9),
+            },
+            ScanPredicateSource::RuntimeMinMax,
+        );
+        let mut counters = IcebergFilePruningCounters::default();
+
+        assert!(iceberg_range_may_satisfy_scan_predicates(
+            &range,
+            &[predicate],
+            &mut counters
+        ));
+        assert_eq!(counters.files_selected, 1);
+        assert_eq!(counters.unsupported, 1);
+    }
+
+    #[test]
     fn identity_partition_point_can_skip_file() {
         let mut file = IcebergDataFileInfo::for_test("s3://bucket/data.parquet", 10, 1);
         file.partition_values.push(
@@ -1047,6 +1133,51 @@ mod tests {
             },
         )]));
         file
+    }
+
+    fn range_with_i64_stats(column: &str, lower: i64, upper: i64) -> FileScanRange {
+        FileScanRange {
+            path: "s3://bucket/data.parquet".to_string(),
+            file_len: 10,
+            offset: 0,
+            length: 10,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: Some(IcebergFilePruningMetadata {
+                columns: HashMap::from([(
+                    column.to_string(),
+                    IcebergColumnStats {
+                        null_count: None,
+                        value_count: None,
+                        column_size: None,
+                        lower_bound: Some(lower.to_le_bytes().to_vec()),
+                        upper_bound: Some(upper.to_le_bytes().to_vec()),
+                    },
+                )]),
+            }),
+        }
+    }
+
+    fn range_without_metadata() -> FileScanRange {
+        FileScanRange {
+            path: "s3://bucket/data.parquet".to_string(),
+            file_len: 10,
+            offset: 0,
+            length: 10,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: None,
+        }
     }
 
     fn stats(lower: Vec<u8>, upper: Vec<u8>) -> IcebergColumnStats {

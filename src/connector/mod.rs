@@ -56,7 +56,7 @@ pub use crate::formats::FileFormatConfig;
 pub use crate::formats::orc::OrcScanConfig;
 pub use crate::formats::parquet::ParquetScanConfig;
 pub use crate::fs::scan_context::FileScanRange;
-pub use hdfs::HdfsScanConfig;
+pub use hdfs::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig};
 pub use iceberg::IcebergMetadataScanConfig;
 pub use jdbc::JdbcScanConfig;
 pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, StarRocksScanRange};

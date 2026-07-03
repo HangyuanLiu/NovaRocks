@@ -43,8 +43,8 @@ use crate::lower::node::decode::{QueryGlobalDictMap, build_scan_query_global_dic
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_connectors::{
-    ConnectorRegistry, FileFormatConfig, FileScanRange, HdfsScanConfig, OrcScanConfig,
-    ParquetScanConfig, ScanConfig,
+    ConnectorRegistry, FileFormatConfig, FileScanRange, HdfsIcebergRuntimePruningConfig,
+    HdfsScanConfig, OrcScanConfig, ParquetScanConfig, ScanConfig,
 };
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::descriptor_snapshot::{
@@ -1740,6 +1740,20 @@ pub(crate) fn lower_hdfs_scan_node(
             }
         }
     }
+    let iceberg_runtime_pruning = if is_iceberg_table {
+        Some(HdfsIcebergRuntimePruningConfig {
+            slot_to_column: read_columns
+                .slot_ids
+                .iter()
+                .zip(read_columns.columns.iter())
+                .map(|(slot_id, column)| (*slot_id, column.clone()))
+                .collect(),
+            min_max_filter_columns: runtime_min_max_filter_columns.clone(),
+            discrete_set_max_values: 256,
+        })
+    } else {
+        None
+    };
     let iceberg_output_schema = if is_iceberg_table {
         build_projected_output_schema_from_descriptor(
             desc_snapshot.iceberg_schema_for_tuple(tuple_id),
@@ -1815,6 +1829,7 @@ pub(crate) fn lower_hdfs_scan_node(
         object_store_config: object_store_config.clone(),
         iceberg_table_locations,
         query_global_dicts,
+        iceberg_runtime_pruning,
     };
     let row_position_scan = row_position_spec.as_ref().and_then(|_| {
         scan_format.map(
