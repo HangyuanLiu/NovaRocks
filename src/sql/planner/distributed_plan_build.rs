@@ -7,8 +7,6 @@ use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::operator::TopNPhase;
-use crate::sql::optimizer::property::OrderingSpec;
 use crate::sql::planner::distributed_fragment::{
     DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment,
 };
@@ -23,8 +21,8 @@ use crate::sql::planner::plan::{
     RedistributeMode, RedistributeNode,
 };
 use crate::sql::planner::{
-    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, WiredRuntimeFilterBuild,
-    WiredRuntimeFilterProbe,
+    OrderingSpec, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
+    WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
 };
 use crate::thrift::partitions;
 
