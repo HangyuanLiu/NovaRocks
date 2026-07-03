@@ -28,6 +28,7 @@ pub(crate) fn min_max_predicates_to_scan_predicates(
         .collect()
 }
 
+#[allow(dead_code)]
 pub(crate) fn file_may_satisfy_min_max(
     file: &IcebergDataFileInfo,
     predicates: &[MinMaxPredicate],
@@ -620,6 +621,54 @@ mod tests {
     }
 
     #[test]
+    fn discrete_set_identity_partition_skips_non_matching_point() {
+        let file = data_file_with_identity_i64_partition("k1", 7);
+        let predicate = ScanPredicate::discrete_set(
+            "k1".to_string(),
+            vec![
+                MinMaxPredicateValue::Int64(1),
+                MinMaxPredicateValue::Int64(2),
+            ],
+            ScanPredicateSource::RuntimeIn,
+        )
+        .expect("discrete set");
+        let mut counters = IcebergFilePruningCounters::default();
+
+        assert!(!file_may_satisfy_scan_predicates(
+            &file,
+            &[predicate],
+            &mut counters
+        ));
+        assert_eq!(counters.files_pruned, 1);
+        assert_eq!(counters.partition_evaluated, 1);
+        assert_eq!(counters.unsupported, 0);
+    }
+
+    #[test]
+    fn discrete_set_identity_partition_keeps_matching_point() {
+        let file = data_file_with_identity_i64_partition("k1", 7);
+        let predicate = ScanPredicate::discrete_set(
+            "k1".to_string(),
+            vec![
+                MinMaxPredicateValue::Int64(1),
+                MinMaxPredicateValue::Int64(7),
+            ],
+            ScanPredicateSource::RuntimeIn,
+        )
+        .expect("discrete set");
+        let mut counters = IcebergFilePruningCounters::default();
+
+        assert!(file_may_satisfy_scan_predicates(
+            &file,
+            &[predicate],
+            &mut counters
+        ));
+        assert_eq!(counters.files_selected, 1);
+        assert_eq!(counters.partition_evaluated, 1);
+        assert_eq!(counters.unsupported, 0);
+    }
+
+    #[test]
     fn missing_stats_keeps_file() {
         let file = IcebergDataFileInfo::for_test("s3://bucket/data.parquet", 10, 1);
         let predicate = ScanPredicate::from_min_max_predicate(
@@ -674,6 +723,14 @@ mod tests {
                 upper_bound: Some(upper.to_le_bytes().to_vec()),
             },
         )]));
+        file
+    }
+
+    fn data_file_with_identity_i64_partition(column: &str, value: i64) -> IcebergDataFileInfo {
+        let mut file = IcebergDataFileInfo::for_test("s3://bucket/data.parquet", 10, 1);
+        file.partition_values.push(
+            crate::sql::catalog::IcebergPartitionFieldValue::identity_int64_for_test(column, value),
+        );
         file
     }
 }

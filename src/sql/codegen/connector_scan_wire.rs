@@ -72,11 +72,18 @@ fn build_iceberg_scan_ranges(
     ctx: &ThriftScanContext,
 ) -> Result<Vec<internal_service::TScanRangeParams>, String> {
     let mut ranges = Vec::new();
+    let scan_predicates =
+        crate::connector::iceberg::file_pruning::min_max_predicates_to_scan_predicates(
+            &ctx.min_max_predicates,
+        );
+    let mut pruning_counters =
+        crate::connector::iceberg::file_pruning::IcebergFilePruningCounters::default();
     for split in splits {
         let file = &iceberg_split(split)?.data_file;
-        if !crate::connector::iceberg::file_pruning::file_may_satisfy_min_max(
+        if !crate::connector::iceberg::file_pruning::file_may_satisfy_scan_predicates(
             file,
-            &ctx.min_max_predicates,
+            &scan_predicates,
+            &mut pruning_counters,
         ) {
             continue;
         }
