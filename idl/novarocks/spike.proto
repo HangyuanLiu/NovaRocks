@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+// NIDL-0 conversion-layer ergonomics spike. TEMPORARY.
+//
+// TOMBSTONE: delete this file, the crate::proto::spike wiring in src/build.rs,
+// src/service/proto_spike.rs, and the `#[cfg(test)] mod proto_spike;` line in
+// src/service/mod.rs when NIDL-3 (plan-face contract freeze) lands.
+//
+// Deliberately fake domain names (Spike*) so this is never mistaken for the real
+// NIDL-3 plan contract. It probes exactly the prost properties NIDL-3 depends on.
+package novarocks.spike;
+
+// (Finding #1) Recursive message — probes prost's Box handling for a self-
+// referential type, mirroring NIDL-3's List<Struct<...>> nested TypeDesc need.
+message SpikeType {
+  oneof kind {
+    SpikeScalar scalar = 1;
+    SpikeList list = 2;
+    SpikeStruct strct = 3;
+  }
+}
+
+message SpikeScalar {
+  int32 type_id = 1;
+}
+
+message SpikeList {
+  SpikeType element = 1;  // recursive -> prost decides where to Box
+}
+
+message SpikeStruct {
+  repeated SpikeField fields = 1;
+}
+
+message SpikeField {
+  string name = 1;
+  SpikeType field_type = 2;  // recursive
+}
+
+// (Finding #2) Large oneof — probes exhaustive-match ergonomics on the generated
+// Rust enum (the core win over thrift's optional-field soup).
+message SpikeNode {
+  int32 node_id = 1;
+  repeated SpikeNode children = 2;
+  oneof payload {
+    SpikeUnit arm01 = 10;
+    SpikeUnit arm02 = 11;
+    SpikeUnit arm03 = 12;
+    SpikeUnit arm04 = 13;
+    SpikeUnit arm05 = 14;
+    SpikeUnit arm06 = 15;
+    SpikeUnit arm07 = 16;
+    SpikeUnit arm08 = 17;
+    SpikeUnit arm09 = 18;
+    SpikeUnit arm10 = 19;
+    SpikeUnit arm11 = 20;
+    SpikeUnit arm12 = 21;
+  }
+}
+
+message SpikeUnit {
+  int64 value = 1;
+}
