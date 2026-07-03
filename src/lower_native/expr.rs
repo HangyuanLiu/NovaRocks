@@ -16,7 +16,6 @@
 // under the License.
 
 //! Proto expression lowering.
-#![allow(dead_code)]
 
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
@@ -27,7 +26,9 @@ use crate::common::ids::SlotId;
 use crate::exec::expr::function::{FunctionKind, function_metadata, lookup_function};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::proto::{common, expr};
+use crate::thrift::types;
 
+#[allow(dead_code)]
 pub(crate) fn lower_proto_expr(
     e: &expr::Expr,
     arena: &mut ExprArena,
@@ -40,10 +41,10 @@ pub(crate) fn lower_proto_expr(
         .ok_or_else(|| "Expr.kind missing".to_string())?;
 
     match kind {
-        expr::expr::Kind::ColumnRef(column) => Ok(arena.push_typed(
-            ExprNode::SlotId(SlotId::new(column.column_id)),
-            data_type,
-        )),
+        expr::expr::Kind::ColumnRef(column) => {
+            let slot_id = input_layout.resolve_column_id(column.column_id)?;
+            Ok(arena.push_typed(ExprNode::SlotId(slot_id), data_type))
+        }
         expr::expr::Kind::Literal(literal) => {
             let value = lower_literal(literal, &data_type)?;
             Ok(arena.push_typed(ExprNode::Literal(value), data_type))
@@ -63,7 +64,7 @@ pub(crate) fn lower_proto_expr(
             "native scalar expr lowering does not lower WindowCall; analytic/window node handles it"
                 .to_string(),
         ),
-        expr::expr::Kind::Cast(cast) => lower_cast(cast, arena, input_layout),
+        expr::expr::Kind::Cast(cast) => lower_cast(cast, arena, input_layout, data_type),
         expr::expr::Kind::IsNull(is_null) => {
             lower_is_null(is_null, arena, input_layout, data_type)
         }
@@ -88,13 +89,7 @@ pub(crate) fn lower_proto_expr(
             "native scalar expr lowering does not lower Lambda; lambda parameter slot ids are not carried by LambdaExpr"
                 .to_string(),
         ),
-        expr::expr::Kind::Nested(nested) => {
-            let inner = nested
-                .inner
-                .as_ref()
-                .ok_or_else(|| "NestedExpr.inner missing".to_string())?;
-            lower_proto_expr(inner, arena, input_layout)
-        }
+        expr::expr::Kind::Nested(nested) => lower_nested(nested, arena, input_layout, data_type),
     }
 }
 
@@ -235,15 +230,72 @@ fn lower_cast(
     cast: &expr::CastExpr,
     arena: &mut ExprArena,
     input_layout: &Layout,
+    data_type: DataType,
 ) -> Result<ExprId, String> {
-    let child = lower_required_child(&cast.operand, "Cast.operand", arena, input_layout)?;
+    let operand = cast
+        .operand
+        .as_ref()
+        .ok_or_else(|| "Cast.operand missing".to_string())?;
+    let child = lower_proto_expr(operand, arena, input_layout)?;
     let target = cast
         .target
         .as_ref()
         .ok_or_else(|| "Cast.target missing".to_string())?;
     let target_type =
         decode_type(target).map_err(|err| format!("Cast.target decode failed: {err}"))?;
-    Ok(arena.push_typed(ExprNode::Cast(child), target_type))
+    if target_type != data_type {
+        return Err(format!(
+            "Cast target type {target_type:?} does not match Expr.type {data_type:?}"
+        ));
+    }
+
+    if matches!(data_type, DataType::LargeBinary) {
+        let child_type = arena
+            .data_type(child)
+            .ok_or_else(|| "CAST child missing data type".to_string())?;
+        if !is_encoded_variant_payload_source(child_type) {
+            return Err("CAST to VARIANT is not supported".to_string());
+        }
+    }
+    if let Some(child_type) = arena.data_type(child)
+        && matches!(child_type, DataType::LargeBinary)
+        && !matches!(data_type, DataType::LargeBinary)
+    {
+        let supported = matches!(
+            data_type,
+            DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::Date32
+                | DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        );
+        if !supported {
+            return Err("CAST from VARIANT is not supported".to_string());
+        }
+    }
+
+    let target_primitive = thrift_primitive_from_type_desc(target, "Cast.target")?;
+    let source_primitive = operand
+        .r#type
+        .as_ref()
+        .map(|desc| thrift_primitive_from_type_desc(desc, "Cast.operand"))
+        .transpose()?
+        .flatten();
+    let node = if target_primitive == Some(types::TPrimitiveType::TIME) {
+        if source_primitive == Some(types::TPrimitiveType::DATETIME) {
+            ExprNode::CastTimeFromDatetime(child)
+        } else {
+            ExprNode::CastTime(child)
+        }
+    } else {
+        ExprNode::Cast(child)
+    };
+    Ok(arena.push_typed(node, data_type))
 }
 
 fn lower_is_null(
@@ -288,12 +340,14 @@ fn lower_between(
     let operand = lower_required_child(&between.operand, "Between.operand", arena, input_layout)?;
     let low = lower_required_child(&between.low, "Between.low", arena, input_layout)?;
     let high = lower_required_child(&between.high, "Between.high", arena, input_layout)?;
-    let ge_low = arena.push_typed(ExprNode::Ge(operand, low), DataType::Boolean);
-    let le_high = arena.push_typed(ExprNode::Le(operand, high), DataType::Boolean);
-    let in_range = arena.push_typed(ExprNode::And(ge_low, le_high), DataType::Boolean);
     if between.negated {
-        Ok(arena.push_typed(ExprNode::Not(in_range), data_type))
+        let lt_low = arena.push_typed(ExprNode::Lt(operand, low), DataType::Boolean);
+        let gt_high = arena.push_typed(ExprNode::Gt(operand, high), DataType::Boolean);
+        Ok(arena.push_typed(ExprNode::Or(lt_low, gt_high), data_type))
     } else {
+        let ge_low = arena.push_typed(ExprNode::Ge(operand, low), DataType::Boolean);
+        let le_high = arena.push_typed(ExprNode::Le(operand, high), DataType::Boolean);
+        let in_range = arena.push_typed(ExprNode::And(ge_low, le_high), DataType::Boolean);
         Ok(in_range)
     }
 }
@@ -371,16 +425,81 @@ fn lower_is_truth(
         return Err(format!("IsTruth must return Boolean, got {data_type:?}"));
     }
     let child = lower_required_child(&is_truth.operand, "IsTruth.operand", arena, input_layout)?;
-    let expected = arena.push_typed(
-        ExprNode::Literal(LiteralValue::Bool(is_truth.value)),
-        DataType::Boolean,
-    );
-    let comparison = arena.push_typed(ExprNode::EqForNull(child, expected), DataType::Boolean);
-    if is_truth.negated {
-        Ok(arena.push_typed(ExprNode::Not(comparison), DataType::Boolean))
+    if is_truth.value && !is_truth.negated {
+        Ok(child)
     } else {
-        Ok(comparison)
+        Ok(arena.push_typed(ExprNode::Not(child), DataType::Boolean))
     }
+}
+
+fn lower_nested(
+    nested: &expr::NestedExpr,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+    data_type: DataType,
+) -> Result<ExprId, String> {
+    let inner = nested
+        .inner
+        .as_ref()
+        .ok_or_else(|| "NestedExpr.inner missing".to_string())?;
+    let inner_type = decode_expr_type(inner)?;
+    if inner_type != data_type {
+        return Err(format!(
+            "NestedExpr type {data_type:?} does not match inner type {inner_type:?}"
+        ));
+    }
+    lower_proto_expr(inner, arena, input_layout)
+}
+
+fn is_encoded_variant_payload_source(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Binary | DataType::LargeBinary | DataType::Null
+    )
+}
+
+fn thrift_primitive_from_type_desc(
+    desc: &common::TypeDesc,
+    context: &str,
+) -> Result<Option<types::TPrimitiveType>, String> {
+    let Some(common::type_desc::Kind::Scalar(scalar)) = desc.kind.as_ref() else {
+        return Ok(None);
+    };
+    let primitive = common::PrimitiveType::try_from(scalar.r#type)
+        .map_err(|_| format!("{context} has unknown primitive type {}", scalar.r#type))?;
+    let thrift = match primitive {
+        common::PrimitiveType::Unspecified => {
+            return Err(format!("{context} primitive type is unspecified"));
+        }
+        common::PrimitiveType::NullType => types::TPrimitiveType::NULL_TYPE,
+        common::PrimitiveType::Boolean => types::TPrimitiveType::BOOLEAN,
+        common::PrimitiveType::Tinyint => types::TPrimitiveType::TINYINT,
+        common::PrimitiveType::Smallint => types::TPrimitiveType::SMALLINT,
+        common::PrimitiveType::Int => types::TPrimitiveType::INT,
+        common::PrimitiveType::Bigint => types::TPrimitiveType::BIGINT,
+        common::PrimitiveType::Largeint => types::TPrimitiveType::LARGEINT,
+        common::PrimitiveType::Float => types::TPrimitiveType::FLOAT,
+        common::PrimitiveType::Double => types::TPrimitiveType::DOUBLE,
+        common::PrimitiveType::Decimal32 => types::TPrimitiveType::DECIMAL32,
+        common::PrimitiveType::Decimal64 => types::TPrimitiveType::DECIMAL64,
+        common::PrimitiveType::Decimal128 => types::TPrimitiveType::DECIMAL128,
+        common::PrimitiveType::Decimal256 => types::TPrimitiveType::DECIMAL256,
+        common::PrimitiveType::Date => types::TPrimitiveType::DATE,
+        common::PrimitiveType::Datetime => types::TPrimitiveType::DATETIME,
+        common::PrimitiveType::Time => types::TPrimitiveType::TIME,
+        common::PrimitiveType::Varchar => types::TPrimitiveType::VARCHAR,
+        common::PrimitiveType::Char => types::TPrimitiveType::CHAR,
+        common::PrimitiveType::Varbinary => types::TPrimitiveType::VARBINARY,
+        common::PrimitiveType::Binary => types::TPrimitiveType::BINARY,
+        common::PrimitiveType::Json => types::TPrimitiveType::JSON,
+        common::PrimitiveType::Hll => types::TPrimitiveType::HLL,
+        common::PrimitiveType::Bitmap | common::PrimitiveType::Object => {
+            types::TPrimitiveType::OBJECT
+        }
+        common::PrimitiveType::Percentile => types::TPrimitiveType::PERCENTILE,
+        common::PrimitiveType::Variant => types::TPrimitiveType::VARIANT,
+    };
+    Ok(Some(thrift))
 }
 
 fn validate_function_arity(name: &str, kind: FunctionKind, arg_count: usize) -> Result<(), String> {
@@ -589,11 +708,14 @@ fn push_zero_literal(arena: &mut ExprArena, data_type: &DataType) -> Result<Expr
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::DataType;
+    use arrow::array::{Array, BooleanArray, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow_buffer::i256;
+    use std::sync::Arc;
 
     use super::*;
     use crate::common::ids::SlotId;
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue, function::FunctionKind};
     use crate::proto::{common, expr};
     use crate::sql::codegen::proto_encode::types::encode_type;
@@ -654,11 +776,41 @@ mod tests {
         )
     }
 
-    fn lower(e: &expr::Expr) -> (ExprArena, crate::exec::expr::ExprId) {
+    fn layout_for_slots(slots: &[u32]) -> super::super::layout::Layout {
+        super::super::layout::Layout::for_slots(slots.iter().copied().map(SlotId::new))
+    }
+
+    fn lower_with_slots(e: &expr::Expr, slots: &[u32]) -> (ExprArena, crate::exec::expr::ExprId) {
         let mut arena = ExprArena::default();
-        let layout = super::super::layout::Layout::default();
+        let layout = layout_for_slots(slots);
         let id = lower_proto_expr(e, &mut arena, &layout).expect("lower proto expr");
         (arena, id)
+    }
+
+    fn lower(e: &expr::Expr) -> (ExprArena, crate::exec::expr::ExprId) {
+        lower_with_slots(e, &[1, 7, 42])
+    }
+
+    fn lower_err_with_slots(e: &expr::Expr, slots: &[u32]) -> String {
+        let mut arena = ExprArena::default();
+        let layout = layout_for_slots(slots);
+        lower_proto_expr(e, &mut arena, &layout).unwrap_err()
+    }
+
+    fn make_i64_chunk(slot: SlotId, values: Vec<Option<i64>>) -> Chunk {
+        let field = Field::new("c0", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .unwrap();
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[slot],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
     #[test]
@@ -670,6 +822,13 @@ mod tests {
             Some(ExprNode::SlotId(slot)) if *slot == SlotId::new(42)
         ));
         assert_eq!(arena.data_type(id), Some(&DataType::Int32));
+    }
+
+    #[test]
+    fn column_ref_missing_from_layout_fails() {
+        let err = lower_err_with_slots(&col(42, DataType::Int32), &[7]);
+
+        assert!(err.contains("ColumnRef column_id=42 not found in input layout"));
     }
 
     #[test]
@@ -780,6 +939,72 @@ mod tests {
     }
 
     #[test]
+    fn cast_rejects_target_type_mismatch() {
+        let expr = scalar_expr(
+            DataType::Float64,
+            expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                operand: Some(Box::new(col(1, DataType::Int64))),
+                target: Some(type_desc(&DataType::Utf8)),
+            })),
+        );
+
+        let err = lower_err_with_slots(&expr, &[1]);
+        assert!(err.contains("Cast target type Utf8 does not match Expr.type Float64"));
+    }
+
+    #[test]
+    fn cast_selects_time_special_case_nodes() {
+        let time_type = DataType::Time64(TimeUnit::Microsecond);
+        let datetime_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let datetime_to_time = scalar_expr(
+            time_type.clone(),
+            expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                operand: Some(Box::new(col(1, datetime_type))),
+                target: Some(type_desc(&time_type)),
+            })),
+        );
+        let int_to_time = scalar_expr(
+            time_type.clone(),
+            expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                operand: Some(Box::new(col(7, DataType::Int64))),
+                target: Some(type_desc(&time_type)),
+            })),
+        );
+
+        let (arena, id) = lower_with_slots(&datetime_to_time, &[1, 7]);
+        assert!(matches!(
+            arena.node(id),
+            Some(ExprNode::CastTimeFromDatetime(_))
+        ));
+
+        let (arena, id) = lower_with_slots(&int_to_time, &[1, 7]);
+        assert!(matches!(arena.node(id), Some(ExprNode::CastTime(_))));
+    }
+
+    #[test]
+    fn cast_preserves_variant_guards() {
+        let scalar_to_variant = scalar_expr(
+            DataType::LargeBinary,
+            expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                operand: Some(Box::new(col(1, DataType::Int64))),
+                target: Some(type_desc(&DataType::LargeBinary)),
+            })),
+        );
+        let variant_to_decimal = scalar_expr(
+            DataType::Decimal128(10, 2),
+            expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                operand: Some(Box::new(col(1, DataType::LargeBinary))),
+                target: Some(type_desc(&DataType::Decimal128(10, 2))),
+            })),
+        );
+
+        let err = lower_err_with_slots(&scalar_to_variant, &[1]);
+        assert!(err.contains("CAST to VARIANT is not supported"));
+        let err = lower_err_with_slots(&variant_to_decimal, &[1]);
+        assert!(err.contains("CAST from VARIANT is not supported"));
+    }
+
+    #[test]
     fn lowers_recursive_binary_cast_and_function_call() {
         let add = scalar_expr(
             DataType::Int64,
@@ -820,6 +1045,66 @@ mod tests {
                 if matches!(arena.node(*left), Some(ExprNode::SlotId(SlotId(7))))
                     && matches!(arena.node(*right), Some(ExprNode::Literal(LiteralValue::Int64(5))))
         ));
+    }
+
+    #[test]
+    fn nested_requires_outer_and_inner_type_match() {
+        let nested = scalar_expr(
+            DataType::Int64,
+            expr::expr::Kind::Nested(Box::new(expr::NestedExpr {
+                inner: Some(Box::new(string_lit("x"))),
+            })),
+        );
+
+        let err = lower_err_with_slots(&nested, &[]);
+        assert!(err.contains("NestedExpr type Int64 does not match inner type Utf8"));
+    }
+
+    #[test]
+    fn not_between_lowers_to_or_of_lt_and_gt() {
+        let between = scalar_expr(
+            DataType::Boolean,
+            expr::expr::Kind::Between(Box::new(expr::BetweenExpr {
+                operand: Some(Box::new(col(1, DataType::Int64))),
+                low: Some(Box::new(int_lit(10))),
+                high: Some(Box::new(int_lit(20))),
+                negated: true,
+            })),
+        );
+
+        let (arena, id) = lower_with_slots(&between, &[1]);
+        let Some(ExprNode::Or(left, right)) = arena.node(id) else {
+            panic!("expected NOT BETWEEN to lower as OR");
+        };
+        assert!(matches!(arena.node(*left), Some(ExprNode::Lt(_, _))));
+        assert!(matches!(arena.node(*right), Some(ExprNode::Gt(_, _))));
+    }
+
+    #[test]
+    fn numeric_is_false_uses_not_path() {
+        let is_false = scalar_expr(
+            DataType::Boolean,
+            expr::expr::Kind::IsTruth(Box::new(expr::IsTruthExpr {
+                operand: Some(Box::new(col(1, DataType::Int64))),
+                value: false,
+                negated: false,
+            })),
+        );
+
+        let (arena, id) = lower_with_slots(&is_false, &[1]);
+        let Some(ExprNode::Not(child)) = arena.node(id) else {
+            panic!("expected numeric IS FALSE to lower through NOT");
+        };
+        assert!(matches!(
+            arena.node(*child),
+            Some(ExprNode::SlotId(SlotId(1)))
+        ));
+
+        let chunk = make_i64_chunk(SlotId::new(1), vec![Some(0), Some(1)]);
+        let out = arena.eval(id, &chunk).expect("eval");
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(out.value(0));
+        assert!(!out.value(1));
     }
 
     #[test]
@@ -911,7 +1196,7 @@ mod tests {
 
         for (expr, needle) in [(aggregate, "AggregateCall"), (window, "WindowCall")] {
             let mut arena = ExprArena::default();
-            let layout = super::super::layout::Layout::default();
+            let layout = layout_for_slots(&[]);
             let err = lower_proto_expr(&expr, &mut arena, &layout).unwrap_err();
             assert!(err.contains(needle), "{err}");
         }
