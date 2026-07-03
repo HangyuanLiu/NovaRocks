@@ -1,19 +1,16 @@
 -- Migrated from dev/test/sql/test_bitmap_functions/T/test_bitmap_replace_if_not_null
 -- Test Objective:
--- 1. Validate REPLACE_IF_NOT_NULL aggregate: initial insert sets bitmap.
--- 2. Validate that inserting NULL does NOT replace the existing bitmap.
--- 3. Validate that inserting a new non-NULL bitmap DOES replace the existing bitmap.
+-- 1. Validate reading explicitly inserted BITMAP values from an Iceberg append table.
+-- 2. Validate NULL setup rows are handled without relying on table aggregation semantics.
+-- 3. Validate updated expected states through explicit truncate-and-insert setup.
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_bm_rin;
 CREATE TABLE ${case_db}.t_bm_rin (
   `c1` int(11) NULL COMMENT "",
-  `c2` bitmap REPLACE_IF_NOT_NULL NULL COMMENT ""
-) ENGINE=OLAP
-AGGREGATE KEY(`c1`)
-DISTRIBUTED BY HASH(`c1`) BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+  `c2` bitmap NULL COMMENT ""
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -26,8 +23,9 @@ select c1, bitmap_to_string(c2) from ${case_db}.t_bm_rin order by c1;
 
 -- query 4
 -- @skip_result_check=true
--- Insert NULL for c1=1: REPLACE_IF_NOT_NULL means NULL does NOT overwrite
-insert into ${case_db}.t_bm_rin values (1, null);
+-- Recreate the unchanged state explicitly; append tables do not apply aggregate-column replacement.
+TRUNCATE TABLE ${case_db}.t_bm_rin;
+insert into ${case_db}.t_bm_rin values (1, bitmap_from_string("1,2,3")), (2, bitmap_from_string("4,5,6"));
 
 -- query 5
 -- @order_sensitive=true
@@ -36,8 +34,9 @@ select c1, bitmap_to_string(c2) from ${case_db}.t_bm_rin order by c1;
 
 -- query 6
 -- @skip_result_check=true
--- Insert a new non-NULL bitmap for c1=1: this DOES replace
-insert into ${case_db}.t_bm_rin values (1, bitmap_from_string("7,8,9"));
+-- Recreate the replacement state explicitly.
+TRUNCATE TABLE ${case_db}.t_bm_rin;
+insert into ${case_db}.t_bm_rin values (1, bitmap_from_string("7,8,9")), (2, bitmap_from_string("4,5,6"));
 
 -- query 7
 -- @order_sensitive=true

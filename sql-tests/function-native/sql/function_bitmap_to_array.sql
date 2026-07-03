@@ -8,14 +8,11 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_bm_arr;
 CREATE TABLE ${case_db}.t_bm_arr (
   `c1` int(11) NULL COMMENT "",
-  `c2` bitmap BITMAP_UNION NULL COMMENT ""
-) ENGINE=OLAP
-AGGREGATE KEY(`c1`)
-DISTRIBUTED BY HASH(`c1`) BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+  `c2` bitmap NULL COMMENT ""
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true

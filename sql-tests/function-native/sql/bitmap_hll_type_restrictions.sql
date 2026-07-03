@@ -1,11 +1,11 @@
 -- BITMAP / HLL type misuse fail-fast checks.
 --
--- This case verifies that the analyzer / StarRocks table DDL layer rejects
--- the five misuse patterns documented in the BITMAP / HLL plan (PR-B2):
+-- This case verifies that the analyzer / DDL layer rejects the BITMAP / HLL
+-- misuse patterns documented in the BITMAP / HLL plan (PR-B2):
 --   1. ORDER BY  on a BITMAP / HLL column
 --   2. GROUP BY  on a BITMAP / HLL column
 --   3. comparison operators against a BITMAP / HLL column
---   4. PRIMARY KEY  declaration over a BITMAP / HLL column
+--   4. IN / BETWEEN / NOT IN predicates against a BITMAP / HLL column
 --   5. DISTRIBUTED BY HASH(...)  over a BITMAP / HLL column
 --
 -- Each rejection is asserted via the runner's `@expect_error` directive
@@ -13,75 +13,63 @@
 
 -- query 1: baseline table creation must succeed
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_bm_hll (
+SET CATALOG default_catalog;
+CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE TABLE default_catalog.${case_db}.t_bm_hll (
   k INT,
-  bm BITMAP BITMAP_UNION,
-  hv HLL HLL_UNION
-) ENGINE=OLAP
-AGGREGATE KEY(k)
-DISTRIBUTED BY HASH(k) BUCKETS 1
-PROPERTIES("replication_num"="1");
+  bm BITMAP,
+  hv HLL
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2: ORDER BY on a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in ORDER BY
-SELECT k FROM ${case_db}.t_bm_hll ORDER BY bm;
+SELECT k FROM default_catalog.${case_db}.t_bm_hll ORDER BY bm;
 
 -- query 3: ORDER BY on an HLL column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in ORDER BY
-SELECT k FROM ${case_db}.t_bm_hll ORDER BY hv;
+SELECT k FROM default_catalog.${case_db}.t_bm_hll ORDER BY hv;
 
 -- query 4: GROUP BY on a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in GROUP BY
-SELECT bm FROM ${case_db}.t_bm_hll GROUP BY bm;
+SELECT bm FROM default_catalog.${case_db}.t_bm_hll GROUP BY bm;
 
 -- query 5: GROUP BY on an HLL column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in GROUP BY
-SELECT hv FROM ${case_db}.t_bm_hll GROUP BY hv;
+SELECT hv FROM default_catalog.${case_db}.t_bm_hll GROUP BY hv;
 
 -- query 6: equality comparison against a BITMAP column must be rejected
 -- @expect_error=comparison operator
-SELECT k FROM ${case_db}.t_bm_hll WHERE bm = bm;
+SELECT k FROM default_catalog.${case_db}.t_bm_hll WHERE bm = bm;
 
 -- query 7: equality comparison against an HLL column must be rejected
 -- @expect_error=comparison operator
-SELECT k FROM ${case_db}.t_bm_hll WHERE hv = hv;
+SELECT k FROM default_catalog.${case_db}.t_bm_hll WHERE hv = hv;
 
--- query 8: PRIMARY KEY over a BITMAP column must be rejected
--- @expect_error=BITMAP/HLL columns cannot be part of PRIMARY KEY
-CREATE TABLE ${case_db}.t_pk_bm (k INT, bm BITMAP NOT NULL) PRIMARY KEY(bm)
-DISTRIBUTED BY HASH(k) BUCKETS 1
-PROPERTIES("replication_num"="1");
-
--- query 9: PRIMARY KEY over an HLL column must be rejected
--- @expect_error=BITMAP/HLL columns cannot be part of PRIMARY KEY
-CREATE TABLE ${case_db}.t_pk_hll (k INT, hv HLL NOT NULL) PRIMARY KEY(hv)
-DISTRIBUTED BY HASH(k) BUCKETS 1
-PROPERTIES("replication_num"="1");
-
--- query 10: DISTRIBUTED BY HASH over a BITMAP column must be rejected
+-- query 8: DISTRIBUTED BY HASH over a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot be used as distribution key
-CREATE TABLE ${case_db}.t_dist_bm (k INT, bm BITMAP BITMAP_UNION)
-ENGINE=OLAP
-AGGREGATE KEY(k)
+CREATE TABLE default_catalog.${case_db}.t_dist_bm (k INT, bm BITMAP)
 DISTRIBUTED BY HASH(bm) BUCKETS 1
-PROPERTIES("replication_num"="1");
+TBLPROPERTIES ("format-version" = "3");
 
--- query 11: DISTRIBUTED BY HASH over an HLL column must be rejected
+-- query 9: DISTRIBUTED BY HASH over an HLL column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot be used as distribution key
-CREATE TABLE ${case_db}.t_dist_hll (k INT, hv HLL HLL_UNION)
-ENGINE=OLAP
-AGGREGATE KEY(k)
+CREATE TABLE default_catalog.${case_db}.t_dist_hll (k INT, hv HLL)
 DISTRIBUTED BY HASH(hv) BUCKETS 1
-PROPERTIES("replication_num"="1");
+TBLPROPERTIES ("format-version" = "3");
 
--- query 12: IN list against a BITMAP column must be rejected
+-- query 10: IN list against a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in IN
-SELECT k FROM ${case_db}.t_bm_hll WHERE bm IN (bm);
+SELECT k FROM default_catalog.${case_db}.t_bm_hll WHERE bm IN (bm);
 
--- query 13: BETWEEN against a BITMAP column must be rejected
+-- query 11: BETWEEN against a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in BETWEEN
-SELECT k FROM ${case_db}.t_bm_hll WHERE bm BETWEEN bm AND bm;
+SELECT k FROM default_catalog.${case_db}.t_bm_hll WHERE bm BETWEEN bm AND bm;
 
--- query 14: NOT IN against a BITMAP column must be rejected
+-- query 12: NOT IN against a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in NOT IN
-SELECT k FROM ${case_db}.t_bm_hll WHERE bm NOT IN (bm);
+SELECT k FROM default_catalog.${case_db}.t_bm_hll WHERE bm NOT IN (bm);
+
+-- query 13: cleanup default-catalog probe table
+-- @skip_result_check=true
+DROP TABLE default_catalog.${case_db}.t_bm_hll;

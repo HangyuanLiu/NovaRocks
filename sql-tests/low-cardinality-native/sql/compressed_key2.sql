@@ -26,7 +26,8 @@ CREATE TABLE t3 (
     c_2_13 LARGEINT NOT NULL,
     c_2_14 LARGEINT NOT NULL,
     c_2_15 LARGEINT NOT NULL
-) DUPLICATE KEY (c_2_0) DISTRIBUTED BY HASH (c_2_0) properties("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -180,9 +181,8 @@ select distinct c_2_0, c_2_1, c_2_2, c_2_3, c_2_4, c_2_5, c_2_6, c_2_7, c_2_8, c
 USE ${case_db};
 CREATE TABLE t4 (
     c_2_0 LARGEINT NOT NULL
-) DUPLICATE KEY (c_2_0)
-DISTRIBUTED BY HASH (c_2_0)
-properties("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 24
 -- @skip_result_check=true

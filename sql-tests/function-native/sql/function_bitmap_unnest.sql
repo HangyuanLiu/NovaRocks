@@ -7,14 +7,11 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_unnest;
 CREATE TABLE ${case_db}.t_unnest (
   `c1` int(11) NULL COMMENT "",
-  `c2` bitmap BITMAP_UNION NULL COMMENT ""
-) ENGINE=OLAP
-AGGREGATE KEY(`c1`)
-DISTRIBUTED BY HASH(`c1`) BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+  `c2` bitmap NULL COMMENT ""
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -49,17 +46,13 @@ set enable_rewrite_unnest_bitmap_to_array=true;
 
 -- query 7
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.test_tags;
 CREATE TABLE ${case_db}.test_tags (
   c1 varchar(65533) NOT NULL,
   tag_name varchar(65533) NOT NULL,
   tag_value varchar(65533) NOT NULL,
   rb bitmap NOT NULL
-) ENGINE=OLAP
-  PRIMARY KEY(c1, tag_name, tag_value)
-PARTITION BY (c1)
-DISTRIBUTED BY HASH(tag_name, tag_value)
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 8
 -- @skip_result_check=true

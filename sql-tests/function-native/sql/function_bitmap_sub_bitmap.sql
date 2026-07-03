@@ -118,10 +118,9 @@ SELECT bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(group_concat(c
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.test_bitmap_table1(
     k1 INT,
-    v1 BITMAP BITMAP_UNION
-) AGGREGATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 3
-PROPERTIES('replication_num'='1');
+    v1 BITMAP
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 37
 -- @skip_result_check=true
@@ -133,11 +132,15 @@ INSERT INTO ${case_db}.test_bitmap_table1 SELECT 1, to_bitmap('1');
 
 -- query 39
 -- @skip_result_check=true
-INSERT INTO ${case_db}.test_bitmap_table1 SELECT 2, to_bitmap(cast(x as string)) FROM TABLE(generate_series(1, 10, 1)) t(x);
+INSERT INTO ${case_db}.test_bitmap_table1
+SELECT 2, bitmap_from_string(group_concat(cast(x as string), ','))
+FROM TABLE(generate_series(1, 10, 1)) t(x);
 
 -- query 40
 -- @skip_result_check=true
-INSERT INTO ${case_db}.test_bitmap_table1 SELECT 3, to_bitmap(cast(x as string)) FROM TABLE(generate_series(1, 100, 1)) t(x);
+INSERT INTO ${case_db}.test_bitmap_table1
+SELECT 3, bitmap_from_string(group_concat(cast(x as string), ','))
+FROM TABLE(generate_series(1, 100, 1)) t(x);
 
 -- query 41
 -- sub_bitmap from tail: k0=NULL,k1=single,k2=10-elem,k3=100-elem

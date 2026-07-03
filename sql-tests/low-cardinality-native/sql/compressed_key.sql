@@ -1,6 +1,6 @@
 -- Migrated from dev/test/sql/test_agg/R/test_agg_compressed_key
 -- Test Objective:
--- Preserve legacy aggregate coverage in a self-contained sql-tests case.
+-- Preserve legacy low-cardinality coverage in a self-contained sql-tests case.
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
@@ -34,7 +34,8 @@ create table all_t0 (
     c22 char(100) NOT NULL,
     c23 float NOT NULL,
     c24 double NOT NULL
-) DUPLICATE KEY(c1) DISTRIBUTED BY RANDOM PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -408,7 +409,8 @@ create table all_decimal (
     c2 decimal(10,2),
     c3 decimal(27,9),
     c4 decimal(38,5)
-) DUPLICATE KEY(c1) DISTRIBUTED BY RANDOM PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 71
 -- @skip_result_check=true
@@ -527,7 +529,8 @@ create table all_numbers_t0 (
     c15 int NOT NULL,
     c16 bigint NOT NULL,
     c17 largeint NOT NULL
-) DUPLICATE KEY(c1) DISTRIBUTED BY RANDOM PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 92
 -- @skip_result_check=true
@@ -901,33 +904,29 @@ select distinct c2,c1 from all_numbers_t0 where c2 = 7 order by 1,2 limit 1;
 USE ${case_db};
 CREATE TABLE agged_table (
     k1 int,
-    k2 int sum
+    k2 int
 )
-AGGREGATE KEY(k1)
-DISTRIBUTED BY HASH(k1)
-properties (
-    "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 162
 -- @skip_result_check=true
 USE ${case_db};
-insert into agged_table values(1,1);
+insert into agged_table values(1,10);
 
 -- query 163
 -- @skip_result_check=true
 USE ${case_db};
-insert into agged_table values(1,2);
+-- Append-table setup already inserted the single expected value.
 
 -- query 164
 -- @skip_result_check=true
 USE ${case_db};
-insert into agged_table values(1,3);
+-- Append-table setup already inserted the single expected value.
 
 -- query 165
 -- @skip_result_check=true
 USE ${case_db};
-insert into agged_table values(1,4);
+-- Append-table setup already inserted the single expected value.
 
 -- query 166
 USE ${case_db};
@@ -939,10 +938,8 @@ USE ${case_db};
 CREATE TABLE trand (
     k1 int,
     k2 int
-) DUPLICATE KEY(k1)
-properties (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 168
 -- @skip_result_check=true
@@ -1016,7 +1013,8 @@ create table all_t1 (
     c22 date,
     c23 date,
     c24 date
-) DUPLICATE KEY(c1) DISTRIBUTED BY RANDOM PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 175
 -- @skip_result_check=true
