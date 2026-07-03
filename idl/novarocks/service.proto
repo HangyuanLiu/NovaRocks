@@ -88,6 +88,9 @@ message SubmitFragmentResponse {
 
 // Coordinator long-poll request for one fragment instance result stream.
 message FetchResultRequest {
+  reserved 3;
+  reserved "typed_result";
+
   novarocks.common.UniqueId finst_id = 1;  // instance to poll
   int64 max_wait_ms = 2;                   // server-side long-poll budget
 }
@@ -96,16 +99,20 @@ message FetchResultRequest {
 message FetchResultResponse {
   enum Status {
     RESULT_STATUS_UNSPECIFIED = 0;  // NIDL-1: fixes former READY = 0 default hazard
-    READY = 1;
-    NOT_READY = 2;
-    EOF = 3;
-    ERROR = 4;
+    reserved 1 to 3;                // retired NIDL-0 READY/NOT_READY/EOF values
+    READY = 4;
+    NOT_READY = 5;
+    EOF = 6;
+    ERROR = 7;
   }
+  reserved 2;
+  reserved "result_batch_thrift";
+
   Status status = 1;             // result lifecycle state for this poll
-  string message = 2;            // error detail when status == ERROR
-  int64 packet_seq = 3;          // was carried in the FetchResult struct
-  bool eos = 4;                  // end-of-stream marker
-  bytes result_arrow_ipc = 5;    // NRX1-framed Arrow IPC (sole data track)
+  string message = 3;            // error detail when status == ERROR
+  bytes result_arrow_ipc = 4;    // NRX1-framed Arrow IPC (sole data track)
+  int64 packet_seq = 5;          // was carried in the FetchResult struct
+  bool eos = 6;                  // end-of-stream marker
 }
 
 // Coordinator cancellation request for active fragment instances.
@@ -263,7 +270,10 @@ message ExecStatusReport {
 
 // BE -> coordinator exec-status report.
 message ReportExecStatusRequest {
-  ExecStatusReport report = 1;
+  reserved 1;
+  reserved "report_exec_status_params_thrift";
+
+  ExecStatusReport report = 2;
 }
 
 // Result for one exec-status report accepted by the coordinator.
@@ -275,7 +285,10 @@ message ReportExecStatusResponse {
 
 // Batched exec-status reports from one BE to the coordinator.
 message BatchReportExecStatusRequest {
-  repeated ExecStatusReport reports = 1;
+  reserved 1;
+  reserved "report_exec_status_params_thrift";
+
+  repeated ExecStatusReport reports = 2;
 }
 
 // Aggregate result for a batch of exec-status reports.
