@@ -36,10 +36,10 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         AggMode, AggregateOutputLayout, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
-        DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, IntersectOp, JoinDistribution, LimitOp,
-        Operator, PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalHashJoinEqCondition,
-        PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp, ScanDictionaryColumn,
-        ScanOp, SortOp, TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
+        ExceptOp, FilterOp, GenerateSeriesOp, IntersectOp, JoinDistribution, LimitOp, Operator,
+        PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalHashJoinEqCondition,
+        PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp, ScanOp, SortOp,
+        TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::physical_tree::{
         JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
@@ -52,7 +52,7 @@ mod tests {
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
         intern_window_exprs,
     };
-    use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
+    use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 
     #[test]
     fn scan_builds_ir_fragment_structure() {
@@ -428,11 +428,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_over_scan_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure("decode_over_scan", decode_over_scan_plan(), 1);
-    }
-
-    #[test]
     fn repeat_grouping_sets_builds_ir_fragment_structure() {
         assert_distributed_plan_ir_structure(
             "repeat_grouping_sets",
@@ -461,34 +456,6 @@ mod tests {
             "unnest_table_function_over_scan",
             unnest_table_function_over_scan_plan(),
             1,
-        );
-    }
-
-    #[test]
-    fn decode_output_expr_uses_materialized_string_slot() {
-        let build = build_distributed_plan_only("decode_output_expr_slot", decode_over_scan_plan());
-        assert_multi_fragment_ir_structure("decode_output_expr_slot", &build, 1);
-        let root = fragment_by_id("decode_output_expr_slot", &build, build.root_fragment_id);
-        let decode = root
-            .plan
-            .nodes
-            .iter()
-            .find(|node| node.node_type == crate::thrift::plan_nodes::TPlanNodeType::DECODE_NODE)
-            .expect("decode node");
-        let decode_payload = decode.decode_node.as_ref().expect("decode payload");
-        let mapping = decode_payload
-            .dict_id_to_string_ids
-            .as_ref()
-            .expect("decode mapping");
-        let string_slot_id = *mapping.values().next().expect("one decode mapping");
-        let output_exprs = root.output_exprs.as_ref().expect("root output exprs");
-        let slot_ref = output_exprs[0].nodes[0]
-            .slot_ref
-            .as_ref()
-            .expect("decode output slot ref");
-        assert_eq!(
-            slot_ref.slot_id, string_slot_id,
-            "decode result sink must read the materialized string slot"
         );
     }
 
@@ -2336,57 +2303,6 @@ mod tests {
         )
     }
 
-    fn decode_over_scan_plan() -> OptimizerPhysicalNode {
-        let source_id = ColumnId::new_for_test(701);
-        let output_id = ColumnId::new_for_test(702);
-        let scan = physical_node(
-            Operator::PhysicalScan(ScanOp {
-                database: "test_db".to_string(),
-                table: dict_metadata_table_def(),
-                alias: Some("t".to_string()),
-                stats_ref: None,
-                columns: vec![OutputColumn {
-                    column_id: source_id,
-                    name: "s".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                    is_internal: false,
-                }],
-                predicates: vec![],
-                required_columns: Some(vec!["s_dict".to_string()]),
-                dict_columns: vec![ScanDictionaryColumn {
-                    source_column: "s".to_string(),
-                    dict_column: "s_dict".to_string(),
-                    dictionary: dict_snapshot_a_b(),
-                }],
-                variant_columns: vec![],
-                mv_rewritten_from: None,
-            }),
-            vec![],
-            vec![OutputColumn {
-                column_id: source_id,
-                name: "s_dict".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                is_internal: false,
-            }],
-        );
-        let decoded = output_col(output_id.0, "s", DataType::Utf8, false);
-        physical_node(
-            Operator::PhysicalDecode(DecodeOp {
-                mappings: vec![DecodeMapping {
-                    source_column_id: source_id,
-                    output_column_id: output_id,
-                    dict_column: "s_dict".to_string(),
-                    string_column: "s".to_string(),
-                }],
-                output_columns: vec![decoded.clone()],
-            }),
-            vec![scan],
-            vec![decoded],
-        )
-    }
-
     fn repeat_grouping_sets_plan() -> OptimizerPhysicalNode {
         let k = output_col(801, "k", DataType::Int64, false);
         let grouping_col = output_col(802, "__grouping_fn_0", DataType::Int64, false);
@@ -2593,21 +2509,6 @@ mod tests {
         }
     }
 
-    fn dict_metadata_table_def() -> TableDef {
-        TableDef {
-            name: "dict_t$snapshots".to_string(),
-            columns: vec![column_def("s", DataType::Utf8, false)],
-            iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::IcebergMetadataTable {
-                table: iceberg_table_info(),
-                metadata_table_type: IcebergMetadataTableType::Snapshots,
-                serialized_table: "{}".to_string(),
-                cloud_properties: Default::default(),
-                metadata_payload: None,
-            },
-        }
-    }
-
     fn iceberg_data_table_def() -> TableDef {
         TableDef {
             name: "t".to_string(),
@@ -2714,44 +2615,6 @@ mod tests {
             data_type: DataType::Int64,
             nullable: true,
         }
-    }
-
-    fn dict_snapshot_a_b() -> Arc<crate::engine::dictionary::model::DictionarySnapshot> {
-        use crate::engine::dictionary::model::{
-            DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue,
-            DictionaryWatermark,
-        };
-
-        Arc::new(DictionarySnapshot {
-            dictionary_id: 1,
-            owner: DictionaryOwner::IcebergTable {
-                catalog: "test_catalog".to_string(),
-                namespace: "test_db".to_string(),
-                table: "dict_t".to_string(),
-                table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
-            },
-            column_id: None,
-            column_name: "s".to_string(),
-            data_type: DataType::Int32,
-            version: 1,
-            watermark: DictionaryWatermark::Iceberg {
-                snapshot_id: Some(7),
-                schema_id: 1,
-            },
-            values: vec![
-                DictionaryValue {
-                    id: 1,
-                    bytes: b"a".to_vec(),
-                },
-                DictionaryValue {
-                    id: 2,
-                    bytes: b"b".to_vec(),
-                },
-            ],
-            null_id: 0,
-            state: DictionaryState::Active,
-            order_preserving: true,
-        })
     }
 
     fn cmp_expr(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {

@@ -6,7 +6,6 @@ pub(crate) mod prune_aggregate;
 pub(crate) mod prune_cte_anchor;
 pub(crate) mod prune_cte_consume;
 pub(crate) mod prune_cte_produce;
-pub(crate) mod prune_decode;
 pub(crate) mod prune_except;
 pub(crate) mod prune_filter;
 pub(crate) mod prune_intersect;
@@ -26,7 +25,7 @@ use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 
-/// Returns all 17 per-operator Phase-2 column pruning rules.
+/// Returns all 16 per-operator Phase-2 column pruning rules.
 ///
 /// These rules consume the `required_output_columns` tags written by the
 /// Phase-1 `TagRequiredColumns` pass and prune each operator's output columns
@@ -48,7 +47,6 @@ pub(crate) fn all_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
         Box::new(prune_cte_consume::PruneCTEConsumeColumns),
         Box::new(prune_cte_produce::PruneCTEProduceColumns),
         Box::new(prune_repeat::PruneRepeatColumns),
-        Box::new(prune_decode::PruneDecodeColumns),
         Box::new(prune_table_function::PruneTableFunctionColumns),
     ]
 }

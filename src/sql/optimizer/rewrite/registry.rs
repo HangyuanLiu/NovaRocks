@@ -150,7 +150,6 @@ mod tests {
                 "PruneCTEAnchorColumns",
                 "PruneCTEConsumeColumns",
                 "PruneCTEProduceColumns",
-                "PruneDecodeColumns",
                 "PruneExceptColumns",
                 "PruneFilterColumns",
                 "PruneIntersectColumns",

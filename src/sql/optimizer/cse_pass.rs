@@ -705,11 +705,6 @@ fn available_output_ids(node: &OptimizerPhysicalNode) -> HashSet<ColumnId> {
             .iter()
             .map(|column| column.column_id)
             .collect(),
-        Operator::PhysicalDecode(decode) => decode
-            .output_columns
-            .iter()
-            .map(|column| column.column_id)
-            .collect(),
         Operator::PhysicalUnion(union) => union
             .output_columns
             .iter()

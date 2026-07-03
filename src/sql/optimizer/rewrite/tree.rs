@@ -476,7 +476,6 @@ mod tests {
                 | Operator::LogicalCTEAnchor(_)
                 | Operator::LogicalCTEProduce(_)
                 | Operator::LogicalCTEConsume(_)
-                | Operator::LogicalDecode(_)
                 | Operator::LogicalAssertOneRow(_)
                 // Pre-memo logical-only variants (eliminated before memo entry).
                 | Operator::LogicalApply(_)
@@ -506,7 +505,6 @@ mod tests {
                 | Operator::PhysicalValues(_)
                 | Operator::PhysicalGenerateSeries(_)
                 | Operator::PhysicalTableFunction(_)
-                | Operator::PhysicalDecode(_)
                 | Operator::PhysicalAssertOneRow(_) => {}
             }
         }

@@ -29,7 +29,6 @@ pub(crate) enum OpKind {
     CTEAnchor,
     CTEProduce,
     CTEConsume,
-    Decode,
     AssertOneRow,
     Apply,
 }
@@ -63,7 +62,6 @@ pub(crate) fn op_kind(op: &Operator) -> Option<OpKind> {
         Operator::LogicalCTEAnchor(_) => Some(OpKind::CTEAnchor),
         Operator::LogicalCTEProduce(_) => Some(OpKind::CTEProduce),
         Operator::LogicalCTEConsume(_) => Some(OpKind::CTEConsume),
-        Operator::LogicalDecode(_) => Some(OpKind::Decode),
         Operator::LogicalAssertOneRow(_) => Some(OpKind::AssertOneRow),
         Operator::LogicalApply(_) => Some(OpKind::Apply),
         Operator::LogicalJoin(_) => Some(OpKind::Join),
@@ -101,8 +99,8 @@ mod tests {
     use crate::sql::common::{ApplyKind, ImvVersionRef, JoinKind, LiteralValue, OutputColumn};
     use crate::sql::optimizer::operator::{
         AggregateOutputLayout, ApplyOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
-        DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp,
-        LimitOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScanOp, SortOp,
+        ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp, LimitOp,
+        LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScanOp, SortOp,
         TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
@@ -248,13 +246,6 @@ mod tests {
                     producer_column_ids: vec![],
                 }),
                 OpKind::CTEConsume,
-            ),
-            (
-                Operator::LogicalDecode(DecodeOp {
-                    mappings: vec![],
-                    output_columns: vec![],
-                }),
-                OpKind::Decode,
             ),
             (
                 Operator::LogicalAssertOneRow(AssertOneRowOp {

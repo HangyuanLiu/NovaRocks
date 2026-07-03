@@ -250,7 +250,6 @@ pub(crate) fn collect_output_ids_ordered_opt(expr: &OptExpr) -> Vec<ColumnId> {
         Operator::LogicalUnion(u) => u.output_columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalIntersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalExcept(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
-        Operator::LogicalDecode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalValues(v) => v.columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalGenerateSeries(g) => {
             if g.output_column_id == ColumnId::UNSET {
@@ -393,12 +392,6 @@ fn collect_qualified_output_columns_opt_inner(expr: &OptExpr, out: &mut HashSet<
                 let col_name = col.name.to_lowercase();
                 out.insert((Some(alias_lower.clone()), col_name.clone()));
                 out.insert((None, col_name));
-            }
-        }
-        Operator::LogicalDecode(d) => {
-            collect_qualified_output_columns_opt_inner(expr.unary_input(), out);
-            for mapping in &d.mappings {
-                out.insert((None, mapping.string_column.to_lowercase()));
             }
         }
         Operator::LogicalAssertOneRow(_) => {

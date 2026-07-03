@@ -8,9 +8,7 @@ use std::collections::HashSet;
 
 use crate::sql::catalog::{BranchScope, TableDef};
 use crate::sql::column_id::ColumnId;
-use crate::sql::common::{
-    ApplyKind, CteId, DecodeMapping, ImvVersionRef, JoinKind, OutputColumn, WindowFrame,
-};
+use crate::sql::common::{ApplyKind, CteId, ImvVersionRef, JoinKind, OutputColumn, WindowFrame};
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarId, SortKey};
 use crate::sql::optimizer::stats_input::StatsRef;
 
@@ -510,22 +508,6 @@ pub(crate) struct AssertOneRowOp {
     pub subquery_text: String,
 }
 
-/// Logical dictionary-decode operator. Maps dictionary-encoded child columns
-/// back to their string form. This native decode-boundary infrastructure is
-/// still present during the R0 cleanup; the implementation rule
-/// `DecodeToPhysical` lowers logical decode boundaries to `PhysicalDecode`.
-///
-/// `output_columns` mirrors the input group's output columns with each
-/// `dict_column` swapped for its `string_column`. Without it
-/// `derive_output_columns` would surface the child's pre-decode names
-/// (the dict columns) to consumers, and parent lookups for the
-/// string column would fail to resolve.
-#[derive(Clone, Debug)]
-pub(crate) struct DecodeOp {
-    pub mappings: Vec<DecodeMapping>,
-    pub output_columns: Vec<OutputColumn>,
-}
-
 /// Apply (correlated subquery) operator. Eliminated by the SubqueryRewrite
 /// stage before memo conversion; must not reach derive/cost/codegen.
 ///
@@ -636,7 +618,6 @@ pub(crate) enum Operator {
     LogicalCTEAnchor(CTEAnchorOp),
     LogicalCTEProduce(CTEProduceOp),
     LogicalCTEConsume(CTEConsumeOp),
-    LogicalDecode(DecodeOp),
     LogicalAssertOneRow(AssertOneRowOp),
     /// Apply (correlated subquery). Eliminated by SubqueryRewrite before memo.
     LogicalApply(ApplyOp),
@@ -668,7 +649,6 @@ pub(crate) enum Operator {
     PhysicalValues(ValuesOp),
     PhysicalGenerateSeries(GenerateSeriesOp),
     PhysicalTableFunction(TableFunctionOp),
-    PhysicalDecode(DecodeOp),
     PhysicalAssertOneRow(AssertOneRowOp),
 }
 
@@ -696,7 +676,6 @@ impl Operator {
                 | Operator::LogicalCTEAnchor(_)
                 | Operator::LogicalCTEProduce(_)
                 | Operator::LogicalCTEConsume(_)
-                | Operator::LogicalDecode(_)
                 | Operator::LogicalAssertOneRow(_)
                 | Operator::LogicalApply(_)
                 | Operator::LogicalImvDelta(_)

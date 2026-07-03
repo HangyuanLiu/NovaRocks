@@ -217,13 +217,10 @@ impl DistributedPlanBuilder {
                 let tuple_ids = child.tuple_ids.clone();
                 Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]))
             }
-            PhysicalPlanKind::Decode(_) => {
-                expect_child_count(node, 1)?;
-                let child = self.visit(&node.children[0])?;
-                let tuple_id = self.alloc_tuple();
-                let node_id = self.alloc_node();
-                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
-            }
+            PhysicalPlanKind::Decode(_) => Err(
+                "native distributed Decode plans are retired before distributed plan build"
+                    .to_string(),
+            ),
             PhysicalPlanKind::Repeat(repeat) => {
                 expect_child_count(node, 1)?;
                 let child = self.visit(&node.children[0])?;
@@ -1754,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn build_distributed_plan_decode_and_change_event_expand_allocate_new_tuple() {
+    fn build_distributed_plan_decode_fails_fast() {
         let scan = scan_node(1, "k");
         let decode = PhysicalPlanNode {
             kind: PhysicalPlanKind::Decode(PlanDecodeNode {
@@ -1767,17 +1764,17 @@ mod tests {
             probe_runtime_filters: vec![],
         };
 
-        let dp = build_distributed_plan(&decode).expect("build_distributed_plan");
+        let err = build_distributed_plan(&decode).expect_err("Decode must fail fast");
+        assert!(
+            err.contains(
+                "native distributed Decode plans are retired before distributed plan build"
+            ),
+            "unexpected error: {err}"
+        );
+    }
 
-        let root = &dp.fragments[0].root;
-        assert!(matches!(
-            &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Decode(_))
-        ));
-        assert_eq!(root.node_id, 2);
-        assert_eq!(root.tuple_ids, vec![2]);
-        assert_eq!(root.children[0].tuple_ids, vec![1]);
-
+    #[test]
+    fn build_distributed_plan_change_event_expand_allocates_new_tuple() {
         let scan = scan_node(1, "k");
         let expand = PhysicalPlanNode {
             kind: PhysicalPlanKind::ChangeEventExpand(DistributedChangeEventExpandNode {

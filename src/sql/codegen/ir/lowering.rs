@@ -43,8 +43,8 @@ use crate::sql::codegen::{
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::operator::{
-    AggMode, AssertOneRowOp, DecodeOp, GenerateSeriesOp, JoinDistribution, RepeatOp,
-    ScanDictionaryColumn, TopNPhase,
+    AggMode, AssertOneRowOp, GenerateSeriesOp, JoinDistribution, RepeatOp, ScanDictionaryColumn,
+    TopNPhase,
 };
 use crate::sql::optimizer::property::OrderingSpec;
 use crate::sql::planner::optimizer_bridge::property::{
@@ -1513,8 +1513,13 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 crate::sql::planner::plan::PhysicalPlanKind::AssertOneRow(assert_one_row),
             ) => self.lower_assert_one_row_node(node, assert_one_row)?,
             crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Decode(decode),
-            ) => self.lower_decode_node(node, decode)?,
+                crate::sql::planner::plan::PhysicalPlanKind::Decode(_),
+            ) => {
+                return Err(
+                    "native distributed Decode plans are retired before codegen lowering"
+                        .to_string(),
+                );
+            }
             crate::sql::planner::DistributedPayload::Physical(
                 crate::sql::planner::plan::PhysicalPlanKind::Repeat(repeat),
             ) => self.lower_repeat_node(node, repeat)?,
@@ -2001,33 +2006,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             tuple_ids: child.tuple_ids,
             output_columns: child.output_columns,
             ordering: child.ordering,
-        })
-    }
-
-    fn lower_decode_node(
-        &mut self,
-        node: &crate::sql::planner::DistributedNode,
-        decode: &super::kind::DistributedDecodeNode,
-    ) -> Result<LoweredDistributedNode, String> {
-        if node.children.len() != 1 {
-            return Err(format!(
-                "DistributedPlan Decode node_id={} expected 1 child, got {}",
-                node.node_id,
-                node.children.len()
-            ));
-        }
-        let child = self.lower_node(&node.children[0])?;
-        let tuple_id = first_tuple_id(node, "Decode")?;
-        let op = decode_node_to_physical_op(decode);
-        let (plan_node, scope) = self.lower_decode(node.node_id, tuple_id, &op, &child.scope)?;
-        let mut plan_nodes = vec![plan_node];
-        plan_nodes.extend(child.plan_nodes);
-        Ok(LoweredDistributedNode {
-            plan_nodes,
-            scope,
-            tuple_ids: vec![tuple_id],
-            output_columns: decode.output_columns.clone(),
-            ordering: OrderingSpec::Any,
         })
     }
 
@@ -4370,136 +4348,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         plan_node
     }
 
-    pub(crate) fn lower_decode(
-        &mut self,
-        decode_node_id: i32,
-        decode_tuple_id: i32,
-        op: &DecodeOp,
-        child_scope: &ExprScope,
-    ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
-        let child_columns: Vec<(String, ColumnBinding)> = child_scope
-            .iter_columns()
-            .map(|(name, binding)| (name.clone(), binding.clone()))
-            .collect();
-        let child_ids_by_slot: Vec<(crate::sql::column_id::ColumnId, ColumnBinding)> = child_scope
-            .iter_id_bindings()
-            .map(|(column_id, binding)| (*column_id, binding.clone()))
-            .collect();
-
-        let dict_target_meta: BTreeMap<
-            i32,
-            (String, DataType, bool, crate::sql::column_id::ColumnId),
-        > = op
-            .mappings
-            .iter()
-            .map(|item| {
-                let dict_binding = child_scope
-                    .resolve_by_id(item.source_column_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "decode source ColumnId({}) for `{}` is not in child scope",
-                            item.source_column_id.0, item.dict_column
-                        )
-                    })?;
-                let declared = op
-                    .output_columns
-                    .iter()
-                    .find(|c| c.column_id == item.output_column_id);
-                let data_type = declared
-                    .map(|c| c.data_type.clone())
-                    .unwrap_or(DataType::Utf8);
-                let nullable = declared.map(|c| c.nullable).unwrap_or(true);
-                let output_name = declared
-                    .map(|c| c.name.clone())
-                    .unwrap_or_else(|| item.string_column.clone());
-                Ok::<_, String>((
-                    dict_binding.slot_id,
-                    (output_name, data_type, nullable, item.output_column_id),
-                ))
-            })
-            .collect::<Result<_, _>>()?;
-
-        let state = &mut *self.state;
-        let mut decode_scope = ExprScope::new();
-        let mut mapping: BTreeMap<i32, i32> = BTreeMap::new();
-        let mut materialized_dict_slots: BTreeMap<i32, ColumnBinding> = BTreeMap::new();
-
-        let mut col_pos: i32 = 0;
-        for (child_name, child_binding) in &child_columns {
-            if let Some((string_name, data_type, nullable, output_column_id)) =
-                dict_target_meta.get(&child_binding.slot_id)
-            {
-                if let Some(binding) = materialized_dict_slots.get(&child_binding.slot_id) {
-                    decode_scope.add_id_alias(*output_column_id, binding.clone());
-                    continue;
-                }
-                let string_slot_id = state.alloc_slot();
-                state.desc_builder().add_slot(
-                    string_slot_id,
-                    decode_tuple_id,
-                    string_name,
-                    data_type,
-                    *nullable,
-                    col_pos,
-                );
-                mapping.insert(child_binding.slot_id, string_slot_id);
-                let output_binding = ColumnBinding {
-                    tuple_id: decode_tuple_id,
-                    slot_id: string_slot_id,
-                    data_type: data_type.clone(),
-                    type_desc: None,
-                    nullable: *nullable,
-                };
-                materialized_dict_slots.insert(child_binding.slot_id, output_binding.clone());
-                decode_scope.add_column_with_id(
-                    *output_column_id,
-                    None,
-                    string_name.clone(),
-                    output_binding,
-                );
-                col_pos += 1;
-            } else {
-                state.desc_builder().add_slot(
-                    child_binding.slot_id,
-                    decode_tuple_id,
-                    child_name,
-                    &child_binding.data_type,
-                    child_binding.nullable,
-                    col_pos,
-                );
-                let output_binding = ColumnBinding {
-                    tuple_id: decode_tuple_id,
-                    slot_id: child_binding.slot_id,
-                    data_type: child_binding.data_type.clone(),
-                    type_desc: child_binding.type_desc.clone(),
-                    nullable: child_binding.nullable,
-                };
-                decode_scope.add_column(None, child_name.clone(), output_binding.clone());
-                for (column_id, id_binding) in &child_ids_by_slot {
-                    if id_binding.tuple_id == child_binding.tuple_id
-                        && id_binding.slot_id == child_binding.slot_id
-                    {
-                        decode_scope.add_id_alias(*column_id, output_binding.clone());
-                    }
-                }
-                col_pos += 1;
-            }
-        }
-
-        if mapping.len() != op.mappings.len() {
-            return Err(format!(
-                "decode mappings unresolved: declared {} entries, materialized {}",
-                op.mappings.len(),
-                mapping.len()
-            ));
-        }
-
-        state.desc_builder().add_tuple(decode_tuple_id, None);
-        let decode_node = nodes::build_decode_node(decode_node_id, vec![decode_tuple_id], mapping);
-
-        Ok((decode_node, decode_scope))
-    }
-
     pub(crate) fn lower_repeat(
         &mut self,
         repeat_node_id: i32,
@@ -5210,13 +5058,6 @@ fn assert_one_row_node_to_physical_op(
 ) -> AssertOneRowOp {
     AssertOneRowOp {
         subquery_text: kind.subquery_text.clone(),
-    }
-}
-
-fn decode_node_to_physical_op(kind: &super::kind::DistributedDecodeNode) -> DecodeOp {
-    DecodeOp {
-        mappings: kind.mappings.clone(),
-        output_columns: kind.output_columns.clone(),
     }
 }
 

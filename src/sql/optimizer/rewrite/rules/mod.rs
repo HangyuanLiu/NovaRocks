@@ -67,11 +67,11 @@ mod tests {
     #[test]
     fn registry_contains_expected_rules() {
         let rules = all_query_rewrite_rules();
-        // 17 v2 pruning rules + 2 ukfk + 1 VariantPathPushdown
+        // 16 v2 pruning rules + 2 ukfk + 1 VariantPathPushdown
         // + 1 AggregatePushdown + 5 predicate pushdown rules
         // + 1 predicate move-around rule + 1 DeriveJoinNotNullPredicate
-        // + 1 UnionDistinctToAggregate = 29
-        assert_eq!(rules.len(), 29);
+        // + 1 UnionDistinctToAggregate = 28
+        assert_eq!(rules.len(), 28);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
@@ -85,7 +85,6 @@ mod tests {
                 "PruneCTEAnchorColumns",
                 "PruneCTEConsumeColumns",
                 "PruneCTEProduceColumns",
-                "PruneDecodeColumns",
                 "PruneExceptColumns",
                 "PruneFilterColumns",
                 "PruneIntersectColumns",

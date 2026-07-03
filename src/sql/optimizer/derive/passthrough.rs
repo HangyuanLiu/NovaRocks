@@ -56,8 +56,7 @@ pub(crate) fn passthrough_required_full(
 }
 
 use crate::sql::optimizer::operator::{
-    CTEProduceOp, ChangeEventExpandOp, DecodeOp, FilterOp, LimitOp, ProjectOp, RepeatOp,
-    TableFunctionOp,
+    CTEProduceOp, ChangeEventExpandOp, FilterOp, LimitOp, ProjectOp, RepeatOp, TableFunctionOp,
 };
 
 use super::{DeriveOutput, DeriveRequired};
@@ -90,7 +89,7 @@ macro_rules! passthrough_distribution_blind_impls {
     };
 }
 
-passthrough_distribution_blind_impls!(FilterOp, ProjectOp, DecodeOp, CTEProduceOp,);
+passthrough_distribution_blind_impls!(FilterOp, ProjectOp, CTEProduceOp,);
 
 impl DeriveOutput for RepeatOp {
     fn derive_output(
