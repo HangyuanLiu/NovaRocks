@@ -90,6 +90,27 @@ pub(crate) fn collect_distributed_profile_summary_from_profile_trees(
     summary
 }
 
+pub(crate) fn sum_profile_counters_by_name_from_profile_trees<'a>(
+    trees: &[runtime_profile::TRuntimeProfileTree],
+    names: &[&'a str],
+) -> HashMap<&'a str, i64> {
+    let mut sums = names
+        .iter()
+        .copied()
+        .map(|name| (name, 0_i64))
+        .collect::<HashMap<_, _>>();
+    for tree in trees {
+        for node in &tree.nodes {
+            for counter in &node.counters {
+                if let Some(total) = sums.get_mut(counter.name.as_str()) {
+                    *total = total.saturating_add(counter.value);
+                }
+            }
+        }
+    }
+    sums
+}
+
 /// Per-fragment attribution (W0'b): group each fragment-instance profile tree by the fragment's
 /// root (output) plan-node id (see `fragment_root_plan_node_id`), merging instances of the same
 /// fragment. The renderer maps each `PLAN FRAGMENT` to the same id via `fragment.root.node_id` and
@@ -608,6 +629,41 @@ mod tests {
         assert_eq!(summary.exchange_process_time_ns, 300);
         assert_eq!(summary.network_time_ns, 900);
         assert_eq!(summary.scan_io_time_ns, 1_100);
+    }
+
+    #[test]
+    fn sums_named_profile_counters_from_thrift_trees() {
+        let make_tree = |files_pruned: i64, unsupported: i64| {
+            let profiler = Profiler::new("fragment");
+            let common = profiler
+                .child("Pipeline (id=0)")
+                .child("PipelineDriver (id=0)")
+                .child("SCAN (plan_node_id=1)")
+                .child("CommonMetrics");
+            common.counter_set(
+                "IcebergRuntimeFilePruning/FilesPruned",
+                metrics::TUnit::UNIT,
+                files_pruned,
+            );
+            common.counter_set(
+                "IcebergRuntimeFilePruning/Unsupported",
+                metrics::TUnit::UNIT,
+                unsupported,
+            );
+            profiler.to_thrift_tree()
+        };
+        let names = [
+            "IcebergRuntimeFilePruning/FilesPruned",
+            "IcebergRuntimeFilePruning/Unsupported",
+        ];
+
+        let sums = super::sum_profile_counters_by_name_from_profile_trees(
+            &[make_tree(1, 0), make_tree(2, 3)],
+            &names,
+        );
+
+        assert_eq!(sums["IcebergRuntimeFilePruning/FilesPruned"], 3);
+        assert_eq!(sums["IcebergRuntimeFilePruning/Unsupported"], 3);
     }
 
     #[test]

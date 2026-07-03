@@ -1566,8 +1566,13 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             ));
         }
         let scan_tuple_id = first_tuple_id(node, "Scan")?;
-        let (scan_plan_node, scope, output_columns) =
+        let (mut scan_plan_node, scope, output_columns) =
             self.lower_scan(node.node_id, scan_tuple_id, scan)?;
+        let probe_runtime_filters =
+            self.probe_runtime_filter_descs_for_plan_node(node, &scope, scan_plan_node.node_id)?;
+        if !probe_runtime_filters.is_empty() {
+            scan_plan_node.probe_runtime_filters = Some(probe_runtime_filters);
+        }
         Ok(LoweredDistributedNode {
             plan_nodes: vec![scan_plan_node],
             scope,
@@ -2554,6 +2559,36 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             }
             _ => {}
         }
+    }
+
+    fn probe_runtime_filter_descs_for_plan_node(
+        &mut self,
+        node: &crate::sql::planner::DistributedNode,
+        scope: &ExprScope,
+        thrift_node_id: i32,
+    ) -> Result<Vec<crate::thrift::runtime_filter::TRuntimeFilterDescription>, String> {
+        if node.probe_runtime_filters.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut descs = Vec::with_capacity(node.probe_runtime_filters.len());
+        for probe in &node.probe_runtime_filters {
+            let mut compiler = ExprCompiler::new(self.state.slot_allocator(), scope);
+            let probe_texpr = compiler.compile_typed(&probe.probe_expr).map_err(|err| {
+                format!(
+                    "failed to lower runtime filter probe expression for scan node_id={} filter_id={}: {}",
+                    node.node_id, probe.filter_id, err
+                )
+            })?;
+            descs.push(crate::thrift::runtime_filter::TRuntimeFilterDescription {
+                filter_id: Some(probe.filter_id),
+                plan_node_id_to_target_expr: Some(BTreeMap::from([(thrift_node_id, probe_texpr)])),
+                filter_type: Some(
+                    crate::thrift::runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER,
+                ),
+                ..Default::default()
+            });
+        }
+        Ok(descs)
     }
 
     fn record_probe_targets(
