@@ -91,6 +91,7 @@ pub(crate) fn build_scan_node(
                     min_max_predicates,
                     change_op_slot,
                     cloud_properties: cloud_properties.clone(),
+                    columns: resolved.table.columns.clone(),
                 },
             )?;
             plan.node.ok_or_else(|| {
@@ -1022,6 +1023,7 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
                             min_max_predicates: scan_file_min_max_predicates(planned),
                             change_op_slot: planned_change_op_slot(planned),
                             cloud_properties: cloud_properties.clone(),
+                            columns: resolved.table.columns.clone(),
                             ..ThriftScanContext::default()
                         },
                     )?;
@@ -1159,6 +1161,7 @@ fn build_iceberg_scan_ranges_from_source(
             min_max_predicates: scan_file_min_max_predicates(planned),
             change_op_slot: planned_change_op_slot(planned),
             cloud_properties: cloud_properties.clone(),
+            columns: planned.resolved.table.columns.clone(),
             ..ThriftScanContext::default()
         },
     )?;
@@ -1496,6 +1499,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .expect("tagged file without __change_op projection should scan ordinary columns");
 
@@ -1515,6 +1519,7 @@ mod tests {
             None,
             Some(9),
             &[],
+            None,
         )
         .expect("tagged file with __change_op projection should emit metadata");
 

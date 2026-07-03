@@ -817,6 +817,7 @@ mod tests {
                     included_positions: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
+                    iceberg_file_pruning: None,
                 })
                 .collect();
             Ok(ScanMorsels::new(morsels, false))

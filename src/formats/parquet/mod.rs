@@ -2553,6 +2553,7 @@ mod tests {
             included_positions: None,
             external_datacache: None,
             delete_files: Vec::new(),
+            iceberg_file_pruning: None,
         }
     }
 
@@ -3249,6 +3250,7 @@ mod tests {
                 included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
+                iceberg_file_pruning: None,
             }],
             None,
             None,
@@ -3279,6 +3281,7 @@ mod tests {
                 included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
+                iceberg_file_pruning: None,
             }],
             None,
             None,
@@ -4225,6 +4228,7 @@ mod tests {
             included_positions: None,
             external_datacache: None,
             delete_files: Vec::new(),
+            iceberg_file_pruning: None,
         };
         ParquetScanIter::new(
             runtime_filter_row_group_scan_cfg(),
@@ -4270,6 +4274,7 @@ mod tests {
             included_positions: None,
             external_datacache: None,
             delete_files: Vec::new(),
+            iceberg_file_pruning: None,
         };
         let mut iter = ParquetScanIter::new(
             cfg,

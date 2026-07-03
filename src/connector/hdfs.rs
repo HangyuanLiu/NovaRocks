@@ -186,6 +186,7 @@ impl ScanOp for HdfsScanOp {
             included_positions,
             external_datacache,
             delete_files,
+            iceberg_file_pruning,
         } = morsel
         else {
             return Err("hdfs scan received unexpected morsel".to_string());
@@ -202,6 +203,7 @@ impl ScanOp for HdfsScanOp {
             included_positions,
             external_datacache: external_datacache.clone(),
             delete_files,
+            iceberg_file_pruning,
         }];
         let scan = FileScanContext::build(
             ranges,
@@ -258,6 +260,7 @@ impl ScanOp for HdfsScanOp {
                 included_positions: r.included_positions.clone(),
                 external_datacache: r.external_datacache.clone(),
                 delete_files: r.delete_files.clone(),
+                iceberg_file_pruning: r.iceberg_file_pruning.clone(),
             });
         }
         Ok(ScanMorsels::new(morsels, self.cfg.has_more))
@@ -376,6 +379,7 @@ impl ScanOp for HdfsScanOp {
                 included_positions: None,
                 external_datacache: hdfs_range.external_datacache.clone(),
                 delete_files,
+                iceberg_file_pruning: None,
             });
         }
 
@@ -427,6 +431,7 @@ impl ScanOp for HdfsScanOp {
             included_positions: None,
             external_datacache: None,
             delete_files: Vec::new(),
+            iceberg_file_pruning: None,
         });
         for del in delete_files {
             loader_ranges.push(crate::fs::scan_context::FileScanRange {
@@ -441,6 +446,7 @@ impl ScanOp for HdfsScanOp {
                 included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
+                iceberg_file_pruning: None,
             });
         }
         let ctx = crate::fs::scan_context::FileScanContext::build(
@@ -509,6 +515,7 @@ impl ScanOp for HdfsScanOp {
             included_positions: None,
             external_datacache: None,
             delete_files: Vec::new(),
+            iceberg_file_pruning: None,
         });
         for del in delete_files {
             loader_ranges.push(crate::fs::scan_context::FileScanRange {
@@ -523,6 +530,7 @@ impl ScanOp for HdfsScanOp {
                 included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
+                iceberg_file_pruning: None,
             });
         }
         let ctx = crate::fs::scan_context::FileScanContext::build(
@@ -558,6 +566,7 @@ impl ScanOp for HdfsScanOp {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema};
@@ -568,6 +577,7 @@ mod tests {
     use crate::connector::iceberg::delete_file::{
         IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
     };
+    use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::node::scan::{
         HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange, ScanMorsel, ScanOp,
@@ -576,6 +586,7 @@ mod tests {
         ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind, VariantPathPruningPredicate,
     };
     use crate::fs::scan_context::FileScanRange;
+    use crate::sql::catalog::IcebergColumnStats;
 
     use super::{HdfsScanConfig, HdfsScanOp, apply_parquet_pruning_gate_for_delete_files};
 
@@ -624,6 +635,21 @@ mod tests {
             length: Some(1),
             content_offset: None,
             content_size_in_bytes: None,
+        }
+    }
+
+    fn test_iceberg_file_pruning_metadata() -> IcebergFilePruningMetadata {
+        IcebergFilePruningMetadata {
+            columns: HashMap::from([(
+                "id".to_string(),
+                IcebergColumnStats {
+                    null_count: None,
+                    value_count: None,
+                    column_size: None,
+                    lower_bound: Some(10_i64.to_le_bytes().to_vec()),
+                    upper_bound: Some(20_i64.to_le_bytes().to_vec()),
+                },
+            )]),
         }
     }
 
@@ -760,6 +786,7 @@ mod tests {
                 included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
+                iceberg_file_pruning: None,
             }],
             original_range_count: 1,
             has_more: true,
@@ -821,6 +848,7 @@ mod tests {
                 included_positions: None,
                 external_datacache: None,
                 delete_files: vec![test_delete_file(IcebergFileContent::PositionDeletes)],
+                iceberg_file_pruning: None,
             }],
             original_range_count: 1,
             has_more: true,
@@ -867,6 +895,7 @@ mod tests {
                 included_positions: None,
                 external_datacache: None,
                 delete_files: vec![test_delete_file(IcebergFileContent::PositionDeletes)],
+                iceberg_file_pruning: None,
             }],
             original_range_count: 1,
             has_more: true,
@@ -904,6 +933,7 @@ mod tests {
                 included_positions: None,
                 external_datacache: None,
                 delete_files: vec![test_delete_file(IcebergFileContent::PositionDeletes)],
+                iceberg_file_pruning: None,
             }],
             original_range_count: 1,
             has_more: true,
@@ -976,6 +1006,7 @@ mod tests {
                     included_positions: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
+                    iceberg_file_pruning: None,
                 },
                 FileScanRange {
                     path: "s3://bucket/path/large.parquet".to_string(),
@@ -989,6 +1020,7 @@ mod tests {
                     included_positions: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
+                    iceberg_file_pruning: None,
                 },
                 FileScanRange {
                     path: "s3://bucket/path/small-b.parquet".to_string(),
@@ -1002,6 +1034,7 @@ mod tests {
                     included_positions: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
+                    iceberg_file_pruning: None,
                 },
             ],
             original_range_count: 3,
@@ -1033,5 +1066,52 @@ mod tests {
                 "s3://bucket/path/small-a.parquet",
             ]
         );
+    }
+
+    #[test]
+    fn build_morsels_preserves_iceberg_file_pruning_metadata() {
+        let cfg = HdfsScanConfig {
+            ranges: vec![FileScanRange {
+                path: "s3://bucket/path/file.parquet".to_string(),
+                file_len: 1024,
+                offset: 0,
+                length: 1024,
+                scan_range_id: -1,
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+                included_positions: None,
+                external_datacache: None,
+                delete_files: Vec::new(),
+                iceberg_file_pruning: Some(test_iceberg_file_pruning_metadata()),
+            }],
+            original_range_count: 1,
+            has_more: false,
+            limit: None,
+            profile_label: None,
+            format: None,
+            object_store_config: None,
+            iceberg_table_locations: std::collections::HashMap::new(),
+            query_global_dicts: Default::default(),
+        };
+        let op = HdfsScanOp::new(cfg);
+
+        let morsels = op.build_morsels().expect("build morsels");
+
+        match &morsels.morsels[0] {
+            ScanMorsel::FileRange {
+                iceberg_file_pruning,
+                ..
+            } => {
+                let metadata = iceberg_file_pruning
+                    .as_ref()
+                    .expect("iceberg pruning metadata");
+                assert_eq!(
+                    metadata.columns["id"].upper_bound,
+                    Some(20_i64.to_le_bytes().to_vec())
+                );
+            }
+            other => panic!("unexpected morsel: {:?}", other),
+        }
     }
 }

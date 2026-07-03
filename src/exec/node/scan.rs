@@ -50,6 +50,8 @@ pub enum ScanMorsel {
         /// Iceberg v2 position-delete files that apply to this data file.
         /// Empty for append-only tables and for v1 scans.
         delete_files: Vec<IcebergDeleteFileSpec>,
+        iceberg_file_pruning:
+            Option<crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata>,
     },
     StarRocksRange {
         index: usize,
@@ -81,8 +83,9 @@ impl ScanMorsel {
                 included_positions,
                 external_datacache,
                 delete_files,
+                iceberg_file_pruning,
             } => format!(
-                "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} data_sequence_number={:?} ivm_change_op={:?} included_positions={} external_datacache={:?} delete_files={}",
+                "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} data_sequence_number={:?} ivm_change_op={:?} included_positions={} external_datacache={:?} delete_files={} iceberg_file_pruning={}",
                 path,
                 file_len,
                 offset,
@@ -93,7 +96,8 @@ impl ScanMorsel {
                 ivm_change_op,
                 included_positions.as_ref().map(|v| v.len()).unwrap_or(0),
                 external_datacache,
-                delete_files.len()
+                delete_files.len(),
+                iceberg_file_pruning.is_some()
             ),
             ScanMorsel::StarRocksRange { index, tablet_id } => {
                 format!("starrocks_range_index={index} tablet_id={tablet_id}")

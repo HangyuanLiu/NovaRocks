@@ -133,6 +133,7 @@ fn test_iceberg_connector_module() {
             included_positions: None,
             external_datacache: None,
             delete_files: Vec::new(),
+            iceberg_file_pruning: None,
         }],
         original_range_count: 1,
         has_more: false,

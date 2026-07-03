@@ -413,6 +413,20 @@ fn validate_included_positions_full_file_range(
     ))
 }
 
+fn iceberg_file_pruning_from_hdfs_range(
+    is_iceberg_table: bool,
+    hdfs_range: &plan_nodes::THdfsScanRange,
+    hive_column_names: Option<&[String]>,
+) -> Option<crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata> {
+    if !is_iceberg_table {
+        return None;
+    }
+    crate::connector::iceberg::file_pruning::iceberg_file_pruning_metadata_from_thrift(
+        hdfs_range,
+        hive_column_names?,
+    )
+}
+
 fn scan_ranges_have_extended_column(
     scan_ranges: &[internal_service::TScanRangeParams],
     slot_id: SlotId,
@@ -943,6 +957,7 @@ pub(crate) fn lower_hdfs_scan_node(
     })?;
     let desc_snapshot = descriptor_snapshot_from_thrift(desc_tbl)?;
     let is_paimon = desc_snapshot.is_paimon_table_for_tuple(tuple_id);
+    let is_iceberg_table = desc_snapshot.is_iceberg_table_for_tuple(tuple_id);
     let hive_column_names = hdfs.hive_column_names.clone();
     let orc_use_column_names = query_opts
         .and_then(|opts| opts.orc_use_column_names)
@@ -1472,6 +1487,11 @@ pub(crate) fn lower_hdfs_scan_node(
                 None
             }
         };
+        let iceberg_file_pruning = iceberg_file_pruning_from_hdfs_range(
+            is_iceberg_table,
+            hdfs_range,
+            hive_column_names.as_deref(),
+        );
 
         // data_sequence_number is populated from THdfsScanRange field 38
         // when the NovaRocks iceberg codegen path (standalone SQL) fills it in.
@@ -1504,6 +1524,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 included_positions: hdfs_range.included_positions.clone(),
                 external_datacache: external_datacache.clone(),
                 delete_files: iceberg_delete_files.clone(),
+                iceberg_file_pruning: iceberg_file_pruning.clone(),
             });
         } else if let Some(rp) = hdfs_range.relative_path.as_ref().filter(|s| !s.is_empty()) {
             let table_id = hdfs_range.table_id.ok_or_else(|| {
@@ -1532,6 +1553,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 included_positions: hdfs_range.included_positions.clone(),
                 external_datacache,
                 delete_files: iceberg_delete_files,
+                iceberg_file_pruning,
             });
         }
     }
@@ -1629,7 +1651,6 @@ pub(crate) fn lower_hdfs_scan_node(
     let external_datacache = DataCacheManager::instance().external_context(cache_options.clone());
     let (enable_file_metacache, enable_file_pagecache) =
         file_cache_flags_from_query_options(query_opts);
-    let is_iceberg_table = desc_snapshot.is_iceberg_table_for_tuple(tuple_id);
     if is_iceberg_table && scan_format == Some(descriptors::THdfsFileFormat::ORC) {
         return Err(format!(
             "HDFS_SCAN_NODE node_id={} does not support Iceberg ORC files; NovaRocks currently only supports Parquet for Iceberg schema/partition evolution",
@@ -1875,14 +1896,16 @@ mod tests {
     use crate::thrift::internal_service::TQueryOptions;
     use crate::thrift::{descriptors, exprs, plan_nodes, runtime_filter, types};
     use arrow::datatypes::{DataType, Field};
+    use thrift::OrderedFloat;
 
     use super::{
         DescriptorLogicalType, HdfsScanReadColumns, HdfsSlotInfo, apply_row_position_pruning_gate,
         build_hdfs_slot_info_map, build_topn_filter_column_map, descriptor_snapshot_from_thrift,
         extract_change_op_from_extended_columns, file_cache_flags_from_query_options,
-        parse_hdfs_scan_pruning_predicates, parse_hdfs_scan_variant_path_columns,
-        resolve_cloud_object_store_config, scan_ranges_have_position_delete_files,
-        validate_included_positions_full_file_range, variant_path_ensure_source_read_columns,
+        iceberg_file_pruning_from_hdfs_range, parse_hdfs_scan_pruning_predicates,
+        parse_hdfs_scan_variant_path_columns, resolve_cloud_object_store_config,
+        scan_ranges_have_position_delete_files, validate_included_positions_full_file_range,
+        variant_path_ensure_source_read_columns,
     };
 
     #[test]
@@ -2323,6 +2346,126 @@ mod tests {
         ])
     }
 
+    fn test_hdfs_range_with_min_max_values(
+        min_max_values: Option<BTreeMap<i32, exprs::TExprMinMaxValue>>,
+    ) -> plan_nodes::THdfsScanRange {
+        plan_nodes::THdfsScanRange::new(
+            None::<String>,
+            Some(0_i64),
+            Some(100_i64),
+            None::<i64>,
+            Some(256_i64),
+            Some(descriptors::THdfsFileFormat::PARQUET),
+            None::<descriptors::TTextFileDesc>,
+            Some("s3://bucket/path/file.parquet".to_string()),
+            None::<Vec<String>>,
+            None::<bool>,
+            None::<Vec<plan_nodes::TIcebergDeleteFile>>,
+            None::<i64>,
+            None::<bool>,
+            None::<String>,
+            None::<String>,
+            None::<i64>,
+            None::<crate::thrift::data_cache::TDataCacheOptions>,
+            None::<Vec<types::TSlotId>>,
+            None::<bool>,
+            None::<BTreeMap<String, String>>,
+            None::<Vec<types::TSlotId>>,
+            None::<bool>,
+            None::<String>,
+            None::<bool>,
+            None::<String>,
+            None::<String>,
+            None::<plan_nodes::TPaimonDeletionFile>,
+            None::<BTreeMap<types::TSlotId, exprs::TExpr>>,
+            None::<descriptors::THdfsPartition>,
+            None::<types::TTableId>,
+            None::<plan_nodes::TDeletionVectorDescriptor>,
+            None::<String>,
+            None::<i64>,
+            None::<bool>,
+            min_max_values,
+            None::<i32>,
+            None::<i64>,
+            None::<i64>,
+            None::<Vec<i64>>,
+        )
+    }
+
+    #[test]
+    fn hdfs_scan_range_lowers_iceberg_file_pruning_stats() {
+        let hdfs_range = test_hdfs_range_with_min_max_values(Some(BTreeMap::from([
+            (
+                0,
+                exprs::TExprMinMaxValue::new(
+                    exprs::TExprNodeType::INT_LITERAL,
+                    false,
+                    false,
+                    Some(10),
+                    Some(20),
+                    None::<OrderedFloat<f64>>,
+                    None::<OrderedFloat<f64>>,
+                ),
+            ),
+            (
+                1,
+                exprs::TExprMinMaxValue::new(
+                    exprs::TExprNodeType::BOOL_LITERAL,
+                    false,
+                    false,
+                    Some(0),
+                    Some(1),
+                    None::<OrderedFloat<f64>>,
+                    None::<OrderedFloat<f64>>,
+                ),
+            ),
+            (
+                2,
+                exprs::TExprMinMaxValue::new(
+                    exprs::TExprNodeType::FLOAT_LITERAL,
+                    false,
+                    false,
+                    None::<i64>,
+                    None::<i64>,
+                    Some(OrderedFloat(1.5)),
+                    Some(OrderedFloat(9.25)),
+                ),
+            ),
+        ])));
+        let column_names = vec!["id".to_string(), "flag".to_string(), "score".to_string()];
+
+        let metadata = iceberg_file_pruning_from_hdfs_range(true, &hdfs_range, Some(&column_names))
+            .expect("iceberg pruning metadata");
+
+        let id = metadata.columns.get("id").expect("id stats");
+        assert_eq!(id.lower_bound, Some(10_i64.to_le_bytes().to_vec()));
+        assert_eq!(id.upper_bound, Some(20_i64.to_le_bytes().to_vec()));
+        let flag = metadata.columns.get("flag").expect("flag stats");
+        assert_eq!(flag.lower_bound, Some(vec![0]));
+        assert_eq!(flag.upper_bound, Some(vec![1]));
+        let score = metadata.columns.get("score").expect("score stats");
+        assert_eq!(score.lower_bound, Some(1.5_f64.to_le_bytes().to_vec()));
+        assert_eq!(score.upper_bound, Some(9.25_f64.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn hdfs_scan_range_without_hive_column_names_has_no_iceberg_file_pruning_stats() {
+        let hdfs_range = test_hdfs_range_with_min_max_values(Some(BTreeMap::from([(
+            0,
+            exprs::TExprMinMaxValue::new(
+                exprs::TExprNodeType::INT_LITERAL,
+                false,
+                false,
+                Some(10),
+                Some(20),
+                None::<OrderedFloat<f64>>,
+                None::<OrderedFloat<f64>>,
+            ),
+        )])));
+
+        assert!(iceberg_file_pruning_from_hdfs_range(true, &hdfs_range, None).is_none());
+    }
+
     #[test]
     fn hdfs_topn_filter_column_map_binds_plain_slot_ref() {
         let node_id = 7;
@@ -2700,6 +2843,7 @@ mod tests {
                 content_offset: None,
                 content_size_in_bytes: None,
             }],
+            iceberg_file_pruning: None,
         }
     }
 
