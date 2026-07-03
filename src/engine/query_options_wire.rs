@@ -34,6 +34,8 @@ pub(crate) fn standalone_query_options_from_thrift(
         enable_profile: opts.enable_profile.unwrap_or(false),
         exec_mem_limit: opts.query_mem_limit.or(opts.mem_limit),
         connector_io_tasks_per_scan_operator: opts.connector_io_tasks_per_scan_operator,
+        runtime_filter_scan_wait_time_ms: opts.runtime_filter_scan_wait_time_ms,
+        runtime_filter_wait_timeout_ms: opts.runtime_filter_wait_timeout_ms,
         allow_throw_exception: opts.allow_throw_exception.unwrap_or(false),
         group_concat_max_len: opts.group_concat_max_len,
         spill: crate::exec::spill::query_options_wire::spill_config_from_query_options(Some(opts))?,
@@ -48,6 +50,8 @@ pub(crate) fn standalone_query_options_to_thrift(opts: &StandaloneQueryOptions) 
         enable_profile: Some(opts.enable_profile),
         query_mem_limit: opts.exec_mem_limit,
         connector_io_tasks_per_scan_operator: opts.connector_io_tasks_per_scan_operator,
+        runtime_filter_scan_wait_time_ms: opts.runtime_filter_scan_wait_time_ms,
+        runtime_filter_wait_timeout_ms: opts.runtime_filter_wait_timeout_ms,
         allow_throw_exception: opts.allow_throw_exception.then_some(true),
         group_concat_max_len: opts.group_concat_max_len,
         enable_spill: Some(opts.spill.is_some()),
@@ -126,6 +130,8 @@ mod tests {
             enable_profile: Some(true),
             query_mem_limit: Some(1 << 30),
             connector_io_tasks_per_scan_operator: Some(12),
+            runtime_filter_scan_wait_time_ms: Some(250),
+            runtime_filter_wait_timeout_ms: Some(5_000),
             allow_throw_exception: Some(true),
             group_concat_max_len: Some(65_535),
             ..Default::default()
@@ -139,6 +145,8 @@ mod tests {
         assert!(opts.enable_profile);
         assert_eq!(opts.exec_mem_limit, Some(1 << 30));
         assert_eq!(opts.connector_io_tasks_per_scan_operator, Some(12));
+        assert_eq!(opts.runtime_filter_scan_wait_time_ms, Some(250));
+        assert_eq!(opts.runtime_filter_wait_timeout_ms, Some(5_000));
         assert!(opts.allow_throw_exception);
         assert_eq!(opts.group_concat_max_len, Some(65_535));
 
@@ -149,6 +157,8 @@ mod tests {
         assert_eq!(thrift.enable_profile, Some(true));
         assert_eq!(thrift.query_mem_limit, Some(1 << 30));
         assert_eq!(thrift.connector_io_tasks_per_scan_operator, Some(12));
+        assert_eq!(thrift.runtime_filter_scan_wait_time_ms, Some(250));
+        assert_eq!(thrift.runtime_filter_wait_timeout_ms, Some(5_000));
         assert_eq!(thrift.allow_throw_exception, Some(true));
         assert_eq!(thrift.group_concat_max_len, Some(65_535));
     }

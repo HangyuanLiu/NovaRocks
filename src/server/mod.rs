@@ -488,6 +488,12 @@ struct NovaRocksMysqlShim {
     /// Per-session pipeline DOP override. `None` (or `SET pipeline_dop = 0`) means auto
     /// (cores/2 via `exec_env::calc_pipeline_dop`); a positive value pins the DOP for this session.
     pipeline_dop: Option<i32>,
+    /// Per-session scan-side runtime filter wait in milliseconds.
+    /// Set via `SET runtime_filter_scan_wait_time = N`.
+    runtime_filter_scan_wait_time_ms: Option<i64>,
+    /// Per-session global runtime filter wait timeout in milliseconds.
+    /// Set via `SET global_runtime_filter_wait_timeout = N`.
+    runtime_filter_wait_timeout_ms: Option<i32>,
     optimizer_settings: SessionOptimizerSettings,
     user_variables: BTreeMap<String, String>,
 }
@@ -511,6 +517,8 @@ impl NovaRocksMysqlShim {
             query_timeout_secs: None,
             group_concat_max_len: 1024,
             pipeline_dop: None,
+            runtime_filter_scan_wait_time_ms: None,
+            runtime_filter_wait_timeout_ms: None,
             optimizer_settings: SessionOptimizerSettings::default(),
             user_variables: BTreeMap::new(),
         }
@@ -1037,6 +1045,16 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "runtime_filter_scan_wait_time") {
+        shim.runtime_filter_scan_wait_time_ms = i64::try_from(v).ok();
+        return Ok(StatementResult::Ok);
+    }
+
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_wait_timeout") {
+        shim.runtime_filter_wait_timeout_ms = i32::try_from(v).ok();
+        return Ok(StatementResult::Ok);
+    }
+
     if apply_broadcast_profile_set(&mut shim.optimizer_settings, trimmed) {
         return Ok(StatementResult::Ok);
     }
@@ -1208,6 +1226,8 @@ async fn execute_sql_in_worker(
         group_concat_max_len: Some(shim.group_concat_max_len),
         query_timeout: query_timeout.and_then(|secs| i32::try_from(secs).ok()),
         pipeline_dop: shim.pipeline_dop,
+        runtime_filter_scan_wait_time_ms: shim.runtime_filter_scan_wait_time_ms,
+        runtime_filter_wait_timeout_ms: shim.runtime_filter_wait_timeout_ms,
         allow_throw_exception,
         ..Default::default()
     };
@@ -2333,6 +2353,24 @@ mod tests {
                 "global_runtime_filter_build_max_size"
             ),
             Some(1048576)
+        );
+    }
+
+    #[test]
+    fn parse_runtime_filter_wait_vars() {
+        assert_eq!(
+            parse_set_non_negative_integer(
+                "SET runtime_filter_scan_wait_time = 10000",
+                "runtime_filter_scan_wait_time"
+            ),
+            Some(10000)
+        );
+        assert_eq!(
+            parse_set_non_negative_integer(
+                "SET global_runtime_filter_wait_timeout = 10000",
+                "global_runtime_filter_wait_timeout"
+            ),
+            Some(10000)
         );
     }
 
