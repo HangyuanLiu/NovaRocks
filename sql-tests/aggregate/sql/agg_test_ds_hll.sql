@@ -15,8 +15,7 @@ CREATE TABLE t1 (
   age SMALLINT,
   dt VARCHAR(10)
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3;
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -28,8 +27,8 @@ CREATE TABLE t2 (
   `ds_province` binary,
   `ds_age` binary,
   `ds_dt` binary
-) ENGINE=OLAP
-DISTRIBUTED BY HASH(id) BUCKETS 3;
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
@@ -41,9 +40,8 @@ CREATE TABLE t3 (
   `ds_province` binary,
   `ds_age` binary,
   `ds_dt` binary
-) ENGINE=OLAP
-PRIMARY KEY(id, dt)
-DISTRIBUTED BY HASH(id) BUCKETS 3;
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true

@@ -8,7 +8,6 @@
 -- 2. Insert deterministic duplicates, NULLs, and boolean cohorts.
 -- 3. Snapshot top-k, extrema arrays, aggregate expression averages, and Mann-Whitney outputs.
 -- query 1
-DROP TABLE IF EXISTS ${case_db}.t_agg_topk_extrema_misc;
 CREATE TABLE ${case_db}.t_agg_topk_extrema_misc (
     id INT,
     grp INT,
@@ -17,7 +16,8 @@ CREATE TABLE ${case_db}.t_agg_topk_extrema_misc (
     flag BOOLEAN,
     big_v BIGINT,
     w BIGINT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_topk_extrema_misc VALUES
     (1, 1, 10, 'delta', TRUE, 10000000, 3),

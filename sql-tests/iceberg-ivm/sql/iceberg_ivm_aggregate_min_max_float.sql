@@ -31,10 +31,9 @@ CREATE TABLE ice_ivm_float_db_${uuid0}.ns_${uuid0}.measurements (
   id BIGINT,
   region STRING,
   reading DOUBLE
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_float_db_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW float_mv_${uuid0}

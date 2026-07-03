@@ -89,9 +89,7 @@ CREATE TABLE t1 (
     c6 largeint,
     c7 string
     )
-DUPLICATE KEY(c1)
-DISTRIBUTED BY HASH(c1) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 13
 -- @skip_result_check=true

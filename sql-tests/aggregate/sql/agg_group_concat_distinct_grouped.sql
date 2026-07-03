@@ -7,11 +7,11 @@
 -- 1. Create/reset grouped source table.
 -- 2. Insert deterministic rows including duplicates and NULL output values.
 -- 3. Group by key and assert ordered group_concat outputs.
-DROP TABLE IF EXISTS ${case_db}.t_agg_group_concat_distinct_grouped;
 CREATE TABLE ${case_db}.t_agg_group_concat_distinct_grouped (
     k INT,
     s STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_group_concat_distinct_grouped VALUES
     (1, 'b'),

@@ -22,17 +22,15 @@ CREATE TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0} (
   id BIGINT NOT NULL,
   dim_id BIGINT,
   amount INT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 CREATE TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0} (
   id BIGINT NOT NULL,
   label STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_mv_apply_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW join_apply_mv_${uuid0}

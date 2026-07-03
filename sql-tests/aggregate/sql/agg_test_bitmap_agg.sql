@@ -18,9 +18,7 @@ CREATE TABLE t1 (
     c6 largeint,
     c7 string
     )
-DUPLICATE KEY(c1)
-DISTRIBUTED BY HASH(c1) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -50,6 +48,7 @@ USE ${case_db};
 SELECT BITMAP_TO_STRING(BITMAP_AGG(c5)) FROM t1;
 
 -- query 8
+-- @expect_error=bitmap aggregate expects
 USE ${case_db};
 SELECT BITMAP_TO_STRING(BITMAP_AGG(c6)) FROM t1;
 
@@ -74,6 +73,7 @@ USE ${case_db};
 SELECT BITMAP_TO_STRING(BITMAP_UNION(TO_BITMAP(c5))) FROM t1;
 
 -- query 14
+-- @expect_error=to_bitmap expects
 USE ${case_db};
 SELECT BITMAP_TO_STRING(BITMAP_UNION(TO_BITMAP(c6))) FROM t1;
 

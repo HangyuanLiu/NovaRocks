@@ -7,12 +7,12 @@
 -- 1. Create/reset key-value source table.
 -- 2. Insert deterministic grouped key-value rows.
 -- 3. Aggregate to map and extract keys for assertions.
-DROP TABLE IF EXISTS ${case_db}.t_agg_map_agg_extract;
 CREATE TABLE ${case_db}.t_agg_map_agg_extract (
     g INT,
     k VARCHAR(10),
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_map_agg_extract VALUES
     (1, 'a', 10),

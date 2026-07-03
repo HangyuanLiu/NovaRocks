@@ -16,15 +16,8 @@ i_1   Array<BigInt>,
 f_1   Array<Double>,
 d_1   Array<DECIMAL(26, 2)>,
 ai_1  Array<Array<BigInt>>
-) ENGINE=OLAP
-DUPLICATE KEY(`id`)
-DISTRIBUTED BY HASH(`id`) BUCKETS 4
-PROPERTIES (
-"replication_num" = "1",
-"enable_persistent_index" = "true",
-"replicated_storage" = "true",
-"compression" = "LZ4"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -72,8 +65,8 @@ create table test_array_agg (
     col_array ARRAY<ARRAY<INT>>,
     col_map ARRAY<MAP<STRING, INT>>,
     col_struct ARRAY<STRUCT<f1 INT, f2 STRING>>
-) DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true

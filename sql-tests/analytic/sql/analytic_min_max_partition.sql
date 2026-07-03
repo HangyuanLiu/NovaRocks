@@ -7,12 +7,12 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic partitioned rows.
 -- 3. Compute partition MIN/MAX and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_analytic_min_max_partition;
 CREATE TABLE ${case_db}.t_analytic_min_max_partition (
     grp VARCHAR(10),
     id INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_min_max_partition VALUES
     ('A', 1, 9),

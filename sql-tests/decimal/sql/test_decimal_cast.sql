@@ -7,19 +7,14 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t1;
 CREATE TABLE ${case_db}.t1 (
     k1 bigint NULL,
     c_tinyint tinyint null,
     c_int int null,
     c_bigint bigint null,
     c_largeint largeint null
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 96
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 insert into ${case_db}.t1 values
     (1, 127, 2147483647, 9223372036854775807, 170141183460469231731687303715884105727),
     (2, -128, -2147483648, -9223372036854775808, -170141183460469231731687303715884105728),

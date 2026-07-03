@@ -31,9 +31,8 @@ INSERT INTO ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v2 VALUES (1, 10);
 CREATE TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v3_no_lineage (
   order_id INT,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v3_no_lineage VALUES (1, 10);
 
 SET CATALOG ice_ivm_reject_v2_${uuid0};

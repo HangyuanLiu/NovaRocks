@@ -15,8 +15,7 @@ CREATE TABLE t1 (
   age SMALLINT,
   dt VARCHAR(10) NOT NULL
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 4;
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

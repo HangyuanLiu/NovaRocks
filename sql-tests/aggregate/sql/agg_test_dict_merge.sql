@@ -15,15 +15,8 @@ CREATE TABLE `test_dict_merge` (
   `city_null` string NULL COMMENT "",
   `city_array` array<string> NOT NULL COMMENT "",
   `city_array_null` array<string> NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`id`)
-DISTRIBUTED BY HASH(`id`) BUCKETS 4
-PROPERTIES (
-"replication_num" = "1",
-"enable_persistent_index" = "true",
-"replicated_storage" = "true",
-"compression" = "LZ4"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -57,10 +50,7 @@ CREATE TABLE t1 (
     c1 int,
     c2 string
     )
-DUPLICATE KEY(c1)
-DISTRIBUTED BY HASH(c1)
-BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true

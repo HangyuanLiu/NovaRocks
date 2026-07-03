@@ -22,18 +22,16 @@ CREATE TABLE ice_ivm_join_mult_${uuid0}.ns_${uuid0}.join_left_${uuid0} (
   order_id BIGINT NOT NULL,
   rid BIGINT,
   amount INT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 CREATE TABLE ice_ivm_join_mult_${uuid0}.ns_${uuid0}.join_right_${uuid0} (
   dim_id BIGINT NOT NULL,
   rid BIGINT,
   label STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_join_mult_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW join_mv_${uuid0}

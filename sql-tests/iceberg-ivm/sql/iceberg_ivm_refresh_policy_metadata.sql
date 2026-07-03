@@ -19,10 +19,9 @@ CREATE DATABASE ice_ivm_policy_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_policy_${uuid0}.ns_${uuid0}.orders (
   k1 INT,
   v2 BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_policy_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_policy_mv_${uuid0}

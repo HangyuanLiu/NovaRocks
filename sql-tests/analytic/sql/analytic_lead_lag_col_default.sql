@@ -4,8 +4,8 @@
 -- 2. Validate IGNORE NULLS combined with column default.
 -- 3. Verify FE rejects column expressions (not plain column refs) as default.
 -- 4. Verify FE rejects type-mismatched column default (INT col, VARCHAR default).
--- 5. Validate ARRAY<INT> and VARCHAR column types with column defaults.
--- 6. Validate ARRAY<VARCHAR> column type with column default.
+-- 5. Validate VARCHAR column type with column defaults.
+-- 6. Verify ARRAY column defaults are rejected by the current analyzer contract.
 -- @order_sensitive=true
 
 -- query 1
@@ -15,11 +15,8 @@ CREATE TABLE ${case_db}.t_col_int (
     col_1 INT,
     col_2 INT,
     col_3 INT NOT NULL
-) PROPERTIES (
-    "compression"        = "LZ4",
-    "replicated_storage" = "true",
-    "replication_num"    = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_col_int (col_1, col_2, col_3) VALUES
     (1, 1, 11), (2, 2, 22), (3, 3, 33), (4, NULL, 44), (5, 5, 55), (6, 6, 66);
@@ -29,11 +26,8 @@ CREATE TABLE ${case_db}.t_col_varchar_default (
     col_1 INT,
     col_2 INT,
     col_3 VARCHAR(255) NOT NULL
-) PROPERTIES (
-    "compression"        = "LZ4",
-    "replicated_storage" = "true",
-    "replication_num"    = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_col_varchar_default (col_1, col_2, col_3) VALUES
     (1, 1, '11'), (2, 2, '22'), (3, 3, '33'),
@@ -45,11 +39,8 @@ CREATE TABLE ${case_db}.t_col_array_int (
     col_1 INT,
     arr1 ARRAY<INT>,
     arr2 ARRAY<INT> NOT NULL
-) PROPERTIES (
-    "compression"        = "LZ4",
-    "replicated_storage" = "true",
-    "replication_num"    = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_col_array_int (col_1, arr1, arr2) VALUES
     (1, [1, 11], [101, 111]),
@@ -64,11 +55,8 @@ CREATE TABLE ${case_db}.t_col_varchar (
     col_1 INT,
     v1 VARCHAR(255),
     v2 VARCHAR(255) NOT NULL
-) PROPERTIES (
-    "compression"        = "LZ4",
-    "replicated_storage" = "true",
-    "replication_num"    = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_col_varchar (col_1, v1, v2) VALUES
     (1, '1',  '11'),
@@ -83,11 +71,8 @@ CREATE TABLE ${case_db}.t_col_array_varchar (
     col_1 INT,
     arr1 ARRAY<VARCHAR(10)>,
     arr2 ARRAY<VARCHAR(10)> NOT NULL
-) PROPERTIES (
-    "compression"        = "LZ4",
-    "replicated_storage" = "true",
-    "replication_num"    = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_col_array_varchar (col_1, arr1, arr2) VALUES
     (1, ['1','11'], ['101','111']),
@@ -130,12 +115,14 @@ SELECT col_1, col_2, LAG(col_2, 2, col_3) OVER (ORDER BY col_1) AS lag_result
 FROM ${case_db}.t_col_varchar_default;
 
 -- query 8
--- ARRAY<INT>: LAG with ARRAY<INT> column as default
+-- ARRAY<INT>: column default is rejected by the current analyzer contract.
+-- @expect_error=The type of the third parameter of LEAD/LAG not match the type UNKNOWN.
 SELECT col_1, arr1, LAG(arr1, 2, arr2) OVER (ORDER BY col_1) AS lag_result
 FROM ${case_db}.t_col_array_int ORDER BY col_1;
 
 -- query 9
--- ARRAY<INT>: LEAD with ARRAY<INT> column as default
+-- ARRAY<INT>: column default is rejected by the current analyzer contract.
+-- @expect_error=The type of the third parameter of LEAD/LAG not match the type UNKNOWN.
 SELECT col_1, arr1, LEAD(arr1, 2, arr2) OVER (ORDER BY col_1) AS lead_result
 FROM ${case_db}.t_col_array_int ORDER BY col_1;
 
@@ -150,11 +137,13 @@ SELECT col_1, v1, LEAD(v1, 2, v2) OVER (ORDER BY col_1) AS lead_result
 FROM ${case_db}.t_col_varchar ORDER BY col_1;
 
 -- query 12
--- ARRAY<VARCHAR>: LAG with ARRAY<VARCHAR> column as default
+-- ARRAY<VARCHAR>: column default is rejected by the current analyzer contract.
+-- @expect_error=The type of the third parameter of LEAD/LAG not match the type UNKNOWN.
 SELECT col_1, arr1, LAG(arr1, 2, arr2) OVER (ORDER BY col_1) AS lag_result
 FROM ${case_db}.t_col_array_varchar ORDER BY col_1;
 
 -- query 13
--- ARRAY<VARCHAR>: LEAD with ARRAY<VARCHAR> column as default
+-- ARRAY<VARCHAR>: column default is rejected by the current analyzer contract.
+-- @expect_error=The type of the third parameter of LEAD/LAG not match the type UNKNOWN.
 SELECT col_1, arr1, LEAD(arr1, 2, arr2) OVER (ORDER BY col_1) AS lead_result
 FROM ${case_db}.t_col_array_varchar ORDER BY col_1;

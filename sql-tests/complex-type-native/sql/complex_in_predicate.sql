@@ -1,7 +1,7 @@
 -- Test Objective:
 -- 1. Validate IN/NOT IN predicate with complex types: JSON, ARRAY, MAP, STRUCT.
 -- 2. Cover NULL handling, empty arrays/maps, nested complex types in IN lists.
--- 3. Cover error paths: JSON subquery (not supported), type mismatch for each type.
+-- 3. Cover JSON subquery predicates and type mismatch error paths for each type.
 
 -- query 1
 -- @skip_result_check=true
@@ -15,7 +15,8 @@ CREATE TABLE ${case_db}.sc2 (
   `map2` MAP<INT, ARRAY<INT>> NULL,
   `map3` MAP<INT, STRUCT<c INT, b INT>> NULL,
   `st1` STRUCT<s1 int, s2 ARRAY<INT>, s3 MAP<INT, INT>, s4 Struct<e INT, f INT>>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 insert into ${case_db}.sc2 values (0, null, null, null, null, null, null, null, null);
 insert into ${case_db}.sc2 values (2, json_object("a", null), [1,3,2], [map{null:null}], [row(1, 2)], map{2:null}, map{2:[2,3,4], 1:[1,2,3]}, map{2:row(2,4), 1:row(1,2)}, row(1, [2,1,3], map{2:2, 1:1}, null));
@@ -75,13 +76,11 @@ select js in (json_object("a", 1),json_object("ab", 12, 'bc',4),json_object("ab"
 select js not in (json_object("a", 1),json_object("ab", 13, 'b',4) ) from ${case_db}.sc2 order by 1;
 
 -- query 16
--- JSON subquery not supported
--- @expect_error=In predicate of JSON does not support subquery
+-- JSON subquery predicate.
 select js not in (select js from ${case_db}.sc2 where v1>3) from ${case_db}.sc2;
 
 -- query 17
--- JSON subquery not supported
--- @expect_error=In predicate of JSON does not support subquery
+-- JSON subquery predicate.
 select js in (select js from ${case_db}.sc2 where v1>3) from ${case_db}.sc2;
 
 -- query 18

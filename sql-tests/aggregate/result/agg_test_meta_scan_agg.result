@@ -46,34 +46,6 @@ count(1)
 count(*)
 5
 
--- query 22
-count(*)
-2
-
--- query 23
-count(*)
-3
-
--- query 24
-count(c0)
-3
-
--- query 25
-count(c1)
-3
-
--- query 26
-min(c0)	max(c0)
-2024-03-10	2024-03-20
-
--- query 27
-min(c1)	max(c1)
-50	70
-
--- query 28
-min(c0)	max(c0)	min(c1)	max(c1)
-2024-03-10	2024-03-20	50	70
-
 -- query 31
 count(*)
 3

@@ -1,6 +1,7 @@
 -- Migrated from dev/test/sql/test_agg/R/test_eliminate_agg
 -- Test Objective:
--- Preserve legacy aggregate coverage in a self-contained sql-tests case.
+-- Preserve legacy GROUP BY result coverage over unique-valued input rows
+-- after Iceberg migration.
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
@@ -9,39 +10,31 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `test_agg_group_single_unique_key` (
+CREATE TABLE `test_agg_group_single_key_values` (
   id INT NOT NULL,
   big_value BIGINT,
   double_value DOUBLE,
   decimal_value DECIMAL(10, 5),
   varchar_value VARCHAR(255)
-) ENGINE=OLAP
-UNIQUE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `test_agg_group_multi_unique_key` (
+CREATE TABLE `test_agg_group_multi_key_values` (
   id INT NOT NULL,
   big_value BIGINT,
   double_value DOUBLE,
   decimal_value DECIMAL(10, 5),
   varchar_value VARCHAR(255)
-) ENGINE=OLAP
-UNIQUE KEY(id,big_value)
-DISTRIBUTED BY HASH(id) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO `test_agg_group_single_unique_key` (id, big_value, double_value, decimal_value, varchar_value) VALUES
+INSERT INTO `test_agg_group_single_key_values` (id, big_value, double_value, decimal_value, varchar_value) VALUES
 (1, 100000, 1.23, 123.45678, 'Test1'),
 (2, 200000, 2.34, 234.56789, 'Test2'),
 (3, 300000, 3.45, 345.67890, 'Test3'),
@@ -66,7 +59,7 @@ INSERT INTO `test_agg_group_single_unique_key` (id, big_value, double_value, dec
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO `test_agg_group_multi_unique_key` (id, big_value, double_value, decimal_value, varchar_value) VALUES
+INSERT INTO `test_agg_group_multi_key_values` (id, big_value, double_value, decimal_value, varchar_value) VALUES
 (1, 100000, 1.23, 123.45678, 'Test1'),
 (2, 200000, 2.34, 234.56789, 'Test2'),
 (3, 300000, 3.45, 345.67890, 'Test3'),
@@ -94,7 +87,7 @@ SELECT
     id,
     SUM(big_value) AS sum_big_value
 FROM
-    test_agg_group_single_unique_key
+    test_agg_group_single_key_values
 GROUP BY
     id
 ORDER BY
@@ -106,7 +99,7 @@ SELECT
     id,
     SUM(double_value) AS sum_double_value
 FROM
-    test_agg_group_single_unique_key
+    test_agg_group_single_key_values
 GROUP BY
     id
 ORDER BY
@@ -118,7 +111,7 @@ SELECT
     id,
     AVG(big_value) AS avg_big_value
 FROM
-    test_agg_group_single_unique_key
+    test_agg_group_single_key_values
 GROUP BY
     id
 ORDER BY
@@ -130,7 +123,7 @@ SELECT
     id,
     AVG(double_value) AS avg_double_value
 FROM
-    test_agg_group_single_unique_key
+    test_agg_group_single_key_values
 GROUP BY
     id
 ORDER BY
@@ -142,7 +135,7 @@ SELECT
     id,
     COUNT(big_value) AS count_big_value
 FROM
-    test_agg_group_single_unique_key
+    test_agg_group_single_key_values
 GROUP BY
     id
 ORDER BY
@@ -154,7 +147,7 @@ SELECT
     id,
     COUNT(varchar_value) AS count_varchar_value
 FROM
-    test_agg_group_single_unique_key
+    test_agg_group_single_key_values
 GROUP BY
     id
 ORDER BY
@@ -166,7 +159,7 @@ SELECT
     id,
     MAX(decimal_value) AS max_decimal_value
 FROM
-    test_agg_group_single_unique_key
+    test_agg_group_single_key_values
 GROUP BY
     id
 ORDER BY
@@ -178,7 +171,7 @@ SELECT
     id,
     MAX(double_value) AS max_double_value
 FROM
-    test_agg_group_single_unique_key
+    test_agg_group_single_key_values
 GROUP BY
     id
 ORDER BY
@@ -190,7 +183,7 @@ SELECT
     id,
     MIN(double_value) AS min_double_value
 FROM
-    test_agg_group_single_unique_key
+    test_agg_group_single_key_values
 GROUP BY
     id
 ORDER BY
@@ -202,7 +195,7 @@ SELECT
     id,
     MIN(big_value) AS min_big_value
 FROM
-    test_agg_group_single_unique_key
+    test_agg_group_single_key_values
 GROUP BY
     id
 ORDER BY
@@ -214,7 +207,7 @@ SELECT
     id,
     GROUP_CONCAT(varchar_value ORDER BY varchar_value) AS group_concat_varchar_value
 FROM
-    test_agg_group_single_unique_key
+    test_agg_group_single_key_values
 GROUP BY
     id
 ORDER BY
@@ -226,7 +219,7 @@ SELECT
     id,
     GROUP_CONCAT(double_value ORDER BY double_value) AS group_concat_double_value
 FROM
-    test_agg_group_single_unique_key
+    test_agg_group_single_key_values
 GROUP BY
     id
 ORDER BY
@@ -239,7 +232,7 @@ SELECT
     big_value,
     SUM(double_value) AS sum_double_value
 FROM
-    test_agg_group_multi_unique_key
+    test_agg_group_multi_key_values
 GROUP BY
     id, big_value
 ORDER BY
@@ -252,7 +245,7 @@ SELECT
     big_value,
     AVG(decimal_value) AS avg_decimal_value
 FROM
-    test_agg_group_multi_unique_key
+    test_agg_group_multi_key_values
 GROUP BY
     id, big_value
 ORDER BY
@@ -265,7 +258,7 @@ SELECT
     big_value,
     COUNT(varchar_value) AS count_varchar_value
 FROM
-    test_agg_group_multi_unique_key
+    test_agg_group_multi_key_values
 GROUP BY
     id, big_value
 ORDER BY
@@ -278,7 +271,7 @@ SELECT
     big_value,
     MAX(double_value) AS max_double_value
 FROM
-    test_agg_group_multi_unique_key
+    test_agg_group_multi_key_values
 GROUP BY
     id, big_value
 ORDER BY
@@ -291,7 +284,7 @@ SELECT
     big_value,
     MIN(big_value) AS min_big_value
 FROM
-    test_agg_group_multi_unique_key
+    test_agg_group_multi_key_values
 GROUP BY
     id, big_value
 ORDER BY
@@ -304,7 +297,7 @@ SELECT
     big_value,
     GROUP_CONCAT(varchar_value ORDER BY varchar_value) AS group_concat_varchar_value
 FROM
-    test_agg_group_multi_unique_key
+    test_agg_group_multi_key_values
 GROUP BY
     id, big_value
 ORDER BY
@@ -313,9 +306,9 @@ ORDER BY
 -- query 24
 -- @skip_result_check=true
 USE ${case_db};
-drop table test_agg_group_single_unique_key;
+drop table test_agg_group_single_key_values;
 
 -- query 25
 -- @skip_result_check=true
 USE ${case_db};
-drop table test_agg_group_multi_unique_key;
+drop table test_agg_group_multi_key_values;

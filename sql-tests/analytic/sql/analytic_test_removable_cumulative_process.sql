@@ -14,9 +14,7 @@ CREATE TABLE ${case_db}.t1 (
     v3 int(11) NOT NULL,
     v4 int(11) NULL
 )
-DUPLICATE KEY(v1)
-DISTRIBUTED BY HASH(v1) BUCKETS 10
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t1 VALUES
 (1, 1, 1, NULL), (1, 1, 2, NULL), (1, NULL, 3, NULL), (1, NULL, 4, NULL),
 (1, 2, 5, NULL), (1, 2, 6, NULL), (1, NULL, 7, NULL), (1, NULL, 8, NULL),
@@ -165,9 +163,7 @@ CREATE TABLE ${case_db}.t2 (
     v1 int(11) NULL,
     v2 STRING NULL
 )
-DUPLICATE KEY(v1)
-DISTRIBUTED BY HASH(v1) BUCKETS 10
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t2 VALUES
 (1, '1'), (2, NULL), (3, '2'), (4, '2'), (5, '2'),
 (6, '3'), (7, '3'), (8, '200'), (9, '40'), (10, '50'),

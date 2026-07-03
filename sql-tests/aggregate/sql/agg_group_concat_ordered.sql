@@ -7,11 +7,11 @@
 -- 1. Create/reset source table with nullable string input.
 -- 2. Insert deterministic rows with duplicates and NULL.
 -- 3. Assert ordered global group_concat output.
-DROP TABLE IF EXISTS ${case_db}.t_agg_group_concat_ordered;
 CREATE TABLE ${case_db}.t_agg_group_concat_ordered (
     k INT,
     s STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_group_concat_ordered VALUES
     (1, 'b'),

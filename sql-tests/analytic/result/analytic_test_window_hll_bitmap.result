@@ -1,19 +1,27 @@
 -- query 2
 val
 NULL
-2
+1
+1
+1
 
 -- query 3
 val
 NULL
 1
+1
+1
 
 -- query 4
 val
 NULL
-2
+1
+1
+1
 
 -- query 5
 val
 NULL
+1
+1
 1

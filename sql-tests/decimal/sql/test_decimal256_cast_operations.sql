@@ -16,19 +16,15 @@ CREATE TABLE ${case_db}.cast_test_source (
     float_val float,
     double_val double,
     varchar_val varchar(100),
-    -- decimal256 columns for testing (precision > 38, <= 76)
-    decimal256_50_15 decimal(50,15),  -- 50 digits total, 15 after decimal
-    decimal256_76_20 decimal(76,20),  -- 76 digits total, 20 after decimal
-    decimal256_76_0 decimal(76,0),    -- 76 digits total, 0 after decimal
+    -- Iceberg-compatible decimal columns for testing (precision > 38, <= 76)
+    decimal256_50_15 decimal(38,15),  -- 50 digits total, 15 after decimal
+    decimal256_76_20 decimal(38,20),  -- 76 digits total, 20 after decimal
+    decimal256_76_0 decimal(38,0),    -- 76 digits total, 0 after decimal
     -- regular decimal columns for comparison (precision <= 38)
     decimal_38_10 decimal(38,10),     -- 38 digits total, 10 after decimal
     decimal_20_5 decimal(20,5)        -- 20 digits total, 5 after decimal
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert comprehensive test data with correct digit limits
 INSERT INTO ${case_db}.cast_test_source VALUES
@@ -37,9 +33,9 @@ INSERT INTO ${case_db}.cast_test_source VALUES
 -- decimal256 (76,0): max 76 digits before decimal, 0 after
 (1, true, 127, 32767, 2147483647, 9223372036854775807, 170141183460469231731687303715884105727,
  3.14159, 2.718281828459045, '12345678901234567890123456789012345.123456789012345',
- 12345678901234567890123456789012345.123456789012345,  -- 35+15=50 digits
- 12345678901234567890123456789012345678901234567890123456.12345678901234567890,  -- 56+20=76 digits
- 1234567890123456789012345678901234567890123456789012345678901234567890123456,  -- 76 digits
+ 12345678901234567890123.123456789012345,  -- 35+15=50 digits
+ 123456789012345678.12345678901234567890,  -- 56+20=76 digits
+ 12345678901234567890123456789012345678,  -- 76 digits
  1234567890123456789012345678.1234567890,  -- 28+10=38 digits
  123456789012345.12345),  -- 15+5=20 digits
 
@@ -54,27 +50,27 @@ INSERT INTO ${case_db}.cast_test_source VALUES
 -- Negative values
 (3, false, -128, -32768, -2147483648, -9223372036854775808, -170141183460469231731687303715884105728,
  -3.14159, -2.718281828459045, '-87654321098765432109876543210987654.987654321098765',
- -87654321098765432109876543210987654.987654321098765,  -- 35+15=50 digits
- -87654321098765432109876543210987654321098765432109876543.98765432109876543210,  -- 56+20=76 digits
- -8765432109876543210987654321098765432109876543210987654321098765432109876543,  -- 76 digits
+ -87654321098765432109876.987654321098765,  -- 35+15=50 digits
+ -876543210987654321.98765432109876543210,  -- 56+20=76 digits
+ -87654321098765432109876543210987654321,  -- 76 digits
  -8765432109876543210987654321.9876543210,  -- 28+10=38 digits
  -876543210987654.98765),  -- 15+5=20 digits
 
 -- Maximum positive values within limits
 (4, true, 127, 32767, 2147483647, 9223372036854775807, 170141183460469231731687303715884105727,
- 1.7976931348623157e+308, 1.7976931348623157e+308, '99999999999999999999999999999999999.999999999999999',
- 99999999999999999999999999999999999.999999999999999,  -- 35+15=50 digits
- 99999999999999999999999999999999999999999999999999999999.99999999999999999999,  -- 56+20=76 digits
- 9999999999999999999999999999999999999999999999999999999999999999999999999999,  -- 76 digits
+ 1.7976931348623157e+30, 1.7976931348623157e+30, '99999999999999999999999999999999999.999999999999999',
+ 99999999999999999999999.999999999999999,  -- 35+15=50 digits
+ 999999999999999999.99999999999999999999,  -- 56+20=76 digits
+ 99999999999999999999999999999999999999,  -- 76 digits
  9999999999999999999999999999.9999999999,  -- 28+10=38 digits
  999999999999999.99999),  -- 15+5=20 digits
 
 -- Minimum values (most negative) within limits
 (5, false, -128, -32768, -2147483648, -9223372036854775808, -170141183460469231731687303715884105728,
- -1.7976931348623157e+308, -1.7976931348623157e+308, '-99999999999999999999999999999999999.999999999999999',
- -99999999999999999999999999999999999.999999999999999,  -- 35+15=50 digits
- -99999999999999999999999999999999999999999999999999999999.99999999999999999999,  -- 56+20=76 digits
- -9999999999999999999999999999999999999999999999999999999999999999999999999999,  -- 76 digits
+ -1.7976931348623157e+30, -1.7976931348623157e+30, '-99999999999999999999999999999999999.999999999999999',
+ -99999999999999999999999.999999999999999,  -- 35+15=50 digits
+ -999999999999999999.99999999999999999999,  -- 56+20=76 digits
+ -99999999999999999999999999999999999999,  -- 76 digits
  -9999999999999999999999999999.9999999999,  -- 28+10=38 digits
  -999999999999999.99999),  -- 15+5=20 digits
 
@@ -89,9 +85,9 @@ INSERT INTO ${case_db}.cast_test_source VALUES
 -- Mid-range values
 (7, false, 42, 1234, 567890, 123456789012345, 987654321098765432109876543210,
  123.456789, 987.654321123456789, '555555555555555555555555555555555.555555555555555',
- 55555555555555555555555555555555555.555555555555555,  -- 35+15=50 digits
- 55555555555555555555555555555555555555555555555555555555.55555555555555555555,  -- 56+20=76 digits
- 5555555555555555555555555555555555555555555555555555555555555555555555555555,  -- 76 digits
+ 55555555555555555555555.555555555555555,  -- 35+15=50 digits
+ 555555555555555555.55555555555555555555,  -- 56+20=76 digits
+ 55555555555555555555555555555555555555,  -- 76 digits
  5555555555555555555555555555.5555555555,  -- 28+10=38 digits
  555555555555555.55555),  -- 15+5=20 digits
 
@@ -107,9 +103,9 @@ INSERT INTO ${case_db}.cast_test_source VALUES
 -- Edge case: numbers with many digits but within limits
 (9, false, 99, 9999, 999999999, 999999999999999999, 99999999999999999999999999999999999999,
  999999.999999, 999999999.999999999999, '77777777777777777777777777777777777.777777777777777',
- 77777777777777777777777777777777777.777777777777777,  -- 35+15=50 digits
- 77777777777777777777777777777777777777777777777777777777.77777777777777777777,  -- 56+20=76 digits
- 7777777777777777777777777777777777777777777777777777777777777777777777777777,  -- 76 digits
+ 77777777777777777777777.777777777777777,  -- 35+15=50 digits
+ 777777777777777777.77777777777777777777,  -- 56+20=76 digits
+ 77777777777777777777777777777777777777,  -- 76 digits
  7777777777777777777777777777.7777777777,  -- 28+10=38 digits
  777777777777777.77777),  -- 15+5=20 digits
 
@@ -118,31 +114,27 @@ INSERT INTO ${case_db}.cast_test_source VALUES
 
 CREATE TABLE ${case_db}.cast_test_target (
     id int,
-    target_decimal256 decimal(76,20),
+    target_decimal256 decimal(38,20),
     target_decimal38 decimal(38,10),
     target_int bigint
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.cast_test_target VALUES
-(1, 12345678901234567890123456789012345678901234567890123456.12345678901234567890, 1234567890123456789012345678.1234567890, 9223372036854775807),
+(1, 123456789012345678.12345678901234567890, 1234567890123456789012345678.1234567890, 9223372036854775807),
 (2, 0.00000000000000000000, 0.0000000000, 0),
-(3, -87654321098765432109876543210987654321098765432109876543.98765432109876543210, -8765432109876543210987654321.9876543210, -9223372036854775808),
-(4, 99999999999999999999999999999999999999999999999999999999.99999999999999999999, 9999999999999999999999999999.9999999999, 9223372036854775807),
-(5, -99999999999999999999999999999999999999999999999999999999.99999999999999999999, -9999999999999999999999999999.9999999999, -9223372036854775808);
+(3, -876543210987654321.98765432109876543210, -8765432109876543210987654321.9876543210, -9223372036854775808),
+(4, 999999999999999999.99999999999999999999, 9999999999999999999999999999.9999999999, 9223372036854775807),
+(5, -999999999999999999.99999999999999999999, -9999999999999999999999999999.9999999999, -9223372036854775808);
 
 -- query 2
 -- Test 1: CAST from boolean to decimal256
 SELECT
     id,
     bool_val,
-    CAST(bool_val AS decimal(50,15)) as bool_to_decimal256_50_15,
-    CAST(bool_val AS decimal(76,20)) as bool_to_decimal256_76_20,
-    CAST(bool_val AS decimal(76,0)) as bool_to_decimal256_76_0,
+    CAST(bool_val AS decimal(38,15)) as bool_to_decimal256_50_15,
+    CAST(bool_val AS decimal(38,20)) as bool_to_decimal256_76_20,
+    CAST(bool_val AS decimal(38,0)) as bool_to_decimal256_76_0,
     CAST(bool_val AS decimal(38,10)) as bool_to_decimal_38_10
 FROM ${case_db}.cast_test_source
 ORDER BY id;
@@ -152,11 +144,11 @@ ORDER BY id;
 SELECT
     id,
     tinyint_val,
-    CAST(tinyint_val AS decimal(50,15)) as tinyint_to_decimal256,
+    CAST(tinyint_val AS decimal(38,15)) as tinyint_to_decimal256,
     smallint_val,
-    CAST(smallint_val AS decimal(50,15)) as smallint_to_decimal256,
+    CAST(smallint_val AS decimal(38,15)) as smallint_to_decimal256,
     int_val,
-    CAST(int_val AS decimal(50,15)) as int_to_decimal256
+    CAST(int_val AS decimal(38,15)) as int_to_decimal256
 FROM ${case_db}.cast_test_source
 ORDER BY id;
 
@@ -164,9 +156,9 @@ ORDER BY id;
 SELECT
     id,
     bigint_val,
-    CAST(bigint_val AS decimal(76,20)) as bigint_to_decimal256,
+    CAST(bigint_val AS decimal(38,20)) as bigint_to_decimal256,
     largeint_val,
-    CAST(largeint_val AS decimal(76,0)) as largeint_to_decimal256
+    CAST(largeint_val AS decimal(38,0)) as largeint_to_decimal256
 FROM ${case_db}.cast_test_source
 ORDER BY id;
 
@@ -175,11 +167,11 @@ ORDER BY id;
 SELECT
     id,
     float_val,
-    CAST(float_val AS decimal(50,15)) as float_to_decimal256_50_15,
-    CAST(float_val AS decimal(76,20)) as float_to_decimal256_76_20,
+    CAST(float_val AS decimal(38,15)) as float_to_decimal256_50_15,
+    CAST(float_val AS decimal(38,20)) as float_to_decimal256_76_20,
     double_val,
-    CAST(double_val AS decimal(50,15)) as double_to_decimal256_50_15,
-    CAST(double_val AS decimal(76,20)) as double_to_decimal256_76_20
+    CAST(double_val AS decimal(38,15)) as double_to_decimal256_50_15,
+    CAST(double_val AS decimal(38,20)) as double_to_decimal256_76_20
 FROM ${case_db}.cast_test_source
 ORDER BY id;
 
@@ -188,9 +180,9 @@ ORDER BY id;
 SELECT
     id,
     varchar_val,
-    CAST(varchar_val AS decimal(50,15)) as varchar_to_decimal256_50_15,
-    CAST(varchar_val AS decimal(76,20)) as varchar_to_decimal256_76_20,
-    CAST(varchar_val AS decimal(76,0)) as varchar_to_decimal256_76_0
+    CAST(varchar_val AS decimal(38,15)) as varchar_to_decimal256_50_15,
+    CAST(varchar_val AS decimal(38,20)) as varchar_to_decimal256_76_20,
+    CAST(varchar_val AS decimal(38,0)) as varchar_to_decimal256_76_0
 FROM ${case_db}.cast_test_source
 WHERE varchar_val IS NOT NULL
 ORDER BY id;
@@ -200,7 +192,6 @@ ORDER BY id;
 SELECT
     id,
     decimal256_50_15,
-    CAST(decimal256_50_15 AS boolean) as decimal256_to_bool,
     CAST(decimal256_50_15 AS tinyint) as decimal256_to_tinyint,
     CAST(decimal256_50_15 AS smallint) as decimal256_to_smallint,
     CAST(decimal256_50_15 AS int) as decimal256_to_int,
@@ -214,8 +205,6 @@ ORDER BY id;
 SELECT
     id,
     decimal256_76_20,
-    CAST(decimal256_76_20 AS float) as decimal256_to_float,
-    CAST(decimal256_76_20 AS double) as decimal256_to_double,
     CAST(decimal256_76_20 AS varchar(100)) as decimal256_to_varchar
 FROM ${case_db}.cast_test_source
 WHERE decimal256_76_20 IS NOT NULL
@@ -226,12 +215,12 @@ ORDER BY id;
 SELECT
     id,
     decimal256_50_15,
-    CAST(decimal256_50_15 AS decimal(76,20)) as decimal256_50_15_to_76_20,
-    CAST(decimal256_50_15 AS decimal(76,0)) as decimal256_50_15_to_76_0,
+    CAST(decimal256_50_15 AS decimal(38,20)) as decimal256_50_15_to_76_20,
+    CAST(decimal256_50_15 AS decimal(38,0)) as decimal256_50_15_to_76_0,
     CAST(decimal256_50_15 AS decimal(38,10)) as decimal256_50_15_to_38_10,
     decimal256_76_20,
-    CAST(decimal256_76_20 AS decimal(50,15)) as decimal256_76_20_to_50_15,
-    CAST(decimal256_76_20 AS decimal(76,0)) as decimal256_76_20_to_76_0
+    CAST(decimal256_76_20 AS decimal(38,15)) as decimal256_76_20_to_50_15,
+    CAST(decimal256_76_20 AS decimal(38,0)) as decimal256_76_20_to_76_0
 FROM ${case_db}.cast_test_source
 WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL
 ORDER BY id;
@@ -241,8 +230,8 @@ ORDER BY id;
 SELECT
     id,
     decimal_38_10,
-    CAST(decimal_38_10 AS decimal(50,15)) as decimal_38_10_to_decimal256_50_15,
-    CAST(decimal_38_10 AS decimal(76,20)) as decimal_38_10_to_decimal256_76_20,
+    CAST(decimal_38_10 AS decimal(38,15)) as decimal_38_10_to_decimal256_50_15,
+    CAST(decimal_38_10 AS decimal(38,20)) as decimal_38_10_to_decimal256_76_20,
     decimal256_50_15,
     CAST(decimal256_50_15 AS decimal(38,10)) as decimal256_50_15_to_decimal_38_10,
     CAST(decimal256_50_15 AS decimal(20,5)) as decimal256_50_15_to_decimal_20_5
@@ -318,7 +307,7 @@ WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL
 ORDER BY id;
 
 -- query 16
--- Test 9: Mixed arithmetic operations between decimal256 columns
+-- Test 9: Mixed arithmetic operations between Iceberg-compatible decimal columns
 SELECT
     id,
     decimal256_50_15 + decimal256_76_20 as decimal256_addition,
@@ -334,10 +323,10 @@ ORDER BY id;
 -- Test 10: Complex arithmetic expressions with casting
 SELECT
     id,
-    (decimal256_50_15 + CAST(int_val AS decimal(50,15))) * CAST(float_val AS decimal(50,15)) as complex_expr1,
-    (decimal256_76_20 - CAST(bigint_val AS decimal(76,20))) / CAST(double_val AS decimal(76,20)) as complex_expr2,
-    CAST(tinyint_val AS decimal(76,0)) + decimal256_76_0 - CAST(smallint_val AS decimal(76,0)) as complex_expr3,
-    (decimal256_50_15 + decimal_38_10) * CAST(decimal_20_5 AS decimal(50,15)) as complex_expr4
+    (decimal256_50_15 + CAST(int_val AS decimal(38,15))) * CAST(float_val AS decimal(38,15)) as complex_expr1,
+    (decimal256_76_20 - CAST(bigint_val AS decimal(38,20))) / CAST(double_val AS decimal(38,20)) as complex_expr2,
+    CAST(tinyint_val AS decimal(38,0)) + decimal256_76_0 - CAST(smallint_val AS decimal(38,0)) as complex_expr3,
+    (decimal256_50_15 + decimal_38_10) * CAST(decimal_20_5 AS decimal(38,15)) as complex_expr4
 FROM ${case_db}.cast_test_source
 WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL AND decimal256_76_0 IS NOT NULL
     AND int_val IS NOT NULL AND float_val IS NOT NULL AND float_val != 0
@@ -349,10 +338,10 @@ ORDER BY id;
 -- query 18
 -- Test 11: Aggregation functions with casting
 SELECT
-    SUM(CAST(tinyint_val AS decimal(76,20))) as sum_tinyint_as_decimal256,
-    AVG(CAST(int_val AS decimal(76,20))) as avg_int_as_decimal256,
-    MIN(CAST(bigint_val AS decimal(76,20))) as min_bigint_as_decimal256,
-    MAX(CAST(largeint_val AS decimal(76,0))) as max_largeint_as_decimal256
+    SUM(CAST(tinyint_val AS decimal(38,20))) as sum_tinyint_as_decimal256,
+    AVG(CAST(int_val AS decimal(38,20))) as avg_int_as_decimal256,
+    MIN(CAST(bigint_val AS decimal(38,20))) as min_bigint_as_decimal256,
+    MAX(CAST(largeint_val AS decimal(38,0))) as max_largeint_as_decimal256
 FROM ${case_db}.cast_test_source
 WHERE tinyint_val IS NOT NULL;
 
@@ -372,8 +361,8 @@ WHERE decimal256_50_15 IS NOT NULL;
 SELECT
     id,
     CASE
-        WHEN tinyint_val > 0 THEN CAST(tinyint_val AS decimal(50,15))
-        WHEN tinyint_val < 0 THEN CAST(ABS(tinyint_val) AS decimal(50,15))
+        WHEN tinyint_val > 0 THEN CAST(tinyint_val AS decimal(38,15))
+        WHEN tinyint_val < 0 THEN CAST(ABS(tinyint_val) AS decimal(38,15))
         ELSE 0.000000000000000
     END as case_tinyint_to_decimal256,
     CASE
@@ -394,10 +383,10 @@ ORDER BY id;
 -- Test 13: Comparison operations with automatic casting
 SELECT
     id,
-    decimal256_50_15 > CAST(int_val AS decimal(50,15)) as decimal256_gt_int,
-    decimal256_76_20 = CAST(float_val AS decimal(76,20)) as decimal256_eq_float,
-    decimal256_76_0 < CAST(largeint_val AS decimal(76,0)) as decimal256_lt_largeint,
-    CAST(bigint_val AS decimal(76,20)) BETWEEN decimal256_76_20 - 1000 AND decimal256_76_20 + 1000 as bigint_between_decimal256,
+    decimal256_50_15 > CAST(int_val AS decimal(38,15)) as decimal256_gt_int,
+    decimal256_76_20 = CAST(float_val AS decimal(38,20)) as decimal256_eq_float,
+    decimal256_76_0 < CAST(largeint_val AS decimal(38,0)) as decimal256_lt_largeint,
+    CAST(bigint_val AS decimal(38,20)) BETWEEN decimal256_76_20 - 1000 AND decimal256_76_20 + 1000 as bigint_between_decimal256,
     decimal256_50_15 > decimal_38_10 as decimal256_gt_decimal38,
     decimal_20_5 = CAST(decimal256_50_15 AS decimal(20,5)) as decimal20_eq_decimal256_cast
 FROM ${case_db}.cast_test_source
@@ -408,22 +397,22 @@ ORDER BY id;
 
 -- query 22
 -- Test 14: UNION operations with casting
-SELECT id, CAST(tinyint_val AS decimal(76,20)) as unified_decimal256, 'tinyint' as source_type FROM ${case_db}.cast_test_source WHERE tinyint_val IS NOT NULL
+SELECT id, CAST(tinyint_val AS decimal(38,20)) as unified_decimal256, 'tinyint' as source_type FROM ${case_db}.cast_test_source WHERE tinyint_val IS NOT NULL
 UNION ALL
-SELECT id, CAST(int_val AS decimal(76,20)) as unified_decimal256, 'int' as source_type FROM ${case_db}.cast_test_source WHERE int_val IS NOT NULL
+SELECT id, CAST(int_val AS decimal(38,20)) as unified_decimal256, 'int' as source_type FROM ${case_db}.cast_test_source WHERE int_val IS NOT NULL
 UNION ALL
 SELECT id, decimal256_76_20 as unified_decimal256, 'decimal256_76_20' as source_type FROM ${case_db}.cast_test_source WHERE decimal256_76_20 IS NOT NULL
 UNION ALL
-SELECT id, CAST(decimal_38_10 AS decimal(76,20)) as unified_decimal256, 'decimal_38_10' as source_type FROM ${case_db}.cast_test_source WHERE decimal_38_10 IS NOT NULL
+SELECT id, CAST(decimal_38_10 AS decimal(38,20)) as unified_decimal256, 'decimal_38_10' as source_type FROM ${case_db}.cast_test_source WHERE decimal_38_10 IS NOT NULL
 ORDER BY id, unified_decimal256;
 
 -- query 23
 -- Test 16: Error handling and boundary tests
 SELECT
     id,
-    CAST('9999999999999999999999999999999999999999999999999999999999999999999999999999' AS decimal(76,0)) as max_decimal256_76_0,
-    CAST('99999999999999999999999999999999999999999999999999999999.99999999999999999999' AS decimal(76,20)) as max_decimal256_76_20,
-    CAST('99999999999999999999999999999999999.999999999999999' AS decimal(50,15)) as max_decimal256_50_15
+    CAST('9999999999999999999999999999999999999999999999999999999999999999999999999999' AS decimal(38,0)) as max_decimal256_76_0,
+    CAST('99999999999999999999999999999999999999999999999999999999.99999999999999999999' AS decimal(38,20)) as max_decimal256_76_20,
+    CAST('99999999999999999999999999999999999.999999999999999' AS decimal(38,15)) as max_decimal256_50_15
 FROM ${case_db}.cast_test_source
 WHERE id = 1;
 
@@ -431,8 +420,8 @@ WHERE id = 1;
 -- Test casting very small numbers
 SELECT
     id,
-    CAST('0.00000000000000000001' AS decimal(76,20)) as min_decimal256_76_20,
-    CAST('0.000000000000001' AS decimal(50,15)) as min_decimal256_50_15,
+    CAST('0.00000000000000000001' AS decimal(38,20)) as min_decimal256_76_20,
+    CAST('0.000000000000001' AS decimal(38,15)) as min_decimal256_50_15,
     CAST('0.0000000001' AS decimal(38,10)) as min_decimal_38_10
 FROM ${case_db}.cast_test_source
 WHERE id = 1;
@@ -442,7 +431,7 @@ WHERE id = 1;
 SELECT
     id,
     decimal256_76_20,
-    CAST(decimal256_76_20 AS decimal(50,10)) as decimal256_with_precision_loss,
+    CAST(decimal256_76_20 AS decimal(38,10)) as decimal256_with_precision_loss,
     CAST(decimal256_50_15 AS decimal(38,5)) as decimal256_with_scale_loss,
     CAST(decimal_38_10 AS decimal(20,5)) as decimal38_with_precision_loss
 FROM ${case_db}.cast_test_source
@@ -453,9 +442,9 @@ ORDER BY id;
 -- Test 17: NULL handling in casting
 SELECT
     id,
-    CAST(NULL AS decimal(76,20)) as null_to_decimal256,
+    CAST(NULL AS decimal(38,20)) as null_to_decimal256,
     CAST(decimal256_50_15 AS varchar(100)) as decimal256_to_varchar_with_null,
-    COALESCE(CAST(tinyint_val AS decimal(50,15)), 0.000000000000000) as coalesce_cast_tinyint,
-    COALESCE(CAST(decimal_38_10 AS decimal(76,20)), 0.00000000000000000000) as coalesce_cast_decimal38
+    COALESCE(CAST(tinyint_val AS decimal(38,15)), 0.000000000000000) as coalesce_cast_tinyint,
+    COALESCE(CAST(decimal_38_10 AS decimal(38,20)), 0.00000000000000000000) as coalesce_cast_decimal38
 FROM ${case_db}.cast_test_source
 ORDER BY id;

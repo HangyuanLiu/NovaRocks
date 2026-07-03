@@ -14,7 +14,8 @@ create table t0 (
     c1 STRING NOT NULL,
     c2 int,
     c3 int NOT NULL
-) DUPLICATE KEY(c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -39,7 +40,8 @@ create table t1 (
     c1 STRING,
     c2 int,
     c3 int
-) DUPLICATE KEY(c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 7
 -- @skip_result_check=true
@@ -49,7 +51,8 @@ create table t2 (
     c1 int,
     c2 string,
     c3 int
-) DUPLICATE KEY(c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 8
 -- @skip_result_check=true
@@ -59,7 +62,8 @@ create table t3 (
     c1 int NOT NULL,
     c2 string,
     c3 int
-) DUPLICATE KEY(c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true
@@ -169,7 +173,8 @@ create table t4 (
     c1 int,
     c2 string,
     c3 int
-) DUPLICATE KEY(c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 34
 -- @skip_result_check=true
@@ -189,7 +194,8 @@ create table t5 (
     c1 int,
     c2 string,
     c3 int
-) DUPLICATE KEY(c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 37
 -- @skip_result_check=true
@@ -252,7 +258,8 @@ create table t6 (
     c1 float,
     c2 string,
     c3 int
-) DUPLICATE KEY(c0) DISTRIBUTED BY HASH(c0) BUCKETS 1 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 49
 -- @skip_result_check=true
@@ -279,7 +286,8 @@ create table tempty (
     c1 float,
     c2 string,
     c3 int
-) DUPLICATE KEY(c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 54
 USE ${case_db};
@@ -300,7 +308,8 @@ create table tarray (
     c0 int,
     c1 array<int>,
     c3 int
-) DUPLICATE KEY(c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 58
 -- @skip_result_check=true

@@ -9,19 +9,19 @@
 -- 2. Insert deterministic grouped rows with duplicates and NULLs.
 -- 3. Assert exact vs approximate distinct counts, bitmap aggregation, and ds_hll state estimation.
 -- query 1
-DROP TABLE IF EXISTS ${case_db}.t_agg_sketch_bitmap_source;
-DROP TABLE IF EXISTS ${case_db}.t_agg_ds_hll_state;
 CREATE TABLE ${case_db}.t_agg_sketch_bitmap_source (
     grp INT,
     id_int INT,
     name STRING,
     vb VARBINARY
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE ${case_db}.t_agg_ds_hll_state (
     grp INT,
     ds_vb BINARY
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_sketch_bitmap_source VALUES
     (1, 1, 'alpha', to_binary('alpha', 'utf8')),

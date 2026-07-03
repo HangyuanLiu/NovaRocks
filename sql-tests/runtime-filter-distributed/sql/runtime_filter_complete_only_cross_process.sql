@@ -4,9 +4,6 @@
 -- 1. Validate complete-only RF correctness under cross-process 1FE+3BE execution.
 -- 2. Result is identical with RF enabled and disabled.
 
-DROP TABLE IF EXISTS ${case_db}.rf_co_dist_probe;
-DROP TABLE IF EXISTS ${case_db}.rf_co_dist_build;
-
 CREATE TABLE ${case_db}.rf_co_dist_probe (
     id INT NOT NULL,
     k INT

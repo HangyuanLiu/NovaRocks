@@ -1,12 +1,12 @@
+-- query 16
+scenario	row_count	t1_sum	t2_sum
+bilateral_probe	1350	191925	191925
+
+-- query 18
+scenario	row_count	t1_sum	t2_sum
+bilateral_probe	1350	191925	191925
+
 -- query 19
-scenario	row_count	t1_sum	t2_sum
-bilateral_probe	1350	191925	191925
-
--- query 21
-scenario	row_count	t1_sum	t2_sum
-bilateral_probe	1350	191925	191925
-
--- query 22
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
@@ -23,10 +23,10 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 10:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count(), sum(t1.v), sum(t2.v)
-  9:HASH JOIN (PARTITIONED, INNER, eq: [t2.k = t3.k]) stats={rows=151}
+  9:HASH JOIN (PARTITIONED, INNER, eq: [t2.k = t3.k]) stats={rows=1355}
     build runtime filters:
     - filter_id = 1, build_expr = (t3.k)
-    6:HASH EXCHANGE stats={rows=300}
+    6:HASH EXCHANGE stats={rows=900}
     8:HASH EXCHANGE stats={rows=151}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
@@ -45,7 +45,7 @@ PLAN FRAGMENT 3
   STREAM DATA SINK
     EXCHANGE ID: 6
     PARTITION: HASH_PARTITIONED (k)
-5:HASH JOIN (PARTITIONED, INNER, eq: [t1.k = t2.k]) stats={rows=300}
+5:HASH JOIN (PARTITIONED, INNER, eq: [t1.k = t2.k]) stats={rows=900}
   build runtime filters:
   - filter_id = 0, build_expr = (t2.k)
   2:HASH EXCHANGE stats={rows=300}

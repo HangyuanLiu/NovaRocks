@@ -8,19 +8,19 @@
 -- 2. Insert deterministic maps with overlapping keys, empty maps, and NULL maps.
 -- 3. Snapshot global/grouped sum_map outputs and NULL-handling behavior.
 -- query 1
-DROP TABLE IF EXISTS ${case_db}.t_agg_sum_map_basic;
-DROP TABLE IF EXISTS ${case_db}.t_agg_sum_map_nullable;
 CREATE TABLE ${case_db}.t_agg_sum_map_basic (
     g INT,
     m_int MAP<INT, INT>,
     m_str MAP<STRING, BIGINT>,
     m_double MAP<INT, DOUBLE>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE ${case_db}.t_agg_sum_map_nullable (
     id INT,
     m_nullable MAP<INT, INT>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_sum_map_basic VALUES
     (1, map{1:10, 2:20, 3:30}, map{'a':100, 'b':200}, map{1:1.5, 2:2.5}),

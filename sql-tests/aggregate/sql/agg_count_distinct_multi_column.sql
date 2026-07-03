@@ -5,13 +5,13 @@
 -- 2. Prevent regressions in multi-column distinct cardinality.
 -- Test Flow:
 -- 1. Create/reset source table.
--- 2. Insert deterministic duplicated and unique key pairs.
+-- 2. Insert deterministic duplicated and distinct value pairs.
 -- 3. Compute COUNT(DISTINCT a,b) and assert scalar output.
-DROP TABLE IF EXISTS ${case_db}.t_agg_count_distinct_multi_column;
 CREATE TABLE ${case_db}.t_agg_count_distinct_multi_column (
     a INT,
     b VARCHAR(20)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_count_distinct_multi_column VALUES
     (1, 'x'),

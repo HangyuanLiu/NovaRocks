@@ -29,17 +29,15 @@ CREATE TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders (
   id BIGINT NOT NULL,
   user_id BIGINT,
   order_amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 CREATE TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.users (
   id BIGINT NOT NULL,
   user_region STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_jmm_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW jmm_mv_${uuid0}

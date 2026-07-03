@@ -7,11 +7,11 @@
 -- 1. Create/reset source table.
 -- 2. Insert duplicate and NULL-contained rows.
 -- 3. Compute grouped COUNT(DISTINCT) and assert deterministic order.
-DROP TABLE IF EXISTS ${case_db}.t_agg_count_distinct_single;
 CREATE TABLE ${case_db}.t_agg_count_distinct_single (
     g INT,
     s VARCHAR(20)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_count_distinct_single VALUES
     (1, 'a'),

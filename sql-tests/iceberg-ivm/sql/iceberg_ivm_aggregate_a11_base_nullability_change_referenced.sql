@@ -23,10 +23,9 @@ CREATE DATABASE ice_ivm_agg_a11_null_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_agg_a11_null_${uuid0}.ns_${uuid0}.orders (
   region STRING NOT NULL,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 INSERT INTO ice_ivm_agg_a11_null_${uuid0}.ns_${uuid0}.orders VALUES ('east', 10), ('west', 5);
 SET CATALOG ice_ivm_agg_a11_null_${uuid0};
 USE ns_${uuid0};

@@ -26,10 +26,9 @@ CREATE TABLE ice_ivm_minmax_decimal_db_${uuid0}.ns_${uuid0}.sales (
   id BIGINT,
   region STRING,
   amount DECIMAL(18, 2)
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_minmax_decimal_db_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW decimal_mv_${uuid0}

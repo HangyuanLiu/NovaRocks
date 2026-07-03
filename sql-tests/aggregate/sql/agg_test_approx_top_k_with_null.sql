@@ -11,12 +11,8 @@ USE ${case_db};
 USE ${case_db};
 CREATE TABLE __row_util_base (
   k1 bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -32,12 +28,8 @@ insert into __row_util_base select * from __row_util_base; -- 8000
 insert into __row_util_base select * from __row_util_base; -- 16000
 CREATE TABLE __row_util (
   idx bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`idx`)
-DISTRIBUTED BY HASH(`idx`) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true
@@ -51,12 +43,8 @@ CREATE TABLE t1 (
   k1 bigint NULL,
   c1 bigint NULL,
   c2 int NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 16
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 7
 -- @skip_result_check=true
@@ -110,12 +98,8 @@ CREATE TABLE t2 (
   k1 bigint NULL,
   c1 bigint NULL,
   c2 int NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 16
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 17
 -- @skip_result_check=true

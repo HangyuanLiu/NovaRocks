@@ -15,9 +15,7 @@ CREATE TABLE t1 (
     c3 map<varchar(10), bigint>,
     c4 map<int, double>
 )
-DUPLICATE KEY(c1)
-DISTRIBUTED BY HASH(c1) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -145,9 +143,7 @@ CREATE TABLE t2 (
     m_float map<int, float>,
     m_double map<int, double>
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 30
 -- @skip_result_check=true
@@ -198,9 +194,7 @@ CREATE TABLE t3 (
     m_key_largeint map<largeint, int>,
     m_key_varchar map<varchar(20), int>
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 39
 -- @skip_result_check=true
@@ -266,9 +260,7 @@ CREATE TABLE t5 (
     id int,
     m_nullable map<int, int>
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 50
 -- @skip_result_check=true
@@ -371,9 +363,7 @@ CREATE TABLE t8 (
     category varchar(20),
     metrics map<varchar(20), int>
 )
-DUPLICATE KEY(category)
-DISTRIBUTED BY HASH(category) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 66
 -- @skip_result_check=true
@@ -407,9 +397,7 @@ CREATE TABLE t10 (
     id int,
     data map<int, bigint>
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 71
 -- @skip_result_check=true
@@ -497,9 +485,7 @@ CREATE TABLE t11_type_matrix (
     m_i_dt map<int, datetime>,
     m_i_str map<int, varchar(10)>
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 74
 -- @skip_result_check=true

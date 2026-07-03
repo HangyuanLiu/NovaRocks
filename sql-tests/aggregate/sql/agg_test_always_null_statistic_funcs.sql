@@ -14,9 +14,8 @@ CREATE TABLE t1 (
     k BIGINT NULL,
     val1 BIGINT NULL,
     val2 BIGINT NULL
-) PRIMARY KEY(idx)
-DISTRIBUTED BY HASH (idx) BUCKETS 32
-PROPERTIES("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -26,9 +25,8 @@ CREATE TABLE t1_nonnull (
     k BIGINT NOT NULL,
     val1 BIGINT NOT NULL,
     val2 BIGINT NOT NULL
-) PRIMARY KEY(idx)
-DISTRIBUTED BY HASH (idx) BUCKETS 32
-PROPERTIES("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true

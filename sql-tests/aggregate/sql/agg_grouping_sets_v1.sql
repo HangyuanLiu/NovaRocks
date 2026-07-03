@@ -24,9 +24,8 @@ CREATE TABLE tbl_with_null1 (
     K11 float,
     K12 double,
     K13 decimal(27,9)
-) DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -55,9 +54,8 @@ CREATE TABLE tbl_with_null2 (
     K11 float,
     K12 double,
     K13 decimal(27,9)
-) DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 9
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true

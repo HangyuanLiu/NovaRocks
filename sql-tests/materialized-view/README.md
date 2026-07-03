@@ -1,24 +1,21 @@
 Materialized view SQL tests for NovaRocks.
 
-This suite migrates the runnable coverage from `dev/test/sql/test_materialized_view`
-into the file-level `sql-tests` runner model:
-- one `.sql` file is one end-to-end MV case
-- file-local `-- query N` steps share setup state
-- one `.result` file snapshots all stable result sets for the case
+The active C1 suite is intentionally lake-native only. It verifies that the
+`materialized-view` runner suite uses its suite-level REST Iceberg catalog and
+covers the basic Iceberg-target MV create / refresh / read / drop path.
 
-Coverage notes:
-- local OLAP rewrite, refresh, status, show/create, privilege, sync-MV, nested-MV,
-  partition compensation, and partition-mapping scenarios are covered directly
-- external-environment-heavy dev/test cases are consolidated into self-hosted local
-  cases where they exercise the same FE-planned MV rewrite and refresh semantics
-- Iceberg-backed MV cases are maintained separately in `sql-tests/mv-on-iceberg`
+The historical StarRocks-compatible MV cases from `dev/test/sql/test_materialized_view`
+are parked under `legacy/`. They cover OLAP rewrite, refresh, status, privilege,
+sync-MV, nested-MV, and partition-compensation behavior that is not the NIDL-C1
+test-migration target and should be reintroduced only through a dedicated
+lake-native rewrite or compatibility task.
 
 Recommended invocation:
 
 ```bash
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --suite materialized-view \
-  --config tests/sql-test-runner/conf/sr.conf \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --mode verify
 ```
 

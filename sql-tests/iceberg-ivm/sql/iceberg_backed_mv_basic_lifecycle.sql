@@ -11,21 +11,22 @@
 CREATE EXTERNAL CATALOG mv_ice_${uuid0}
 PROPERTIES (
   "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_catalog_warehouse}/iceberg_${uuid0}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
+  "iceberg.catalog.type" = "rest",
+  "uri" = "${iceberg_rest_uri}",
+  "warehouse" = "${iceberg_rest_warehouse}",
   "aws.s3.access_key" = "${oss_ak}",
   "aws.s3.secret_key" = "${oss_sk}",
+  "aws.s3.endpoint" = "${oss_endpoint}",
+  "aws.s3.region" = "us-east-1",
   "aws.s3.enable_path_style_access" = "true"
 );
 CREATE DATABASE mv_ice_${uuid0}.ns_${uuid0};
 CREATE TABLE mv_ice_${uuid0}.ns_${uuid0}.orders (
   k1 INT,
   v2 BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 INSERT INTO mv_ice_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 10),
   (2, 20),

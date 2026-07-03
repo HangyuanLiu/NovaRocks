@@ -7,11 +7,11 @@
 -- 1. Create/reset grouped source table.
 -- 2. Insert rows that exercise true/false/null predicate outcomes.
 -- 3. Group by key and assert ordered count_if outputs.
-DROP TABLE IF EXISTS ${case_db}.t_agg_count_if_grouped;
 CREATE TABLE ${case_db}.t_agg_count_if_grouped (
     k INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_count_if_grouped VALUES
     (1, 10),

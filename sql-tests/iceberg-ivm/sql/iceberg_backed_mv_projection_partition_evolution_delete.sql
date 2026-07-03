@@ -31,10 +31,8 @@ CREATE TABLE mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders (
   amount BIGINT
 )
 PARTITION BY (customer)
-TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 INSERT INTO mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 'A', 10),
   (2, 'A', 20);

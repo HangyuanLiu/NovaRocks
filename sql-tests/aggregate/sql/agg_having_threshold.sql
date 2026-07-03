@@ -7,11 +7,11 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows across groups.
 -- 3. Apply GROUP BY + HAVING and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_agg_having_threshold;
 CREATE TABLE ${case_db}.t_agg_having_threshold (
     g INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_having_threshold VALUES
     (1, 5),

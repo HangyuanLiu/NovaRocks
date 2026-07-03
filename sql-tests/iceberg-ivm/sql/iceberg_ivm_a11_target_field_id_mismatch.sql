@@ -29,10 +29,9 @@ CREATE TABLE ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} (
   id INT NOT NULL,
   region STRING,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES
   (1, 'US', 100),
   (2, 'EU', 50);
@@ -61,15 +60,13 @@ INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES (3, 'A
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 6
--- Spark: externally drop `amount` from the target MV storage table.
--- The NovaRocks-visible MV name stays public, while the Iceberg storage table
--- is prefixed to keep it separate from the public projection surface.
+-- Spark: externally drop `amount` from the target MV Iceberg table.
 -- @result_contains=SPARK_SQL_OK
 shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-a11-tgt-fid-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-ALTER TABLE ice_rest.ns_${uuid0}.__nr_mv_mv_${uuid0} DROP COLUMN amount;
+ALTER TABLE ice_rest.ns_${uuid0}.mv_${uuid0} DROP COLUMN amount;
 SPARK_SQL
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 printf 'SPARK_SQL_OK\n'

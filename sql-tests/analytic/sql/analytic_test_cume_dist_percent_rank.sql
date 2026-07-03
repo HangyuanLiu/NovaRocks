@@ -8,19 +8,15 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.cume_test;
 CREATE TABLE IF NOT EXISTS ${case_db}.cume_test (
   k1 INT,
   k2 INT,
-  v1 INT SUM,
-  v2 DOUBLE MAX,
-  v3 DATE MIN,
-  v4 VARCHAR(20) REPLACE
+  v1 INT,
+  v2 DOUBLE,
+  v3 DATE,
+  v4 VARCHAR(20)
 )
-ENGINE = olap
-AGGREGATE KEY(k1, k2)
-DISTRIBUTED BY HASH(k1)
-PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.cume_test (k1, k2, v1, v2, v3, v4)
 VALUES (1, 10, 15, 2.5, '2023-01-01', 'apple'),
        (1, 2, 15, 2.5, '2023-01-02', 'banana'),

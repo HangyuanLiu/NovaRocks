@@ -14,7 +14,8 @@ create table t0 (
     c1 STRING NOT NULL,
     c2 int,
     c3 int NOT NULL
-) DUPLICATE KEY(c0) DISTRIBUTED BY HASH(c0) BUCKETS 3 PROPERTIES('replication_num' = '1');
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

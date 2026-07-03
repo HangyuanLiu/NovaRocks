@@ -16,8 +16,8 @@ CREATE TABLE `t0` (
   `v4` varchar(50) NULL COMMENT "",
   `v5` decimal(10,2) NULL COMMENT "",
   `v6` float NULL COMMENT ""
-) ENGINE=OLAP
-PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -563,8 +563,8 @@ CREATE TABLE `t1` (
   `v4` varchar(50) NULL COMMENT "",
   `v5` decimal(10,2) NULL COMMENT "",
   `v6` float NULL COMMENT ""
-) ENGINE=OLAP
-PROPERTIES("replication_num"="1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 59
 -- @skip_result_check=true

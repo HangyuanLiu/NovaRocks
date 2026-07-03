@@ -12,13 +12,8 @@ USE ${case_db};
 CREATE TABLE IF NOT EXISTS `lineorder` (
     `lo_orderkey` int(11) NOT NULL COMMENT "",
     `lo_shipmode` varchar(11) NOT NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`lo_orderkey`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`lo_orderkey`) BUCKETS 48
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 USE ${case_db};
@@ -32,15 +27,8 @@ CREATE TABLE `ss` (
   `name` varchar(255) NULL COMMENT "",
   `subject` varchar(255) NULL COMMENT "",
   `score` int(11) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`id`)
-DISTRIBUTED BY HASH(`id`) BUCKETS 4
-PROPERTIES (
-"replication_num" = "1",
-"enable_persistent_index" = "false",
-"replicated_storage" = "true",
-"compression" = "LZ4"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true

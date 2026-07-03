@@ -7,11 +7,11 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic ordered values.
 -- 3. Compute distribution windows and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_analytic_ntile_percentile;
 CREATE TABLE ${case_db}.t_analytic_ntile_percentile (
     grp VARCHAR(10),
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_ntile_percentile VALUES
     ('A', 10),

@@ -22,12 +22,8 @@ USE ${case_db};
 CREATE TABLE `t1` (
   `id` int(11) NULL COMMENT "",
   `array_varchar` array<varchar(100)>
-) ENGINE=OLAP
-DUPLICATE KEY(`id`)
-DISTRIBUTED BY HASH(`id`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true

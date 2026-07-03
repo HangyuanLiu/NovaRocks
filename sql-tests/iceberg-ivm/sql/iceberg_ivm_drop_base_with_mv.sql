@@ -27,10 +27,9 @@ CREATE TABLE ice_ivm_dropbase_${uuid0}.dropbase_${uuid0}.orders_${uuid0} (
   id BIGINT,
   region STRING,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 INSERT INTO ice_ivm_dropbase_${uuid0}.dropbase_${uuid0}.orders_${uuid0} VALUES
   (1, 'east', 10),
   (2, 'west', 20);

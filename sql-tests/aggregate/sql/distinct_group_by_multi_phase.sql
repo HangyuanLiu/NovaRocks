@@ -5,7 +5,6 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_dg;
 
 -- query 2
 -- @skip_result_check=true
@@ -13,7 +12,8 @@ CREATE TABLE ${case_db}.t_dg (
     g INT,
     x INT,
     a BIGINT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

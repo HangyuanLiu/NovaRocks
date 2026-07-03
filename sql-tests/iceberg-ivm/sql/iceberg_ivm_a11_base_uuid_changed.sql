@@ -27,10 +27,9 @@ CREATE DATABASE ice_ivm_a11_uuid_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_a11_uuid_${uuid0}.ns_${uuid0}.base_${uuid0} (
   id INT NOT NULL,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 INSERT INTO ice_ivm_a11_uuid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES
   (1, 100),
   (2, 50);
@@ -64,11 +63,8 @@ CREATE TABLE ice_rest.ns_${uuid0}.base_${uuid0} (
   id INT NOT NULL,
   amount BIGINT
 )
-USING iceberg
-TBLPROPERTIES (
-  'format-version' = '3',
-  'write.row-lineage' = 'true'
-);
+TBLPROPERTIES ('format-version' = '3',
+  'write.row-lineage' = 'true');
 INSERT INTO ice_rest.ns_${uuid0}.base_${uuid0} VALUES (10, 999);
 SPARK_SQL
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"

@@ -8,7 +8,6 @@
 -- 2. Insert deterministic grouped rows with duplicates and NULLs.
 -- 3. Snapshot grouped collection outputs and dict_merge payloads.
 -- query 1
-DROP TABLE IF EXISTS ${case_db}.t_agg_collection_string_dict;
 CREATE TABLE ${case_db}.t_agg_collection_string_dict (
     g INT,
     id INT,
@@ -20,7 +19,8 @@ CREATE TABLE ${case_db}.t_agg_collection_string_dict (
     city_null STRING,
     city_array ARRAY<STRING>,
     city_array_null ARRAY<STRING>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_collection_string_dict VALUES
     (1, 1, 'Tom', 90, [90, 90], ['a', 'b'], 'beijing', 'beijing', ['beijing', 'shanghai'], NULL),

@@ -7,11 +7,11 @@
 -- 1. Create/reset the source table.
 -- 2. Insert deterministic rows including NULL.
 -- 3. Assert global count_if outputs.
-DROP TABLE IF EXISTS ${case_db}.t_agg_count_if_global;
 CREATE TABLE ${case_db}.t_agg_count_if_global (
     k INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_count_if_global VALUES
     (1, 10),

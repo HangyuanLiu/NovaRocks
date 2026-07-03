@@ -3,7 +3,7 @@
 -- 1. Validate typeof() returns correct type names for all scalar literal types (tinyint through json, including BINARY).
 -- 2. Validate typeof() for complex types: array, map, struct, bitmap, hll, json.
 -- 3. Validate typeof() with table columns preserves the stored column types.
--- 4. Validate typeof() with BITMAP and HLL aggregate columns from AGGREGATE KEY tables.
+-- 4. Validate typeof() with ordinary BITMAP and HLL columns in Iceberg append tables.
 
 -- query 1
 select typeof(cast(1 as tinyint));
@@ -77,27 +77,35 @@ select typeof(null);
 -- query 24
 -- @skip_result_check=true
 USE ${case_db};
-create table t1 properties("replication_num" = "1") as
-select cast(1 as tinyint) as c1
-,cast(1 as smallint) as c2
-,cast(1 as int) as c3
-,cast(1 as bigint) as c4
-,cast(1 as largeint) as c5
-,cast(1 as decimal(19, 2)) as c6
-,cast(1 as double) as c7
-,cast(1 as float) as c8
-,cast(1 as boolean) as c9
-,cast(1 as char) as c10
-,cast(1 as string) as c11
-,cast(1 as varchar) as c12
-,cast('s' as BINARY) as c13
-,cast('2023-03-07' as date) as c14
-,cast('2023-03-07 11:22:33' as datetime) as c15
-,[1, 2, 3] as c16
-,get_json_object('{"k1":1, "k2":"v2"}', '$.k1') as c17
-,map{1:"apple", 2:"orange", 3:"pear"} as c18
-,struct(1, 2, 3, 4) as c19
-,parse_json('{"a": 1, "b": true}') as c20;
+create table t1 (
+  c1 tinyint,
+  c2 smallint,
+  c3 int,
+  c4 bigint,
+  c5 largeint,
+  c6 decimal(19, 2),
+  c7 decimal(38, 9),
+  c8 decimal(38, 9),
+  c9 boolean,
+  c10 varchar,
+  c11 string,
+  c12 varchar,
+  c13 binary,
+  c14 date,
+  c15 datetime,
+  c16 array<tinyint>,
+  c17 string,
+  c18 map<tinyint, varchar>,
+  c19 struct<col1 tinyint, col2 tinyint, col3 tinyint, col4 tinyint>,
+  c20 json
+)
+TBLPROPERTIES ("format-version" = "3");
+insert into t1 values (
+  NULL, NULL, NULL, NULL, NULL,
+  NULL, NULL, NULL, NULL, NULL,
+  NULL, NULL, NULL, NULL, NULL,
+  NULL, NULL, NULL, NULL, NULL
+);
 
 -- query 25
 USE ${case_db};
@@ -128,12 +136,9 @@ select typeof(c1)
 CREATE TABLE ${case_db}.pv_bitmap (
     dt INT(11) NULL COMMENT "",
     page VARCHAR(10) NULL COMMENT "",
-    user_id bitmap BITMAP_UNION NULL COMMENT ""
-) ENGINE=OLAP
-AGGREGATE KEY(dt, page)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(dt) BUCKETS 1
-PROPERTIES("replication_num" = "1");
+    user_id bitmap NULL COMMENT ""
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 27
 -- @skip_result_check=true
@@ -149,10 +154,9 @@ select typeof(user_id) from pv_bitmap;
 CREATE TABLE ${case_db}.test_uv(
     dt date,
     id int,
-    uv_set hll hll_union
+    uv_set hll
 )
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 30
 -- @skip_result_check=true

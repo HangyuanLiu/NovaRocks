@@ -7,11 +7,11 @@
 -- 1. Create/reset a minimal customer-like table.
 -- 2. Insert deterministic rows spanning all expected regions.
 -- 3. Aggregate by region and order output for stable comparison.
-DROP TABLE IF EXISTS ${case_db}.t_agg_region_distribution;
 CREATE TABLE ${case_db}.t_agg_region_distribution (
     c_custkey INT,
     c_region VARCHAR(32)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_region_distribution VALUES
     (1, 'AFRICA'),

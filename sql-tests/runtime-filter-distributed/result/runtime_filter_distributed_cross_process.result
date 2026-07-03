@@ -1,10 +1,14 @@
+-- query 8
+scenario	row_count	id_sum
+inner_int	3	10
+
 -- query 10
 scenario	row_count	id_sum
 inner_int	3	10
 
 -- query 12
 scenario	row_count	id_sum
-inner_int	3	10
+left_semi_string	3	10
 
 -- query 14
 scenario	row_count	id_sum
@@ -12,7 +16,7 @@ left_semi_string	3	10
 
 -- query 16
 scenario	row_count	id_sum
-left_semi_string	3	10
+multi_column	3	10
 
 -- query 18
 scenario	row_count	id_sum
@@ -20,7 +24,7 @@ multi_column	3	10
 
 -- query 20
 scenario	row_count	id_sum
-multi_column	3	10
+decimal_key	3	10
 
 -- query 22
 scenario	row_count	id_sum
@@ -28,12 +32,8 @@ decimal_key	3	10
 
 -- query 24
 scenario	row_count	id_sum
-decimal_key	3	10
-
--- query 26
-scenario	row_count	id_sum
 empty_build	0	0
 
--- query 28
+-- query 26
 scenario	row_count	id_sum
 empty_build	0	0

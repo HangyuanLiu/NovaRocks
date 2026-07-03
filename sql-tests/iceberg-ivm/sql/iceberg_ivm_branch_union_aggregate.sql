@@ -25,18 +25,16 @@ CREATE TABLE ice_ivm_bunion_${uuid0}.ns_${uuid0}.t1 (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 CREATE TABLE ice_ivm_bunion_${uuid0}.ns_${uuid0}.t2 (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_bunion_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW branch_union_mv_${uuid0}

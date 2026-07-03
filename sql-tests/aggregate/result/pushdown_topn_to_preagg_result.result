@@ -1,10 +1,10 @@
--- query 6
+-- query 5
 city	total_sales
 a	26
 b	12
 c	14
 
--- query 8
+-- query 7
 city	total_sales
 a	26
 b	12

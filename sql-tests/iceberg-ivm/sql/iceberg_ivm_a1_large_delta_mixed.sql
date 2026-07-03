@@ -30,10 +30,9 @@ CREATE TABLE ice_ivm_ldm_${uuid0}.ns_${uuid0}.orders_${uuid0} (
   id     BIGINT NOT NULL,
   region STRING,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version"   = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_ldm_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_mv_${uuid0}

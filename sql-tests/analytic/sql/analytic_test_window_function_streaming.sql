@@ -11,12 +11,8 @@ CREATE TABLE ${case_db}.t1 (
   `v2` int(11) NULL,
   `v3` int(11) NOT NULL,
   `v4` int(11) NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`)
-DISTRIBUTED BY HASH(`v1`) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t1 (v1, v2, v3, v4) values
     (1, 1, 1, NULL),

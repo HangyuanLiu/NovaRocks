@@ -1,12 +1,12 @@
+-- query 11
+scenario	row_count	id_sum
+partitioned_probe	1000	1001000
+
 -- query 13
 scenario	row_count	id_sum
 partitioned_probe	1000	1001000
 
--- query 15
-scenario	row_count	id_sum
-partitioned_probe	1000	1001000
-
--- query 16
+-- query 14
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
@@ -23,7 +23,7 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 6:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count(), sum(p.id)
-  5:HASH JOIN (PARTITIONED, INNER, eq: [p.k = b.k]) stats={rows=45}
+  5:HASH JOIN (PARTITIONED, INNER, eq: [p.k = b.k]) stats={rows=405}
     build runtime filters:
     - filter_id = 0, build_expr = (b.k)
     2:HASH EXCHANGE stats={rows=1800}

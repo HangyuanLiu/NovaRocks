@@ -1,11 +1,11 @@
 -- @tags=aggregate,p5,typedesc,intermediate-state,cross-process
-DROP TABLE IF EXISTS ${case_db}.agg_state_typedesc_contract;
 CREATE TABLE ${case_db}.agg_state_typedesc_contract (
     grp INT,
     k INT,
     v BIGINT,
     d DOUBLE
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.agg_state_typedesc_contract VALUES
     (1, 10, 10, 0.10),
     (1, 11, 20, 0.20),

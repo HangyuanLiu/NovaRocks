@@ -7,12 +7,12 @@
 -- 1. Create/reset analytic source table.
 -- 2. Insert deterministic rows with tie scores.
 -- 3. Compute ranking functions and assert ordered output.
-DROP TABLE IF EXISTS ${case_db}.t_analytic_row_rank_dense;
 CREATE TABLE ${case_db}.t_analytic_row_rank_dense (
     grp VARCHAR(10),
     id INT,
     score INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_analytic_row_rank_dense VALUES
     ('A', 1, 100),

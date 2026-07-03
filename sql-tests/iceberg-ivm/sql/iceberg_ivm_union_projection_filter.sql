@@ -25,18 +25,16 @@ CREATE TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_live (
   id INT NOT NULL,
   name STRING,
   amount INT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 CREATE TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_archive (
   id INT NOT NULL,
   name STRING,
   amount INT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+)
+TBLPROPERTIES ("format-version" = "3",
+  "write.row-lineage" = "true");
 SET CATALOG ice_ivm_union_pf_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW union_pf_mv_${uuid0}

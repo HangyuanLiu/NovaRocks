@@ -7,11 +7,11 @@
 -- 1. Create/reset a minimal lineorder-like table.
 -- 2. Insert deterministic quantity/discount rows with explicit boundaries.
 -- 3. Compute MIN/MAX and compare a single deterministic row.
-DROP TABLE IF EXISTS ${case_db}.t_agg_quantity_discount_ranges;
 CREATE TABLE ${case_db}.t_agg_quantity_discount_ranges (
     lo_quantity INT,
     lo_discount INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_quantity_discount_ranges VALUES
     (1, 0),

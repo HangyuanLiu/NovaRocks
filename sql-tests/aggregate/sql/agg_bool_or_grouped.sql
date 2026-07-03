@@ -7,11 +7,11 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows including NULL.
 -- 3. Aggregate predicate truth values by group and assert output.
-DROP TABLE IF EXISTS ${case_db}.t_agg_bool_or_grouped;
 CREATE TABLE ${case_db}.t_agg_bool_or_grouped (
     g INT,
     v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_agg_bool_or_grouped VALUES
     (1, 10),

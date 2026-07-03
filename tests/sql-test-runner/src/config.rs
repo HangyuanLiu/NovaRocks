@@ -145,7 +145,7 @@ pub(crate) fn insert_placeholder_default(
 pub fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>, suite_name: &str) {
     match suite_name {
         "iceberg" | "iceberg-ddl" | "iceberg-dml" | "iceberg-ivm" | "iceberg-mv-apply"
-        | "iceberg-mv-scheduler" => {
+        | "iceberg-mv-scheduler" | "materialized-view" | "mv-rewrite" => {
             // Keep local suites that exercise Iceberg catalogs aligned with bootstrap
             // defaults so they run out of the box against the MinIO-backed dev setup.
             insert_placeholder_default(variables, "iceberg_catalog_type", "hadoop");
@@ -153,6 +153,20 @@ pub fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>,
                 variables,
                 "iceberg_catalog_warehouse",
                 env_or_default("CATALOG_WAREHOUSE_URI", "s3://novarocks/iceberg-catalog"),
+            );
+            let rest_warehouse_default = env_or_default(
+                "NOVA_ENV_REST_WAREHOUSE_URI",
+                "s3://warehouse/sql-tests-rest",
+            );
+            insert_placeholder_default(
+                variables,
+                "iceberg_rest_uri",
+                env_or_default("NOVAROCKS_ICEBERG_REST_URI", "http://127.0.0.1:8181"),
+            );
+            insert_placeholder_default(
+                variables,
+                "iceberg_rest_warehouse",
+                env_or_default("NOVAROCKS_ICEBERG_REST_WAREHOUSE", &rest_warehouse_default),
             );
         }
         "iceberg-compatibility" => {

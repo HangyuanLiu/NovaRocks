@@ -10,12 +10,8 @@ CREATE TABLE ${case_db}.`t1` (
   `v2` int(11) NULL,
   `v3` int(11) NOT NULL,
   `v4` int(11) NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`)
-DISTRIBUTED BY HASH(`v1`) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.`t1` (v1, v2, v3, v4) values
     (1, 1, 1, NULL),
@@ -86,12 +82,8 @@ CREATE TABLE ${case_db}.`t5` (
   `v4` decimal64(18,5) NOT NULL,
   `v5` decimal64(18,5) NOT NULL,
   `v6` decimal64(18,5) NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`)
-DISTRIBUTED BY HASH(`v1`) BUCKETS 10
-PROPERTIES (
- "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.`t5` (v1, v2, v3, v4, v5, v6)
 SELECT v1, v2, v3,
