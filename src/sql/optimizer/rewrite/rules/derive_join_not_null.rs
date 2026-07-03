@@ -298,7 +298,6 @@ mod tests {
                 .collect(),
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         };
@@ -575,7 +574,6 @@ mod tests {
             }],
             predicates: vec![pred_l_id],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         };
@@ -607,7 +605,6 @@ mod tests {
             }],
             predicates: vec![pred_r_id],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         };

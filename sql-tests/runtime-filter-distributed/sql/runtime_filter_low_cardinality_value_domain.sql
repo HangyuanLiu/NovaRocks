@@ -1,10 +1,7 @@
 -- @order_sensitive=true
 -- @tags=runtime_filter,cross_process,distributed,low-cardinality,dictionary
 -- C5: 1FE+3BE cross-fragment RF over a low-cardinality string probe column
--- must stay value-domain correct while scan-side dictionary values are folded.
-
-DROP TABLE IF EXISTS ${case_db}.rf_dist_lc_probe FORCE;
-DROP TABLE IF EXISTS ${case_db}.rf_dist_lc_build FORCE;
+-- must stay value-domain correct without standalone native dictionary rewrites.
 
 CREATE TABLE ${case_db}.rf_dist_lc_probe (
   status STRING,
@@ -49,7 +46,6 @@ SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_contains=build runtime filters:
 -- @explain_contains=probe runtime filters:
--- @explain_contains=dict=[status]
 SELECT 'rf_on' AS mode, COUNT(*) AS row_count, COALESCE(SUM(p.payload), 0) AS payload_sum
 FROM ${case_db}.rf_dist_lc_probe p
 JOIN ${case_db}.rf_dist_lc_build b ON p.status = b.status

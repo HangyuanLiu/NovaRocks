@@ -76,11 +76,6 @@ pub(crate) fn query_rewrite_pipeline() -> RewritePipeline {
             RewritePhase::StructuralRewrite,
             rules::column_pruning_rules(),
         ),
-        RewriteStage::new(
-            "LowCardinalityDictionaryRewrite",
-            RewritePhase::StructuralRewrite,
-            rules::low_cardinality_dictionary_rules(),
-        ),
     ])
 }
 
@@ -135,7 +130,6 @@ mod tests {
                 "AggregatePushdown",
                 "TagRequiredColumns",
                 "ColumnPruning",
-                "LowCardinalityDictionaryRewrite",
             ]
         );
 
@@ -152,12 +146,10 @@ mod tests {
                 "EliminateUniqueAggregate",
                 "ExistentialApplyToJoin",
                 "JoinPredicateMoveAround",
-                "LowCardinalityDictionaryRewrite",
                 "PruneAggregateColumns",
                 "PruneCTEAnchorColumns",
                 "PruneCTEConsumeColumns",
                 "PruneCTEProduceColumns",
-                "PruneDecodeColumns",
                 "PruneExceptColumns",
                 "PruneFilterColumns",
                 "PruneIntersectColumns",
@@ -227,9 +219,6 @@ mod tests {
         assert!(!is_known_rewrite_rule_name(""));
         assert!(is_known_rewrite_rule_name("AggregatePushdown"));
         assert!(is_known_rewrite_rule_name("PushDownPredicateProject"));
-        assert!(is_known_rewrite_rule_name(
-            "LowCardinalityDictionaryRewrite"
-        ));
         assert!(is_known_rewrite_rule_name("TagRequiredColumns"));
         assert!(is_known_rewrite_rule_name("VariantPathPushdown"));
         assert!(!is_known_rewrite_rule_name("PushFilterThroughProject"));

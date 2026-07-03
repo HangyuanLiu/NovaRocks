@@ -1,7 +1,6 @@
 -- @tags=low-cardinality,dictionary,rewrite
--- Verify ANALYZE FULL + LowCardinalityDictionaryRewrite drives DISTINCT and
--- GROUP BY through a dict-id plan and decodes at the user output boundary.
-DROP TABLE IF EXISTS ${case_db}.dict_rewrite_t;
+-- Verify ANALYZE FULL keeps standalone SQL on plain string plan shape while
+-- GROUP BY results remain correct over dictionary metadata.
 CREATE TABLE ${case_db}.dict_rewrite_t (
   k INT,
   s STRING,
@@ -10,8 +9,6 @@ CREATE TABLE ${case_db}.dict_rewrite_t (
 INSERT INTO ${case_db}.dict_rewrite_t VALUES
   (1, 'a', 10), (2, 'b', 20), (3, 'a', 30), (4, 'c', 40);
 ANALYZE FULL TABLE ${case_db}.dict_rewrite_t;
--- @result_contains=DECODE
--- @result_contains=dict=[s]
--- @skip_result_check=true
-EXPLAIN VERBOSE SELECT DISTINCT s FROM ${case_db}.dict_rewrite_t;
+-- @explain_not_contains=DECODE
+-- @explain_not_contains=dict=[
 SELECT s, SUM(v) FROM ${case_db}.dict_rewrite_t GROUP BY s ORDER BY s;

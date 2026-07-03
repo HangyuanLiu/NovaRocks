@@ -134,13 +134,6 @@ fn collect_plan_column_ids(plan: &LogicalPlanNode, max_id: &mut u32) {
                 }
             }
         }
-        LogicalPlanKind::Decode(decode) => {
-            collect_output_columns(&decode.output_columns, max_id);
-            for mapping in &decode.mappings {
-                collect_column_id(mapping.source_column_id, max_id);
-                collect_column_id(mapping.output_column_id, max_id);
-            }
-        }
         LogicalPlanKind::Repeat(repeat) => {
             for ids in &repeat.repeat_column_ref_ids {
                 for column_id in ids {
@@ -502,7 +495,6 @@ mod tests {
                 }],
                 predicates: Vec::new(),
                 required_columns: None,
-                dict_columns: Vec::new(),
                 variant_columns: Vec::new(),
                 mv_rewritten_from: None,
             }),
@@ -777,7 +769,6 @@ mod tests {
                 ],
                 predicates: Vec::new(),
                 required_columns: None,
-                dict_columns: Vec::new(),
                 variant_columns: Vec::new(),
                 mv_rewritten_from: None,
             }),
@@ -1161,7 +1152,6 @@ mod tests {
                 ],
                 predicates: Vec::new(),
                 required_columns: None,
-                dict_columns: Vec::new(),
                 variant_columns: Vec::new(),
                 mv_rewritten_from: None,
             }),

@@ -328,7 +328,7 @@ impl DictionaryQueryProvider {
                 }))
             }
             // Metadata tables, IVM delta scans, IMV pinned-version placeholders,
-            // and IMV refresh target scans never participate in dictionary rewriting.
+            // and IMV refresh target scans do not have dictionary owners.
             ScanSource::IcebergMetadataTable { .. }
             | ScanSource::IcebergDeltaTable { .. }
             | ScanSource::IcebergVersionTable { .. }
@@ -361,8 +361,7 @@ impl QueryDictionaryProvider for DictionaryQueryProvider {
         // change) advances the table's current snapshot or schema id, after
         // which the dictionary may no longer cover the visible string set. A
         // watermark mismatch therefore means the snapshot is stale and must
-        // NOT drive the rewrite (encoding an uncovered value would silently
-        // map it to the null/0 id). This is conservative per the
+        // not be returned to callers. This is conservative per the
         // low-cardinality design — we do not try to prove a delete-only commit
         // is safe; ANALYZE FULL must be re-run to refresh the dictionary.
         // (StarRocks tables use the tablet-version watermark maintained by
@@ -556,12 +555,9 @@ mod tests {
         );
     }
 
-    /// Iceberg scans now participate in the low-cardinality dictionary rewrite
-    /// because Option A (iceberg scan execution-layer dictionary-encode support)
-    /// has landed. `DictionaryQueryProvider::owner_for` maps `IcebergDataFiles`
-    /// to a `DictionaryOwner::IcebergTable`, so when an Active iceberg
-    /// dictionary snapshot exists in the metadata store,
-    /// `load_active_snapshot` must return it (not `None`).
+    /// `DictionaryQueryProvider::owner_for` maps `IcebergDataFiles` to a
+    /// `DictionaryOwner::IcebergTable`, so `load_active_snapshot` returns an
+    /// Active iceberg dictionary snapshot when one exists in the metadata store.
     #[test]
     fn dictionary_provider_loads_iceberg_data_files_snapshot() {
         use crate::sql::catalog::{
@@ -575,8 +571,8 @@ mod tests {
         let state = Arc::new(state);
 
         // Persist an Active iceberg dictionary snapshot that matches the
-        // iceberg table identity used below. If owner_for still mapped
-        // IcebergDataFiles to an iceberg owner, this snapshot would be found.
+        // iceberg table identity used below. Since owner_for maps
+        // IcebergDataFiles to an iceberg owner, this snapshot should be found.
         let owner = DictionaryOwner::IcebergTable {
             catalog: "test_catalog".to_string(),
             namespace: "test_db".to_string(),
@@ -641,8 +637,7 @@ mod tests {
         let loaded = provider
             .load_active_snapshot(&table, "test_db", "s")
             .expect("load_active_snapshot returns Ok");
-        let snapshot =
-            loaded.expect("iceberg scans support dict execution (Option A); snapshot must load");
+        let snapshot = loaded.expect("iceberg dictionary snapshot must load");
         assert_eq!(snapshot.column_name, "s");
         assert_eq!(snapshot.dictionary_id, 99);
     }
@@ -650,8 +645,7 @@ mod tests {
     /// Iceberg snapshot-watermark staleness: a dictionary built for snapshot 7
     /// must NOT be used once the table's current snapshot advances (e.g. after
     /// an INSERT), even though the persisted snapshot is still `Active`. This
-    /// keeps a post-write query from driving the rewrite off a stale dict
-    /// (which would encode the new, uncovered values to the null/0 id).
+    /// keeps a post-write query from loading a stale dictionary snapshot.
     #[test]
     fn dictionary_provider_skips_stale_iceberg_snapshot_after_table_advances() {
         use crate::sql::catalog::{

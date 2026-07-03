@@ -3,7 +3,7 @@
 use crate::sql::analysis::{OutputColumn, SortItem};
 use crate::sql::optimizer::operator::{
     AggregateOutputLayout, ApplyOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
-    DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp, LimitOp,
+    ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp, LimitOp,
     LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScalarAggregateSpec, ScanOp,
     SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
 };
@@ -16,11 +16,11 @@ use crate::sql::planner::optimizer_bridge::scalar::{
 };
 use crate::sql::planner::plan::{
     LogicalAggregateNode, LogicalApplyNode, LogicalAssertOneRowNode, LogicalCTEAnchorNode,
-    LogicalCTEConsumeNode, LogicalCTEProduceNode, LogicalDecodeNode, LogicalExceptNode,
-    LogicalFilterNode, LogicalGenerateSeriesNode, LogicalImvDeltaNode, LogicalImvVersionNode,
-    LogicalIntersectNode, LogicalJoinNode, LogicalLimitNode, LogicalPlanKind, LogicalPlanNode,
-    LogicalProjectNode, LogicalRepeatNode, LogicalScanNode, LogicalSortNode,
-    LogicalTableFunctionNode, LogicalUnionNode, LogicalValuesNode, LogicalWindowNode,
+    LogicalCTEConsumeNode, LogicalCTEProduceNode, LogicalExceptNode, LogicalFilterNode,
+    LogicalGenerateSeriesNode, LogicalImvDeltaNode, LogicalImvVersionNode, LogicalIntersectNode,
+    LogicalJoinNode, LogicalLimitNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode,
+    LogicalRepeatNode, LogicalScanNode, LogicalSortNode, LogicalTableFunctionNode,
+    LogicalUnionNode, LogicalValuesNode, LogicalWindowNode,
 };
 
 /// Bridge 1: convert a `LogicalPlanNode` tree into an `OptExpr` tree, interning
@@ -101,7 +101,6 @@ fn logical_plan_to_opt_expr_unchecked(
                 columns: node.columns.clone(),
                 predicates: intern_exprs(scalars, &node.predicates),
                 required_columns: node.required_columns.clone(),
-                dict_columns: node.dict_columns.clone(),
                 variant_columns: node.variant_columns.clone(),
                 mv_rewritten_from: None,
             });
@@ -323,15 +322,6 @@ fn logical_plan_to_opt_expr_unchecked(
             OptExpr::new(op, vec![child])
         }
 
-        LogicalPlanKind::Decode(node) => {
-            let child = logical_plan_to_opt_expr_unchecked(plan.unary_input(), scalars);
-            let op = Operator::LogicalDecode(DecodeOp {
-                mappings: node.mappings.clone(),
-                output_columns: node.output_columns.clone(),
-            });
-            OptExpr::new(op, vec![child])
-        }
-
         LogicalPlanKind::AssertOneRow(node) => {
             let child = logical_plan_to_opt_expr_unchecked(plan.unary_input(), scalars);
             let op = Operator::LogicalAssertOneRow(AssertOneRowOp {
@@ -417,7 +407,6 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
             columns: op.columns,
             predicates: materialize_exprs(arena, &op.predicates),
             required_columns: op.required_columns,
-            dict_columns: op.dict_columns,
             variant_columns: op.variant_columns,
             mv_rewritten_from: None,
         }),
@@ -540,10 +529,6 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
             output_columns: op.output_columns,
             producer_column_ids: op.producer_column_ids,
         }),
-        Operator::LogicalDecode(op) => LogicalPlanKind::Decode(LogicalDecodeNode {
-            mappings: op.mappings,
-            output_columns: op.output_columns,
-        }),
         Operator::LogicalApply(op) => {
             // Apply is expected to be eliminated by the SubqueryRewrite stage
             // before opt_expr_to_logical_plan is called. If it survives, we
@@ -655,7 +640,6 @@ mod tests {
                 columns: dummy_output_columns(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: Some("mv_t1".to_string()),
             }),
@@ -795,7 +779,6 @@ mod tests {
                 columns: dummy_output_columns(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -854,7 +837,6 @@ mod tests {
                 ],
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![variant_descriptor.clone()],
                 mv_rewritten_from: None,
             }),
@@ -902,7 +884,6 @@ mod tests {
                 columns: dummy_output_columns(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -958,7 +939,6 @@ mod tests {
                 columns: dummy_output_columns(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),

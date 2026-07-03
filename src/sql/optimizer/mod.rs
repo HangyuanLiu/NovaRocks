@@ -176,8 +176,7 @@ fn optimize_with_root_property(
 
     // 1. Query logical rewrite pipeline. The ordered stages preserve the
     //    legacy-safe sequence: pushdown → join reorder → pushdown →
-    //    variant path pushdown → aggregate pushdown → column pruning →
-    //    low-cardinality dict rewrite.
+    //    variant path pushdown → aggregate pushdown → column pruning.
     let session_settings = options::current_session_optimizer_settings();
     let options = options::OptimizerOptions::from_session(&session_settings);
     let mut rewrite_ctx =
@@ -344,7 +343,6 @@ fn optimizer_rejects_unbound_scan_stats() {
         }],
         predicates: vec![],
         required_columns: None,
-        dict_columns: vec![],
         variant_columns: vec![],
         mv_rewritten_from: None,
     }));
@@ -356,8 +354,8 @@ fn optimizer_rejects_unbound_scan_stats() {
     );
 }
 
-/// Resolve which dictionary provider should drive the
-/// `LowCardinalityDictionaryRewrite` rule for this `optimize()` call.
+/// Resolve which dictionary provider should be attached to the rewrite context
+/// for this `optimize()` call.
 ///
 /// Precedence: an explicit `parameter` (passed by the caller) wins over
 /// any `with_dictionary_provider` TLS binding. The parameter wins even
@@ -1244,7 +1242,6 @@ mod is_known_rule_name_tests {
                 columns: vec![base_a.clone(), base_b.clone(), base_v.clone()],
                 predicates: vec![query_predicate],
                 required_columns: Some(vec!["a".to_string(), "b".to_string()]),
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             },
@@ -1290,7 +1287,6 @@ mod is_known_rule_name_tests {
                 columns: vec![mv_a.clone(), mv_b.clone(), mv_v.clone()],
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             },
@@ -1426,7 +1422,6 @@ mod is_known_rule_name_tests {
                 columns: vec![s_col.clone()],
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1492,11 +1487,16 @@ mod is_known_rule_name_tests {
         opt_expr_to_logical_plan(opt_result, &arena)
     }
 
-    fn contains_decode(plan: &LogicalPlanNode) -> bool {
-        match &plan.kind {
-            LogicalPlanKind::Decode(_) => true,
-            _ => plan.children.iter().any(contains_decode),
-        }
+    fn assert_no_native_dict_rewrite(rewritten: &LogicalPlanNode, context: &str) {
+        let LogicalPlanKind::Aggregate(_) = &rewritten.kind else {
+            panic!("{context}: expected aggregate root, got {rewritten:?}")
+        };
+        let LogicalPlanKind::Scan(_) = &rewritten.unary_input().kind else {
+            panic!(
+                "{context}: expected scan child, got {:?}",
+                rewritten.unary_input()
+            )
+        };
     }
 
     #[test]
@@ -1504,50 +1504,23 @@ mod is_known_rule_name_tests {
         // Sanity: ensure TLS is unset for this thread.
         assert!(current_dictionary_provider().is_none());
         let rewritten = rewrite_with(None);
-        assert!(
-            !contains_decode(&rewritten),
-            "no provider → no Decode boundary"
-        );
-        let LogicalPlanKind::Aggregate(_) = &rewritten.kind else {
-            panic!("expected aggregate root")
-        };
-        let LogicalPlanKind::Scan(scan) = &rewritten.unary_input().kind else {
-            panic!("expected scan child")
-        };
-        assert!(scan.dict_columns.is_empty());
+        assert_no_native_dict_rewrite(&rewritten, "no provider");
     }
 
     #[test]
-    fn optimize_with_tls_provider_rewrites() {
+    fn optimize_with_tls_provider_does_not_rewrite_after_legacy_removal() {
         let provider: Arc<dyn QueryDictionaryProvider> = Arc::new(AlwaysSomeProvider);
         let rewritten = with_dictionary_provider(provider, || rewrite_with(None));
-        // Plan must contain a Decode boundary above the aggregate.
-        assert!(
-            matches!(&rewritten.kind, LogicalPlanKind::Decode(_)),
-            "TLS provider must drive the rewrite, got {rewritten:?}"
-        );
+        assert_no_native_dict_rewrite(&rewritten, "TLS provider");
     }
 
     #[test]
-    fn optimize_parameter_overrides_tls() {
-        // TLS provider would dict-encode. The explicit parameter is a
-        // provider that always returns None — the parameter must win,
-        // so the plan is left untouched.
+    fn optimize_parameter_provider_does_not_rewrite_after_legacy_removal() {
         let tls_provider: Arc<dyn QueryDictionaryProvider> = Arc::new(AlwaysSomeProvider);
         let param_provider: Arc<dyn QueryDictionaryProvider> = Arc::new(AlwaysNoneProvider);
         let rewritten =
             with_dictionary_provider(tls_provider, || rewrite_with(Some(param_provider.clone())));
-        assert!(
-            !contains_decode(&rewritten),
-            "parameter must override TLS — no Decode expected"
-        );
-        let LogicalPlanKind::Aggregate(_) = &rewritten.kind else {
-            panic!("expected aggregate root, got {rewritten:?}")
-        };
-        let LogicalPlanKind::Scan(scan) = &rewritten.unary_input().kind else {
-            panic!("expected scan child, got {:?}", rewritten.unary_input())
-        };
-        assert!(scan.dict_columns.is_empty());
+        assert_no_native_dict_rewrite(&rewritten, "parameter provider");
     }
 
     #[test]

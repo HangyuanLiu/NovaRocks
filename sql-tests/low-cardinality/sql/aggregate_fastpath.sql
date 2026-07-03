@@ -1,7 +1,6 @@
 -- @tags=low-cardinality,dictionary,aggregate
--- C3: aggregate may keep a single dict group-by slot encoded internally.
--- Results must match flat Utf8 semantics, including NULL group handling.
-DROP TABLE IF EXISTS ${case_db}.dict_agg_fastpath_t;
+-- Verify aggregate results over low-cardinality metadata match flat Utf8
+-- semantics, including NULL group handling.
 CREATE TABLE ${case_db}.dict_agg_fastpath_t (
   k INT,
   status STRING,
@@ -22,12 +21,12 @@ FROM ${case_db}.dict_agg_fastpath_t
 GROUP BY status
 ORDER BY status IS NOT NULL, status;
 
--- Mixed dict+plain grouping is deliberately hydrated/fallback in C3 first cut.
+-- Mixed string grouping keeps plain result semantics.
 SELECT status, region, COUNT(*) AS c
 FROM ${case_db}.dict_agg_fastpath_t
 GROUP BY status, region
 ORDER BY status IS NOT NULL, status, region;
 
--- min/max on dict string remains correctness-first fallback.
+-- min/max on low-cardinality strings remains value-domain correct.
 SELECT MIN(status), MAX(status)
 FROM ${case_db}.dict_agg_fastpath_t;

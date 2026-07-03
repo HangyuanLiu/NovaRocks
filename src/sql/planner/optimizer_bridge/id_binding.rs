@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
-    ChangeEventExpandOp, DecodeOp, GenerateSeriesOp, Operator, PhysicalDistributionOp,
+    ChangeEventExpandOp, GenerateSeriesOp, Operator, PhysicalDistributionOp,
     PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp,
     TableFunctionOp, WindowOp,
 };
@@ -100,7 +100,6 @@ fn verify_node(
         Operator::PhysicalChangeEventExpand(op) => {
             verify_change_event_expand(op, &child_outputs, scalars)
         }
-        Operator::PhysicalDecode(op) => verify_decode(op, &child_outputs),
 
         Operator::PhysicalUnion(op) => {
             Ok(output_ids(op.output_columns.iter().map(|c| c.column_id)))
@@ -386,25 +385,6 @@ fn verify_change_event_expand(
         }
     }
     Ok(outputs)
-}
-
-fn verify_decode(
-    op: &DecodeOp,
-    child_outputs: &[HashSet<ColumnId>],
-) -> Result<HashSet<ColumnId>, String> {
-    let input = only_child(child_outputs, "PhysicalDecode")?;
-    let output_ids = output_ids(op.output_columns.iter().map(|c| c.column_id));
-    for mapping in &op.mappings {
-        verify_input_id(mapping.source_column_id, input, "PhysicalDecode source")?;
-        verify_output_id(mapping.output_column_id, "PhysicalDecode output")?;
-        if !output_ids.contains(&mapping.output_column_id) {
-            return Err(format!(
-                "PhysicalDecode mapping output ColumnId({}) is not in Decode output columns",
-                mapping.output_column_id.0
-            ));
-        }
-    }
-    Ok(output_ids)
 }
 
 fn verify_generate_series(op: &GenerateSeriesOp) -> Result<HashSet<ColumnId>, String> {

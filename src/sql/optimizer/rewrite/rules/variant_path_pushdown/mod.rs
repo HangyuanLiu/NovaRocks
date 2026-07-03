@@ -110,7 +110,6 @@ mod tests {
                     columns: vec![source_column.clone()],
                     predicates: vec![],
                     required_columns: None,
-                    dict_columns: vec![],
                     variant_columns: vec![],
                     mv_rewritten_from: None,
                 }),
@@ -618,7 +617,6 @@ mod tests {
             columns: vec![source_column],
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         }));

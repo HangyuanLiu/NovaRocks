@@ -57,7 +57,6 @@ impl BridgeCtx<'_> {
                 columns: op.columns.clone(),
                 predicates: materialize_exprs(self.scalars, &op.predicates),
                 required_columns: op.required_columns.clone(),
-                dict_columns: op.dict_columns.clone(),
                 variant_columns: op.variant_columns.clone(),
                 mv_rewritten_from: op.mv_rewritten_from.clone(),
             })),
@@ -164,10 +163,6 @@ impl BridgeCtx<'_> {
                     subquery_text: op.subquery_text.clone(),
                 }))
             }
-            Operator::PhysicalDecode(op) => Ok(PhysicalPlanKind::Decode(PlanDecodeNode {
-                mappings: op.mappings.clone(),
-                output_columns: op.output_columns.clone(),
-            })),
             Operator::PhysicalRepeat(op) => Ok(PhysicalPlanKind::Repeat(PlanRepeatNode {
                 repeat_column_ref_list: op.repeat_column_ref_list.clone(),
                 repeat_column_ref_ids: op.repeat_column_ref_ids.clone(),
@@ -313,7 +308,6 @@ fn validate_shape(node: &OptimizerPhysicalNode) -> Result<(), String> {
         | Operator::PhysicalTopN(_)
         | Operator::PhysicalHashAggregate(_)
         | Operator::PhysicalAssertOneRow(_)
-        | Operator::PhysicalDecode(_)
         | Operator::PhysicalRepeat(_)
         | Operator::PhysicalChangeEventExpand(_)
         | Operator::PhysicalWindow(_)
@@ -401,7 +395,6 @@ fn operator_name(op: &Operator) -> &'static str {
         Operator::PhysicalValues(_) => "PhysicalValues",
         Operator::PhysicalGenerateSeries(_) => "PhysicalGenerateSeries",
         Operator::PhysicalTableFunction(_) => "PhysicalTableFunction",
-        Operator::PhysicalDecode(_) => "PhysicalDecode",
         Operator::PhysicalAssertOneRow(_) => "PhysicalAssertOneRow",
         _ => "LogicalOperator",
     }

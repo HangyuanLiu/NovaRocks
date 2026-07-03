@@ -579,7 +579,6 @@ mod tests {
                 columns: vec![output_column(10, "k", DataType::Int64, false)],
                 predicates: Vec::new(),
                 required_columns: None,
-                dict_columns: Vec::new(),
                 variant_columns: Vec::new(),
                 mv_rewritten_from: None,
             }),

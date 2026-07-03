@@ -16,11 +16,11 @@ use crate::sql::planner::optimizer_bridge::scalar::{
 };
 use crate::sql::planner::plan::{
     LogicalAggregateNode, LogicalApplyNode, LogicalAssertOneRowNode, LogicalCTEAnchorNode,
-    LogicalCTEConsumeNode, LogicalCTEProduceNode, LogicalDecodeNode, LogicalExceptNode,
-    LogicalFilterNode, LogicalGenerateSeriesNode, LogicalImvDeltaNode, LogicalImvVersionNode,
-    LogicalIntersectNode, LogicalJoinNode, LogicalLimitNode, LogicalPlanKind, LogicalPlanNode,
-    LogicalProjectNode, LogicalRepeatNode, LogicalScanNode, LogicalSortNode,
-    LogicalTableFunctionNode, LogicalUnionNode, LogicalValuesNode, LogicalWindowNode,
+    LogicalCTEConsumeNode, LogicalCTEProduceNode, LogicalExceptNode, LogicalFilterNode,
+    LogicalGenerateSeriesNode, LogicalImvDeltaNode, LogicalImvVersionNode, LogicalIntersectNode,
+    LogicalJoinNode, LogicalLimitNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode,
+    LogicalRepeatNode, LogicalScanNode, LogicalSortNode, LogicalTableFunctionNode,
+    LogicalUnionNode, LogicalValuesNode, LogicalWindowNode,
 };
 
 /// Materialise an `OptExpr` subtree into a `LogicalPlanNode`, converting all
@@ -43,7 +43,6 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             columns: op.columns.clone(),
             predicates: materialize_exprs(arena, &op.predicates),
             required_columns: op.required_columns.clone(),
-            dict_columns: op.dict_columns.clone(),
             variant_columns: op.variant_columns.clone(),
             mv_rewritten_from: None,
         }),
@@ -197,11 +196,6 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             grouping_fn_arg_ids: op.grouping_fn_arg_ids.clone(),
             grouping_fn_ids: op.grouping_fn_ids.clone(),
             virtual_tuple_id: None,
-        }),
-
-        Operator::LogicalDecode(op) => LogicalPlanKind::Decode(LogicalDecodeNode {
-            mappings: op.mappings.clone(),
-            output_columns: op.output_columns.clone(),
         }),
 
         Operator::LogicalImvDelta(op) => LogicalPlanKind::ImvDelta(LogicalImvDeltaNode {

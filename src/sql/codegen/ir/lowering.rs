@@ -43,8 +43,7 @@ use crate::sql::codegen::{
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::operator::{
-    AggMode, AssertOneRowOp, DecodeOp, GenerateSeriesOp, JoinDistribution, RepeatOp,
-    ScanDictionaryColumn, TopNPhase,
+    AggMode, AssertOneRowOp, GenerateSeriesOp, JoinDistribution, RepeatOp, TopNPhase,
 };
 use crate::sql::optimizer::property::OrderingSpec;
 use crate::sql::planner::optimizer_bridge::property::{
@@ -104,10 +103,6 @@ pub(crate) fn lower_distributed_plan(
             &lowered.scope,
             &fragment.output_columns,
         )?;
-        let query_global_dicts = state
-            .query_global_dicts_per_fragment
-            .remove(&fragment.fragment_id)
-            .filter(|dicts| !dicts.is_empty());
         prepared_fragments.push((
             fragment,
             lowered,
@@ -115,7 +110,6 @@ pub(crate) fn lower_distributed_plan(
             output_exprs,
             output_columns,
             root_node_id,
-            query_global_dicts,
         ));
     }
 
@@ -128,15 +122,8 @@ pub(crate) fn lower_distributed_plan(
     )?;
 
     let mut fragment_results = Vec::with_capacity(prepared_fragments.len());
-    for (
-        fragment,
-        lowered,
-        output_sink,
-        output_exprs,
-        output_columns,
-        root_node_id,
-        query_global_dicts,
-    ) in prepared_fragments
+    for (fragment, lowered, output_sink, output_exprs, output_columns, root_node_id) in
+        prepared_fragments
     {
         let boundary_schemas = vec![result_root_boundary_schema_report(
             fragment.fragment_id,
@@ -155,7 +142,7 @@ pub(crate) fn lower_distributed_plan(
             boundary_schemas,
             cte_id: fragment.cte_id,
             cte_exchange_nodes: fragment.cte_exchange_nodes.clone(),
-            query_global_dicts,
+            query_global_dicts: None,
             query_global_dict_exprs: None,
         });
     }
@@ -1092,11 +1079,6 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     fn desc_builder(&mut self) -> &mut DescriptorTableBuilder;
     fn scan_tables(&mut self) -> &mut Vec<nodes::PlannedScanTable>;
     fn fragment_stack(&self) -> &[FragmentId];
-    fn query_global_dicts_per_fragment(
-        &mut self,
-    ) -> &mut HashMap<FragmentId, Vec<crate::thrift::data::TGlobalDict>>;
-    fn slot_to_global_dict(&self) -> &HashMap<i32, crate::thrift::data::TGlobalDict>;
-    fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::thrift::data::TGlobalDict>;
     fn rf_probe_targets(&mut self) -> &mut HashMap<i32, Vec<RfProbeTarget>>;
     fn rf_all_filters(
         &mut self,
@@ -1132,36 +1114,6 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     fn refresh_scan_table_for_codegen(&self, table: &TableDef) -> Result<TableDef, String> {
         refresh_scan_table_for_codegen(self.mv_refresh_ctx(), table)
     }
-
-    fn propagate_dict_to_slot(&mut self, source_slot_id: i32, new_slot_id: i32) {
-        if source_slot_id == new_slot_id {
-            return;
-        }
-        let Some(source_dict) = self.slot_to_global_dict().get(&source_slot_id).cloned() else {
-            return;
-        };
-        let new_dict = crate::thrift::data::TGlobalDict::new(
-            Some(new_slot_id),
-            source_dict.strings.clone(),
-            source_dict.ids.clone(),
-            source_dict.version,
-        );
-        let fragments: Vec<FragmentId> = if self.fragment_stack().is_empty() {
-            self.current_fragment_id()
-                .ok()
-                .map(|fragment_id| vec![fragment_id])
-                .unwrap_or_default()
-        } else {
-            self.fragment_stack().to_vec()
-        };
-        for fragment_id in fragments {
-            self.query_global_dicts_per_fragment()
-                .entry(fragment_id)
-                .or_default()
-                .push(new_dict.clone());
-        }
-        self.slot_to_global_dict_mut().insert(new_slot_id, new_dict);
-    }
 }
 
 pub(crate) struct OwnedLoweringState<'a> {
@@ -1171,8 +1123,6 @@ pub(crate) struct OwnedLoweringState<'a> {
     scan_tables: Vec<nodes::PlannedScanTable>,
     next_slot_id: Rc<RefCell<i32>>,
     fragment_stack: Vec<FragmentId>,
-    query_global_dicts_per_fragment: HashMap<FragmentId, Vec<crate::thrift::data::TGlobalDict>>,
-    slot_to_global_dict: HashMap<i32, crate::thrift::data::TGlobalDict>,
     rf_probe_targets: HashMap<i32, Vec<RfProbeTarget>>,
     rf_all_filters: HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>,
     rf_build_targets: Vec<(i32, i32, FragmentId)>,
@@ -1207,8 +1157,6 @@ impl<'a> OwnedLoweringState<'a> {
             scan_tables: Vec::new(),
             next_slot_id: Rc::new(RefCell::new(1)),
             fragment_stack: Vec::new(),
-            query_global_dicts_per_fragment: HashMap::new(),
-            slot_to_global_dict: HashMap::new(),
             rf_probe_targets: HashMap::new(),
             rf_all_filters: HashMap::new(),
             rf_build_targets: Vec::new(),
@@ -1320,20 +1268,6 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
 
     fn fragment_stack(&self) -> &[FragmentId] {
         &self.fragment_stack
-    }
-
-    fn query_global_dicts_per_fragment(
-        &mut self,
-    ) -> &mut HashMap<FragmentId, Vec<crate::thrift::data::TGlobalDict>> {
-        &mut self.query_global_dicts_per_fragment
-    }
-
-    fn slot_to_global_dict(&self) -> &HashMap<i32, crate::thrift::data::TGlobalDict> {
-        &self.slot_to_global_dict
-    }
-
-    fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::thrift::data::TGlobalDict> {
-        &mut self.slot_to_global_dict
     }
 
     fn rf_probe_targets(&mut self) -> &mut HashMap<i32, Vec<RfProbeTarget>> {
@@ -1512,9 +1446,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             crate::sql::planner::DistributedPayload::Physical(
                 crate::sql::planner::plan::PhysicalPlanKind::AssertOneRow(assert_one_row),
             ) => self.lower_assert_one_row_node(node, assert_one_row)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Decode(decode),
-            ) => self.lower_decode_node(node, decode)?,
             crate::sql::planner::DistributedPayload::Physical(
                 crate::sql::planner::plan::PhysicalPlanKind::Repeat(repeat),
             ) => self.lower_repeat_node(node, repeat)?,
@@ -2001,33 +1932,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             tuple_ids: child.tuple_ids,
             output_columns: child.output_columns,
             ordering: child.ordering,
-        })
-    }
-
-    fn lower_decode_node(
-        &mut self,
-        node: &crate::sql::planner::DistributedNode,
-        decode: &super::kind::DistributedDecodeNode,
-    ) -> Result<LoweredDistributedNode, String> {
-        if node.children.len() != 1 {
-            return Err(format!(
-                "DistributedPlan Decode node_id={} expected 1 child, got {}",
-                node.node_id,
-                node.children.len()
-            ));
-        }
-        let child = self.lower_node(&node.children[0])?;
-        let tuple_id = first_tuple_id(node, "Decode")?;
-        let op = decode_node_to_physical_op(decode);
-        let (plan_node, scope) = self.lower_decode(node.node_id, tuple_id, &op, &child.scope)?;
-        let mut plan_nodes = vec![plan_node];
-        plan_nodes.extend(child.plan_nodes);
-        Ok(LoweredDistributedNode {
-            plan_nodes,
-            scope,
-            tuple_ids: vec![tuple_id],
-            output_columns: decode.output_columns.clone(),
-            ordering: OrderingSpec::Any,
         })
     }
 
@@ -2800,55 +2704,15 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 .add_table_for_scan(table_id, &op.database, &table);
         }
 
-        // Build a quick lookup so the column registration loop below can
-        // recognise base-table columns that the dict rewriter retargeted
-        // to a hidden `__nr_dict_<t>_<c>` Int32 slot. For those columns
-        // we allocate ONE slot (at the source column's storage position)
-        // named after the dict column and typed Int32 — keeping the
-        // single-slot-per-column contract the StarRocks lake scan
-        // expects (see `src/lower/node/lake_scan.rs`'s
-        // `dict_int_to_string` self-map handling).
-        let dict_source_to_target: HashMap<String, &ScanDictionaryColumn> = op
-            .dict_columns
-            .iter()
-            .map(|dc| (dc.source_column.to_ascii_lowercase(), dc))
-            .collect();
-        // Track dict slot ids by source column so the second loop over
-        // `op.dict_columns` doesn't re-allocate a slot for the same
-        // column. Also accumulates the `(dict_slot_id, dict_col)` pairs
-        // that feed the TGlobalDict / dict_string_id_to_int_ids payload
-        // construction further down.
-        let mut dict_slot_for_source: HashMap<String, i32> = HashMap::new();
-        let mut dict_slot_to_dict: Vec<(i32, &ScanDictionaryColumn)> = Vec::new();
         let mut physical_slot_by_column: HashMap<String, i32> = HashMap::new();
         for (idx, col) in table.columns.iter().enumerate() {
-            // The dict rewriter renames the source string column to the
-            // dict column name in `op.columns` / `op.required_columns`,
-            // so check membership using BOTH names when a dict mapping
-            // exists for this base column.
-            let dict_target = dict_source_to_target.get(&col.name.to_lowercase());
             if let Some(ref req) = required {
-                let keep = req.contains(&col.name.to_lowercase())
-                    || dict_target
-                        .map(|dc| req.contains(&dc.dict_column.to_lowercase()))
-                        .unwrap_or(false);
-                if !keep {
+                if !req.contains(&col.name.to_lowercase()) {
                     continue;
                 }
             }
             let slot_id = state.alloc_slot();
-            // Bug B contract: slot keeps the SOURCE column's storage
-            // name (so the lake scan finds the column by name in the
-            // tablet schema) and Int32 type (the BE reads it as Utf8 via
-            // `build_scan_schema_for_global_dict_encoding` when a
-            // TGlobalDict is registered for the slot, then encodes
-            // string -> dict id). The dict_column NAME is exposed only
-            // in the FE codegen scope below, NOT in the slot descriptor
-            // — the BE never sees `__nr_dict_t_s` as a column name.
-            let slot_type = match dict_target {
-                Some(_) => DataType::Int32,
-                None => col.data_type.clone(),
-            };
+            let slot_type = col.data_type.clone();
             let nullable = col.nullable;
             let field_id = iceberg_field_id_for_column(&table, &col.name);
             state.desc_builder().add_slot_with_field_id(
@@ -2874,15 +2738,11 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             // what lets the optimizer's `DistributionSpec::HashPartitioned`
             // (which is now a `Vec<ColumnId>`) resolve directly against the
             // scan's child scope without having to round-trip through the
-            // display name. The dict-renamed `OutputColumn` carries the
-            // source column's id so the lookup still hits.
-            let output_column = op.columns.iter().find(|oc| {
-                let lc = oc.name.to_ascii_lowercase();
-                lc == col.name.to_ascii_lowercase()
-                    || dict_target
-                        .map(|dc| lc == dc.dict_column.to_ascii_lowercase())
-                        .unwrap_or(false)
-            });
+            // display name.
+            let output_column = op
+                .columns
+                .iter()
+                .find(|oc| oc.name.eq_ignore_ascii_case(&col.name));
             let col_id = output_column
                 .map(|oc| oc.column_id)
                 .unwrap_or(crate::sql::column_id::ColumnId::UNSET);
@@ -2895,22 +2755,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 col.name.clone(),
                 binding.clone(),
             );
-            // Also register the dict column name in the scope so the
-            // post-rewrite `ColumnRef("__nr_dict_t_s")` resolves to this
-            // same slot. The scan tuple holds a SINGLE slot for this
-            // column; both names refer to it.
-            if let Some(dict_col) = dict_target {
-                scope.add_column_with_id(
-                    col_id,
-                    qualifier.map(|s| s.to_string()),
-                    dict_col.dict_column.clone(),
-                    binding.clone(),
-                );
-            }
-            if let Some(dict_col) = dict_target {
-                dict_slot_for_source.insert(col.name.to_ascii_lowercase(), slot_id);
-                dict_slot_to_dict.push((slot_id, *dict_col));
-            }
         }
 
         // Iceberg metadata pseudo-columns: register in ExprScope and emit as
@@ -3049,39 +2893,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             conjuncts
         };
 
-        // Dict-encoded scan columns (Task 5/7/8 plan hints). The slot for
-        // each dict column was already allocated in the table-column loop
-        // above (where its storage `col_pos` is recorded). Here we just
-        // build the BE-facing payload: a self-map `dict_slot → dict_slot`
-        // for `TLakeScanNode.dict_string_id_to_int_ids` (the BE replaces
-        // the dict slot in the scan layout with this id, so the storage
-        // reader keeps the same slot) and a TGlobalDict for each. The
-        // dict_columns hint is still consulted later to detect a planning
-        // bug on non-StarRocks scans. `dict_columns` is empty in all
-        // production paths today.
-        let mut string_to_dict_slot: BTreeMap<i32, i32> = BTreeMap::new();
-        for dict_col in &op.dict_columns {
-            let dict_slot_id = dict_slot_for_source
-                .get(&dict_col.source_column.to_ascii_lowercase())
-                .copied()
-                .ok_or_else(|| {
-                    format!(
-                        "scan `{}.{}` dict_columns references unknown source column `{}`",
-                        op.database, table.name, dict_col.source_column
-                    )
-                })?;
-            // Self-map: the BE's `lake_scan.rs` rewrites every dict int
-            // slot in the layout to its mapped string slot before issuing
-            // the storage read. With the FE-only fix the FE no longer
-            // emits a separate string slot — the dict slot itself is the
-            // storage slot, declared Int32 in desc_tbl but read as Utf8
-            // via the query global dict path (see
-            // `build_scan_schema_for_global_dict_encoding`). A self-map
-            // keeps the BE's layout swap a no-op while preserving the
-            // "dict-encoded" semantics on the FE/wire contract.
-            string_to_dict_slot.insert(dict_slot_id, dict_slot_id);
-        }
-
         let resolved = ResolvedTable {
             database: op.database.clone(),
             table: table.clone(),
@@ -3116,76 +2927,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     op.database, table.name
                 ));
             }
-        }
-
-        // StarRocks lake scans carry the dict slot self-map on the wire via
-        // `TLakeScanNode.dict_string_id_to_int_ids`. Iceberg/HDFS scans have no
-        // such thrift field and don't need one: the dict slot is already an
-        // Int32 storage slot, and the per-fragment `TGlobalDict` payloads
-        // emitted below feed `lower_hdfs_scan_node`'s encode map directly
-        // (the parquet reader reads Utf8 and encodes to dict ids). So for an
-        // iceberg `hdfs_scan_node` we leave the thrift node untouched. Any
-        // other scan kind receiving dict_columns is a planning bug.
-        if !string_to_dict_slot.is_empty() {
-            if let Some(lake) = scan_plan_node.lake_scan_node.as_mut() {
-                lake.dict_string_id_to_int_ids = Some(string_to_dict_slot);
-            } else if scan_plan_node.hdfs_scan_node.is_some() {
-                // iceberg/HDFS: dicts flow via query_global_dicts in lowering.
-            } else {
-                return Err(format!(
-                    "scan `{}.{}` has dict_columns but is neither a StarRocks lake scan nor an iceberg/HDFS scan",
-                    op.database, op.table.name,
-                ));
-            }
-        }
-
-        // Emit per-dict-column TGlobalDict payloads onto EVERY fragment in
-        // the current stack (the leaf scan's fragment plus every parent
-        // fragment that consumes its output through an exchange). The
-        // dict slot id is consistent across fragments, so a Decode
-        // operator inserted above the exchange — which lives in a parent
-        // fragment — must also receive the TGlobalDict via its own
-        // fragment's `query_global_dicts`. Without this, the BE's
-        // `lower_decode_node` fails with `missing query global dict for
-        // encoded slot_id=<N>` (each fragment builds its own
-        // QueryGlobalDictMap from its own TGlobalDict list).
-        let current_frag = state.current_fragment_id()?;
-        let dict_fragments: Vec<FragmentId> = if state.fragment_stack().is_empty() {
-            vec![current_frag]
-        } else {
-            state.fragment_stack().to_vec()
-        };
-        for (dict_slot_id, dict_col) in &dict_slot_to_dict {
-            let snapshot = dict_col.dictionary.as_ref();
-            let mut ids = Vec::with_capacity(snapshot.values.len());
-            let mut strings = Vec::with_capacity(snapshot.values.len());
-            for value in &snapshot.values {
-                ids.push(value.id);
-                strings.push(value.bytes.clone());
-            }
-            let global_dict = crate::thrift::data::TGlobalDict::new(
-                Some(*dict_slot_id),
-                Some(strings),
-                Some(ids),
-                Some(snapshot.version),
-            );
-            for fragment_id in &dict_fragments {
-                state
-                    .query_global_dicts_per_fragment()
-                    .entry(*fragment_id)
-                    .or_default()
-                    .push(global_dict.clone());
-            }
-            // Track the slot -> dict association so any operator that
-            // allocates a new slot inheriting this slot's values
-            // (Aggregate group-by, Project column ref, etc.) can
-            // re-register the dict on the new slot id. The downstream
-            // `Decode` resolves by NAME against the new slot, then the
-            // BE's `lower_decode_node` needs a TGlobalDict keyed by that
-            // new slot id — registered via `propagate_dict_to_slot`.
-            state
-                .slot_to_global_dict_mut()
-                .insert(*dict_slot_id, global_dict);
         }
 
         state.scan_tables().push(nodes::PlannedScanTable {
@@ -3262,17 +3003,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             if !unqualified_display.eq_ignore_ascii_case(&name) {
                 let _ = unqualified_display;
             }
-
-            // Propagate the dict registration on a ColumnRef passthrough:
-            // the new slot inherits the source slot's dict, so a parent
-            // fragment's Decode (post-exchange) finds the matching dict
-            // in its own `query_global_dicts`.
-            if let ExprKind::ColumnRef { column_id, .. } = item.expr.kind
-                && let Some(child_binding) = child_scope.resolve_by_id(column_id)
-            {
-                let source_slot_id = child_binding.slot_id;
-                state.propagate_dict_to_slot(source_slot_id, slot_id);
-            }
         }
 
         state.desc_builder().add_tuple(project_tuple_id, None);
@@ -3333,18 +3063,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             } = gb_expr.kind
             {
                 let _ = (q, column, binding);
-            }
-            // Propagate dict registration through the aggregate's group-
-            // by output: when the group-by is a passthrough ColumnRef of
-            // a dict-encoded source slot, the new agg output slot also
-            // carries dict ids. Re-register the TGlobalDict on the new
-            // slot so a downstream Decode (in this or a parent fragment
-            // post-exchange) resolves its `dict_id_to_string_ids` key.
-            if let ExprKind::ColumnRef { column_id, .. } = gb_expr.kind
-                && let Some(child_binding) = child_scope.resolve_by_id(column_id)
-            {
-                let source_slot_id = child_binding.slot_id;
-                state.propagate_dict_to_slot(source_slot_id, slot_id);
             }
             grouping_exprs.push(texpr);
         }
@@ -4370,136 +4088,6 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         plan_node
     }
 
-    pub(crate) fn lower_decode(
-        &mut self,
-        decode_node_id: i32,
-        decode_tuple_id: i32,
-        op: &DecodeOp,
-        child_scope: &ExprScope,
-    ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
-        let child_columns: Vec<(String, ColumnBinding)> = child_scope
-            .iter_columns()
-            .map(|(name, binding)| (name.clone(), binding.clone()))
-            .collect();
-        let child_ids_by_slot: Vec<(crate::sql::column_id::ColumnId, ColumnBinding)> = child_scope
-            .iter_id_bindings()
-            .map(|(column_id, binding)| (*column_id, binding.clone()))
-            .collect();
-
-        let dict_target_meta: BTreeMap<
-            i32,
-            (String, DataType, bool, crate::sql::column_id::ColumnId),
-        > = op
-            .mappings
-            .iter()
-            .map(|item| {
-                let dict_binding = child_scope
-                    .resolve_by_id(item.source_column_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "decode source ColumnId({}) for `{}` is not in child scope",
-                            item.source_column_id.0, item.dict_column
-                        )
-                    })?;
-                let declared = op
-                    .output_columns
-                    .iter()
-                    .find(|c| c.column_id == item.output_column_id);
-                let data_type = declared
-                    .map(|c| c.data_type.clone())
-                    .unwrap_or(DataType::Utf8);
-                let nullable = declared.map(|c| c.nullable).unwrap_or(true);
-                let output_name = declared
-                    .map(|c| c.name.clone())
-                    .unwrap_or_else(|| item.string_column.clone());
-                Ok::<_, String>((
-                    dict_binding.slot_id,
-                    (output_name, data_type, nullable, item.output_column_id),
-                ))
-            })
-            .collect::<Result<_, _>>()?;
-
-        let state = &mut *self.state;
-        let mut decode_scope = ExprScope::new();
-        let mut mapping: BTreeMap<i32, i32> = BTreeMap::new();
-        let mut materialized_dict_slots: BTreeMap<i32, ColumnBinding> = BTreeMap::new();
-
-        let mut col_pos: i32 = 0;
-        for (child_name, child_binding) in &child_columns {
-            if let Some((string_name, data_type, nullable, output_column_id)) =
-                dict_target_meta.get(&child_binding.slot_id)
-            {
-                if let Some(binding) = materialized_dict_slots.get(&child_binding.slot_id) {
-                    decode_scope.add_id_alias(*output_column_id, binding.clone());
-                    continue;
-                }
-                let string_slot_id = state.alloc_slot();
-                state.desc_builder().add_slot(
-                    string_slot_id,
-                    decode_tuple_id,
-                    string_name,
-                    data_type,
-                    *nullable,
-                    col_pos,
-                );
-                mapping.insert(child_binding.slot_id, string_slot_id);
-                let output_binding = ColumnBinding {
-                    tuple_id: decode_tuple_id,
-                    slot_id: string_slot_id,
-                    data_type: data_type.clone(),
-                    type_desc: None,
-                    nullable: *nullable,
-                };
-                materialized_dict_slots.insert(child_binding.slot_id, output_binding.clone());
-                decode_scope.add_column_with_id(
-                    *output_column_id,
-                    None,
-                    string_name.clone(),
-                    output_binding,
-                );
-                col_pos += 1;
-            } else {
-                state.desc_builder().add_slot(
-                    child_binding.slot_id,
-                    decode_tuple_id,
-                    child_name,
-                    &child_binding.data_type,
-                    child_binding.nullable,
-                    col_pos,
-                );
-                let output_binding = ColumnBinding {
-                    tuple_id: decode_tuple_id,
-                    slot_id: child_binding.slot_id,
-                    data_type: child_binding.data_type.clone(),
-                    type_desc: child_binding.type_desc.clone(),
-                    nullable: child_binding.nullable,
-                };
-                decode_scope.add_column(None, child_name.clone(), output_binding.clone());
-                for (column_id, id_binding) in &child_ids_by_slot {
-                    if id_binding.tuple_id == child_binding.tuple_id
-                        && id_binding.slot_id == child_binding.slot_id
-                    {
-                        decode_scope.add_id_alias(*column_id, output_binding.clone());
-                    }
-                }
-                col_pos += 1;
-            }
-        }
-
-        if mapping.len() != op.mappings.len() {
-            return Err(format!(
-                "decode mappings unresolved: declared {} entries, materialized {}",
-                op.mappings.len(),
-                mapping.len()
-            ));
-        }
-
-        state.desc_builder().add_tuple(decode_tuple_id, None);
-        let decode_node = nodes::build_decode_node(decode_node_id, vec![decode_tuple_id], mapping);
-
-        Ok((decode_node, decode_scope))
-    }
-
     pub(crate) fn lower_repeat(
         &mut self,
         repeat_node_id: i32,
@@ -5210,13 +4798,6 @@ fn assert_one_row_node_to_physical_op(
 ) -> AssertOneRowOp {
     AssertOneRowOp {
         subquery_text: kind.subquery_text.clone(),
-    }
-}
-
-fn decode_node_to_physical_op(kind: &super::kind::DistributedDecodeNode) -> DecodeOp {
-    DecodeOp {
-        mappings: kind.mappings.clone(),
-        output_columns: kind.output_columns.clone(),
     }
 }
 
@@ -6986,7 +6567,6 @@ mod tests {
                 columns: vec![k.clone()],
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),

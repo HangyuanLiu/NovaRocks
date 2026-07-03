@@ -8,13 +8,11 @@ use std::collections::HashSet;
 
 use crate::sql::catalog::{BranchScope, TableDef};
 use crate::sql::column_id::ColumnId;
-use crate::sql::common::{
-    ApplyKind, CteId, DecodeMapping, ImvVersionRef, JoinKind, OutputColumn, WindowFrame,
-};
+use crate::sql::common::{ApplyKind, CteId, ImvVersionRef, JoinKind, OutputColumn, WindowFrame};
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarId, SortKey};
 use crate::sql::optimizer::stats_input::StatsRef;
 
-pub(crate) use crate::sql::common::{ScanDictionaryColumn, ScanVariantColumn};
+pub(crate) use crate::sql::common::ScanVariantColumn;
 
 // ---------------------------------------------------------------------------
 // Physical decision enums
@@ -217,10 +215,6 @@ pub(crate) struct ScanOp {
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<ScalarId>,
     pub required_columns: Option<Vec<String>>,
-    /// Per-scan dictionary plan hints. Populated by the Task 7
-    /// `LowCardinalityDictionaryRewrite` rule on the logical side and
-    /// propagated to `ScanOp` by `ScanToPhysical`.
-    pub dict_columns: Vec<ScanDictionaryColumn>,
     /// Synthetic typed columns materialized from variant paths during scan.
     /// Populated by `VariantPathPushdownRule` and propagated to
     /// `ScanOp` by `ScanToPhysical`.
@@ -511,22 +505,6 @@ pub(crate) struct AssertOneRowOp {
     pub subquery_text: String,
 }
 
-/// Logical dictionary-decode operator. Maps dictionary-encoded child columns
-/// back to their string form. Produced exclusively by the dictionary-rewrite
-/// rule (Task 7); the implementation rule `DecodeToPhysical` lowers it to
-/// `DecodeOp`.
-///
-/// `output_columns` mirrors the input group's output columns with each
-/// `dict_column` swapped for its `string_column`. Without it
-/// `derive_output_columns` would surface the child's pre-decode names
-/// (the dict columns) to consumers, and parent lookups for the
-/// string column would fail to resolve.
-#[derive(Clone, Debug)]
-pub(crate) struct DecodeOp {
-    pub mappings: Vec<DecodeMapping>,
-    pub output_columns: Vec<OutputColumn>,
-}
-
 /// Apply (correlated subquery) operator. Eliminated by the SubqueryRewrite
 /// stage before memo conversion; must not reach derive/cost/codegen.
 ///
@@ -637,7 +615,6 @@ pub(crate) enum Operator {
     LogicalCTEAnchor(CTEAnchorOp),
     LogicalCTEProduce(CTEProduceOp),
     LogicalCTEConsume(CTEConsumeOp),
-    LogicalDecode(DecodeOp),
     LogicalAssertOneRow(AssertOneRowOp),
     /// Apply (correlated subquery). Eliminated by SubqueryRewrite before memo.
     LogicalApply(ApplyOp),
@@ -669,7 +646,6 @@ pub(crate) enum Operator {
     PhysicalValues(ValuesOp),
     PhysicalGenerateSeries(GenerateSeriesOp),
     PhysicalTableFunction(TableFunctionOp),
-    PhysicalDecode(DecodeOp),
     PhysicalAssertOneRow(AssertOneRowOp),
 }
 
@@ -697,7 +673,6 @@ impl Operator {
                 | Operator::LogicalCTEAnchor(_)
                 | Operator::LogicalCTEProduce(_)
                 | Operator::LogicalCTEConsume(_)
-                | Operator::LogicalDecode(_)
                 | Operator::LogicalAssertOneRow(_)
                 | Operator::LogicalApply(_)
                 | Operator::LogicalImvDelta(_)

@@ -1,6 +1,6 @@
 -- @tags=low-cardinality,dictionary,filter
--- Verify simple string filters can run on low-cardinality dictionary carriers
--- while preserving selected and passthrough string columns.
+-- Verify simple string filters over low-cardinality metadata preserve selected
+-- and passthrough string columns.
 CREATE TABLE ${case_db}.dict_filter_fastpath_c1_t (
   id INT,
   status STRING,

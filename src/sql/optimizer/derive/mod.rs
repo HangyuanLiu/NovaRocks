@@ -163,7 +163,6 @@ pub(crate) fn derive_output(
         Operator::PhysicalDistribution(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalFilter(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalProject(o) => o.derive_output(scalars, children_outputs),
-        Operator::PhysicalDecode(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalLimit(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalAssertOneRow(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalCTEProduce(o) => o.derive_output(scalars, children_outputs),
@@ -225,7 +224,6 @@ pub(crate) fn derive_required(
         }
         Operator::PhysicalFilter(o) => o.derive_required(scalars, parent_required, num_children),
         Operator::PhysicalProject(o) => o.derive_required(scalars, parent_required, num_children),
-        Operator::PhysicalDecode(o) => o.derive_required(scalars, parent_required, num_children),
         Operator::PhysicalLimit(o) => o.derive_required(scalars, parent_required, num_children),
         Operator::PhysicalAssertOneRow(o) => {
             o.derive_required(scalars, parent_required, num_children)

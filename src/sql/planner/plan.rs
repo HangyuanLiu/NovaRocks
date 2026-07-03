@@ -12,9 +12,7 @@ use crate::sql::catalog::TableDef;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
-pub(crate) use crate::sql::common::{
-    ApplyKind, ChangeStreamBranchKind, DecodeMapping, ScanDictionaryColumn, ScanVariantColumn,
-};
+pub(crate) use crate::sql::common::{ApplyKind, ChangeStreamBranchKind, ScanVariantColumn};
 use crate::sql::optimizer::operator::{
     AggMode, AggregateOutputLayout, JoinDistribution, TopNPhase,
 };
@@ -48,7 +46,6 @@ pub(crate) enum LogicalPlanKind {
     /// Sort/TopN offsets, or ExchangeFlavor::LimitOffset instead of a Limit kind.
     Limit(PlanLimitNode),
     Values(PlanValuesNode),
-    Decode(PlanDecodeNode),
     Repeat(PlanRepeatNode),
     Window(PlanWindowNode),
     GenerateSeries(PlanGenerateSeriesNode),
@@ -76,7 +73,6 @@ impl LogicalPlanKind {
             LogicalPlanKind::Sort(_) => "Sort",
             LogicalPlanKind::Limit(_) => "Limit",
             LogicalPlanKind::Values(_) => "Values",
-            LogicalPlanKind::Decode(_) => "Decode",
             LogicalPlanKind::Repeat(_) => "Repeat",
             LogicalPlanKind::Window(_) => "Window",
             LogicalPlanKind::GenerateSeries(_) => "GenerateSeries",
@@ -105,7 +101,6 @@ impl LogicalPlanKind {
             "Sort",
             "Limit",
             "Values",
-            "Decode",
             "Repeat",
             "Window",
             "GenerateSeries",
@@ -135,7 +130,6 @@ pub(crate) struct PlanScanNode {
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<TypedExpr>,
     pub required_columns: Option<Vec<String>>,
-    pub dict_columns: Vec<ScanDictionaryColumn>,
     pub variant_columns: Vec<ScanVariantColumn>,
     pub mv_rewritten_from: Option<String>,
 }
@@ -176,13 +170,6 @@ pub(crate) struct PlanLimitNode {
 pub(crate) struct PlanValuesNode {
     pub rows: Vec<Vec<TypedExpr>>,
     pub columns: Vec<OutputColumn>,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct PlanDecodeNode {
-    pub mappings: Vec<DecodeMapping>,
-    pub output_columns: Vec<OutputColumn>,
 }
 
 #[allow(dead_code)]
@@ -352,8 +339,6 @@ pub(crate) struct DistributedChangeEventOutputExpr {
     pub(crate) expr: Option<TypedExpr>,
 }
 
-pub(crate) type LogicalDecodeNode = PlanDecodeNode;
-
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalApplyNode {
@@ -511,7 +496,6 @@ pub(crate) enum PhysicalPlanKind {
     Sort(PlanSortNode),
     Limit(PlanLimitNode),
     Values(PlanValuesNode),
-    Decode(PlanDecodeNode),
     Repeat(PlanRepeatNode),
     Window(PlanWindowNode),
     GenerateSeries(PlanGenerateSeriesNode),
@@ -539,7 +523,6 @@ impl PhysicalPlanKind {
             "Sort",
             "Limit",
             "Values",
-            "Decode",
             "Repeat",
             "Window",
             "GenerateSeries",
@@ -792,7 +775,6 @@ mod plan_tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: Some("mv_orders_rollup".to_string()),
         });

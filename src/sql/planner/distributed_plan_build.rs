@@ -217,13 +217,6 @@ impl DistributedPlanBuilder {
                 let tuple_ids = child.tuple_ids.clone();
                 Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]))
             }
-            PhysicalPlanKind::Decode(_) => {
-                expect_child_count(node, 1)?;
-                let child = self.visit(&node.children[0])?;
-                let tuple_id = self.alloc_tuple();
-                let node_id = self.alloc_node();
-                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
-            }
             PhysicalPlanKind::Repeat(repeat) => {
                 expect_child_count(node, 1)?;
                 let child = self.visit(&node.children[0])?;
@@ -1105,7 +1098,6 @@ fn physical_kind_name(kind: &PhysicalPlanKind) -> &'static str {
         PhysicalPlanKind::Sort(_) => "Sort",
         PhysicalPlanKind::Limit(_) => "Limit",
         PhysicalPlanKind::Values(_) => "Values",
-        PhysicalPlanKind::Decode(_) => "Decode",
         PhysicalPlanKind::Repeat(_) => "Repeat",
         PhysicalPlanKind::Window(_) => "Window",
         PhysicalPlanKind::GenerateSeries(_) => "GenerateSeries",
@@ -1149,8 +1141,8 @@ mod tests {
         LogicalCTEConsumeNode, LogicalCTEProduceNode, PhysicalHashAggregateNode,
         PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
         PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PhysicalTopNNode,
-        PlanAssertOneRowNode, PlanDecodeNode, PlanFilterNode, PlanGenerateSeriesNode,
-        PlanLimitNode, PlanProjectNode, PlanRepeatNode, PlanScanNode, PlanSetOpKind, PlanSortNode,
+        PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode,
+        PlanProjectNode, PlanRepeatNode, PlanScanNode, PlanSetOpKind, PlanSortNode,
         PlanTableFunctionNode, PlanValuesNode, PlanWindowNode, RedistributeMode, RedistributeNode,
         WindowExpr,
     };
@@ -1223,7 +1215,6 @@ mod tests {
                 columns: scan_columns.clone(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1280,7 +1271,6 @@ mod tests {
                 columns: scan_columns.clone(),
                 predicates: vec![bool_lit(true)],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1352,7 +1342,6 @@ mod tests {
                 columns: scan_columns.clone(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1754,30 +1743,7 @@ mod tests {
     }
 
     #[test]
-    fn build_distributed_plan_decode_and_change_event_expand_allocate_new_tuple() {
-        let scan = scan_node(1, "k");
-        let decode = PhysicalPlanNode {
-            kind: PhysicalPlanKind::Decode(PlanDecodeNode {
-                mappings: vec![],
-                output_columns: vec![output_col(2, "decoded", DataType::Utf8, false)],
-            }),
-            children: vec![scan],
-            output_columns: vec![output_col(2, "decoded", DataType::Utf8, false)],
-            stats: stats(),
-            probe_runtime_filters: vec![],
-        };
-
-        let dp = build_distributed_plan(&decode).expect("build_distributed_plan");
-
-        let root = &dp.fragments[0].root;
-        assert!(matches!(
-            &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Decode(_))
-        ));
-        assert_eq!(root.node_id, 2);
-        assert_eq!(root.tuple_ids, vec![2]);
-        assert_eq!(root.children[0].tuple_ids, vec![1]);
-
+    fn build_distributed_plan_change_event_expand_allocates_new_tuple() {
         let scan = scan_node(1, "k");
         let expand = PhysicalPlanNode {
             kind: PhysicalPlanKind::ChangeEventExpand(DistributedChangeEventExpandNode {
@@ -3071,7 +3037,6 @@ mod tests {
                 columns: scan_columns.clone(),
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),

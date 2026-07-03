@@ -51,7 +51,6 @@ pub(super) fn opt_output_columns(
         }]),
         Operator::LogicalCTEProduce(produce) => Ok(produce.output_columns.clone()),
         Operator::LogicalCTEConsume(consume) => Ok(consume.output_columns.clone()),
-        Operator::LogicalDecode(decode) => Ok(decode.output_columns.clone()),
         Operator::LogicalFilter(_)
         | Operator::LogicalSort(_)
         | Operator::LogicalLimit(_)

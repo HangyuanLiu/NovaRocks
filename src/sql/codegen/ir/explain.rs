@@ -7,8 +7,8 @@ use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::column_id::ColumnId;
 use crate::sql::explain::{
-    ExplainLevel, PlanNodeExplainStage, format_expr, format_project_item, format_scan_dict_suffix,
-    format_sort_items, format_window_exprs,
+    ExplainLevel, PlanNodeExplainStage, format_expr, format_project_item, format_sort_items,
+    format_window_exprs,
 };
 use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
@@ -19,7 +19,7 @@ use crate::sql::planner::plan::{
     DistributedChangeEventExpandNode, ExchangeFlavor, PhysicalHashAggregateNode,
     PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode,
     PhysicalTopNNode, PlanAssertOneRowNode as DistributedAssertOneRowNode,
-    PlanDecodeNode as DistributedDecodeNode, PlanFilterNode as DistributedFilterNode,
+    PlanFilterNode as DistributedFilterNode,
     PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
     PlanProjectNode as DistributedProjectNode, PlanRepeatNode as DistributedRepeatNode,
     PlanScanNode as DistributedScanNode, PlanSetOpKind as SetOpKind,
@@ -153,10 +153,9 @@ fn format_distributed_shared_plan_node_header(
                 .as_deref()
                 .map(|a| format!(" (alias={a})"))
                 .unwrap_or_default();
-            let dict = format_scan_dict_suffix(&node.dict_columns);
             Some(format!(
-                "SCAN {}.{}{}{}",
-                node.database, node.table.name, alias, dict
+                "SCAN {}.{}{}",
+                node.database, node.table.name, alias
             ))
         }
         PhysicalPlanKind::Filter(_) => Some("FILTER".to_string()),
@@ -177,14 +176,6 @@ fn format_distributed_shared_plan_node_header(
             Some(format!("WINDOW [{}]", fns.join("; ")))
         }
         PhysicalPlanKind::Values(node) => Some(format!("VALUES ({} rows)", node.rows.len())),
-        PhysicalPlanKind::Decode(node) => {
-            let pairs = node
-                .mappings
-                .iter()
-                .map(|m| format!("{}->{}", m.dict_column, m.string_column))
-                .collect::<Vec<_>>();
-            Some(format!("DECODE [{}]", pairs.join(", ")))
-        }
         PhysicalPlanKind::Repeat(node) => Some(format!(
             "REPEAT ({} grouping sets)",
             node.grouping_ids.len()
@@ -294,10 +285,6 @@ fn format_distributed_node(
             format_assert_one_row_node(node, assert, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::Decode(decode)) => {
-            format_decode_node(node, decode, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, actuals, out);
-        }
         DistributedPayload::Physical(PhysicalPlanKind::Repeat(repeat)) => {
             format_repeat_node(node, repeat, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
@@ -375,7 +362,6 @@ fn physical_kind_name(payload: &DistributedPayload) -> &'static str {
         DistributedPayload::Physical(PhysicalPlanKind::Sort(_)) => "Sort",
         DistributedPayload::Physical(PhysicalPlanKind::Limit(_)) => "Limit",
         DistributedPayload::Physical(PhysicalPlanKind::Values(_)) => "Values",
-        DistributedPayload::Physical(PhysicalPlanKind::Decode(_)) => "Decode",
         DistributedPayload::Physical(PhysicalPlanKind::Repeat(_)) => "Repeat",
         DistributedPayload::Physical(PhysicalPlanKind::Window(_)) => "Window",
         DistributedPayload::Physical(PhysicalPlanKind::GenerateSeries(_)) => "GenerateSeries",
@@ -436,9 +422,6 @@ fn format_scan_node(
         out.push(format!("{pad}     {line}"));
     }
     let local_hints = explain_hints_for_scan(scan);
-    if matches!(level, ExplainLevel::Costs) && local_hints.has_decode {
-        out.push(format!("{pad}     Decode"));
-    }
     if matches!(level, ExplainLevel::Verbose | ExplainLevel::Analyze)
         && local_hints.has_min_max_stats
     {
@@ -803,25 +786,6 @@ fn format_assert_one_row_node(
     out.push(format!(
         "{pad}{}{body}{costs_suffix}{stats_suffix}",
         node_prefix(node)
-    ));
-}
-
-fn format_decode_node(
-    node: &DistributedNode,
-    _decode: &DistributedDecodeNode,
-    pad: &str,
-    costs_suffix: &str,
-    stats_suffix: &str,
-    out: &mut Vec<String>,
-) {
-    let body = format_distributed_shared_plan_node_header(
-        physical_payload(node).expect("Decode is a physical explain node"),
-        PlanNodeExplainStage::Distributed,
-    )
-    .expect("Decode is a shared explain node");
-    out.push(format!(
-        "{pad}{}{body}{costs_suffix}{stats_suffix}",
-        node_prefix(node),
     ));
 }
 
@@ -1332,7 +1296,6 @@ fn push_probe_rf_lines(
 
 #[derive(Default)]
 struct LocalScanExplainHints {
-    has_decode: bool,
     has_min_max_stats: bool,
 }
 
@@ -1344,20 +1307,8 @@ fn explain_hints_for_scan(scan: &DistributedScanNode) -> LocalScanExplainHints {
         return LocalScanExplainHints::default();
     }
 
-    let resolved = required_columns
-        .iter()
-        .map(|required| {
-            scan.dict_columns
-                .iter()
-                .find(|d| d.dict_column.eq_ignore_ascii_case(required))
-                .map(|d| d.source_column.clone())
-                .unwrap_or_else(|| required.clone())
-        })
-        .collect::<Vec<_>>();
-
     LocalScanExplainHints {
-        has_decode: scan_supports_decode_hint(&scan.table, &resolved),
-        has_min_max_stats: scan_supports_min_max_stats(&scan.table, &resolved),
+        has_min_max_stats: scan_supports_min_max_stats(&scan.table, required_columns),
     }
 }
 
@@ -1517,26 +1468,6 @@ fn format_scan_pruned_type(data_type: &DataType, top_level: bool) -> String {
     }
 }
 
-fn scan_supports_decode_hint(table: &TableDef, required_columns: &[String]) -> bool {
-    match &table.source {
-        ScanSource::IcebergDataFiles { .. } | ScanSource::StarRocks { .. } => {
-            required_columns.iter().any(|required| {
-                table
-                    .columns
-                    .iter()
-                    .find(|column| column.name.eq_ignore_ascii_case(required))
-                    .map(|column| supports_scan_decode_hint(&column.data_type))
-                    .unwrap_or(false)
-            })
-        }
-        ScanSource::IcebergMetadataTable { .. } => false,
-        ScanSource::IcebergDeltaTable { .. }
-        | ScanSource::IcebergVersionTable { .. }
-        | ScanSource::IcebergMvTargetState { .. }
-        | ScanSource::IcebergMvTargetLocator { .. } => false,
-    }
-}
-
 fn scan_supports_min_max_stats(table: &TableDef, required_columns: &[String]) -> bool {
     match &table.source {
         ScanSource::IcebergDataFiles { .. } | ScanSource::StarRocks { .. } => {}
@@ -1578,13 +1509,6 @@ fn supports_scan_min_max_stats(data_type: &DataType) -> bool {
             | DataType::Binary
             | DataType::LargeBinary
             | DataType::FixedSizeBinary(_)
-    )
-}
-
-fn supports_scan_decode_hint(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
     )
 }
 
@@ -1738,15 +1662,6 @@ mod tests {
             text.contains("1:SCAN test_db.t (alias=t)"),
             "missing shared SCAN header in distributed explain:\n{text}"
         );
-    }
-
-    #[test]
-    fn distributed_explain_scan_shows_dict_encoded_columns() {
-        let dp = build_distributed_plan(&dict_scan_plan()).expect("build DistributedPlan");
-        let text = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
-
-        assert!(text.contains("SCAN test_db.t"), "{text}");
-        assert!(text.contains("dict=[s]"), "{text}");
     }
 
     #[test]
@@ -2278,70 +2193,12 @@ mod tests {
                 columns: vec![k.clone(), v.clone()],
                 predicates: vec![],
                 required_columns: Some(vec!["k".to_string(), "v".to_string()]),
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
             vec![],
             vec![k, v],
         )
-    }
-
-    fn dict_scan_plan() -> OptimizerPhysicalNode {
-        let s = output_col(1, "s", DataType::Utf8, true);
-        let dict_s = output_col(2, "__nr_dict_t_s", DataType::Int32, true);
-        physical_node(
-            Operator::PhysicalScan(ScanOp {
-                database: "test_db".to_string(),
-                table: table_def(),
-                alias: None,
-                stats_ref: None,
-                columns: vec![s.clone(), dict_s.clone()],
-                predicates: vec![],
-                required_columns: Some(vec!["s".to_string(), "__nr_dict_t_s".to_string()]),
-                dict_columns: vec![crate::sql::common::ScanDictionaryColumn {
-                    source_column: "s".to_string(),
-                    dict_column: "__nr_dict_t_s".to_string(),
-                    dictionary: sample_dict_snapshot(),
-                }],
-                variant_columns: vec![],
-                mv_rewritten_from: None,
-            }),
-            vec![],
-            vec![s, dict_s],
-        )
-    }
-
-    fn sample_dict_snapshot() -> Arc<crate::sql::common::DictionarySnapshot> {
-        use crate::engine::dictionary::model::{
-            DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue,
-            DictionaryWatermark,
-        };
-
-        Arc::new(DictionarySnapshot {
-            dictionary_id: 1,
-            owner: DictionaryOwner::StarRocksTable {
-                database: "test_db".to_string(),
-                table: "t".to_string(),
-                db_id: 1,
-                table_id: 2,
-            },
-            column_id: Some(10),
-            column_name: "s".to_string(),
-            data_type: DataType::Utf8,
-            version: 1,
-            watermark: DictionaryWatermark::Iceberg {
-                snapshot_id: None,
-                schema_id: 0,
-            },
-            values: vec![DictionaryValue {
-                id: 1,
-                bytes: b"a".to_vec(),
-            }],
-            null_id: 0,
-            state: DictionaryState::Active,
-            order_preserving: true,
-        })
     }
 
     fn alias_collision_scan_plan() -> OptimizerPhysicalNode {
@@ -2367,7 +2224,6 @@ mod tests {
                 columns: vec![id.clone(), v.clone()],
                 predicates: vec![],
                 required_columns: Some(vec!["id".to_string(), "v".to_string()]),
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),

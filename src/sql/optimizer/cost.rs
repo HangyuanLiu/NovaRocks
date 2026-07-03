@@ -89,7 +89,6 @@ pub(crate) fn compute_cost(
         | Operator::LogicalCTEAnchor(_)
         | Operator::LogicalCTEProduce(_)
         | Operator::LogicalCTEConsume(_)
-        | Operator::LogicalDecode(_)
         | Operator::LogicalAssertOneRow(_)
         // Apply and IMV markers are eliminated before costing; unreachable here.
         | Operator::LogicalApply(_)
@@ -196,7 +195,7 @@ pub(crate) fn compute_cost(
         Operator::PhysicalCTEAnchor(_) => 0.0,
 
         // Window, Repeat, Union, Intersect, Except, Values, GenerateSeries,
-        // CTE, Decode — lightweight default.
+        // and CTE operators use a lightweight default.
         Operator::PhysicalWindow(_)
         | Operator::PhysicalRepeat(_)
         | Operator::PhysicalChangeEventExpand(_)
@@ -207,8 +206,7 @@ pub(crate) fn compute_cost(
         | Operator::PhysicalGenerateSeries(_)
         | Operator::PhysicalTableFunction(_)
         | Operator::PhysicalCTEProduce(_)
-        | Operator::PhysicalCTEConsume(_)
-        | Operator::PhysicalDecode(_) => own_stats.output_row_count * 0.01,
+        | Operator::PhysicalCTEConsume(_) => own_stats.output_row_count * 0.01,
     }
 }
 
@@ -1293,7 +1291,6 @@ mod tests {
             predicates: vec![],
             required_columns: required_columns
                 .map(|columns| columns.into_iter().map(str::to_string).collect()),
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         })
@@ -1316,7 +1313,6 @@ mod tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         })
@@ -3238,7 +3234,6 @@ mod tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         });
@@ -3582,7 +3577,6 @@ mod tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         });

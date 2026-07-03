@@ -129,8 +129,8 @@ pub(crate) struct FragmentBuildResult {
     /// `(cte_id, exchange_node_id, receive_producer_column_ids)`.
     pub cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
     /// Per-fragment global dictionaries emitted to `TPlanFragment.query_global_dicts`.
-    /// Populated by the fragment builder when a scan exposes a dict-encoded slot.
-    /// `None` when this fragment has no dictionary-encoded slots.
+    /// Standalone SQL lowering no longer populates this after the native Decode
+    /// path was retired; external fragment producers may still carry it.
     pub query_global_dicts: Option<Vec<crate::thrift::data::TGlobalDict>>,
     /// Per-fragment dictionary expressions emitted to
     /// `TPlanFragment.query_global_dict_exprs`. Wired through for Task 7+;

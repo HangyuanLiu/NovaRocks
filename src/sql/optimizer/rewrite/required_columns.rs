@@ -68,7 +68,6 @@ pub(crate) fn tag_required_columns(
         Operator::LogicalChangeEventExpand(_) => {
             tag_change_event_expand(expr, arena, parent_needed)
         }
-        Operator::LogicalDecode(_) => tag_decode(expr, arena, parent_needed),
         Operator::LogicalTableFunction(_) => tag_table_function(expr, arena, parent_needed),
         Operator::LogicalAssertOneRow(_) => tag_assert_one_row(expr, arena, parent_needed),
         _ => {
@@ -498,25 +497,6 @@ fn tag_change_event_expand(
     OptExpr {
         op: expr.op,
         children: vec![tag_required_columns(input, arena, Some(child_needed))],
-        required_output_columns: parent_needed,
-    }
-}
-
-/// Decode node: ColumnIds are pass-through transparent (same ids on both sides
-/// of the decode boundary per the rewriter invariant). Pass parent_needed to
-/// the child unchanged.
-fn tag_decode(
-    mut expr: OptExpr,
-    arena: &ScalarArena,
-    parent_needed: Option<HashSet<ColumnId>>,
-) -> OptExpr {
-    debug_assert!(matches!(expr.op, Operator::LogicalDecode(_)));
-    expr.required_output_columns = parent_needed.clone();
-    let mut children = expr.children;
-    let input = children.remove(0);
-    OptExpr {
-        op: expr.op,
-        children: vec![tag_required_columns(input, arena, parent_needed.clone())],
         required_output_columns: parent_needed,
     }
 }
@@ -1128,7 +1108,6 @@ mod tests {
             ],
             predicates: vec![],
             required_columns: None,
-            dict_columns: vec![],
             variant_columns: vec![],
             mv_rewritten_from: None,
         }))
@@ -2604,7 +2583,6 @@ mod tests {
                 columns: vec![make_output_column(ColumnId::new_for_test(1), "a")],
                 predicates: vec![],
                 required_columns: None,
-                dict_columns: vec![],
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }))],
