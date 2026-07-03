@@ -177,6 +177,7 @@ fn column_stats_satisfy_scan_predicate(
                 Ok(true)
             }
         }
+        ScanPredicateDomain::Membership(_) => Ok(true),
     }
 }
 

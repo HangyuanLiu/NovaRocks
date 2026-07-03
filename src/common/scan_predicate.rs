@@ -28,6 +28,18 @@ pub(crate) enum ScanPredicateSource {
     RuntimeMinMax,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScanPredicateDomainKind {
+    Range,
+    DiscreteSet,
+    Membership,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum MembershipPredicate {
+    BloomProbe { values: Vec<MinMaxPredicateValue> },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ScanPredicateDomain {
     Range {
@@ -39,6 +51,143 @@ pub(crate) enum ScanPredicateDomain {
         min: MinMaxPredicateValue,
         max: MinMaxPredicateValue,
     },
+    Membership(MembershipPredicate),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PruneVerdict {
+    Skip,
+    Keep,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum ScanLayer {
+    File,
+    Split,
+    RowGroup,
+    Page,
+}
+
+pub(crate) type UnitId = usize;
+
+pub(crate) trait ColumnStats {
+    fn min_max(&self) -> Option<(MinMaxPredicateValue, MinMaxPredicateValue)> {
+        None
+    }
+
+    fn contains(&self, _value: &MinMaxPredicateValue) -> Option<bool> {
+        None
+    }
+
+    fn may_satisfy_range(
+        &self,
+        op: MinMaxPredicateOp,
+        value: &MinMaxPredicateValue,
+    ) -> Result<Option<bool>, String> {
+        let Some((min, max)) = self.min_max() else {
+            return Ok(None);
+        };
+        Ok(Some(range_stats_may_satisfy(op, value, &min, &max)))
+    }
+
+    fn may_satisfy_discrete_set(
+        &self,
+        values: &[MinMaxPredicateValue],
+        min: &MinMaxPredicateValue,
+        max: &MinMaxPredicateValue,
+    ) -> Result<Option<bool>, String> {
+        let mut has_missing_contains_answer = false;
+        for value in values {
+            match self.contains(value) {
+                Some(false) => {}
+                Some(true) => return Ok(Some(true)),
+                None => has_missing_contains_answer = true,
+            }
+        }
+        if !has_missing_contains_answer {
+            return Ok(Some(false));
+        }
+
+        let Some((stats_min, stats_max)) = self.min_max() else {
+            return Ok(None);
+        };
+        Ok(Some(ranges_may_overlap(&stats_min, &stats_max, min, max)))
+    }
+}
+
+pub(crate) trait ScanPruner {
+    #[allow(dead_code)]
+    fn layer(&self) -> ScanLayer;
+
+    fn accepts_domain(&self, _kind: ScanPredicateDomainKind) -> bool {
+        false
+    }
+
+    fn units(&self) -> &[UnitId];
+
+    fn column_stats<'a>(&'a self, column: &str, unit: UnitId) -> Option<Box<dyn ColumnStats + 'a>>;
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PruneResult {
+    pub(crate) kept_units: Vec<UnitId>,
+    pub(crate) skipped_units: Vec<UnitId>,
+}
+
+impl ScanPredicateDomain {
+    pub(crate) fn kind(&self) -> ScanPredicateDomainKind {
+        match self {
+            Self::Range { .. } => ScanPredicateDomainKind::Range,
+            Self::DiscreteSet { .. } => ScanPredicateDomainKind::DiscreteSet,
+            Self::Membership(_) => ScanPredicateDomainKind::Membership,
+        }
+    }
+
+    pub(crate) fn fallback_domains(&self) -> Vec<Self> {
+        match self {
+            Self::Range { .. } | Self::Membership(_) => Vec::new(),
+            Self::DiscreteSet { min, max, .. } => {
+                vec![
+                    Self::Range {
+                        op: MinMaxPredicateOp::Ge,
+                        value: min.clone(),
+                    },
+                    Self::Range {
+                        op: MinMaxPredicateOp::Le,
+                        value: max.clone(),
+                    },
+                ]
+            }
+        }
+    }
+
+    pub(crate) fn evaluate(&self, stats: &dyn ColumnStats) -> Result<PruneVerdict, String> {
+        let verdict = match self {
+            Self::Range { op, value } => {
+                if stats.may_satisfy_range(*op, value)? == Some(false) {
+                    PruneVerdict::Skip
+                } else {
+                    PruneVerdict::Keep
+                }
+            }
+            Self::DiscreteSet { values, min, max } => {
+                if stats.may_satisfy_discrete_set(values, min, max)? == Some(false) {
+                    PruneVerdict::Skip
+                } else {
+                    PruneVerdict::Keep
+                }
+            }
+            Self::Membership(MembershipPredicate::BloomProbe { values }) => {
+                if values_all_absent(stats, values) {
+                    PruneVerdict::Skip
+                } else {
+                    PruneVerdict::Keep
+                }
+            }
+        };
+        Ok(verdict)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -125,8 +274,16 @@ impl ScanPredicate {
     pub(crate) fn range_op(&self) -> Option<MinMaxPredicateOp> {
         match &self.domain {
             ScanPredicateDomain::Range { op, .. } => Some(*op),
-            ScanPredicateDomain::DiscreteSet { .. } => None,
+            ScanPredicateDomain::DiscreteSet { .. } | ScanPredicateDomain::Membership(_) => None,
         }
+    }
+
+    pub(crate) fn fallback_predicates(&self) -> Vec<Self> {
+        self.domain
+            .fallback_domains()
+            .into_iter()
+            .map(|domain| Self::new(self.column.clone(), domain, self.source))
+            .collect()
     }
 
     pub(crate) fn to_min_max_predicates(&self) -> Vec<MinMaxPredicate> {
@@ -138,20 +295,95 @@ impl ScanPredicate {
                     value.clone(),
                 )]
             }
-            ScanPredicateDomain::DiscreteSet { min, max, .. } => {
-                vec![
-                    MinMaxPredicate::Ge {
-                        column: self.column.clone(),
-                        value: min.clone(),
-                    },
-                    MinMaxPredicate::Le {
-                        column: self.column.clone(),
-                        value: max.clone(),
-                    },
-                ]
-            }
+            ScanPredicateDomain::DiscreteSet { .. } | ScanPredicateDomain::Membership(_) => self
+                .fallback_predicates()
+                .into_iter()
+                .flat_map(|predicate| predicate.to_min_max_predicates())
+                .collect(),
         }
     }
+}
+
+pub(crate) fn prune_units(
+    pruner: &dyn ScanPruner,
+    predicates: &[ScanPredicate],
+) -> Result<PruneResult, String> {
+    let mut result = PruneResult::default();
+
+    'unit: for &unit in pruner.units() {
+        for predicate in predicates {
+            let domains = accepted_domains(pruner, predicate.domain());
+            if domains.is_empty() {
+                continue;
+            }
+
+            let Some(stats) = pruner.column_stats(predicate.column(), unit) else {
+                continue;
+            };
+
+            for domain in domains {
+                if domain.evaluate(stats.as_ref())? == PruneVerdict::Skip {
+                    result.skipped_units.push(unit);
+                    continue 'unit;
+                }
+            }
+        }
+        result.kept_units.push(unit);
+    }
+
+    Ok(result)
+}
+
+fn accepted_domains(
+    pruner: &dyn ScanPruner,
+    domain: &ScanPredicateDomain,
+) -> Vec<ScanPredicateDomain> {
+    if pruner.accepts_domain(domain.kind()) {
+        return vec![domain.clone()];
+    }
+
+    domain
+        .fallback_domains()
+        .into_iter()
+        .flat_map(|fallback| accepted_domains(pruner, &fallback))
+        .collect()
+}
+
+fn range_stats_may_satisfy(
+    op: MinMaxPredicateOp,
+    value: &MinMaxPredicateValue,
+    min: &MinMaxPredicateValue,
+    max: &MinMaxPredicateValue,
+) -> bool {
+    match op {
+        MinMaxPredicateOp::Le => !compare_min_max_values(min, value).is_some_and(Ordering::is_gt),
+        MinMaxPredicateOp::Ge => !compare_min_max_values(max, value).is_some_and(Ordering::is_lt),
+        MinMaxPredicateOp::Lt => compare_min_max_values(min, value).is_none_or(Ordering::is_lt),
+        MinMaxPredicateOp::Gt => compare_min_max_values(max, value).is_none_or(Ordering::is_gt),
+        MinMaxPredicateOp::Eq => ranges_may_overlap(min, max, value, value),
+    }
+}
+
+fn ranges_may_overlap(
+    left_min: &MinMaxPredicateValue,
+    left_max: &MinMaxPredicateValue,
+    right_min: &MinMaxPredicateValue,
+    right_max: &MinMaxPredicateValue,
+) -> bool {
+    if compare_min_max_values(left_max, right_min).is_some_and(Ordering::is_lt) {
+        return false;
+    }
+    if compare_min_max_values(left_min, right_max).is_some_and(Ordering::is_gt) {
+        return false;
+    }
+    true
+}
+
+fn values_all_absent(stats: &dyn ColumnStats, values: &[MinMaxPredicateValue]) -> bool {
+    !values.is_empty()
+        && values
+            .iter()
+            .all(|value| stats.contains(value) == Some(false))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,6 +474,64 @@ fn compare_scan_predicate_values(
     }
 }
 
+fn compare_min_max_values(
+    left: &MinMaxPredicateValue,
+    right: &MinMaxPredicateValue,
+) -> Option<Ordering> {
+    match (left, right) {
+        (MinMaxPredicateValue::Boolean(left), MinMaxPredicateValue::Boolean(right)) => {
+            Some(left.cmp(right))
+        }
+        (MinMaxPredicateValue::Int32(left), MinMaxPredicateValue::Int32(right)) => {
+            Some(left.cmp(right))
+        }
+        (MinMaxPredicateValue::Int64(left), MinMaxPredicateValue::Int64(right)) => {
+            Some(left.cmp(right))
+        }
+        (MinMaxPredicateValue::Float(left), MinMaxPredicateValue::Float(right)) => {
+            left.partial_cmp(right)
+        }
+        (MinMaxPredicateValue::Double(left), MinMaxPredicateValue::Double(right)) => {
+            left.partial_cmp(right)
+        }
+        (MinMaxPredicateValue::ByteArray(left), MinMaxPredicateValue::ByteArray(right)) => {
+            Some(left.cmp(right))
+        }
+        (
+            MinMaxPredicateValue::FixedLenByteArray(left),
+            MinMaxPredicateValue::FixedLenByteArray(right),
+        ) => Some(left.cmp(right)),
+        (MinMaxPredicateValue::Date32(left), MinMaxPredicateValue::Date32(right)) => {
+            Some(left.cmp(right))
+        }
+        (
+            MinMaxPredicateValue::DateTimeMicros(left),
+            MinMaxPredicateValue::DateTimeMicros(right),
+        ) => Some(left.cmp(right)),
+        (MinMaxPredicateValue::DateTimeNanos(left), MinMaxPredicateValue::DateTimeNanos(right)) => {
+            Some(left.cmp(right))
+        }
+        (MinMaxPredicateValue::LargeInt(left), MinMaxPredicateValue::LargeInt(right)) => {
+            Some(left.cmp(right))
+        }
+        (
+            MinMaxPredicateValue::Decimal128 {
+                value: left,
+                precision: left_precision,
+                scale: left_scale,
+            },
+            MinMaxPredicateValue::Decimal128 {
+                value: right,
+                precision: right_precision,
+                scale: right_scale,
+            },
+        ) if left_precision == right_precision && left_scale == right_scale => {
+            Some(left.cmp(right))
+        }
+        _ => None,
+    }
+}
+
 fn min_max_predicate_from_parts(
     column: String,
     op: MinMaxPredicateOp,
@@ -261,7 +551,11 @@ mod tests {
     use crate::common::min_max_predicate::{
         MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue,
     };
-    use crate::common::scan_predicate::{ScanPredicate, ScanPredicateDomain, ScanPredicateSource};
+    use crate::common::scan_predicate::{
+        ColumnStats, MembershipPredicate, PruneVerdict, ScanLayer, ScanPredicate,
+        ScanPredicateDomain, ScanPredicateDomainKind, ScanPredicateSource, ScanPruner, UnitId,
+        prune_units,
+    };
 
     #[test]
     fn range_predicate_round_trips_to_min_max_predicate() {
@@ -490,5 +784,423 @@ mod tests {
         );
 
         assert_eq!(predicate.range_op(), Some(MinMaxPredicateOp::Lt));
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct TestColumnStats {
+        min_max: Option<(MinMaxPredicateValue, MinMaxPredicateValue)>,
+        contains: Vec<(MinMaxPredicateValue, bool)>,
+    }
+
+    impl ColumnStats for TestColumnStats {
+        fn min_max(&self) -> Option<(MinMaxPredicateValue, MinMaxPredicateValue)> {
+            self.min_max.clone()
+        }
+
+        fn contains(&self, value: &MinMaxPredicateValue) -> Option<bool> {
+            self.contains
+                .iter()
+                .find_map(|(candidate, present)| (candidate == value).then_some(*present))
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct OverrideColumnStats {
+        range_result: Option<bool>,
+        discrete_result: Option<bool>,
+    }
+
+    impl ColumnStats for OverrideColumnStats {
+        fn may_satisfy_range(
+            &self,
+            _op: MinMaxPredicateOp,
+            _value: &MinMaxPredicateValue,
+        ) -> Result<Option<bool>, String> {
+            Ok(self.range_result)
+        }
+
+        fn may_satisfy_discrete_set(
+            &self,
+            _values: &[MinMaxPredicateValue],
+            _min: &MinMaxPredicateValue,
+            _max: &MinMaxPredicateValue,
+        ) -> Result<Option<bool>, String> {
+            Ok(self.discrete_result)
+        }
+    }
+
+    struct TestPruner {
+        units: Vec<UnitId>,
+        accepted: Vec<ScanPredicateDomainKind>,
+        stats: Option<TestColumnStats>,
+    }
+
+    impl ScanPruner for TestPruner {
+        fn layer(&self) -> ScanLayer {
+            ScanLayer::RowGroup
+        }
+
+        fn accepts_domain(&self, kind: ScanPredicateDomainKind) -> bool {
+            self.accepted.contains(&kind)
+        }
+
+        fn units(&self) -> &[UnitId] {
+            &self.units
+        }
+
+        fn column_stats<'a>(
+            &'a self,
+            _column: &str,
+            _unit: UnitId,
+        ) -> Option<Box<dyn ColumnStats + 'a>> {
+            self.stats
+                .clone()
+                .map(|stats| Box::new(stats) as Box<dyn ColumnStats>)
+        }
+    }
+
+    #[test]
+    fn domain_kind_and_fallback_are_explicit() {
+        let range = ScanPredicateDomain::Range {
+            op: MinMaxPredicateOp::Ge,
+            value: MinMaxPredicateValue::Int32(10),
+        };
+        assert_eq!(range.kind(), ScanPredicateDomainKind::Range);
+        assert!(range.fallback_domains().is_empty());
+
+        let discrete = ScanPredicateDomain::DiscreteSet {
+            values: vec![
+                MinMaxPredicateValue::Int32(3),
+                MinMaxPredicateValue::Int32(8),
+            ],
+            min: MinMaxPredicateValue::Int32(3),
+            max: MinMaxPredicateValue::Int32(8),
+        };
+        assert_eq!(discrete.kind(), ScanPredicateDomainKind::DiscreteSet);
+        assert_eq!(
+            discrete.fallback_domains(),
+            vec![
+                ScanPredicateDomain::Range {
+                    op: MinMaxPredicateOp::Ge,
+                    value: MinMaxPredicateValue::Int32(3),
+                },
+                ScanPredicateDomain::Range {
+                    op: MinMaxPredicateOp::Le,
+                    value: MinMaxPredicateValue::Int32(8),
+                },
+            ]
+        );
+
+        let membership = ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+            values: vec![MinMaxPredicateValue::Int32(3)],
+        });
+        assert_eq!(membership.kind(), ScanPredicateDomainKind::Membership);
+        assert!(membership.fallback_domains().is_empty());
+    }
+
+    #[test]
+    fn range_domain_evaluate_skips_disjoint_stats() {
+        let stats = TestColumnStats {
+            min_max: Some((
+                MinMaxPredicateValue::Int32(10),
+                MinMaxPredicateValue::Int32(20),
+            )),
+            contains: Vec::new(),
+        };
+        let domain = ScanPredicateDomain::Range {
+            op: MinMaxPredicateOp::Lt,
+            value: MinMaxPredicateValue::Int32(5),
+        };
+
+        assert_eq!(
+            domain.evaluate(&stats).expect("range evaluate"),
+            PruneVerdict::Skip
+        );
+    }
+
+    #[test]
+    fn range_domain_evaluate_uses_column_stats_override() {
+        let stats = OverrideColumnStats {
+            range_result: Some(false),
+            discrete_result: None,
+        };
+        let domain = ScanPredicateDomain::Range {
+            op: MinMaxPredicateOp::Ge,
+            value: MinMaxPredicateValue::Int32(10),
+        };
+
+        assert_eq!(
+            domain.evaluate(&stats).expect("range override"),
+            PruneVerdict::Skip
+        );
+    }
+
+    #[test]
+    fn discrete_set_evaluate_uses_contains_before_min_max() {
+        let stats = TestColumnStats {
+            min_max: Some((
+                MinMaxPredicateValue::Int32(0),
+                MinMaxPredicateValue::Int32(100),
+            )),
+            contains: vec![
+                (MinMaxPredicateValue::Int32(3), false),
+                (MinMaxPredicateValue::Int32(8), false),
+            ],
+        };
+        let domain = ScanPredicateDomain::DiscreteSet {
+            values: vec![
+                MinMaxPredicateValue::Int32(3),
+                MinMaxPredicateValue::Int32(8),
+            ],
+            min: MinMaxPredicateValue::Int32(3),
+            max: MinMaxPredicateValue::Int32(8),
+        };
+
+        assert_eq!(
+            domain.evaluate(&stats).expect("discrete evaluate"),
+            PruneVerdict::Skip
+        );
+    }
+
+    #[test]
+    fn discrete_set_evaluate_uses_column_stats_override() {
+        let stats = OverrideColumnStats {
+            range_result: None,
+            discrete_result: Some(false),
+        };
+        let domain = ScanPredicateDomain::DiscreteSet {
+            values: vec![
+                MinMaxPredicateValue::Int32(3),
+                MinMaxPredicateValue::Int32(8),
+            ],
+            min: MinMaxPredicateValue::Int32(3),
+            max: MinMaxPredicateValue::Int32(8),
+        };
+
+        assert_eq!(
+            domain.evaluate(&stats).expect("discrete override"),
+            PruneVerdict::Skip
+        );
+    }
+
+    #[test]
+    fn discrete_set_partial_contains_answers_keep_without_min_max() {
+        let stats = TestColumnStats {
+            min_max: None,
+            contains: vec![(MinMaxPredicateValue::Int32(3), false)],
+        };
+        let domain = ScanPredicateDomain::DiscreteSet {
+            values: vec![
+                MinMaxPredicateValue::Int32(3),
+                MinMaxPredicateValue::Int32(8),
+            ],
+            min: MinMaxPredicateValue::Int32(3),
+            max: MinMaxPredicateValue::Int32(8),
+        };
+
+        assert_eq!(
+            domain.evaluate(&stats).expect("partial contains"),
+            PruneVerdict::Keep
+        );
+    }
+
+    #[test]
+    fn discrete_set_present_contains_answer_keeps_despite_missing_answer_and_disjoint_min_max() {
+        let stats = TestColumnStats {
+            min_max: Some((
+                MinMaxPredicateValue::Int32(10),
+                MinMaxPredicateValue::Int32(20),
+            )),
+            contains: vec![(MinMaxPredicateValue::Int32(3), true)],
+        };
+        let domain = ScanPredicateDomain::DiscreteSet {
+            values: vec![
+                MinMaxPredicateValue::Int32(3),
+                MinMaxPredicateValue::Int32(8),
+            ],
+            min: MinMaxPredicateValue::Int32(3),
+            max: MinMaxPredicateValue::Int32(8),
+        };
+
+        assert_eq!(
+            domain.evaluate(&stats).expect("present contains answer"),
+            PruneVerdict::Keep
+        );
+    }
+
+    #[test]
+    fn membership_domain_keeps_without_contains_and_skips_when_all_values_absent() {
+        let domain = ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+            values: vec![MinMaxPredicateValue::Int32(7)],
+        });
+        let no_membership_stats = TestColumnStats {
+            min_max: Some((
+                MinMaxPredicateValue::Int32(0),
+                MinMaxPredicateValue::Int32(10),
+            )),
+            contains: Vec::new(),
+        };
+        assert_eq!(
+            domain
+                .evaluate(&no_membership_stats)
+                .expect("membership without contains"),
+            PruneVerdict::Keep
+        );
+
+        let absent_stats = TestColumnStats {
+            min_max: None,
+            contains: vec![(MinMaxPredicateValue::Int32(7), false)],
+        };
+        assert_eq!(
+            domain.evaluate(&absent_stats).expect("membership absent"),
+            PruneVerdict::Skip
+        );
+    }
+
+    #[test]
+    fn prune_units_uses_fallback_when_pruner_rejects_discrete_set() {
+        let predicate = ScanPredicate::discrete_set(
+            "0".to_string(),
+            vec![
+                MinMaxPredicateValue::Int32(1),
+                MinMaxPredicateValue::Int32(2),
+            ],
+            ScanPredicateSource::RuntimeIn,
+        )
+        .expect("discrete predicate");
+        let pruner = TestPruner {
+            units: vec![0],
+            accepted: vec![ScanPredicateDomainKind::Range],
+            stats: Some(TestColumnStats {
+                min_max: Some((
+                    MinMaxPredicateValue::Int32(10),
+                    MinMaxPredicateValue::Int32(20),
+                )),
+                contains: Vec::new(),
+            }),
+        };
+
+        let result = prune_units(&pruner, &[predicate]).expect("prune units");
+        assert!(result.kept_units.is_empty());
+        assert_eq!(result.skipped_units, vec![0]);
+    }
+
+    #[test]
+    fn prune_units_keeps_rejected_membership_domain() {
+        let predicate = ScanPredicate::new(
+            "0".to_string(),
+            ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                values: vec![MinMaxPredicateValue::Int32(7)],
+            }),
+            ScanPredicateSource::RuntimeMembership,
+        );
+        let pruner = TestPruner {
+            units: vec![0],
+            accepted: vec![ScanPredicateDomainKind::Range],
+            stats: Some(TestColumnStats {
+                min_max: None,
+                contains: vec![(MinMaxPredicateValue::Int32(7), false)],
+            }),
+        };
+
+        let result = prune_units(&pruner, &[predicate]).expect("prune units");
+        assert_eq!(result.kept_units, vec![0]);
+        assert!(result.skipped_units.is_empty());
+    }
+
+    #[test]
+    fn prune_units_keeps_when_no_fallback_domain_is_accepted() {
+        let predicate = ScanPredicate::discrete_set(
+            "0".to_string(),
+            vec![
+                MinMaxPredicateValue::Int32(1),
+                MinMaxPredicateValue::Int32(2),
+            ],
+            ScanPredicateSource::RuntimeIn,
+        )
+        .expect("discrete predicate");
+        let pruner = TestPruner {
+            units: vec![0],
+            accepted: Vec::new(),
+            stats: Some(TestColumnStats {
+                min_max: Some((
+                    MinMaxPredicateValue::Int32(10),
+                    MinMaxPredicateValue::Int32(20),
+                )),
+                contains: Vec::new(),
+            }),
+        };
+
+        let result = prune_units(&pruner, &[predicate]).expect("prune units");
+        assert_eq!(result.kept_units, vec![0]);
+        assert!(result.skipped_units.is_empty());
+    }
+
+    #[test]
+    fn prune_units_treats_multiple_predicates_as_and() {
+        let keep_predicate = ScanPredicate::from_min_max_predicate(
+            MinMaxPredicate::Ge {
+                column: "0".to_string(),
+                value: MinMaxPredicateValue::Int32(5),
+            },
+            ScanPredicateSource::Static,
+        );
+        let skip_predicate = ScanPredicate::from_min_max_predicate(
+            MinMaxPredicate::Lt {
+                column: "0".to_string(),
+                value: MinMaxPredicateValue::Int32(5),
+            },
+            ScanPredicateSource::Static,
+        );
+        let pruner = TestPruner {
+            units: vec![0],
+            accepted: vec![ScanPredicateDomainKind::Range],
+            stats: Some(TestColumnStats {
+                min_max: Some((
+                    MinMaxPredicateValue::Int32(10),
+                    MinMaxPredicateValue::Int32(20),
+                )),
+                contains: Vec::new(),
+            }),
+        };
+
+        let result = prune_units(&pruner, &[keep_predicate, skip_predicate]).expect("prune units");
+        assert!(result.kept_units.is_empty());
+        assert_eq!(result.skipped_units, vec![0]);
+    }
+
+    #[test]
+    fn to_min_max_predicates_uses_domain_fallback_and_drops_membership() {
+        let discrete = ScanPredicate::discrete_set(
+            "0".to_string(),
+            vec![
+                MinMaxPredicateValue::Int32(8),
+                MinMaxPredicateValue::Int32(3),
+            ],
+            ScanPredicateSource::RuntimeIn,
+        )
+        .expect("discrete predicate");
+        assert_eq!(
+            discrete.to_min_max_predicates(),
+            vec![
+                MinMaxPredicate::Ge {
+                    column: "0".to_string(),
+                    value: MinMaxPredicateValue::Int32(3),
+                },
+                MinMaxPredicate::Le {
+                    column: "0".to_string(),
+                    value: MinMaxPredicateValue::Int32(8),
+                },
+            ]
+        );
+
+        let membership = ScanPredicate::new(
+            "0".to_string(),
+            ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                values: vec![MinMaxPredicateValue::Int32(3)],
+            }),
+            ScanPredicateSource::RuntimeMembership,
+        );
+        assert!(membership.to_min_max_predicates().is_empty());
     }
 }
