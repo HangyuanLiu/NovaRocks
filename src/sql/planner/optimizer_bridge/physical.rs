@@ -87,21 +87,21 @@ impl BridgeCtx<'_> {
                 items: materialize_sort_keys(self.scalars, &op.items),
                 limit: op.limit,
                 offset: op.offset,
-                phase: op.phase,
+                phase: map_topn_phase(op.phase),
                 is_split: op.is_split,
             })),
             Operator::PhysicalHashAggregate(op) => {
                 let group_by = materialize_exprs(self.scalars, &op.group_by);
                 Ok(PhysicalPlanKind::HashAggregate(Box::new(
                     PhysicalHashAggregateNode {
-                        mode: op.mode,
+                        mode: map_agg_mode(op.mode),
                         group_by,
                         aggregates: materialize_aggregate_calls(
                             self.scalars,
                             &op.aggregates,
                             &op.output_layout,
                         ),
-                        output_layout: op.output_layout.clone(),
+                        output_layout: map_aggregate_output_layout(&op.output_layout),
                         is_merge: op.is_merge.clone(),
                         output_columns: op.output_columns.clone(),
                     },
@@ -128,7 +128,7 @@ impl BridgeCtx<'_> {
                     other_condition: op
                         .other_condition
                         .map(|expr| materialize(self.scalars, expr)),
-                    distribution: op.distribution.clone(),
+                    distribution: map_join_distribution(op.distribution.clone()),
                     execution_mode,
                     build_runtime_filters: node
                         .build_runtime_filters
