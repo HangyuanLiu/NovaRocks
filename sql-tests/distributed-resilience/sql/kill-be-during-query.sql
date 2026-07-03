@@ -5,8 +5,7 @@
 CREATE TABLE ${case_db}.resilience_series (
   id BIGINT
 )
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 8;
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.resilience_series
 SELECT generate_series FROM TABLE(generate_series(1, 1000000));
 

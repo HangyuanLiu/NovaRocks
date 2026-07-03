@@ -10,7 +10,8 @@ CREATE TABLE `customer` (
   `c_region` STRING NOT NULL,
   `c_phone` STRING NOT NULL,
   `c_mktsegment` STRING NOT NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE `dates` (
   `d_datekey` INT NOT NULL,
@@ -30,7 +31,8 @@ CREATE TABLE `dates` (
   `d_lastdayinmonthfl` INT NOT NULL,
   `d_holidayfl` INT NOT NULL,
   `d_weekdayfl` INT NOT NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE `lineorder` (
   `lo_orderkey` INT NOT NULL,
@@ -50,7 +52,8 @@ CREATE TABLE `lineorder` (
   `lo_tax` INT NOT NULL,
   `lo_commitdate` INT NOT NULL,
   `lo_shipmode` STRING NOT NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE `part` (
   `p_partkey` INT NOT NULL,
@@ -62,7 +65,8 @@ CREATE TABLE `part` (
   `p_type` STRING NOT NULL,
   `p_size` INT NOT NULL,
   `p_container` STRING NOT NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE `supplier` (
   `s_suppkey` INT NOT NULL,
@@ -72,4 +76,5 @@ CREATE TABLE `supplier` (
   `s_nation` STRING NOT NULL,
   `s_region` STRING NOT NULL,
   `s_phone` STRING NOT NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
