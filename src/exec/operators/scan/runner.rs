@@ -29,14 +29,15 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use super::dispatch::ScanDispatchState;
-use super::types::{PushResult, ScanAsyncState, ScanRuntimeFilterProbe};
+use super::types::{
+    PushResult, ScanAsyncState, ScanRuntimeFilterProbe, SharedRuntimeFilterDecision,
+};
 use crate::common::failpoint;
 use crate::connector::iceberg::equality_delete::{EqualityDeleteSet, equality_delete_keep_mask};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanNode};
-use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::exec::row_position::LakeRowPositionSpec;
@@ -49,9 +50,7 @@ use crate::exec::runtime_filter::{
 };
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
-use crate::runtime::runtime_filter_hub::{
-    AcquireProgress, AcquiredRuntimeFilters, RuntimeFilterSnapshot,
-};
+use crate::runtime::runtime_filter_hub::{AcquiredRuntimeFilters, RuntimeFilterSnapshot};
 use crate::runtime::runtime_filter_observability::RfLifecycleHandle;
 use crate::thrift::metrics;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
@@ -59,7 +58,7 @@ use arrow::compute::filter_record_batch;
 use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const SLOW_SCAN_PROGRESS_THRESHOLD: Duration = Duration::from_secs(5);
@@ -74,7 +73,6 @@ const RUNTIME_IN_FILTER_NUM: &str = "RuntimeInFilterNum";
 const RUNTIME_FILTER_PLANNED: &str = "RuntimeFilterPlanned";
 const RUNTIME_FILTER_COMPLETE: &str = "RuntimeFilterComplete";
 const RUNTIME_FILTER_UNAVAILABLE: &str = "RuntimeFilterUnavailable";
-const SCAN_ASYNC_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 const IO_TASK_EXEC_TIME: &str = "IOTaskExecTime";
 const SCAN_TIME: &str = "ScanTime";
 
@@ -120,35 +118,6 @@ impl Drop for IoExecScope {
     }
 }
 
-fn wait_for_dependency(state: &ScanAsyncState, dep: &DependencyHandle) -> bool {
-    if dep.is_ready() {
-        return true;
-    }
-    let pair = Arc::new((Mutex::new(false), Condvar::new()));
-    let pair_clone = Arc::clone(&pair);
-    dep.add_waiter(Arc::new(move || {
-        let (lock, cv) = &*pair_clone;
-        let mut ready = lock.lock().expect("scan dependency wait lock");
-        *ready = true;
-        cv.notify_all();
-    }));
-    let (lock, cv) = &*pair;
-    let mut ready = lock.lock().expect("scan dependency wait lock");
-    while !*ready {
-        if dep.is_ready() {
-            return true;
-        }
-        if state.is_canceled() {
-            return false;
-        }
-        let (guard, _) = cv
-            .wait_timeout(ready, SCAN_ASYNC_WAIT_INTERVAL)
-            .expect("scan dependency wait");
-        ready = guard;
-    }
-    dep.is_ready()
-}
-
 /// Async scan runner that executes connector scan tasks and pushes produced chunks to scan buffers.
 pub(super) struct ScanAsyncRunner {
     name: String,
@@ -157,6 +126,7 @@ pub(super) struct ScanAsyncRunner {
     pub(super) morsel_iter: Option<BoxedExecIter>,
     pub(super) pending_chunk: Option<Chunk>,
     finished: bool,
+    shared_runtime_filter_decision: SharedRuntimeFilterDecision,
     runtime_filter_probe: Option<ScanRuntimeFilterProbe>,
     runtime_filter_exprs: HashMap<i32, ExprId>,
     runtime_filter_dict_fold_cache: RuntimeFilterDictionaryFoldCache,
@@ -334,6 +304,7 @@ impl ScanAsyncRunner {
         name: String,
         scan: ScanNode,
         dispatch: Arc<ScanDispatchState>,
+        shared_runtime_filter_decision: SharedRuntimeFilterDecision,
         runtime_filter_probe: Option<ScanRuntimeFilterProbe>,
         runtime_filter_exprs: HashMap<i32, ExprId>,
         runtime_filters_expected: usize,
@@ -349,6 +320,7 @@ impl ScanAsyncRunner {
             morsel_iter: None,
             pending_chunk: None,
             finished: false,
+            shared_runtime_filter_decision,
             runtime_filter_probe,
             runtime_filter_exprs,
             runtime_filter_dict_fold_cache: RuntimeFilterDictionaryFoldCache::default(),
@@ -451,32 +423,27 @@ impl ScanAsyncRunner {
         if self.runtime_filters_loaded {
             return Ok(());
         }
-        let Some(rf) = self.runtime_filter_probe.as_ref() else {
-            self.acquired = None;
-            self.runtime_filter_ctx = None;
-            self.runtime_filters_loaded = true;
-            return Ok(());
-        };
-        if self.runtime_filters_expected == 0 {
-            self.acquired = None;
-            self.runtime_filter_ctx = None;
-            self.runtime_filters_loaded = true;
-            return Ok(());
-        }
-
-        let acquired = loop {
-            match rf.poll_acquire() {
-                AcquireProgress::Pending(dep) => {
-                    if !wait_for_dependency(state, &dep) {
-                        return Err("scan canceled while waiting for runtime filters".to_string());
-                    }
-                }
-                AcquireProgress::Resolved(acquired) => break acquired,
-            }
-        };
+        let acquired = self.shared_runtime_filter_decision.get_or_acquire(
+            state,
+            self.runtime_filter_probe.as_ref(),
+            self.runtime_filters_expected,
+        )?;
         if state.is_canceled() {
             return Err("scan canceled while waiting for runtime filters".to_string());
         }
+        self.install_acquired_runtime_filters(acquired)
+    }
+
+    fn install_acquired_runtime_filters(
+        &mut self,
+        acquired: Option<AcquiredRuntimeFilters>,
+    ) -> Result<(), String> {
+        let Some(acquired) = acquired else {
+            self.acquired = None;
+            self.runtime_filter_ctx = None;
+            self.runtime_filters_loaded = true;
+            return Ok(());
+        };
         if let Some(profile) = self.profiles.as_ref() {
             profile.common.add_timer(JOIN_RUNTIME_FILTER_TIME);
             profile.common.add_timer(JOIN_RUNTIME_FILTER_HASH_TIME);
@@ -501,8 +468,10 @@ impl ScanAsyncRunner {
             self.runtime_filter_ctx = Some(Arc::new(RuntimeFilterContext::from_snapshot(
                 snapshot.clone(),
             )));
-            let ready_latency_ns = rf
-                .mark_ready()
+            let ready_latency_ns = self
+                .runtime_filter_probe
+                .as_ref()
+                .and_then(|rf| rf.mark_ready())
                 .map(|elapsed| clamp_u128_to_i64(elapsed.as_nanos()));
             self.record_runtime_filter_acquired("complete", ready_latency_ns.unwrap_or(0));
             if let Some(latency_ns) = ready_latency_ns
@@ -1697,6 +1666,7 @@ mod tests {
         RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
     };
     use crate::exec::operators::scan::dispatch::ScanDispatchState;
+    use crate::exec::operators::scan::types::SharedRuntimeFilterDecision;
     use crate::exec::pipeline::dependency::DependencyManager;
     use crate::exec::pipeline::scan::morsel::DynamicMorselQueue;
     use crate::exec::row_position::IcebergVirtualSpec;
@@ -2204,6 +2174,7 @@ mod tests {
             "scan".to_string(),
             scan,
             dispatch,
+            SharedRuntimeFilterDecision::new(),
             Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
             HashMap::from([(filter_id, expr)]),
             1,
@@ -2412,6 +2383,7 @@ mod tests {
             "scan".to_string(),
             scan,
             dispatch,
+            SharedRuntimeFilterDecision::new(),
             Some(ScanRuntimeFilterProbe::new(probe)),
             runtime_filter_exprs,
             1,
@@ -2696,6 +2668,7 @@ mod tests {
             "scan".to_string(),
             scan,
             dispatch,
+            SharedRuntimeFilterDecision::new(),
             Some(ScanRuntimeFilterProbe::new(probe)),
             HashMap::from([(7, expr)]),
             1,
@@ -2724,6 +2697,77 @@ mod tests {
                 .expect("observed min/max lock"),
             vec![0],
             "connector must see the frozen prepare-time snapshot, not late handle updates"
+        );
+    }
+
+    #[test]
+    fn runner_uses_cached_runtime_filter_decision_for_connector_context() {
+        let hub = RuntimeFilterHub::new(DependencyManager::new());
+        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
+
+        let mut arena = ExprArena::default();
+        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let arena = Arc::new(arena);
+        hub.register_probe_specs(
+            42,
+            &[crate::exec::node::RuntimeFilterProbeSpec {
+                filter_id: 7,
+                expr_id: expr,
+                slot_id: SlotId::new(1),
+                data_type: DataType::Int32,
+            }],
+        );
+        let source_probe = ScanRuntimeFilterProbe::new(hub.register_probe(42));
+        hub.publish_filters(&[], &[pruning_membership_filter(7, vec![1, 2, 3])]);
+
+        let shared_decision = SharedRuntimeFilterDecision::new();
+        let state = ScanAsyncState::new(1, "shared-runtime-filter-decision-test".to_string());
+        let cached = shared_decision
+            .get_or_acquire(&state, Some(&source_probe), 1)
+            .expect("warm shared runtime filter decision");
+        assert!(
+            matches!(cached, Some(AcquiredRuntimeFilters::Complete(_))),
+            "shared decision should cache complete runtime filters"
+        );
+
+        let observed_min_max_counts = Arc::new(Mutex::new(Vec::new()));
+        let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let scan = ScanNode::new(Arc::new(RuntimeFilterRecordingScanOp {
+            observed_min_max_counts: Arc::clone(&observed_min_max_counts),
+        }))
+        .with_node_id(42)
+        .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
+        let morsels = scan.build_morsels().expect("build morsels");
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            morsels.morsels,
+            morsels.has_more,
+        )));
+        let mut runner = ScanAsyncRunner::new(
+            "scan".to_string(),
+            scan,
+            dispatch,
+            shared_decision,
+            None,
+            HashMap::from([(7, expr)]),
+            1,
+            arena,
+            None,
+            0,
+        );
+        runner
+            .prepare_runtime_filters(&state)
+            .expect("prepare runtime filters from cached decision");
+
+        assert!(
+            runner.next_chunk().expect("scan next chunk").is_none(),
+            "recording scan has no rows"
+        );
+        assert_eq!(
+            *observed_min_max_counts
+                .lock()
+                .expect("observed min/max lock"),
+            vec![0],
+            "connector scan should receive runtime filter context from the shared decision"
         );
     }
 
@@ -2794,6 +2838,7 @@ mod tests {
             "scan".to_string(),
             scan.clone(),
             Arc::clone(&dispatch),
+            SharedRuntimeFilterDecision::new(),
             None,
             HashMap::new(),
             0,
@@ -2807,6 +2852,7 @@ mod tests {
             "scan".to_string(),
             scan,
             Arc::clone(&dispatch),
+            SharedRuntimeFilterDecision::new(),
             None,
             HashMap::new(),
             0,
@@ -2868,6 +2914,7 @@ mod tests {
             "scan".to_string(),
             scan,
             dispatch,
+            SharedRuntimeFilterDecision::new(),
             None,
             HashMap::new(),
             0,
@@ -2924,6 +2971,7 @@ mod tests {
             "scan".to_string(),
             scan,
             dispatch,
+            SharedRuntimeFilterDecision::new(),
             None,
             HashMap::new(),
             0,

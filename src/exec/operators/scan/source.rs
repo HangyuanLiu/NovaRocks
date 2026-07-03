@@ -335,6 +335,7 @@ impl ScanSourceOperator {
                 self.name.clone(),
                 self.scan.clone(),
                 Arc::clone(dispatch),
+                self.state.runtime_filter_decision.clone(),
                 self.runtime_filter_probe.clone(),
                 self.runtime_filter_exprs.clone(),
                 self.runtime_filters_expected,
@@ -552,11 +553,29 @@ impl Operator for ScanSourceOperator {
         }
 
         let scan = self.scan.clone();
+        let materialize_after_runtime_filters = scan.materialize_morsels_after_runtime_filters();
+        let async_state = Arc::clone(&self.async_state);
+        let runtime_filter_probe = self.runtime_filter_probe.clone();
+        let runtime_filters_expected = self.runtime_filters_expected;
+        let runtime_filter_decision = self.state.runtime_filter_decision.clone();
         let dispatch_result = self
             .state
             .dispatch
-            .get_or_init(|| {
-                let morsels = scan.build_morsels()?;
+            .get_or_init(move || {
+                let acquired = if materialize_after_runtime_filters {
+                    runtime_filter_decision.get_or_acquire(
+                        async_state.as_ref(),
+                        runtime_filter_probe.as_ref(),
+                        runtime_filters_expected,
+                    )?
+                } else {
+                    None
+                };
+                let morsels = if materialize_after_runtime_filters {
+                    scan.build_morsels_with_runtime_filters(acquired.as_ref())?
+                } else {
+                    scan.build_morsels()?
+                };
                 if morsels.has_more && !scan.supports_incremental_scan_ranges() {
                     let node_id = scan.node_id().unwrap_or(-1);
                     return Err(format!(
@@ -751,12 +770,12 @@ mod tests {
 
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
-    use crate::exec::expr::ExprArena;
+    use crate::exec::expr::{ExprArena, ExprId};
     use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanNode, ScanOp};
     use crate::exec::pipeline::dependency::DependencyManager;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::io::io_executor;
-    use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
+    use crate::runtime::runtime_filter_hub::{AcquiredRuntimeFilters, RuntimeFilterHub};
 
     use super::ScanSourceFactory;
     use std::thread;
@@ -765,6 +784,131 @@ mod tests {
     #[derive(Clone)]
     struct TestMorselScanOp {
         morsels: Vec<Vec<i32>>,
+    }
+
+    fn test_file_morsel(path: impl Into<String>) -> ScanMorsel {
+        ScanMorsel::FileRange {
+            path: path.into(),
+            file_len: 0,
+            offset: 0,
+            length: 0,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: None,
+        }
+    }
+
+    struct RecordingScanOp {
+        plain_calls: AtomicUsize,
+        runtime_filter_calls: AtomicUsize,
+        decisions: Mutex<Vec<String>>,
+    }
+
+    impl RecordingScanOp {
+        fn new() -> Self {
+            Self {
+                plain_calls: AtomicUsize::new(0),
+                runtime_filter_calls: AtomicUsize::new(0),
+                decisions: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn build_plain_calls(&self) -> usize {
+            self.plain_calls.load(Ordering::Acquire)
+        }
+
+        fn build_with_runtime_filter_calls(&self) -> usize {
+            self.runtime_filter_calls.load(Ordering::Acquire)
+        }
+
+        fn decisions(&self) -> Vec<String> {
+            self.decisions.lock().expect("decision lock").clone()
+        }
+    }
+
+    impl ScanOp for RecordingScanOp {
+        fn execute_iter(
+            &self,
+            _morsel: ScanMorsel,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
+        ) -> Result<crate::exec::node::BoxedExecIter, String> {
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        fn build_morsels(&self) -> Result<ScanMorsels, String> {
+            self.plain_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(ScanMorsels::new(vec![test_file_morsel("plain")], false))
+        }
+
+        fn materialize_morsels_after_runtime_filters(&self) -> bool {
+            true
+        }
+
+        fn build_morsels_with_runtime_filters(
+            &self,
+            acquired: Option<&AcquiredRuntimeFilters>,
+        ) -> Result<ScanMorsels, String> {
+            self.runtime_filter_calls.fetch_add(1, Ordering::AcqRel);
+            let decision = match acquired {
+                Some(AcquiredRuntimeFilters::Complete(_)) => "complete".to_string(),
+                Some(AcquiredRuntimeFilters::Unavailable(reason)) => {
+                    format!("unavailable:{reason:?}")
+                }
+                None => "none".to_string(),
+            };
+            self.decisions.lock().expect("decision lock").push(decision);
+            Ok(ScanMorsels::new(
+                vec![test_file_morsel("runtime-filter")],
+                false,
+            ))
+        }
+    }
+
+    struct PlainScanOp {
+        plain_calls: AtomicUsize,
+    }
+
+    impl PlainScanOp {
+        fn new() -> Self {
+            Self {
+                plain_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn build_plain_calls(&self) -> usize {
+            self.plain_calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl ScanOp for PlainScanOp {
+        fn execute_iter(
+            &self,
+            _morsel: ScanMorsel,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
+        ) -> Result<crate::exec::node::BoxedExecIter, String> {
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        fn build_morsels(&self) -> Result<ScanMorsels, String> {
+            self.plain_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(ScanMorsels::new(vec![test_file_morsel("plain")], false))
+        }
+    }
+
+    fn runtime_filter_probe_spec(filter_id: i32) -> crate::exec::node::RuntimeFilterProbeSpec {
+        crate::exec::node::RuntimeFilterProbeSpec {
+            filter_id,
+            expr_id: ExprId(0),
+            slot_id: SlotId::new(3),
+            data_type: DataType::Int32,
+        }
     }
 
     impl ScanOp for TestMorselScanOp {
@@ -822,6 +966,51 @@ mod tests {
                 .collect();
             Ok(ScanMorsels::new(morsels, false))
         }
+    }
+
+    #[test]
+    fn dispatch_materialization_uses_runtime_filter_decision_once() {
+        let op = Arc::new(RecordingScanOp::new());
+        let scan = ScanNode::new(op.clone())
+            .with_node_id(10)
+            .with_runtime_filter_specs(vec![runtime_filter_probe_spec(1)])
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+        runtime_filter_hub.set_wait_timeouts(None, None);
+        let arena = Arc::new(ExprArena::default());
+        let factory = ScanSourceFactory::new(scan, runtime_filter_hub, arena);
+        let rt = RuntimeState::default();
+
+        let mut source_a = factory.create(2, 0);
+        let mut source_b = factory.create(2, 1);
+        source_a
+            .bind_runtime_state(&rt)
+            .expect("bind source a runtime state");
+        source_b
+            .bind_runtime_state(&rt)
+            .expect("bind source b runtime state");
+        source_a.prepare().expect("prepare source a");
+        source_b.prepare().expect("prepare source b");
+
+        assert_eq!(op.build_with_runtime_filter_calls(), 1);
+        assert_eq!(op.build_plain_calls(), 0);
+        assert_eq!(op.decisions(), vec!["unavailable:NoWaitConfigured"]);
+    }
+
+    #[test]
+    fn non_runtime_materialized_scan_keeps_plain_build_morsels() {
+        let op = Arc::new(PlainScanOp::new());
+        let scan = ScanNode::new(op.clone())
+            .with_node_id(11)
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+        let arena = Arc::new(ExprArena::default());
+        let factory = ScanSourceFactory::new(scan, runtime_filter_hub, arena);
+
+        let mut source = factory.create(1, 0);
+        source.prepare().expect("prepare source");
+
+        assert_eq!(op.build_plain_calls(), 1);
     }
 
     #[test]

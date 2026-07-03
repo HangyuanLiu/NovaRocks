@@ -29,7 +29,7 @@ use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, Runt
 use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::warn;
 use crate::runtime::profile::RuntimeProfile;
-use crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot;
+use crate::runtime::runtime_filter_hub::{AcquiredRuntimeFilters, RuntimeFilterSnapshot};
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {
@@ -296,6 +296,17 @@ pub trait ScanOp: Send + Sync {
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String>;
+
+    fn materialize_morsels_after_runtime_filters(&self) -> bool {
+        false
+    }
+
+    fn build_morsels_with_runtime_filters(
+        &self,
+        _acquired: Option<&AcquiredRuntimeFilters>,
+    ) -> Result<ScanMorsels, String> {
+        self.build_morsels()
+    }
 
     /// Load Iceberg v2 position-delete files attached to `morsel` and collect
     /// the row positions they retire for the morsel's data file. Returns
@@ -572,6 +583,19 @@ impl ScanNode {
 
     pub fn build_morsels(&self) -> Result<ScanMorsels, String> {
         let mut morsels = self.op.build_morsels()?;
+        morsels.ensure_non_empty(self.accept_empty_scan_ranges);
+        Ok(morsels)
+    }
+
+    pub fn materialize_morsels_after_runtime_filters(&self) -> bool {
+        self.op.materialize_morsels_after_runtime_filters()
+    }
+
+    pub fn build_morsels_with_runtime_filters(
+        &self,
+        acquired: Option<&AcquiredRuntimeFilters>,
+    ) -> Result<ScanMorsels, String> {
+        let mut morsels = self.op.build_morsels_with_runtime_filters(acquired)?;
         morsels.ensure_non_empty(self.accept_empty_scan_ranges);
         Ok(morsels)
     }
