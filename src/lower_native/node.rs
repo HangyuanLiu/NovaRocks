@@ -56,6 +56,7 @@ use crate::proto::{common, expr, novarocks, plan};
 use crate::runtime::exchange::ExchangeKey;
 use crate::sql::codegen::expr_compiler::infer_agg_function_types;
 use crate::sql::common::ChangeStreamBranchKind;
+use crate::thrift::internal_service;
 use crate::types::wider_type;
 
 #[derive(Clone, Debug)]
@@ -69,6 +70,7 @@ pub(crate) struct LoweredNode {
 pub(crate) struct NodeLoweringContext {
     exchange_sender_counts: HashMap<ExchangeKey, usize>,
     scan_ranges: HashMap<i32, Vec<novarocks::ScanRange>>,
+    query_options: Option<internal_service::TQueryOptions>,
     connectors: Option<Arc<crate::connector::ConnectorRegistry>>,
     fragment_instance_hi: i64,
     fragment_instance_lo: i64,
@@ -99,6 +101,15 @@ impl NodeLoweringContext {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn with_query_options(
+        mut self,
+        query_options: Option<internal_service::TQueryOptions>,
+    ) -> Self {
+        self.query_options = query_options;
+        self
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn with_connector_registry(
         mut self,
         connectors: Arc<crate::connector::ConnectorRegistry>,
@@ -107,11 +118,15 @@ impl NodeLoweringContext {
         self
     }
 
-    pub(crate) fn scan_ranges(&self, node_id: i32) -> &[novarocks::ScanRange] {
+    pub(crate) fn scan_ranges(&self, node_id: i32) -> Result<&[novarocks::ScanRange], String> {
         self.scan_ranges
             .get(&node_id)
             .map(Vec::as_slice)
-            .unwrap_or_default()
+            .ok_or_else(|| format!("native ScanNode node_id={node_id} missing scan ranges"))
+    }
+
+    pub(crate) fn query_options(&self) -> Option<&internal_service::TQueryOptions> {
+        self.query_options.as_ref()
     }
 
     pub(crate) fn connectors(&self) -> Result<&crate::connector::ConnectorRegistry, String> {
