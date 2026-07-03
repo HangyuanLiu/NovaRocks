@@ -1,0 +1,261 @@
+syntax = "proto3";
+
+// NovaRocks-native scalar expression contract. Mirrors analyzer TypedExpr /
+// ExprKind after subquery decorrelation. This is a wire contract only: future FE
+// encode and BE prepare conversion layers own translation; planner and exec code
+// must not import generated proto directly.
+package novarocks.expr;
+
+import "common.proto";
+
+// Typed scalar expression tree node.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message Expr {
+  novarocks.common.TypeDesc type = 1;  // SQL type of this expression node.
+  bool nullable = 2;                   // true when this expression can return NULL.
+  oneof kind {
+    ColumnRef column_ref = 10;            // column reference by ColumnId.
+    LiteralExpr literal = 11;             // scalar literal.
+    BinaryOpExpr binary_op = 12;          // binary operator expression.
+    UnaryOpExpr unary_op = 13;            // unary operator expression.
+    FunctionCall function_call = 14;      // scalar function call by name.
+    AggregateCall aggregate_call = 15;    // aggregate function call by name.
+    WindowCall window_call = 16;          // analytic/window function call by name.
+    CastExpr cast = 17;                   // explicit cast.
+    IsNullExpr is_null = 18;              // IS NULL / IS NOT NULL predicate.
+    InListExpr in_list = 19;              // IN / NOT IN predicate.
+    BetweenExpr between = 20;             // BETWEEN / NOT BETWEEN predicate.
+    LikeExpr like = 21;                   // LIKE / NOT LIKE predicate.
+    CaseExpr case_expr = 22;              // CASE expression.
+    IsTruthExpr is_truth = 23;            // IS TRUE/FALSE predicate.
+    LambdaParamRef lambda_param_ref = 24; // lambda parameter reference.
+    LambdaExpr lambda = 25;               // lambda body and parameter names.
+    NestedExpr nested = 26;               // parenthesized expression wrapper.
+    // ExprKind::SubqueryPlaceholder is intentionally absent: subqueries are
+    // decorrelated before codegen; BE prepare must fail fast if one reaches it.
+  }
+}
+
+// Column reference keyed by ColumnId. Display names are optional diagnostics.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message ColumnRef {
+  uint32 column_id = 1;           // authoritative ColumnId identity.
+  optional string qualifier = 2;  // optional display-only qualifier.
+  optional string column = 3;     // optional display-only column name.
+}
+
+// Literal expression wrapper.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message LiteralExpr {
+  novarocks.common.LiteralValue value = 1;  // scalar literal value.
+}
+
+// Binary operator expression.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message BinaryOpExpr {
+  BinaryOp op = 1;  // binary operator.
+  Expr left = 2;    // left operand.
+  Expr right = 3;   // right operand.
+}
+
+// Unary operator expression.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message UnaryOpExpr {
+  UnaryOp op = 1;  // unary operator.
+  Expr operand = 2;  // input operand.
+}
+
+// Scalar function call identified by function name, not opcode.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message FunctionCall {
+  string function_name = 1;  // scalar function registry name.
+  repeated Expr args = 2;    // call arguments in source order.
+  bool distinct = 3;         // true for DISTINCT calls when supported.
+}
+
+// Aggregate function call identified by function name, not opcode.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message AggregateCall {
+  string function_name = 1;       // aggregate function registry name.
+  repeated Expr args = 2;         // aggregate arguments in source order.
+  bool distinct = 3;              // true for DISTINCT aggregate calls.
+  repeated SortItem order_by = 4; // ORDER BY items for order-sensitive aggregates.
+}
+
+// Window function call identified by function name, not opcode.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message WindowCall {
+  string function_name = 1;        // window function registry name.
+  repeated Expr args = 2;          // window function arguments.
+  bool distinct = 3;               // true when DISTINCT was requested.
+  repeated Expr partition_by = 4;  // window partition expressions.
+  repeated SortItem order_by = 5;  // window ordering items.
+  optional WindowFrame frame = 6;  // optional window frame.
+  bool ignore_nulls = 7;           // true when IGNORE NULLS is requested.
+}
+
+// Explicit cast expression.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message CastExpr {
+  Expr operand = 1;                         // expression being cast.
+  novarocks.common.TypeDesc target = 2;     // target SQL type.
+}
+
+// IS NULL / IS NOT NULL predicate.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IsNullExpr {
+  Expr operand = 1;  // expression tested for NULL.
+  bool negated = 2;  // true for IS NOT NULL.
+}
+
+// IN / NOT IN predicate.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message InListExpr {
+  Expr operand = 1;      // expression tested against the list.
+  repeated Expr list = 2; // candidate expressions.
+  bool negated = 3;      // true for NOT IN.
+}
+
+// BETWEEN / NOT BETWEEN predicate.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message BetweenExpr {
+  Expr operand = 1;  // expression tested against the range.
+  Expr low = 2;      // lower bound expression.
+  Expr high = 3;     // upper bound expression.
+  bool negated = 4;  // true for NOT BETWEEN.
+}
+
+// LIKE / NOT LIKE predicate.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message LikeExpr {
+  Expr operand = 1;  // string expression being matched.
+  Expr pattern = 2;  // pattern expression.
+  bool negated = 3;  // true for NOT LIKE.
+}
+
+// CASE expression.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message CaseExpr {
+  optional Expr operand = 1;    // optional simple CASE operand.
+  repeated WhenThen when_then = 2; // ordered WHEN/THEN branches.
+  optional Expr else_expr = 3;  // optional ELSE expression.
+}
+
+// One CASE WHEN/THEN branch.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message WhenThen {
+  Expr when = 1;  // WHEN predicate or comparison expression.
+  Expr then = 2;  // THEN result expression.
+}
+
+// IS TRUE / IS FALSE predicate.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message IsTruthExpr {
+  Expr operand = 1;  // expression tested for truth value.
+  bool value = 2;    // true for TRUE, false for FALSE.
+  bool negated = 3;  // true for IS NOT TRUE/FALSE.
+}
+
+// Lambda parameter reference by slot id.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message LambdaParamRef {
+  int32 slot_id = 1;          // lambda parameter slot id.
+  optional string name = 2;   // optional display-only parameter name.
+}
+
+// Lambda expression.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message LambdaExpr {
+  repeated string params = 1;  // lambda parameter names in source order.
+  Expr body = 2;               // lambda body expression.
+}
+
+// Parenthesized expression wrapper.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message NestedExpr {
+  Expr inner = 1;  // nested expression.
+}
+
+// Sort key used by expression ORDER BY surfaces and plan sort/topn nodes.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message SortItem {
+  Expr expr = 1;       // expression to sort by.
+  bool asc = 2;        // true for ascending order.
+  bool nulls_first = 3; // true when NULL values sort first.
+}
+
+// Window frame for analytic expressions.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message WindowFrame {
+  WindowFrameType frame_type = 1;  // ROWS or RANGE frame type.
+  WindowBound start = 2;           // frame start bound.
+  WindowBound end = 3;             // frame end bound.
+}
+
+// Window frame type. Mirrors src/sql/common/expr.rs WindowFrameType.
+enum WindowFrameType {
+  WINDOW_FRAME_TYPE_UNSPECIFIED = 0;
+  ROWS = 1;
+  RANGE = 2;
+}
+
+// Window frame bound.
+// Owner: produced by the future FE/native plan encoder and consumed by the
+// future BE/native plan prepare layer.
+message WindowBound {
+  oneof bound {
+    bool unbounded_preceding = 1; // true for UNBOUNDED PRECEDING.
+    int64 preceding = 2;          // number of rows/range units PRECEDING.
+    bool current_row = 3;         // true for CURRENT ROW.
+    int64 following = 4;          // number of rows/range units FOLLOWING.
+    bool unbounded_following = 5; // true for UNBOUNDED FOLLOWING.
+  }
+}
+
+// Binary operators. Mirrors src/sql/common/expr.rs BinOp; extend append-only.
+enum BinaryOp {
+  BINARY_OP_UNSPECIFIED = 0;
+  ADD = 1;
+  SUB = 2;
+  MUL = 3;
+  DIV = 4;
+  MOD = 5;
+  EQ = 6;
+  NE = 7;
+  LT = 8;
+  LE = 9;
+  GT = 10;
+  GE = 11;
+  EQ_FOR_NULL = 12;
+  AND = 13;
+  OR = 14;
+}
+
+// Unary operators. Mirrors src/sql/common/expr.rs UnOp; extend append-only.
+enum UnaryOp {
+  UNARY_OP_UNSPECIFIED = 0;
+  NOT = 1;
+  NEGATE = 2;
+  BITWISE_NOT = 3;
+}
