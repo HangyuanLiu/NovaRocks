@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::common::engine_error::EngineError;
 use crate::proto::{common, novarocks};
 use crate::runtime::sink_commit_wire;
-use crate::thrift::{frontend_service, status, status_code, types};
+use crate::thrift::{status, status_code, types};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct WriterKey {
@@ -329,40 +329,6 @@ impl WriteCoordinator {
     }
 }
 
-pub(crate) fn report_from_thrift(
-    params: frontend_service::TReportExecStatusParams,
-) -> Result<FragmentExecStatusReport, String> {
-    let query_id = params
-        .query_id
-        .ok_or_else(|| "TReportExecStatusParams missing query_id".to_string())?;
-    let fragment_instance_id = params
-        .fragment_instance_id
-        .ok_or_else(|| "TReportExecStatusParams missing fragment_instance_id".to_string())?;
-    let backend_num = params
-        .backend_num
-        .ok_or_else(|| "TReportExecStatusParams missing backend_num".to_string())?;
-    let status = params
-        .status
-        .ok_or_else(|| "TReportExecStatusParams missing status".to_string())?;
-    let done = params
-        .done
-        .ok_or_else(|| "TReportExecStatusParams missing done".to_string())?;
-    Ok(FragmentExecStatusReport {
-        query_id,
-        fragment_instance_id,
-        backend_num,
-        done,
-        status,
-        sink_commit_infos: params.sink_commit_infos.unwrap_or_default(),
-        tablet_commit_infos: params.commit_infos.unwrap_or_default(),
-        tablet_fail_infos: params.fail_infos.unwrap_or_default(),
-        load_counters: params.load_counters.unwrap_or_default(),
-        loaded_rows: params.loaded_rows.unwrap_or_default(),
-        loaded_bytes: params.sink_load_bytes.unwrap_or_default(),
-        filtered_rows: params.filtered_rows.unwrap_or_default(),
-    })
-}
-
 pub(crate) fn report_from_native(
     report: novarocks::ExecStatusReport,
 ) -> Result<FragmentExecStatusReport, String> {
@@ -502,10 +468,9 @@ pub(crate) fn unregister_query(query_id: &types::TUniqueId) {
         .remove(&query_key(query_id));
 }
 
-pub(crate) fn handle_report_exec_status(
-    params: frontend_service::TReportExecStatusParams,
+pub(crate) fn handle_fragment_report_exec_status(
+    report: FragmentExecStatusReport,
 ) -> Result<ReportOutcome, EngineError> {
-    let report = report_from_thrift(params).map_err(EngineError::protocol_decode)?;
     apply_report_to_query_state(&report);
 
     let coord = registry()
@@ -534,28 +499,7 @@ pub(crate) fn handle_native_report_exec_status(
     report: novarocks::ExecStatusReport,
 ) -> Result<ReportOutcome, EngineError> {
     let report = report_from_native(report).map_err(EngineError::protocol_decode)?;
-    apply_report_to_query_state(&report);
-
-    let coord = registry()
-        .queries
-        .lock()
-        .expect("write coordinator registry lock")
-        .get(&query_key(&report.query_id))
-        .cloned();
-
-    let Some(coord) = coord else {
-        if report_has_write_metadata(&report) {
-            return Err(EngineError::write_coordinator_gone(report.query_id.clone()));
-        }
-        return Ok(ReportOutcome::Accepted);
-    };
-    coord
-        .lock()
-        .expect("write coordinator lock")
-        .apply_report(report)
-        .map_err(|message| {
-            EngineError::distributed_write_output_mismatch("reportExecStatus", message)
-        })
+    handle_fragment_report_exec_status(report)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -750,40 +694,6 @@ mod tests {
             loaded_bytes: 70,
             filtered_rows: 0,
         }
-    }
-
-    fn thrift_params(
-        report: FragmentExecStatusReport,
-    ) -> frontend_service::TReportExecStatusParams {
-        frontend_service::TReportExecStatusParams::new(
-            frontend_service::FrontendServiceVersion::V1,
-            Some(report.query_id),
-            Some(report.backend_num),
-            Some(report.fragment_instance_id),
-            Some(report.status),
-            Some(report.done),
-            None,
-            Option::<Vec<String>>::None,
-            Option::<Vec<String>>::None,
-            Some(report.load_counters),
-            None,
-            Option::<Vec<String>>::None,
-            Some(report.tablet_commit_infos),
-            Some(report.loaded_rows),
-            None,
-            Some(report.loaded_bytes),
-            None,
-            None,
-            None,
-            Some(report.tablet_fail_infos),
-            Some(report.filtered_rows),
-            None,
-            None,
-            Some(report.sink_commit_infos),
-            None,
-            None,
-            None,
-        )
     }
 
     fn native_report(writer: &WriterKey) -> novarocks::ExecStatusReport {
@@ -1227,12 +1137,12 @@ mod tests {
             .expect("register write coordinator");
 
         assert_eq!(
-            handle_report_exec_status(thrift_params(report(
+            handle_fragment_report_exec_status(report(
                 &writer,
                 true,
                 ok_status(),
                 "s3://w/registry.parquet"
-            )))
+            ))
             .expect("handle report"),
             ReportOutcome::CommitReady
         );
@@ -1244,12 +1154,12 @@ mod tests {
         assert_eq!(commit.write_id, query_id);
 
         guard.unregister_query(&query_id);
-        let err = handle_report_exec_status(thrift_params(report(
+        let err = handle_fragment_report_exec_status(report(
             &writer,
             true,
             ok_status(),
             "s3://w/late.parquet",
-        )))
+        ))
         .expect_err("unregistered write-looking report must fail");
         assert_eq!(err.code(), EngineErrorCode::WriteCoordinatorGone);
         assert!(err.to_user_message().contains("not found"), "{err}");
@@ -1304,22 +1214,22 @@ mod tests {
             .expect("register two writer coordinator");
 
         assert_eq!(
-            handle_report_exec_status(thrift_params(report(
+            handle_fragment_report_exec_status(report(
                 &writer_a,
                 true,
                 ok_status(),
                 "s3://w/registry-a.parquet"
-            )))
+            ))
             .expect("handle writer a report"),
             ReportOutcome::Accepted
         );
         assert_eq!(
-            handle_report_exec_status(thrift_params(report(
+            handle_fragment_report_exec_status(report(
                 &writer_b,
                 true,
                 ok_status(),
                 "s3://w/registry-b.parquet"
-            )))
+            ))
             .expect("handle writer b report"),
             ReportOutcome::CommitReady
         );
@@ -1365,105 +1275,6 @@ mod tests {
     }
 
     #[test]
-    fn thrift_report_requires_identity_and_status() {
-        let params = frontend_service::TReportExecStatusParams::new(
-            frontend_service::FrontendServiceVersion::V1,
-            None,
-            Some(0),
-            None,
-            Some(ok_status()),
-            Some(true),
-            None,
-            Option::<Vec<String>>::None,
-            Option::<Vec<String>>::None,
-            None,
-            None,
-            Option::<Vec<String>>::None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        let err = report_from_thrift(params).expect_err("missing ids must fail");
-        assert!(err.contains("query_id"), "{err}");
-    }
-
-    #[test]
-    fn thrift_report_maps_commit_and_load_fields() {
-        let query_id = id(21, 31);
-        let finst_id = id(123, 223);
-        let sink_commit = types::TSinkCommitInfo {
-            iceberg_data_file: Some(types::TIcebergDataFile {
-                path: Some("s3://w/from-thrift.parquet".to_string()),
-                record_count: Some(123),
-                file_size_in_bytes: Some(456),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let tablet_commit =
-            types::TTabletCommitInfo::new(1001, 2002, None, Some(vec!["c1".to_string()]), None);
-        let tablet_fail = types::TTabletFailInfo::new(Some(3003), Some(4004));
-        let load_counters = BTreeMap::from([
-            ("dpp.norm.ALL".to_string(), "123".to_string()),
-            ("loaded.bytes".to_string(), "456".to_string()),
-        ]);
-        let params = frontend_service::TReportExecStatusParams::new(
-            frontend_service::FrontendServiceVersion::V1,
-            Some(query_id.clone()),
-            Some(7),
-            Some(finst_id.clone()),
-            Some(ok_status()),
-            Some(true),
-            None,
-            Option::<Vec<String>>::None,
-            Option::<Vec<String>>::None,
-            Some(load_counters.clone()),
-            None,
-            Option::<Vec<String>>::None,
-            Some(vec![tablet_commit.clone()]),
-            Some(123),
-            None,
-            Some(456),
-            None,
-            None,
-            None,
-            Some(vec![tablet_fail.clone()]),
-            Some(5),
-            None,
-            None,
-            Some(vec![sink_commit.clone()]),
-            None,
-            None,
-            None,
-        );
-
-        let report = report_from_thrift(params).expect("thrift report");
-        assert_eq!(report.query_id, query_id);
-        assert_eq!(report.fragment_instance_id, finst_id);
-        assert_eq!(report.backend_num, 7);
-        assert!(report.done);
-        assert_eq!(report.sink_commit_infos, vec![sink_commit]);
-        assert_eq!(report.tablet_commit_infos, vec![tablet_commit]);
-        assert_eq!(report.tablet_fail_infos, vec![tablet_fail]);
-        assert_eq!(report.load_counters, load_counters);
-        assert_eq!(report.loaded_rows, 123);
-        assert_eq!(report.loaded_bytes, 456);
-        assert_eq!(report.filtered_rows, 5);
-    }
-
-    #[test]
     fn unregistered_done_report_is_accepted_and_finishes_query_state() {
         let query_id = runtime_query_id(1900, 2900);
         let finst_id = crate::common::types::UniqueId { hi: 3100, lo: 4100 };
@@ -1484,7 +1295,7 @@ mod tests {
             filtered_rows: 0,
         };
 
-        let outcome = handle_report_exec_status(thrift_params(report))
+        let outcome = handle_fragment_report_exec_status(report)
             .expect("unregistered non-write report should be accepted");
         assert_eq!(outcome, ReportOutcome::Accepted);
         assert_eq!(
@@ -1516,7 +1327,7 @@ mod tests {
             filtered_rows: 0,
         };
 
-        let outcome = handle_report_exec_status(thrift_params(report))
+        let outcome = handle_fragment_report_exec_status(report)
             .expect("unregistered failure report should still be accepted");
         assert_eq!(outcome, ReportOutcome::Accepted);
         assert_eq!(
