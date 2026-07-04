@@ -67,7 +67,10 @@ use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
 use crate::thrift::metrics;
-use page_selection::build_row_selection_for_row_groups;
+use page_selection::{
+    PageSelectionResult, build_row_selection_for_row_groups,
+    build_row_selection_for_scan_predicates,
+};
 pub(crate) use reader::ParquetCachedReader;
 use row_group_selector::select_row_groups_for_range;
 pub use variant_pruning::VariantPathPruningPredicate;
@@ -90,6 +93,59 @@ fn read_app_io_time_ns(profile: &RuntimeProfile) -> i64 {
     profile
         .add_child_timer("AppIOTime", INPUT_STREAM_PROFILE_GROUP)
         .value()
+}
+
+fn record_page_selection(profile: &RuntimeProfile, selection: &PageSelectionResult) {
+    profile.counter_add(
+        "ParquetPageRowsTotal",
+        metrics::TUnit::UNIT,
+        clamp_u128_to_i64(selection.rows_total as u128),
+    );
+    profile.counter_add(
+        "ParquetPageRowsSelected",
+        metrics::TUnit::UNIT,
+        clamp_u128_to_i64(selection.rows_selected as u128),
+    );
+    profile.counter_add(
+        "ParquetPageRowsPruned",
+        metrics::TUnit::UNIT,
+        clamp_u128_to_i64(selection.rows_total.saturating_sub(selection.rows_selected) as u128),
+    );
+    profile.counter_add(
+        "ParquetPagePagesTotal",
+        metrics::TUnit::UNIT,
+        clamp_u128_to_i64(selection.pages_total),
+    );
+    profile.counter_add(
+        "ParquetPagePagesSelected",
+        metrics::TUnit::UNIT,
+        clamp_u128_to_i64(selection.pages_selected),
+    );
+    profile.counter_add(
+        "ParquetPagePagesPruned",
+        metrics::TUnit::UNIT,
+        clamp_u128_to_i64(selection.pages_pruned),
+    );
+    profile.counter_add(
+        "ParquetPagePredicatesRange",
+        metrics::TUnit::UNIT,
+        clamp_u128_to_i64(selection.physical_range_predicates),
+    );
+    profile.counter_add(
+        "ParquetPagePredicatesDiscreteSet",
+        metrics::TUnit::UNIT,
+        clamp_u128_to_i64(selection.physical_discrete_set_predicates),
+    );
+    profile.counter_add(
+        "ParquetPagePredicatesEnvelopeFallback",
+        metrics::TUnit::UNIT,
+        clamp_u128_to_i64(selection.physical_envelope_fallback_predicates),
+    );
+    profile.counter_add(
+        "ParquetPagePredicatesUnsupported",
+        metrics::TUnit::UNIT,
+        clamp_u128_to_i64(selection.predicates_unsupported),
+    );
 }
 
 fn normalize_batch_to_chunk_schema(
@@ -567,7 +623,7 @@ impl ParquetScanIter {
     fn arrow_reader_options(&self) -> ArrowReaderOptions {
         let mut opts = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
         if self.cfg.enable_page_index {
-            opts = opts.with_page_index_policy(PageIndexPolicy::Required);
+            opts = opts.with_page_index_policy(PageIndexPolicy::Optional);
         }
         opts
     }
@@ -759,7 +815,7 @@ impl ParquetScanIter {
         metadata: &Arc<ParquetMetaData>,
         row_groups: &[usize],
         projected_columns: &[String],
-        predicates: &[MinMaxPredicate],
+        page_predicates: &[ScanPredicate],
         variant_predicates: &[BoundVariantPathPruningPredicate],
         explicit_row_selection: Option<RowSelection>,
         apply_page_selection: bool,
@@ -800,16 +856,19 @@ impl ParquetScanIter {
             builder = builder.with_row_selection(selection);
         } else if apply_page_selection
             && self.cfg.enable_page_index
-            && (!predicates.is_empty() || !variant_predicates.is_empty())
+            && (!page_predicates.is_empty() || !variant_predicates.is_empty())
         {
-            let selection = build_row_selection_for_row_groups(
+            let selection = build_row_selection_for_scan_predicates(
                 metadata,
                 row_groups,
-                predicates,
+                page_predicates,
                 variant_predicates,
                 projected_columns,
                 self.cfg.case_sensitive,
             );
+            if let Some(profile) = self.profile.as_ref() {
+                record_page_selection(profile, &selection);
+            }
             if selection.rows_selected == 0 {
                 return Ok(None);
             }
@@ -828,7 +887,7 @@ impl ParquetScanIter {
         builder: ParquetRecordBatchReaderBuilder<ParquetCachedReader>,
         metadata: &Arc<ParquetMetaData>,
         row_groups: &[usize],
-        predicates: &[MinMaxPredicate],
+        page_predicates: &[ScanPredicate],
         variant_predicates: &[BoundVariantPathPruningPredicate],
     ) -> Result<Option<ParquetRecordBatchReader>, String> {
         self.build_projected_parquet_reader(
@@ -836,7 +895,7 @@ impl ParquetScanIter {
             metadata,
             row_groups,
             &self.cfg.columns,
-            predicates,
+            page_predicates,
             variant_predicates,
             None,
             true,
@@ -897,13 +956,16 @@ impl ParquetScanIter {
         cached_reader: &CachedRangeReader,
         metadata: &Arc<ParquetMetaData>,
         row_groups: &[usize],
-        predicates: &[MinMaxPredicate],
+        page_predicates: &[ScanPredicate],
+        delayed_min_max_predicates: &[MinMaxPredicate],
         variant_predicates: &[BoundVariantPathPruningPredicate],
     ) -> Result<DelayedReaderDecision, String> {
         self.record_delayed_decision("ParquetDelayedDecisionTry");
-        let Some(plan) =
-            build_delayed_projection_plan(predicates, &self.cfg.columns, self.cfg.case_sensitive)
-        else {
+        let Some(plan) = build_delayed_projection_plan(
+            delayed_min_max_predicates,
+            &self.cfg.columns,
+            self.cfg.case_sensitive,
+        ) else {
             self.record_delayed_decision("ParquetDelayedDecisionFallbackNoPlan");
             return Ok(DelayedReaderDecision::Fallback);
         };
@@ -911,16 +973,19 @@ impl ParquetScanIter {
         // Use page index as a cheap pre-check: only enable delayed materialization when
         // it can actually prune rows in this range. This avoids an expensive pre-scan
         // that would otherwise fallback to eager path with no pruning benefit.
-        let selection = build_row_selection_for_row_groups(
+        let selection = build_row_selection_for_scan_predicates(
             metadata,
             row_groups,
-            predicates,
+            page_predicates,
             variant_predicates,
             &self.cfg.columns,
             self.cfg.case_sensitive,
         );
 
         if selection.rows_selected == 0 {
+            if let Some(profile) = self.profile.as_ref() {
+                record_page_selection(profile, &selection);
+            }
             self.record_delayed_decision("ParquetDelayedDecisionSkipRangeNoRows");
             return Ok(DelayedReaderDecision::SkipRange);
         }
@@ -946,7 +1011,7 @@ impl ParquetScanIter {
             metadata,
             row_groups,
             &plan.active_columns,
-            predicates,
+            &[],
             &[],
             Some(active_selection),
             false,
@@ -959,7 +1024,7 @@ impl ParquetScanIter {
             metadata,
             row_groups,
             &plan.lazy_columns,
-            predicates,
+            &[],
             &[],
             Some(lazy_selection),
             false,
@@ -971,6 +1036,7 @@ impl ParquetScanIter {
 
         self.record_delayed_decision("ParquetDelayedDecisionUse");
         if let Some(profile) = self.profile.as_ref() {
+            record_page_selection(profile, &selection);
             profile.counter_add("ParquetDelayedRange", metrics::TUnit::UNIT, 1);
             profile.counter_add(
                 "ParquetDelayedRowsTotal",
@@ -1267,12 +1333,12 @@ impl ParquetScanIter {
                 }
                 continue;
             }
-            let page_min_max_predicates =
+            let delayed_min_max_predicates =
                 scan_predicates_to_min_max_predicates(&predicates.physical);
             let use_name_based_projection = !self.has_iceberg_schema_evolution();
             let active_projection_columns = if use_name_based_projection {
                 build_active_projection_columns(
-                    &page_min_max_predicates,
+                    &delayed_min_max_predicates,
                     &self.cfg.columns,
                     self.cfg.case_sensitive,
                 )
@@ -1303,7 +1369,8 @@ impl ParquetScanIter {
                 &cached_reader,
                 &metadata,
                 &row_groups,
-                &page_min_max_predicates,
+                &predicates.physical,
+                &delayed_min_max_predicates,
                 &bound_variant_predicates,
             )? {
                 DelayedReaderDecision::Use(reader) => {
@@ -1336,7 +1403,7 @@ impl ParquetScanIter {
                 builder,
                 &metadata,
                 &row_groups,
-                &page_min_max_predicates,
+                &predicates.physical,
                 &bound_variant_predicates,
             )?;
             let reader_init_ns = reader_init_start.elapsed().as_nanos();
@@ -2498,9 +2565,10 @@ mod tests {
         VariantPathPruningPredicate, VariantPathSpec, bind_variant_path_pruning_predicates,
         build_active_projection_columns, build_delayed_output_sources,
         build_delayed_projection_plan, build_parquet_iter, build_row_selection_for_row_groups,
-        collect_parquet_coalesce_io_ranges, evaluate_batch_predicate_mask,
-        reader::ParquetCachedReader, runtime_filters_to_scan_predicates,
-        scan_predicates_to_min_max_predicates, select_row_groups_for_range,
+        build_row_selection_for_scan_predicates, collect_parquet_coalesce_io_ranges,
+        evaluate_batch_predicate_mask, reader::ParquetCachedReader,
+        runtime_filters_to_scan_predicates, scan_predicates_to_min_max_predicates,
+        select_row_groups_for_range,
     };
 
     fn field_id_meta(field_id: i32) -> HashMap<String, String> {
@@ -2599,7 +2667,7 @@ mod tests {
     }
 
     #[test]
-    fn page_min_max_conversion_keeps_discrete_set_envelope_for_a3a() {
+    fn delayed_projection_min_max_conversion_keeps_discrete_set_envelope() {
         let predicate = ScanPredicate::discrete_set(
             "0".to_string(),
             vec![
@@ -2626,7 +2694,7 @@ mod tests {
     }
 
     #[test]
-    fn page_min_max_conversion_drops_membership_without_fallback_for_a3a() {
+    fn delayed_projection_min_max_conversion_drops_membership_without_fallback() {
         let predicate = ScanPredicate::new(
             "0".to_string(),
             ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
@@ -4184,6 +4252,87 @@ mod tests {
         }
     }
 
+    const RUNTIME_FILTER_PAGE_ROWS: i32 = 100;
+    const RUNTIME_FILTER_PAGE_COUNT: i32 = 10;
+
+    fn write_runtime_filter_page_fixture(path: &Path) -> ParquetMetaData {
+        let total_rows = (RUNTIME_FILTER_PAGE_ROWS * RUNTIME_FILTER_PAGE_COUNT) as usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(field_id_meta(1)),
+            Field::new("payload", DataType::Int32, false).with_metadata(field_id_meta(2)),
+        ]));
+        let ids: Vec<i32> = (0..total_rows as i32).collect();
+        let payloads: Vec<i32> = ids.iter().map(|value| value * 10).collect();
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(Int32Array::from(payloads)) as ArrayRef,
+            ],
+        )
+        .expect("runtime filter page fixture batch");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(total_rows))
+            .set_write_batch_size(RUNTIME_FILTER_PAGE_ROWS as usize)
+            .set_data_page_row_count_limit(RUNTIME_FILTER_PAGE_ROWS as usize)
+            .set_data_page_size_limit(1)
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+        let file = File::create(path).expect("create runtime filter page fixture parquet");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).expect("parquet writer");
+        writer
+            .write(&batch)
+            .expect("write runtime filter page fixture");
+        writer
+            .close()
+            .expect("close runtime filter page fixture writer");
+
+        let file = File::open(path).expect("open runtime filter page fixture parquet");
+        let options = parquet::file::serialized_reader::ReadOptionsBuilder::new()
+            .with_page_index()
+            .build();
+        let reader =
+            SerializedFileReader::new_with_options(file, options).expect("metadata reader");
+        reader.metadata().clone()
+    }
+
+    fn runtime_filter_page_scan_cfg(enable_page_index: bool) -> ParquetScanConfig {
+        let mut cfg = runtime_filter_row_group_scan_cfg();
+        cfg.enable_page_index = enable_page_index;
+        cfg.batch_size = Some(64);
+        cfg
+    }
+
+    fn runtime_filter_page_scan_cfg_with_payload(enable_page_index: bool) -> ParquetScanConfig {
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            &Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("payload", DataType::Int32, false),
+            ]),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .expect("runtime filter page payload fixture chunk schema");
+        ParquetScanConfig {
+            columns: vec!["id".to_string(), "payload".to_string()],
+            chunk_schema,
+            slot_kinds: vec![ParquetSlotKind::Regular, ParquetSlotKind::Regular],
+            case_sensitive: true,
+            enable_page_index,
+            min_max_predicates: Vec::new(),
+            runtime_min_max_filter_columns: HashMap::new(),
+            variant_path_predicates: Vec::new(),
+            batch_size: Some(64),
+            datacache: test_datacache_context(),
+            cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
+            profile_label: None,
+            iceberg_output_schema: None,
+            variant_path_columns: Vec::new(),
+            query_global_dicts: Default::default(),
+        }
+    }
+
     /// Builds an in-filter `RuntimeFilterContext` (round-tripped through
     /// `RuntimeFilterSnapshot`/`RuntimeFilterContext::from_snapshot`, matching
     /// how the scan-runner path reconstructs a context from a hub snapshot)
@@ -4335,6 +4484,61 @@ mod tests {
             Some(runtime_filters),
         )
         .expect("runtime filter scan iter")
+    }
+
+    fn open_runtime_filter_page_scan_iter(
+        path: &Path,
+        runtime_filters: crate::exec::node::scan::RuntimeFilterContext,
+        profile: crate::runtime::profile::RuntimeProfile,
+        enable_page_index: bool,
+    ) -> ParquetScanIter {
+        open_runtime_filter_page_scan_iter_with_cfg(
+            path,
+            runtime_filters,
+            profile,
+            runtime_filter_page_scan_cfg(enable_page_index),
+        )
+    }
+
+    fn open_runtime_filter_page_scan_iter_with_cfg(
+        path: &Path,
+        runtime_filters: crate::exec::node::scan::RuntimeFilterContext,
+        profile: crate::runtime::profile::RuntimeProfile,
+        cfg: ParquetScanConfig,
+    ) -> ParquetScanIter {
+        let file_len = fs::metadata(path).expect("fixture file metadata").len();
+        let temp_dir = path.parent().expect("fixture parent dir");
+        let op = build_fs_operator(temp_dir.to_str().expect("temp dir path")).expect("fs operator");
+        let factory = OpendalRangeReaderFactory::from_operator(op)
+            .expect("reader factory")
+            .with_profile(Some(profile.clone()));
+        let range = FileScanRange {
+            path: path
+                .file_name()
+                .expect("fixture file name")
+                .to_string_lossy()
+                .to_string(),
+            file_len,
+            offset: 0,
+            length: file_len,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: None,
+        };
+        ParquetScanIter::new(
+            cfg,
+            vec![range],
+            factory,
+            None,
+            Some(profile),
+            Some(runtime_filters),
+        )
+        .expect("runtime filter page scan iter")
     }
 
     #[test]
@@ -4554,6 +4758,159 @@ mod tests {
                 .counter_value("ParquetScanPredicatesEnvelopeFallback")
                 .unwrap_or(0),
             0
+        );
+    }
+
+    #[test]
+    fn runtime_filter_sparse_in_set_prunes_pages_inside_selected_row_group() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("rf_sparse_in_pages.parquet");
+        let metadata = write_runtime_filter_page_fixture(&file_path);
+        assert_eq!(metadata.num_row_groups(), 1);
+        let empty_selection = build_row_selection_for_scan_predicates(
+            &metadata,
+            &[0],
+            &[],
+            &[],
+            &["id".to_string()],
+            true,
+        );
+        assert!(empty_selection.selection.is_none());
+
+        let runtime_filters = runtime_filter_ctx_for_keys(vec![
+            0,
+            RUNTIME_FILTER_PAGE_ROWS * RUNTIME_FILTER_PAGE_COUNT - 1,
+        ]);
+        let profile = crate::runtime::profile::RuntimeProfile::new("rf_sparse_in_pages_test");
+        let mut iter =
+            open_runtime_filter_page_scan_iter(&file_path, runtime_filters, profile.clone(), true);
+
+        let mut rf_on_batches = Vec::new();
+        for item in &mut iter {
+            rf_on_batches.push(item.expect("scan chunk").batch);
+        }
+        let values = collect_id_values(&rf_on_batches);
+
+        assert_eq!(
+            profile
+                .counter_value("ParquetRowGroupsSelected")
+                .expect("row group selected counter"),
+            1
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetPagePredicatesDiscreteSet")
+                .expect("page discrete-set counter"),
+            1
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetPagePredicatesEnvelopeFallback")
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetPagePagesPruned")
+                .expect("page pruned counter"),
+            (RUNTIME_FILTER_PAGE_COUNT - 2) as i64
+        );
+        assert_eq!(
+            values.len(),
+            (2 * RUNTIME_FILTER_PAGE_ROWS) as usize,
+            "page pruning should keep the first and last pages only"
+        );
+        let last_page_start = (RUNTIME_FILTER_PAGE_COUNT - 1) * RUNTIME_FILTER_PAGE_ROWS;
+        let last_page_end = RUNTIME_FILTER_PAGE_COUNT * RUNTIME_FILTER_PAGE_ROWS;
+        assert!(
+            values.iter().all(|&value| {
+                (0..RUNTIME_FILTER_PAGE_ROWS).contains(&value)
+                    || (last_page_start..last_page_end).contains(&value)
+            }),
+            "sparse IN page pruning should keep only first and last pages"
+        );
+
+        let runtime_filters_without_page_index = runtime_filter_ctx_for_keys(vec![
+            0,
+            RUNTIME_FILTER_PAGE_ROWS * RUNTIME_FILTER_PAGE_COUNT - 1,
+        ]);
+        let profile_without_page_index =
+            crate::runtime::profile::RuntimeProfile::new("rf_sparse_in_pages_disabled_test");
+        let mut full_iter = open_runtime_filter_page_scan_iter_with_cfg(
+            &file_path,
+            runtime_filters_without_page_index,
+            profile_without_page_index.clone(),
+            runtime_filter_page_scan_cfg_with_payload(false),
+        );
+        let mut full_batches = Vec::new();
+        for item in &mut full_iter {
+            full_batches.push(item.expect("scan chunk").batch);
+        }
+        assert_eq!(
+            collect_id_values(&full_batches).len(),
+            (RUNTIME_FILTER_PAGE_ROWS * RUNTIME_FILTER_PAGE_COUNT) as usize
+        );
+        assert!(
+            profile_without_page_index
+                .counter_value("ParquetPageRowsTotal")
+                .is_none(),
+            "page counters should not be recorded when page index is disabled"
+        );
+        assert!(
+            profile_without_page_index
+                .counter_value("ParquetPagePredicatesDiscreteSet")
+                .is_none()
+        );
+        assert!(
+            profile_without_page_index
+                .counter_value("ParquetPagePagesPruned")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn enabled_page_index_keeps_file_without_page_indexes() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("rf_sparse_in_no_page_indexes.parquet");
+        let metadata = write_runtime_filter_row_group_fixture(&file_path);
+        assert_eq!(
+            metadata.num_row_groups(),
+            RUNTIME_FILTER_ROW_GROUP_COUNT as usize
+        );
+
+        // This fixture has row-group statistics but no page index. Enabling
+        // page-index pruning must remain conservative and read selected row
+        // groups in full instead of failing while opening Parquet metadata.
+        let runtime_filters = runtime_filter_ctx_for_keys(vec![
+            0,
+            RUNTIME_FILTER_ROW_GROUP_ROWS * RUNTIME_FILTER_ROW_GROUP_COUNT - 1,
+        ]);
+        let profile =
+            crate::runtime::profile::RuntimeProfile::new("rf_sparse_in_no_page_indexes_test");
+        let mut iter =
+            open_runtime_filter_page_scan_iter(&file_path, runtime_filters, profile.clone(), true);
+
+        let mut batches = Vec::new();
+        for item in &mut iter {
+            batches.push(item.expect("scan chunk").batch);
+        }
+        let values = collect_id_values(&batches);
+
+        assert_eq!(
+            values.len(),
+            (2 * RUNTIME_FILTER_ROW_GROUP_ROWS) as usize,
+            "missing page index should keep selected row groups in full"
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetRowGroupsSelected")
+                .expect("row group selected counter"),
+            2
+        );
+        assert_eq!(
+            profile.counter_value("ParquetPagePagesPruned").unwrap_or(0),
+            0,
+            "missing page index must not claim page pruning"
         );
     }
 
