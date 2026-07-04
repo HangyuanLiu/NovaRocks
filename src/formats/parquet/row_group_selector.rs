@@ -1305,6 +1305,20 @@ mod tests {
     }
 
     #[test]
+    fn bloom_value_encoding_rejects_decimal_for_int64_column() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
+        let column = metadata.row_group(0).column(0);
+        let bloom = parquet::bloom_filter::Sbbf::new_with_num_of_bytes(32);
+        let value = MinMaxPredicateValue::Decimal128 {
+            value: 101,
+            precision: 10,
+            scale: 2,
+        };
+
+        assert_eq!(bloom_filter_may_contain_value(&bloom, column, &value), None);
+    }
+
+    #[test]
     fn row_group_pruner_accepts_membership_only_with_bloom_provider() {
         let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
         let columns = vec!["a".to_string()];

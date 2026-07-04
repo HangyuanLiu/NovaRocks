@@ -4785,6 +4785,35 @@ mod tests {
     }
 
     #[test]
+    fn bloom_probe_keeps_when_file_has_no_column_bloom() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("no_bloom_overlap.parquet");
+        write_runtime_filter_row_group_fixture(&file_path);
+
+        let runtime_filters = runtime_filter_ctx_for_keys(vec![101]);
+        let profile = crate::runtime::profile::RuntimeProfile::new("no_bloom_overlap_test");
+        let mut iter = open_runtime_filter_scan_iter(&file_path, runtime_filters, profile.clone());
+
+        for item in &mut iter {
+            item.expect("chunk");
+        }
+
+        assert_eq!(
+            profile
+                .counter_value("ParquetBloomFilterDefiniteMiss")
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetRowGroupsSelected")
+                .expect("selected counter"),
+            1,
+            "the existing DiscreteSet min/max path still prunes to the matching row group"
+        );
+    }
+
+    #[test]
     fn static_eq_bloom_probe_prunes_row_group_when_minmax_overlaps() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let file_path = temp_dir.path().join("static_eq_bloom_overlap.parquet");
