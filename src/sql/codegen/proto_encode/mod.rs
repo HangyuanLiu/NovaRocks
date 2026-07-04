@@ -824,11 +824,11 @@ mod tests {
             payload: crate::sql::planner::DistributedPayload::Physical(
                 crate::sql::planner::plan::PhysicalPlanKind::HashAggregate(Box::new(
                     crate::sql::planner::plan::PhysicalHashAggregateNode {
-                        mode: crate::sql::optimizer::operator::AggMode::Local,
+                        mode: crate::sql::planner::AggMode::Local,
                         group_by: vec![column_expr(2, "c1", DataType::Utf8)],
                         aggregates: Vec::new(),
                         is_merge: Vec::new(),
-                        output_layout: crate::sql::optimizer::operator::AggregateOutputLayout::new(
+                        output_layout: crate::sql::planner::AggregateOutputLayout::new(
                             vec![group_column.clone()],
                             Vec::new(),
                         ),
