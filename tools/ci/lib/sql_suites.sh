@@ -40,6 +40,19 @@ ci_tier_suites() {
   esac
 }
 
+ci_proto_core_suites() {
+  printf "%s\n" join filter sort aggregate cte subquery iceberg-rest runtime-filter-distributed
+}
+
+ci_proto_suites() {
+  if [ "${NOVA_CI_PROTO_FULL:-0}" = "1" ]; then
+    ci_tier_suites full "$STABLE_SUITES_FILE"
+    return $?
+  fi
+
+  ci_proto_core_suites
+}
+
 ci_discover_sql_suites() {
   local repo_root="$1"
   local dir

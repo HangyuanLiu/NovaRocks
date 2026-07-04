@@ -23,6 +23,9 @@ CI_RUNTIME_PREPARED="false"
 NOVA_CI_CARGO_PROFILE="${NOVA_CI_CARGO_PROFILE:-dev-opt}"
 SQL_CLUSTER_MODE="${SQL_CLUSTER_MODE:-all-in-one}"
 SQL_CLUSTER_SIZE="${SQL_CLUSTER_SIZE:-1}"
+NOVA_CI_PROTO_CORE="${NOVA_CI_PROTO_CORE:-1}"
+NOVA_CI_PROTO_FULL="${NOVA_CI_PROTO_FULL:-0}"
+NOVA_CI_PROTO_REQUIRED="${NOVA_CI_PROTO_REQUIRED:-0}"
 
 usage() {
   cat <<'EOF'
@@ -35,6 +38,10 @@ Rust tests are executed with --test-threads=1 for the same reason.
 Cargo build/test/run stages use NOVA_CI_CARGO_PROFILE, defaulting to dev-opt.
 Clippy runs in warning-only mode until the repository has a clean strict-clippy
 baseline.
+Proto-mode SQL CI runs the core matrix by default for NIDL-5 M1 discovery. Set
+NOVA_CI_PROTO_CORE=0 to disable it, NOVA_CI_PROTO_FULL=1 to run the stable
+full-suite proto matrix, and NOVA_CI_PROTO_REQUIRED=1 to make proto failures
+fail CI.
 
 Options:
   --all-discovered      Run every suite discovered from sql-tests/*/sql.
@@ -270,6 +277,9 @@ prepare_runtime() {
     echo "NOVAROCKS_ICEBERG_REST_URI=$NOVAROCKS_ICEBERG_REST_URI"
     echo "NOVAROCKS_SPARK_DEFAULTS=${NOVAROCKS_SPARK_DEFAULTS:-}"
     echo "NOVA_CI_CARGO_PROFILE=$NOVA_CI_CARGO_PROFILE"
+    echo "NOVA_CI_PROTO_CORE=$NOVA_CI_PROTO_CORE"
+    echo "NOVA_CI_PROTO_FULL=$NOVA_CI_PROTO_FULL"
+    echo "NOVA_CI_PROTO_REQUIRED=$NOVA_CI_PROTO_REQUIRED"
   } >"$log_path" 2>&1
   code=$?
   duration=$(($(ci_epoch) - start))
@@ -523,6 +533,25 @@ ci_suite_cluster_size() {
       printf "%s\n" "$SQL_CLUSTER_SIZE"
       ;;
   esac
+}
+
+ci_proto_enabled() {
+  [ "$NOVA_CI_PROTO_CORE" = "1" ] || [ "$NOVA_CI_PROTO_FULL" = "1" ]
+}
+
+ci_proto_suite_cluster_mode() {
+  local suite="$1"
+  printf "cross-process\n"
+}
+
+ci_proto_suite_cluster_size() {
+  local suite="$1"
+  printf "3\n"
+}
+
+ci_proto_runner_extra_args() {
+  local suite="$1"
+  printf "%s\n" "--plan-wire-format proto"
 }
 
 ci_classify_sql_log() {
@@ -779,6 +808,136 @@ run_sql_suites() {
   fi
 }
 
+stop_server_for_proto_stage() {
+  local log_path="$CI_RUN_DIR/server-stop-for-proto.log"
+  local start
+  local code
+  local duration
+
+  start="$(ci_epoch)"
+  {
+    echo "Stopping standalone-server before proto cross-process SQL suites."
+    ci_stop_standalone_server
+  } >"$log_path" 2>&1
+  code=$?
+  duration=$(($(ci_epoch) - start))
+
+  if [ "$code" -ne 0 ]; then
+    ci_record_stage "standalone-server stop for proto" "FAIL" "$duration" "$log_path"
+    ci_mark_failure_tail "standalone-server stop for proto failed" "$log_path"
+    ci_render_summary "FAIL"
+    exit "$code"
+  fi
+
+  ci_record_stage "standalone-server stop for proto" "PASS" "$duration" "$log_path"
+  ci_render_summary "RUNNING"
+}
+
+run_proto_sql_suites() {
+  local failed=0
+  local suite
+  local log_path
+  local start
+  local code
+  local duration
+  local query_timeout
+  local novarocks_bin
+  local suite_cluster_mode
+  local suite_cluster_size
+  local proto_args
+  local -a proto_extra_args
+  local -a proto_suites
+  local suites_output
+
+  if ! ci_proto_enabled; then
+    return 0
+  fi
+
+  mkdir -p "$CI_RUN_DIR/sql-proto"
+  novarocks_bin="$REPO_ROOT/$(ci_novarocks_binary_path "$NOVA_CI_CARGO_PROFILE")"
+
+  if ! suites_output="$(ci_proto_suites)"; then
+    echo "error: failed to resolve proto SQL suites" >&2
+    exit 2
+  fi
+
+  proto_suites=()
+  while IFS= read -r suite; do
+    [ -n "$suite" ] || continue
+    if ! ci_suite_exists "$REPO_ROOT" "$suite"; then
+      echo "error: proto SQL suite does not exist: $suite" >&2
+      exit 2
+    fi
+    proto_suites+=("$suite")
+  done <<<"$suites_output"
+
+  if [ "${#proto_suites[@]}" -eq 0 ]; then
+    echo "error: no proto SQL suites selected" >&2
+    exit 2
+  fi
+
+  if [ "$SQL_CLUSTER_MODE" = "all-in-one" ]; then
+    stop_server_for_proto_stage
+  fi
+
+  for suite in "${proto_suites[@]}"; do
+    log_path="$CI_RUN_DIR/sql-proto/${suite}.log"
+    start="$(ci_epoch)"
+    query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-60}"
+    suite_cluster_mode="$(ci_proto_suite_cluster_mode "$suite")"
+    suite_cluster_size="$(ci_proto_suite_cluster_size "$suite")"
+    proto_args="$(ci_proto_runner_extra_args "$suite")"
+    read -r -a proto_extra_args <<<"$proto_args"
+    case "$suite" in
+      tpc-ds|tpc-h)
+        query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-180}"
+        ;;
+      complex-type|ssb)
+        query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-120}"
+        ;;
+      optimizer-dist)
+        query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-300}"
+        ;;
+    esac
+
+    ci_run_logged "$log_path" \
+      env NO_PROXY=127.0.0.1,localhost \
+      NOVAROCKS_BIN="$novarocks_bin" \
+      cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests --profile "$NOVA_CI_CARGO_PROFILE" -- \
+        --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+        --suite "$suite" \
+        --mode verify \
+        --query-timeout "$query_timeout" \
+        --cluster-mode "$suite_cluster_mode" \
+        --cluster-size "$suite_cluster_size" \
+        "${proto_extra_args[@]}" \
+        -j 1
+    code=$?
+    duration=$(($(ci_epoch) - start))
+
+    if [ "$code" -eq 0 ]; then
+      ci_record_sql_suite "proto:$suite" "PASS" "$duration" "$log_path"
+    else
+      failed=1
+      ci_classify_sql_log "$suite" "$log_path" "false" >/dev/null || true
+      if [ "$NOVA_CI_PROTO_REQUIRED" = "1" ]; then
+        ci_record_sql_suite "proto:$suite" "FAIL" "$duration" "$log_path"
+        if [ -z "$CI_FAILURE_TAIL" ]; then
+          ci_mark_failure_tail "proto SQL suite failed: $suite" "$log_path"
+        fi
+      else
+        ci_record_sql_suite "proto:$suite" "DISCOVERY_FAIL" "$duration" "$log_path"
+      fi
+    fi
+    ci_render_summary "RUNNING"
+  done
+
+  if [ "$failed" -ne 0 ] && [ "$NOVA_CI_PROTO_REQUIRED" = "1" ]; then
+    ci_render_summary "FAIL"
+    exit 1
+  fi
+}
+
 reclassify_existing_run() {
   local failed=0
   local any_logs=0
@@ -862,6 +1021,7 @@ main() {
     ci_render_summary "RUNNING"
   fi
   run_sql_suites
+  run_proto_sql_suites
 
   ci_render_summary "PASS"
   echo "PASS: $CI_SUMMARY"

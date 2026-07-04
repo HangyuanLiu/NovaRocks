@@ -83,3 +83,55 @@ if [ "$(ci_suite_cluster_size optimizer)" != "1" ]; then
   echo "ordinary suites should keep the global cluster size" >&2
   exit 1
 fi
+
+proto_core_suites="$(ci_proto_core_suites)"
+expected_proto_core_suites="$(printf "%s\n" join filter sort aggregate cte subquery iceberg-rest runtime-filter-distributed)"
+if [ "$proto_core_suites" != "$expected_proto_core_suites" ]; then
+  echo "proto core suites do not match the NIDL-5 M1 matrix" >&2
+  printf "expected:\n%s\nactual:\n%s\n" "$expected_proto_core_suites" "$proto_core_suites" >&2
+  exit 1
+fi
+
+if ! ci_proto_enabled; then
+  echo "proto core matrix should be enabled by default" >&2
+  exit 1
+fi
+
+if [ "$(ci_proto_suites | tr '\n' ' ')" != "$(printf "%s " join filter sort aggregate cte subquery iceberg-rest runtime-filter-distributed)" ]; then
+  echo "default proto matrix should use the core suites" >&2
+  exit 1
+fi
+
+NOVA_CI_PROTO_CORE="0"
+NOVA_CI_PROTO_FULL="0"
+if ci_proto_enabled; then
+  echo "explicit NOVA_CI_PROTO_CORE=0 should disable proto when full proto is off" >&2
+  exit 1
+fi
+
+NOVA_CI_PROTO_FULL="1"
+if ! ci_proto_enabled; then
+  echo "NOVA_CI_PROTO_FULL=1 should enable proto even when core proto is off" >&2
+  exit 1
+fi
+if ! ci_proto_suites | grep -qx "optimizer-dist"; then
+  echo "proto full matrix should include stable full suites" >&2
+  exit 1
+fi
+
+SQL_CLUSTER_MODE="all-in-one"
+SQL_CLUSTER_SIZE="1"
+if [ "$(ci_proto_suite_cluster_mode join)" != "cross-process" ]; then
+  echo "proto suites must force cross-process cluster mode" >&2
+  exit 1
+fi
+if [ "$(ci_proto_suite_cluster_size join)" != "3" ]; then
+  echo "proto suites must force a 3-BE cluster" >&2
+  exit 1
+fi
+
+proto_args="$(ci_proto_runner_extra_args join)"
+if ! grep -q -- "--plan-wire-format proto" <<<"$proto_args"; then
+  echo "proto runner args must include --plan-wire-format proto" >&2
+  exit 1
+fi
