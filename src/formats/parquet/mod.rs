@@ -44,7 +44,9 @@ use parquet::arrow::arrow_reader::{
     ParquetRecordBatchReaderBuilder, RowSelection,
 };
 use parquet::basic::Encoding;
+use parquet::bloom_filter::Sbbf;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -55,7 +57,9 @@ use crate::common::runtime_scan_predicate::{
     RuntimeScanPredicateBindings, RuntimeScanPredicateCounters, RuntimeScanPredicateOptions,
     runtime_filters_to_scan_predicates as build_runtime_scan_predicates,
 };
-use crate::common::scan_predicate::{ScanPredicate, ScanPredicateSource};
+use crate::common::scan_predicate::{
+    MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::cast_with_special_rules;
 use crate::exec::node::BoxedExecIter;
@@ -72,7 +76,9 @@ use page_selection::{
     build_row_selection_for_scan_predicates,
 };
 pub(crate) use reader::ParquetCachedReader;
-use row_group_selector::select_row_groups_for_range;
+use row_group_selector::{
+    ParquetBloomFilterCounters, ParquetColumnBloomProvider, select_row_groups_for_range,
+};
 pub use variant_pruning::VariantPathPruningPredicate;
 pub(crate) use variant_pruning::{
     BoundVariantPathPruningPredicate, bind_variant_path_pruning_predicates,
@@ -279,11 +285,40 @@ fn min_max_predicates_to_scan_predicates(
     predicates: &[MinMaxPredicate],
     source: ScanPredicateSource,
 ) -> Vec<ScanPredicate> {
-    predicates
+    let mut out = Vec::with_capacity(predicates.len());
+    for predicate in predicates {
+        out.push(ScanPredicate::from_min_max_predicate(
+            predicate.clone(),
+            source,
+        ));
+        if let MinMaxPredicate::Eq { column, value } = predicate {
+            out.push(ScanPredicate::new(
+                column.clone(),
+                ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                    values: vec![value.clone()],
+                }),
+                source,
+            ));
+        }
+    }
+    out
+}
+
+fn append_bloom_probes_for_discrete_sets(predicates: &mut Vec<ScanPredicate>) {
+    let probes = predicates
         .iter()
-        .cloned()
-        .map(|predicate| ScanPredicate::from_min_max_predicate(predicate, source))
-        .collect()
+        .filter_map(|predicate| match predicate.domain() {
+            ScanPredicateDomain::DiscreteSet { values, .. } => Some(ScanPredicate::new(
+                predicate.column().to_string(),
+                ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                    values: values.clone(),
+                }),
+                predicate.source(),
+            )),
+            ScanPredicateDomain::Range { .. } | ScanPredicateDomain::Membership(_) => None,
+        })
+        .collect::<Vec<_>>();
+    predicates.extend(probes);
 }
 
 fn scan_predicates_to_min_max_predicates(predicates: &[ScanPredicate]) -> Vec<MinMaxPredicate> {
@@ -335,7 +370,7 @@ fn runtime_filters_to_scan_predicates(
 ) -> Result<Vec<ScanPredicate>, String> {
     let bindings = runtime_scan_predicate_bindings(cfg);
     let mut counters = RuntimeScanPredicateCounters::default();
-    build_runtime_scan_predicates(
+    let mut predicates = build_runtime_scan_predicates(
         runtime_filters,
         &bindings,
         RuntimeScanPredicateOptions {
@@ -343,7 +378,9 @@ fn runtime_filters_to_scan_predicates(
             label: "parquet",
         },
         &mut counters,
-    )
+    )?;
+    append_bloom_probes_for_discrete_sets(&mut predicates);
+    Ok(predicates)
 }
 
 #[derive(Clone, Debug)]
@@ -615,6 +652,64 @@ struct CurrentPruningPredicates {
     counters: RuntimeScanPredicateCounters,
 }
 
+struct ParquetColumnBloomCache<'a> {
+    builder: &'a ParquetRecordBatchReaderBuilder<ParquetCachedReader>,
+    filters: RefCell<HashMap<(usize, usize), Option<Arc<Sbbf>>>>,
+    counters: ParquetBloomFilterCounters,
+}
+
+impl<'a> ParquetColumnBloomCache<'a> {
+    fn new(builder: &'a ParquetRecordBatchReaderBuilder<ParquetCachedReader>) -> Self {
+        Self {
+            builder,
+            filters: RefCell::new(HashMap::new()),
+            counters: ParquetBloomFilterCounters::default(),
+        }
+    }
+
+    fn counters(&self) -> &ParquetBloomFilterCounters {
+        &self.counters
+    }
+}
+
+impl ParquetColumnBloomProvider for ParquetColumnBloomCache<'_> {
+    fn bloom_filter(&self, row_group_idx: usize, column_idx: usize) -> Option<Arc<Sbbf>> {
+        let key = (row_group_idx, column_idx);
+        if let Some(filter) = self.filters.borrow().get(&key) {
+            return filter.clone();
+        }
+
+        let filter = match self
+            .builder
+            .get_row_group_column_bloom_filter(row_group_idx, column_idx)
+        {
+            Ok(Some(filter)) => Some(Arc::new(filter)),
+            Ok(None) => None,
+            Err(e) => {
+                debug!(
+                    "error reading parquet column bloom filter row_group={} column={}: {}",
+                    row_group_idx, column_idx, e
+                );
+                None
+            }
+        };
+        self.filters.borrow_mut().insert(key, filter.clone());
+        filter
+    }
+
+    fn record_bloom_probe(&self) {
+        self.counters.record_probe();
+    }
+
+    fn record_bloom_definite_miss(&self) {
+        self.counters.record_definite_miss();
+    }
+
+    fn record_bloom_unsupported_value(&self) {
+        self.counters.record_unsupported_value();
+    }
+}
+
 impl ParquetScanIter {
     fn has_iceberg_schema_evolution(&self) -> bool {
         self.cfg.iceberg_output_schema.is_some()
@@ -737,6 +832,26 @@ impl ParquetScanIter {
         }
     }
 
+    fn record_bloom_filter_counters(&self, counters: &ParquetBloomFilterCounters) {
+        if let Some(profile) = self.profile.as_ref() {
+            profile.counter_add(
+                "ParquetBloomFilterProbe",
+                metrics::TUnit::UNIT,
+                clamp_u128_to_i64(counters.probes()),
+            );
+            profile.counter_add(
+                "ParquetBloomFilterDefiniteMiss",
+                metrics::TUnit::UNIT,
+                clamp_u128_to_i64(counters.definite_misses()),
+            );
+            profile.counter_add(
+                "ParquetBloomFilterUnsupported",
+                metrics::TUnit::UNIT,
+                clamp_u128_to_i64(counters.unsupported_values()),
+            );
+        }
+    }
+
     fn current_pruning_predicates(&self) -> Result<CurrentPruningPredicates, String> {
         if self.has_iceberg_schema_evolution() {
             return Ok(CurrentPruningPredicates {
@@ -768,6 +883,7 @@ impl ParquetScanIter {
                 },
                 &mut counters,
             )?;
+            append_bloom_probes_for_discrete_sets(&mut runtime_preds);
             if !runtime_preds.is_empty() {
                 predicates.physical.append(&mut runtime_preds);
             }
@@ -1247,6 +1363,7 @@ impl ParquetScanIter {
                 &predicates.variant,
             );
             let limit_rows = self.limit.map(|_| self.remaining);
+            let bloom_cache = ParquetColumnBloomCache::new(&builder);
             let selected_row_groups = select_row_groups_for_range(
                 &metadata,
                 &range,
@@ -1255,7 +1372,9 @@ impl ParquetScanIter {
                 &bound_variant_predicates,
                 &self.cfg.columns,
                 self.cfg.case_sensitive,
+                Some(&bloom_cache),
             );
+            self.record_bloom_filter_counters(bloom_cache.counters());
 
             let row_groups = if let Some(row_groups) = selected_row_groups {
                 let rg_total = metadata.num_row_groups() as u128;
@@ -2547,6 +2666,7 @@ mod tests {
     use parquet::file::metadata::ParquetMetaData;
     use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::schema::types::ColumnPath;
     use parquet::variant::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     use crate::cache::{
@@ -2704,6 +2824,98 @@ mod tests {
         );
 
         assert!(scan_predicates_to_min_max_predicates(&[predicate]).is_empty());
+    }
+
+    #[test]
+    fn static_eq_predicate_adds_bloom_probe_for_parquet() {
+        let predicates = super::min_max_predicates_to_scan_predicates(
+            &[MinMaxPredicate::Eq {
+                column: "0".to_string(),
+                value: MinMaxPredicateValue::Int32(101),
+            }],
+            ScanPredicateSource::Static,
+        );
+
+        assert_eq!(
+            predicates,
+            vec![
+                ScanPredicate::from_min_max_predicate(
+                    MinMaxPredicate::Eq {
+                        column: "0".to_string(),
+                        value: MinMaxPredicateValue::Int32(101),
+                    },
+                    ScanPredicateSource::Static,
+                ),
+                ScanPredicate::new(
+                    "0".to_string(),
+                    ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                        values: vec![MinMaxPredicateValue::Int32(101)],
+                    }),
+                    ScanPredicateSource::Static,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_in_discrete_set_adds_bloom_probe_for_parquet() {
+        let cfg = runtime_filter_row_group_scan_cfg();
+        let runtime_filters = runtime_filter_ctx_for_keys(vec![101, 101]);
+
+        let predicates =
+            runtime_filters_to_scan_predicates(&cfg, &runtime_filters).expect("predicates");
+
+        assert_eq!(
+            predicates,
+            vec![
+                ScanPredicate::discrete_set(
+                    "0".to_string(),
+                    vec![MinMaxPredicateValue::Int32(101)],
+                    ScanPredicateSource::RuntimeIn,
+                )
+                .expect("runtime in scan predicate"),
+                ScanPredicate::new(
+                    "0".to_string(),
+                    ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                        values: vec![MinMaxPredicateValue::Int32(101)],
+                    }),
+                    ScanPredicateSource::RuntimeIn,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_bloom_membership_filter_stays_range_envelope_without_exact_values() {
+        let cfg = runtime_filter_row_group_scan_cfg();
+        let runtime_filters = runtime_bloom_membership_filter_ctx_for_i32(0, 99);
+
+        let predicates =
+            runtime_filters_to_scan_predicates(&cfg, &runtime_filters).expect("predicates");
+
+        assert_eq!(
+            predicates,
+            vec![
+                ScanPredicate::from_min_max_predicate(
+                    MinMaxPredicate::Ge {
+                        column: "0".to_string(),
+                        value: MinMaxPredicateValue::Int32(0),
+                    },
+                    ScanPredicateSource::RuntimeMembership,
+                ),
+                ScanPredicate::from_min_max_predicate(
+                    MinMaxPredicate::Le {
+                        column: "0".to_string(),
+                        value: MinMaxPredicateValue::Int32(99),
+                    },
+                    ScanPredicateSource::RuntimeMembership,
+                ),
+            ]
+        );
+        assert!(!predicates.iter().any(|predicate| matches!(
+            predicate.domain(),
+            ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe { .. })
+        )));
     }
 
     fn variant_row_group_metadata(stats: EnabledStatistics) -> ParquetMetaData {
@@ -2924,6 +3136,7 @@ mod tests {
             &bound,
             &[],
             true,
+            None,
         )
         .expect("row groups selected");
 
@@ -2948,6 +3161,7 @@ mod tests {
             &bound,
             &["payload".to_string()],
             true,
+            None,
         )
         .expect("row groups selected");
 
@@ -2978,6 +3192,7 @@ mod tests {
             &bound,
             &[],
             true,
+            None,
         )
         .expect("row groups selected");
 
@@ -3004,6 +3219,7 @@ mod tests {
             &bound,
             &["payload".to_string()],
             true,
+            None,
         )
         .expect("row groups selected");
         let page_selection = build_row_selection_for_row_groups(
@@ -3192,6 +3408,16 @@ mod tests {
                     ScanPredicateSource::RuntimeIn,
                 )
                 .expect("runtime in scan predicate"),
+                ScanPredicate::new(
+                    "0".to_string(),
+                    ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                        values: vec![
+                            MinMaxPredicateValue::Int32(10),
+                            MinMaxPredicateValue::Int32(20),
+                        ],
+                    }),
+                    ScanPredicateSource::RuntimeIn,
+                ),
             ]
         );
         assert_eq!(predicates.variant, vec![variant_path_predicate(Some(10))]);
@@ -3295,7 +3521,17 @@ mod tests {
                     ],
                     ScanPredicateSource::RuntimeIn,
                 )
-                .expect("runtime in scan predicate")
+                .expect("runtime in scan predicate"),
+                ScanPredicate::new(
+                    "0".to_string(),
+                    ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                        values: vec![
+                            MinMaxPredicateValue::Int32(10),
+                            MinMaxPredicateValue::Int32(20),
+                        ],
+                    }),
+                    ScanPredicateSource::RuntimeIn,
+                ),
             ]
         );
     }
@@ -4227,6 +4463,60 @@ mod tests {
         reader.metadata().clone()
     }
 
+    fn write_bloom_overlap_fixture(path: &Path) -> ParquetMetaData {
+        let schema = Arc::new(Schema::new(vec![field_with_id(
+            "id",
+            DataType::Int32,
+            false,
+            1,
+        )]));
+        let row_group_0 = (0..RUNTIME_FILTER_ROW_GROUP_ROWS)
+            .map(|idx| idx * 2)
+            .collect::<Vec<_>>();
+        assert!(
+            !row_group_0.contains(&101),
+            "first row group must overlap 101 by min/max but not contain it"
+        );
+        let row_group_1 = vec![101; RUNTIME_FILTER_ROW_GROUP_ROWS as usize];
+        let ids = row_group_0
+            .into_iter()
+            .chain(row_group_1)
+            .collect::<Vec<_>>();
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(ids)) as ArrayRef],
+        )
+        .expect("bloom overlap fixture batch");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(RUNTIME_FILTER_ROW_GROUP_ROWS as usize))
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .set_column_bloom_filter_enabled(ColumnPath::from("id"), true)
+            .set_column_bloom_filter_ndv(
+                ColumnPath::from("id"),
+                RUNTIME_FILTER_ROW_GROUP_ROWS as u64,
+            )
+            .build();
+        let file = File::create(path).expect("create bloom overlap fixture parquet");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).expect("parquet writer");
+        writer.write(&batch).expect("write bloom overlap fixture");
+        writer.close().expect("close bloom overlap fixture writer");
+
+        let file = File::open(path).expect("open bloom overlap fixture parquet");
+        let reader = SerializedFileReader::new(file).expect("metadata reader");
+        let metadata = reader.metadata().clone();
+        assert_eq!(metadata.num_row_groups(), 2);
+        assert!(
+            metadata
+                .row_group(0)
+                .column(0)
+                .bloom_filter_offset()
+                .is_some(),
+            "fixture must include a column bloom filter"
+        );
+        metadata
+    }
+
     fn runtime_filter_row_group_scan_cfg() -> ParquetScanConfig {
         let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
             &Schema::new(vec![Field::new("id", DataType::Int32, false)]),
@@ -4412,6 +4702,33 @@ mod tests {
             2,
             min_max,
         ));
+        let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
+            Vec::new(),
+            vec![membership],
+        );
+        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+    }
+
+    fn runtime_bloom_membership_filter_ctx_for_i32(
+        min: i32,
+        max: i32,
+    ) -> crate::exec::node::scan::RuntimeFilterContext {
+        use crate::exec::runtime_filter::{
+            RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeBloomFilter, RuntimeFilterType,
+            RuntimeMembershipFilter,
+        };
+
+        let values = Arc::new(Int32Array::from(vec![min, max])) as ArrayRef;
+        let membership = RuntimeMembershipFilter::Bloom(
+            RuntimeBloomFilter::build_from_array(
+                77,
+                SlotId::new(1),
+                RuntimeFilterType::Int32,
+                &values,
+                RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+            )
+            .expect("build runtime bloom filter"),
+        );
         let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
             Vec::new(),
             vec![membership],
@@ -4619,6 +4936,158 @@ mod tests {
                 .expect("selected counter"),
             RUNTIME_FILTER_ROW_GROUP_COUNT as i64
         );
+    }
+
+    #[test]
+    fn runtime_in_bloom_probe_prunes_row_group_when_minmax_overlaps() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("runtime_in_bloom_overlap.parquet");
+        write_bloom_overlap_fixture(&file_path);
+
+        let runtime_filters = runtime_filter_ctx_for_keys(vec![101]);
+        let profile = crate::runtime::profile::RuntimeProfile::new("runtime_in_bloom_overlap_test");
+        let mut iter = open_runtime_filter_scan_iter(&file_path, runtime_filters, profile.clone());
+
+        let mut batches = Vec::new();
+        for item in &mut iter {
+            batches.push(item.expect("scan chunk").batch);
+        }
+        let values = collect_id_values(&batches);
+
+        assert_eq!(
+            profile
+                .counter_value("ParquetRowGroupsSelected")
+                .expect("ParquetRowGroupsSelected counter recorded"),
+            1
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetRowGroupsPruned")
+                .expect("ParquetRowGroupsPruned counter recorded"),
+            1
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetBloomFilterProbe")
+                .expect("ParquetBloomFilterProbe counter recorded"),
+            2
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetBloomFilterDefiniteMiss")
+                .expect("ParquetBloomFilterDefiniteMiss counter recorded"),
+            1
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetBloomFilterUnsupported")
+                .unwrap_or(0),
+            0
+        );
+        assert!(!values.is_empty());
+        assert!(values.iter().all(|value| *value == 101));
+    }
+
+    #[test]
+    fn bloom_probe_keeps_when_file_has_no_column_bloom() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("no_bloom_overlap.parquet");
+        write_runtime_filter_row_group_fixture(&file_path);
+
+        let runtime_filters = runtime_filter_ctx_for_keys(vec![101]);
+        let profile = crate::runtime::profile::RuntimeProfile::new("no_bloom_overlap_test");
+        let mut iter = open_runtime_filter_scan_iter(&file_path, runtime_filters, profile.clone());
+
+        for item in &mut iter {
+            item.expect("chunk");
+        }
+
+        assert_eq!(
+            profile
+                .counter_value("ParquetBloomFilterDefiniteMiss")
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetRowGroupsSelected")
+                .expect("selected counter"),
+            1,
+            "the existing DiscreteSet min/max path still prunes to the matching row group"
+        );
+    }
+
+    #[test]
+    fn static_eq_bloom_probe_prunes_row_group_when_minmax_overlaps() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("static_eq_bloom_overlap.parquet");
+        write_bloom_overlap_fixture(&file_path);
+
+        let profile = crate::runtime::profile::RuntimeProfile::new("static_eq_bloom_overlap_test");
+        let file_len = fs::metadata(&file_path)
+            .expect("fixture file metadata")
+            .len();
+        let temp_dir_path = file_path.parent().expect("fixture parent dir");
+        let op =
+            build_fs_operator(temp_dir_path.to_str().expect("temp dir path")).expect("fs operator");
+        let factory = OpendalRangeReaderFactory::from_operator(op)
+            .expect("reader factory")
+            .with_profile(Some(profile.clone()));
+        let range = FileScanRange {
+            path: file_path.file_name().unwrap().to_string_lossy().to_string(),
+            file_len,
+            offset: 0,
+            length: file_len,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: None,
+        };
+        let mut cfg = runtime_filter_row_group_scan_cfg();
+        cfg.min_max_predicates.push(MinMaxPredicate::Eq {
+            column: "0".to_string(),
+            value: MinMaxPredicateValue::Int32(101),
+        });
+        let mut iter =
+            ParquetScanIter::new(cfg, vec![range], factory, None, Some(profile.clone()), None)
+                .expect("static eq scan iter");
+
+        let mut batches = Vec::new();
+        for item in &mut iter {
+            batches.push(item.expect("scan chunk").batch);
+        }
+        let values = collect_id_values(&batches);
+
+        assert_eq!(
+            profile
+                .counter_value("ParquetRowGroupsSelected")
+                .expect("ParquetRowGroupsSelected counter recorded"),
+            1
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetBloomFilterProbe")
+                .expect("ParquetBloomFilterProbe counter recorded"),
+            2
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetBloomFilterDefiniteMiss")
+                .expect("ParquetBloomFilterDefiniteMiss counter recorded"),
+            1
+        );
+        assert_eq!(
+            profile
+                .counter_value("ParquetBloomFilterUnsupported")
+                .unwrap_or(0),
+            0
+        );
+        assert!(!values.is_empty());
+        assert!(values.iter().all(|value| *value == 101));
     }
 
     fn collect_id_values(chunks: &[arrow::record_batch::RecordBatch]) -> Vec<i32> {
