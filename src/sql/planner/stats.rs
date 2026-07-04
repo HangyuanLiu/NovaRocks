@@ -4,6 +4,15 @@ use std::collections::HashMap;
 
 use crate::sql::column_id::ColumnId;
 
+/// Cost display weights (sunk from optimizer; EXPLAIN formats a scalar total
+/// from the planner-owned PlannerCostEstimate using these).
+pub(crate) const DEFAULT_CPU_COST_WEIGHT: f64 = 0.5;
+pub(crate) const DEFAULT_MEMORY_COST_WEIGHT: f64 = 2.0;
+pub(crate) const DEFAULT_NETWORK_COST_WEIGHT: f64 = 1.5;
+
+/// Row-count sentinel ceiling for EXPLAIN stats trailer.
+pub(crate) const MAX_ROW_COUNT: f64 = 1e15;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) enum PlannerConfidence {
     #[default]

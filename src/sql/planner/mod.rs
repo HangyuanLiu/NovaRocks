@@ -11,6 +11,8 @@ mod distributed_node;
 mod distributed_plan_build;
 pub(crate) mod imv_rewrite;
 pub(crate) mod optimizer_bridge;
+mod ordering;
+mod physical_vocab;
 pub(crate) mod plan;
 pub(crate) mod runtime_filter;
 pub(crate) mod stats;
@@ -28,6 +30,12 @@ pub(crate) use distributed_fragment::{
 pub(crate) use distributed_node::{DistributedNode, DistributedPayload, ExchangeReceiver};
 pub(crate) use distributed_plan_build::{
     build_distributed_plan, union_distinct_must_be_rewritten_error,
+};
+#[allow(unused_imports)]
+pub(crate) use ordering::{OrderingSpec, SortKey};
+#[allow(unused_imports)]
+pub(crate) use physical_vocab::{
+    AggMode, AggregateOutputLayout, HashSource, JoinDistribution, TopNPhase,
 };
 pub(crate) use runtime_filter::{
     JoinExecutionMode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
@@ -51,7 +59,6 @@ use crate::sql::analysis::*;
 use crate::sql::catalog::{IcebergDataFileInfo, IcebergDeleteFileContent};
 use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-use crate::sql::optimizer::property::OrderingSpec;
 use crate::sql::planner::optimizer_bridge::property::ordering_spec_from_sort_items;
 use plan::*;
 

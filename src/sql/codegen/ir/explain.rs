@@ -10,11 +10,6 @@ use crate::sql::explain::{
     ExplainLevel, PlanNodeExplainStage, format_expr, format_project_item, format_sort_items,
     format_window_exprs,
 };
-use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
-use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
-use crate::sql::optimizer::statistics::{
-    DEFAULT_CPU_COST_WEIGHT, DEFAULT_MEMORY_COST_WEIGHT, DEFAULT_NETWORK_COST_WEIGHT,
-};
 use crate::sql::planner::plan::{
     DistributedChangeEventExpandNode, ExchangeFlavor, PhysicalHashAggregateNode,
     PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode,
@@ -27,10 +22,14 @@ use crate::sql::planner::plan::{
     PlanValuesNode as DistributedValuesNode, PlanWindowNode as DistributedWindowNode,
     ScanVariantColumn,
 };
+use crate::sql::planner::stats::{
+    DEFAULT_CPU_COST_WEIGHT, DEFAULT_MEMORY_COST_WEIGHT, DEFAULT_NETWORK_COST_WEIGHT, MAX_ROW_COUNT,
+};
 use crate::sql::planner::{
-    DistributedNode, DistributedPayload, DistributedPlan, ExchangeReceiver, JoinExecutionMode,
-    PhysicalPlanStats, PlanFragment, PlannerBroadcastDecision, PlannerConfidence,
-    PlannerCostEstimate, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+    AggMode, DistributedNode, DistributedPayload, DistributedPlan, ExchangeReceiver,
+    JoinDistribution, JoinExecutionMode, PhysicalPlanStats, PlanFragment, PlannerBroadcastDecision,
+    PlannerConfidence, PlannerCostEstimate, TopNPhase, WiredRuntimeFilterBuild,
+    WiredRuntimeFilterProbe,
 };
 use crate::thrift::partitions;
 

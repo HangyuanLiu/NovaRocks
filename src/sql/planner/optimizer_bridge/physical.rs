@@ -13,9 +13,10 @@ use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, DistinctValueCount};
 use crate::sql::planner::plan::*;
 use crate::sql::planner::{
-    JoinExecutionMode, PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats,
-    PlannerBroadcastDecision, PlannerColumnStatistic, PlannerConfidence, PlannerCostEstimate,
-    RedistributeMode, RedistributeNode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+    AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
+    PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlannerBroadcastDecision,
+    PlannerColumnStatistic, PlannerConfidence, PlannerCostEstimate, RedistributeMode,
+    RedistributeNode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
 };
 
 struct BridgeCtx<'a> {
@@ -86,21 +87,21 @@ impl BridgeCtx<'_> {
                 items: materialize_sort_keys(self.scalars, &op.items),
                 limit: op.limit,
                 offset: op.offset,
-                phase: op.phase,
+                phase: map_topn_phase(op.phase),
                 is_split: op.is_split,
             })),
             Operator::PhysicalHashAggregate(op) => {
                 let group_by = materialize_exprs(self.scalars, &op.group_by);
                 Ok(PhysicalPlanKind::HashAggregate(Box::new(
                     PhysicalHashAggregateNode {
-                        mode: op.mode,
+                        mode: map_agg_mode(op.mode),
                         group_by,
                         aggregates: materialize_aggregate_calls(
                             self.scalars,
                             &op.aggregates,
                             &op.output_layout,
                         ),
-                        output_layout: op.output_layout.clone(),
+                        output_layout: map_aggregate_output_layout(&op.output_layout),
                         is_merge: op.is_merge.clone(),
                         output_columns: op.output_columns.clone(),
                     },
@@ -127,7 +128,7 @@ impl BridgeCtx<'_> {
                     other_condition: op
                         .other_condition
                         .map(|expr| materialize(self.scalars, expr)),
-                    distribution: op.distribution.clone(),
+                    distribution: map_join_distribution(op.distribution.clone()),
                     execution_mode,
                     build_runtime_filters: node
                         .build_runtime_filters
@@ -410,6 +411,54 @@ fn join_execution_mode(
     })
 }
 
+fn map_agg_mode(mode: crate::sql::optimizer::operator::AggMode) -> AggMode {
+    use crate::sql::optimizer::operator::AggMode as O;
+    match mode {
+        O::Single => AggMode::Single,
+        O::Local => AggMode::Local,
+        O::Global => AggMode::Global,
+        O::DistinctGlobal => AggMode::DistinctGlobal,
+        O::DistinctLocal => AggMode::DistinctLocal,
+    }
+}
+
+fn map_topn_phase(phase: crate::sql::optimizer::operator::TopNPhase) -> TopNPhase {
+    use crate::sql::optimizer::operator::TopNPhase as O;
+    match phase {
+        O::Partial => TopNPhase::Partial,
+        O::Final => TopNPhase::Final,
+    }
+}
+
+fn map_join_distribution(
+    distribution: crate::sql::optimizer::operator::JoinDistribution,
+) -> JoinDistribution {
+    use crate::sql::optimizer::operator::JoinDistribution as O;
+    match distribution {
+        O::Unknown => JoinDistribution::Unknown,
+        O::Shuffle => JoinDistribution::Shuffle,
+        O::Broadcast => JoinDistribution::Broadcast,
+        O::Colocate => JoinDistribution::Colocate,
+    }
+}
+
+fn map_hash_source(source: crate::sql::optimizer::property::HashSource) -> HashSource {
+    use crate::sql::optimizer::property::HashSource as O;
+    match source {
+        O::ShuffleAgg => HashSource::ShuffleAgg,
+        O::ShuffleJoin => HashSource::ShuffleJoin,
+    }
+}
+
+fn map_aggregate_output_layout(
+    layout: &crate::sql::optimizer::operator::AggregateOutputLayout,
+) -> AggregateOutputLayout {
+    AggregateOutputLayout::new(
+        layout.group_key_columns.clone(),
+        layout.aggregate_columns.clone(),
+    )
+}
+
 fn runtime_filter_execution_mode(
     node: &OptimizerPhysicalNode,
 ) -> Result<JoinExecutionMode, String> {
@@ -438,7 +487,7 @@ fn redistribute_mode(op: &PhysicalDistributionOp) -> Result<RedistributeMode, St
         DistributionSpec::Broadcast => Ok(RedistributeMode::Broadcast),
         DistributionSpec::HashPartitioned { cols, source } => Ok(RedistributeMode::Hash {
             cols: cols.clone(),
-            source: *source,
+            source: map_hash_source(*source),
         }),
         DistributionSpec::Any => Err(
             "Bridge 2a cannot convert PhysicalDistribution with DistributionSpec::Any".to_string(),
@@ -573,7 +622,9 @@ mod tests {
         ValuesOp,
     };
     use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
-    use crate::sql::optimizer::property::{DistributionSpec, HashSource, PhysicalPropertySet};
+    use crate::sql::optimizer::property::{
+        DistributionSpec, HashSource as OptimizerHashSource, PhysicalPropertySet,
+    };
     use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::{Confidence, CostEstimate, Statistics};
@@ -728,7 +779,7 @@ mod tests {
         let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
             spec: DistributionSpec::HashPartitioned {
                 cols: vec![ColumnId::new_for_test(7)],
-                source: HashSource::ShuffleJoin,
+                source: OptimizerHashSource::ShuffleJoin,
             },
         }));
         node.output_columns = vec![output_column(7, "parent_k")];
@@ -788,7 +839,7 @@ mod tests {
         let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
             spec: DistributionSpec::HashPartitioned {
                 cols: vec![ColumnId::new_for_test(7)],
-                source: HashSource::ShuffleAgg,
+                source: OptimizerHashSource::ShuffleAgg,
             },
         }));
         node.output_columns = vec![group_column];
@@ -842,7 +893,7 @@ mod tests {
         let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
             spec: DistributionSpec::HashPartitioned {
                 cols: vec![ColumnId::new_for_test(8)],
-                source: HashSource::ShuffleAgg,
+                source: OptimizerHashSource::ShuffleAgg,
             },
         }));
         node.output_columns = vec![group_column];

@@ -13,10 +13,7 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 pub(crate) use crate::sql::common::{ApplyKind, ChangeStreamBranchKind, ScanVariantColumn};
-use crate::sql::optimizer::operator::{
-    AggMode, AggregateOutputLayout, JoinDistribution, TopNPhase,
-};
-use crate::sql::optimizer::property::HashSource;
+use crate::sql::planner::{AggMode, AggregateOutputLayout, JoinDistribution, TopNPhase};
 
 // ---------------------------------------------------------------------------
 // Logical plan tree
@@ -556,7 +553,7 @@ pub(crate) enum RedistributeMode {
     Gather,
     Hash {
         cols: Vec<ColumnId>,
-        source: HashSource,
+        source: crate::sql::planner::HashSource,
     },
     Broadcast,
 }
@@ -795,7 +792,7 @@ mod plan_tests {
             items: vec![],
             limit: Some(10),
             offset: Some(3),
-            phase: crate::sql::optimizer::operator::TopNPhase::Final,
+            phase: TopNPhase::Final,
             is_split: false,
         });
 
@@ -869,6 +866,25 @@ mod plan_tests {
         assert!(
             !PhysicalPlanKind::variant_names_for_test().contains(&"Exchange"),
             "Exchange belongs to DistributedPlan, not PhysicalPlanKind"
+        );
+    }
+
+    #[test]
+    fn redistribute_mode_variants_are_frozen() {
+        fn _exhaustive(mode: &RedistributeMode) {
+            match mode {
+                RedistributeMode::Gather => {}
+                RedistributeMode::Hash { .. } => {}
+                RedistributeMode::Broadcast => {}
+            }
+        }
+    }
+
+    #[test]
+    fn physical_plan_kind_has_no_exchange_variant() {
+        assert!(
+            !PhysicalPlanKind::variant_names_for_test().contains(&"Exchange"),
+            "Exchange must not be a PhysicalPlanKind variant"
         );
     }
 }

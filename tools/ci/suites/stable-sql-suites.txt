@@ -21,6 +21,7 @@ aggregate
 # run `--suite analytic` explicitly when full window-matrix coverage is needed.
 analytic
 optimizer
+optimizer-dist
 ssb
 tpc-h
 # q85 is skipped by tools/ci/local-full-ci.sh in default stable mode until its
