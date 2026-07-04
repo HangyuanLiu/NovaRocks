@@ -55,7 +55,9 @@ use crate::common::runtime_scan_predicate::{
     RuntimeScanPredicateBindings, RuntimeScanPredicateCounters, RuntimeScanPredicateOptions,
     runtime_filters_to_scan_predicates as build_runtime_scan_predicates,
 };
-use crate::common::scan_predicate::{ScanPredicate, ScanPredicateSource};
+use crate::common::scan_predicate::{
+    MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::cast_with_special_rules;
 use crate::exec::node::BoxedExecIter;
@@ -223,11 +225,40 @@ fn min_max_predicates_to_scan_predicates(
     predicates: &[MinMaxPredicate],
     source: ScanPredicateSource,
 ) -> Vec<ScanPredicate> {
-    predicates
+    let mut out = Vec::with_capacity(predicates.len());
+    for predicate in predicates {
+        out.push(ScanPredicate::from_min_max_predicate(
+            predicate.clone(),
+            source,
+        ));
+        if let MinMaxPredicate::Eq { column, value } = predicate {
+            out.push(ScanPredicate::new(
+                column.clone(),
+                ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                    values: vec![value.clone()],
+                }),
+                source,
+            ));
+        }
+    }
+    out
+}
+
+fn append_bloom_probes_for_discrete_sets(predicates: &mut Vec<ScanPredicate>) {
+    let probes = predicates
         .iter()
-        .cloned()
-        .map(|predicate| ScanPredicate::from_min_max_predicate(predicate, source))
-        .collect()
+        .filter_map(|predicate| match predicate.domain() {
+            ScanPredicateDomain::DiscreteSet { values, .. } => Some(ScanPredicate::new(
+                predicate.column().to_string(),
+                ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                    values: values.clone(),
+                }),
+                predicate.source(),
+            )),
+            ScanPredicateDomain::Range { .. } | ScanPredicateDomain::Membership(_) => None,
+        })
+        .collect::<Vec<_>>();
+    predicates.extend(probes);
 }
 
 fn scan_predicates_to_min_max_predicates(predicates: &[ScanPredicate]) -> Vec<MinMaxPredicate> {
@@ -279,7 +310,7 @@ fn runtime_filters_to_scan_predicates(
 ) -> Result<Vec<ScanPredicate>, String> {
     let bindings = runtime_scan_predicate_bindings(cfg);
     let mut counters = RuntimeScanPredicateCounters::default();
-    build_runtime_scan_predicates(
+    let mut predicates = build_runtime_scan_predicates(
         runtime_filters,
         &bindings,
         RuntimeScanPredicateOptions {
@@ -287,7 +318,9 @@ fn runtime_filters_to_scan_predicates(
             label: "parquet",
         },
         &mut counters,
-    )
+    )?;
+    append_bloom_probes_for_discrete_sets(&mut predicates);
+    Ok(predicates)
 }
 
 #[derive(Clone, Debug)]
@@ -712,6 +745,7 @@ impl ParquetScanIter {
                 },
                 &mut counters,
             )?;
+            append_bloom_probes_for_discrete_sets(&mut runtime_preds);
             if !runtime_preds.is_empty() {
                 predicates.physical.append(&mut runtime_preds);
             }
@@ -2638,6 +2672,98 @@ mod tests {
         assert!(scan_predicates_to_min_max_predicates(&[predicate]).is_empty());
     }
 
+    #[test]
+    fn static_eq_predicate_adds_bloom_probe_for_parquet() {
+        let predicates = super::min_max_predicates_to_scan_predicates(
+            &[MinMaxPredicate::Eq {
+                column: "0".to_string(),
+                value: MinMaxPredicateValue::Int32(101),
+            }],
+            ScanPredicateSource::Static,
+        );
+
+        assert_eq!(
+            predicates,
+            vec![
+                ScanPredicate::from_min_max_predicate(
+                    MinMaxPredicate::Eq {
+                        column: "0".to_string(),
+                        value: MinMaxPredicateValue::Int32(101),
+                    },
+                    ScanPredicateSource::Static,
+                ),
+                ScanPredicate::new(
+                    "0".to_string(),
+                    ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                        values: vec![MinMaxPredicateValue::Int32(101)],
+                    }),
+                    ScanPredicateSource::Static,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_in_discrete_set_adds_bloom_probe_for_parquet() {
+        let cfg = runtime_filter_row_group_scan_cfg();
+        let runtime_filters = runtime_filter_ctx_for_keys(vec![101, 101]);
+
+        let predicates =
+            runtime_filters_to_scan_predicates(&cfg, &runtime_filters).expect("predicates");
+
+        assert_eq!(
+            predicates,
+            vec![
+                ScanPredicate::discrete_set(
+                    "0".to_string(),
+                    vec![MinMaxPredicateValue::Int32(101)],
+                    ScanPredicateSource::RuntimeIn,
+                )
+                .expect("runtime in scan predicate"),
+                ScanPredicate::new(
+                    "0".to_string(),
+                    ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                        values: vec![MinMaxPredicateValue::Int32(101)],
+                    }),
+                    ScanPredicateSource::RuntimeIn,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_bloom_membership_filter_stays_range_envelope_without_exact_values() {
+        let cfg = runtime_filter_row_group_scan_cfg();
+        let runtime_filters = runtime_bloom_membership_filter_ctx_for_i32(0, 99);
+
+        let predicates =
+            runtime_filters_to_scan_predicates(&cfg, &runtime_filters).expect("predicates");
+
+        assert_eq!(
+            predicates,
+            vec![
+                ScanPredicate::from_min_max_predicate(
+                    MinMaxPredicate::Ge {
+                        column: "0".to_string(),
+                        value: MinMaxPredicateValue::Int32(0),
+                    },
+                    ScanPredicateSource::RuntimeMembership,
+                ),
+                ScanPredicate::from_min_max_predicate(
+                    MinMaxPredicate::Le {
+                        column: "0".to_string(),
+                        value: MinMaxPredicateValue::Int32(99),
+                    },
+                    ScanPredicateSource::RuntimeMembership,
+                ),
+            ]
+        );
+        assert!(!predicates.iter().any(|predicate| matches!(
+            predicate.domain(),
+            ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe { .. })
+        )));
+    }
+
     fn variant_row_group_metadata(stats: EnabledStatistics) -> ParquetMetaData {
         let leaf_values = Arc::new(Int64Array::from(vec![1, 2, 3, 10, 11, 12])) as ArrayRef;
         let typed_value_field = Arc::new(Field::new("typed_value", DataType::Int64, true));
@@ -3124,6 +3250,16 @@ mod tests {
                     ScanPredicateSource::RuntimeIn,
                 )
                 .expect("runtime in scan predicate"),
+                ScanPredicate::new(
+                    "0".to_string(),
+                    ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                        values: vec![
+                            MinMaxPredicateValue::Int32(10),
+                            MinMaxPredicateValue::Int32(20),
+                        ],
+                    }),
+                    ScanPredicateSource::RuntimeIn,
+                ),
             ]
         );
         assert_eq!(predicates.variant, vec![variant_path_predicate(Some(10))]);
@@ -3227,7 +3363,17 @@ mod tests {
                     ],
                     ScanPredicateSource::RuntimeIn,
                 )
-                .expect("runtime in scan predicate")
+                .expect("runtime in scan predicate"),
+                ScanPredicate::new(
+                    "0".to_string(),
+                    ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                        values: vec![
+                            MinMaxPredicateValue::Int32(10),
+                            MinMaxPredicateValue::Int32(20),
+                        ],
+                    }),
+                    ScanPredicateSource::RuntimeIn,
+                ),
             ]
         );
     }
@@ -4263,6 +4409,33 @@ mod tests {
             2,
             min_max,
         ));
+        let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
+            Vec::new(),
+            vec![membership],
+        );
+        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+    }
+
+    fn runtime_bloom_membership_filter_ctx_for_i32(
+        min: i32,
+        max: i32,
+    ) -> crate::exec::node::scan::RuntimeFilterContext {
+        use crate::exec::runtime_filter::{
+            RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeBloomFilter, RuntimeFilterType,
+            RuntimeMembershipFilter,
+        };
+
+        let values = Arc::new(Int32Array::from(vec![min, max])) as ArrayRef;
+        let membership = RuntimeMembershipFilter::Bloom(
+            RuntimeBloomFilter::build_from_array(
+                77,
+                SlotId::new(1),
+                RuntimeFilterType::Int32,
+                &values,
+                RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+            )
+            .expect("build runtime bloom filter"),
+        );
         let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
             Vec::new(),
             vec![membership],
