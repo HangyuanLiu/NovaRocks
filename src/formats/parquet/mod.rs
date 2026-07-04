@@ -1223,6 +1223,7 @@ impl ParquetScanIter {
                 &bound_variant_predicates,
                 &self.cfg.columns,
                 self.cfg.case_sensitive,
+                None,
             );
 
             let row_groups = if let Some(row_groups) = selected_row_groups {
@@ -2982,6 +2983,7 @@ mod tests {
             &bound,
             &[],
             true,
+            None,
         )
         .expect("row groups selected");
 
@@ -3006,6 +3008,7 @@ mod tests {
             &bound,
             &["payload".to_string()],
             true,
+            None,
         )
         .expect("row groups selected");
 
@@ -3036,6 +3039,7 @@ mod tests {
             &bound,
             &[],
             true,
+            None,
         )
         .expect("row groups selected");
 
@@ -3062,6 +3066,7 @@ mod tests {
             &bound,
             &["payload".to_string()],
             true,
+            None,
         )
         .expect("row groups selected");
         let page_selection = build_row_selection_for_row_groups(

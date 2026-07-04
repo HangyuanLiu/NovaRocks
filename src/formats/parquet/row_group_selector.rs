@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cell::Cell;
+use std::sync::Arc;
+
+use parquet::basic::Type as ParquetPhysicalType;
+use parquet::bloom_filter::Sbbf;
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 
@@ -32,11 +37,57 @@ use super::{
 #[cfg(test)]
 const FORCE_ROW_GROUP_PRUNER_ERROR_COLUMN: &str = "__force_row_group_pruner_error";
 
+#[derive(Debug, Default)]
+pub(crate) struct ParquetBloomFilterCounters {
+    probes: Cell<u128>,
+    definite_misses: Cell<u128>,
+    unsupported_values: Cell<u128>,
+}
+
+impl ParquetBloomFilterCounters {
+    pub(crate) fn probes(&self) -> u128 {
+        self.probes.get()
+    }
+
+    pub(crate) fn definite_misses(&self) -> u128 {
+        self.definite_misses.get()
+    }
+
+    pub(crate) fn unsupported_values(&self) -> u128 {
+        self.unsupported_values.get()
+    }
+
+    pub(crate) fn record_probe(&self) {
+        self.probes.set(self.probes.get().saturating_add(1));
+    }
+
+    pub(crate) fn record_definite_miss(&self) {
+        self.definite_misses
+            .set(self.definite_misses.get().saturating_add(1));
+    }
+
+    pub(crate) fn record_unsupported_value(&self) {
+        self.unsupported_values
+            .set(self.unsupported_values.get().saturating_add(1));
+    }
+}
+
+pub(crate) trait ParquetColumnBloomProvider {
+    fn bloom_filter(&self, row_group_idx: usize, column_idx: usize) -> Option<Arc<Sbbf>>;
+
+    fn record_bloom_probe(&self);
+
+    fn record_bloom_definite_miss(&self);
+
+    fn record_bloom_unsupported_value(&self);
+}
+
 struct ParquetRowGroupPruner<'a> {
     metadata: &'a ParquetMetaData,
     units: Vec<UnitId>,
     columns: &'a [String],
     case_sensitive: bool,
+    bloom_provider: Option<&'a dyn ParquetColumnBloomProvider>,
 }
 
 impl<'a> ParquetRowGroupPruner<'a> {
@@ -45,12 +96,14 @@ impl<'a> ParquetRowGroupPruner<'a> {
         units: Vec<UnitId>,
         columns: &'a [String],
         case_sensitive: bool,
+        bloom_provider: Option<&'a dyn ParquetColumnBloomProvider>,
     ) -> Self {
         Self {
             metadata,
             units,
             columns,
             case_sensitive,
+            bloom_provider,
         }
     }
 }
@@ -61,10 +114,10 @@ impl ScanPruner for ParquetRowGroupPruner<'_> {
     }
 
     fn accepts_domain(&self, kind: ScanPredicateDomainKind) -> bool {
-        matches!(
-            kind,
-            ScanPredicateDomainKind::Range | ScanPredicateDomainKind::DiscreteSet
-        )
+        match kind {
+            ScanPredicateDomainKind::Range | ScanPredicateDomainKind::DiscreteSet => true,
+            ScanPredicateDomainKind::Membership => self.bloom_provider.is_some(),
+        }
     }
 
     fn units(&self) -> &[UnitId] {
@@ -80,15 +133,25 @@ impl ScanPruner for ParquetRowGroupPruner<'_> {
         let col_idx = column.parse::<usize>().ok()?;
         let col_name = self.columns.get(col_idx)?;
         let row_group = self.metadata.row_groups().get(unit)?;
-        let chunk = row_group.columns().iter().find(|candidate| {
-            let path_str = candidate.column_path().string();
-            if self.case_sensitive {
-                path_str == *col_name
-            } else {
-                path_str.eq_ignore_ascii_case(col_name)
-            }
-        })?;
-        Some(Box::new(ParquetRowGroupColumnStats { column: chunk }))
+        let (column_idx, chunk) =
+            row_group
+                .columns()
+                .iter()
+                .enumerate()
+                .find(|(_, candidate)| {
+                    let path_str = candidate.column_path().string();
+                    if self.case_sensitive {
+                        path_str == *col_name
+                    } else {
+                        path_str.eq_ignore_ascii_case(col_name)
+                    }
+                })?;
+        Some(Box::new(ParquetRowGroupColumnStats {
+            column: chunk,
+            row_group_idx: unit,
+            column_idx,
+            bloom_provider: self.bloom_provider,
+        }))
     }
 }
 
@@ -117,9 +180,29 @@ impl ColumnStats for ForcedErrorColumnStats {
 
 struct ParquetRowGroupColumnStats<'a> {
     column: &'a ColumnChunkMetaData,
+    row_group_idx: usize,
+    column_idx: usize,
+    bloom_provider: Option<&'a dyn ParquetColumnBloomProvider>,
 }
 
 impl ColumnStats for ParquetRowGroupColumnStats<'_> {
+    fn contains(&self, value: &MinMaxPredicateValue) -> Option<bool> {
+        let provider = self.bloom_provider?;
+        let bloom = provider.bloom_filter(self.row_group_idx, self.column_idx)?;
+        provider.record_bloom_probe();
+        match bloom_filter_may_contain_value(&bloom, self.column, value) {
+            Some(false) => {
+                provider.record_bloom_definite_miss();
+                Some(false)
+            }
+            Some(true) => Some(true),
+            None => {
+                provider.record_bloom_unsupported_value();
+                None
+            }
+        }
+    }
+
     fn may_satisfy_range(
         &self,
         op: crate::common::min_max_predicate::MinMaxPredicateOp,
@@ -175,6 +258,7 @@ pub(crate) fn select_row_groups_for_range(
     variant_predicates: &[BoundVariantPathPruningPredicate],
     columns: &[String],
     case_sensitive: bool,
+    bloom_provider: Option<&dyn ParquetColumnBloomProvider>,
 ) -> Option<Vec<usize>> {
     if range.length == 0
         && remaining_rows.is_none()
@@ -192,7 +276,13 @@ pub(crate) fn select_row_groups_for_range(
     for idx in candidate_row_groups {
         let row_group = metadata.row_group(idx);
         if !physical_predicates.is_empty() {
-            let pruner = ParquetRowGroupPruner::new(metadata, vec![idx], columns, case_sensitive);
+            let pruner = ParquetRowGroupPruner::new(
+                metadata,
+                vec![idx],
+                columns,
+                case_sensitive,
+                bloom_provider,
+            );
             match prune_units(&pruner, physical_predicates) {
                 Ok(result) => {
                     if !result.kept_units.contains(&idx) {
@@ -368,6 +458,24 @@ fn discrete_set_stats_may_satisfy(
             }))
         }
         _ => Ok(true),
+    }
+}
+
+fn bloom_filter_may_contain_value(
+    bloom: &Sbbf,
+    column: &ColumnChunkMetaData,
+    value: &MinMaxPredicateValue,
+) -> Option<bool> {
+    match column.column_type() {
+        ParquetPhysicalType::BOOLEAN => value.as_bool().map(|v| bloom.check(&v)),
+        ParquetPhysicalType::INT32 => value.as_i32().map(|v| bloom.check(&v)),
+        ParquetPhysicalType::INT64 => value.as_i64().map(|v| bloom.check(&v)),
+        ParquetPhysicalType::INT96 => None,
+        ParquetPhysicalType::FLOAT => value.as_f32().map(|v| bloom.check(&v)),
+        ParquetPhysicalType::DOUBLE => value.as_f64().map(|v| bloom.check(&v)),
+        ParquetPhysicalType::BYTE_ARRAY | ParquetPhysicalType::FIXED_LEN_BYTE_ARRAY => {
+            value.as_bytes().map(|v| bloom.check(v))
+        }
     }
 }
 
@@ -899,6 +1007,60 @@ mod tests {
         }
     }
 
+    struct NullBloomProvider;
+
+    impl ParquetColumnBloomProvider for NullBloomProvider {
+        fn bloom_filter(
+            &self,
+            _row_group_idx: usize,
+            _column_idx: usize,
+        ) -> Option<Arc<parquet::bloom_filter::Sbbf>> {
+            None
+        }
+
+        fn record_bloom_probe(&self) {}
+
+        fn record_bloom_definite_miss(&self) {}
+
+        fn record_bloom_unsupported_value(&self) {}
+    }
+
+    struct StaticBloomProvider {
+        bloom: Arc<parquet::bloom_filter::Sbbf>,
+        counters: ParquetBloomFilterCounters,
+    }
+
+    impl StaticBloomProvider {
+        fn empty() -> Self {
+            Self {
+                bloom: Arc::new(parquet::bloom_filter::Sbbf::new_with_num_of_bytes(32)),
+                counters: ParquetBloomFilterCounters::default(),
+            }
+        }
+    }
+
+    impl ParquetColumnBloomProvider for StaticBloomProvider {
+        fn bloom_filter(
+            &self,
+            _row_group_idx: usize,
+            _column_idx: usize,
+        ) -> Option<Arc<parquet::bloom_filter::Sbbf>> {
+            Some(Arc::clone(&self.bloom))
+        }
+
+        fn record_bloom_probe(&self) {
+            self.counters.record_probe();
+        }
+
+        fn record_bloom_definite_miss(&self) {
+            self.counters.record_definite_miss();
+        }
+
+        fn record_bloom_unsupported_value(&self) {
+            self.counters.record_unsupported_value();
+        }
+    }
+
     #[test]
     fn candidate_row_groups_for_range_preserves_split_bounds() {
         let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
@@ -940,6 +1102,7 @@ mod tests {
             &[],
             &["a".to_string()],
             true,
+            None,
         )
         .expect("row groups selected");
 
@@ -966,6 +1129,7 @@ mod tests {
             &[variant_predicate],
             &["a".to_string()],
             true,
+            None,
         )
         .expect("row groups selected");
 
@@ -985,6 +1149,7 @@ mod tests {
             &[predicate],
             &[],
             true,
+            None,
         )
         .expect("row groups selected");
 
@@ -1006,6 +1171,7 @@ mod tests {
             &[predicate],
             &[],
             true,
+            None,
         )
         .expect("row groups selected");
 
@@ -1024,6 +1190,7 @@ mod tests {
             &[out_of_range],
             &[],
             true,
+            None,
         )
         .expect("row groups selected");
         assert_eq!(selected, vec![0, 1]);
@@ -1039,6 +1206,7 @@ mod tests {
             &[missing_stats],
             &[],
             true,
+            None,
         )
         .expect("row groups selected");
         assert_eq!(selected, vec![0, 1]);
@@ -1058,6 +1226,7 @@ mod tests {
             &[out_of_range, usable],
             &[],
             true,
+            None,
         )
         .expect("row groups selected");
 
@@ -1107,22 +1276,106 @@ mod tests {
     }
 
     #[test]
-    fn parquet_row_group_pruner_declares_existing_capabilities() {
+    fn bloom_filter_may_contain_value_checks_inserted_int64() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
+        let column = metadata.row_group(0).column(0);
+        let mut bloom = parquet::bloom_filter::Sbbf::new_with_num_of_bytes(32);
+        bloom.insert(&2_i64);
+
+        assert_eq!(
+            bloom_filter_may_contain_value(&bloom, column, &MinMaxPredicateValue::Int64(2)),
+            Some(true)
+        );
+        assert_eq!(
+            bloom_filter_may_contain_value(&bloom, column, &MinMaxPredicateValue::Int64(99)),
+            Some(false)
+        );
+        assert_eq!(
+            bloom_filter_may_contain_value(
+                &bloom,
+                column,
+                &MinMaxPredicateValue::Decimal128 {
+                    value: 2,
+                    precision: 10,
+                    scale: 0,
+                },
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn row_group_pruner_accepts_membership_only_with_bloom_provider() {
         let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
         let columns = vec!["a".to_string()];
-        let pruner = ParquetRowGroupPruner::new(&metadata, vec![0, 1], &columns, true);
+        let pruner = ParquetRowGroupPruner::new(&metadata, vec![0, 1], &columns, true, None);
 
         assert_eq!(pruner.layer(), ScanLayer::RowGroup);
         assert!(pruner.accepts_domain(ScanPredicateDomainKind::Range));
         assert!(pruner.accepts_domain(ScanPredicateDomainKind::DiscreteSet));
         assert!(!pruner.accepts_domain(ScanPredicateDomainKind::Membership));
+
+        let provider = NullBloomProvider;
+        let pruner =
+            ParquetRowGroupPruner::new(&metadata, vec![0, 1], &columns, true, Some(&provider));
+        assert!(pruner.accepts_domain(ScanPredicateDomainKind::Membership));
+    }
+
+    #[test]
+    fn parquet_row_group_pruner_uses_bloom_membership_definite_misses() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
+        let columns = vec!["a".to_string()];
+        let provider = StaticBloomProvider::empty();
+        let pruner =
+            ParquetRowGroupPruner::new(&metadata, vec![0, 1], &columns, true, Some(&provider));
+        let predicate = ScanPredicate::new(
+            "0".to_string(),
+            ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                values: vec![MinMaxPredicateValue::Int64(2)],
+            }),
+            ScanPredicateSource::RuntimeMembership,
+        );
+
+        let result = prune_units(&pruner, &[predicate]).expect("prune row groups");
+        assert!(result.kept_units.is_empty());
+        assert_eq!(result.skipped_units, vec![0, 1]);
+        assert_eq!(provider.counters.probes(), 2);
+        assert_eq!(provider.counters.definite_misses(), 2);
+        assert_eq!(provider.counters.unsupported_values(), 0);
+    }
+
+    #[test]
+    fn parquet_row_group_pruner_keeps_unsupported_bloom_values_conservatively() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
+        let columns = vec!["a".to_string()];
+        let provider = StaticBloomProvider::empty();
+        let pruner =
+            ParquetRowGroupPruner::new(&metadata, vec![0, 1], &columns, true, Some(&provider));
+        let predicate = ScanPredicate::new(
+            "0".to_string(),
+            ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe {
+                values: vec![MinMaxPredicateValue::Decimal128 {
+                    value: 2,
+                    precision: 10,
+                    scale: 0,
+                }],
+            }),
+            ScanPredicateSource::RuntimeMembership,
+        );
+
+        let result = prune_units(&pruner, &[predicate]).expect("prune row groups");
+        assert_eq!(result.kept_units, vec![0, 1]);
+        assert!(result.skipped_units.is_empty());
+        assert_eq!(provider.counters.probes(), 2);
+        assert_eq!(provider.counters.definite_misses(), 0);
+        assert_eq!(provider.counters.unsupported_values(), 2);
     }
 
     #[test]
     fn parquet_row_group_pruner_keeps_only_discrete_set_overlapping_groups() {
         let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
         let columns = vec!["a".to_string()];
-        let pruner = ParquetRowGroupPruner::new(&metadata, vec![0, 1], &columns, true);
+        let pruner = ParquetRowGroupPruner::new(&metadata, vec![0, 1], &columns, true, None);
         let predicate = ScanPredicate::discrete_set(
             "0".to_string(),
             vec![
@@ -1142,7 +1395,7 @@ mod tests {
     fn parquet_row_group_pruner_keeps_all_when_stats_are_missing() {
         let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::None);
         let columns = vec!["a".to_string()];
-        let pruner = ParquetRowGroupPruner::new(&metadata, vec![0, 1], &columns, true);
+        let pruner = ParquetRowGroupPruner::new(&metadata, vec![0, 1], &columns, true, None);
         let predicate = ScanPredicate::from_min_max_predicate(
             MinMaxPredicate::Gt {
                 column: "0".to_string(),
