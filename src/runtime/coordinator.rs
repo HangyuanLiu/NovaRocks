@@ -508,7 +508,7 @@ impl ExecutionCoordinator {
                 let submission = match plan_wire_format {
                     PlanWireFormat::Thrift => FragmentSubmission::thrift_only(params),
                     PlanWireFormat::Proto => {
-                        let native_fragment =
+                        let mut native_fragment =
                             native_fragments_by_id.get(&fragment_id).cloned().ok_or_else(
                                 || {
                                     format!(
@@ -516,6 +516,27 @@ impl ExecutionCoordinator {
                                     )
                                 },
                             )?;
+                        if !is_root && !is_terminal_write && stream_edge.is_none() {
+                            if let Some((router_group_id, branch_edges)) = router_edges {
+                                patch_native_iceberg_change_stream_router_sink(
+                                    &mut native_fragment,
+                                    fragment_id,
+                                    *router_group_id,
+                                    branch_edges,
+                                    &plan.by_fragment,
+                                )?;
+                            } else if let Some(cte_id) = fr.cte_id {
+                                let consumers =
+                                    cte_consumers.get(&cte_id).cloned().unwrap_or_default();
+                                patch_native_cte_multicast_sink(
+                                    &mut native_fragment,
+                                    fragment_id,
+                                    cte_id,
+                                    &consumers,
+                                    &consumer_dests,
+                                )?;
+                            }
+                        }
                         let exec = params.params.as_ref().ok_or_else(|| {
                             format!(
                                 "fragment {fragment_id} missing exec params while plan_wire_format=proto"
@@ -1259,19 +1280,17 @@ fn ensure_native_sidecar_sink_supported(
     has_router_edges: bool,
     has_cte_id: bool,
 ) -> Result<(), String> {
-    if wire_format != PlanWireFormat::Proto || is_root || is_terminal_write {
+    if wire_format != PlanWireFormat::Proto
+        || is_root
+        || is_terminal_write
+        || has_stream_edge
+        || has_router_edges
+        || has_cte_id
+    {
         return Ok(());
     }
 
-    let dynamic_sink = if has_stream_edge {
-        "DATA_STREAM_SINK"
-    } else if has_router_edges {
-        "ICEBERG_CHANGE_STREAM_ROUTER_SINK destinations"
-    } else if has_cte_id {
-        "MULTI_CAST_DATA_STREAM_SINK"
-    } else {
-        "dynamic fragment sink"
-    };
+    let dynamic_sink = "dynamic fragment sink";
     Err(format!(
         "plan_wire_format=proto cannot encode {dynamic_sink} for fragment {fragment_id}; \
          use plan_wire_format=thrift until the native sink contract carries dynamic destinations"
@@ -1299,6 +1318,243 @@ fn native_fragment_sidecars(
             Ok(by_id)
         }
     }
+}
+
+fn patch_native_iceberg_change_stream_router_sink(
+    fragment: &mut crate::proto::plan::PlanFragment,
+    fragment_id: FragmentId,
+    router_group_id: i32,
+    branch_edges: &[&FragmentEdge],
+    placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
+) -> Result<(), String> {
+    if branch_edges.is_empty() {
+        return Err("native Iceberg change-stream router sink has no branch edges".to_string());
+    }
+    let router = match fragment.sink.as_mut().and_then(|sink| sink.kind.as_mut()) {
+        Some(crate::proto::plan::data_sink::Kind::IcebergChangeStreamRouter(router)) => router,
+        _ => {
+            return Err(format!(
+                "fragment {fragment_id} is router source for group {router_group_id} but native \
+                 sidecar is missing ICEBERG_CHANGE_STREAM_ROUTER_SINK"
+            ));
+        }
+    };
+
+    for edge in branch_edges {
+        let FragmentEdgeKind::IcebergChangeStreamRouter {
+            router_group_id: edge_group_id,
+            branch_id,
+            branch_kind,
+        } = edge.edge_kind
+        else {
+            return Err(format!(
+                "fragment {} edge to fragment {} is not an Iceberg change-stream router edge",
+                edge.source_fragment_id, edge.target_fragment_id
+            ));
+        };
+        if edge_group_id != router_group_id {
+            return Err(format!(
+                "native Iceberg change-stream router source={} expected group={} but edge uses group={}",
+                fragment_id, router_group_id, edge_group_id
+            ));
+        }
+
+        let route = router
+            .branches
+            .iter_mut()
+            .find(|route| {
+                route.branch_id == branch_id
+                    && native_change_stream_branch_kind(route.branch_kind)
+                        .is_ok_and(|route_kind| route_kind == branch_kind)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "native Iceberg change-stream router source={} group={} branch_id={} \
+                     branch_kind={:?} has no matching branch route",
+                    fragment_id, router_group_id, branch_id, branch_kind
+                )
+            })?;
+        route.target_fragment_id = edge.target_fragment_id;
+        route.target_exchange_node_id = edge.target_exchange_node_id;
+
+        let partition_exprs = route
+            .output_partition_ordinals
+            .iter()
+            .map(|ordinal| {
+                let idx = usize::try_from(*ordinal).map_err(|_| {
+                    format!(
+                        "native Iceberg change-stream router partition ordinal {ordinal} overflows usize"
+                    )
+                })?;
+                fragment.output_exprs.get(idx).cloned().ok_or_else(|| {
+                    format!(
+                        "native Iceberg change-stream router partition ordinal {ordinal} is out of range"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        route.output_partition = Some(native_data_partition_from_thrift_with_exprs(
+            &edge.output_partition,
+            partition_exprs,
+        )?);
+
+        let dests = placements.get(&edge.target_fragment_id).ok_or_else(|| {
+            format!(
+                "native Iceberg change-stream router source={} group={} branch_id={} target \
+                 fragment {} has no placements",
+                fragment_id, router_group_id, branch_id, edge.target_fragment_id
+            )
+        })?;
+        route.destinations = Some(crate::proto::plan::StreamDestinationList {
+            destinations: dests
+                .iter()
+                .map(|placement| {
+                    Ok(crate::proto::plan::StreamDestination {
+                        finst_id: Some(crate::proto::common::UniqueId {
+                            hi: placement.finst_id.hi,
+                            lo: placement.finst_id.lo,
+                        }),
+                        brpc_addr: format!(
+                            "{}:{}",
+                            placement.brpc_server.hostname, placement.brpc_server.port
+                        ),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        });
+    }
+
+    debug!(
+        "patched native Iceberg change-stream router sink: fragment={} group={} branches={}",
+        fragment_id,
+        router_group_id,
+        branch_edges.len()
+    );
+    Ok(())
+}
+
+fn native_change_stream_branch_kind(
+    value: i32,
+) -> Result<crate::sql::common::ChangeStreamBranchKind, String> {
+    match crate::proto::plan::ChangeStreamBranchKind::try_from(value)
+        .map_err(|_| format!("unknown native ChangeStreamBranchKind value {value}"))?
+    {
+        crate::proto::plan::ChangeStreamBranchKind::DeleteDv => {
+            Ok(crate::sql::common::ChangeStreamBranchKind::DeleteDv)
+        }
+        crate::proto::plan::ChangeStreamBranchKind::ReuseData => {
+            Ok(crate::sql::common::ChangeStreamBranchKind::ReuseData)
+        }
+        crate::proto::plan::ChangeStreamBranchKind::FreshData => {
+            Ok(crate::sql::common::ChangeStreamBranchKind::FreshData)
+        }
+        crate::proto::plan::ChangeStreamBranchKind::Unspecified => {
+            Err("native ChangeStreamBranchKind is unspecified".to_string())
+        }
+    }
+}
+
+fn patch_native_cte_multicast_sink(
+    fragment: &mut crate::proto::plan::PlanFragment,
+    fragment_id: FragmentId,
+    cte_id: CteId,
+    consumers: &[(FragmentId, i32, partitions::TDataPartition, Vec<i32>)],
+    consumer_dests: &BTreeMap<FragmentId, Vec<data_sinks::TPlanFragmentDestination>>,
+) -> Result<(), String> {
+    if consumers.is_empty() {
+        return Err(format!("CTE fragment (cte_id={cte_id}) has no consumers"));
+    }
+    let mut sinks = Vec::with_capacity(consumers.len());
+    let mut destinations = Vec::with_capacity(consumers.len());
+    for (consumer_fragment_id, exchange_node_id, partition, output_slot_ids) in consumers {
+        sinks.push(crate::proto::plan::DataStreamSink {
+            dest_node_id: *exchange_node_id,
+            output_partition: Some(native_data_partition_from_thrift(partition)?),
+            output_columns: output_slot_ids.clone(),
+            limit: None,
+        });
+        let dests = consumer_dests.get(consumer_fragment_id).ok_or_else(|| {
+            format!("CTE consumer fragment {consumer_fragment_id} has no placements")
+        })?;
+        destinations.push(crate::proto::plan::StreamDestinationList {
+            destinations: dests
+                .iter()
+                .map(native_stream_destination_from_thrift)
+                .collect::<Result<Vec<_>, _>>()?,
+        });
+    }
+    fragment.sink = Some(crate::proto::plan::DataSink {
+        kind: Some(crate::proto::plan::data_sink::Kind::MultiCastDataStream(
+            crate::proto::plan::MultiCastDataStreamSink {
+                sinks,
+                destinations,
+            },
+        )),
+    });
+    debug!(
+        "patched native CTE multicast sink: fragment={} cte_id={} sinks={}",
+        fragment_id,
+        cte_id,
+        consumers.len()
+    );
+    Ok(())
+}
+
+fn native_stream_destination_from_thrift(
+    src: &data_sinks::TPlanFragmentDestination,
+) -> Result<crate::proto::plan::StreamDestination, String> {
+    let brpc = src.brpc_server.as_ref().ok_or_else(|| {
+        "TPlanFragmentDestination.brpc_server is required for native multicast sink".to_string()
+    })?;
+    Ok(crate::proto::plan::StreamDestination {
+        finst_id: Some(crate::proto::common::UniqueId {
+            hi: src.fragment_instance_id.hi,
+            lo: src.fragment_instance_id.lo,
+        }),
+        brpc_addr: format!("{}:{}", brpc.hostname, brpc.port),
+    })
+}
+
+fn native_data_partition_from_thrift(
+    src: &partitions::TDataPartition,
+) -> Result<crate::proto::plan::DataPartition, String> {
+    native_data_partition_from_thrift_with_exprs(src, Vec::new())
+}
+
+fn native_data_partition_from_thrift_with_exprs(
+    src: &partitions::TDataPartition,
+    exprs: Vec<crate::proto::expr::Expr>,
+) -> Result<crate::proto::plan::DataPartition, String> {
+    if src
+        .partition_exprs
+        .as_ref()
+        .is_some_and(|exprs| !exprs.is_empty())
+        && exprs.is_empty()
+    {
+        return Err(
+            "native dynamic stream sink does not yet convert thrift partition exprs".to_string(),
+        );
+    }
+    let kind = match src.type_ {
+        partitions::TPartitionType::UNPARTITIONED => {
+            crate::proto::plan::PartitionKind::Unpartitioned
+        }
+        partitions::TPartitionType::RANDOM => crate::proto::plan::PartitionKind::Random,
+        partitions::TPartitionType::HASH_PARTITIONED
+        | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
+            crate::proto::plan::PartitionKind::Hash
+        }
+        other => {
+            return Err(format!(
+                "native CTE multicast sink unsupported partition type {:?}",
+                other
+            ));
+        }
+    };
+    Ok(crate::proto::plan::DataPartition {
+        kind: kind as i32,
+        exprs,
+    })
 }
 
 /// Assemble the per-instance `TRuntimeFilterParams` from scheduler-provided
@@ -2017,8 +2273,8 @@ mod tests {
     }
 
     #[test]
-    fn native_sidecar_sink_support_rejects_proto_dynamic_stream_sink() {
-        let err = ensure_native_sidecar_sink_supported(
+    fn native_sidecar_sink_support_allows_proto_dynamic_stream_sink() {
+        ensure_native_sidecar_sink_supported(
             PlanWireFormat::Proto,
             7,
             false,
@@ -2027,15 +2283,12 @@ mod tests {
             false,
             false,
         )
-        .expect_err("proto mode must reject dynamic stream sinks");
-
-        assert!(err.contains("DATA_STREAM_SINK"), "{err}");
-        assert!(err.contains("dynamic destinations"), "{err}");
+        .expect("proto mode carries native DATA_STREAM_SINK sidecars");
     }
 
     #[test]
-    fn native_sidecar_sink_support_rejects_proto_router_and_cte_sinks() {
-        let router_err = ensure_native_sidecar_sink_supported(
+    fn native_sidecar_sink_support_allows_proto_router_and_cte_sinks() {
+        ensure_native_sidecar_sink_supported(
             PlanWireFormat::Proto,
             8,
             false,
@@ -2044,13 +2297,9 @@ mod tests {
             true,
             false,
         )
-        .expect_err("proto mode must reject router destinations");
-        assert!(
-            router_err.contains("ICEBERG_CHANGE_STREAM_ROUTER_SINK"),
-            "{router_err}"
-        );
+        .expect("proto mode patches native ICEBERG_CHANGE_STREAM_ROUTER_SINK sidecars");
 
-        let cte_err = ensure_native_sidecar_sink_supported(
+        ensure_native_sidecar_sink_supported(
             PlanWireFormat::Proto,
             9,
             false,
@@ -2059,8 +2308,7 @@ mod tests {
             false,
             true,
         )
-        .expect_err("proto mode must reject CTE multicast sinks");
-        assert!(cte_err.contains("MULTI_CAST_DATA_STREAM_SINK"), "{cte_err}");
+        .expect("proto mode patches native MULTI_CAST_DATA_STREAM_SINK sidecars");
     }
 
     #[test]

@@ -40,15 +40,11 @@ use crate::exec::pipeline::executor::{
 };
 use crate::lower::layout::{build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots};
 use crate::lower::thrift::{Lowered, PlanOrigin, lower_plan};
+use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
-
-#[derive(Clone, Debug)]
-pub(crate) struct FragmentOutput {
-    pub(crate) profile_json: Option<String>,
-}
 
 fn merge_row_pos_descs(
     target: &mut HashMap<i32, RowPositionDescriptor>,

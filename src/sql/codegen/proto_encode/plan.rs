@@ -6,6 +6,7 @@ use iceberg::spec::{PrimitiveType, Type};
 use super::expr::{encode_expr, encode_sort_items, encode_window_frame};
 use super::types::encode_type;
 use crate::proto::{common, plan};
+use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog;
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
@@ -29,12 +30,14 @@ use crate::sql::planner::{
 pub(crate) fn encode_distributed_plan(
     src: &DistributedPlan,
 ) -> Result<plan::DistributedPlan, String> {
+    let mut fragments = src
+        .fragments
+        .iter()
+        .map(encode_plan_fragment)
+        .collect::<Result<Vec<_>, _>>()?;
+    attach_stream_sinks(src, &mut fragments)?;
     Ok(plan::DistributedPlan {
-        fragments: src
-            .fragments
-            .iter()
-            .map(encode_plan_fragment)
-            .collect::<Result<Vec<_>, _>>()?,
+        fragments,
         root_fragment_id: src.root_fragment_id,
         edges: src
             .edges
@@ -44,20 +47,221 @@ pub(crate) fn encode_distributed_plan(
     })
 }
 
+fn attach_stream_sinks(
+    src: &DistributedPlan,
+    fragments: &mut [plan::PlanFragment],
+) -> Result<(), String> {
+    let fragment_index_by_id = fragments
+        .iter()
+        .enumerate()
+        .map(|(idx, fragment)| (fragment.fragment_id, idx))
+        .collect::<HashMap<_, _>>();
+    let source_fragment_by_id = src
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.fragment_id, fragment))
+        .collect::<HashMap<_, _>>();
+
+    for edge in &src.edges {
+        if !matches!(edge.edge_kind, FragmentEdgeKind::Stream) {
+            continue;
+        }
+        let idx = *fragment_index_by_id
+            .get(&edge.source_fragment_id)
+            .ok_or_else(|| {
+                format!(
+                    "native stream edge source fragment {} missing encoded fragment",
+                    edge.source_fragment_id
+                )
+            })?;
+        let target_idx = *fragment_index_by_id
+            .get(&edge.target_fragment_id)
+            .ok_or_else(|| {
+                format!(
+                    "native stream edge target fragment {} missing encoded fragment",
+                    edge.target_fragment_id
+                )
+            })?;
+        let source = source_fragment_by_id
+            .get(&edge.source_fragment_id)
+            .ok_or_else(|| {
+                format!(
+                    "native stream edge source fragment {} missing source fragment",
+                    edge.source_fragment_id
+                )
+            })?;
+        let stream_output_columns = stream_edge_output_columns(source, &fragments[idx], edge)?;
+        let fragment = &mut fragments[idx];
+        if !matches!(
+            fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref()),
+            Some(plan::data_sink::Kind::Noop(true))
+        ) {
+            return Err(format!(
+                "native stream edge source fragment {} must have a NOOP sink before stream attachment",
+                edge.source_fragment_id
+            ));
+        }
+        fragment.sink = Some(plan::DataSink {
+            kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                dest_node_id: edge.target_exchange_node_id,
+                output_partition: Some(encode_data_partition(&source.output_partition)?),
+                output_columns: edge.output_slot_ids.clone(),
+                limit: None,
+            })),
+        });
+        patch_exchange_receiver_output_columns(
+            &mut fragments[target_idx],
+            edge.target_exchange_node_id,
+            stream_output_columns,
+        )?;
+    }
+    Ok(())
+}
+
+fn stream_edge_output_columns(
+    source: &PlanFragment,
+    encoded_source: &plan::PlanFragment,
+    edge: &FragmentEdge,
+) -> Result<Vec<common::OutputColumn>, String> {
+    let columns = if source.output_columns.is_empty() {
+        encoded_fragment_root_output_columns(encoded_source)?
+    } else {
+        encode_output_columns(&source.output_columns)?
+    };
+    retag_output_columns_for_edge(columns, &edge.output_slot_ids)
+}
+
+fn encoded_fragment_root_output_columns(
+    fragment: &plan::PlanFragment,
+) -> Result<Vec<common::OutputColumn>, String> {
+    let root = fragment
+        .root
+        .as_ref()
+        .ok_or_else(|| format!("native fragment {} missing root", fragment.fragment_id))?;
+    encoded_node_output_columns(root)
+}
+
+fn encoded_node_output_columns(
+    node: &plan::DistributedNode,
+) -> Result<Vec<common::OutputColumn>, String> {
+    match node.payload.as_ref() {
+        Some(plan::distributed_node::Payload::Physical(physical)) => {
+            if !physical.output_columns.is_empty() {
+                return Ok(physical.output_columns.clone());
+            }
+            match physical.kind.as_ref() {
+                Some(plan::plan_node::Kind::HashAggregate(aggregate)) => {
+                    if !aggregate.output_columns.is_empty() {
+                        return Ok(aggregate.output_columns.clone());
+                    }
+                    let output_layout = aggregate.output_layout.as_ref().ok_or_else(|| {
+                        format!(
+                            "native stream source aggregate node {} missing output_layout",
+                            node.node_id
+                        )
+                    })?;
+                    let mut columns = Vec::with_capacity(
+                        output_layout.group_key_columns.len()
+                            + output_layout.aggregate_columns.len(),
+                    );
+                    columns.extend(output_layout.group_key_columns.clone());
+                    columns.extend(output_layout.aggregate_columns.clone());
+                    Ok(columns)
+                }
+                Some(kind) => Err(format!(
+                    "native stream source node {} has no output columns for {:?}",
+                    node.node_id, kind
+                )),
+                None => Err(format!(
+                    "native stream source physical node {} missing kind",
+                    node.node_id
+                )),
+            }
+        }
+        Some(plan::distributed_node::Payload::Exchange(exchange)) => {
+            Ok(exchange.output_columns.clone())
+        }
+        None => Err(format!(
+            "native stream source node {} missing payload",
+            node.node_id
+        )),
+    }
+}
+
+fn retag_output_columns_for_edge(
+    mut columns: Vec<common::OutputColumn>,
+    output_slot_ids: &[i32],
+) -> Result<Vec<common::OutputColumn>, String> {
+    if output_slot_ids.is_empty() {
+        return Ok(columns);
+    }
+    if output_slot_ids.len() != columns.len() {
+        return Err(format!(
+            "native stream edge output_slot_ids length {} does not match output columns {}",
+            output_slot_ids.len(),
+            columns.len()
+        ));
+    }
+    for (column, slot_id) in columns.iter_mut().zip(output_slot_ids.iter().copied()) {
+        column.column_id = u32::try_from(slot_id).map_err(|_| {
+            format!("native stream edge output slot id {slot_id} cannot convert to u32")
+        })?;
+    }
+    Ok(columns)
+}
+
+fn patch_exchange_receiver_output_columns(
+    fragment: &mut plan::PlanFragment,
+    target_exchange_node_id: i32,
+    output_columns: Vec<common::OutputColumn>,
+) -> Result<(), String> {
+    let root = fragment
+        .root
+        .as_mut()
+        .ok_or_else(|| format!("native fragment {} missing root", fragment.fragment_id))?;
+    if patch_exchange_receiver_output_columns_in_node(
+        root,
+        target_exchange_node_id,
+        &output_columns,
+    ) {
+        return Ok(());
+    }
+    Err(format!(
+        "native stream edge target fragment {} missing exchange node {}",
+        fragment.fragment_id, target_exchange_node_id
+    ))
+}
+
+fn patch_exchange_receiver_output_columns_in_node(
+    node: &mut plan::DistributedNode,
+    target_exchange_node_id: i32,
+    output_columns: &[common::OutputColumn],
+) -> bool {
+    if node.node_id == target_exchange_node_id
+        && let Some(plan::distributed_node::Payload::Exchange(exchange)) = node.payload.as_mut()
+    {
+        exchange.output_columns = output_columns.to_vec();
+        return true;
+    }
+    node.children.iter_mut().any(|child| {
+        patch_exchange_receiver_output_columns_in_node(
+            child,
+            target_exchange_node_id,
+            output_columns,
+        )
+    })
+}
+
 pub(crate) fn encode_plan_fragment(src: &PlanFragment) -> Result<plan::PlanFragment, String> {
+    let (output_exprs, output_columns) = encode_fragment_output_contract(src)?;
     Ok(plan::PlanFragment {
         fragment_id: src.fragment_id,
         root: Some(encode_node(&src.root)?),
         data_partition: Some(encode_data_partition(&src.data_partition)?),
         output_partition: Some(encode_data_partition(&src.output_partition)?),
         sink: Some(encode_data_sink(&src.sink)?),
-        output_exprs: src
-            .output_exprs
-            .as_ref()
-            .map(|exprs| exprs.iter().map(encode_expr).collect::<Result<Vec<_>, _>>())
-            .transpose()?
-            .unwrap_or_default(),
-        output_columns: encode_output_columns(&src.output_columns)?,
+        output_exprs,
+        output_columns,
         cte_id: src.cte_id,
         cte_exchange_nodes: src
             .cte_exchange_nodes
@@ -69,6 +273,102 @@ pub(crate) fn encode_plan_fragment(src: &PlanFragment) -> Result<plan::PlanFragm
             })
             .collect(),
     })
+}
+
+fn encode_fragment_output_contract(
+    src: &PlanFragment,
+) -> Result<(Vec<crate::proto::expr::Expr>, Vec<common::OutputColumn>), String> {
+    if let DataSink::IcebergWrite(sink) = &src.sink {
+        let output_exprs = if let Some(exprs) = src.output_exprs.as_ref() {
+            if exprs.len() != sink.spec.target_columns.len() {
+                return Err(format!(
+                    "native Iceberg write fragment output_exprs count {} does not match target column count {}",
+                    exprs.len(),
+                    sink.spec.target_columns.len()
+                ));
+            }
+            encode_exprs(exprs)?
+        } else {
+            let sink_columns =
+                iceberg_write_sink_columns_for_input(&src.output_columns, &sink.input)?;
+            if sink_columns.len() != sink.spec.target_columns.len() {
+                return Err(format!(
+                    "native Iceberg write sink input column count {} does not match target column count {}",
+                    sink_columns.len(),
+                    sink.spec.target_columns.len()
+                ));
+            }
+            let exprs = sink_columns
+                .iter()
+                .map(column_ref_expr_for_output_column)
+                .collect::<Vec<_>>();
+            encode_exprs(&exprs)?
+        };
+        let output_columns = encode_iceberg_write_sink_output_columns(&sink.spec.target_columns)?;
+        return Ok((output_exprs, output_columns));
+    }
+
+    let output_exprs = src
+        .output_exprs
+        .as_ref()
+        .map(|exprs| encode_exprs(exprs))
+        .transpose()?
+        .unwrap_or_default();
+    let output_columns = encode_output_columns(&src.output_columns)?;
+    Ok((output_exprs, output_columns))
+}
+
+fn iceberg_write_sink_columns_for_input(
+    output_columns: &[AnalysisOutputColumn],
+    input: &IcebergWriteInputBinding,
+) -> Result<Vec<AnalysisOutputColumn>, String> {
+    match input {
+        IcebergWriteInputBinding::RootOutputByOrdinal => Ok(output_columns.to_vec()),
+        IcebergWriteInputBinding::OutputOrdinals(ordinals) => ordinals
+            .iter()
+            .copied()
+            .map(|ordinal| {
+                output_columns.get(ordinal).cloned().ok_or_else(|| {
+                    format!("native Iceberg write sink output ordinal {ordinal} is out of range")
+                })
+            })
+            .collect(),
+    }
+}
+
+fn column_ref_expr_for_output_column(column: &AnalysisOutputColumn) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id: column.column_id,
+            qualifier: None,
+            column: column.name.clone(),
+        },
+        data_type: column.data_type.clone(),
+        nullable: column.nullable,
+    }
+}
+
+fn encode_iceberg_write_sink_output_columns(
+    target_columns: &[catalog::ColumnDef],
+) -> Result<Vec<common::OutputColumn>, String> {
+    target_columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            let ordinal = idx
+                .checked_add(1)
+                .ok_or_else(|| "native Iceberg write sink output ordinal overflow".to_string())?;
+            let column_id = u32::try_from(ordinal)
+                .map_err(|_| "native Iceberg write sink output column id overflow".to_string())?;
+            Ok(common::OutputColumn {
+                column_id,
+                name: column.name.clone(),
+                r#type: Some(encode_type(&column.data_type)?),
+                nullable: column.nullable,
+                is_internal: false,
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode, String> {
@@ -594,6 +894,8 @@ fn encode_data_sink(src: &DataSink) -> Result<plan::DataSink, String> {
                                 .iter()
                                 .map(|value| usize_to_u64(*value))
                                 .collect(),
+                            output_partition: None,
+                            destinations: None,
                         })
                         .collect(),
                 })

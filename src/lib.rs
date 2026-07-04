@@ -28,6 +28,7 @@ pub mod exec;
 pub mod formats;
 pub mod fs;
 pub mod lower;
+pub(crate) mod lower_native;
 pub mod meta;
 pub mod runtime;
 pub mod server;

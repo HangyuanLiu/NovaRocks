@@ -291,15 +291,39 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 "debug submit fault injected on call {call_index}"
             )));
         }
-        let bytes = request.into_inner().exec_plan_fragment_params_thrift;
-        // submit_exec_plan_fragment does thrift deserialization and pipeline setup,
-        // which is CPU-bound. Offload to the blocking thread pool so tonic worker
-        // threads remain free for I/O.
-        let result = tokio::task::spawn_blocking(move || crate::submit_exec_plan_fragment(&bytes))
+        let proto::novarocks::SubmitFragmentRequest {
+            exec_plan_fragment_params_thrift,
+            plan,
+            instance_params,
+        } = request.into_inner();
+        let result = match (plan, instance_params) {
+            (Some(plan), Some(instance_params)) => tokio::task::spawn_blocking(move || {
+                crate::service::internal_service::submit_exec_plan_fragment_native(
+                    plan,
+                    instance_params,
+                )
+            })
             .await
             .map_err(|e| {
                 tonic::Status::internal(format!("submit_fragment handler panicked: {e}"))
-            })?;
+            })?,
+            (Some(_), None) | (None, Some(_)) => Err(
+                "SubmitFragmentRequest native plan and instance_params must be provided together"
+                    .to_string(),
+            ),
+            (None, None) => {
+                // submit_exec_plan_fragment does thrift deserialization and pipeline setup,
+                // which is CPU-bound. Offload to the blocking thread pool so tonic worker
+                // threads remain free for I/O.
+                tokio::task::spawn_blocking(move || {
+                    crate::submit_exec_plan_fragment(&exec_plan_fragment_params_thrift)
+                })
+                .await
+                .map_err(|e| {
+                    tonic::Status::internal(format!("submit_fragment handler panicked: {e}"))
+                })?
+            }
+        };
         match result {
             Ok(()) => Ok(tonic::Response::new(
                 proto::novarocks::SubmitFragmentResponse {
@@ -1350,6 +1374,7 @@ mod pr3_tests {
         IcebergCommitInfo, IcebergDataFile, IcebergFileContent, ReportExecStatusRequest,
         SubmitFragmentRequest,
     };
+    use super::proto::{novarocks, plan};
     use crate::thrift::types;
     use tonic::Request;
 
@@ -1423,6 +1448,85 @@ mod pr3_tests {
             "should return business error for bad thrift"
         );
         assert!(!body.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submit_fragment_native_sidecar_ignores_bad_thrift_bytes() {
+        let svc = GrpcService::default();
+        let req = Request::new(SubmitFragmentRequest {
+            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
+            plan: Some(plan::PlanFragment::default()),
+            instance_params: Some(novarocks::InstanceParams::default()),
+        });
+        let resp = svc.submit_fragment(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+        assert_ne!(body.status_code, 0);
+        assert!(
+            body.message.contains("query_id"),
+            "native path should validate InstanceParams before thrift decode, got: {}",
+            body.message
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_fragment_rejects_partial_native_sidecar_before_thrift_decode() {
+        let svc = GrpcService::default();
+        let req = Request::new(SubmitFragmentRequest {
+            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
+            plan: Some(plan::PlanFragment::default()),
+            instance_params: None,
+        });
+        let resp = svc.submit_fragment(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+        assert_ne!(body.status_code, 0);
+        assert!(
+            body.message.contains("provided together"),
+            "partial native sidecar should be rejected directly, got: {}",
+            body.message
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_fragment_native_result_sink_precreates_fetch_buffer() {
+        use crate::common::types::UniqueId;
+        use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
+
+        let finst = ProtoUniqueId { hi: 7101, lo: 7102 };
+        let svc = GrpcService::default();
+        let req = Request::new(SubmitFragmentRequest {
+            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
+            plan: Some(plan::PlanFragment {
+                sink: Some(plan::DataSink {
+                    kind: Some(plan::data_sink::Kind::Result(true)),
+                }),
+                ..Default::default()
+            }),
+            instance_params: Some(novarocks::InstanceParams {
+                query_id: Some(ProtoUniqueId { hi: 7001, lo: 7002 }),
+                fragment_instance_id: Some(finst.clone()),
+                backend_num: 0,
+                query_options: Some(novarocks::QueryOptions {
+                    batch_size: 1024,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        });
+        let resp = svc.submit_fragment(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+        assert_eq!(body.status_code, 0, "{}", body.message);
+
+        let finst_id = UniqueId {
+            hi: finst.hi,
+            lo: finst.lo,
+        };
+        match result_buffer::wait_fetch(finst_id, 1000) {
+            TryFetchResult::Error(err) if matches!(err.kind, FetchErrorKind::NotFound) => {
+                panic!("native result sink submit must precreate result buffer")
+            }
+            _ => {}
+        }
+        crate::runtime::query_context::query_context_manager().unregister_finst(finst_id);
     }
 
     #[tokio::test]

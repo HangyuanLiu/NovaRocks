@@ -139,3 +139,29 @@ pub(crate) struct FragmentBuildResult {
     pub query_global_dict_exprs:
         Option<std::collections::BTreeMap<i32, crate::thrift::exprs::TExpr>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::proto_encode::types::decode_type;
+    use crate::proto::common;
+
+    #[test]
+    fn proto_type_decode_is_available_to_sibling_lowering_modules() {
+        let desc = common::TypeDesc {
+            kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+                r#type: common::PrimitiveType::Int as i32,
+                len: None,
+                precision: None,
+                scale: None,
+                time_unit: None,
+            })),
+        };
+
+        assert_eq!(
+            decode_type(&desc).expect("decode int TypeDesc"),
+            DataType::Int32
+        );
+    }
+}
