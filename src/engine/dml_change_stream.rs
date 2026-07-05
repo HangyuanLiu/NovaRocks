@@ -223,11 +223,8 @@ fn inject_keyed_assert_before_expand_node(
             expand.node_id
         )
     })?;
-    let key_slot = find_slot_id_in_row_tuples(
-        &fragment.desc_tbl,
-        &child.row_tuples,
-        &keyed_assert.key_column_name,
-    )?;
+    let key_slot =
+        find_key_slot_for_pre_expand_assert(&fragment.desc_tbl, expand, child, keyed_assert)?;
     let mut assert_node = crate::sql::codegen::nodes::default_plan_node();
     assert_node.node_id = -1;
     assert_node.node_type = crate::thrift::plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE;
@@ -246,6 +243,132 @@ fn inject_keyed_assert_before_expand_node(
     });
     fragment.plan.nodes.insert(expand_idx + 1, assert_node);
     Ok(())
+}
+
+fn find_key_slot_for_pre_expand_assert(
+    desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
+    expand: &crate::thrift::plan_nodes::TPlanNode,
+    child: &crate::thrift::plan_nodes::TPlanNode,
+    keyed_assert: &DmlPreExpandKeyedAssert,
+) -> Result<i32, String> {
+    if can_derive_key_from_row_id_assignment(keyed_assert)
+        && let Some(slot_id) =
+            find_key_slot_from_change_event_assignment(desc_tbl, expand, child, keyed_assert)?
+    {
+        return Ok(slot_id);
+    }
+    find_slot_id_in_row_tuples(desc_tbl, &child.row_tuples, &keyed_assert.key_column_name)
+}
+
+fn can_derive_key_from_row_id_assignment(keyed_assert: &DmlPreExpandKeyedAssert) -> bool {
+    keyed_assert
+        .key_column_name
+        .eq_ignore_ascii_case("__nr_row_id")
+        && keyed_assert
+            .key_label
+            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+}
+
+fn find_key_slot_from_change_event_assignment(
+    desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
+    expand: &crate::thrift::plan_nodes::TPlanNode,
+    child: &crate::thrift::plan_nodes::TPlanNode,
+    keyed_assert: &DmlPreExpandKeyedAssert,
+) -> Result<Option<i32>, String> {
+    let Some(expand_payload) = expand.change_event_expand_node.as_ref() else {
+        return Ok(None);
+    };
+    let Some(output_slot_id) = find_slot_id_by_name(
+        desc_tbl,
+        &expand_payload.output_slot_ids,
+        &keyed_assert.key_label,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let mut key_slot_id = None;
+    for event in &expand_payload.events {
+        for assignment in &event.assignments {
+            if assignment.output_slot_id != output_slot_id {
+                continue;
+            }
+            let Some(expr) = assignment.expr.as_ref() else {
+                continue;
+            };
+            let Some(slot_id) = direct_slot_ref_slot_id(expr) else {
+                continue;
+            };
+            if !slot_id_belongs_to_row_tuples(desc_tbl, &child.row_tuples, slot_id)? {
+                return Err(format!(
+                    "DML change-stream keyed assert assignment slot {slot_id} is not produced by the ChangeEventExpand child"
+                ));
+            }
+            if let Some(previous) = key_slot_id {
+                if previous != slot_id {
+                    return Err(format!(
+                        "DML change-stream keyed assert output `{}` is assigned from multiple child slots: {previous} and {slot_id}",
+                        keyed_assert.key_label
+                    ));
+                }
+            } else {
+                key_slot_id = Some(slot_id);
+            }
+        }
+    }
+    Ok(key_slot_id)
+}
+
+fn find_slot_id_by_name(
+    desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
+    slot_ids: &[i32],
+    column_name: &str,
+) -> Result<Option<i32>, String> {
+    let slots = desc_tbl.slot_descriptors.as_ref().ok_or_else(|| {
+        "DML change-stream keyed assert descriptor table has no slots".to_string()
+    })?;
+    let mut matches = slots.iter().filter(|slot| {
+        slot.id.is_some_and(|slot_id| slot_ids.contains(&slot_id))
+            && slot
+                .col_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+    });
+    let Some(slot) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "DML change-stream keyed assert output column `{column_name}` is ambiguous"
+        ));
+    }
+    Ok(slot.id)
+}
+
+fn direct_slot_ref_slot_id(expr: &crate::thrift::exprs::TExpr) -> Option<i32> {
+    let [node] = expr.nodes.as_slice() else {
+        return None;
+    };
+    if node.node_type != crate::thrift::exprs::TExprNodeType::SLOT_REF {
+        return None;
+    }
+    node.slot_ref.as_ref().map(|slot_ref| slot_ref.slot_id)
+}
+
+fn slot_id_belongs_to_row_tuples(
+    desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
+    row_tuples: &[i32],
+    slot_id: i32,
+) -> Result<bool, String> {
+    let slots = desc_tbl.slot_descriptors.as_ref().ok_or_else(|| {
+        "DML change-stream keyed assert descriptor table has no slots".to_string()
+    })?;
+    Ok(slots.iter().any(|slot| {
+        slot.id == Some(slot_id)
+            && slot
+                .parent
+                .is_some_and(|tuple_id| row_tuples.contains(&tuple_id))
+    }))
 }
 
 fn find_slot_id_in_row_tuples(
@@ -601,19 +724,18 @@ pub(crate) fn plan_dml_change_stream_write(
     )?;
     let crate::engine::PlannedIcebergChangeStreamWrite {
         mut build_result,
-        distributed_plan,
+        mut distributed_plan,
         commit_plan,
         #[cfg(test)]
         topology,
     } = planned;
     inject_dml_pre_expand_keyed_assert(&mut build_result, plan.pre_expand_keyed_assert.as_ref())?;
-    // The keyed assert is a post-codegen thrift mutation; the native
-    // DistributedPlan cannot represent it yet, so proto mode must fail fast.
-    let distributed_plan = if plan.pre_expand_keyed_assert.is_some() {
-        None
-    } else {
-        distributed_plan
-    };
+    if let (Some(distributed_plan), Some(keyed_assert)) = (
+        distributed_plan.as_mut(),
+        plan.pre_expand_keyed_assert.as_ref(),
+    ) {
+        inject_dml_pre_expand_keyed_assert_into_native_plan(distributed_plan, keyed_assert)?;
+    }
     Ok(crate::engine::PlannedIcebergChangeStreamWrite {
         build_result,
         distributed_plan,
@@ -621,6 +743,344 @@ pub(crate) fn plan_dml_change_stream_write(
         #[cfg(test)]
         topology,
     })
+}
+
+pub(crate) fn inject_dml_pre_expand_keyed_assert_into_native_plan(
+    plan: &mut crate::sql::planner::DistributedPlan,
+    keyed_assert: &DmlPreExpandKeyedAssert,
+) -> Result<(), String> {
+    let mut next_node_id = next_native_node_id(plan);
+    let mut expand_count = 0usize;
+    for fragment in &mut plan.fragments {
+        inject_native_keyed_assert_before_expand_node(
+            &mut fragment.root,
+            keyed_assert,
+            &mut next_node_id,
+            &mut expand_count,
+        )?;
+    }
+    if expand_count != 1 {
+        return Err(format!(
+            "DML change-stream keyed assert requires exactly one native ChangeEventExpand node, found {expand_count}"
+        ));
+    }
+    renumber_native_plan_node_ids_preserving_preorder(plan)?;
+    Ok(())
+}
+
+fn inject_native_keyed_assert_before_expand_node(
+    node: &mut crate::sql::planner::DistributedNode,
+    keyed_assert: &DmlPreExpandKeyedAssert,
+    next_node_id: &mut i32,
+    expand_count: &mut usize,
+) -> Result<(), String> {
+    for child in &mut node.children {
+        inject_native_keyed_assert_before_expand_node(
+            child,
+            keyed_assert,
+            next_node_id,
+            expand_count,
+        )?;
+    }
+
+    if !matches!(
+        node.payload,
+        crate::sql::planner::DistributedPayload::Physical(
+            crate::sql::planner::plan::PhysicalPlanKind::ChangeEventExpand(_)
+        )
+    ) {
+        return Ok(());
+    }
+
+    *expand_count += 1;
+    if node.children.len() != 1 {
+        return Err(format!(
+            "DML change-stream native ChangeEventExpand node_id={} expected one child, got {}",
+            node.node_id,
+            node.children.len()
+        ));
+    }
+
+    let key_column_id = find_native_key_column_id_for_pre_expand_assert(node, keyed_assert)?;
+    let original_child = node.children.pop().expect("validated single child");
+    let assert_node = crate::sql::planner::DistributedNode {
+        node_id: *next_node_id,
+        fragment_id: original_child.fragment_id,
+        tuple_ids: original_child.tuple_ids.clone(),
+        nullable_tuple_ids: original_child.nullable_tuple_ids.clone(),
+        limit: -1,
+        build_runtime_filters: Vec::new(),
+        probe_runtime_filters: Vec::new(),
+        children: vec![original_child],
+        stats: node.stats.clone(),
+        payload: crate::sql::planner::DistributedPayload::Physical(
+            crate::sql::planner::plan::PhysicalPlanKind::AssertOneRow(
+                crate::sql::planner::plan::PlanAssertOneRowNode::per_key_at_most_one(
+                    "DML change-stream matched row uniqueness",
+                    vec![key_column_id],
+                    vec![keyed_assert.key_label.clone()],
+                    keyed_assert.message_prefix.clone(),
+                ),
+            ),
+        ),
+    };
+    *next_node_id += 1;
+    node.children.push(assert_node);
+    Ok(())
+}
+
+fn find_native_key_column_id_for_pre_expand_assert(
+    expand_node: &crate::sql::planner::DistributedNode,
+    keyed_assert: &DmlPreExpandKeyedAssert,
+) -> Result<crate::sql::column_id::ColumnId, String> {
+    let child = expand_node.children.first().ok_or_else(|| {
+        format!(
+            "DML change-stream native ChangeEventExpand node_id={} missing child",
+            expand_node.node_id
+        )
+    })?;
+    match find_output_column_id_by_name(child, &keyed_assert.key_column_name) {
+        Ok(column_id) => Ok(column_id),
+        Err(name_err) if can_derive_key_from_row_id_assignment(keyed_assert) => {
+            if let Some(column_id) =
+                find_native_key_column_id_from_change_event_assignment(expand_node, keyed_assert)?
+            {
+                Ok(column_id)
+            } else {
+                Err(name_err)
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn find_native_key_column_id_from_change_event_assignment(
+    expand_node: &crate::sql::planner::DistributedNode,
+    keyed_assert: &DmlPreExpandKeyedAssert,
+) -> Result<Option<crate::sql::column_id::ColumnId>, String> {
+    let crate::sql::planner::DistributedPayload::Physical(
+        crate::sql::planner::plan::PhysicalPlanKind::ChangeEventExpand(expand),
+    ) = &expand_node.payload
+    else {
+        return Ok(None);
+    };
+    let mut output_columns = expand
+        .output_columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(&keyed_assert.key_label));
+    let Some(output_column) = output_columns.next() else {
+        return Ok(None);
+    };
+    if output_columns.next().is_some() {
+        return Err(format!(
+            "DML change-stream native keyed assert output column `{}` is ambiguous",
+            keyed_assert.key_label
+        ));
+    }
+
+    let mut key_column_id = None;
+    for event in &expand.events {
+        for assignment in &event.assignments {
+            if assignment.output_column_id != output_column.column_id {
+                continue;
+            }
+            let Some(expr) = assignment.expr.as_ref() else {
+                continue;
+            };
+            let crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } = &expr.kind else {
+                continue;
+            };
+            if let Some(previous) = key_column_id {
+                if previous != *column_id {
+                    return Err(format!(
+                        "DML change-stream native keyed assert output `{}` is assigned from multiple child columns: {:?} and {:?}",
+                        keyed_assert.key_label, previous, column_id
+                    ));
+                }
+            } else {
+                key_column_id = Some(*column_id);
+            }
+        }
+    }
+    Ok(key_column_id)
+}
+
+fn next_native_node_id(plan: &crate::sql::planner::DistributedPlan) -> i32 {
+    plan.fragments
+        .iter()
+        .flat_map(|fragment| native_node_ids(&fragment.root))
+        .max()
+        .unwrap_or_default()
+        + 1
+}
+
+fn native_node_ids(node: &crate::sql::planner::DistributedNode) -> Vec<i32> {
+    let mut ids = vec![node.node_id];
+    for child in &node.children {
+        ids.extend(native_node_ids(child));
+    }
+    ids
+}
+
+fn renumber_native_plan_node_ids_preserving_preorder(
+    plan: &mut crate::sql::planner::DistributedPlan,
+) -> Result<(), String> {
+    let mut next_node_id = 1;
+    let mut node_id_map = HashMap::new();
+    for fragment in &mut plan.fragments {
+        assign_native_preorder_invariant_node_ids(
+            &mut fragment.root,
+            &mut next_node_id,
+            &mut node_id_map,
+        )?;
+    }
+    remap_native_plan_node_references(plan, &node_id_map)?;
+    Ok(())
+}
+
+fn assign_native_preorder_invariant_node_ids(
+    node: &mut crate::sql::planner::DistributedNode,
+    next_node_id: &mut i32,
+    node_id_map: &mut HashMap<i32, i32>,
+) -> Result<(), String> {
+    for child in &mut node.children {
+        assign_native_preorder_invariant_node_ids(child, next_node_id, node_id_map)?;
+    }
+    let old_node_id = node.node_id;
+    let new_node_id = *next_node_id;
+    *next_node_id += 1;
+    if node_id_map.insert(old_node_id, new_node_id).is_some() {
+        return Err(format!(
+            "DML change-stream keyed assert cannot renumber duplicate native node id {old_node_id}"
+        ));
+    }
+    node.node_id = new_node_id;
+    Ok(())
+}
+
+fn remap_native_plan_node_references(
+    plan: &mut crate::sql::planner::DistributedPlan,
+    node_id_map: &HashMap<i32, i32>,
+) -> Result<(), String> {
+    for fragment in &mut plan.fragments {
+        for (_, exchange_node_id, _) in &mut fragment.cte_exchange_nodes {
+            *exchange_node_id = remap_native_node_id(*exchange_node_id, node_id_map)?;
+        }
+        if let crate::sql::planner::DataSink::IcebergChangeStreamRouter(router) = &mut fragment.sink
+        {
+            for branch in &mut router.branches {
+                branch.target_exchange_node_id =
+                    remap_native_node_id(branch.target_exchange_node_id, node_id_map)?;
+            }
+        }
+    }
+    for edge in &mut plan.edges {
+        edge.target_exchange_node_id =
+            remap_native_node_id(edge.target_exchange_node_id, node_id_map)?;
+    }
+    Ok(())
+}
+
+fn remap_native_node_id(node_id: i32, node_id_map: &HashMap<i32, i32>) -> Result<i32, String> {
+    node_id_map.get(&node_id).copied().ok_or_else(|| {
+        format!("DML change-stream keyed assert cannot remap unknown native node id {node_id}")
+    })
+}
+
+fn find_output_column_id_by_name(
+    node: &crate::sql::planner::DistributedNode,
+    column_name: &str,
+) -> Result<crate::sql::column_id::ColumnId, String> {
+    if let crate::sql::planner::DistributedPayload::Physical(
+        crate::sql::planner::plan::PhysicalPlanKind::Project(project),
+    ) = &node.payload
+    {
+        let mut matches = project
+            .items
+            .iter()
+            .filter(|item| item.output_name.eq_ignore_ascii_case(column_name));
+        let item = matches.next().ok_or_else(|| {
+            format!(
+                "DML change-stream keyed assert column `{column_name}` not found in native Project child"
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "DML change-stream keyed assert column `{column_name}` is ambiguous in native Project child"
+            ));
+        }
+        return Ok(item.output_column_id);
+    }
+
+    let columns = native_node_output_columns(node).ok_or_else(|| {
+        format!(
+            "DML change-stream keyed assert cannot infer output columns for native node {}",
+            node.node_id
+        )
+    })?;
+    let mut matches = columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(column_name));
+    let column = matches.next().ok_or_else(|| {
+        format!("DML change-stream keyed assert column `{column_name}` not found in native child")
+    })?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "DML change-stream keyed assert column `{column_name}` is ambiguous in native child"
+        ));
+    }
+    Ok(column.column_id)
+}
+
+fn native_node_output_columns(
+    node: &crate::sql::planner::DistributedNode,
+) -> Option<&[crate::sql::analysis::OutputColumn]> {
+    match &node.payload {
+        crate::sql::planner::DistributedPayload::Exchange(exchange) => {
+            Some(&exchange.output_columns)
+        }
+        crate::sql::planner::DistributedPayload::Physical(kind) => match kind {
+            crate::sql::planner::plan::PhysicalPlanKind::Scan(scan) => Some(&scan.columns),
+            crate::sql::planner::plan::PhysicalPlanKind::Sort(sort) => Some(&sort.output_columns),
+            crate::sql::planner::plan::PhysicalPlanKind::Values(values) => Some(&values.columns),
+            crate::sql::planner::plan::PhysicalPlanKind::Window(window) => {
+                Some(&window.output_columns)
+            }
+            crate::sql::planner::plan::PhysicalPlanKind::TableFunction(table_function) => {
+                Some(&table_function.output_columns)
+            }
+            crate::sql::planner::plan::PhysicalPlanKind::HashAggregate(aggregate) => {
+                Some(&aggregate.output_columns)
+            }
+            crate::sql::planner::plan::PhysicalPlanKind::SetOp(set_op) => {
+                Some(&set_op.output_columns)
+            }
+            crate::sql::planner::plan::PhysicalPlanKind::ChangeEventExpand(expand) => {
+                Some(&expand.output_columns)
+            }
+            crate::sql::planner::plan::PhysicalPlanKind::CTEProduce(produce) => {
+                Some(&produce.output_columns)
+            }
+            crate::sql::planner::plan::PhysicalPlanKind::CTEConsume(consume) => {
+                Some(&consume.output_columns)
+            }
+            crate::sql::planner::plan::PhysicalPlanKind::Redistribute(redistribute) => {
+                Some(&redistribute.output_columns)
+            }
+            crate::sql::planner::plan::PhysicalPlanKind::Filter(_)
+            | crate::sql::planner::plan::PhysicalPlanKind::Project(_)
+            | crate::sql::planner::plan::PhysicalPlanKind::Limit(_)
+            | crate::sql::planner::plan::PhysicalPlanKind::AssertOneRow(_)
+            | crate::sql::planner::plan::PhysicalPlanKind::TopN(_)
+            | crate::sql::planner::plan::PhysicalPlanKind::HashJoin(_)
+            | crate::sql::planner::plan::PhysicalPlanKind::NestLoopJoin(_)
+            | crate::sql::planner::plan::PhysicalPlanKind::Repeat(_)
+            | crate::sql::planner::plan::PhysicalPlanKind::GenerateSeries(_)
+            | crate::sql::planner::plan::PhysicalPlanKind::CTEAnchor(_) => {
+                node.children.first().and_then(native_node_output_columns)
+            }
+        },
+    }
 }
 
 fn dml_change_stream_write_execution(
@@ -1350,6 +1810,274 @@ mod tests {
             err.contains("requires exactly one ChangeEventExpand node, found 0"),
             "unexpected error: {err}"
         );
+    }
+
+    fn native_change_event_expand_plan_for_test() -> crate::sql::planner::DistributedPlan {
+        use crate::sql::planner::plan::{
+            DistributedChangeEventExpandNode, PhysicalPlanKind, PlanValuesNode,
+        };
+        use crate::sql::planner::{
+            DataPartition, DataSink, DistributedNode, DistributedPayload, PhysicalPlanStats,
+            PlanFragment, PlannerConfidence,
+        };
+
+        let child = DistributedNode {
+            node_id: 1,
+            fragment_id: 0,
+            tuple_ids: vec![1],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: PhysicalPlanStats {
+                output_row_count: 1.0,
+                row_count_confidence: PlannerConfidence::Exact,
+                column_statistics: Default::default(),
+                cost_estimate: None,
+                broadcast_decision: None,
+            },
+            payload: DistributedPayload::Physical(PhysicalPlanKind::Values(PlanValuesNode {
+                rows: Vec::new(),
+                columns: vec![crate::sql::analysis::OutputColumn {
+                    column_id: crate::sql::column_id::ColumnId::new_for_test(1),
+                    name: "__nr_row_id".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    is_internal: true,
+                }],
+            })),
+        };
+        let expand = DistributedNode {
+            node_id: 2,
+            fragment_id: 0,
+            tuple_ids: vec![1],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: vec![child],
+            stats: PhysicalPlanStats {
+                output_row_count: 1.0,
+                row_count_confidence: PlannerConfidence::Exact,
+                column_statistics: Default::default(),
+                cost_estimate: None,
+                broadcast_decision: None,
+            },
+            payload: DistributedPayload::Physical(PhysicalPlanKind::ChangeEventExpand(
+                DistributedChangeEventExpandNode {
+                    events: Vec::new(),
+                    output_columns: vec![crate::sql::analysis::OutputColumn {
+                        column_id: crate::sql::column_id::ColumnId::new_for_test(1),
+                        name: "__nr_row_id".to_string(),
+                        data_type: arrow::datatypes::DataType::Int64,
+                        nullable: false,
+                        is_internal: true,
+                    }],
+                    change_op_column_id: crate::sql::column_id::ColumnId::new_for_test(2),
+                    data_route_column_id: Some(crate::sql::column_id::ColumnId::new_for_test(3)),
+                },
+            )),
+        };
+        crate::sql::planner::DistributedPlan {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: expand,
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns: Vec::new(),
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        }
+    }
+
+    fn native_change_event_expand_router_plan_for_test() -> crate::sql::planner::DistributedPlan {
+        let mut plan = native_change_event_expand_plan_for_test();
+        let writer_exchange = crate::sql::planner::DistributedNode {
+            node_id: 30,
+            fragment_id: 1,
+            tuple_ids: vec![30],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: crate::sql::planner::PhysicalPlanStats {
+                output_row_count: 1.0,
+                row_count_confidence: crate::sql::planner::PlannerConfidence::Exact,
+                column_statistics: Default::default(),
+                cost_estimate: None,
+                broadcast_decision: None,
+            },
+            payload: crate::sql::planner::DistributedPayload::Exchange(
+                crate::sql::planner::ExchangeReceiver {
+                    partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 0,
+                    output_columns: vec![crate::sql::analysis::OutputColumn {
+                        column_id: crate::sql::column_id::ColumnId::new_for_test(1),
+                        name: "id".to_string(),
+                        data_type: arrow::datatypes::DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    }],
+                    output_qualifier: None,
+                    flavor: crate::sql::planner::plan::ExchangeFlavor::Distribution,
+                },
+            ),
+        };
+        plan.fragments.push(crate::sql::planner::PlanFragment {
+            fragment_id: 1,
+            root: writer_exchange,
+            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::DataSink::IcebergWrite(
+                crate::sql::planner::IcebergWriteFragmentSink {
+                    descriptor_database: "default".to_string(),
+                    spec: crate::sql::planner::write_sink::test_support::simple_sink_spec(),
+                    input: crate::sql::planner::IcebergWriteInputBinding::RootOutputByOrdinal,
+                },
+            ),
+            output_exprs: None,
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        });
+        plan.edges.push(crate::sql::codegen::FragmentEdge {
+            source_fragment_id: 0,
+            target_fragment_id: 1,
+            target_exchange_node_id: 30,
+            output_partition: crate::thrift::partitions::TDataPartition::new(
+                crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                None::<Vec<crate::thrift::exprs::TExpr>>,
+                None::<Vec<crate::thrift::partitions::TRangePartition>>,
+                None::<Vec<crate::thrift::partitions::TBucketProperty>>,
+            ),
+            stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
+            edge_kind: crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter {
+                router_group_id: 0,
+                branch_id: 0,
+                branch_kind: ChangeStreamBranchKind::ReuseData,
+            },
+            output_slot_ids: Vec::new(),
+        });
+        plan
+    }
+
+    fn native_plan_has_exchange_node(
+        plan: &crate::sql::planner::DistributedPlan,
+        fragment_id: crate::sql::codegen::FragmentId,
+        node_id: i32,
+    ) -> bool {
+        fn node_has_exchange(node: &crate::sql::planner::DistributedNode, node_id: i32) -> bool {
+            node.node_id == node_id
+                && matches!(
+                    node.payload,
+                    crate::sql::planner::DistributedPayload::Exchange(_)
+                )
+                || node
+                    .children
+                    .iter()
+                    .any(|child| node_has_exchange(child, node_id))
+        }
+
+        plan.fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == fragment_id)
+            .is_some_and(|fragment| node_has_exchange(&fragment.root, node_id))
+    }
+
+    #[test]
+    fn pre_expand_keyed_assert_wraps_native_change_event_expand_child() {
+        let mut plan = native_change_event_expand_plan_for_test();
+        inject_dml_pre_expand_keyed_assert_into_native_plan(&mut plan, &keyed_assert_for_test())
+            .expect("inject native keyed assert");
+
+        let root = &plan.fragments[0].root;
+        let crate::sql::planner::DistributedPayload::Physical(
+            crate::sql::planner::plan::PhysicalPlanKind::ChangeEventExpand(_),
+        ) = &root.payload
+        else {
+            panic!("expected native ChangeEventExpand root");
+        };
+        let assert_node = &root.children[0];
+        let crate::sql::planner::DistributedPayload::Physical(
+            crate::sql::planner::plan::PhysicalPlanKind::AssertOneRow(assert),
+        ) = &assert_node.payload
+        else {
+            panic!("expected native AssertOneRow below ChangeEventExpand");
+        };
+        assert_eq!(
+            assert.group_key_column_ids,
+            vec![crate::sql::column_id::ColumnId::new_for_test(1)]
+        );
+        assert_eq!(assert.group_key_labels, vec!["_row_id".to_string()]);
+        assert_eq!(
+            assert.keyed_message_prefix.as_deref(),
+            Some("MOR UPDATE matched target row")
+        );
+        assert!(matches!(
+            assert_node.children[0].payload,
+            crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::Values(_)
+            )
+        ));
+    }
+
+    #[test]
+    fn pre_expand_keyed_assert_keeps_native_router_edge_node_ids_in_sync() {
+        let mut build_result = keyed_assert_build_result(vec![
+            change_event_expand_plan_node(20),
+            exchange_plan_node(10, 1),
+        ]);
+        build_result
+            .fragment_results
+            .push(keyed_assert_fragment(vec![exchange_plan_node(30, 30)]));
+        build_result.edges.push(crate::sql::codegen::FragmentEdge {
+            source_fragment_id: 0,
+            target_fragment_id: 1,
+            target_exchange_node_id: 30,
+            output_partition: crate::thrift::partitions::TDataPartition::new(
+                crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                None::<Vec<crate::thrift::exprs::TExpr>>,
+                None::<Vec<crate::thrift::partitions::TRangePartition>>,
+                None::<Vec<crate::thrift::partitions::TBucketProperty>>,
+            ),
+            stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
+            edge_kind: crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter {
+                router_group_id: 0,
+                branch_id: 0,
+                branch_kind: ChangeStreamBranchKind::ReuseData,
+            },
+            output_slot_ids: Vec::new(),
+        });
+        let mut native_plan = native_change_event_expand_router_plan_for_test();
+
+        inject_dml_pre_expand_keyed_assert(&mut build_result, Some(&keyed_assert_for_test()))
+            .expect("inject thrift keyed assert");
+        inject_dml_pre_expand_keyed_assert_into_native_plan(
+            &mut native_plan,
+            &keyed_assert_for_test(),
+        )
+        .expect("inject native keyed assert");
+
+        for edge in &build_result.edges {
+            assert!(
+                native_plan_has_exchange_node(
+                    &native_plan,
+                    edge.target_fragment_id,
+                    edge.target_exchange_node_id,
+                ),
+                "native sidecar missing exchange node {} for fragment {}",
+                edge.target_exchange_node_id,
+                edge.target_fragment_id
+            );
+        }
     }
 
     #[test]

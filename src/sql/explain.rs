@@ -6,7 +6,9 @@ use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr, UnOp,
 };
 use crate::sql::catalog::ScanSource;
-use crate::sql::planner::plan::{ApplyKind, LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::plan::{
+    ApplyKind, LogicalPlanKind, LogicalPlanNode, PlanAssertOneRowNode, PlanRowCountAssertion,
+};
 
 /// Detail level for EXPLAIN output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,11 +319,45 @@ pub(crate) fn format_shared_plan_node_header(
                 node.function_name.to_uppercase()
             ))
         }
-        LogicalPlanKind::AssertOneRow(_) => Some(match stage {
-            PlanNodeExplainStage::Logical => "ASSERT ONE ROW".to_string(),
-            PlanNodeExplainStage::Distributed => "ASSERT NUM ROWS (<= 1)".to_string(),
-        }),
+        LogicalPlanKind::AssertOneRow(node) => Some(format_assert_one_row_header(node, stage)),
         _ => None,
+    }
+}
+
+pub(crate) fn format_assert_one_row_header(
+    node: &PlanAssertOneRowNode,
+    stage: PlanNodeExplainStage,
+) -> String {
+    if matches!(stage, PlanNodeExplainStage::Logical) {
+        return "ASSERT ONE ROW".to_string();
+    }
+    let relation = format_row_count_assertion(node.assertion);
+    let desired = node.desired_num_rows.unwrap_or(1);
+    if node.group_key_column_ids.is_empty() {
+        return format!("ASSERT NUM ROWS ({relation} {desired})");
+    }
+    let labels = if node.group_key_labels.is_empty() {
+        node.group_key_column_ids
+            .iter()
+            .map(|column_id| format!("column_{}", column_id.0))
+            .collect::<Vec<_>>()
+    } else {
+        node.group_key_labels.clone()
+    };
+    format!(
+        "ASSERT NUM ROWS (PER KEY {relation} {desired} BY [{}])",
+        labels.join(", ")
+    )
+}
+
+fn format_row_count_assertion(assertion: PlanRowCountAssertion) -> &'static str {
+    match assertion {
+        PlanRowCountAssertion::Eq => "=",
+        PlanRowCountAssertion::Ne => "!=",
+        PlanRowCountAssertion::Lt => "<",
+        PlanRowCountAssertion::Le => "<=",
+        PlanRowCountAssertion::Gt => ">",
+        PlanRowCountAssertion::Ge => ">=",
     }
 }
 
@@ -770,9 +806,9 @@ mod tests {
             vec![
                 empty_values_for_test(),
                 LogicalPlanNode::new(
-                    LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode {
-                        subquery_text: "select 1".to_string(),
-                    }),
+                    LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode::global_at_most_one(
+                        "select 1",
+                    )),
                     vec![empty_values_for_test()],
                     None,
                 ),
@@ -798,9 +834,8 @@ mod tests {
             rows: vec![vec![], vec![]],
             columns: vec![],
         });
-        let assert = LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode {
-            subquery_text: "select 1".to_string(),
-        });
+        let assert =
+            LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode::global_at_most_one("select 1"));
 
         assert_eq!(
             format_shared_plan_node_header(&values, PlanNodeExplainStage::Logical),
@@ -817,6 +852,17 @@ mod tests {
         assert_eq!(
             format_shared_plan_node_header(&assert, PlanNodeExplainStage::Distributed),
             Some("ASSERT NUM ROWS (<= 1)".to_string())
+        );
+
+        let keyed = LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode::per_key_at_most_one(
+            "DML change-stream matched row uniqueness",
+            vec![crate::sql::column_id::ColumnId::new_for_test(7)],
+            vec!["_row_id".to_string()],
+            "MOR UPDATE matched target row",
+        ));
+        assert_eq!(
+            format_shared_plan_node_header(&keyed, PlanNodeExplainStage::Distributed),
+            Some("ASSERT NUM ROWS (PER KEY <= 1 BY [_row_id])".to_string())
         );
     }
 

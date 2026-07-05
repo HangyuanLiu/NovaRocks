@@ -604,11 +604,27 @@ message TableFunctionNode {
   bool is_left_join = 5;                              // true when emitted for left join semantics.
 }
 
-// Assert-one-row physical node.
+// Row-count assertion relation.
+enum RowCountAssertion {
+  ROW_COUNT_ASSERTION_UNSPECIFIED = 0;
+  ROW_COUNT_ASSERTION_EQ = 1;
+  ROW_COUNT_ASSERTION_NE = 2;
+  ROW_COUNT_ASSERTION_LT = 3;
+  ROW_COUNT_ASSERTION_LE = 4;
+  ROW_COUNT_ASSERTION_GT = 5;
+  ROW_COUNT_ASSERTION_GE = 6;
+}
+
+// Assert row-count physical node.
 // Owner: produced by the future FE/native plan encoder and consumed by the
 // future BE/native plan prepare layer.
 message AssertOneRowNode {
-  string subquery_text = 1; // diagnostic subquery text.
+  string subquery_text = 1;                    // diagnostic subquery text.
+  optional int64 desired_num_rows = 2;         // target row count; defaults to 1.
+  RowCountAssertion assertion = 3;             // assertion relation; defaults to <=.
+  repeated uint32 group_key_column_ids = 4;    // keyed assertion grouping columns.
+  repeated string group_key_labels = 5;        // keyed assertion display labels.
+  optional string keyed_message_prefix = 6;    // keyed assertion error prefix.
 }
 
 // Physical TopN node.
@@ -873,6 +889,116 @@ message IcebergDeltaTable {
   IcebergTableInfo table = 1;  // underlying Iceberg table.
   int64 from_snapshot_id = 2;  // starting snapshot id.
   int64 to_snapshot_id = 3;    // ending snapshot id.
+  IcebergDeltaScanPlan delta_plan = 4; // typed delta scan runtime payload.
+}
+
+// Typed Iceberg delta scan runtime plan.
+message IcebergDeltaScanPlan {
+  string table_location = 1;                         // Iceberg table location.
+  repeated IcebergDeltaDataColumn data_columns = 2;  // data columns by Iceberg field id.
+  map<string, string> cloud_properties = 3;          // object-store properties.
+  repeated IcebergDeltaSourceFile change_files = 4;  // files added/deleted in the snapshot range.
+  IcebergDeltaDeleteSidePlan delete_side = 5;        // optional delete-side runtime payload.
+}
+
+message IcebergDeltaDataColumn {
+  string name = 1;    // Iceberg column name.
+  int32 field_id = 2; // Iceberg field id.
+}
+
+enum IcebergDeltaSourceRole {
+  ICEBERG_DELTA_SOURCE_ROLE_UNSPECIFIED = 0;
+  ICEBERG_DELTA_SOURCE_ROLE_DATA_FILE = 1;
+  ICEBERG_DELTA_SOURCE_ROLE_POSITION_DELETE = 2;
+  ICEBERG_DELTA_SOURCE_ROLE_EQUALITY_DELETE = 3;
+  ICEBERG_DELTA_SOURCE_ROLE_DELETED_DATA_FILE = 4;
+}
+
+message IcebergDeltaSourceFile {
+  string path = 1;                                     // source file path.
+  int64 size = 2;                                      // source file size.
+  IcebergDeltaSourceRole role = 3;                     // source role in the delta stream.
+  optional int32 partition_spec_id = 4;                // Iceberg partition spec id.
+  optional string partition_key = 5;                   // serialized partition key.
+  optional int64 first_row_id = 6;                     // v3 row lineage first row id.
+  optional int64 data_sequence_number = 7;             // Iceberg data sequence number.
+  repeated int64 row_id_allow_list = 8;                // optional CoW row-id allow-list.
+  repeated IcebergDeltaPositionDeleteSource position_deletes = 9; // position-delete payload.
+  repeated int32 equality_field_ids = 10;              // equality-delete field ids.
+  repeated IcebergDeltaEqualityDeleteTarget equality_targets = 11; // equality target files.
+  IcebergDeltaDeletedFileVisibility deleted_file_visibility = 12; // deleted-file visibility.
+}
+
+enum IcebergDeltaPositionDeleteFileFormat {
+  ICEBERG_DELTA_POSITION_DELETE_FILE_FORMAT_UNSPECIFIED = 0;
+  ICEBERG_DELTA_POSITION_DELETE_FILE_FORMAT_PARQUET = 1;
+  ICEBERG_DELTA_POSITION_DELETE_FILE_FORMAT_PUFFIN = 2;
+}
+
+message IcebergDeltaPositionDeleteSource {
+  string delete_file_path = 1;                                // delete file path.
+  int64 delete_file_size = 2;                                 // delete file size.
+  optional string referenced_data_file = 3;                   // referenced data file.
+  IcebergDeltaPositionDeleteFileFormat file_format = 4;       // delete file format.
+  optional int64 content_offset = 5;                          // Puffin blob offset.
+  optional int64 content_size_in_bytes = 6;                   // Puffin blob size.
+}
+
+message IcebergDeltaEqualityDeleteTarget {
+  string data_file_path = 1;                      // target data file path.
+  int64 data_file_size = 2;                       // target data file size.
+  optional int64 data_file_first_row_id = 3;      // target data-file first row id.
+  optional int64 data_file_sequence_number = 4;   // target data-file sequence number.
+}
+
+message IcebergDeltaDeletedFileVisibility {
+  repeated int64 already_deleted_positions = 1; // positions already deleted before this delta.
+}
+
+message IcebergDeltaDeleteSidePlan {
+  map<string, IcebergDeltaBaseDataFileLineage> base_data_file_lineage = 1;
+  map<string, IcebergDeltaBaseDataFileLineage> previous_data_file_lineage = 2;
+  repeated IcebergDeltaDeleteVisibilityDataFile previous_delete_visibility_data_files = 3;
+  map<string, IcebergDeltaPositionList> previously_deleted_positions_per_file = 4;
+  repeated string deleted_data_file_paths = 5;
+}
+
+message IcebergDeltaBaseDataFileLineage {
+  int64 first_row_id = 1;             // data-file first row id.
+  int64 data_sequence_number = 2;     // data-file sequence number.
+}
+
+message IcebergDeltaPositionList {
+  repeated uint64 positions = 1; // deleted row positions.
+}
+
+message IcebergDeltaDeleteVisibilityDataFile {
+  string path = 1;                                      // data file path.
+  int64 size = 2;                                       // data file size.
+  optional int64 first_row_id = 3;                      // data-file first row id.
+  optional int64 data_sequence_number = 4;              // data-file sequence number.
+  repeated IcebergDeltaDeleteVisibilityDeleteFile delete_files = 5; // delete files.
+}
+
+enum IcebergDeltaDeleteFileFormat {
+  ICEBERG_DELTA_DELETE_FILE_FORMAT_UNSPECIFIED = 0;
+  ICEBERG_DELTA_DELETE_FILE_FORMAT_PARQUET = 1;
+  ICEBERG_DELTA_DELETE_FILE_FORMAT_PUFFIN = 2;
+}
+
+enum IcebergDeltaDeleteFileContent {
+  ICEBERG_DELTA_DELETE_FILE_CONTENT_UNSPECIFIED = 0;
+  ICEBERG_DELTA_DELETE_FILE_CONTENT_POSITION = 1;
+  ICEBERG_DELTA_DELETE_FILE_CONTENT_EQUALITY = 2;
+}
+
+message IcebergDeltaDeleteVisibilityDeleteFile {
+  string path = 1;                              // delete file path.
+  IcebergDeltaDeleteFileFormat file_format = 2; // delete file format.
+  IcebergDeltaDeleteFileContent file_content = 3; // delete file content.
+  optional int64 length = 4;                    // delete file length.
+  optional int64 content_offset = 5;            // Puffin blob offset.
+  optional int64 content_size_in_bytes = 6;     // Puffin blob size.
 }
 
 // Pinned Iceberg snapshot scan source.

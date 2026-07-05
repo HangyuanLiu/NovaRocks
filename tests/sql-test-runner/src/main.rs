@@ -270,8 +270,8 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = ClusterMode::AllInOne)]
     cluster_mode: ClusterMode,
 
-    /// FE plan wire format for the cross-process cluster: thrift (default) or proto.
-    #[arg(long, value_enum, default_value_t = PlanWireFormatArg::Thrift)]
+    /// FE plan wire format for the cross-process cluster: proto (default) or thrift.
+    #[arg(long, value_enum, default_value_t = PlanWireFormatArg::Proto)]
     plan_wire_format: PlanWireFormatArg,
 
     /// Number of BE processes to launch in cross-process cluster mode (>= 1).
@@ -3183,9 +3183,9 @@ mod tests {
     }
 
     #[test]
-    fn cli_plan_wire_format_defaults_to_thrift() {
+    fn cli_plan_wire_format_defaults_to_proto() {
         let cli = crate::Cli::parse_from(["sql-tests", "--suite", "ssb"]);
-        assert_eq!(cli.plan_wire_format, PlanWireFormatArg::Thrift);
+        assert_eq!(cli.plan_wire_format, PlanWireFormatArg::Proto);
     }
 
     #[test]
@@ -3193,6 +3193,18 @@ mod tests {
         let cli =
             crate::Cli::parse_from(["sql-tests", "--suite", "ssb", "--plan-wire-format", "proto"]);
         assert_eq!(cli.plan_wire_format, PlanWireFormatArg::Proto);
+    }
+
+    #[test]
+    fn cli_plan_wire_format_accepts_thrift_escape_hatch() {
+        let cli = crate::Cli::parse_from([
+            "sql-tests",
+            "--suite",
+            "ssb",
+            "--plan-wire-format",
+            "thrift",
+        ]);
+        assert_eq!(cli.plan_wire_format, PlanWireFormatArg::Thrift);
     }
 
     #[test]

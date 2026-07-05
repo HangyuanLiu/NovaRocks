@@ -5915,9 +5915,7 @@ mod tests {
             is_internal: false,
         };
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode {
-                subquery_text: "select 1".to_string(),
-            }),
+            LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode::global_at_most_one("select 1")),
             vec![LogicalPlanNode::new(
                 LogicalPlanKind::Values(LogicalValuesNode {
                     rows: vec![],

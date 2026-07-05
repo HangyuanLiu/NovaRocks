@@ -12,7 +12,7 @@ use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::parser::ast::SqlType;
 use crate::sql::planner::plan::{
-    ExchangeFlavor, PhysicalPlanKind, PlanSetOpKind, RedistributeMode,
+    ExchangeFlavor, PhysicalPlanKind, PlanRowCountAssertion, PlanSetOpKind, RedistributeMode,
 };
 use crate::sql::planner::runtime_filter::{
     JoinExecutionMode, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
@@ -127,7 +127,7 @@ fn stream_edge_output_columns(
     } else {
         encode_output_columns(&source.output_columns)?
     };
-    retag_output_columns_for_edge(columns, &edge.output_slot_ids)
+    project_output_columns_for_edge(columns, &edge.output_slot_ids)
 }
 
 fn encoded_fragment_root_output_columns(
@@ -187,8 +187,8 @@ fn encoded_node_output_columns(
     }
 }
 
-fn retag_output_columns_for_edge(
-    mut columns: Vec<common::OutputColumn>,
+fn project_output_columns_for_edge(
+    columns: Vec<common::OutputColumn>,
     output_slot_ids: &[i32],
 ) -> Result<Vec<common::OutputColumn>, String> {
     if output_slot_ids.is_empty() {
@@ -201,12 +201,24 @@ fn retag_output_columns_for_edge(
             columns.len()
         ));
     }
-    for (column, slot_id) in columns.iter_mut().zip(output_slot_ids.iter().copied()) {
-        column.column_id = u32::try_from(slot_id).map_err(|_| {
-            format!("native stream edge output slot id {slot_id} cannot convert to u32")
-        })?;
-    }
-    Ok(columns)
+    let columns_by_id = columns
+        .into_iter()
+        .map(|column| (column.column_id, column))
+        .collect::<HashMap<_, _>>();
+    output_slot_ids
+        .iter()
+        .copied()
+        .map(|slot_id| {
+            let column_id = u32::try_from(slot_id).map_err(|_| {
+                format!("native stream edge output slot id {slot_id} cannot convert to u32")
+            })?;
+            columns_by_id.get(&column_id).cloned().ok_or_else(|| {
+                format!(
+                    "native stream edge output slot id {slot_id} missing from source output columns"
+                )
+            })
+        })
+        .collect()
 }
 
 fn patch_exchange_receiver_output_columns(
@@ -258,7 +270,7 @@ pub(crate) fn encode_plan_fragment(src: &PlanFragment) -> Result<plan::PlanFragm
         root: Some(encode_node(&src.root)?),
         data_partition: Some(encode_data_partition(&src.data_partition)?),
         output_partition: Some(encode_data_partition(&src.output_partition)?),
-        sink: Some(encode_data_sink(&src.sink)?),
+        sink: Some(encode_data_sink(&src.sink, &src.output_columns)?),
         output_exprs,
         output_columns,
         cte_id: src.cte_id,
@@ -602,6 +614,15 @@ fn encode_physical_node(src: &PhysicalPlanKind) -> Result<plan::PlanNode, String
             Vec::new(),
             Kind::AssertOneRow(plan::AssertOneRowNode {
                 subquery_text: node.subquery_text.clone(),
+                desired_num_rows: node.desired_num_rows,
+                assertion: encode_row_count_assertion(node.assertion),
+                group_key_column_ids: node
+                    .group_key_column_ids
+                    .iter()
+                    .map(|column_id| column_id.0)
+                    .collect(),
+                group_key_labels: node.group_key_labels.clone(),
+                keyed_message_prefix: node.keyed_message_prefix.clone(),
             }),
         ),
         PhysicalPlanKind::TopN(node) => (
@@ -771,6 +792,17 @@ fn encode_physical_node(src: &PhysicalPlanKind) -> Result<plan::PlanNode, String
     })
 }
 
+fn encode_row_count_assertion(assertion: PlanRowCountAssertion) -> i32 {
+    match assertion {
+        PlanRowCountAssertion::Eq => plan::RowCountAssertion::Eq as i32,
+        PlanRowCountAssertion::Ne => plan::RowCountAssertion::Ne as i32,
+        PlanRowCountAssertion::Lt => plan::RowCountAssertion::Lt as i32,
+        PlanRowCountAssertion::Le => plan::RowCountAssertion::Le as i32,
+        PlanRowCountAssertion::Gt => plan::RowCountAssertion::Gt as i32,
+        PlanRowCountAssertion::Ge => plan::RowCountAssertion::Ge as i32,
+    }
+}
+
 fn encode_scan_node(
     src: &crate::sql::planner::plan::PlanScanNode,
 ) -> Result<plan::ScanNode, String> {
@@ -858,7 +890,10 @@ fn encode_data_partition(src: &DataPartition) -> Result<plan::DataPartition, Str
     })
 }
 
-fn encode_data_sink(src: &DataSink) -> Result<plan::DataSink, String> {
+fn encode_data_sink(
+    src: &DataSink,
+    fragment_output_columns: &[AnalysisOutputColumn],
+) -> Result<plan::DataSink, String> {
     use plan::data_sink::Kind;
 
     Ok(plan::DataSink {
@@ -878,28 +913,64 @@ fn encode_data_sink(src: &DataSink) -> Result<plan::DataSink, String> {
                     branches: sink
                         .branches
                         .iter()
-                        .map(|branch| plan::IcebergChangeStreamBranchRoute {
-                            branch_id: branch.branch_id,
-                            branch_kind: encode_change_stream_branch_kind(branch.branch_kind),
-                            target_fragment_id: branch.target_fragment_id,
-                            target_exchange_node_id: branch.target_exchange_node_id,
-                            output_ordinals: branch
-                                .output_ordinals
-                                .iter()
-                                .map(|value| usize_to_u64(*value))
-                                .collect(),
-                            output_partition_ordinals: branch
-                                .output_partition_ordinals
-                                .iter()
-                                .map(|value| usize_to_u64(*value))
-                                .collect(),
-                            output_partition: None,
-                            destinations: None,
+                        .map(|branch| {
+                            Ok(plan::IcebergChangeStreamBranchRoute {
+                                branch_id: branch.branch_id,
+                                branch_kind: encode_change_stream_branch_kind(branch.branch_kind),
+                                target_fragment_id: branch.target_fragment_id,
+                                target_exchange_node_id: branch.target_exchange_node_id,
+                                output_ordinals: branch
+                                    .output_ordinals
+                                    .iter()
+                                    .map(|value| usize_to_u64(*value))
+                                    .collect(),
+                                output_partition_ordinals: branch
+                                    .output_partition_ordinals
+                                    .iter()
+                                    .map(|value| usize_to_u64(*value))
+                                    .collect(),
+                                output_partition: Some(encode_change_stream_branch_partition(
+                                    branch,
+                                    fragment_output_columns,
+                                )?),
+                                destinations: None,
+                            })
                         })
-                        .collect(),
+                        .collect::<Result<Vec<_>, String>>()?,
                 })
             }
         }),
+    })
+}
+
+fn encode_change_stream_branch_partition(
+    branch: &crate::sql::planner::IcebergChangeStreamBranchRoute,
+    fragment_output_columns: &[AnalysisOutputColumn],
+) -> Result<plan::DataPartition, String> {
+    if branch.output_partition_ordinals.is_empty() {
+        return Ok(plan::DataPartition {
+            kind: plan::PartitionKind::Unpartitioned as i32,
+            exprs: Vec::new(),
+        });
+    }
+    let exprs = branch
+        .output_partition_ordinals
+        .iter()
+        .map(|ordinal| {
+            fragment_output_columns
+                .get(*ordinal)
+                .ok_or_else(|| {
+                    format!(
+                        "native Iceberg change-stream router branch {} partition ordinal {} is out of range",
+                        branch.branch_id, ordinal
+                    )
+                })
+                .map(column_ref_expr_for_output_column)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(plan::DataPartition {
+        kind: plan::PartitionKind::Hash as i32,
+        exprs: encode_exprs(&exprs)?,
     })
 }
 
@@ -1116,6 +1187,7 @@ fn encode_scan_source(src: &catalog::ScanSource) -> Result<plan::ScanSource, Str
                 table: Some(encode_iceberg_table_info(table)?),
                 from_snapshot_id: *from_snapshot_id,
                 to_snapshot_id: *to_snapshot_id,
+                delta_plan: None,
             }),
             catalog::ScanSource::IcebergVersionTable { table, snapshot_id } => {
                 Kind::IcebergVersionTable(plan::IcebergVersionTable {
@@ -1708,4 +1780,242 @@ fn usize_to_u64(value: usize) -> u64 {
 
 fn usize_to_u32(value: usize) -> Result<u32, String> {
     u32::try_from(value).map_err(|_| format!("value {value} does not fit in u32"))
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::*;
+    use crate::proto::expr::expr;
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::{
+        DataPartition, IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
+        PhysicalPlanStats, PlannerConfidence,
+    };
+
+    #[test]
+    fn change_stream_router_encoder_materializes_partition_exprs() {
+        let plan = single_fragment_router_plan_for_test();
+
+        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
+        let root = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == encoded.root_fragment_id)
+            .expect("root fragment");
+        let Some(plan::data_sink::Kind::IcebergChangeStreamRouter(router)) =
+            root.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+        else {
+            panic!("expected Iceberg change-stream router sink");
+        };
+        let branch = router.branches.first().expect("router branch");
+        assert_eq!(branch.output_partition_ordinals, vec![2]);
+        let partition = branch
+            .output_partition
+            .as_ref()
+            .expect("branch output partition");
+        assert_eq!(partition.kind, plan::PartitionKind::Hash as i32);
+        let [expr] = partition.exprs.as_slice() else {
+            panic!("expected one materialized partition expr");
+        };
+        let Some(expr::Kind::ColumnRef(column_ref)) = expr.kind.as_ref() else {
+            panic!("expected partition expr to be a column ref");
+        };
+        assert_eq!(column_ref.column_id, 3);
+    }
+
+    #[test]
+    fn stream_sink_projection_and_receiver_schema_follow_edge_output_slots() {
+        let plan = two_fragment_stream_plan_for_test();
+
+        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
+
+        let source = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 1)
+            .expect("source fragment");
+        let Some(plan::data_sink::Kind::DataStream(sink)) =
+            source.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+        else {
+            panic!("expected DataStream sink");
+        };
+        assert_eq!(sink.output_columns, vec![2, 1]);
+
+        let target = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 0)
+            .expect("target fragment");
+        let receiver = target.root.as_ref().expect("target root");
+        let Some(plan::distributed_node::Payload::Exchange(exchange)) = receiver.payload.as_ref()
+        else {
+            panic!("expected Exchange receiver");
+        };
+        assert_eq!(
+            exchange
+                .output_columns
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "delta"), (1, "old")]
+        );
+    }
+
+    fn two_fragment_stream_plan_for_test() -> DistributedPlan {
+        let source_columns = vec![
+            output_column(1, "old", DataType::Int64),
+            output_column(2, "delta", DataType::Int64),
+        ];
+        let receiver_columns = vec![source_columns[1].clone(), source_columns[0].clone()];
+        DistributedPlan {
+            fragments: vec![
+                PlanFragment {
+                    fragment_id: 1,
+                    root: DistributedNode {
+                        node_id: 10,
+                        fragment_id: 1,
+                        tuple_ids: vec![10],
+                        nullable_tuple_ids: Vec::new(),
+                        limit: -1,
+                        build_runtime_filters: Vec::new(),
+                        probe_runtime_filters: Vec::new(),
+                        children: Vec::new(),
+                        stats: stats(),
+                        payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                            crate::sql::planner::plan::PlanValuesNode {
+                                rows: Vec::new(),
+                                columns: source_columns.clone(),
+                            },
+                        )),
+                    },
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition::unpartitioned(),
+                    sink: DataSink::Noop,
+                    output_exprs: None,
+                    output_columns: source_columns,
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+                PlanFragment {
+                    fragment_id: 0,
+                    root: DistributedNode {
+                        node_id: 20,
+                        fragment_id: 0,
+                        tuple_ids: vec![20],
+                        nullable_tuple_ids: Vec::new(),
+                        limit: -1,
+                        build_runtime_filters: Vec::new(),
+                        probe_runtime_filters: Vec::new(),
+                        children: Vec::new(),
+                        stats: stats(),
+                        payload: DistributedPayload::Exchange(ExchangeReceiver {
+                            partition_type:
+                                crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                            partition_exprs: Vec::new(),
+                            source_fragment_id: 1,
+                            output_columns: receiver_columns,
+                            output_qualifier: None,
+                            flavor: ExchangeFlavor::Distribution,
+                        }),
+                    },
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition::unpartitioned(),
+                    sink: DataSink::Result,
+                    output_exprs: None,
+                    output_columns: Vec::new(),
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+            ],
+            root_fragment_id: 0,
+            edges: vec![FragmentEdge {
+                source_fragment_id: 1,
+                target_fragment_id: 0,
+                target_exchange_node_id: 20,
+                output_partition: crate::thrift::partitions::TDataPartition::new(
+                    crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                    None::<Vec<crate::thrift::exprs::TExpr>>,
+                    None::<Vec<crate::thrift::partitions::TRangePartition>>,
+                    None::<Vec<crate::thrift::partitions::TBucketProperty>>,
+                ),
+                stream_kind: FragmentStreamKind::Gather,
+                edge_kind: FragmentEdgeKind::Stream,
+                output_slot_ids: vec![2, 1],
+            }],
+        }
+    }
+
+    fn single_fragment_router_plan_for_test() -> DistributedPlan {
+        let output_columns = vec![
+            output_column(1, "op", DataType::Int32),
+            output_column(2, "route", DataType::Int32),
+            output_column(3, "bucket", DataType::Int32),
+        ];
+        DistributedPlan {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: DistributedNode {
+                    node_id: 10,
+                    fragment_id: 0,
+                    tuple_ids: vec![10],
+                    nullable_tuple_ids: Vec::new(),
+                    limit: -1,
+                    build_runtime_filters: Vec::new(),
+                    probe_runtime_filters: Vec::new(),
+                    children: Vec::new(),
+                    stats: stats(),
+                    payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                        crate::sql::planner::plan::PlanValuesNode {
+                            rows: Vec::new(),
+                            columns: output_columns.clone(),
+                        },
+                    )),
+                },
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::IcebergChangeStreamRouter(IcebergChangeStreamRouterSink {
+                    group_id: 0,
+                    change_op_output_ordinal: 0,
+                    data_route_output_ordinal: Some(1),
+                    branches: vec![IcebergChangeStreamBranchRoute {
+                        branch_id: 0,
+                        branch_kind: ChangeStreamBranchKind::DeleteDv,
+                        target_fragment_id: 1,
+                        target_exchange_node_id: 20,
+                        output_ordinals: vec![2],
+                        output_partition_ordinals: vec![2],
+                    }],
+                }),
+                output_exprs: None,
+                output_columns,
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        }
+    }
+
+    fn output_column(id: u32, name: &str, data_type: DataType) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn stats() -> PhysicalPlanStats {
+        PhysicalPlanStats {
+            output_row_count: 1.0,
+            row_count_confidence: PlannerConfidence::Exact,
+            column_statistics: Default::default(),
+            cost_estimate: None,
+            broadcast_decision: None,
+        }
+    }
 }

@@ -230,13 +230,15 @@ pub(crate) fn render_cross_process_config(
         }
     }
 
-    if matches!(role, ClusterProcessRole::Fe)
-        && matches!(plan_wire_format, PlanWireFormatArg::Proto)
-    {
+    if matches!(role, ClusterProcessRole::Fe) {
         let runtime_tbl = table_mut(root, "runtime");
+        let plan_wire_format = match plan_wire_format {
+            PlanWireFormatArg::Thrift => "thrift",
+            PlanWireFormatArg::Proto => "proto",
+        };
         runtime_tbl.insert(
             "plan_wire_format".to_string(),
-            Value::String("proto".to_string()),
+            Value::String(plan_wire_format.to_string()),
         );
     }
 
@@ -1176,7 +1178,7 @@ exec_node_output = true
     }
 
     #[test]
-    fn render_cross_process_config_thrift_does_not_create_runtime_key() {
+    fn render_cross_process_config_thrift_injects_fe_runtime_escape_hatch_only() {
         let runtime = make_runtime_1be();
 
         let fe = render_cross_process_config(
@@ -1199,24 +1201,21 @@ exec_node_output = true
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
         let be_value: toml::Value = be.parse().expect("parse be toml");
 
-        assert!(
-            fe_value
-                .get("runtime")
-                .and_then(|value| value.get("plan_wire_format"))
-                .is_none(),
-            "default thrift must preserve base config behavior"
+        assert_eq!(
+            fe_value["runtime"]["plan_wire_format"].as_str(),
+            Some("thrift")
         );
         assert!(
             be_value
                 .get("runtime")
                 .and_then(|value| value.get("plan_wire_format"))
                 .is_none(),
-            "BE config must not receive a plan wire format override"
+            "BE config must not receive the FE plan wire format override"
         );
     }
 
     #[test]
-    fn render_cross_process_config_preserves_base_runtime_format_when_thrift() {
+    fn render_cross_process_config_thrift_overrides_base_runtime_format_on_fe_only() {
         let runtime = make_runtime_1be();
         let base_config = format!(
             "{}\n[runtime]\nplan_wire_format = \"proto\"\n",
@@ -1245,13 +1244,12 @@ exec_node_output = true
 
         assert_eq!(
             fe_value["runtime"]["plan_wire_format"].as_str(),
-            Some("proto"),
-            "thrift/default means no CLI override, so base config remains authoritative"
+            Some("thrift")
         );
         assert_eq!(
             be_value["runtime"]["plan_wire_format"].as_str(),
             Some("proto"),
-            "BE base config values are preserved when the CLI does not override them"
+            "BE base config values are preserved because plan wire format is FE-only"
         );
     }
 

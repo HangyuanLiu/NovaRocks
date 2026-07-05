@@ -18,6 +18,7 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use super::expr::lower_proto_expr;
 use super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
@@ -38,6 +39,13 @@ use crate::connector::iceberg::{
 use crate::connector::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig, ScanConfig};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprNode};
+use crate::exec::node::iceberg_delta_scan::{
+    ApplyKeySource, BaseDataFileLineage, BaseTableIdent, DeletedFileVisibility,
+    DeltaScanDeleteSide, DeltaScanDeleteSidePayload, DeltaSourceFile, DeltaSourceRole,
+    EqualityDeleteTargetData, IcebergDeltaDataColumnPayload, IcebergDeltaScanNode,
+    IcebergDeltaTablePayload, IcebergRuntimeHandles, PositionDeleteFileFormat,
+    PositionDeleteSourceData,
+};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::row_position::IcebergVirtualSpec;
@@ -86,8 +94,8 @@ pub(crate) fn lower_scan_node(
         plan::scan_source::Kind::IcebergMetadataTable(source) => {
             lower_iceberg_metadata_scan(node, scan, source, ctx, arena)
         }
-        plan::scan_source::Kind::IcebergDeltaTable(_) => {
-            unsupported_scan_source("IcebergDeltaTable")
+        plan::scan_source::Kind::IcebergDeltaTable(source) => {
+            lower_iceberg_delta_table_scan(node, scan, source)
         }
         plan::scan_source::Kind::IcebergVersionTable(_) => {
             unsupported_scan_source("IcebergVersionTable")
@@ -219,6 +227,409 @@ fn lower_iceberg_metadata_scan(
         layout,
         output_schema,
     })
+}
+
+fn lower_iceberg_delta_table_scan(
+    node: &plan::DistributedNode,
+    scan: &plan::ScanNode,
+    source: &plan::IcebergDeltaTable,
+) -> Result<LoweredNode, String> {
+    let output_columns = scan_output_columns(scan)?;
+    let layout = layout_from_output_columns(output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let table = source
+        .table
+        .as_ref()
+        .ok_or_else(|| "IcebergDeltaTable table missing".to_string())?;
+    if source.from_snapshot_id < 0 {
+        return Err(format!(
+            "IcebergDeltaTable node_id={} from_snapshot_id must be non-negative, got {}",
+            node.node_id, source.from_snapshot_id
+        ));
+    }
+    if source.to_snapshot_id < 0 {
+        return Err(format!(
+            "IcebergDeltaTable node_id={} to_snapshot_id must be non-negative, got {}",
+            node.node_id, source.to_snapshot_id
+        ));
+    }
+    let delta_plan = source
+        .delta_plan
+        .as_ref()
+        .ok_or_else(|| "IcebergDeltaTable delta_plan missing".to_string())?;
+    let table_payload = IcebergDeltaTablePayload {
+        table_location: delta_plan.table_location.clone(),
+        data_columns: delta_plan
+            .data_columns
+            .iter()
+            .map(|column| IcebergDeltaDataColumnPayload {
+                name: column.name.clone(),
+                field_id: column.field_id,
+            })
+            .collect(),
+    };
+    let change_files = lower_delta_source_files_from_native(&delta_plan.change_files)?;
+    let object_store_config = resolve_cloud_object_store_config(&delta_plan.cloud_properties)?;
+    let object_store_factory = Arc::new(
+        crate::connector::iceberg::changes::build_factory_for_table_location(
+            &table_payload.table_location,
+            object_store_config.as_ref(),
+        )?,
+    );
+    let delete_side_payload =
+        lower_delta_delete_side_payload_from_native(delta_plan.delete_side.as_ref())?;
+    let delete_side =
+        build_delta_delete_side_from_payload(delete_side_payload, object_store_config.as_ref())?;
+
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::IcebergDeltaScan(IcebergDeltaScanNode {
+                base_table_ident: BaseTableIdent {
+                    catalog: table.catalog.clone(),
+                    namespace: table.namespace.clone(),
+                    table: table.table.clone(),
+                },
+                table_location: table_payload.table_location.clone(),
+                from_snapshot_id: source.from_snapshot_id,
+                to_snapshot_id: source.to_snapshot_id,
+                output_chunk_schema: output_schema.clone(),
+                apply_key_source: ApplyKeySource::BaseRowId,
+                change_files,
+                object_store_config,
+                iceberg_runtime: Arc::new(IcebergRuntimeHandles {
+                    table: table_payload,
+                    object_store_factory,
+                    delete_side,
+                }),
+                node_id: node.node_id,
+            }),
+        },
+        layout,
+        output_schema,
+    })
+}
+
+fn lower_delta_source_files_from_native(
+    files: &[plan::IcebergDeltaSourceFile],
+) -> Result<Vec<DeltaSourceFile>, String> {
+    files
+        .iter()
+        .map(lower_delta_source_file_from_native)
+        .collect()
+}
+
+fn lower_delta_source_file_from_native(
+    file: &plan::IcebergDeltaSourceFile,
+) -> Result<DeltaSourceFile, String> {
+    let role = match plan::IcebergDeltaSourceRole::try_from(file.role).map_err(|_| {
+        format!(
+            "IcebergDeltaTable source file {} has unknown delta role {}",
+            file.path, file.role
+        )
+    })? {
+        plan::IcebergDeltaSourceRole::Unspecified => {
+            return Err(format!(
+                "IcebergDeltaTable source file {} has unspecified delta role",
+                file.path
+            ));
+        }
+        plan::IcebergDeltaSourceRole::DataFile => {
+            reject_native_delta_role_payload(
+                file,
+                "DATA_FILE",
+                &[
+                    "position_deletes",
+                    "equality_field_ids",
+                    "equality_targets",
+                    "deleted_file_visibility",
+                ],
+            )?;
+            DeltaSourceRole::DataFile
+        }
+        plan::IcebergDeltaSourceRole::PositionDelete => {
+            reject_native_delta_role_payload(
+                file,
+                "POSITION_DELETE",
+                &[
+                    "equality_field_ids",
+                    "equality_targets",
+                    "deleted_file_visibility",
+                ],
+            )?;
+            if file.position_deletes.is_empty() {
+                return Err(format!(
+                    "IcebergDeltaTable source file {} role POSITION_DELETE requires position_deletes",
+                    file.path
+                ));
+            }
+            DeltaSourceRole::PositionDelete {
+                deletes: file
+                    .position_deletes
+                    .iter()
+                    .map(lower_position_delete_source_from_native)
+                    .collect::<Result<Vec<_>, _>>()?,
+            }
+        }
+        plan::IcebergDeltaSourceRole::EqualityDelete => {
+            reject_native_delta_role_payload(
+                file,
+                "EQUALITY_DELETE",
+                &["position_deletes", "deleted_file_visibility"],
+            )?;
+            if file.equality_field_ids.is_empty() {
+                return Err(format!(
+                    "IcebergDeltaTable source file {} role EQUALITY_DELETE requires equality_field_ids",
+                    file.path
+                ));
+            }
+            if file.equality_targets.is_empty() {
+                return Err(format!(
+                    "IcebergDeltaTable source file {} role EQUALITY_DELETE requires equality_targets",
+                    file.path
+                ));
+            }
+            DeltaSourceRole::EqualityDelete {
+                equality_field_ids: file.equality_field_ids.clone(),
+                targets: file
+                    .equality_targets
+                    .iter()
+                    .map(lower_equality_delete_target_from_native)
+                    .collect(),
+            }
+        }
+        plan::IcebergDeltaSourceRole::DeletedDataFile => {
+            reject_native_delta_role_payload(
+                file,
+                "DELETED_DATA_FILE",
+                &["position_deletes", "equality_field_ids", "equality_targets"],
+            )?;
+            DeltaSourceRole::DeletedDataFile {
+                previous_data_file_visibility: file.deleted_file_visibility.as_ref().map(
+                    |visibility| DeletedFileVisibility {
+                        already_deleted_positions: visibility.already_deleted_positions.clone(),
+                    },
+                ),
+            }
+        }
+    };
+
+    Ok(DeltaSourceFile {
+        path: file.path.clone(),
+        size: file.size,
+        role,
+        partition_spec_id: file.partition_spec_id,
+        partition_key: file.partition_key.clone(),
+        first_row_id: file.first_row_id,
+        data_sequence_number: file.data_sequence_number,
+        row_id_allow_list: if file.row_id_allow_list.is_empty() {
+            None
+        } else {
+            Some(file.row_id_allow_list.iter().copied().collect())
+        },
+    })
+}
+
+fn reject_native_delta_role_payload(
+    file: &plan::IcebergDeltaSourceFile,
+    role_name: &str,
+    fields: &[&str],
+) -> Result<(), String> {
+    for field in fields {
+        let present = match *field {
+            "position_deletes" => !file.position_deletes.is_empty(),
+            "equality_field_ids" => !file.equality_field_ids.is_empty(),
+            "equality_targets" => !file.equality_targets.is_empty(),
+            "deleted_file_visibility" => file.deleted_file_visibility.is_some(),
+            _ => false,
+        };
+        if present {
+            return Err(format!(
+                "IcebergDeltaTable source file {} role {} must not carry {}",
+                file.path, role_name, field
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn lower_position_delete_source_from_native(
+    delete: &plan::IcebergDeltaPositionDeleteSource,
+) -> Result<PositionDeleteSourceData, String> {
+    Ok(PositionDeleteSourceData {
+        delete_file_path: delete.delete_file_path.clone(),
+        delete_file_size: delete.delete_file_size,
+        referenced_data_file: delete.referenced_data_file.clone(),
+        file_format: lower_position_delete_format_from_native(delete.file_format)?,
+        content_offset: delete.content_offset,
+        content_size_in_bytes: delete.content_size_in_bytes,
+    })
+}
+
+fn lower_position_delete_format_from_native(
+    format: i32,
+) -> Result<PositionDeleteFileFormat, String> {
+    match plan::IcebergDeltaPositionDeleteFileFormat::try_from(format).map_err(|_| {
+        format!("IcebergDeltaTable unsupported position-delete file format {format}")
+    })? {
+        plan::IcebergDeltaPositionDeleteFileFormat::Unspecified => {
+            Err("IcebergDeltaTable position-delete file format is unspecified".to_string())
+        }
+        plan::IcebergDeltaPositionDeleteFileFormat::Parquet => {
+            Ok(PositionDeleteFileFormat::Parquet)
+        }
+        plan::IcebergDeltaPositionDeleteFileFormat::Puffin => Ok(PositionDeleteFileFormat::Puffin),
+    }
+}
+
+fn lower_equality_delete_target_from_native(
+    target: &plan::IcebergDeltaEqualityDeleteTarget,
+) -> EqualityDeleteTargetData {
+    EqualityDeleteTargetData {
+        data_file_path: target.data_file_path.clone(),
+        data_file_size: target.data_file_size,
+        data_file_first_row_id: target.data_file_first_row_id,
+        data_file_sequence_number: target.data_file_sequence_number,
+    }
+}
+
+fn lower_delta_delete_side_payload_from_native(
+    payload: Option<&plan::IcebergDeltaDeleteSidePlan>,
+) -> Result<Option<DeltaScanDeleteSidePayload>, String> {
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    Ok(Some(DeltaScanDeleteSidePayload {
+        base_data_file_lineage: lower_native_base_lineage_map(&payload.base_data_file_lineage),
+        previous_data_file_lineage: lower_native_base_lineage_map(
+            &payload.previous_data_file_lineage,
+        ),
+        previous_delete_visibility_data_files: payload
+            .previous_delete_visibility_data_files
+            .iter()
+            .map(lower_native_delete_visibility_data_file)
+            .collect::<Result<Vec<_>, _>>()?,
+        previously_deleted_positions_per_file: payload
+            .previously_deleted_positions_per_file
+            .iter()
+            .map(|(path, positions)| (path.clone(), positions.positions.clone()))
+            .collect(),
+        deleted_data_file_paths: payload.deleted_data_file_paths.iter().cloned().collect(),
+    }))
+}
+
+fn lower_native_base_lineage_map(
+    input: &HashMap<String, plan::IcebergDeltaBaseDataFileLineage>,
+) -> HashMap<String, BaseDataFileLineage> {
+    input
+        .iter()
+        .map(|(path, lineage)| {
+            (
+                path.clone(),
+                BaseDataFileLineage {
+                    first_row_id: lineage.first_row_id,
+                    data_sequence_number: lineage.data_sequence_number,
+                },
+            )
+        })
+        .collect()
+}
+
+fn lower_native_delete_visibility_data_file(
+    file: &plan::IcebergDeltaDeleteVisibilityDataFile,
+) -> Result<crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor, String> {
+    Ok(
+        crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor {
+            path: file.path.clone(),
+            size: file.size,
+            first_row_id: file.first_row_id,
+            data_sequence_number: file.data_sequence_number,
+            delete_files: file
+                .delete_files
+                .iter()
+                .map(lower_native_delete_visibility_delete_file)
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+    )
+}
+
+fn lower_native_delete_visibility_delete_file(
+    file: &plan::IcebergDeltaDeleteVisibilityDeleteFile,
+) -> Result<crate::connector::iceberg::changes::DeleteVisibilityDeleteFileDescriptor, String> {
+    Ok(
+        crate::connector::iceberg::changes::DeleteVisibilityDeleteFileDescriptor {
+            path: file.path.clone(),
+            file_format: lower_native_delete_file_format(file.file_format)?,
+            file_content: lower_native_delete_file_content(file.file_content)?,
+            length: file.length,
+            content_offset: file.content_offset,
+            content_size_in_bytes: file.content_size_in_bytes,
+        },
+    )
+}
+
+fn lower_native_delete_file_format(
+    format: i32,
+) -> Result<crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat, String> {
+    match plan::IcebergDeltaDeleteFileFormat::try_from(format)
+        .map_err(|_| format!("IcebergDeltaTable unsupported delete file format {format}"))?
+    {
+        plan::IcebergDeltaDeleteFileFormat::Unspecified => {
+            Err("IcebergDeltaTable delete file format is unspecified".to_string())
+        }
+        plan::IcebergDeltaDeleteFileFormat::Parquet => {
+            Ok(crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat::Parquet)
+        }
+        plan::IcebergDeltaDeleteFileFormat::Puffin => {
+            Ok(crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat::Puffin)
+        }
+    }
+}
+
+fn lower_native_delete_file_content(
+    content: i32,
+) -> Result<crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent, String> {
+    match plan::IcebergDeltaDeleteFileContent::try_from(content)
+        .map_err(|_| format!("IcebergDeltaTable unsupported delete file content {content}"))?
+    {
+        plan::IcebergDeltaDeleteFileContent::Unspecified => {
+            Err("IcebergDeltaTable delete file content is unspecified".to_string())
+        }
+        plan::IcebergDeltaDeleteFileContent::Position => {
+            Ok(crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Position)
+        }
+        plan::IcebergDeltaDeleteFileContent::Equality => {
+            Ok(crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Equality)
+        }
+    }
+}
+
+fn build_delta_delete_side_from_payload(
+    payload: Option<DeltaScanDeleteSidePayload>,
+    object_store_config: Option<&ObjectStoreConfig>,
+) -> Result<Option<DeltaScanDeleteSide>, String> {
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let mut previously_deleted_positions_per_file = HashMap::new();
+    for (path, positions) in payload.previously_deleted_positions_per_file {
+        let mut bitmap = roaring::RoaringTreemap::new();
+        for pos in positions {
+            bitmap.insert(pos);
+        }
+        previously_deleted_positions_per_file.insert(path, bitmap);
+    }
+    let previous_delete_visibility =
+        crate::engine::delete_flow::load_existing_delete_visibility_from_descriptors(
+            &payload.previous_delete_visibility_data_files,
+            object_store_config,
+        )?;
+    Ok(Some(DeltaScanDeleteSide {
+        base_data_file_lineage: payload.base_data_file_lineage,
+        previous_delete_visibility,
+        previously_deleted_positions_per_file,
+        previous_data_file_lineage: payload.previous_data_file_lineage,
+        deleted_data_file_paths: payload.deleted_data_file_paths,
+    }))
 }
 
 fn scan_output_columns(scan: &plan::ScanNode) -> Result<&[common::OutputColumn], String> {
@@ -921,11 +1332,6 @@ fn decode_file_scan_range(
             hdfs.file_format
         ));
     }
-    if hdfs.deletion_vector_descriptor.is_some() {
-        return Err(format!(
-            "ScanNode node_id={node_id} range {idx} deletion vectors are not supported by native lowering yet"
-        ));
-    }
     let path = hdfs_range_path(table, hdfs)?;
     let file_len = nonnegative_u64(hdfs.file_length, "file_length")?;
     let offset = nonnegative_u64(hdfs.offset, "offset")?;
@@ -940,6 +1346,10 @@ fn decode_file_scan_range(
     } else {
         file_len - offset
     };
+    let mut delete_files = decode_delete_files(node_id, idx, &hdfs.delete_files)?;
+    if let Some(dv) = hdfs.deletion_vector_descriptor.as_ref() {
+        delete_files.push(decode_deletion_vector_descriptor(node_id, idx, dv)?);
+    }
     Ok(FileScanRange {
         path,
         file_len,
@@ -956,7 +1366,7 @@ fn decode_file_scan_range(
             Some(hdfs.included_positions.clone())
         },
         external_datacache: hdfs_external_datacache(hdfs),
-        delete_files: decode_delete_files(node_id, idx, &hdfs.delete_files)?,
+        delete_files,
         iceberg_file_pruning: None,
     })
 }
@@ -1048,6 +1458,37 @@ fn decode_delete_files(
             })
         })
         .collect()
+}
+
+fn decode_deletion_vector_descriptor(
+    node_id: i32,
+    range_idx: usize,
+    dv: &novarocks::DeletionVectorDescriptor,
+) -> Result<IcebergDeleteFileSpec, String> {
+    let path = dv
+        .path_or_inline_dv
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "ScanNode node_id={node_id} range {range_idx} deletion vector is missing path_or_inline_dv"
+            )
+        })?
+        .to_string();
+    let offset = dv.offset.ok_or_else(|| {
+        format!(
+            "ScanNode node_id={node_id} range {range_idx} deletion vector {path} is missing offset"
+        )
+    })?;
+    let size = dv.size_in_bytes.ok_or_else(|| {
+        format!(
+            "ScanNode node_id={node_id} range {range_idx} deletion vector {path} is missing size_in_bytes"
+        )
+    })?;
+    Ok(IcebergDeleteFileSpec::puffin_position_delete(
+        path, None, offset, size,
+    ))
 }
 
 fn decode_metadata_scan_ranges(
@@ -1189,6 +1630,7 @@ mod tests {
     use super::*;
     use crate::connector::ConnectorRegistry;
     use crate::exec::node::ExecNodeKind;
+    use crate::exec::node::scan::ScanMorsel;
     use crate::proto::{common, expr};
     use crate::sql::codegen::proto_encode::types::encode_type;
 
@@ -1328,6 +1770,21 @@ mod tests {
         }
     }
 
+    fn hdfs_range_with_deletion_vector() -> novarocks::ScanRange {
+        let mut range = hdfs_range();
+        let Some(novarocks::scan_range::Kind::Hdfs(hdfs)) = range.kind.as_mut() else {
+            panic!("expected HDFS range");
+        };
+        hdfs.deletion_vector_descriptor = Some(novarocks::DeletionVectorDescriptor {
+            storage_type: Some("PUFFIN".to_string()),
+            path_or_inline_dv: Some("s3://bucket/warehouse/db/t/delete-1.puffin".to_string()),
+            offset: Some(12),
+            size_in_bytes: Some(34),
+            cardinality: Some(2),
+        });
+        range
+    }
+
     #[test]
     fn lowers_iceberg_data_file_scan_to_scan_node() {
         let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
@@ -1349,6 +1806,96 @@ mod tests {
         };
         assert_eq!(scan.node_id(), Some(10));
         assert_eq!(scan.output_chunk_schema().slot_ids(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_iceberg_data_file_scan_deletion_vector_to_puffin_delete_file() {
+        let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
+            plan::IcebergDataFiles {
+                table: Some(table_info()),
+                files: Vec::new(),
+                cloud_properties: HashMap::new(),
+                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+            },
+        ));
+        let ctx = NodeLoweringContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_scan_ranges(10, vec![hdfs_range_with_deletion_vector()]);
+        let mut arena = ExprArena::default();
+        let lowered = crate::lower_native::lower_proto_node(&node, &mut arena, &ctx)
+            .expect("lower native scan");
+        let ExecNodeKind::Scan(scan) = lowered.node.kind else {
+            panic!("expected Scan");
+        };
+        let morsels = scan.build_morsels().expect("build morsels");
+        let [ScanMorsel::FileRange { delete_files, .. }] = morsels.morsels.as_slice() else {
+            panic!("expected one file morsel, got {:?}", morsels.morsels);
+        };
+        assert_eq!(delete_files.len(), 1);
+        let dv = &delete_files[0];
+        assert_eq!(dv.file_format, IcebergFileFormat::Puffin);
+        assert_eq!(dv.file_content, IcebergFileContent::PositionDeletes);
+        assert_eq!(
+            dv.path,
+            "s3://bucket/warehouse/db/t/delete-1.puffin".to_string()
+        );
+        assert_eq!(dv.content_offset, Some(12));
+        assert_eq!(dv.content_size_in_bytes, Some(34));
+    }
+
+    #[test]
+    fn lowers_iceberg_delta_table_scan_from_native_payload() {
+        let node = scan_node(plan::scan_source::Kind::IcebergDeltaTable(
+            plan::IcebergDeltaTable {
+                table: Some(table_info()),
+                from_snapshot_id: 1,
+                to_snapshot_id: 2,
+                delta_plan: Some(plan::IcebergDeltaScanPlan {
+                    table_location: "file:///tmp/novarocks-delta-table".to_string(),
+                    data_columns: vec![plan::IcebergDeltaDataColumn {
+                        name: "id".to_string(),
+                        field_id: 10,
+                    }],
+                    cloud_properties: HashMap::new(),
+                    change_files: vec![plan::IcebergDeltaSourceFile {
+                        path: "file:///tmp/novarocks-delta-table/data-1.parquet".to_string(),
+                        size: 10,
+                        role: plan::IcebergDeltaSourceRole::DataFile as i32,
+                        partition_spec_id: Some(0),
+                        partition_key: None,
+                        first_row_id: Some(100),
+                        data_sequence_number: Some(7),
+                        row_id_allow_list: Vec::new(),
+                        position_deletes: Vec::new(),
+                        equality_field_ids: Vec::new(),
+                        equality_targets: Vec::new(),
+                        deleted_file_visibility: None,
+                    }],
+                    delete_side: None,
+                }),
+            },
+        ));
+        let ctx = NodeLoweringContext::default();
+        let mut arena = ExprArena::default();
+        let lowered = crate::lower_native::lower_proto_node(&node, &mut arena, &ctx)
+            .expect("lower native delta scan");
+        let ExecNodeKind::IcebergDeltaScan(scan) = lowered.node.kind else {
+            panic!("expected IcebergDeltaScan");
+        };
+        assert_eq!(scan.node_id, 10);
+        assert_eq!(scan.base_table_ident.catalog, "rest");
+        assert_eq!(scan.from_snapshot_id, 1);
+        assert_eq!(scan.to_snapshot_id, 2);
+        assert_eq!(scan.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(scan.change_files.len(), 1);
+        assert_eq!(
+            scan.change_files[0].path,
+            "file:///tmp/novarocks-delta-table/data-1.parquet"
+        );
+        assert!(matches!(
+            scan.change_files[0].role,
+            DeltaSourceRole::DataFile
+        ));
     }
 
     #[test]

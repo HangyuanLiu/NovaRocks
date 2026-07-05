@@ -72,7 +72,7 @@ fn assert_columns_match_schema(
             return Err(format!(
                 "{context} type mismatch at column {idx}: descriptor={:?} actual={:?}",
                 descriptor,
-                column.data_type()
+                column.data_type(),
             ));
         }
     }

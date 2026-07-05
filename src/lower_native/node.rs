@@ -488,7 +488,7 @@ fn lower_project_node(
 ) -> Result<LoweredNode, String> {
     check_exact_arity("ProjectNode", 1, children.len())?;
     let child = children.pop().expect("child");
-    let project_outputs = project_output_plan(project)?;
+    let project_outputs = project_output_plan(project, &child.layout)?;
     let layout = layout_from_output_columns(&project_outputs.output_columns)?;
     let output_schema = chunk_schema_from_output_columns(&project_outputs.output_columns)?;
     let expr_slot_schemas = slot_schemas_from_output_columns(&project_outputs.computed_columns)?;
@@ -540,19 +540,30 @@ struct ProjectOutputPlan {
     output_indices: Option<Vec<usize>>,
 }
 
-fn project_output_plan(project: &plan::ProjectNode) -> Result<ProjectOutputPlan, String> {
+fn project_output_plan(
+    project: &plan::ProjectNode,
+    input_layout: &Layout,
+) -> Result<ProjectOutputPlan, String> {
     let item_outputs = project
         .items
         .iter()
         .enumerate()
         .map(project_item_output)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut used_column_ids = item_outputs
+    let input_column_ids = input_layout
+        .order()
         .iter()
-        .map(|item| item.physical_column_id)
+        .map(|slot| slot.as_u32())
         .collect::<HashSet<_>>();
-    let mut next_synthetic_column_id = used_column_ids
+    let output_column_id_candidates = item_outputs
         .iter()
+        .map(|item| item.output_column_id)
+        .collect::<HashSet<_>>();
+    let mut used_output_column_ids = HashSet::new();
+    let mut used_compute_column_ids = input_column_ids.clone();
+    let mut next_synthetic_column_id = output_column_id_candidates
+        .iter()
+        .chain(used_compute_column_ids.iter())
         .copied()
         .max()
         .unwrap_or(0)
@@ -562,19 +573,40 @@ fn project_output_plan(project: &plan::ProjectNode) -> Result<ProjectOutputPlan,
     let mut computed_columns = Vec::new();
     let mut output_columns = Vec::with_capacity(project.items.len());
     let mut output_indices = Vec::with_capacity(project.items.len());
-    let mut has_duplicate_outputs = false;
+    let mut needs_output_indices = false;
 
     for item in item_outputs {
-        let (computed_idx, is_duplicate) = if let Some(computed_idx) =
-            first_expr_index_by_column_id.get(&item.physical_column_id)
+        let preferred_compute_column_id = item.preferred_compute_column_id;
+        let mut compute_column_id = if item.can_reuse_input_slot
+            || !input_column_ids.contains(&preferred_compute_column_id)
+        {
+            preferred_compute_column_id
+        } else {
+            allocate_project_synthetic_column_id(
+                &mut next_synthetic_column_id,
+                &mut used_output_column_ids,
+                &mut used_compute_column_ids,
+            )?
+        };
+        if !item.can_reuse_input_slot && used_compute_column_ids.contains(&compute_column_id) {
+            compute_column_id = allocate_project_synthetic_column_id(
+                &mut next_synthetic_column_id,
+                &mut used_output_column_ids,
+                &mut used_compute_column_ids,
+            )?;
+        }
+
+        let (computed_idx, is_duplicate_compute) = if item.can_reuse_input_slot
+            && let Some(computed_idx) = first_expr_index_by_column_id.get(&compute_column_id)
         {
             (*computed_idx, true)
         } else {
             let computed_idx = computed_columns.len();
-            first_expr_index_by_column_id.insert(item.physical_column_id, computed_idx);
+            first_expr_index_by_column_id.insert(compute_column_id, computed_idx);
+            used_compute_column_ids.insert(compute_column_id);
             computed_item_indices.push(item.item_index);
             computed_columns.push(common::OutputColumn {
-                column_id: item.physical_column_id,
+                column_id: compute_column_id,
                 name: item.output_name.clone(),
                 r#type: Some(item.r#type.clone()),
                 nullable: item.nullable,
@@ -583,23 +615,14 @@ fn project_output_plan(project: &plan::ProjectNode) -> Result<ProjectOutputPlan,
             (computed_idx, false)
         };
 
-        let output_column_id = if is_duplicate {
-            has_duplicate_outputs = true;
-            while used_column_ids.contains(&next_synthetic_column_id) {
-                next_synthetic_column_id =
-                    next_synthetic_column_id.checked_add(1).ok_or_else(|| {
-                        "ProjectNode cannot allocate synthetic output column id".to_string()
-                    })?;
-            }
-            let synthetic = next_synthetic_column_id;
-            used_column_ids.insert(synthetic);
-            next_synthetic_column_id =
-                next_synthetic_column_id.checked_add(1).ok_or_else(|| {
-                    "ProjectNode cannot allocate synthetic output column id".to_string()
-                })?;
-            synthetic
+        let output_column_id = if used_output_column_ids.insert(item.output_column_id) {
+            item.output_column_id
         } else {
-            item.physical_column_id
+            allocate_project_synthetic_column_id(
+                &mut next_synthetic_column_id,
+                &mut used_output_column_ids,
+                &mut used_compute_column_ids,
+            )?
         };
         output_columns.push(common::OutputColumn {
             column_id: output_column_id,
@@ -608,6 +631,9 @@ fn project_output_plan(project: &plan::ProjectNode) -> Result<ProjectOutputPlan,
             nullable: item.nullable,
             is_internal: false,
         });
+        if is_duplicate_compute || computed_idx != output_indices.len() {
+            needs_output_indices = true;
+        }
         output_indices.push(computed_idx);
     }
 
@@ -615,13 +641,36 @@ fn project_output_plan(project: &plan::ProjectNode) -> Result<ProjectOutputPlan,
         computed_item_indices,
         computed_columns,
         output_columns,
-        output_indices: has_duplicate_outputs.then_some(output_indices),
+        output_indices: needs_output_indices.then_some(output_indices),
     })
+}
+
+fn allocate_project_synthetic_column_id(
+    next_synthetic_column_id: &mut u32,
+    used_output_column_ids: &mut HashSet<u32>,
+    used_compute_column_ids: &mut HashSet<u32>,
+) -> Result<u32, String> {
+    while used_output_column_ids.contains(next_synthetic_column_id)
+        || used_compute_column_ids.contains(next_synthetic_column_id)
+    {
+        *next_synthetic_column_id = next_synthetic_column_id
+            .checked_add(1)
+            .ok_or_else(|| "ProjectNode cannot allocate synthetic output column id".to_string())?;
+    }
+    let synthetic = *next_synthetic_column_id;
+    used_output_column_ids.insert(synthetic);
+    used_compute_column_ids.insert(synthetic);
+    *next_synthetic_column_id = next_synthetic_column_id
+        .checked_add(1)
+        .ok_or_else(|| "ProjectNode cannot allocate synthetic output column id".to_string())?;
+    Ok(synthetic)
 }
 
 struct ProjectItemOutput {
     item_index: usize,
-    physical_column_id: u32,
+    preferred_compute_column_id: u32,
+    output_column_id: u32,
+    can_reuse_input_slot: bool,
     output_name: String,
     r#type: common::TypeDesc,
     nullable: bool,
@@ -638,13 +687,15 @@ fn project_item_output(
         .r#type
         .clone()
         .ok_or_else(|| format!("ProjectNode item {idx} expr type missing"))?;
-    let physical_column_id = match expr.kind.as_ref() {
-        Some(expr::expr::Kind::ColumnRef(column)) => column.column_id,
-        _ => item.output_column_id,
+    let (preferred_compute_column_id, can_reuse_input_slot) = match expr.kind.as_ref() {
+        Some(expr::expr::Kind::ColumnRef(column)) => (column.column_id, true),
+        _ => (item.output_column_id, false),
     };
     Ok(ProjectItemOutput {
         item_index: idx,
-        physical_column_id,
+        preferred_compute_column_id,
+        output_column_id: item.output_column_id,
+        can_reuse_input_slot,
         output_name: item.output_name.clone(),
         r#type,
         nullable: expr.nullable,
@@ -1525,11 +1576,8 @@ fn lower_join_runtime_filters(
     build_keys: &[crate::exec::expr::ExprId],
     arena: &mut ExprArena,
 ) -> Result<Vec<JoinRuntimeFilterSpec>, String> {
-    if !join.build_runtime_filters.is_empty() && !is_runtime_filter_safe_join_type(join_type) {
-        return Err(format!(
-            "HashJoinNode runtime filters are not supported for join type {:?}",
-            join_type
-        ));
+    if !is_runtime_filter_safe_join_type(join_type) {
+        return Ok(Vec::new());
     }
     let mut runtime_filters = Vec::new();
     for rf in &join.build_runtime_filters {
@@ -2307,21 +2355,93 @@ fn lower_assert_one_row_node(
 ) -> Result<LoweredNode, String> {
     check_exact_arity("AssertOneRowNode", 1, children.len())?;
     let child = children.pop().expect("child");
+    let desired_num_rows = parse_optional_nonnegative_i64(
+        assert.desired_num_rows,
+        "AssertOneRowNode.desired_num_rows",
+    )?
+    .or(Some(1));
+    let assertion = lower_row_count_assertion(assert.assertion)?;
+    let mode = if assert.group_key_column_ids.is_empty() {
+        if !assert.group_key_labels.is_empty() || assert.keyed_message_prefix.is_some() {
+            return Err(
+                "AssertOneRowNode group_key_column_ids is required when keyed metadata is present"
+                    .to_string(),
+            );
+        }
+        AssertNumRowsMode::Global {
+            desired_num_rows,
+            assertion,
+            subquery_string: Some(assert.subquery_text.clone()),
+        }
+    } else {
+        if desired_num_rows != Some(1) || !matches!(assertion, Assertion::Le) {
+            return Err(
+                "AssertOneRowNode keyed assertions only support desired_num_rows <= 1".to_string(),
+            );
+        }
+        if !assert.group_key_labels.is_empty()
+            && assert.group_key_labels.len() != assert.group_key_column_ids.len()
+        {
+            return Err(format!(
+                "AssertOneRowNode group_key_labels length mismatch: key_columns={} labels={}",
+                assert.group_key_column_ids.len(),
+                assert.group_key_labels.len()
+            ));
+        }
+        let key_slots = assert
+            .group_key_column_ids
+            .iter()
+            .map(|column_id| {
+                child
+                    .layout
+                    .resolve_column_id(*column_id)
+                    .map_err(|err| format!("AssertOneRowNode group key: {err}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let key_labels = if assert.group_key_labels.is_empty() {
+            assert
+                .group_key_column_ids
+                .iter()
+                .map(|column_id| format!("column_{column_id}"))
+                .collect()
+        } else {
+            assert.group_key_labels.clone()
+        };
+        AssertNumRowsMode::PerKeyAtMostOne {
+            key_slots,
+            key_labels,
+            message_prefix: assert
+                .keyed_message_prefix
+                .clone()
+                .unwrap_or_else(|| "assert_num_rows failed".to_string()),
+        }
+    };
     Ok(LoweredNode {
         node: ExecNode {
             kind: ExecNodeKind::AssertNumRows(AssertNumRowsNode {
                 input: Box::new(child.node),
                 node_id: node.node_id,
-                mode: AssertNumRowsMode::Global {
-                    desired_num_rows: Some(1),
-                    assertion: Assertion::Le,
-                    subquery_string: Some(assert.subquery_text.clone()),
-                },
+                mode,
             }),
         },
         layout: child.layout,
         output_schema: child.output_schema,
     })
+}
+
+fn lower_row_count_assertion(value: i32) -> Result<Assertion, String> {
+    match value {
+        value if value == plan::RowCountAssertion::Unspecified as i32 => Ok(Assertion::Le),
+        value if value == plan::RowCountAssertion::Eq as i32 => Ok(Assertion::Eq),
+        value if value == plan::RowCountAssertion::Ne as i32 => Ok(Assertion::Ne),
+        value if value == plan::RowCountAssertion::Lt as i32 => Ok(Assertion::Lt),
+        value if value == plan::RowCountAssertion::Le as i32 => Ok(Assertion::Le),
+        value if value == plan::RowCountAssertion::Gt as i32 => Ok(Assertion::Gt),
+        value if value == plan::RowCountAssertion::Ge as i32 => Ok(Assertion::Ge),
+        other => Err(format!(
+            "AssertOneRowNode assertion {other} is not supported"
+        )),
+    }
 }
 
 fn parse_optional_nonnegative_i64(
@@ -2748,13 +2868,51 @@ mod tests {
         };
         assert_eq!(project.node_id, 20);
         assert_eq!(project.expr_slot_ids, vec![SlotId::new(1)]);
-        assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(7)]);
         assert_eq!(
             project.output_chunk_schema.field(0).unwrap().name(),
             "projected_id"
         );
-        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(7)]);
         assert!(matches!(project.input.kind, ExecNodeKind::Values(_)));
+    }
+
+    #[test]
+    fn parent_project_can_reference_child_project_output_column_id() {
+        let inner = physical_node(
+            20,
+            plan::plan_node::Kind::Project(plan::ProjectNode {
+                items: vec![plan::ProjectItem {
+                    expr: Some(column_ref(1, DataType::Int64)),
+                    output_name: "projected_id".to_string(),
+                    output_column_id: 7,
+                }],
+                output_qualifier: None,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let outer = physical_node(
+            21,
+            plan::plan_node::Kind::Project(plan::ProjectNode {
+                items: vec![plan::ProjectItem {
+                    expr: Some(column_ref(7, DataType::Int64)),
+                    output_name: "outer_id".to_string(),
+                    output_column_id: 9,
+                }],
+                output_qualifier: None,
+            }),
+            Vec::new(),
+            vec![inner],
+        );
+
+        let lowered = lower(&outer);
+        let ExecNodeKind::Project(project) = lowered.node.kind else {
+            panic!("expected Project");
+        };
+        assert_eq!(project.expr_slot_ids, vec![SlotId::new(7)]);
+        assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(9)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(9)]);
     }
 
     #[test]
@@ -2789,7 +2947,7 @@ mod tests {
         assert_eq!(project.output_indices, Some(vec![0, 0]));
         assert_eq!(
             project.output_chunk_schema.slot_ids(),
-            &[SlotId::new(1), SlotId::new(2)]
+            &[SlotId::new(7), SlotId::new(8)]
         );
         assert_eq!(
             project.output_chunk_schema.field(0).unwrap().name(),
@@ -2799,7 +2957,7 @@ mod tests {
             project.output_chunk_schema.field(1).unwrap().name(),
             "right_copy"
         );
-        assert_eq!(lowered.layout.order(), &[SlotId::new(1), SlotId::new(2)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(7), SlotId::new(8)]);
     }
 
     #[test]
@@ -3025,6 +3183,11 @@ mod tests {
             70,
             plan::plan_node::Kind::AssertOneRow(plan::AssertOneRowNode {
                 subquery_text: "select id from t".to_string(),
+                desired_num_rows: Some(1),
+                assertion: plan::RowCountAssertion::Le as i32,
+                group_key_column_ids: Vec::new(),
+                group_key_labels: Vec::new(),
+                keyed_message_prefix: None,
             }),
             Vec::new(),
             vec![one_col_values_node(10)],
@@ -3044,6 +3207,39 @@ mod tests {
                 assert_eq!(subquery_string.as_deref(), Some("select id from t"));
             }
             AssertNumRowsMode::PerKeyAtMostOne { .. } => panic!("expected global assert"),
+        }
+    }
+
+    #[test]
+    fn lowers_keyed_assert_num_rows_from_native_proto() {
+        let assert_node = physical_node(
+            70,
+            plan::plan_node::Kind::AssertOneRow(plan::AssertOneRowNode {
+                subquery_text: "DML change-stream matched row uniqueness".to_string(),
+                desired_num_rows: Some(1),
+                assertion: plan::RowCountAssertion::Le as i32,
+                group_key_column_ids: vec![1],
+                group_key_labels: vec!["_row_id".to_string()],
+                keyed_message_prefix: Some("MOR UPDATE matched target row".to_string()),
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&assert_node);
+        let ExecNodeKind::AssertNumRows(assert) = lowered.node.kind else {
+            panic!("expected AssertNumRows");
+        };
+        match assert.mode {
+            AssertNumRowsMode::PerKeyAtMostOne {
+                key_slots,
+                key_labels,
+                message_prefix,
+            } => {
+                assert_eq!(key_slots, vec![SlotId::new(1)]);
+                assert_eq!(key_labels, vec!["_row_id".to_string()]);
+                assert_eq!(message_prefix, "MOR UPDATE matched target row");
+            }
+            AssertNumRowsMode::Global { .. } => panic!("expected keyed assert"),
         }
     }
 
@@ -3280,7 +3476,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_join_runtime_filter_rejects_unsafe_join_type_and_mismatched_exprs() {
+    fn hash_join_runtime_filter_skips_unsafe_join_type_and_rejects_mismatched_exprs() {
         let outer_with_rf = physical_node(
             30,
             plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
@@ -3308,9 +3504,12 @@ mod tests {
             ],
         );
         let mut arena = ExprArena::default();
-        let err = lower_proto_node(&outer_with_rf, &mut arena, &NodeLoweringContext::default())
-            .unwrap_err();
-        assert!(err.contains("runtime filters are not supported"));
+        let lowered = lower_proto_node(&outer_with_rf, &mut arena, &NodeLoweringContext::default())
+            .expect("outer join runtime filters should be skipped");
+        let ExecNodeKind::Join(join) = lowered.node.kind else {
+            panic!("expected Join");
+        };
+        assert!(join.runtime_filters.is_empty());
 
         let mismatched_probe = physical_node(
             31,

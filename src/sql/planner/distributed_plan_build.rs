@@ -458,7 +458,7 @@ impl DistributedPlanBuilder {
             stream_kind,
             ExchangeFlavor::Distribution,
             -1,
-            Vec::new(),
+            node.output_columns.clone(),
             None,
             node.stats.clone(),
         )
@@ -585,13 +585,19 @@ impl DistributedPlanBuilder {
             output_partition: tdata_partition_placeholder(partition_type),
             stream_kind,
             edge_kind: FragmentEdgeKind::Stream,
-            output_slot_ids: Vec::new(),
+            output_slot_ids: output_slot_ids_for_exchange(&exchange_output_columns)?,
         });
+
+        let exchange_tuple_ids = if exchange_output_columns.is_empty() {
+            child.tuple_ids.clone()
+        } else {
+            vec![self.alloc_tuple()]
+        };
 
         Ok(DistributedNode {
             node_id: exchange_node_id,
             fragment_id: parent_fragment_id,
-            tuple_ids: child.tuple_ids.clone(),
+            tuple_ids: exchange_tuple_ids,
             nullable_tuple_ids: Vec::new(),
             limit,
             build_runtime_filters: Vec::new(),
@@ -803,6 +809,20 @@ fn data_partition_for_redistribute_mode(
             }
         }
     }
+}
+
+fn output_slot_ids_for_exchange(output_columns: &[OutputColumn]) -> Result<Vec<i32>, String> {
+    output_columns
+        .iter()
+        .map(|column| {
+            i32::try_from(column.column_id.0).map_err(|_| {
+                format!(
+                    "build_distributed_plan: output column id {} cannot be encoded as stream output slot id",
+                    column.column_id
+                )
+            })
+        })
+        .collect()
 }
 
 fn data_partition_for_redistribute_node(
@@ -1716,9 +1736,9 @@ mod tests {
     fn build_distributed_plan_assert_one_row_reuses_child_tuple() {
         let scan = scan_node(1, "k");
         let assert_one_row = PhysicalPlanNode {
-            kind: PhysicalPlanKind::AssertOneRow(PlanAssertOneRowNode {
-                subquery_text: "select k from t".to_string(),
-            }),
+            kind: PhysicalPlanKind::AssertOneRow(PlanAssertOneRowNode::global_at_most_one(
+                "select k from t",
+            )),
             children: vec![scan],
             output_columns: vec![output_col(1, "k", DataType::Int64, false)],
             stats: stats(),
@@ -2067,6 +2087,12 @@ mod tests {
             exchange_receiver.flavor,
             crate::sql::planner::plan::ExchangeFlavor::Distribution
         ));
+        assert_eq!(exchange_receiver.output_columns.len(), 1);
+        assert_eq!(
+            exchange_receiver.output_columns[0].column_id,
+            ColumnId::new_for_test(1)
+        );
+        assert_eq!(exchange_receiver.output_columns[0].name, "k");
 
         let edge = &dp.edges[0];
         assert_eq!(edge.source_fragment_id, 1);
@@ -2074,9 +2100,11 @@ mod tests {
         assert_eq!(edge.target_exchange_node_id, exchange.node_id);
         assert_eq!(edge.stream_kind, FragmentStreamKind::Partitioned);
         assert!(matches!(edge.edge_kind, FragmentEdgeKind::Stream));
+        assert_eq!(edge.output_slot_ids, vec![1]);
 
         let child_fragment = &dp.fragments[0];
-        assert_eq!(exchange.tuple_ids, child_fragment.root.tuple_ids);
+        assert_ne!(exchange.tuple_ids, child_fragment.root.tuple_ids);
+        assert_eq!(exchange.tuple_ids.len(), 1);
         assert!(matches!(child_fragment.sink, DataSink::Noop));
         assert!(matches!(
             child_fragment.output_partition.kind,
@@ -2100,6 +2128,59 @@ mod tests {
         ));
         assert_no_physical_redistribute(&dp.fragments[1].root);
         assert_no_physical_redistribute(&child_fragment.root);
+    }
+
+    #[test]
+    fn build_distributed_plan_stream_edge_carries_exchange_output_slot_order() {
+        let source_columns = vec![
+            output_col(1, "old", DataType::Int64, false),
+            output_col(2, "delta", DataType::Int64, false),
+        ];
+        let exchange_columns = vec![source_columns[1].clone(), source_columns[0].clone()];
+        let scan = scan_node_with_columns(source_columns.clone());
+        let redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Hash {
+                    cols: vec![ColumnId::new_for_test(2)],
+                    source: HashSource::ShuffleJoin,
+                },
+                partition_exprs: vec![],
+                output_columns: exchange_columns.clone(),
+            }),
+            children: vec![scan],
+            output_columns: exchange_columns.clone(),
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
+
+        let edge = &dp.edges[0];
+        assert_eq!(edge.output_slot_ids, vec![2, 1]);
+
+        let root = &dp.fragments[1].root;
+        let receiver = match &root.payload {
+            DistributedPayload::Exchange(receiver) => receiver,
+            other => panic!("expected Exchange root, got {other:?}"),
+        };
+        assert_eq!(
+            receiver
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId::new_for_test(2), ColumnId::new_for_test(1)]
+        );
+
+        let child_fragment = &dp.fragments[0];
+        assert_eq!(
+            child_fragment
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId::new_for_test(1), ColumnId::new_for_test(2)]
+        );
     }
 
     #[test]

@@ -466,11 +466,9 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
         Operator::LogicalImvVersion(op) => LogicalPlanKind::ImvVersion(LogicalImvVersionNode {
             version_ref: op.version_ref,
         }),
-        Operator::LogicalAssertOneRow(op) => {
-            LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode {
-                subquery_text: op.subquery_text,
-            })
-        }
+        Operator::LogicalAssertOneRow(op) => LogicalPlanKind::AssertOneRow(
+            LogicalAssertOneRowNode::global_at_most_one(op.subquery_text),
+        ),
         Operator::LogicalIntersect(op) => LogicalPlanKind::Intersect(LogicalIntersectNode {
             output_columns: op.output_columns,
         }),

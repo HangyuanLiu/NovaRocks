@@ -115,11 +115,9 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             })
         }
 
-        Operator::LogicalAssertOneRow(op) => {
-            LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode {
-                subquery_text: op.subquery_text.clone(),
-            })
-        }
+        Operator::LogicalAssertOneRow(op) => LogicalPlanKind::AssertOneRow(
+            LogicalAssertOneRowNode::global_at_most_one(op.subquery_text.clone()),
+        ),
 
         Operator::LogicalApply(op) => LogicalPlanKind::Apply(LogicalApplyNode {
             kind: op.kind,

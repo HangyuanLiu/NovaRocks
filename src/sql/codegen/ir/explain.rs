@@ -7,8 +7,8 @@ use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::column_id::ColumnId;
 use crate::sql::explain::{
-    ExplainLevel, PlanNodeExplainStage, format_expr, format_project_item, format_sort_items,
-    format_window_exprs,
+    ExplainLevel, PlanNodeExplainStage, format_assert_one_row_header, format_expr,
+    format_project_item, format_sort_items, format_window_exprs,
 };
 use crate::sql::planner::plan::{
     DistributedChangeEventExpandNode, ExchangeFlavor, PhysicalHashAggregateNode,
@@ -203,10 +203,7 @@ fn format_distributed_shared_plan_node_header(
                 node.function_name.to_uppercase()
             ))
         }
-        PhysicalPlanKind::AssertOneRow(_) => Some(match stage {
-            PlanNodeExplainStage::Logical => "ASSERT ONE ROW".to_string(),
-            PlanNodeExplainStage::Distributed => "ASSERT NUM ROWS (<= 1)".to_string(),
-        }),
+        PhysicalPlanKind::AssertOneRow(node) => Some(format_assert_one_row_header(node, stage)),
         _ => None,
     }
 }

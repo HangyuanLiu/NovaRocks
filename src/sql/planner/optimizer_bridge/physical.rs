@@ -159,11 +159,9 @@ impl BridgeCtx<'_> {
                     .collect(),
                 columns: op.columns.clone(),
             })),
-            Operator::PhysicalAssertOneRow(op) => {
-                Ok(PhysicalPlanKind::AssertOneRow(PlanAssertOneRowNode {
-                    subquery_text: op.subquery_text.clone(),
-                }))
-            }
+            Operator::PhysicalAssertOneRow(op) => Ok(PhysicalPlanKind::AssertOneRow(
+                PlanAssertOneRowNode::global_at_most_one(op.subquery_text.clone()),
+            )),
             Operator::PhysicalRepeat(op) => Ok(PhysicalPlanKind::Repeat(PlanRepeatNode {
                 repeat_column_ref_list: op.repeat_column_ref_list.clone(),
                 repeat_column_ref_ids: op.repeat_column_ref_ids.clone(),

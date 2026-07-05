@@ -38,10 +38,11 @@ Rust tests are executed with --test-threads=1 for the same reason.
 Cargo build/test/run stages use NOVA_CI_CARGO_PROFILE, defaulting to dev-opt.
 Clippy runs in warning-only mode until the repository has a clean strict-clippy
 baseline.
-Proto-mode SQL CI runs the core matrix by default for NIDL-5 M1 discovery. Set
-NOVA_CI_PROTO_CORE=0 to disable it, NOVA_CI_PROTO_FULL=1 to run the stable
-full-suite proto matrix, and NOVA_CI_PROTO_REQUIRED=1 to make proto failures
-fail CI.
+Default SQL suite runs use the sql-test runner's default plan wire format
+(proto after NIDL-5 M3). The explicit proto matrix is retained as a focused
+cross-process required check for NIDL-5 regressions. Set NOVA_CI_PROTO_CORE=0
+to disable it, NOVA_CI_PROTO_FULL=1 to run the stable full-suite proto matrix,
+and NOVA_CI_PROTO_REQUIRED=1 to make proto failures fail CI.
 
 Options:
   --all-discovered      Run every suite discovered from sql-tests/*/sql.

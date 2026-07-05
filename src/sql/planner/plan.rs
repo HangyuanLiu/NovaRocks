@@ -213,9 +213,54 @@ pub(crate) struct PlanTableFunctionNode {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlanRowCountAssertion {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct PlanAssertOneRowNode {
     pub subquery_text: String,
+    pub desired_num_rows: Option<i64>,
+    pub assertion: PlanRowCountAssertion,
+    pub group_key_column_ids: Vec<ColumnId>,
+    pub group_key_labels: Vec<String>,
+    pub keyed_message_prefix: Option<String>,
+}
+
+impl PlanAssertOneRowNode {
+    pub(crate) fn global_at_most_one(subquery_text: impl Into<String>) -> Self {
+        Self {
+            subquery_text: subquery_text.into(),
+            desired_num_rows: Some(1),
+            assertion: PlanRowCountAssertion::Le,
+            group_key_column_ids: Vec::new(),
+            group_key_labels: Vec::new(),
+            keyed_message_prefix: None,
+        }
+    }
+
+    pub(crate) fn per_key_at_most_one(
+        subquery_text: impl Into<String>,
+        group_key_column_ids: Vec<ColumnId>,
+        group_key_labels: Vec<String>,
+        keyed_message_prefix: impl Into<String>,
+    ) -> Self {
+        Self {
+            subquery_text: subquery_text.into(),
+            desired_num_rows: Some(1),
+            assertion: PlanRowCountAssertion::Le,
+            group_key_column_ids,
+            group_key_labels,
+            keyed_message_prefix: Some(keyed_message_prefix.into()),
+        }
+    }
 }
 
 #[allow(dead_code)]
