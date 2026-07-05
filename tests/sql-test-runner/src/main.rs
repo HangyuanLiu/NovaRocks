@@ -73,6 +73,12 @@ enum RecordFrom {
     Reference,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum PlanWireFormatArg {
+    Thrift,
+    Proto,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaseStatus {
     Pass,
@@ -263,6 +269,10 @@ struct Cli {
 
     #[arg(long, value_enum, default_value_t = ClusterMode::AllInOne)]
     cluster_mode: ClusterMode,
+
+    /// FE plan wire format for the cross-process cluster: proto (default) or thrift.
+    #[arg(long, value_enum, default_value_t = PlanWireFormatArg::Proto)]
+    plan_wire_format: PlanWireFormatArg,
 
     /// Number of BE processes to launch in cross-process cluster mode (>= 1).
     /// All-in-one mode requires cluster_size = 1.
@@ -2348,6 +2358,7 @@ fn run() -> Result<i32> {
         cli.cluster_size,
         &base_dir,
         &runner_config,
+        cli.plan_wire_format,
     )?;
 
     // Resolve global connection params
@@ -2894,9 +2905,9 @@ mod tests {
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::types::{QueryMeta, ResultSet, SqlCase, SqlStep};
     use crate::{
-        Cli, annotate_failure_with_engine_error_code, evaluate_expected_error_branch,
-        expected_engine_error_code_diff_result, expected_engine_error_code_result,
-        validate_fault_injection_jobs,
+        Cli, PlanWireFormatArg, annotate_failure_with_engine_error_code,
+        evaluate_expected_error_branch, expected_engine_error_code_diff_result,
+        expected_engine_error_code_result, validate_fault_injection_jobs,
     };
     use clap::Parser;
     use regex::Regex;
@@ -3155,9 +3166,45 @@ mod tests {
     }
 
     #[test]
+    fn help_includes_plan_wire_format_option() {
+        let help = <crate::Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--plan-wire-format <PLAN_WIRE_FORMAT>"));
+        assert!(help.contains("thrift"));
+        assert!(help.contains("proto"));
+    }
+
+    #[test]
     fn cli_cluster_mode_defaults_to_all_in_one() {
         let cli = crate::Cli::parse_from(["sql-tests", "--suite", "ssb"]);
         assert_eq!(cli.cluster_mode, ClusterMode::AllInOne);
+    }
+
+    #[test]
+    fn cli_plan_wire_format_defaults_to_proto() {
+        let cli = crate::Cli::parse_from(["sql-tests", "--suite", "ssb"]);
+        assert_eq!(cli.plan_wire_format, PlanWireFormatArg::Proto);
+    }
+
+    #[test]
+    fn cli_plan_wire_format_accepts_proto() {
+        let cli =
+            crate::Cli::parse_from(["sql-tests", "--suite", "ssb", "--plan-wire-format", "proto"]);
+        assert_eq!(cli.plan_wire_format, PlanWireFormatArg::Proto);
+    }
+
+    #[test]
+    fn cli_plan_wire_format_accepts_thrift_escape_hatch() {
+        let cli = crate::Cli::parse_from([
+            "sql-tests",
+            "--suite",
+            "ssb",
+            "--plan-wire-format",
+            "thrift",
+        ]);
+        assert_eq!(cli.plan_wire_format, PlanWireFormatArg::Thrift);
     }
 
     #[test]
@@ -3243,10 +3290,22 @@ access_key_id = "admin"
 enable_path_style_access = true
 "#;
 
-        let fe = render_cross_process_config(base, ClusterProcessRole::Fe, 0, &runtime)
-            .expect("render fe config");
-        let be = render_cross_process_config(base, ClusterProcessRole::Be, 0, &runtime)
-            .expect("render be config");
+        let fe = render_cross_process_config(
+            base,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render fe config");
+        let be = render_cross_process_config(
+            base,
+            ClusterProcessRole::Be,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render be config");
 
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
         let be_value: toml::Value = be.parse().expect("parse be toml");

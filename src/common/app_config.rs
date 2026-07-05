@@ -858,7 +858,7 @@ fn default_exchange_io_max_inflight_bytes() -> usize {
 }
 
 fn default_plan_wire_format() -> PlanWireFormat {
-    PlanWireFormat::Thrift
+    PlanWireFormat::Proto
 }
 
 fn default_mem_limit() -> String {
@@ -2037,17 +2037,17 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
     }
 
     #[test]
-    fn test_runtime_plan_wire_format_defaults_to_thrift() {
+    fn test_runtime_plan_wire_format_defaults_to_proto() {
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
 [runtime]
 "#,
         )
         .expect("parse config");
-        assert_eq!(cfg.runtime.plan_wire_format, PlanWireFormat::Thrift);
+        assert_eq!(cfg.runtime.plan_wire_format, PlanWireFormat::Proto);
         assert_eq!(
             RuntimeConfig::default().plan_wire_format,
-            PlanWireFormat::Thrift
+            PlanWireFormat::Proto
         );
     }
 
@@ -2061,6 +2061,18 @@ plan_wire_format = "proto"
         )
         .expect("parse config");
         assert_eq!(cfg.runtime.plan_wire_format, PlanWireFormat::Proto);
+    }
+
+    #[test]
+    fn test_runtime_plan_wire_format_can_be_thrift() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+plan_wire_format = "thrift"
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.runtime.plan_wire_format, PlanWireFormat::Thrift);
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub(crate) use crate::sql::planner::{
     PlanFragment,
 };
 pub(crate) use explain::{explain_distributed_plan, explain_distributed_plan_analyze};
-pub(crate) use lowering::lower_distributed_plan;
+pub(crate) use lowering::{lower_distributed_plan, refresh_distributed_plan_for_native_sidecar};
 
 #[cfg(test)]
 mod tests {

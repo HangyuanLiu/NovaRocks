@@ -353,15 +353,7 @@ impl ExecutionCoordinator {
                 let (output_sink, fragment_partition, exec_destinations) = if is_root {
                     (fr.output_sink.clone(), unpartitioned_partition(), None)
                 } else if let Some(edge) = stream_edge {
-                    let stream_sink = data_sinks::TDataStreamSink::new(
-                        edge.target_exchange_node_id,
-                        edge.output_partition.clone(),
-                        None::<bool>,
-                        None::<bool>,
-                        None::<i32>,
-                        None::<Vec<i32>>,
-                        None::<i64>,
-                    );
+                    let stream_sink = build_stream_sink_for_edge(edge);
                     let output_sink = wrap_data_stream_sink(stream_sink);
                     (
                         output_sink,
@@ -402,18 +394,13 @@ impl ExecutionCoordinator {
                     for (consumer_fragment_id, exchange_node_id, partition, output_slot_ids) in
                         &consumers
                     {
-                        let output_columns = if output_slot_ids.is_empty() {
-                            None::<Vec<i32>>
-                        } else {
-                            Some(output_slot_ids.clone())
-                        };
                         let stream_sink = data_sinks::TDataStreamSink::new(
                             *exchange_node_id,
                             partition.clone(),
                             None::<bool>,
                             None::<bool>,
                             None::<i32>,
-                            output_columns,
+                            stream_sink_output_columns(output_slot_ids),
                             None::<i64>,
                         );
                         sinks.push(stream_sink);
@@ -537,6 +524,7 @@ impl ExecutionCoordinator {
                                 )?;
                             }
                         }
+                        patch_native_iceberg_delta_scan_payloads(&mut native_fragment, &fr.plan)?;
                         let exec = params.params.as_ref().ok_or_else(|| {
                             format!(
                                 "fragment {fragment_id} missing exec params while plan_wire_format=proto"
@@ -893,6 +881,26 @@ fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks
         None::<data_sinks::TSplitDataStreamSink>,
         None::<data_sinks::TIcebergChangeStreamRouterSink>,
     )
+}
+
+fn build_stream_sink_for_edge(edge: &FragmentEdge) -> data_sinks::TDataStreamSink {
+    data_sinks::TDataStreamSink::new(
+        edge.target_exchange_node_id,
+        edge.output_partition.clone(),
+        None::<bool>,
+        None::<bool>,
+        None::<i32>,
+        stream_sink_output_columns(&edge.output_slot_ids),
+        None::<i64>,
+    )
+}
+
+fn stream_sink_output_columns(output_slot_ids: &[i32]) -> Option<Vec<i32>> {
+    if output_slot_ids.is_empty() {
+        None
+    } else {
+        Some(output_slot_ids.to_vec())
+    }
 }
 
 /// Wrap a `TMultiCastDataStreamSink` in a MULTI_CAST_DATA_STREAM_SINK `TDataSink`.
@@ -1320,6 +1328,308 @@ fn native_fragment_sidecars(
     }
 }
 
+fn patch_native_iceberg_delta_scan_payloads(
+    fragment: &mut crate::proto::plan::PlanFragment,
+    thrift_plan: &crate::thrift::plan_nodes::TPlan,
+) -> Result<(), String> {
+    let delta_payloads = thrift_plan
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            node.iceberg_delta_scan_node
+                .as_ref()
+                .map(|payload| (node.node_id, payload))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    if delta_payloads.is_empty() {
+        return Ok(());
+    }
+
+    let root = fragment
+        .root
+        .as_mut()
+        .ok_or_else(|| format!("native fragment {} missing root", fragment.fragment_id))?;
+    let patched = patch_native_iceberg_delta_scan_payloads_in_node(root, &delta_payloads)?;
+    if patched == 0 {
+        return Err(format!(
+            "native fragment {} has thrift IcebergDeltaScan payloads but no matching native IcebergDeltaTable scan",
+            fragment.fragment_id
+        ));
+    }
+    Ok(())
+}
+
+fn patch_native_iceberg_delta_scan_payloads_in_node(
+    node: &mut crate::proto::plan::DistributedNode,
+    delta_payloads: &std::collections::HashMap<
+        i32,
+        &crate::thrift::plan_nodes::TIcebergDeltaScanNode,
+    >,
+) -> Result<usize, String> {
+    let mut patched = 0;
+    if let Some(crate::proto::plan::distributed_node::Payload::Physical(physical)) =
+        node.payload.as_mut()
+        && let Some(crate::proto::plan::plan_node::Kind::Scan(scan)) = physical.kind.as_mut()
+        && let Some(table) = scan.table.as_mut()
+        && let Some(source) = table.source.as_mut()
+        && let Some(crate::proto::plan::scan_source::Kind::IcebergDeltaTable(delta)) =
+            source.kind.as_mut()
+    {
+        let payload = delta_payloads.get(&node.node_id).ok_or_else(|| {
+            format!(
+                "native IcebergDeltaTable scan node_id={} has no matching thrift delta payload",
+                node.node_id
+            )
+        })?;
+        delta.delta_plan = Some(encode_native_delta_scan_plan(&payload.delta_plan)?);
+        patched += 1;
+    }
+    for child in &mut node.children {
+        patched += patch_native_iceberg_delta_scan_payloads_in_node(child, delta_payloads)?;
+    }
+    Ok(patched)
+}
+
+fn encode_native_delta_scan_plan(
+    src: &crate::thrift::plan_nodes::TIcebergDeltaScanPlan,
+) -> Result<crate::proto::plan::IcebergDeltaScanPlan, String> {
+    Ok(crate::proto::plan::IcebergDeltaScanPlan {
+        table_location: src.table_location.clone(),
+        data_columns: src
+            .data_columns
+            .iter()
+            .map(|column| crate::proto::plan::IcebergDeltaDataColumn {
+                name: column.name.clone(),
+                field_id: column.field_id,
+            })
+            .collect(),
+        cloud_properties: src
+            .cloud_configuration
+            .as_ref()
+            .and_then(|cloud| cloud.cloud_properties.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        change_files: src
+            .change_files
+            .iter()
+            .map(encode_native_delta_source_file)
+            .collect::<Result<Vec<_>, _>>()?,
+        delete_side: src
+            .delete_side
+            .as_ref()
+            .map(encode_native_delta_delete_side)
+            .transpose()?,
+    })
+}
+
+fn encode_native_delta_source_file(
+    src: &crate::thrift::plan_nodes::TIcebergDeltaSourceFile,
+) -> Result<crate::proto::plan::IcebergDeltaSourceFile, String> {
+    Ok(crate::proto::plan::IcebergDeltaSourceFile {
+        path: src.path.clone(),
+        size: src.size,
+        role: encode_native_delta_source_role(src.role)? as i32,
+        partition_spec_id: src.partition_spec_id,
+        partition_key: src.partition_key.clone(),
+        first_row_id: src.first_row_id,
+        data_sequence_number: src.data_sequence_number,
+        row_id_allow_list: src
+            .row_id_allow_list
+            .as_ref()
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default(),
+        position_deletes: src
+            .position_deletes
+            .as_ref()
+            .map(|deletes| {
+                deletes
+                    .iter()
+                    .map(encode_native_position_delete_source)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        equality_field_ids: src.equality_field_ids.clone().unwrap_or_default(),
+        equality_targets: src
+            .equality_targets
+            .as_ref()
+            .map(|targets| {
+                targets
+                    .iter()
+                    .map(encode_native_equality_delete_target)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        deleted_file_visibility: src.deleted_file_visibility.as_ref().map(|visibility| {
+            crate::proto::plan::IcebergDeltaDeletedFileVisibility {
+                already_deleted_positions: visibility.already_deleted_positions.clone(),
+            }
+        }),
+    })
+}
+
+fn encode_native_delta_source_role(
+    src: crate::thrift::plan_nodes::TIcebergDeltaSourceRole,
+) -> Result<crate::proto::plan::IcebergDeltaSourceRole, String> {
+    use crate::thrift::plan_nodes::TIcebergDeltaSourceRole as T;
+    match src {
+        T::DATA_FILE => Ok(crate::proto::plan::IcebergDeltaSourceRole::DataFile),
+        T::POSITION_DELETE => Ok(crate::proto::plan::IcebergDeltaSourceRole::PositionDelete),
+        T::EQUALITY_DELETE => Ok(crate::proto::plan::IcebergDeltaSourceRole::EqualityDelete),
+        T::DELETED_DATA_FILE => Ok(crate::proto::plan::IcebergDeltaSourceRole::DeletedDataFile),
+        other => Err(format!(
+            "unsupported thrift IcebergDeltaSourceRole {other:?}"
+        )),
+    }
+}
+
+fn encode_native_position_delete_source(
+    src: &crate::thrift::plan_nodes::TIcebergDeltaPositionDeleteSource,
+) -> Result<crate::proto::plan::IcebergDeltaPositionDeleteSource, String> {
+    Ok(crate::proto::plan::IcebergDeltaPositionDeleteSource {
+        delete_file_path: src.delete_file_path.clone(),
+        delete_file_size: src.delete_file_size,
+        referenced_data_file: src.referenced_data_file.clone(),
+        file_format: encode_native_position_delete_format(src.file_format)? as i32,
+        content_offset: src.content_offset,
+        content_size_in_bytes: src.content_size_in_bytes,
+    })
+}
+
+fn encode_native_position_delete_format(
+    src: crate::thrift::plan_nodes::TIcebergDeltaPositionDeleteFileFormat,
+) -> Result<crate::proto::plan::IcebergDeltaPositionDeleteFileFormat, String> {
+    use crate::thrift::plan_nodes::TIcebergDeltaPositionDeleteFileFormat as T;
+    match src {
+        T::PARQUET => Ok(crate::proto::plan::IcebergDeltaPositionDeleteFileFormat::Parquet),
+        T::PUFFIN => Ok(crate::proto::plan::IcebergDeltaPositionDeleteFileFormat::Puffin),
+        other => Err(format!(
+            "unsupported thrift IcebergDeltaPositionDeleteFileFormat {other:?}"
+        )),
+    }
+}
+
+fn encode_native_equality_delete_target(
+    src: &crate::thrift::plan_nodes::TIcebergDeltaEqualityDeleteTarget,
+) -> crate::proto::plan::IcebergDeltaEqualityDeleteTarget {
+    crate::proto::plan::IcebergDeltaEqualityDeleteTarget {
+        data_file_path: src.data_file_path.clone(),
+        data_file_size: src.data_file_size,
+        data_file_first_row_id: src.data_file_first_row_id,
+        data_file_sequence_number: src.data_file_sequence_number,
+    }
+}
+
+fn encode_native_delta_delete_side(
+    src: &crate::thrift::plan_nodes::TIcebergDeltaDeleteSidePlan,
+) -> Result<crate::proto::plan::IcebergDeltaDeleteSidePlan, String> {
+    Ok(crate::proto::plan::IcebergDeltaDeleteSidePlan {
+        base_data_file_lineage: src
+            .base_data_file_lineage
+            .iter()
+            .map(|(path, lineage)| (path.clone(), encode_native_base_lineage(lineage)))
+            .collect(),
+        previous_data_file_lineage: src
+            .previous_data_file_lineage
+            .iter()
+            .map(|(path, lineage)| (path.clone(), encode_native_base_lineage(lineage)))
+            .collect(),
+        previous_delete_visibility_data_files: src
+            .previous_delete_visibility_data_files
+            .iter()
+            .map(encode_native_delete_visibility_data_file)
+            .collect::<Result<Vec<_>, _>>()?,
+        previously_deleted_positions_per_file: src
+            .previously_deleted_positions_per_file
+            .iter()
+            .map(|(path, positions)| {
+                Ok((
+                    path.clone(),
+                    crate::proto::plan::IcebergDeltaPositionList {
+                        positions: positions
+                            .iter()
+                            .map(|position| {
+                                u64::try_from(*position).map_err(|_| {
+                                    format!(
+                                        "negative IcebergDelta previous deleted position for {}: {}",
+                                        path, position
+                                    )
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    },
+                ))
+            })
+            .collect::<Result<_, String>>()?,
+        deleted_data_file_paths: src.deleted_data_file_paths.iter().cloned().collect(),
+    })
+}
+
+fn encode_native_base_lineage(
+    src: &crate::thrift::plan_nodes::TIcebergDeltaBaseDataFileLineage,
+) -> crate::proto::plan::IcebergDeltaBaseDataFileLineage {
+    crate::proto::plan::IcebergDeltaBaseDataFileLineage {
+        first_row_id: src.first_row_id,
+        data_sequence_number: src.data_sequence_number,
+    }
+}
+
+fn encode_native_delete_visibility_data_file(
+    src: &crate::thrift::plan_nodes::TIcebergDeltaDeleteVisibilityDataFile,
+) -> Result<crate::proto::plan::IcebergDeltaDeleteVisibilityDataFile, String> {
+    Ok(crate::proto::plan::IcebergDeltaDeleteVisibilityDataFile {
+        path: src.path.clone(),
+        size: src.size,
+        first_row_id: src.first_row_id,
+        data_sequence_number: src.data_sequence_number,
+        delete_files: src
+            .delete_files
+            .iter()
+            .map(encode_native_delete_visibility_delete_file)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn encode_native_delete_visibility_delete_file(
+    src: &crate::thrift::plan_nodes::TIcebergDeltaDeleteVisibilityDeleteFile,
+) -> Result<crate::proto::plan::IcebergDeltaDeleteVisibilityDeleteFile, String> {
+    Ok(crate::proto::plan::IcebergDeltaDeleteVisibilityDeleteFile {
+        path: src.path.clone(),
+        file_format: encode_native_delete_file_format(src.file_format)? as i32,
+        file_content: encode_native_delete_file_content(src.file_content)? as i32,
+        length: src.length,
+        content_offset: src.content_offset,
+        content_size_in_bytes: src.content_size_in_bytes,
+    })
+}
+
+fn encode_native_delete_file_format(
+    src: crate::thrift::plan_nodes::TIcebergDeltaDeleteFileFormat,
+) -> Result<crate::proto::plan::IcebergDeltaDeleteFileFormat, String> {
+    use crate::thrift::plan_nodes::TIcebergDeltaDeleteFileFormat as T;
+    match src {
+        T::PARQUET => Ok(crate::proto::plan::IcebergDeltaDeleteFileFormat::Parquet),
+        T::PUFFIN => Ok(crate::proto::plan::IcebergDeltaDeleteFileFormat::Puffin),
+        other => Err(format!(
+            "unsupported thrift IcebergDeltaDeleteFileFormat {other:?}"
+        )),
+    }
+}
+
+fn encode_native_delete_file_content(
+    src: crate::thrift::plan_nodes::TIcebergDeltaDeleteFileContent,
+) -> Result<crate::proto::plan::IcebergDeltaDeleteFileContent, String> {
+    use crate::thrift::plan_nodes::TIcebergDeltaDeleteFileContent as T;
+    match src {
+        T::POSITION => Ok(crate::proto::plan::IcebergDeltaDeleteFileContent::Position),
+        T::EQUALITY => Ok(crate::proto::plan::IcebergDeltaDeleteFileContent::Equality),
+        other => Err(format!(
+            "unsupported thrift IcebergDeltaDeleteFileContent {other:?}"
+        )),
+    }
+}
+
 fn patch_native_iceberg_change_stream_router_sink(
     fragment: &mut crate::proto::plan::PlanFragment,
     fragment_id: FragmentId,
@@ -1377,26 +1687,28 @@ fn patch_native_iceberg_change_stream_router_sink(
         route.target_fragment_id = edge.target_fragment_id;
         route.target_exchange_node_id = edge.target_exchange_node_id;
 
-        let partition_exprs = route
-            .output_partition_ordinals
-            .iter()
-            .map(|ordinal| {
-                let idx = usize::try_from(*ordinal).map_err(|_| {
-                    format!(
-                        "native Iceberg change-stream router partition ordinal {ordinal} overflows usize"
-                    )
-                })?;
-                fragment.output_exprs.get(idx).cloned().ok_or_else(|| {
-                    format!(
-                        "native Iceberg change-stream router partition ordinal {ordinal} is out of range"
-                    )
+        if route.output_partition.is_none() {
+            let partition_exprs = route
+                .output_partition_ordinals
+                .iter()
+                .map(|ordinal| {
+                    let idx = usize::try_from(*ordinal).map_err(|_| {
+                        format!(
+                            "native Iceberg change-stream router partition ordinal {ordinal} overflows usize"
+                        )
+                    })?;
+                    fragment.output_exprs.get(idx).cloned().ok_or_else(|| {
+                        format!(
+                            "native Iceberg change-stream router partition ordinal {ordinal} is out of range"
+                        )
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        route.output_partition = Some(native_data_partition_from_thrift_with_exprs(
-            &edge.output_partition,
-            partition_exprs,
-        )?);
+                .collect::<Result<Vec<_>, _>>()?;
+            route.output_partition = Some(native_data_partition_from_thrift_with_exprs(
+                &edge.output_partition,
+                partition_exprs,
+            )?);
+        }
 
         let dests = placements.get(&edge.target_fragment_id).ok_or_else(|| {
             format!(
@@ -3435,6 +3747,26 @@ mod tests {
     }
 
     #[test]
+    fn plain_stream_sink_carries_edge_output_columns() {
+        let mut edge = fake_stream_edge(1, 2, 77);
+        edge.output_slot_ids = vec![31, 12, 9];
+
+        let sink = build_stream_sink_for_edge(&edge);
+
+        assert_eq!(sink.dest_node_id, 77);
+        assert_eq!(sink.output_columns, Some(vec![31, 12, 9]));
+    }
+
+    #[test]
+    fn plain_stream_sink_omits_empty_output_columns() {
+        let edge = fake_stream_edge(1, 2, 77);
+
+        let sink = build_stream_sink_for_edge(&edge);
+
+        assert_eq!(sink.output_columns, None);
+    }
+
+    #[test]
     fn router_sink_does_not_require_write_report() {
         let sink = data_sinks::TDataSink {
             type_: data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK,
@@ -3513,6 +3845,101 @@ mod tests {
             "10.0.0.20"
         );
         assert_eq!(branch.destinations[1].fragment_instance_id.lo, 201);
+    }
+
+    #[test]
+    fn native_router_patch_preserves_static_output_partition() {
+        use crate::proto::expr;
+        use crate::proto::plan as native_plan;
+        use crate::sql::common::ChangeStreamBranchKind;
+
+        let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
+        edge.output_partition = partitions::TDataPartition::new(
+            partitions::TPartitionType::HASH_PARTITIONED,
+            None::<Vec<crate::thrift::exprs::TExpr>>,
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
+        );
+        let mut fragment = native_plan::PlanFragment {
+            fragment_id: 1,
+            root: None,
+            data_partition: Some(native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            }),
+            output_partition: Some(native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            }),
+            sink: Some(native_plan::DataSink {
+                kind: Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(
+                    native_plan::IcebergChangeStreamRouterSink {
+                        group_id: 7,
+                        change_op_output_ordinal: 0,
+                        data_route_output_ordinal: None,
+                        branches: vec![native_plan::IcebergChangeStreamBranchRoute {
+                            branch_id: 0,
+                            branch_kind: native_plan::ChangeStreamBranchKind::DeleteDv as i32,
+                            target_fragment_id: 0,
+                            target_exchange_node_id: -1,
+                            output_ordinals: vec![0],
+                            output_partition_ordinals: vec![0],
+                            output_partition: Some(native_plan::DataPartition {
+                                kind: native_plan::PartitionKind::Hash as i32,
+                                exprs: vec![expr::Expr {
+                                    r#type: None,
+                                    nullable: false,
+                                    kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                                        column_id: 42,
+                                        qualifier: None,
+                                        column: Some("bucket".to_string()),
+                                    })),
+                                }],
+                            }),
+                            destinations: None,
+                        }],
+                    },
+                )),
+            }),
+            output_exprs: Vec::new(),
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        let placements = BTreeMap::from([(2, vec![fake_placement(2, 0, 200, "10.0.0.20")])]);
+
+        patch_native_iceberg_change_stream_router_sink(&mut fragment, 1, 7, &[&edge], &placements)
+            .expect("patch native router sink");
+
+        let Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(router)) =
+            fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+        else {
+            panic!("expected native router sink");
+        };
+        let branch = router.branches.first().expect("router branch");
+        assert_eq!(branch.target_fragment_id, 2);
+        assert_eq!(branch.target_exchange_node_id, 77);
+        assert_eq!(
+            branch
+                .destinations
+                .as_ref()
+                .expect("destinations")
+                .destinations
+                .len(),
+            1
+        );
+        let partition = branch
+            .output_partition
+            .as_ref()
+            .expect("static output partition");
+        assert_eq!(partition.kind, native_plan::PartitionKind::Hash as i32);
+        let [expr] = partition.exprs.as_slice() else {
+            panic!("expected one partition expr");
+        };
+        let Some(expr::expr::Kind::ColumnRef(column_ref)) = expr.kind.as_ref() else {
+            panic!("expected preserved column ref");
+        };
+        assert_eq!(column_ref.column_id, 42);
     }
 
     #[test]

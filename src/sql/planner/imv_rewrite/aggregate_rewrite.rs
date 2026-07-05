@@ -175,8 +175,10 @@ pub(crate) fn build_aggregate_state_merge(
     let old_scan = target_state_old_scan(
         target,
         target_columns,
+        &group_key_names,
         &aggregate_state_names,
         &row_id_column_name,
+        branch_scope.as_ref(),
         old_source,
         ctx,
     )?;
@@ -211,14 +213,64 @@ pub(crate) fn build_aggregate_state_merge(
 fn target_state_old_scan(
     target: &crate::engine::mv::iceberg_refresh::IcebergMvTarget,
     target_columns: Vec<ColumnDef>,
+    group_key_names: &[String],
     aggregate_state_names: &[String],
     row_id_column_name: &str,
+    branch_scope: Option<&crate::sql::catalog::BranchScope>,
     old_source: crate::sql::catalog::ScanSource,
     ctx: &RewriteContext,
 ) -> Result<LogicalPlanNode, String> {
     let locator_metadata_columns = target_state_locator_metadata_columns();
+    let old_columns = if branch_scope.is_some() {
+        target_state_branch_scoped_old_scan_columns(
+            ctx,
+            &target_columns,
+            &locator_metadata_columns,
+            aggregate_state_names,
+            row_id_column_name,
+        )?
+    } else {
+        target_state_compact_old_scan_columns(
+            ctx,
+            &target_columns,
+            &locator_metadata_columns,
+            group_key_names,
+            aggregate_state_names,
+            row_id_column_name,
+        )?
+    };
+    let required_columns =
+        target_state_required_column_names(&target_columns, &locator_metadata_columns);
+    Ok(LogicalPlanNode::new(
+        LogicalPlanKind::Scan(LogicalScanNode {
+            database: target.namespace.clone(),
+            table: TableDef {
+                name: target.table.clone(),
+                columns: target_columns,
+                iceberg_row_lineage_metadata_columns: locator_metadata_columns,
+                source: old_source,
+            },
+            alias: None,
+            columns: old_columns,
+            predicates: Vec::new(),
+            required_columns: Some(required_columns),
+            variant_columns: Vec::new(),
+            mv_rewritten_from: None,
+        }),
+        vec![],
+        None,
+    ))
+}
+
+fn target_state_branch_scoped_old_scan_columns(
+    ctx: &RewriteContext,
+    target_columns: &[ColumnDef],
+    locator_metadata_columns: &[ColumnDef],
+    aggregate_state_names: &[String],
+    row_id_column_name: &str,
+) -> Result<Vec<OutputColumn>, String> {
     let mut old_columns = Vec::with_capacity(target_columns.len() + locator_metadata_columns.len());
-    for column in &target_columns {
+    for column in target_columns {
         old_columns.push(allocate_imv_output_column(
             ctx,
             &column.name,
@@ -230,7 +282,7 @@ fn target_state_old_scan(
                 || column.name.eq_ignore_ascii_case(row_id_column_name),
         )?);
     }
-    for column in &locator_metadata_columns {
+    for column in locator_metadata_columns {
         if old_columns
             .iter()
             .any(|existing| existing.name.eq_ignore_ascii_case(&column.name))
@@ -245,25 +297,82 @@ fn target_state_old_scan(
             true,
         )?);
     }
-    Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Scan(LogicalScanNode {
-            database: target.namespace.clone(),
-            table: TableDef {
-                name: target.table.clone(),
-                columns: target_columns,
-                iceberg_row_lineage_metadata_columns: locator_metadata_columns,
-                source: old_source,
-            },
-            alias: None,
-            columns: old_columns,
-            predicates: Vec::new(),
-            required_columns: None,
-            variant_columns: Vec::new(),
-            mv_rewritten_from: None,
-        }),
-        vec![],
-        None,
-    ))
+    Ok(old_columns)
+}
+
+fn target_state_compact_old_scan_columns(
+    ctx: &RewriteContext,
+    target_columns: &[ColumnDef],
+    locator_metadata_columns: &[ColumnDef],
+    group_key_names: &[String],
+    aggregate_state_names: &[String],
+    row_id_column_name: &str,
+) -> Result<Vec<OutputColumn>, String> {
+    let mut names = Vec::with_capacity(
+        1 + group_key_names.len() + aggregate_state_names.len() + locator_metadata_columns.len(),
+    );
+    push_unique_name(&mut names, row_id_column_name);
+    for name in group_key_names {
+        push_unique_name(&mut names, name);
+    }
+    for name in aggregate_state_names {
+        push_unique_name(&mut names, name);
+    }
+    for column in locator_metadata_columns {
+        push_unique_name(&mut names, &column.name);
+    }
+
+    names
+        .into_iter()
+        .map(|name| {
+            let column = target_columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(&name))
+                .map(|column| (column, false))
+                .or_else(|| {
+                    locator_metadata_columns
+                        .iter()
+                        .find(|column| column.name.eq_ignore_ascii_case(&name))
+                        .map(|column| (column, true))
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "Iceberg IMV aggregate rewrite target-state old input cannot resolve public column {name}"
+                    )
+                })?;
+            Ok(allocate_imv_output_column(
+                ctx,
+                &column.0.name,
+                column.0.data_type.clone(),
+                column.0.nullable,
+                column.1
+                    || aggregate_state_names
+                        .iter()
+                        .any(|state| state.eq_ignore_ascii_case(&column.0.name))
+                    || column.0.name.eq_ignore_ascii_case(row_id_column_name),
+            )?)
+        })
+        .collect()
+}
+
+fn target_state_required_column_names(
+    target_columns: &[ColumnDef],
+    locator_metadata_columns: &[ColumnDef],
+) -> Vec<String> {
+    let mut names = Vec::with_capacity(target_columns.len() + locator_metadata_columns.len());
+    for column in target_columns.iter().chain(locator_metadata_columns.iter()) {
+        push_unique_name(&mut names, &column.name);
+    }
+    names
+}
+
+fn push_unique_name(names: &mut Vec<String>, name: &str) {
+    if !names
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(name))
+    {
+        names.push(name.to_string());
+    }
 }
 
 fn target_state_locator_metadata_columns() -> Vec<ColumnDef> {
@@ -317,7 +426,7 @@ fn branch_scoped_old_input(
     );
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Project(LogicalProjectNode {
-            items: aggregate_physical_passthrough_items(layout, &old_outputs)?,
+            items: aggregate_old_state_passthrough_items(layout, &old_outputs)?,
             output_qualifier: None,
         }),
         vec![filtered],
@@ -1116,53 +1225,45 @@ fn branch_scope_predicate(
     })
 }
 
-fn aggregate_physical_passthrough_items(
+fn aggregate_old_state_passthrough_items(
     layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     outputs: &[OutputColumn],
 ) -> Result<Vec<ProjectItem>, String> {
-    let mut items = layout
-        .physical_columns
-        .iter()
-        .map(|physical| {
-            let column = &physical.column;
-            let source = find_output_column_by_name(outputs, &column.name)?;
-            Ok(ProjectItem {
-                expr: TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: source.column_id,
-                        qualifier: None,
-                        column: source.name.clone(),
-                    },
-                    data_type: source.data_type.clone(),
-                    nullable: source.nullable,
-                },
-                output_name: column.name.clone(),
-                output_column_id: source.column_id,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let mut names = Vec::with_capacity(
+        1 + layout.group_key_source_indexes.len() + layout.state_columns.len() + 4,
+    );
+    push_unique_name(&mut names, &layout.row_id_column.column.name);
+    for &visible_source_index in &layout.group_key_source_indexes {
+        let visible = layout.visible_columns.get(visible_source_index).ok_or_else(|| {
+            format!(
+                "Iceberg IMV aggregate rewrite group key visible source index {visible_source_index} out of range"
+            )
+        })?;
+        push_unique_name(&mut names, &visible.name);
+    }
+    for state_column in &layout.state_columns {
+        push_unique_name(&mut names, &state_column.name);
+    }
     for name in [
         crate::exec::row_position::ICEBERG_FILE_PATH_COL,
         crate::exec::row_position::ICEBERG_ROW_POS_COL,
         crate::exec::row_position::ICEBERG_ROW_ID_COL,
         crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
     ] {
-        let source = find_output_column_by_name(outputs, name)?;
-        items.push(ProjectItem {
-            expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: source.column_id,
-                    qualifier: None,
-                    column: source.name.clone(),
-                },
-                data_type: source.data_type.clone(),
-                nullable: source.nullable,
-            },
-            output_name: source.name.clone(),
-            output_column_id: source.column_id,
-        });
+        push_unique_name(&mut names, name);
     }
-    Ok(items)
+
+    names
+        .into_iter()
+        .map(|name| {
+            let source = find_output_column_by_name(outputs, &name)?;
+            Ok(ProjectItem {
+                expr: column_ref(source),
+                output_name: source.name.clone(),
+                output_column_id: source.column_id,
+            })
+        })
+        .collect()
 }
 
 fn find_output_column_by_name<'a>(
@@ -2893,14 +2994,35 @@ mod tests {
             old_scan
                 .columns
                 .iter()
-                .rev()
-                .take(4)
                 .map(|column| column.name.as_str())
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
                 .collect::<Vec<_>>(),
-            expected_row_lineage_metadata_names()
+            vec![
+                "__row_id__",
+                "k",
+                "__agg_state_s",
+                "__agg_state___ivm_row_count",
+                "_file",
+                "_pos",
+                "_row_id",
+                "_last_updated_sequence_number",
+            ]
+        );
+        assert_eq!(
+            old_scan
+                .required_columns
+                .as_ref()
+                .map(|columns| columns.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec![
+                "k",
+                "v",
+                "__row_id__",
+                "__agg_state_s",
+                "__agg_state___ivm_row_count",
+                "_file",
+                "_pos",
+                "_row_id",
+                "_last_updated_sequence_number",
+            ])
         );
         assert_eq!(
             old_scan
@@ -3446,14 +3568,18 @@ mod tests {
             project
                 .items
                 .iter()
-                .rev()
-                .take(4)
                 .map(|item| item.output_name.as_str())
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
                 .collect::<Vec<_>>(),
-            expected_row_lineage_metadata_names()
+            vec![
+                "__row_id__",
+                "k",
+                "__agg_state_s",
+                "__agg_state___ivm_row_count",
+                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                crate::exec::row_position::ICEBERG_ROW_POS_COL,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            ]
         );
         for item in &project.items {
             let source = find_output_column_by_name(old_scan.columns.as_slice(), &item.output_name)

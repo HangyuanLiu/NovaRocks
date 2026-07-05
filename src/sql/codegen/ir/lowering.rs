@@ -168,6 +168,113 @@ pub(crate) fn lower_distributed_plan(
     })
 }
 
+pub(crate) fn refresh_distributed_plan_for_native_sidecar(
+    dp: &crate::sql::planner::DistributedPlan,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<crate::sql::planner::DistributedPlan, String> {
+    let mut out = dp.clone();
+    for fragment in &mut out.fragments {
+        refresh_distributed_node_scan_tables_for_native(&mut fragment.root, mv_refresh_ctx)?;
+    }
+    Ok(out)
+}
+
+fn refresh_distributed_node_scan_tables_for_native(
+    node: &mut crate::sql::planner::DistributedNode,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<(), String> {
+    if let crate::sql::planner::DistributedPayload::Physical(
+        crate::sql::planner::plan::PhysicalPlanKind::Scan(scan),
+    ) = &mut node.payload
+    {
+        let refresh_only_source = is_refresh_only_scan_source(&scan.table.source);
+        let native_projected_names = native_refresh_scan_projected_names(&scan.table.source);
+        let refreshed_table = refresh_scan_table_for_codegen(mv_refresh_ctx, &scan.table)?;
+        if let Some(projected_names) = native_projected_names {
+            scan.required_columns = Some(merge_required_columns_with_projected(
+                scan.required_columns.take(),
+                &projected_names,
+            ));
+        } else if refresh_only_source {
+            scan.columns = scan_output_columns_for_refreshed_table(scan, &refreshed_table);
+        }
+        scan.table = refreshed_table;
+    }
+    for child in &mut node.children {
+        refresh_distributed_node_scan_tables_for_native(child, mv_refresh_ctx)?;
+    }
+    Ok(())
+}
+
+fn is_refresh_only_scan_source(source: &ScanSource) -> bool {
+    matches!(
+        source,
+        ScanSource::IcebergVersionTable { .. }
+            | ScanSource::IcebergMvTargetState(_)
+            | ScanSource::IcebergMvTargetLocator(_)
+    )
+}
+
+fn native_refresh_scan_projected_names(source: &ScanSource) -> Option<Vec<String>> {
+    match source {
+        ScanSource::IcebergMvTargetState(scan) => {
+            Some(nodes::projected_target_state_column_names(scan))
+        }
+        ScanSource::IcebergMvTargetLocator(scan) => {
+            Some(nodes::projected_target_locator_column_names(scan))
+        }
+        _ => None,
+    }
+}
+
+fn scan_output_columns_for_refreshed_table(
+    scan: &crate::sql::planner::plan::PlanScanNode,
+    table: &TableDef,
+) -> Vec<AnalysisOutputColumn> {
+    let mut out = Vec::new();
+    for column in table
+        .columns
+        .iter()
+        .chain(table.iceberg_row_lineage_metadata_columns.iter())
+    {
+        if let Some(output_column) = scan
+            .columns
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(&column.name))
+        {
+            out.push(output_column.clone());
+        }
+    }
+    for variant_column in &scan.variant_columns {
+        if let Some(output_column) = scan
+            .columns
+            .iter()
+            .find(|column| column.column_id == variant_column.synthetic_column_id)
+        {
+            out.push(output_column.clone());
+        }
+    }
+    out
+}
+
+fn merge_required_columns_with_projected(
+    existing: Option<Vec<String>>,
+    projected_names: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for name in projected_names
+        .iter()
+        .cloned()
+        .chain(existing.unwrap_or_default())
+    {
+        if seen.insert(name.to_lowercase()) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 fn apply_local_rf_waiting_sets(
     lowered_fragments: &mut [(crate::sql::planner::PlanFragment, LoweredDistributedNode)],
     local_rf_waits: &HashMap<i32, Vec<i32>>,
@@ -638,6 +745,9 @@ fn lower_fragment_edges(
                         &source.scope,
                         "lower_fragment_edges",
                     )?;
+                } else {
+                    lowered_edge.output_slot_ids =
+                        lower_stream_edge_output_slot_ids(edge, &source.scope)?;
                 }
             }
             crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
@@ -816,6 +926,36 @@ fn lower_cte_receive_output_slot_ids(
         slots.push(binding.slot_id);
     }
     Ok(slots)
+}
+
+fn lower_stream_edge_output_slot_ids(
+    edge: &crate::sql::codegen::FragmentEdge,
+    source_scope: &ExprScope,
+) -> Result<Vec<i32>, String> {
+    if edge.output_slot_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    edge.output_slot_ids
+        .iter()
+        .copied()
+        .map(|column_id| {
+            let column_id = u32::try_from(column_id).map_err(|_| {
+                format!(
+                    "stream edge source fragment {} output column id {} cannot convert to ColumnId",
+                    edge.source_fragment_id, column_id
+                )
+            })?;
+            source_scope
+                .resolve_by_id(ColumnId(column_id))
+                .map(|binding| binding.slot_id)
+                .ok_or_else(|| {
+                    format!(
+                        "stream edge source fragment {} output column id {} has no materialized slot",
+                        edge.source_fragment_id, column_id
+                    )
+                })
+        })
+        .collect()
 }
 
 fn edge_boundary_schemas(
@@ -1925,7 +2065,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             ));
         }
         let child = self.lower_node(&node.children[0])?;
-        let plan_node = self.lower_assert_one_row(node.node_id, assert_one_row, &child.tuple_ids);
+        let plan_node =
+            self.lower_assert_one_row(node.node_id, assert_one_row, &child.tuple_ids)?;
         let mut plan_nodes = vec![plan_node];
         plan_nodes.extend(child.plan_nodes);
         Ok(LoweredDistributedNode {
@@ -4099,7 +4240,21 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         assert_node_id: i32,
         op: &super::kind::DistributedAssertOneRowNode,
         child_tuple_ids: &[i32],
-    ) -> plan_nodes::TPlanNode {
+    ) -> Result<plan_nodes::TPlanNode, String> {
+        if op.desired_num_rows != Some(1)
+            || !matches!(
+                op.assertion,
+                crate::sql::planner::plan::PlanRowCountAssertion::Le
+            )
+            || !op.group_key_column_ids.is_empty()
+            || !op.group_key_labels.is_empty()
+            || op.keyed_message_prefix.is_some()
+        {
+            return Err(
+                "thrift IR lowering only supports global AssertOneRow <= 1; keyed or non-default assertions require native lowering or a dedicated patch"
+                    .to_string(),
+            );
+        }
         let mut plan_node = nodes::default_plan_node();
         plan_node.node_id = assert_node_id;
         plan_node.node_type = plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE;
@@ -4116,7 +4271,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             group_key_labels: None,
             keyed_message_prefix: None,
         });
-        plan_node
+        Ok(plan_node)
     }
 
     pub(crate) fn lower_repeat(
@@ -5044,6 +5199,7 @@ fn refresh_scan_table_for_codegen(
                 DataType::Int64,
                 false,
             );
+            reorder_refresh_table_columns_by_projected_names(&mut out, &projected)?;
             out.source = refresh_ctx.target_state_scan_source(scan)?;
             nodes::reject_target_state_equality_deletes(&out.source)?;
             Ok(out)
@@ -5092,6 +5248,7 @@ fn refresh_scan_table_for_codegen(
                 DataType::Int64,
                 false,
             );
+            reorder_refresh_table_columns_by_projected_names(&mut out, &projected)?;
             out.source = refresh_ctx.target_locator_scan_source(scan)?;
             nodes::reject_target_state_equality_deletes(&out.source)?;
             Ok(out)
@@ -5132,6 +5289,46 @@ fn ensure_iceberg_metadata_column(
         });
 }
 
+fn reorder_refresh_table_columns_by_projected_names(
+    table: &mut crate::sql::catalog::TableDef,
+    projected: &[String],
+) -> Result<(), String> {
+    let physical = table.columns.clone();
+    let metadata = table.iceberg_row_lineage_metadata_columns.clone();
+    let mut next_physical = Vec::new();
+    let mut next_metadata = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for name in projected {
+        let key = name.to_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        if let Some(column) = physical
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(name))
+        {
+            next_physical.push(column.clone());
+            continue;
+        }
+        if let Some(column) = metadata
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(name))
+        {
+            next_metadata.push(column.clone());
+            continue;
+        }
+        return Err(format!(
+            "refresh-only scan table `{}` cannot resolve projected column `{}`",
+            table.name, name
+        ));
+    }
+
+    table.columns = next_physical;
+    table.iceberg_row_lineage_metadata_columns = next_metadata;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -5143,7 +5340,9 @@ mod tests {
     use crate::lower::type_lowering::arrow_type_from_desc;
     use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{
-        CatalogProvider, ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+        CatalogProvider, ColumnDef, IcebergMvTargetStatePartitionConstraint,
+        IcebergMvTargetStateRowFilter, IcebergMvTargetStateScan, IcebergSchemaDef,
+        IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::codegen::boundary_schema::BoundaryKind;
     use crate::sql::codegen::expr_compiler::infer_agg_function_types;
@@ -5172,7 +5371,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
-    use crate::sql::planner::plan::{AggregateCall, PhysicalPlanKind};
+    use crate::sql::planner::plan::{AggregateCall, PhysicalPlanKind, PlanScanNode};
     use crate::sql::planner::{
         AggMode, AggregateOutputLayout, JoinDistribution, JoinExecutionMode, PhysicalPlanStats,
         PlannerConfidence, WiredRuntimeFilterBuild,
@@ -5337,6 +5536,169 @@ mod tests {
         .expect("boundary tuple ids");
 
         assert_eq!(tuple_ids, vec![2]);
+    }
+
+    #[test]
+    fn native_refresh_target_state_columns_follow_projected_reader_order() {
+        let source_scan = IcebergMvTargetStateScan {
+            catalog: "ice".to_string(),
+            database: "db".to_string(),
+            table: "mv".to_string(),
+            target_table_uuid: "target-uuid".to_string(),
+            target_snapshot_id: Some(7),
+            aggregate_state_layout_version: 1,
+            columns: vec![
+                column_def("__row_id__", DataType::Utf8, false),
+                column_def("region", DataType::Utf8, true),
+                column_def("mn", DataType::Int64, true),
+                column_def("mx", DataType::Int64, true),
+                column_def("c", DataType::Int64, true),
+            ],
+            group_key_names: vec!["region".to_string()],
+            aggregate_state_names: vec![
+                "__agg_state_mn".to_string(),
+                "__agg_state_mx".to_string(),
+                "__agg_state_c".to_string(),
+            ],
+            physical_column_names: vec![
+                "__row_id__".to_string(),
+                "region".to_string(),
+                "mn".to_string(),
+                "mx".to_string(),
+                "c".to_string(),
+                "__agg_state_mn".to_string(),
+                "__agg_state_mx".to_string(),
+                "__agg_state_c".to_string(),
+            ],
+            row_id_column_name: "__row_id__".to_string(),
+            row_filter: IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name: "__row_id__".to_string(),
+                branch_scope: None,
+            },
+            partition_constraint: IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+        };
+        let projected_names = super::native_refresh_scan_projected_names(
+            &ScanSource::IcebergMvTargetState(source_scan.clone()),
+        )
+        .expect("target-state projected names");
+        let table = TableDef {
+            name: "mv".to_string(),
+            columns: vec![
+                column_def("__row_id__", DataType::Utf8, false),
+                column_def("region", DataType::Utf8, true),
+                column_def("__agg_state_mn", DataType::Binary, false),
+                column_def("__agg_state_mx", DataType::Binary, false),
+                column_def("__agg_state_c", DataType::Binary, false),
+                column_def("mn", DataType::Int64, true),
+                column_def("mx", DataType::Int64, true),
+                column_def("c", DataType::Int64, true),
+            ],
+            iceberg_row_lineage_metadata_columns: vec![
+                column_def(
+                    crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                    DataType::Int64,
+                    false,
+                ),
+                column_def(
+                    crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                    DataType::Int64,
+                    true,
+                ),
+                column_def(
+                    crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                    DataType::Utf8,
+                    false,
+                ),
+                column_def(
+                    crate::exec::row_position::ICEBERG_ROW_POS_COL,
+                    DataType::Int64,
+                    false,
+                ),
+            ],
+            source: ScanSource::IcebergMvTargetState(source_scan),
+        };
+        let mut table = table;
+        super::reorder_refresh_table_columns_by_projected_names(&mut table, &projected_names)
+            .expect("refresh table reorder");
+        let physical_names = table
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            physical_names,
+            vec![
+                "__row_id__",
+                "region",
+                "__agg_state_mn",
+                "__agg_state_mx",
+                "__agg_state_c",
+            ]
+        );
+        let metadata_names = table
+            .iceberg_row_lineage_metadata_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            metadata_names,
+            vec![
+                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                crate::exec::row_position::ICEBERG_ROW_POS_COL,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            ]
+        );
+        let scan = PlanScanNode {
+            database: "db".to_string(),
+            table: table.clone(),
+            alias: None,
+            columns: vec![
+                output_col(10, "__row_id__", DataType::Utf8, false),
+                output_col(11, "region", DataType::Utf8, true),
+                output_col(12, "__agg_state_mn", DataType::Binary, false),
+                output_col(13, "__agg_state_mx", DataType::Binary, false),
+                output_col(14, "__agg_state_c", DataType::Binary, false),
+            ],
+            predicates: Vec::new(),
+            required_columns: None,
+            variant_columns: Vec::new(),
+            mv_rewritten_from: None,
+        };
+
+        let public_names = scan
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            public_names,
+            &[
+                "__row_id__",
+                "region",
+                "__agg_state_mn",
+                "__agg_state_mx",
+                "__agg_state_c",
+            ]
+        );
+        let required = super::merge_required_columns_with_projected(
+            scan.required_columns.clone(),
+            &projected_names,
+        );
+        assert_eq!(
+            required,
+            &[
+                "__row_id__",
+                "region",
+                "__agg_state_mn",
+                "__agg_state_mx",
+                "__agg_state_c",
+                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                crate::exec::row_position::ICEBERG_ROW_POS_COL,
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            ]
+        );
     }
 
     #[test]
@@ -6448,6 +6810,41 @@ mod tests {
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn stream_edge_output_slot_ids_lower_to_source_scope_slots() {
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            ColumnId::new_for_test(1),
+            None,
+            "amount".to_string(),
+            ColumnBinding {
+                tuple_id: 7,
+                slot_id: 12,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        scope.add_column_with_id(
+            ColumnId::new_for_test(2),
+            None,
+            "region".to_string(),
+            ColumnBinding {
+                tuple_id: 7,
+                slot_id: 9,
+                data_type: DataType::Utf8,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        let mut edge = fragment_edge(1, 2, 77);
+        edge.output_slot_ids = vec![2, 1];
+
+        let lowered = super::lower_stream_edge_output_slot_ids(&edge, &scope).expect("lower slots");
+
+        assert_eq!(lowered, vec![9, 12]);
     }
 
     fn distributed_values_node(

@@ -1,3 +1,4 @@
+use crate::PlanWireFormatArg;
 use crate::types::RunnerConfig;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
@@ -56,6 +57,7 @@ pub(crate) fn launch_server(
     cluster_size: usize,
     repo_root: &Path,
     runner_config: &RunnerConfig,
+    plan_wire_format: PlanWireFormatArg,
 ) -> Result<Box<dyn ServerHandle>> {
     match mode {
         ClusterMode::AllInOne => Ok(Box::new(NoopServerHandle)),
@@ -63,6 +65,7 @@ pub(crate) fn launch_server(
             cluster_size,
             repo_root,
             runner_config,
+            plan_wire_format,
         )?)),
     }
 }
@@ -157,6 +160,7 @@ pub(crate) fn render_cross_process_config(
     role: ClusterProcessRole,
     be_index: usize,
     runtime: &CrossProcessRuntime,
+    plan_wire_format: PlanWireFormatArg,
 ) -> Result<String> {
     let mut value = if base_config.trim().is_empty() {
         Value::Table(Default::default())
@@ -226,6 +230,18 @@ pub(crate) fn render_cross_process_config(
         }
     }
 
+    if matches!(role, ClusterProcessRole::Fe) {
+        let runtime_tbl = table_mut(root, "runtime");
+        let plan_wire_format = match plan_wire_format {
+            PlanWireFormatArg::Thrift => "thrift",
+            PlanWireFormatArg::Proto => "proto",
+        };
+        runtime_tbl.insert(
+            "plan_wire_format".to_string(),
+            Value::String(plan_wire_format.to_string()),
+        );
+    }
+
     toml::to_string(&value).context("serialize cross-process standalone config")
 }
 
@@ -250,9 +266,11 @@ pub(crate) fn render_cross_process_config_with_metadata_db_override(
     role: ClusterProcessRole,
     be_index: usize,
     runtime: &CrossProcessRuntime,
+    plan_wire_format: PlanWireFormatArg,
     metadata_db_path: &str,
 ) -> Result<String> {
-    let rendered = render_cross_process_config(base_config, role, be_index, runtime)?;
+    let rendered =
+        render_cross_process_config(base_config, role, be_index, runtime, plan_wire_format)?;
 
     let mut value = rendered
         .parse::<Value>()
@@ -330,8 +348,15 @@ impl CrossProcessServerHandle {
         cluster_size: usize,
         repo_root: &Path,
         runner_config: &RunnerConfig,
+        plan_wire_format: PlanWireFormatArg,
     ) -> Result<Self> {
-        Self::launch_impl(cluster_size, repo_root, runner_config, None)
+        Self::launch_impl(
+            cluster_size,
+            repo_root,
+            runner_config,
+            plan_wire_format,
+            None,
+        )
     }
 
     /// Same as [`Self::launch`], but every rendered process config (FE and
@@ -350,11 +375,13 @@ impl CrossProcessServerHandle {
         repo_root: &Path,
         runner_config: &RunnerConfig,
         metadata_db_path: &str,
+        plan_wire_format: PlanWireFormatArg,
     ) -> Result<Self> {
         Self::launch_impl(
             cluster_size,
             repo_root,
             runner_config,
+            plan_wire_format,
             Some(metadata_db_path),
         )
     }
@@ -363,6 +390,7 @@ impl CrossProcessServerHandle {
         cluster_size: usize,
         repo_root: &Path,
         runner_config: &RunnerConfig,
+        plan_wire_format: PlanWireFormatArg,
         metadata_db_override: Option<&str>,
     ) -> Result<Self> {
         let runtime_dir = RuntimeDirGuard::new(create_runtime_dir(repo_root)?);
@@ -399,9 +427,16 @@ impl CrossProcessServerHandle {
                     role,
                     be_index,
                     &runtime,
+                    plan_wire_format,
                     metadata_db_path,
                 ),
-                None => render_cross_process_config(&base_config, role, be_index, &runtime),
+                None => render_cross_process_config(
+                    &base_config,
+                    role,
+                    be_index,
+                    &runtime,
+                    plan_wire_format,
+                ),
             }
         };
 
@@ -877,6 +912,8 @@ fn table_mut<'a>(
 
 #[cfg(test)]
 mod tests {
+    use crate::PlanWireFormatArg;
+
     use super::*;
     use std::fs;
 
@@ -1010,10 +1047,22 @@ exec_node_output = true
     fn render_cross_process_config_patches_fe_and_be_independently() {
         let runtime = make_runtime_1be();
 
-        let fe = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Fe, 0, &runtime)
-            .expect("render fe config");
-        let be = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Be, 0, &runtime)
-            .expect("render be config");
+        let fe = render_cross_process_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render fe config");
+        let be = render_cross_process_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Be,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render be config");
 
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
         let be_value: toml::Value = be.parse().expect("parse be toml");
@@ -1091,6 +1140,158 @@ exec_node_output = true
         );
     }
 
+    #[test]
+    fn render_cross_process_config_proto_injects_fe_runtime_only() {
+        let runtime = make_runtime_1be();
+
+        let fe = render_cross_process_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            PlanWireFormatArg::Proto,
+        )
+        .expect("render fe config");
+        let be = render_cross_process_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Be,
+            0,
+            &runtime,
+            PlanWireFormatArg::Proto,
+        )
+        .expect("render be config");
+
+        let fe_value: toml::Value = fe.parse().expect("parse fe toml");
+        let be_value: toml::Value = be.parse().expect("parse be toml");
+
+        assert_eq!(
+            fe_value["runtime"]["plan_wire_format"].as_str(),
+            Some("proto")
+        );
+        assert!(
+            be_value
+                .get("runtime")
+                .and_then(|value| value.get("plan_wire_format"))
+                .is_none(),
+            "BE config must not receive the FE plan wire format override"
+        );
+    }
+
+    #[test]
+    fn render_cross_process_config_thrift_injects_fe_runtime_escape_hatch_only() {
+        let runtime = make_runtime_1be();
+
+        let fe = render_cross_process_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render fe config");
+        let be = render_cross_process_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Be,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render be config");
+
+        let fe_value: toml::Value = fe.parse().expect("parse fe toml");
+        let be_value: toml::Value = be.parse().expect("parse be toml");
+
+        assert_eq!(
+            fe_value["runtime"]["plan_wire_format"].as_str(),
+            Some("thrift")
+        );
+        assert!(
+            be_value
+                .get("runtime")
+                .and_then(|value| value.get("plan_wire_format"))
+                .is_none(),
+            "BE config must not receive the FE plan wire format override"
+        );
+    }
+
+    #[test]
+    fn render_cross_process_config_thrift_overrides_base_runtime_format_on_fe_only() {
+        let runtime = make_runtime_1be();
+        let base_config = format!(
+            "{}\n[runtime]\nplan_wire_format = \"proto\"\n",
+            BASE_CONFIG
+        );
+
+        let fe = render_cross_process_config(
+            &base_config,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render fe config");
+        let be = render_cross_process_config(
+            &base_config,
+            ClusterProcessRole::Be,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render be config");
+
+        let fe_value: toml::Value = fe.parse().expect("parse fe toml");
+        let be_value: toml::Value = be.parse().expect("parse be toml");
+
+        assert_eq!(
+            fe_value["runtime"]["plan_wire_format"].as_str(),
+            Some("thrift")
+        );
+        assert_eq!(
+            be_value["runtime"]["plan_wire_format"].as_str(),
+            Some("proto"),
+            "BE base config values are preserved because plan wire format is FE-only"
+        );
+    }
+
+    #[test]
+    fn render_cross_process_config_proto_writes_proto_over_base_runtime_format() {
+        let runtime = make_runtime_1be();
+        let base_config = format!(
+            "{}\n[runtime]\nplan_wire_format = \"thrift\"\n",
+            BASE_CONFIG
+        );
+
+        let fe = render_cross_process_config(
+            &base_config,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            PlanWireFormatArg::Proto,
+        )
+        .expect("render fe config");
+        let be = render_cross_process_config(
+            &base_config,
+            ClusterProcessRole::Be,
+            0,
+            &runtime,
+            PlanWireFormatArg::Proto,
+        )
+        .expect("render be config");
+
+        let fe_value: toml::Value = fe.parse().expect("parse fe toml");
+        let be_value: toml::Value = be.parse().expect("parse be toml");
+
+        assert_eq!(
+            fe_value["runtime"]["plan_wire_format"].as_str(),
+            Some("proto")
+        );
+        assert_eq!(
+            be_value["runtime"]["plan_wire_format"].as_str(),
+            Some("thrift"),
+            "proto CLI override is FE-only and must not rewrite BE runtime config"
+        );
+    }
+
     /// Locally-validated unit test for the M7 L2 harness helper: confirms the
     /// override lands on `[metadata].path` (the key `open_metadata_provider`
     /// actually reads via `MetadataConfig { provider, path }`) and leaves every
@@ -1108,6 +1309,7 @@ exec_node_output = true
             ClusterProcessRole::Fe,
             0,
             &runtime,
+            PlanWireFormatArg::Thrift,
             "/new/empty.sqlite",
         )
         .expect("render fe config with metadata override");
@@ -1130,9 +1332,14 @@ exec_node_output = true
         );
 
         // Every other section must be untouched relative to a normal render.
-        let plain_fe =
-            render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Fe, 0, &runtime)
-                .expect("render plain fe config");
+        let plain_fe = render_cross_process_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render plain fe config");
         let plain_fe_value: toml::Value = plain_fe.parse().expect("parse plain fe toml");
 
         assert_eq!(fe_value["server"], plain_fe_value["server"]);
@@ -1157,6 +1364,7 @@ exec_node_output = true
             ClusterProcessRole::Be,
             0,
             &runtime,
+            PlanWireFormatArg::Thrift,
             "/new/empty.sqlite",
         )
         .expect("render be config with metadata override");
@@ -1168,13 +1376,72 @@ exec_node_output = true
     }
 
     #[test]
+    fn render_cross_process_config_with_metadata_override_preserves_proto_runtime_dimension() {
+        let runtime = make_runtime_1be();
+
+        let fe = render_cross_process_config_with_metadata_db_override(
+            BASE_CONFIG,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            PlanWireFormatArg::Proto,
+            "/new/empty.sqlite",
+        )
+        .expect("render fe config with metadata override");
+        let be = render_cross_process_config_with_metadata_db_override(
+            BASE_CONFIG,
+            ClusterProcessRole::Be,
+            0,
+            &runtime,
+            PlanWireFormatArg::Proto,
+            "/new/empty.sqlite",
+        )
+        .expect("render be config with metadata override");
+
+        let fe_value: toml::Value = fe.parse().expect("parse fe toml");
+        let be_value: toml::Value = be.parse().expect("parse be toml");
+
+        assert_eq!(
+            fe_value["metadata"]["path"].as_str(),
+            Some("/new/empty.sqlite")
+        );
+        assert_eq!(
+            fe_value["runtime"]["plan_wire_format"].as_str(),
+            Some("proto")
+        );
+        assert_eq!(
+            be_value["metadata"]["path"].as_str(),
+            Some("/new/empty.sqlite")
+        );
+        assert!(
+            be_value
+                .get("runtime")
+                .and_then(|value| value.get("plan_wire_format"))
+                .is_none(),
+            "BE config must not receive the FE plan wire format override"
+        );
+    }
+
+    #[test]
     fn render_cross_process_config_empty_base_patches_fe_heartbeat_only() {
         let runtime = make_runtime_1be();
 
-        let fe = render_cross_process_config("", ClusterProcessRole::Fe, 0, &runtime)
-            .expect("render fe config");
-        let be = render_cross_process_config("", ClusterProcessRole::Be, 0, &runtime)
-            .expect("render be config");
+        let fe = render_cross_process_config(
+            "",
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render fe config");
+        let be = render_cross_process_config(
+            "",
+            ClusterProcessRole::Be,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render be config");
 
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
         let be_value: toml::Value = be.parse().expect("parse be toml");
@@ -1213,8 +1480,14 @@ exec_node_output = true
     fn render_cross_process_config_2be_fe_has_both_backends() {
         let runtime = make_runtime_2be();
 
-        let fe = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Fe, 0, &runtime)
-            .expect("render fe config");
+        let fe = render_cross_process_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render fe config");
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
 
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
@@ -1238,10 +1511,22 @@ exec_node_output = true
     fn render_cross_process_config_2be_each_be_has_own_ports() {
         let runtime = make_runtime_2be();
 
-        let be0 = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Be, 0, &runtime)
-            .expect("render be0 config");
-        let be1 = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Be, 1, &runtime)
-            .expect("render be1 config");
+        let be0 = render_cross_process_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Be,
+            0,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render be0 config");
+        let be1 = render_cross_process_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Be,
+            1,
+            &runtime,
+            PlanWireFormatArg::Thrift,
+        )
+        .expect("render be1 config");
 
         let be0_value: toml::Value = be0.parse().expect("parse be0 toml");
         let be1_value: toml::Value = be1.parse().expect("parse be1 toml");

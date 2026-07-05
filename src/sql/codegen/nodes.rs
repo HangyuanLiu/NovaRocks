@@ -1172,44 +1172,20 @@ pub(crate) fn projected_target_state_column_names(
     scan: &crate::sql::catalog::IcebergMvTargetStateScan,
 ) -> Vec<String> {
     let mut names = Vec::new();
-    for name in scan.columns.iter().map(|column| &column.name).chain(
-        scan.group_key_names
-            .iter()
-            .chain(scan.aggregate_state_names.iter()),
-    ) {
-        if !names
-            .iter()
-            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
-        {
-            names.push(name.clone());
-        }
-    }
-    if !names
+    push_unique_projected_name(&mut names, &scan.row_id_column_name);
+    for name in scan
+        .group_key_names
         .iter()
-        .any(|name| name.eq_ignore_ascii_case(&scan.row_id_column_name))
+        .chain(scan.aggregate_state_names.iter())
     {
-        names.push(scan.row_id_column_name.clone());
-    }
-    for name in [
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
-    ] {
-        if !names
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(name))
-        {
-            names.push(name.to_string());
-        }
+        push_unique_projected_name(&mut names, name);
     }
     if let crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
         branch_scope: Some(scope),
         ..
     } = &scan.row_filter
-        && !names
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(&scope.branch_id_column_name))
     {
-        names.push(scope.branch_id_column_name.clone());
+        push_unique_projected_name(&mut names, &scope.branch_id_column_name);
     }
     for name in [
         crate::exec::row_position::ICEBERG_FILE_PATH_COL,
@@ -1217,14 +1193,18 @@ pub(crate) fn projected_target_state_column_names(
         crate::exec::row_position::ICEBERG_ROW_ID_COL,
         crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
     ] {
-        if !names
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(name))
-        {
-            names.push(name.to_string());
-        }
+        push_unique_projected_name(&mut names, name);
     }
     names
+}
+
+fn push_unique_projected_name(names: &mut Vec<String>, name: &str) {
+    if !names
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(name))
+    {
+        names.push(name.to_string());
+    }
 }
 
 pub(crate) fn projected_target_locator_column_names(
@@ -2031,12 +2011,11 @@ mod tests {
             vec![
                 "__row_id__".to_string(),
                 "k".to_string(),
-                "visible_sum".to_string(),
                 "sum_v".to_string(),
-                "_row_id".to_string(),
-                "_last_updated_sequence_number".to_string(),
                 "_file".to_string(),
                 "_pos".to_string(),
+                "_row_id".to_string(),
+                "_last_updated_sequence_number".to_string(),
             ]
         );
     }

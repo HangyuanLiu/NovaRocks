@@ -3269,13 +3269,18 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
             mv_refresh_ctx,
         ),
     )?;
+    let native_distributed_plan =
+        crate::sql::codegen::ir::refresh_distributed_plan_for_native_sidecar(
+            &distributed_plan,
+            mv_refresh_ctx,
+        )?;
     let commit_plan =
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_topology(
             &topology,
         )?;
     Ok(PlannedIcebergChangeStreamWrite {
         build_result,
-        distributed_plan: Some(distributed_plan),
+        distributed_plan: Some(native_distributed_plan),
         commit_plan,
         #[cfg(test)]
         topology,
@@ -3677,10 +3682,12 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
             mv_refresh_ctx,
         ),
     )?;
+    let native_dp =
+        crate::sql::codegen::ir::refresh_distributed_plan_for_native_sidecar(&dp, mv_refresh_ctx)?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
         build_result,
-        dp,
+        native_dp,
         dispatcher,
         scheduler,
         crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
@@ -3740,10 +3747,12 @@ pub(crate) fn execute_logical_plan_with_options(
             mv_refresh_ctx,
         ),
     )?;
+    let native_dp =
+        crate::sql::codegen::ir::refresh_distributed_plan_for_native_sidecar(&dp, mv_refresh_ctx)?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
         build_result,
-        dp,
+        native_dp,
         dispatcher,
         scheduler,
         crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
