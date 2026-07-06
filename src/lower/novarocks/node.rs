@@ -165,14 +165,39 @@ pub(crate) fn lower_proto_node(
         .payload
         .as_ref()
         .ok_or_else(|| format!("DistributedNode node_id={} payload missing", node.node_id))?;
-    match payload {
+    let lowered = match payload {
         plan::distributed_node::Payload::Physical(physical) => {
             lower_physical_node(node, physical, children, arena, ctx)
         }
         plan::distributed_node::Payload::Exchange(exchange) => {
             lower_exchange_receiver(node, exchange, children, arena, ctx)
         }
+    }?;
+    apply_distributed_limit_if_needed(node, lowered)
+}
+
+fn apply_distributed_limit_if_needed(
+    node: &plan::DistributedNode,
+    mut lowered: LoweredNode,
+) -> Result<LoweredNode, String> {
+    let Some(limit) = parse_distributed_limit(node.limit, "DistributedNode.limit")? else {
+        return Ok(lowered);
+    };
+    if matches!(
+        lowered.node.kind,
+        ExecNodeKind::Limit(_) | ExecNodeKind::Sort(_)
+    ) {
+        return Ok(lowered);
     }
+    lowered.node = ExecNode {
+        kind: ExecNodeKind::Limit(LimitNode {
+            input: Box::new(lowered.node),
+            node_id: node.node_id,
+            limit: Some(limit),
+            offset: 0,
+        }),
+    };
+    Ok(lowered)
 }
 
 fn lower_physical_node(
@@ -1461,9 +1486,7 @@ fn lower_exchange_receiver(
         plan::exchange_flavor::Kind::Distribution(false) => {
             return Err("ExchangeReceiver distribution flavor must be true".to_string());
         }
-        plan::exchange_flavor::Kind::LimitOffset(_) => {
-            return unsupported("ExchangeReceiver LimitOffset");
-        }
+        plan::exchange_flavor::Kind::LimitOffset(_) => {}
         plan::exchange_flavor::Kind::TopnSplit(_) => {}
         plan::exchange_flavor::Kind::CteMulticast(_) => {
             return unsupported("ExchangeReceiver CteMulticast");
@@ -1502,32 +1525,57 @@ fn lower_exchange_receiver(
         output_schema,
     };
 
-    if let plan::exchange_flavor::Kind::TopnSplit(topn) = flavor {
-        let order_by = lower_sort_items(
-            "ExchangeReceiver TopNSplit",
-            &topn.items,
-            arena,
-            &lowered.layout,
-        )?;
-        let limit = parse_optional_nonnegative_i64(topn.limit, "ExchangeReceiver TopNSplit.limit")?;
-        let offset =
-            parse_optional_nonnegative_i64(topn.offset, "ExchangeReceiver TopNSplit.offset")?
-                .unwrap_or(0);
-        lowered.node = ExecNode {
-            kind: ExecNodeKind::Sort(SortNode {
-                input: Box::new(lowered.node),
-                node_id: node.node_id,
-                use_top_n: false,
-                order_by,
-                limit,
-                offset,
-                topn_type: SortTopNType::RowNumber,
-                max_buffered_rows: None,
-                max_buffered_bytes: None,
-                partition_exprs: Vec::new(),
-                partition_limit: None,
-            }),
-        };
+    match flavor {
+        plan::exchange_flavor::Kind::LimitOffset(limit_offset) => {
+            let limit = parse_optional_nonnegative_i64(
+                limit_offset.limit,
+                "ExchangeReceiver LimitOffset.limit",
+            )?;
+            let offset = parse_optional_nonnegative_i64(
+                limit_offset.offset,
+                "ExchangeReceiver LimitOffset.offset",
+            )?
+            .unwrap_or(0);
+            if limit.is_some() || offset > 0 {
+                lowered.node = ExecNode {
+                    kind: ExecNodeKind::Limit(LimitNode {
+                        input: Box::new(lowered.node),
+                        node_id: node.node_id,
+                        limit,
+                        offset,
+                    }),
+                };
+            }
+        }
+        plan::exchange_flavor::Kind::TopnSplit(topn) => {
+            let order_by = lower_sort_items(
+                "ExchangeReceiver TopNSplit",
+                &topn.items,
+                arena,
+                &lowered.layout,
+            )?;
+            let limit =
+                parse_optional_nonnegative_i64(topn.limit, "ExchangeReceiver TopNSplit.limit")?;
+            let offset =
+                parse_optional_nonnegative_i64(topn.offset, "ExchangeReceiver TopNSplit.offset")?
+                    .unwrap_or(0);
+            lowered.node = ExecNode {
+                kind: ExecNodeKind::Sort(SortNode {
+                    input: Box::new(lowered.node),
+                    node_id: node.node_id,
+                    use_top_n: false,
+                    order_by,
+                    limit,
+                    offset,
+                    topn_type: SortTopNType::RowNumber,
+                    max_buffered_rows: None,
+                    max_buffered_bytes: None,
+                    partition_exprs: Vec::new(),
+                    partition_limit: None,
+                }),
+            };
+        }
+        _ => {}
     }
 
     Ok(lowered)
@@ -3168,6 +3216,37 @@ mod tests {
         }
     }
 
+    fn limit_offset_exchange_node(
+        node_id: i32,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: limit.unwrap_or(-1),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Exchange(
+                plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Unpartitioned as i32,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 7,
+                    output_columns: vec![output_column(1, "id", DataType::Int64)],
+                    output_qualifier: None,
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::LimitOffset(
+                            plan::LimitOffsetFlavor { limit, offset },
+                        )),
+                    }),
+                },
+            )),
+        }
+    }
+
     fn physical_node(
         node_id: i32,
         kind: plan::plan_node::Kind,
@@ -3496,6 +3575,35 @@ mod tests {
     }
 
     #[test]
+    fn wraps_project_distributed_limit_as_limit_node() {
+        let mut project = physical_node(
+            20,
+            plan::plan_node::Kind::Project(plan::ProjectNode {
+                items: vec![plan::ProjectItem {
+                    expr: Some(column_ref(1, DataType::Int64)),
+                    output_name: "projected_id".to_string(),
+                    output_column_id: 7,
+                }],
+                output_qualifier: None,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        project.limit = 1;
+
+        let lowered = lower(&project);
+        let ExecNodeKind::Limit(limit) = lowered.node.kind else {
+            panic!("expected Limit");
+        };
+        assert_eq!(limit.node_id, 20);
+        assert_eq!(limit.limit, Some(1));
+        assert_eq!(limit.offset, 0);
+        assert!(matches!(limit.input.kind, ExecNodeKind::Project(_)));
+        assert_eq!(lowered.layout.order(), &[SlotId::new(7)]);
+        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(7)]);
+    }
+
+    #[test]
     fn parent_project_can_reference_child_project_output_column_id() {
         let inner = physical_node(
             20,
@@ -3817,6 +3925,37 @@ mod tests {
         assert_eq!(sort.order_by.len(), 1);
         let ExecNodeKind::ExchangeSource(exchange) = sort.input.kind else {
             panic!("expected ExchangeSource under Sort");
+        };
+        assert_eq!(exchange.expected_senders, 2);
+        assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_limit_offset_exchange_receiver_as_limit_node() {
+        let mut arena = ExprArena::default();
+        let lowered = lower_proto_node(
+            &limit_offset_exchange_node(42, Some(3), Some(1)),
+            &mut arena,
+            &NodeLoweringContext::default().with_exchange_sender_count(
+                ExchangeKey {
+                    finst_id_hi: 0,
+                    finst_id_lo: 0,
+                    node_id: 42,
+                },
+                2,
+            ),
+        )
+        .expect("LimitOffset exchange receiver");
+
+        let ExecNodeKind::Limit(limit) = lowered.node.kind else {
+            panic!("expected Limit");
+        };
+        assert_eq!(limit.node_id, 42);
+        assert_eq!(limit.limit, Some(3));
+        assert_eq!(limit.offset, 1);
+        let ExecNodeKind::ExchangeSource(exchange) = limit.input.kind else {
+            panic!("expected ExchangeSource under Limit");
         };
         assert_eq!(exchange.expected_senders, 2);
         assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
