@@ -234,9 +234,11 @@ fn lower_physical_node(
         plan::plan_node::Kind::HashAggregate(aggregate) => {
             lower_hash_aggregate_node(node, physical, aggregate, children, arena)
         }
-        plan::plan_node::Kind::HashJoin(join) => lower_hash_join_node(node, join, children, arena),
+        plan::plan_node::Kind::HashJoin(join) => {
+            lower_hash_join_node(node, physical, join, children, arena)
+        }
         plan::plan_node::Kind::NestLoopJoin(join) => {
-            lower_nest_loop_join_node(node, join, children, arena)
+            lower_nest_loop_join_node(node, physical, join, children, arena)
         }
         plan::plan_node::Kind::Window(window) => {
             lower_window_node(node, physical, window, children, arena)
@@ -2060,6 +2062,7 @@ fn pack_struct_inputs(
 
 fn lower_hash_join_node(
     node: &plan::DistributedNode,
+    physical: &plan::PlanNode,
     join: &plan::HashJoinNode,
     children: Vec<LoweredNode>,
     arena: &mut ExprArena,
@@ -2078,6 +2081,8 @@ fn lower_hash_join_node(
         left.output_schema.clone(),
         right.output_schema.clone(),
     ])?);
+    let output_schema =
+        join_output_chunk_schema(physical, join_scope_chunk_schema.clone(), "HashJoinNode")?;
 
     let mut probe_keys = Vec::with_capacity(join.eq_conditions.len());
     let mut build_keys = Vec::with_capacity(join.eq_conditions.len());
@@ -2138,7 +2143,7 @@ fn lower_hash_join_node(
                 distribution_mode,
                 left_chunk_schema: left.output_schema,
                 right_chunk_schema: right.output_schema,
-                join_scope_chunk_schema: join_scope_chunk_schema.clone(),
+                join_scope_chunk_schema: output_schema.clone(),
                 probe_keys,
                 build_keys,
                 eq_null_safe,
@@ -2147,8 +2152,24 @@ fn lower_hash_join_node(
             }),
         },
         layout: join_layout,
-        output_schema: join_scope_chunk_schema,
+        output_schema,
     })
+}
+
+fn join_output_chunk_schema(
+    physical: &plan::PlanNode,
+    fallback: ChunkSchemaRef,
+    node_kind: &str,
+) -> Result<ChunkSchemaRef, String> {
+    if physical.output_columns.is_empty() {
+        return Ok(fallback);
+    }
+    let output_schema = chunk_schema_from_output_columns(&physical.output_columns)
+        .map_err(|err| format!("{node_kind} output_columns: {err}"))?;
+    if output_schema.slot_ids() == fallback.slot_ids() {
+        return Ok(output_schema);
+    }
+    Ok(fallback)
 }
 
 fn hash_join_distribution_mode(join: &plan::HashJoinNode) -> Result<JoinDistributionMode, String> {
@@ -2511,6 +2532,7 @@ fn common_join_key_type(left: &DataType, right: &DataType) -> Result<Option<Data
 
 fn lower_nest_loop_join_node(
     node: &plan::DistributedNode,
+    physical: &plan::PlanNode,
     join: &plan::NestLoopJoinNode,
     children: Vec<LoweredNode>,
     arena: &mut ExprArena,
@@ -2525,6 +2547,11 @@ fn lower_nest_loop_join_node(
         left.output_schema.clone(),
         right.output_schema.clone(),
     ])?);
+    let output_schema = join_output_chunk_schema(
+        physical,
+        join_scope_chunk_schema.clone(),
+        "NestLoopJoinNode",
+    )?;
     let join_conjunct = join
         .condition
         .as_ref()
@@ -2542,11 +2569,11 @@ fn lower_nest_loop_join_node(
                 join_conjunct,
                 left_chunk_schema: left.output_schema,
                 right_chunk_schema: right.output_schema,
-                join_scope_chunk_schema: join_scope_chunk_schema.clone(),
+                join_scope_chunk_schema: output_schema.clone(),
             }),
         },
         layout: join_layout,
-        output_schema: join_scope_chunk_schema,
+        output_schema,
     })
 }
 
@@ -3119,14 +3146,23 @@ mod tests {
         encode_type(data_type).expect("encode type")
     }
 
-    fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
+    fn output_column_with_nullable(
+        column_id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> common::OutputColumn {
         common::OutputColumn {
             column_id,
             name: name.to_string(),
             r#type: Some(type_desc(&data_type)),
-            nullable: true,
+            nullable,
             is_internal: false,
         }
+    }
+
+    fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
+        output_column_with_nullable(column_id, name, data_type, true)
     }
 
     fn int_literal(value: i64) -> expr::Expr {
@@ -3302,7 +3338,22 @@ mod tests {
         name: &str,
         value: i64,
     ) -> plan::DistributedNode {
-        let columns = vec![output_column(column_id, name, DataType::Int64)];
+        one_col_values_node_with_nullable(node_id, column_id, name, value, true)
+    }
+
+    fn one_col_values_node_with_nullable(
+        node_id: i32,
+        column_id: u32,
+        name: &str,
+        value: i64,
+        nullable: bool,
+    ) -> plan::DistributedNode {
+        let columns = vec![output_column_with_nullable(
+            column_id,
+            name,
+            DataType::Int64,
+            nullable,
+        )];
         physical_node(
             node_id,
             plan::plan_node::Kind::Values(plan::ValuesNode {
@@ -4259,6 +4310,80 @@ mod tests {
             join.join_type,
             crate::exec::node::join::JoinType::Inner
         ));
+    }
+
+    #[test]
+    fn hash_join_output_schema_uses_plan_output_nullability() {
+        let output_columns = vec![
+            output_column_with_nullable(1, "lhs", DataType::Int64, false),
+            output_column_with_nullable(2, "rhs", DataType::Int64, true),
+        ];
+        let join = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: plan::JoinKind::LeftOuter as i32,
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(column_ref(2, DataType::Int64)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: plan::JoinDistribution::Broadcast as i32,
+                execution_mode: None,
+                build_runtime_filters: Vec::new(),
+            }),
+            output_columns,
+            vec![
+                one_col_values_node_with_nullable(10, 1, "lhs", 10, false),
+                one_col_values_node_with_nullable(11, 2, "rhs", 10, false),
+            ],
+        );
+
+        let lowered = lower(&join);
+        assert_eq!(
+            lowered.output_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert!(!lowered.output_schema.slots()[0].nullable());
+        assert!(lowered.output_schema.slots()[1].nullable());
+        let ExecNodeKind::Join(join) = lowered.node.kind else {
+            panic!("expected Join");
+        };
+        assert!(!join.join_scope_chunk_schema.slots()[0].nullable());
+        assert!(join.join_scope_chunk_schema.slots()[1].nullable());
+    }
+
+    #[test]
+    fn nested_loop_join_output_schema_uses_plan_output_nullability() {
+        let output_columns = vec![
+            output_column_with_nullable(1, "lhs", DataType::Int64, false),
+            output_column_with_nullable(2, "rhs", DataType::Int64, true),
+        ];
+        let join = physical_node(
+            30,
+            plan::plan_node::Kind::NestLoopJoin(plan::NestLoopJoinNode {
+                join_type: plan::JoinKind::LeftOuter as i32,
+                condition: Some(bool_literal(true)),
+            }),
+            output_columns,
+            vec![
+                one_col_values_node_with_nullable(10, 1, "lhs", 10, false),
+                one_col_values_node_with_nullable(11, 2, "rhs", 10, false),
+            ],
+        );
+
+        let lowered = lower(&join);
+        assert_eq!(
+            lowered.output_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert!(!lowered.output_schema.slots()[0].nullable());
+        assert!(lowered.output_schema.slots()[1].nullable());
+        let ExecNodeKind::NestedLoopJoin(join) = lowered.node.kind else {
+            panic!("expected NestedLoopJoin");
+        };
+        assert!(!join.join_scope_chunk_schema.slots()[0].nullable());
+        assert!(join.join_scope_chunk_schema.slots()[1].nullable());
     }
 
     #[test]

@@ -7204,6 +7204,54 @@ mod tests {
     }
 
     #[test]
+    fn not_in_value_form_marker_relations_are_nullable() {
+        use crate::sql::analysis::{QueryBody, Relation};
+
+        fn collect_marker_outputs(rel: &Relation, out: &mut Vec<(String, bool)>) {
+            match rel {
+                Relation::Subquery {
+                    alias,
+                    output_columns,
+                    ..
+                } => {
+                    if alias.starts_with("__sq_null_") || alias.starts_with("__sq_any_") {
+                        for column in output_columns {
+                            if column.name.starts_with("__has_") {
+                                out.push((column.name.clone(), column.nullable));
+                            }
+                        }
+                    }
+                }
+                Relation::Join(join) => {
+                    collect_marker_outputs(&join.left, out);
+                    collect_marker_outputs(&join.right, out);
+                }
+                _ => {}
+            }
+        }
+
+        let resolved = parse_and_analyze_for_apply_specs(
+            "SELECT k1 FROM t1 WHERE k2 NOT IN (SELECT t2.k2 FROM t2) OR false",
+        )
+        .expect("analyze value-form NOT IN");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        let mut markers = Vec::new();
+        if let Some(from) = &select.from {
+            collect_marker_outputs(from, &mut markers);
+        }
+        assert_eq!(
+            markers.len(),
+            2,
+            "nullable NOT IN should create null and nonempty marker relations"
+        );
+        for (name, nullable) in markers {
+            assert!(nullable, "{name} marker output must be nullable");
+        }
+    }
+
+    #[test]
     fn correlated_exists_inside_or_is_rejected_without_fallback() {
         let err = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE k1 = 1 OR EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)",
