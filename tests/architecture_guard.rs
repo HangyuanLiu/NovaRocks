@@ -135,6 +135,563 @@ fn source_and_test_rs_files() -> Vec<PathBuf> {
         .collect()
 }
 
+fn rs_files_under(relative_roots: &[&str]) -> Vec<PathBuf> {
+    let repo = Path::new(manifest_dir());
+    let mut files = Vec::new();
+    for root in relative_roots {
+        files.extend(rs_files(&repo.join(root)));
+    }
+    files
+}
+
+fn is_ident_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+#[derive(Clone, Copy)]
+enum RustWirePolicy {
+    StrictNoWire,
+    StarRocksProtoOnly,
+    StrictNoStarRocksWire,
+    AllowNativeProto,
+    PlannerPartitionBridge,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RustWireContext {
+    in_crate_use_group: bool,
+    in_proto_use_group: bool,
+    in_thrift_use_group: bool,
+}
+
+fn compact_line(line: &str) -> String {
+    line.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn first_ident(text: &str) -> Option<String> {
+    let start = text.find(|ch| is_ident_char(ch))?;
+    let tail = &text[start..];
+    let end = tail.find(|ch| !is_ident_char(ch)).unwrap_or(tail.len());
+    Some(tail[..end].to_string())
+}
+
+fn group_entry_modules(text: &str) -> Vec<String> {
+    text.split(',')
+        .filter_map(first_ident)
+        .filter(|entry| !matches!(entry.as_str(), "use" | "crate" | "self" | "super"))
+        .collect()
+}
+
+fn modules_after_needle(compact: &str, needle: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    let mut rest = compact;
+    while let Some(pos) = rest.find(needle) {
+        let after = &rest[pos + needle.len()..];
+        if let Some(group) = after.strip_prefix('{') {
+            let end = group.find('}').unwrap_or(group.len());
+            modules.extend(group_entry_modules(&group[..end]));
+        } else if let Some(module) = first_ident(after) {
+            modules.push(module);
+        }
+        rest = &after[after.len().min(1)..];
+    }
+    modules
+}
+
+fn line_has_ident(line: &str, ident: &str) -> bool {
+    line.match_indices(ident).any(|(idx, _)| {
+        let before = line[..idx].chars().next_back();
+        let after = line[idx + ident.len()..].chars().next();
+        before.is_none_or(|ch| !is_ident_char(ch)) && after.is_none_or(|ch| !is_ident_char(ch))
+    })
+}
+
+fn proto_reference_modules(line: &str, context: RustWireContext) -> Vec<String> {
+    let compact = compact_line(line);
+    let in_crate_group = context.in_crate_use_group || compact.contains("crate::{");
+    let mut modules = modules_after_needle(&compact, "crate::proto::");
+    modules.extend(modules_after_needle(&compact, "grpc_client::proto::"));
+    modules.extend(modules_after_needle(
+        &compact,
+        "service::grpc_client::proto::",
+    ));
+    if in_crate_group {
+        modules.extend(modules_after_needle(&compact, "proto::"));
+        if line_has_ident(line, "proto") && !compact.contains("proto::") {
+            modules.push("proto".to_string());
+        }
+    }
+    if context.in_proto_use_group {
+        modules.extend(group_entry_modules(&compact));
+    }
+    modules.sort();
+    modules.dedup();
+    modules
+}
+
+fn thrift_reference_modules(line: &str, context: RustWireContext) -> Vec<String> {
+    let compact = compact_line(line);
+    let in_crate_group = context.in_crate_use_group || compact.contains("crate::{");
+    let mut modules = modules_after_needle(&compact, "crate::thrift::");
+    if in_crate_group {
+        modules.extend(modules_after_needle(&compact, "thrift::"));
+        if line_has_ident(line, "thrift") && !compact.contains("thrift::") {
+            modules.push("thrift".to_string());
+        }
+    }
+    if context.in_thrift_use_group {
+        modules.extend(group_entry_modules(&compact));
+    }
+    if compact.contains("crate::types::arrow_thrift")
+        || (in_crate_group && compact.contains("types::arrow_thrift"))
+    {
+        modules.push("arrow_thrift".to_string());
+    }
+    modules.sort();
+    modules.dedup();
+    modules
+}
+
+fn contains_starrocks_proto_ref(line: &str) -> bool {
+    proto_reference_modules(line, RustWireContext::default())
+        .iter()
+        .any(|module| module == "starrocks")
+}
+
+fn contains_staros_proto_ref(line: &str) -> bool {
+    proto_reference_modules(line, RustWireContext::default())
+        .iter()
+        .any(|module| module == "staros")
+}
+
+fn contains_thrift_ref(line: &str) -> bool {
+    !thrift_reference_modules(line, RustWireContext::default()).is_empty()
+}
+
+fn rust_wire_policy_violates_line(
+    line: &str,
+    context: RustWireContext,
+    policy: RustWirePolicy,
+) -> bool {
+    let proto_modules = proto_reference_modules(line, context);
+    let thrift_modules = thrift_reference_modules(line, context);
+    let starrocks_proto = proto_modules.iter().any(|module| module == "starrocks");
+    let staros_proto = proto_modules.iter().any(|module| module == "staros");
+    let thrift = !thrift_modules.is_empty();
+
+    match policy {
+        RustWirePolicy::StrictNoWire => !proto_modules.is_empty() || thrift,
+        RustWirePolicy::StarRocksProtoOnly => starrocks_proto || staros_proto,
+        RustWirePolicy::StrictNoStarRocksWire | RustWirePolicy::AllowNativeProto => {
+            starrocks_proto || staros_proto || thrift
+        }
+        RustWirePolicy::PlannerPartitionBridge => {
+            starrocks_proto
+                || staros_proto
+                || (thrift && thrift_modules.iter().any(|module| module != "partitions"))
+        }
+    }
+}
+
+fn update_wire_group_depth(depth: &mut isize, line: &str) {
+    if *depth > 0 {
+        *depth += brace_delta(line);
+        if *depth < 0 {
+            *depth = 0;
+        }
+    }
+}
+
+fn start_wire_group_depth(depth: &mut isize, line: &str, needle: &str) {
+    if *depth == 0 && compact_line(line).contains(needle) {
+        *depth = brace_delta(line).max(0);
+    }
+}
+
+fn rust_wire_reference_hits(path: &Path, policy: RustWirePolicy) -> Vec<(usize, String)> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut hits = Vec::new();
+    let mut pending_cfg_test = false;
+    let mut test_depth = 0isize;
+    let mut crate_use_group_depth = 0isize;
+    let mut proto_use_group_depth = 0isize;
+    let mut thrift_use_group_depth = 0isize;
+
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+
+        if test_depth > 0 {
+            test_depth += brace_delta(line);
+            if test_depth < 0 {
+                test_depth = 0;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("#[cfg(test") {
+            pending_cfg_test = true;
+            let delta = brace_delta(line);
+            if delta > 0 {
+                test_depth = delta;
+                pending_cfg_test = false;
+            }
+            continue;
+        }
+
+        if pending_cfg_test {
+            let delta = brace_delta(line);
+            if delta > 0 {
+                test_depth = delta;
+            }
+            pending_cfg_test = false;
+            continue;
+        }
+
+        let context = RustWireContext {
+            in_crate_use_group: crate_use_group_depth > 0,
+            in_proto_use_group: proto_use_group_depth > 0,
+            in_thrift_use_group: thrift_use_group_depth > 0,
+        };
+        if !is_comment_or_blank(line) && rust_wire_policy_violates_line(line, context, policy) {
+            hits.push((idx + 1, line.trim().to_string()));
+        }
+
+        update_wire_group_depth(&mut crate_use_group_depth, line);
+        update_wire_group_depth(&mut proto_use_group_depth, line);
+        update_wire_group_depth(&mut thrift_use_group_depth, line);
+        start_wire_group_depth(&mut crate_use_group_depth, line, "usecrate::{");
+        start_wire_group_depth(&mut proto_use_group_depth, line, "usecrate::proto::{");
+        start_wire_group_depth(&mut thrift_use_group_depth, line, "usecrate::thrift::{");
+    }
+
+    hits
+}
+
+fn proto_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(proto_files(&path));
+            } else if path.extension().is_some_and(|ext| ext == "proto") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn proto_imports(path: &Path) -> Vec<(usize, String)> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut imports = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            let rest = rest
+                .strip_prefix("public ")
+                .or_else(|| rest.strip_prefix("weak "))
+                .unwrap_or(rest);
+            if let Some(rest) = rest.strip_prefix('"')
+                && let Some((import, _)) = rest.split_once('"')
+            {
+                imports.push((idx + 1, import.to_string()));
+            }
+        }
+    }
+    imports
+}
+
+fn disallowed_novarocks_proto_imports(files: &[PathBuf]) -> Vec<String> {
+    let allowed = [
+        "common.proto",
+        "expr.proto",
+        "filter.proto",
+        "plan.proto",
+        "service.proto",
+    ];
+    let mut hits = Vec::new();
+    for file in files {
+        for (line, import) in proto_imports(file) {
+            if !allowed.contains(&import.as_str()) {
+                hits.push(format!("{}:{}: import \"{}\"", rel(file), line, import));
+            }
+        }
+    }
+    hits
+}
+
+fn named_let_array_lines<'a>(text: &'a str, name: &str) -> Option<Vec<(usize, &'a str)>> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .position(|line| line.contains(&format!("let {name} = [")))?;
+    let mut block = Vec::new();
+    for (idx, line) in lines.iter().enumerate().skip(start) {
+        block.push((idx + 1, *line));
+        if line.contains("];") {
+            return Some(block);
+        }
+    }
+    Some(block)
+}
+
+fn compile_protos_call_lines<'a>(
+    text: &'a str,
+    protos_name: &str,
+) -> Option<Vec<(usize, &'a str)>> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .position(|line| compact_line(line).contains(&format!("compile_protos(&{protos_name}")))?;
+    let mut call = Vec::new();
+    for (idx, line) in lines.iter().enumerate().skip(start).take(12) {
+        call.push((idx + 1, *line));
+        if line.contains(';') || line.contains(".unwrap()") || line.contains(".context(") {
+            break;
+        }
+    }
+    Some(call)
+}
+
+fn contains_compat_proto_root(line: &str) -> bool {
+    line.contains("COMPAT_PROTO_DIR")
+        || line.contains("COMPAT_STAROS_DIR")
+        || line.contains("compat/proto")
+        || line.contains("compat/staros")
+}
+
+fn block_contains(lines: &[(usize, &str)], needle: &str) -> bool {
+    lines.iter().any(|(_, line)| line.contains(needle))
+}
+
+fn native_proto_codegen_boundary_violations(build_rs: &Path) -> Vec<String> {
+    let text = fs::read_to_string(build_rs).unwrap_or_default();
+    let mut hits = Vec::new();
+    let build_rel = rel(build_rs);
+
+    if let Some(native_block) = named_let_array_lines(&text, "novarocks_protos") {
+        for (line, text) in &native_block {
+            if contains_compat_proto_root(text) {
+                hits.push(format!(
+                    "{build_rel}:{line}: novarocks_protos must not include compat proto dirs: {}",
+                    text.trim()
+                ));
+            }
+        }
+    } else {
+        hits.push(format!("{build_rel}:1: novarocks_protos block must exist"));
+    }
+
+    if let Some(native_call) = compile_protos_call_lines(&text, "novarocks_protos") {
+        let mut call_has_compat_root = false;
+        for (line, text) in &native_call {
+            if contains_compat_proto_root(text) {
+                call_has_compat_root = true;
+                hits.push(format!(
+                    "{build_rel}:{line}: native compile_protos include roots must stay NOVAROCKS_IDL_DIR only: {}",
+                    text.trim()
+                ));
+            }
+        }
+        let compact_call = native_call
+            .iter()
+            .map(|(_, line)| compact_line(line))
+            .collect::<String>();
+        if !call_has_compat_root
+            && !compact_call.contains("compile_protos(&novarocks_protos,&[NOVAROCKS_IDL_DIR])")
+        {
+            let line = native_call.first().map(|(line, _)| *line).unwrap_or(1);
+            hits.push(format!(
+                "{build_rel}:{line}: native compile_protos include roots must be &[NOVAROCKS_IDL_DIR]"
+            ));
+        }
+    } else {
+        hits.push(format!(
+            "{build_rel}:1: native compile_protos call for novarocks_protos must exist"
+        ));
+    }
+
+    if let Some(starrocks_block) = named_let_array_lines(&text, "starrocks_protos") {
+        if !block_contains(&starrocks_block, "COMPAT_PROTO_DIR") {
+            let line = starrocks_block.first().map(|(line, _)| *line).unwrap_or(1);
+            hits.push(format!(
+                "{build_rel}:{line}: starrocks_protos must explicitly use COMPAT_PROTO_DIR"
+            ));
+        }
+    } else {
+        hits.push(format!("{build_rel}:1: starrocks_protos block must exist"));
+    }
+
+    if let Some(staros_block) = named_let_array_lines(&text, "staros_protos") {
+        if !block_contains(&staros_block, "COMPAT_STAROS_DIR") {
+            let line = staros_block.first().map(|(line, _)| *line).unwrap_or(1);
+            hits.push(format!(
+                "{build_rel}:{line}: staros_protos must explicitly use COMPAT_STAROS_DIR"
+            ));
+        }
+    } else {
+        hits.push(format!("{build_rel}:1: staros_protos block must exist"));
+    }
+    hits
+}
+
+#[test]
+fn nidl_d2c_detector_flags_proto_build_and_rust_wire_violations() {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "nidl_d2c_guard_probe_{}_{}",
+        std::process::id(),
+        "wire_refs"
+    ));
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    let proto = tmp_dir.join("service.proto");
+    fs::write(
+        &proto,
+        concat!(
+            "syntax = \"proto3\";\n",
+            "import \"common.proto\";\n",
+            "import \"../compat/proto/internal_service.proto\";\n",
+            "import \"staros/starlet.proto\";\n",
+            "import public \"../compat/proto/public.proto\";\n",
+            "import weak \"staros/weak.proto\";\n",
+        ),
+    )
+    .unwrap();
+    let proto_hits = disallowed_novarocks_proto_imports(&[proto.clone()]);
+    assert_eq!(proto_hits.len(), 4, "{proto_hits:?}");
+
+    let build_rs = tmp_dir.join("build.rs");
+    fs::write(
+        &build_rs,
+        concat!(
+            "let novarocks_protos = [idl_path(NOVAROCKS_IDL_DIR, \"service.proto\"), idl_path(COMPAT_PROTO_DIR, \"internal_service.proto\")];\n",
+            "tonic_build::configure().compile_protos(&novarocks_protos, &[NOVAROCKS_IDL_DIR, COMPAT_PROTO_DIR]).unwrap();\n",
+            "let starrocks_protos = [idl_path(COMPAT_PROTO_DIR, \"internal_service.proto\")];\n",
+            "tonic_build::configure().compile_protos(&starrocks_protos, &[COMPAT_PROTO_DIR]).unwrap();\n",
+            "let staros_protos = [idl_path(COMPAT_STAROS_DIR, \"starlet.proto\")];\n",
+            "tonic_build::configure().compile_protos(&staros_protos, &[COMPAT_STAROS_DIR]).unwrap();\n",
+        ),
+    )
+    .unwrap();
+    let build_hits = native_proto_codegen_boundary_violations(&build_rs);
+    assert_eq!(build_hits.len(), 2, "{build_hits:?}");
+    assert!(
+        build_hits.iter().all(|hit| hit.contains("build.rs:")),
+        "{build_hits:?}"
+    );
+
+    let rust = tmp_dir.join("planner.rs");
+    fs::write(
+        &rust,
+        concat!(
+            "use crate::proto::starrocks::PPlanFragment;\n",
+            "use crate::proto::staros::StarStatus;\n",
+            "use crate::thrift::types;\n",
+            "use crate::thrift::partitions;\n",
+            "use crate::{runtime, thrift::types};\n",
+            "use crate::thrift::partitions; use crate::thrift::exprs;\n",
+            "use crate::service::grpc_client::proto::starrocks::PPlanFragment;\n",
+        ),
+    )
+    .unwrap();
+    let strict_hits = rust_wire_reference_hits(&rust, RustWirePolicy::StrictNoStarRocksWire);
+    assert_eq!(strict_hits.len(), 7, "{strict_hits:?}");
+    let planner_hits = rust_wire_reference_hits(&rust, RustWirePolicy::PlannerPartitionBridge);
+    assert_eq!(planner_hits.len(), 6, "{planner_hits:?}");
+    assert!(contains_starrocks_proto_ref(
+        "use crate::proto::{starrocks};"
+    ));
+    assert!(contains_staros_proto_ref("use crate::proto::{staros};"));
+    assert!(contains_thrift_ref("use crate::{runtime, thrift::types};"));
+
+    let common = tmp_dir.join("common.rs");
+    fs::write(
+        &common,
+        concat!(
+            "use crate::{runtime, proto::plan};\n",
+            "use crate::proto::{common, plan};\n",
+            "use crate::service::grpc_client::proto::starrocks::PPlanFragment;\n",
+            "use crate::{\n",
+            "    runtime,\n",
+            "    thrift::types,\n",
+            "};\n",
+        ),
+    )
+    .unwrap();
+    let common_hits = rust_wire_reference_hits(&common, RustWirePolicy::StrictNoWire);
+    assert_eq!(common_hits.len(), 4, "{common_hits:?}");
+    let proto_only_hits = rust_wire_reference_hits(&common, RustWirePolicy::StarRocksProtoOnly);
+    assert_eq!(proto_only_hits.len(), 1, "{proto_only_hits:?}");
+
+    fs::remove_dir_all(&tmp_dir).ok();
+}
+
+#[test]
+fn nidl_d2c_novarocks_proto_imports_stay_native_only() {
+    let files = proto_files(&Path::new(manifest_dir()).join("idl/novarocks"));
+    let violations = disallowed_novarocks_proto_imports(&files);
+    assert!(
+        violations.is_empty(),
+        "idl/novarocks proto files must import only native proto files:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nidl_d2c_native_proto_codegen_root_excludes_compat_idl() {
+    let build_rs = Path::new(manifest_dir()).join("src/build.rs");
+    let violations = native_proto_codegen_boundary_violations(&build_rs);
+    assert!(
+        violations.is_empty(),
+        "native proto codegen must stay rooted at idl/novarocks, with StarRocks protos generated explicitly:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nidl_d2c_rust_wire_imports_stay_inside_owned_boundaries() {
+    let mut violations = Vec::new();
+
+    for file in rs_files_under(&["src/sql/analyzer", "src/sql/optimizer"]) {
+        for (line, text) in rust_wire_reference_hits(&file, RustWirePolicy::StrictNoStarRocksWire) {
+            violations.push(format!("{}:{}: {}", rel(&file), line, text));
+        }
+    }
+
+    for file in rs_files_under(&["src/sql/planner"]) {
+        for (line, text) in rust_wire_reference_hits(&file, RustWirePolicy::PlannerPartitionBridge)
+        {
+            violations.push(format!("{}:{}: {}", rel(&file), line, text));
+        }
+    }
+
+    for file in rs_files_under(&["src/sql/codegen/proto_encode"]) {
+        for (line, text) in rust_wire_reference_hits(&file, RustWirePolicy::StarRocksProtoOnly) {
+            violations.push(format!("{}:{}: {}", rel(&file), line, text));
+        }
+    }
+
+    for file in rs_files_under(&["src/lower/novarocks"]) {
+        for (line, text) in rust_wire_reference_hits(&file, RustWirePolicy::AllowNativeProto) {
+            violations.push(format!("{}:{}: {}", rel(&file), line, text));
+        }
+    }
+
+    for file in rs_files_under(&["src/lower/common"]) {
+        for (line, text) in rust_wire_reference_hits(&file, RustWirePolicy::StrictNoWire) {
+            violations.push(format!("{}:{}: {}", rel(&file), line, text));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "D2C Rust wire imports crossed native/planner/lowering ownership boundaries:\n{}",
+        violations.join("\n")
+    );
+}
+
 #[test]
 fn detector_flags_non_test_and_skips_cfg_test_blocks() {
     let tmp = std::env::temp_dir().join(format!(
