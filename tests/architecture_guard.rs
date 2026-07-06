@@ -5,8 +5,13 @@
 //! leak optimizer physical types into planner/codegen main paths.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+const NIDL_D3B_BASELINE_PATH: &str = "tests/proto_schema_baseline/novarocks_schema.json";
+const NIDL_D3B_WRITE_BASELINE_ENV: &str = "NOVA_WRITE_PROTO_SCHEMA_BASELINE";
+const NIDL_D3B_WRITE_BASELINE_COMMAND: &str = "NOVA_WRITE_PROTO_SCHEMA_BASELINE=1 cargo test --test architecture_guard nidl_d3b_current_schema_matches_baseline -- --nocapture";
 
 fn manifest_dir() -> &'static str {
     env!("CARGO_MANIFEST_DIR")
@@ -2258,6 +2263,42 @@ fn parse_current_novarocks_proto_schema() -> Result<ProtoSchema, String> {
     Ok(ProtoSchema { version: 1, files })
 }
 
+fn nidl_d3b_baseline_path() -> PathBuf {
+    Path::new(manifest_dir()).join(NIDL_D3B_BASELINE_PATH)
+}
+
+fn read_proto_schema_baseline(path: &Path) -> Result<ProtoSchema, String> {
+    let input = fs::read_to_string(path)
+        .map_err(|err| format!("{}: failed to read proto schema baseline: {err}", rel(path)))?;
+    serde_json::from_str(&input).map_err(|err| {
+        format!(
+            "{}: failed to parse proto schema baseline JSON: {err}",
+            rel(path)
+        )
+    })
+}
+
+fn write_proto_schema_baseline(path: &Path, schema: &ProtoSchema) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "{}: failed to create proto schema baseline directory: {err}",
+                rel(parent)
+            )
+        })?;
+    }
+
+    let mut json = serde_json::to_string_pretty(schema)
+        .map_err(|err| format!("failed to serialize proto schema baseline JSON: {err}"))?;
+    json.push('\n');
+    fs::write(path, json).map_err(|err| {
+        format!(
+            "{}: failed to write proto schema baseline: {err}",
+            rel(path)
+        )
+    })
+}
+
 fn compare_proto_schema_to_baseline(current: &ProtoSchema, baseline: &ProtoSchema) -> Vec<String> {
     let mut violations = Vec::new();
 
@@ -2308,6 +2349,102 @@ fn compare_proto_schema_to_baseline(current: &ProtoSchema, baseline: &ProtoSchem
     violations.sort();
     violations.dedup();
     violations
+}
+
+fn merge_proto_schema_baseline(
+    current: &ProtoSchema,
+    existing: &ProtoSchema,
+) -> Result<ProtoSchema, String> {
+    let unsafe_violations = compare_proto_schema_to_baseline(current, existing)
+        .into_iter()
+        .filter(|violation| !is_proto_schema_baseline_stale_violation(violation))
+        .collect::<Vec<_>>();
+    if !unsafe_violations.is_empty() {
+        return Err(format!(
+            "cannot merge proto schema baseline because current schema contains incompatible changes:\n{}",
+            format_proto_schema_violations(&unsafe_violations)
+        ));
+    }
+
+    let mut merged = current.clone();
+    for (path, existing_file) in &existing.files {
+        let Some(current_file) = current.files.get(path) else {
+            continue;
+        };
+        let Some(merged_file) = merged.files.get_mut(path) else {
+            continue;
+        };
+        merge_proto_file_schema_baseline(path, current_file, existing_file, merged_file)?;
+    }
+
+    Ok(merged)
+}
+
+fn is_proto_schema_baseline_stale_violation(violation: &str) -> bool {
+    violation.contains("baseline stale: new ")
+}
+
+fn merge_proto_file_schema_baseline(
+    path: &str,
+    current_file: &ProtoFileSchema,
+    existing_file: &ProtoFileSchema,
+    merged_file: &mut ProtoFileSchema,
+) -> Result<(), String> {
+    for (message_name, existing_message) in &existing_file.messages {
+        let Some(current_message) = current_file.messages.get(message_name) else {
+            continue;
+        };
+        let Some(merged_message) = merged_file.messages.get_mut(message_name) else {
+            continue;
+        };
+        merge_proto_message_schema_baseline(
+            path,
+            message_name,
+            current_message,
+            existing_message,
+            merged_message,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn merge_proto_message_schema_baseline(
+    path: &str,
+    message_name: &str,
+    current_message: &ProtoMessageSchema,
+    existing_message: &ProtoMessageSchema,
+    merged_message: &mut ProtoMessageSchema,
+) -> Result<(), String> {
+    for (number, existing_field) in &existing_message.fields {
+        if current_message.fields.contains_key(number) {
+            continue;
+        }
+        if current_message.reserved_numbers.contains(number)
+            && current_message
+                .reserved_names
+                .contains(&existing_field.name)
+        {
+            merged_message
+                .fields
+                .insert(*number, existing_field.clone());
+        } else {
+            return Err(format!(
+                "{path} {message_name} removed field #{number} {} without reserved number {number} and reserved name {}; refusing to write proto schema baseline",
+                existing_field.name, existing_field.name
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn format_proto_schema_violations(violations: &[String]) -> String {
+    violations
+        .iter()
+        .map(|violation| format!("  - {violation}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn compare_proto_messages_to_baseline(
@@ -2886,6 +3023,19 @@ fn assert_proto_schema_comparator_rejects_all(
     }
 }
 
+fn assert_proto_schema_baseline_merge_rejects(
+    current: ProtoSchema,
+    existing: ProtoSchema,
+    expected_error: &str,
+) {
+    let err = merge_proto_schema_baseline(&current, &existing)
+        .expect_err("expected proto schema baseline merge to reject unsafe change");
+    assert!(
+        err.contains(expected_error),
+        "expected proto schema baseline merge error containing `{expected_error}`, got: {err}"
+    );
+}
+
 #[test]
 fn nidl_d3b_proto_schema_parser_handles_current_syntax() {
     let input = r#"
@@ -2982,6 +3132,61 @@ fn nidl_d3b_proto_schema_parser_parses_all_native_proto_files() {
             .reserved_numbers
             .contains(&2)
     );
+}
+
+#[test]
+fn nidl_d3b_current_schema_matches_baseline() {
+    let current =
+        parse_current_novarocks_proto_schema().expect("current native proto schema should parse");
+    let baseline_path = nidl_d3b_baseline_path();
+
+    match env::var(NIDL_D3B_WRITE_BASELINE_ENV) {
+        Ok(value) if value == "1" => {
+            let next_baseline = if baseline_path.exists() {
+                let existing = read_proto_schema_baseline(&baseline_path)
+                    .unwrap_or_else(|err| panic!("{err}"));
+                merge_proto_schema_baseline(&current, &existing)
+                    .unwrap_or_else(|err| panic!("{err}"))
+            } else {
+                current.clone()
+            };
+
+            write_proto_schema_baseline(&baseline_path, &next_baseline)
+                .unwrap_or_else(|err| panic!("{err}"));
+            let written =
+                read_proto_schema_baseline(&baseline_path).unwrap_or_else(|err| panic!("{err}"));
+            let violations = compare_proto_schema_to_baseline(&current, &written);
+            assert!(
+                violations.is_empty(),
+                "written proto schema baseline still violates current schema:\n{}",
+                format_proto_schema_violations(&violations)
+            );
+        }
+        Ok(value) => panic!(
+            "{NIDL_D3B_WRITE_BASELINE_ENV} must be exactly `1` to write the proto schema baseline, got `{value}`"
+        ),
+        Err(env::VarError::NotUnicode(_)) => panic!(
+            "{NIDL_D3B_WRITE_BASELINE_ENV} must be valid UTF-8 and exactly `1` to write the proto schema baseline"
+        ),
+        Err(env::VarError::NotPresent) => {
+            let baseline = read_proto_schema_baseline(&baseline_path)
+                .unwrap_or_else(|err| panic!("{err}\n\n{}", nidl_d3b_baseline_update_hint()));
+            let violations = compare_proto_schema_to_baseline(&current, &baseline);
+            assert!(
+                violations.is_empty(),
+                "current native proto schema does not match baseline:\n{}\n\n{}",
+                format_proto_schema_violations(&violations),
+                nidl_d3b_baseline_update_hint()
+            );
+        }
+    }
+}
+
+fn nidl_d3b_baseline_update_hint() -> String {
+    format!(
+        "To intentionally update the proto schema ledger, run:\n{}",
+        NIDL_D3B_WRITE_BASELINE_COMMAND
+    )
 }
 
 #[test]
@@ -3453,6 +3658,61 @@ fn nidl_d3b_proto_schema_comparator_accepts_deleted_field_with_reserved_number_a
 }
 
 #[test]
+fn nidl_d3b_proto_schema_baseline_merge_preserves_reserved_deleted_field_history() {
+    let existing = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "plan", "PlanNode")]),
+        )],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message_with_reserved(
+                vec![test_proto_field(3, "fragment_plan", "bytes")],
+                &[2],
+                &["plan"],
+            ),
+        )],
+        vec![],
+        vec![],
+    );
+
+    let merged =
+        merge_proto_schema_baseline(&current, &existing).expect("baseline merge should succeed");
+    let merged_message =
+        &merged.files["idl/novarocks/test.proto"].messages["SubmitFragmentRequest"];
+
+    assert_eq!(merged_message.fields[&2].name, "plan");
+    assert_eq!(merged_message.fields[&3].name, "fragment_plan");
+    assert_proto_schema_comparator_accepts(current, merged);
+}
+
+#[test]
+fn nidl_d3b_proto_schema_baseline_merge_rejects_deleted_field_without_reserved_name() {
+    let existing = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "plan", "PlanNode")]),
+        )],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message_with_reserved(vec![], &[2], &[]),
+        )],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_baseline_merge_rejects(current, existing, "without reserved name plan");
+}
+
+#[test]
 fn nidl_d3b_proto_schema_comparator_rejects_enum_zero_value_drift() {
     let baseline = test_proto_schema(
         vec![],
@@ -3556,6 +3816,28 @@ fn nidl_d3b_proto_schema_comparator_rejects_enum_deletion() {
         baseline,
         "enum FetchResultResponse.Status removed",
     );
+}
+
+#[test]
+fn nidl_d3b_proto_schema_baseline_merge_rejects_enum_value_deletion() {
+    let existing = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![(0, "STATUS_UNSPECIFIED"), (1, "STATUS_OK")]),
+        )],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![(0, "STATUS_UNSPECIFIED")]),
+        )],
+        vec![],
+    );
+
+    assert_proto_schema_baseline_merge_rejects(current, existing, "value STATUS_OK=1 removed");
 }
 
 #[test]
@@ -3687,6 +3969,46 @@ fn nidl_d3b_proto_schema_comparator_rejects_rpc_deletion() {
     );
 
     assert_proto_schema_comparator_rejects(current, baseline, "rpc FetchResult removed");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_baseline_merge_rejects_service_deletion() {
+    let existing = test_proto_schema(
+        vec![],
+        vec![],
+        vec![(
+            "NovaRocksGrpc",
+            test_proto_service(vec![(
+                "FetchResult",
+                test_proto_rpc("FetchResultRequest", "FetchResultResponse"),
+            )]),
+        )],
+    );
+    let current = test_proto_schema(vec![], vec![], vec![]);
+
+    assert_proto_schema_baseline_merge_rejects(current, existing, "service NovaRocksGrpc removed");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_baseline_merge_rejects_rpc_deletion() {
+    let existing = test_proto_schema(
+        vec![],
+        vec![],
+        vec![(
+            "NovaRocksGrpc",
+            test_proto_service(vec![(
+                "FetchResult",
+                test_proto_rpc("FetchResultRequest", "FetchResultResponse"),
+            )]),
+        )],
+    );
+    let current = test_proto_schema(
+        vec![],
+        vec![],
+        vec![("NovaRocksGrpc", test_proto_service(vec![]))],
+    );
+
+    assert_proto_schema_baseline_merge_rejects(current, existing, "rpc FetchResult removed");
 }
 
 #[test]
