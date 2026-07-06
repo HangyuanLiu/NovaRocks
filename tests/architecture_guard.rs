@@ -4,6 +4,7 @@
 //! modules may still build optimizer trees as inputs; production code may not
 //! leak optimizer physical types into planner/codegen main paths.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -52,6 +53,64 @@ fn is_comment_or_blank(line: &str) -> bool {
         || trimmed.starts_with("//")
         || trimmed.starts_with("/*")
         || trimmed.starts_with('*')
+}
+
+fn non_comment_trimmed_lines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut in_block_comment = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if in_block_comment {
+            if trimmed.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('*') {
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+
+        lines.push(trimmed);
+    }
+
+    lines
+}
+
+fn has_non_comment_line(text: &str, needle: &str) -> bool {
+    non_comment_trimmed_lines(text)
+        .into_iter()
+        .any(|line| line == needle)
+}
+
+fn has_cfg_test_mod_tests(text: &str) -> bool {
+    non_comment_trimmed_lines(text)
+        .windows(2)
+        .any(|lines| lines == ["#[cfg(test)]", "mod tests;"])
+}
+
+fn module_declarations(text: &str) -> BTreeSet<String> {
+    non_comment_trimmed_lines(text)
+        .into_iter()
+        .filter_map(|line| {
+            let module = line.strip_prefix("mod ")?.strip_suffix(';')?;
+            if module
+                .chars()
+                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+            {
+                Some(module.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn non_test_line_hits<F>(path: &Path, mut predicate: F) -> Vec<(usize, String)>
@@ -732,6 +791,36 @@ fn prod() { let _ = crate::sql::optimizer::property::DistributionSpec::Any; }
 }
 
 #[test]
+fn nidl_d3a_detector_ignores_commented_module_declarations() {
+    let commented = "\
+// mod proto_contract;
+/*
+mod proto_contract;
+*/
+/*
+#[cfg(test)]
+mod tests;
+*/
+";
+    assert!(!has_non_comment_line(commented, "mod proto_contract;"));
+    assert!(!has_cfg_test_mod_tests(commented));
+    assert!(module_declarations(commented).is_empty());
+
+    let active = "\
+#[cfg(test)]
+// comment between attribute and module
+mod tests;
+mod proto_contract;
+";
+    assert!(has_cfg_test_mod_tests(active));
+    assert!(has_non_comment_line(active, "mod proto_contract;"));
+    assert_eq!(
+        module_declarations(active),
+        BTreeSet::from(["proto_contract".to_string(), "tests".to_string()])
+    );
+}
+
+#[test]
 fn planner_distributed_and_codegen_do_not_import_optimizer() {
     let mut checked = vec![
         src_dir().join("sql/planner/plan.rs"),
@@ -1003,6 +1092,124 @@ fn nidl_d2d_common_lowering_has_no_wire_dependencies() {
     assert!(
         violations.is_empty(),
         "src/lower/common must stay protocol-neutral and must not depend on thrift/proto/native wire adapters:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nidl_d3a_proto_contract_tests_live_under_src_tests() {
+    let repo = Path::new(manifest_dir());
+    let proto_contract_dir = repo.join("src/tests/proto_contract");
+    let mut violations = Vec::new();
+    if repo.join("src/proto_contract").exists() {
+        violations.push(
+            "src/proto_contract must not be a top-level src module; move it to src/tests/proto_contract"
+                .to_string(),
+        );
+    }
+    if !repo.join("src/tests/mod.rs").is_file() {
+        violations
+            .push("src/tests/mod.rs must own crate-internal white-box test suites".to_string());
+    }
+    if !repo.join("src/tests/proto_contract/mod.rs").is_file() {
+        violations.push(
+            "src/tests/proto_contract/mod.rs must own native proto contract tests".to_string(),
+        );
+    }
+
+    for file in [
+        "common.rs",
+        "expr.rs",
+        "filter.rs",
+        "instance_params.rs",
+        "plan.rs",
+        "report.rs",
+        "service.rs",
+    ] {
+        let path = proto_contract_dir.join(file);
+        if !path.is_file() {
+            violations.push(format!(
+                "native proto contract test file must live at {}",
+                rel(&path)
+            ));
+        }
+    }
+
+    let lib = fs::read_to_string(repo.join("src/lib.rs")).unwrap();
+    if !has_cfg_test_mod_tests(&lib) {
+        violations.push(
+            "src/lib.rs must mount crate-internal white-box tests through #[cfg(test)] mod tests"
+                .to_string(),
+        );
+    }
+    if has_non_comment_line(&lib, "mod proto_contract;") {
+        violations.push("src/lib.rs must not keep the legacy proto_contract module".to_string());
+    }
+
+    if let Ok(root_mod) = fs::read_to_string(repo.join("src/tests/mod.rs")) {
+        if !has_non_comment_line(&root_mod, "mod proto_contract;") {
+            violations.push("src/tests/mod.rs must mount the proto contract suite".to_string());
+        }
+    }
+
+    if let Ok(proto_mod) = fs::read_to_string(proto_contract_dir.join("mod.rs")) {
+        let declared_modules = module_declarations(&proto_mod);
+        let mut file_modules = BTreeSet::new();
+        if let Ok(entries) = fs::read_dir(&proto_contract_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "rs")
+                    && path.file_name().and_then(|name| name.to_str()) != Some("mod.rs")
+                {
+                    if let Some(module) = path.file_stem().and_then(|stem| stem.to_str()) {
+                        file_modules.insert(module.to_string());
+                    }
+                }
+            }
+        }
+
+        for module in &file_modules {
+            if !declared_modules.contains(module) {
+                violations.push(format!(
+                    "src/tests/proto_contract/mod.rs must declare `mod {module};`"
+                ));
+            }
+        }
+        for module in &declared_modules {
+            if !file_modules.contains(module) {
+                violations.push(format!(
+                    "src/tests/proto_contract/mod.rs declares `{module}`, but src/tests/proto_contract/{module}.rs is missing"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "proto contract test layout guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nidl_d3a_test_contract_modules_do_not_leak_into_production_code() {
+    let mut violations = Vec::new();
+    for file in rs_files(&src_dir()) {
+        let rel_path = rel(&file);
+        if rel_path == "src/lib.rs" || rel_path.starts_with("src/tests/") {
+            continue;
+        }
+
+        for (line, text) in non_test_line_hits(&file, |line| {
+            line.contains("crate::tests") || line.contains("proto_contract")
+        }) {
+            violations.push(format!("{}:{}: {}", rel_path, line, text));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "test-only contract modules must not be referenced by production code:\n{}",
         violations.join("\n")
     );
 }
