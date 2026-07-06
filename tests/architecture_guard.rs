@@ -1575,6 +1575,41 @@ fn parse_proto_package(path: &str, statement: &str) -> Result<String, String> {
     }
 }
 
+fn parse_proto_syntax(path: &str, statement: &str) -> Result<(), String> {
+    let body = proto_statement_body(statement, ";")
+        .ok_or_else(|| proto_parse_error(path, statement, "expected syntax terminator"))?;
+    let body = proto_keyword_tail(body, "syntax")
+        .ok_or_else(|| proto_parse_error(path, statement, "expected syntax declaration"))?;
+    let (left, right) = proto_split_once_top_level(body, '=')
+        .ok_or_else(|| proto_parse_error(path, statement, "expected syntax assignment"))?;
+    if !left.trim().is_empty() {
+        return Err(proto_parse_error(
+            path,
+            statement,
+            format!("unexpected syntax assignment prefix `{}`", left.trim()),
+        ));
+    }
+
+    let value = right.trim();
+    if !(value.starts_with('"') && value.ends_with('"') && value.len() >= 2) {
+        return Err(proto_parse_error(
+            path,
+            statement,
+            format!("invalid syntax literal `{value}`"),
+        ));
+    }
+    let syntax = &value[1..value.len() - 1];
+    if syntax != "proto3" {
+        return Err(proto_parse_error(
+            path,
+            statement,
+            format!("unsupported syntax `{syntax}`; expected `proto3`"),
+        ));
+    }
+
+    Ok(())
+}
+
 fn current_proto_path(stack: &[String], name: &str) -> String {
     if stack.is_empty() {
         name.to_string()
@@ -2140,7 +2175,12 @@ fn parse_proto_schema(path: &str, input: &str) -> Result<ProtoFileSchema, String
             continue;
         }
 
-        if statement.starts_with("syntax ") || statement.starts_with("import ") {
+        if statement.starts_with("syntax ") {
+            parse_proto_syntax(path, &statement)?;
+            continue;
+        }
+
+        if statement.starts_with("import ") {
             if statement.ends_with(';') {
                 continue;
             }
@@ -2299,6 +2339,21 @@ fn write_proto_schema_baseline(path: &Path, schema: &ProtoSchema) -> Result<(), 
     })
 }
 
+fn next_proto_schema_baseline_for_write(
+    current: &ProtoSchema,
+    baseline_path: &Path,
+) -> Result<ProtoSchema, String> {
+    if baseline_path.exists() {
+        let existing = read_proto_schema_baseline(baseline_path)?;
+        merge_proto_schema_baseline(current, &existing)
+    } else {
+        Err(format!(
+            "{}: proto schema baseline is missing; {NIDL_D3B_WRITE_BASELINE_ENV}=1 can only update an existing baseline after D3B is established",
+            rel(baseline_path)
+        ))
+    }
+}
+
 fn compare_proto_schema_to_baseline(current: &ProtoSchema, baseline: &ProtoSchema) -> Vec<String> {
     let mut violations = Vec::new();
 
@@ -2321,11 +2376,16 @@ fn compare_proto_schema_to_baseline(current: &ProtoSchema, baseline: &ProtoSchem
         }
     }
 
-    for path in current.files.keys() {
+    for (path, current_file) in &current.files {
         if !baseline.files.contains_key(path) {
             violations.push(format!(
                 "{path} baseline stale: new file is missing from baseline; run the proto schema baseline write command"
             ));
+            for service_name in current_file.services.keys() {
+                violations.push(format!(
+                    "{path} service {service_name} new service is not allowed; D3B only allows extending existing NovaRocksGrpc"
+                ));
+            }
         }
     }
 
@@ -3113,6 +3173,24 @@ fn nidl_d3b_proto_schema_parser_handles_current_syntax() {
 }
 
 #[test]
+fn nidl_d3b_proto_schema_parser_rejects_proto2_syntax() {
+    let err = parse_proto_schema(
+        "idl/novarocks/proto2.proto",
+        r#"
+        syntax = "proto2";
+        package novarocks.bad;
+        message Bad {
+          optional string value = 1;
+        }
+        "#,
+    )
+    .expect_err("proto2 syntax should fail");
+
+    assert!(err.contains("syntax = \"proto2\";"), "{err}");
+    assert!(err.contains("expected `proto3`"), "{err}");
+}
+
+#[test]
 fn nidl_d3b_proto_schema_parser_parses_all_native_proto_files() {
     let schema =
         parse_current_novarocks_proto_schema().expect("current native proto schema should parse");
@@ -3142,14 +3220,8 @@ fn nidl_d3b_current_schema_matches_baseline() {
 
     match env::var(NIDL_D3B_WRITE_BASELINE_ENV) {
         Ok(value) if value == "1" => {
-            let next_baseline = if baseline_path.exists() {
-                let existing = read_proto_schema_baseline(&baseline_path)
-                    .unwrap_or_else(|err| panic!("{err}"));
-                merge_proto_schema_baseline(&current, &existing)
-                    .unwrap_or_else(|err| panic!("{err}"))
-            } else {
-                current.clone()
-            };
+            let next_baseline = next_proto_schema_baseline_for_write(&current, &baseline_path)
+                .unwrap_or_else(|err| panic!("{err}"));
 
             write_proto_schema_baseline(&baseline_path, &next_baseline)
                 .unwrap_or_else(|err| panic!("{err}"));
@@ -3187,6 +3259,26 @@ fn nidl_d3b_baseline_update_hint() -> String {
         "To intentionally update the proto schema ledger, run:\n{}",
         NIDL_D3B_WRITE_BASELINE_COMMAND
     )
+}
+
+#[test]
+fn nidl_d3b_proto_schema_write_mode_rejects_missing_baseline_without_bootstrap() {
+    let missing_path = std::env::temp_dir().join(format!(
+        "novarocks-missing-proto-schema-baseline-{}.json",
+        std::process::id()
+    ));
+    fs::remove_file(&missing_path).ok();
+    let current = test_proto_schema(vec![], vec![], vec![]);
+
+    let err = next_proto_schema_baseline_for_write(&current, &missing_path)
+        .expect_err("write mode should reject a missing baseline");
+
+    assert!(err.contains("proto schema baseline is missing"), "{err}");
+    assert!(err.contains(NIDL_D3B_WRITE_BASELINE_ENV), "{err}");
+    assert!(
+        !missing_path.exists(),
+        "missing-baseline decision test must not write a real baseline"
+    );
 }
 
 #[test]
@@ -3362,6 +3454,35 @@ fn nidl_d3b_proto_schema_comparator_rejects_current_new_file_as_baseline_stale()
     )]);
 
     assert_proto_schema_comparator_rejects(current, baseline, "new file is missing from baseline");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_new_file_with_service_as_unsafe() {
+    let baseline = test_proto_schema_with_files(vec![]);
+    let current = test_proto_schema_with_files(vec![(
+        "idl/novarocks/admin.proto",
+        test_proto_file(
+            "novarocks.admin",
+            vec![],
+            vec![],
+            vec![(
+                "AdminGrpc",
+                test_proto_service(vec![(
+                    "Reload",
+                    test_proto_rpc("ReloadRequest", "ReloadResponse"),
+                )]),
+            )],
+        ),
+    )]);
+
+    assert_proto_schema_comparator_rejects_all(
+        current,
+        baseline,
+        &[
+            "new file is missing from baseline",
+            "service AdminGrpc new service is not allowed",
+        ],
+    );
 }
 
 #[test]
@@ -4009,6 +4130,32 @@ fn nidl_d3b_proto_schema_baseline_merge_rejects_rpc_deletion() {
     );
 
     assert_proto_schema_baseline_merge_rejects(current, existing, "rpc FetchResult removed");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_baseline_merge_rejects_new_file_with_service() {
+    let existing = test_proto_schema_with_files(vec![]);
+    let current = test_proto_schema_with_files(vec![(
+        "idl/novarocks/admin.proto",
+        test_proto_file(
+            "novarocks.admin",
+            vec![],
+            vec![],
+            vec![(
+                "AdminGrpc",
+                test_proto_service(vec![(
+                    "Reload",
+                    test_proto_rpc("ReloadRequest", "ReloadResponse"),
+                )]),
+            )],
+        ),
+    )]);
+
+    assert_proto_schema_baseline_merge_rejects(
+        current,
+        existing,
+        "service AdminGrpc new service is not allowed",
+    );
 }
 
 #[test]
