@@ -11,17 +11,6 @@ package novarocks;
 import "common.proto";
 import "filter.proto";
 import "plan.proto";
-// LOAD-BEARING import, NOT dead. Lookup is native in novarocks.filter, but this
-// import still anchors starrocks protobuf messages used by non-service code.
-import "internal_service.proto";
-// LOAD-BEARING import, NOT dead. No `lake.`/`starrocks.` type from this file is
-// referenced syntactically here, but this import is the SOLE anchor that pulls
-// lake_service.proto into the non-compat transitive compile, which is what emits
-// proto::starrocks::{TxnInfoPb, TxnLogPb, PublishVersionRequest, ...}. Those are
-// consumed by src/connector/starrocks/lake/** (currently ungated, in the default
-// build). Removing this import breaks the pure build. Real home: NIDL-D1 gates
-// the lake module, after which this anchor moves under the compat compile.
-import "lake_service.proto";
 
 // FE<->BE control + data-plane RPC surface. One service, all cluster-internal
 // traffic. Consumers: src/service/grpc_server.rs (server), src/service/
