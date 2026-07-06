@@ -282,6 +282,26 @@ fn legacy_lower_path_hits(path: &Path) -> Vec<(usize, String)> {
     hits
 }
 
+fn legacy_lower_filesystem_path_hits(path: &Path) -> Vec<(usize, String)> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let legacy_dirs = [
+        concat!("/lower/", "expr"),
+        concat!("/lower/", "fragment"),
+        concat!("/lower/", "layout"),
+        concat!("/lower/", "node"),
+        concat!("/lower/", "sink"),
+        concat!("/lower/", "type_lowering"),
+        concat!("/lower", "_native"),
+    ];
+    let mut hits = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        if legacy_dirs.iter().any(|needle| line.contains(needle)) {
+            hits.push((idx + 1, line.trim().to_string()));
+        }
+    }
+    hits
+}
+
 #[test]
 fn nidl_d2d_detector_flags_visibility_variants_and_grouped_imports() {
     let root_mod = concat!(
@@ -313,12 +333,17 @@ fn nidl_d2d_detector_flags_visibility_variants_and_grouped_imports() {
             "fn f() { let _ = crate::",
             "lower::",
             "thrift::PlanOrigin::StarRocksFeCompatible; }\n",
+            "const P: &str = \"../../",
+            "lower/",
+            "sink/iceberg.rs\";\n",
         ),
     )
     .unwrap();
     let path_hits = legacy_lower_path_hits(&tmp);
+    let file_path_hits = legacy_lower_filesystem_path_hits(&tmp);
     fs::remove_file(&tmp).ok();
     assert_eq!(path_hits.len(), 3, "{path_hits:?}");
+    assert_eq!(file_path_hits.len(), 1, "{file_path_hits:?}");
 }
 
 #[test]
@@ -584,6 +609,9 @@ fn nidl_d2d_legacy_lowering_paths_do_not_remain() {
             violations.push(format!("{}:{}: {}", rel(&file), line, text));
         }
         for (line, text) in legacy_lower_path_hits(&file) {
+            violations.push(format!("{}:{}: {}", rel(&file), line, text));
+        }
+        for (line, text) in legacy_lower_filesystem_path_hits(&file) {
             violations.push(format!("{}:{}: {}", rel(&file), line, text));
         }
     }
