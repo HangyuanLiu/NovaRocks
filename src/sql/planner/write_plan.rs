@@ -349,7 +349,7 @@ fn tdata_partition_placeholder(
 ) -> partitions::TDataPartition {
     partitions::TDataPartition::new(
         partition_type,
-        None::<Vec<crate::thrift::exprs::TExpr>>,
+        None,
         None::<Vec<partitions::TRangePartition>>,
         None::<Vec<partitions::TBucketProperty>>,
     )
