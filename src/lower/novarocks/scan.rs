@@ -1278,7 +1278,7 @@ fn maybe_project_data_scan_output(
 }
 
 fn scan_batch_size(
-    query_options: Option<&crate::runtime::native_fragment_wire::QueryOptions>,
+    query_options: Option<&crate::runtime::runtime_state::QueryOptions>,
 ) -> Result<usize, String> {
     let Some(value) = query_options.and_then(|opts| opts.batch_size) else {
         return Ok(4096);

@@ -24,10 +24,9 @@ use crate::common::config::{
 use crate::common::types::UniqueId;
 use crate::exec::spill::QuerySpillManager;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::native_fragment_wire::{QueryOptions, RuntimeFilterParams};
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
-use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::runtime_state::{QueryOptions, RuntimeFilterParams, RuntimeState};
 
 pub(crate) struct RuntimeStateInputs {
     pub(crate) query_options: Option<QueryOptions>,

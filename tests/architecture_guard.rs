@@ -424,6 +424,33 @@ fn nidl_d2d_legacy_lowering_paths_do_not_remain() {
 }
 
 #[test]
+fn nidl_d2d_common_lowering_has_no_wire_dependencies() {
+    let common_dir = src_dir().join("lower/common");
+    let forbidden = [
+        "native_fragment_wire",
+        "crate::thrift",
+        "crate::proto",
+        "thrift::",
+        "proto::",
+    ];
+
+    let mut violations = Vec::new();
+    for file in rs_files(&common_dir) {
+        for needle in forbidden {
+            for (line, text) in source_line_hits(&file, |line| line.contains(needle)) {
+                violations.push(format!("{}:{}: {}", rel(&file), line, text));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "src/lower/common must stay protocol-neutral and must not depend on thrift/proto/native wire adapters:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn distributed_build_does_not_call_optimizer_cost_model() {
     let file = src_dir().join("sql/planner/distributed_plan_build.rs");
     let mut violations = Vec::new();

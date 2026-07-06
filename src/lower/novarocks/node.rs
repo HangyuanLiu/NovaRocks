@@ -55,7 +55,7 @@ use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common, expr, novarocks, plan};
 use crate::runtime::exchange::ExchangeKey;
-use crate::runtime::native_fragment_wire;
+use crate::runtime::runtime_state::QueryOptions;
 use crate::sql::codegen::expr_compiler::infer_agg_function_types;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::types::wider_type;
@@ -71,7 +71,7 @@ pub(crate) struct LoweredNode {
 pub(crate) struct NodeLoweringContext {
     exchange_sender_counts: HashMap<ExchangeKey, usize>,
     scan_ranges: HashMap<i32, Vec<novarocks::ScanRange>>,
-    query_options: Option<native_fragment_wire::QueryOptions>,
+    query_options: Option<QueryOptions>,
     connectors: Option<Arc<crate::connector::ConnectorRegistry>>,
     fragment_instance_hi: i64,
     fragment_instance_lo: i64,
@@ -102,10 +102,7 @@ impl NodeLoweringContext {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn with_query_options(
-        mut self,
-        query_options: Option<native_fragment_wire::QueryOptions>,
-    ) -> Self {
+    pub(crate) fn with_query_options(mut self, query_options: Option<QueryOptions>) -> Self {
         self.query_options = query_options;
         self
     }
@@ -126,7 +123,7 @@ impl NodeLoweringContext {
             .ok_or_else(|| format!("native ScanNode node_id={node_id} missing scan ranges"))
     }
 
-    pub(crate) fn query_options(&self) -> Option<&native_fragment_wire::QueryOptions> {
+    pub(crate) fn query_options(&self) -> Option<&QueryOptions> {
         self.query_options.as_ref()
     }
 

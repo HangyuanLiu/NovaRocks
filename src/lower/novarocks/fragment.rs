@@ -43,6 +43,7 @@ use crate::runtime::native_fragment_wire as native_wire;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::result_buffer;
+use crate::runtime::runtime_state::QueryOptions;
 use crate::{connector, proto};
 
 pub(crate) fn execute_fragment_native(
@@ -171,7 +172,7 @@ fn query_id_from_native(src: &proto::common::UniqueId) -> QueryId {
 
 fn node_context_from_instance_params(
     instance_params: &proto::novarocks::InstanceParams,
-    query_options: Option<native_wire::QueryOptions>,
+    query_options: Option<QueryOptions>,
     fragment_instance_id: UniqueId,
 ) -> Result<NodeLoweringContext, String> {
     let mut ctx = NodeLoweringContext::default()

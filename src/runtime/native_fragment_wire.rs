@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use thrift::OrderedFloat;
 
 use crate::proto;
+use crate::runtime::runtime_state::{QueryOptions, RuntimeFilterParams};
 use crate::thrift::{data_sinks, internal_service, partitions, runtime_filter, types};
 
 pub(crate) type NetworkAddress = types::TNetworkAddress;
@@ -34,9 +35,7 @@ pub(crate) type MultiCastDataStreamSink = data_sinks::TMultiCastDataStreamSink;
 pub(crate) type PlanFragmentDestination = data_sinks::TPlanFragmentDestination;
 pub(crate) type PlanFragmentExecParams = internal_service::TPlanFragmentExecParams;
 pub(crate) type DataPartition = partitions::TDataPartition;
-pub(crate) type QueryOptions = internal_service::TQueryOptions;
 pub(crate) type ResultSinkType = data_sinks::TResultSinkType;
-pub(crate) type RuntimeFilterParams = runtime_filter::TRuntimeFilterParams;
 
 #[cfg(test)]
 pub(crate) type SpillMode = internal_service::TSpillMode;

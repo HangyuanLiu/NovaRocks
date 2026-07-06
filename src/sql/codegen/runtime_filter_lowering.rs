@@ -59,7 +59,7 @@ pub(in crate::sql::codegen) fn local_rf_waiting_sets(
 
 /// Remap a runtime filter's `expr_order` from the join's PRE-demote
 /// `op.eq_conditions` index space to the POST-demote `eq_join_conjuncts`
-/// index space that BE lowering indexes (`src/lower/node/hash_join.rs`).
+/// index space that BE lowering indexes (`src/lower/compact/node/hash_join.rs`).
 ///
 /// `surviving_eq_origin[j]` is the original `op.eq_conditions` index of the
 /// `j`-th surviving (non-demoted) `eq_join_conjuncts` entry — built in
