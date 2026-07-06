@@ -266,28 +266,25 @@ impl ExecutionCoordinator {
 
         // Snapshot the per-consumer-fragment instance destinations for CTE
         // multicast sub-sinks (each consumer fans out to all of its instances).
-        let consumer_dests: BTreeMap<FragmentId, Vec<data_sinks::TPlanFragmentDestination>> = plan
+        let consumer_dests: BTreeMap<
+            FragmentId,
+            Vec<crate::runtime::endpoint::FragmentDestination>,
+        > = plan
             .by_fragment
             .iter()
             .map(|(fid, insts)| {
-                let dests: Result<Vec<_>, String> = insts
+                let dests = insts
                     .iter()
                     .map(|inst| {
-                        let addr = live_backend_addr(&live, inst.backend_idx)?;
-                        Ok(data_sinks::TPlanFragmentDestination::new(
+                        crate::runtime::endpoint::FragmentDestination::new(
                             inst.finst_id.clone(),
-                            None::<types::TNetworkAddress>,
-                            Some(types::TNetworkAddress::new(
-                                addr.ip().to_string(),
-                                addr.port() as i32,
-                            )),
-                            None::<i32>,
-                        ))
+                            inst.endpoint.clone(),
+                        )
                     })
                     .collect();
-                dests.map(|d| (*fid, d))
+                (*fid, dests)
             })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+            .collect();
 
         let fr_by_id: BTreeMap<FragmentId, &crate::sql::codegen::FragmentBuildResult> =
             fragment_results
@@ -355,10 +352,15 @@ impl ExecutionCoordinator {
                 } else if let Some(edge) = stream_edge {
                     let stream_sink = build_stream_sink_for_edge(edge);
                     let output_sink = wrap_data_stream_sink(stream_sink);
+                    let exec_destinations = placement
+                        .destinations
+                        .iter()
+                        .map(thrift_destination_from_native)
+                        .collect();
                     (
                         output_sink,
                         edge.output_partition.clone(),
-                        Some(placement.destinations.clone()),
+                        Some(exec_destinations),
                     )
                 } else if let Some((router_group_id, branch_edges)) = router_edges {
                     let template = fr
@@ -406,12 +408,14 @@ impl ExecutionCoordinator {
                         sinks.push(stream_sink);
                         let dests = consumer_dests
                             .get(consumer_fragment_id)
-                            .cloned()
                             .ok_or_else(|| {
                                 format!(
                                     "CTE consumer fragment {consumer_fragment_id} has no placements"
                                 )
-                            })?;
+                            })?
+                            .iter()
+                            .map(thrift_destination_from_native)
+                            .collect();
                         destinations.push(dests);
                     }
                     let multi_cast_sink =
@@ -526,19 +530,35 @@ impl ExecutionCoordinator {
                             }
                         }
                         patch_native_iceberg_delta_scan_payloads(&mut native_fragment, &fr.plan)?;
-                        let exec = params.params.as_ref().ok_or_else(|| {
+                        params.params.as_ref().ok_or_else(|| {
                             format!(
                                 "fragment {fragment_id} missing exec params while plan_wire_format=proto"
                             )
                         })?;
+                        let native_rf_builder_number = runtime_filter_builder_number_for_instance(
+                            rf_plan.as_ref(),
+                            &instance_counts,
+                        );
+                        let native_rf_max_size = if rf_plan.is_some() {
+                            16_i64 * 1024 * 1024
+                        } else {
+                            0
+                        };
+                        let fragment_report_endpoint = params
+                            .novarocks_report_addr
+                            .as_ref()
+                            .map(crate::runtime::endpoint::RuntimeEndpoint::from_network_address)
+                            .transpose()?;
                         let native_instance_params =
                             crate::sql::codegen::proto_encode::instance::encode_instance_params(
                                 &query_id,
                                 placement,
                                 query_options.as_ref(),
-                                exec.runtime_filter_params.as_ref(),
+                                &placement.runtime_filter_prober_params,
+                                &native_rf_builder_number,
+                                native_rf_max_size,
                                 placement.instance_index as i32,
-                                params.novarocks_report_addr.as_ref(),
+                                fragment_report_endpoint.as_ref(),
                                 params.novarocks_typed_result_sink.unwrap_or(false),
                             )?;
                         FragmentSubmission::with_native(
@@ -1092,12 +1112,11 @@ fn wrap_iceberg_change_stream_router_sink(
             })?
             .iter()
             .map(|placement| {
-                data_sinks::TPlanFragmentDestination::new(
+                let destination = crate::runtime::endpoint::FragmentDestination::new(
                     placement.finst_id.clone(),
-                    None::<types::TNetworkAddress>,
-                    Some(placement.brpc_server.clone()),
-                    None::<i32>,
-                )
+                    placement.endpoint.clone(),
+                );
+                thrift_destination_from_native(&destination)
             })
             .collect();
 
@@ -1723,18 +1742,12 @@ fn patch_native_iceberg_change_stream_router_sink(
             destinations: dests
                 .iter()
                 .map(|placement| {
-                    Ok(crate::proto::plan::StreamDestination {
-                        finst_id: Some(crate::proto::common::UniqueId {
-                            hi: placement.finst_id.hi,
-                            lo: placement.finst_id.lo,
-                        }),
-                        brpc_addr: format!(
-                            "{}:{}",
-                            placement.brpc_server.hostname, placement.brpc_server.port
-                        ),
-                    })
+                    native_stream_destination(&crate::runtime::endpoint::FragmentDestination::new(
+                        placement.finst_id.clone(),
+                        placement.endpoint.clone(),
+                    ))
                 })
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect(),
         });
     }
 
@@ -1773,7 +1786,7 @@ fn patch_native_cte_multicast_sink(
     fragment_id: FragmentId,
     cte_id: CteId,
     consumers: &[(FragmentId, i32, partitions::TDataPartition, Vec<i32>)],
-    consumer_dests: &BTreeMap<FragmentId, Vec<data_sinks::TPlanFragmentDestination>>,
+    consumer_dests: &BTreeMap<FragmentId, Vec<crate::runtime::endpoint::FragmentDestination>>,
 ) -> Result<(), String> {
     if consumers.is_empty() {
         return Err(format!("CTE fragment (cte_id={cte_id}) has no consumers"));
@@ -1791,10 +1804,7 @@ fn patch_native_cte_multicast_sink(
             format!("CTE consumer fragment {consumer_fragment_id} has no placements")
         })?;
         destinations.push(crate::proto::plan::StreamDestinationList {
-            destinations: dests
-                .iter()
-                .map(native_stream_destination_from_thrift)
-                .collect::<Result<Vec<_>, _>>()?,
+            destinations: dests.iter().map(native_stream_destination).collect(),
         });
     }
     fragment.sink = Some(crate::proto::plan::DataSink {
@@ -1814,19 +1824,27 @@ fn patch_native_cte_multicast_sink(
     Ok(())
 }
 
-fn native_stream_destination_from_thrift(
-    src: &data_sinks::TPlanFragmentDestination,
-) -> Result<crate::proto::plan::StreamDestination, String> {
-    let brpc = src.brpc_server.as_ref().ok_or_else(|| {
-        "TPlanFragmentDestination.brpc_server is required for native multicast sink".to_string()
-    })?;
-    Ok(crate::proto::plan::StreamDestination {
+fn thrift_destination_from_native(
+    src: &crate::runtime::endpoint::FragmentDestination,
+) -> data_sinks::TPlanFragmentDestination {
+    data_sinks::TPlanFragmentDestination::new(
+        src.finst_id().clone(),
+        None::<types::TNetworkAddress>,
+        Some(src.endpoint().to_network_address()),
+        None::<i32>,
+    )
+}
+
+fn native_stream_destination(
+    src: &crate::runtime::endpoint::FragmentDestination,
+) -> crate::proto::plan::StreamDestination {
+    crate::proto::plan::StreamDestination {
         finst_id: Some(crate::proto::common::UniqueId {
-            hi: src.fragment_instance_id.hi,
-            lo: src.fragment_instance_id.lo,
+            hi: src.finst_id().hi,
+            lo: src.finst_id().lo,
         }),
-        brpc_addr: format!("{}:{}", brpc.hostname, brpc.port),
-    })
+        grpc_endpoint: src.endpoint().as_host_port(),
+    }
 }
 
 fn native_data_partition_from_thrift(
@@ -1882,25 +1900,56 @@ fn native_data_partition_from_thrift_with_exprs(
 /// filter at N > 1 instances (wrong join results).
 fn build_instance_runtime_filter_params(
     rf_plan: &RuntimeFilterPlanResult,
-    id_to_prober_params: &BTreeMap<i32, Vec<runtime_filter::TRuntimeFilterProberParams>>,
+    id_to_prober_params: &BTreeMap<
+        i32,
+        Vec<crate::runtime::endpoint::RuntimeFilterProberDestination>,
+    >,
     instance_counts: &BTreeMap<FragmentId, usize>,
 ) -> runtime_filter::TRuntimeFilterParams {
-    let mut builder_number: BTreeMap<i32, i32> = BTreeMap::new();
-    for (build_frag_id, filter_ids) in &rf_plan.build_side_filters {
-        let n_builders = instance_counts
-            .get(build_frag_id)
-            .map(|&n| n as i32)
-            .unwrap_or(1);
-        for fid in filter_ids {
-            builder_number.insert(*fid, n_builders);
-        }
-    }
+    let thrift_probers: BTreeMap<i32, Vec<runtime_filter::TRuntimeFilterProberParams>> =
+        id_to_prober_params
+            .iter()
+            .map(|(filter_id, probers)| {
+                (
+                    *filter_id,
+                    probers
+                        .iter()
+                        .map(|prober| {
+                            runtime_filter::TRuntimeFilterProberParams::new(
+                                Some(prober.fragment_instance_id().clone()),
+                                Some(prober.endpoint().to_network_address()),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+    let builder_number = runtime_filter_builder_number_for_instance(Some(rf_plan), instance_counts);
     runtime_filter::TRuntimeFilterParams::new(
-        id_to_prober_params.clone(),
-        builder_number,
-        16_i64 * 1024 * 1024,
+        (!thrift_probers.is_empty()).then_some(thrift_probers),
+        (!builder_number.is_empty()).then_some(builder_number),
+        Some(16_i64 * 1024 * 1024),
         None::<std::collections::BTreeSet<i32>>,
     )
+}
+
+fn runtime_filter_builder_number_for_instance(
+    rf_plan: Option<&RuntimeFilterPlanResult>,
+    instance_counts: &BTreeMap<FragmentId, usize>,
+) -> BTreeMap<i32, i32> {
+    let mut builder_number = BTreeMap::new();
+    if let Some(rf_plan) = rf_plan {
+        for (build_frag_id, filter_ids) in &rf_plan.build_side_filters {
+            let n_builders = instance_counts
+                .get(build_frag_id)
+                .map(|&n| n as i32)
+                .unwrap_or(1);
+            for filter_id in filter_ids {
+                builder_number.insert(*filter_id, n_builders);
+            }
+        }
+    }
+    builder_number
 }
 
 /// Inject the designated runtime-filter merge node into every descriptor that
@@ -3419,7 +3468,8 @@ mod tests {
             instance_index,
             finst_id: types::TUniqueId::new(11, finst_lo),
             backend_idx: instance_index,
-            brpc_server: types::TNetworkAddress::new(host.to_string(), 9010),
+            endpoint: crate::runtime::endpoint::RuntimeEndpoint::new(host, 9010)
+                .expect("test endpoint"),
             scan_ranges: BTreeMap::new(),
             destinations: Vec::new(),
             runtime_filter_prober_params: BTreeMap::new(),
