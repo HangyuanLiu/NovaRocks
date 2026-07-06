@@ -1490,9 +1490,7 @@ fn lower_exchange_receiver(
         }
         plan::exchange_flavor::Kind::LimitOffset(_) => {}
         plan::exchange_flavor::Kind::TopnSplit(_) => {}
-        plan::exchange_flavor::Kind::CteMulticast(_) => {
-            return unsupported("ExchangeReceiver CteMulticast");
-        }
+        plan::exchange_flavor::Kind::CteMulticast(_) => {}
     }
 
     let key = ctx.exchange_key(node.node_id);
@@ -3283,6 +3281,36 @@ mod tests {
         }
     }
 
+    fn cte_multicast_exchange_node(node_id: i32) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Exchange(
+                plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Unpartitioned as i32,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 7,
+                    output_columns: vec![output_column(1, "id", DataType::Int64)],
+                    output_qualifier: None,
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::CteMulticast(
+                            plan::CteMulticastFlavor {
+                                cte_id: 3,
+                                receive_producer_column_ids: vec![1],
+                            },
+                        )),
+                    }),
+                },
+            )),
+        }
+    }
+
     fn physical_node(
         node_id: i32,
         kind: plan::plan_node::Kind,
@@ -4007,6 +4035,31 @@ mod tests {
         assert_eq!(limit.offset, 1);
         let ExecNodeKind::ExchangeSource(exchange) = limit.input.kind else {
             panic!("expected ExchangeSource under Limit");
+        };
+        assert_eq!(exchange.expected_senders, 2);
+        assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_cte_multicast_exchange_receiver_as_exchange_source() {
+        let mut arena = ExprArena::default();
+        let lowered = lower_proto_node(
+            &cte_multicast_exchange_node(43),
+            &mut arena,
+            &NodeLoweringContext::default().with_exchange_sender_count(
+                ExchangeKey {
+                    finst_id_hi: 0,
+                    finst_id_lo: 0,
+                    node_id: 43,
+                },
+                2,
+            ),
+        )
+        .expect("CTE multicast exchange receiver");
+
+        let ExecNodeKind::ExchangeSource(exchange) = lowered.node.kind else {
+            panic!("expected ExchangeSource");
         };
         assert_eq!(exchange.expected_senders, 2);
         assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
