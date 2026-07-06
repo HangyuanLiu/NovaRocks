@@ -126,11 +126,26 @@ fn compat_feature_enabled() -> bool {
     env::var_os("CARGO_FEATURE_COMPAT").is_some()
 }
 
+const NOVAROCKS_IDL_DIR: &str = "idl/novarocks";
+const COMPAT_THRIFT_DIR: &str = "idl/compat/thrift";
+const COMPAT_PROTO_DIR: &str = "idl/compat/proto";
+const COMPAT_STAROS_DIR: &str = "idl/compat/staros";
+
+fn idl_path(dir: &str, file: &str) -> PathBuf {
+    Path::new(dir).join(file)
+}
+
+fn print_rerun_files(dir: &str, files: &[&str]) {
+    for file in files {
+        println!("cargo:rerun-if-changed={}", idl_path(dir, file).display());
+    }
+}
+
 fn validate_thrift_rs_namespaces() {
-    let thrift_dir = Path::new("idl/thrift");
+    let thrift_dir = Path::new(COMPAT_THRIFT_DIR);
     let mut missing = Vec::new();
     let mut entries = fs::read_dir(thrift_dir)
-        .expect("read idl/thrift dir")
+        .expect("read compat thrift dir")
         .map(|entry| entry.expect("read thrift dir entry").path())
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("thrift"))
         .collect::<Vec<_>>();
@@ -223,45 +238,65 @@ fn main() {
     println!("cargo:rerun-if-changed=src/shim/compat.cpp");
     println!("cargo:rerun-if-changed=src/shim/compat.h");
     println!("cargo:rerun-if-changed=src/shim/brpc_server.cpp");
-    println!("cargo:rerun-if-changed=idl/thrift/HeartbeatService.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/BackendService.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/InternalService.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/FrontendService.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/Data.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/Planner.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/PlanNodes.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/DataSinks.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/Exprs.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/Opcodes.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/Status.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/StatusCode.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/Types.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/AgentService.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/StarrocksExternalService.thrift");
-    println!("cargo:rerun-if-changed=idl/thrift/Descriptors.thrift");
-    println!("cargo:rerun-if-changed=idl/proto/internal_service.proto");
-    println!("cargo:rerun-if-changed=idl/proto/data.proto");
-    println!("cargo:rerun-if-changed=idl/proto/status.proto");
-    println!("cargo:rerun-if-changed=idl/proto/types.proto");
-    println!("cargo:rerun-if-changed=idl/proto/binlog.proto");
-    println!("cargo:rerun-if-changed=idl/proto/descriptors.proto");
-    println!("cargo:rerun-if-changed=idl/proto/olap_common.proto");
-    println!("cargo:rerun-if-changed=idl/proto/olap_file.proto");
-    println!("cargo:rerun-if-changed=idl/proto/lake_types.proto");
-    println!("cargo:rerun-if-changed=idl/proto/lake_service.proto");
-    println!("cargo:rerun-if-changed=idl/proto/tablet_schema.proto");
-    println!("cargo:rerun-if-changed=idl/novarocks/common.proto");
-    println!("cargo:rerun-if-changed=idl/novarocks/expr.proto");
-    println!("cargo:rerun-if-changed=idl/novarocks/filter.proto");
-    println!("cargo:rerun-if-changed=idl/novarocks/plan.proto");
-    println!("cargo:rerun-if-changed=idl/novarocks/service.proto");
-    println!("cargo:rerun-if-changed=idl/proto/staros/starlet.proto");
-    println!("cargo:rerun-if-changed=idl/proto/staros/manager.proto");
-    println!("cargo:rerun-if-changed=idl/proto/staros/service.proto");
-    println!("cargo:rerun-if-changed=idl/proto/staros/star_status.proto");
-    println!("cargo:rerun-if-changed=idl/proto/staros/file_store.proto");
-    println!("cargo:rerun-if-changed=idl/proto/staros/shard.proto");
-    println!("cargo:rerun-if-changed=idl/proto/staros/worker.proto");
+    print_rerun_files(
+        COMPAT_THRIFT_DIR,
+        &[
+            "HeartbeatService.thrift",
+            "BackendService.thrift",
+            "InternalService.thrift",
+            "FrontendService.thrift",
+            "Data.thrift",
+            "Planner.thrift",
+            "PlanNodes.thrift",
+            "DataSinks.thrift",
+            "Exprs.thrift",
+            "Opcodes.thrift",
+            "Status.thrift",
+            "StatusCode.thrift",
+            "Types.thrift",
+            "AgentService.thrift",
+            "StarrocksExternalService.thrift",
+            "Descriptors.thrift",
+        ],
+    );
+    print_rerun_files(
+        COMPAT_PROTO_DIR,
+        &[
+            "internal_service.proto",
+            "data.proto",
+            "status.proto",
+            "types.proto",
+            "binlog.proto",
+            "descriptors.proto",
+            "olap_common.proto",
+            "olap_file.proto",
+            "lake_types.proto",
+            "lake_service.proto",
+            "tablet_schema.proto",
+        ],
+    );
+    print_rerun_files(
+        NOVAROCKS_IDL_DIR,
+        &[
+            "common.proto",
+            "expr.proto",
+            "filter.proto",
+            "plan.proto",
+            "service.proto",
+        ],
+    );
+    print_rerun_files(
+        COMPAT_STAROS_DIR,
+        &[
+            "starlet.proto",
+            "manager.proto",
+            "service.proto",
+            "star_status.proto",
+            "file_store.proto",
+            "shard.proto",
+            "worker.proto",
+        ],
+    );
     println!("cargo:rerun-if-env-changed=STARROCKS_THIRDPARTY");
     println!("cargo:rerun-if-env-changed=STARROCKS_GCC_HOME");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_COMPAT");
@@ -315,18 +350,19 @@ fn main() {
     // C++ thrift codegen — only needed for compat builds.
     if compat {
         let thrift_cmd = find_tool("thrift", &tp_bin);
-        for thrift_file in [
-            "idl/thrift/HeartbeatService.thrift",
-            "idl/thrift/InternalService.thrift",
-        ] {
+        for thrift_file in ["HeartbeatService.thrift", "InternalService.thrift"] {
+            let thrift_path = idl_path(COMPAT_THRIFT_DIR, thrift_file);
             let thrift_status = std::process::Command::new(&thrift_cmd)
-                .args(["-r", "-I", "idl/thrift", "--gen", "cpp", "-out"])
+                .args(["-r", "-I", COMPAT_THRIFT_DIR, "--gen", "cpp", "-out"])
                 .arg(&thrift_out)
-                .arg(thrift_file)
+                .arg(&thrift_path)
                 .status()
                 .expect("run thrift");
             if !thrift_status.success() {
-                panic!("thrift codegen failed for {thrift_file} with status={thrift_status}");
+                panic!(
+                    "thrift codegen failed for {} with status={thrift_status}",
+                    thrift_path.display()
+                );
             }
         }
     }
@@ -335,19 +371,23 @@ fn main() {
     // Uses thirdparty thrift if available, otherwise falls back to PATH.
     let thrift_rs_cmd = find_tool("thrift", &tp_bin);
     for thrift_file in [
-        "idl/thrift/InternalService.thrift",
-        "idl/thrift/FrontendService.thrift",
-        "idl/thrift/HeartbeatService.thrift",
-        "idl/thrift/BackendService.thrift",
+        "InternalService.thrift",
+        "FrontendService.thrift",
+        "HeartbeatService.thrift",
+        "BackendService.thrift",
     ] {
+        let thrift_path = idl_path(COMPAT_THRIFT_DIR, thrift_file);
         let thrift_rs_status = std::process::Command::new(&thrift_rs_cmd)
-            .args(["-r", "-I", "idl/thrift", "--gen", "rs", "-out"])
+            .args(["-r", "-I", COMPAT_THRIFT_DIR, "--gen", "rs", "-out"])
             .arg(&thrift_rs_out)
-            .arg(thrift_file)
+            .arg(&thrift_path)
             .status()
             .expect("run thrift --gen rs");
         if !thrift_rs_status.success() {
-            panic!("thrift rs codegen failed for {thrift_file} with status={thrift_rs_status}");
+            panic!(
+                "thrift rs codegen failed for {} with status={thrift_rs_status}",
+                thrift_path.display()
+            );
         }
     }
 
@@ -385,24 +425,25 @@ fn main() {
     // — only needed for compat builds.
     if compat {
         let proto_files = [
-            "idl/proto/status.proto",
-            "idl/proto/types.proto",
-            "idl/proto/data.proto",
-            "idl/proto/binlog.proto",
-            "idl/proto/olap_common.proto",
-            "idl/proto/tablet_schema.proto",
-            "idl/proto/olap_file.proto",
-            "idl/proto/descriptors.proto",
-            "idl/proto/lake_types.proto",
-            "idl/proto/lake_service.proto",
-            "idl/proto/internal_service.proto",
-        ];
+            "status.proto",
+            "types.proto",
+            "data.proto",
+            "binlog.proto",
+            "olap_common.proto",
+            "tablet_schema.proto",
+            "olap_file.proto",
+            "descriptors.proto",
+            "lake_types.proto",
+            "lake_service.proto",
+            "internal_service.proto",
+        ]
+        .map(|file| idl_path(COMPAT_PROTO_DIR, file));
 
         let protoc_cmd = find_tool("protoc", &tp_bin);
         let mut protoc = std::process::Command::new(&protoc_cmd);
-        protoc.arg("-I").arg("idl/proto");
+        protoc.arg("-I").arg(COMPAT_PROTO_DIR);
         protoc.arg("--cpp_out").arg(&proto_out);
-        for file in proto_files {
+        for file in &proto_files {
             protoc.arg(file);
         }
         let protoc_status = protoc.status().expect("run protoc");
@@ -549,35 +590,30 @@ static C++ runtime is required.",
         std::env::set_var("PROTOC", protoc);
     }
 
-    // NIDL-0: novarocks service.proto lives in idl/novarocks/. It still
-    // imports internal_service.proto (and the load-bearing lake_service.proto)
-    // from idl/proto/, so both dirs are include roots. idl/novarocks first so
-    // its files win on any future name overlap.
+    // D2A: service.proto still has load-bearing StarRocks proto imports until
+    // D2B removes them, so native tonic generation temporarily includes the
+    // compat proto root. The native IDL files themselves remain in idl/novarocks.
+    let novarocks_protos = [
+        idl_path(NOVAROCKS_IDL_DIR, "common.proto"),
+        idl_path(NOVAROCKS_IDL_DIR, "expr.proto"),
+        idl_path(NOVAROCKS_IDL_DIR, "filter.proto"),
+        idl_path(NOVAROCKS_IDL_DIR, "plan.proto"),
+        idl_path(NOVAROCKS_IDL_DIR, "service.proto"),
+    ];
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
-        .compile_protos(
-            &[
-                "idl/novarocks/common.proto",
-                "idl/novarocks/expr.proto",
-                "idl/novarocks/filter.proto",
-                "idl/novarocks/plan.proto",
-                "idl/novarocks/service.proto",
-            ],
-            &["idl/novarocks", "idl/proto"],
-        )
+        .compile_protos(&novarocks_protos, &[NOVAROCKS_IDL_DIR, COMPAT_PROTO_DIR])
         .expect("compile novarocks common + expr + filter + plan + service protos");
 
+    let staros_protos = [
+        idl_path(COMPAT_STAROS_DIR, "starlet.proto"),
+        idl_path(COMPAT_STAROS_DIR, "manager.proto"),
+    ];
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
-        .compile_protos(
-            &[
-                "idl/proto/staros/starlet.proto",
-                "idl/proto/staros/manager.proto",
-            ],
-            &["idl/proto/staros"],
-        )
+        .compile_protos(&staros_protos, &[COMPAT_STAROS_DIR])
         .expect("compile staros protos");
 
     emit_proto_root_mod(&out_dir);
