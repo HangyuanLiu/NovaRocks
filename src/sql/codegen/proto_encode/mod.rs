@@ -1290,6 +1290,7 @@ mod tests {
         assert_eq!(opts.batch_size, 4096);
         assert_eq!(opts.query_timeout, 60);
         assert_eq!(opts.pipeline_dop, 8);
+        assert_eq!(opts.query_mem_limit, 1 << 20);
         assert_eq!(opts.runtime_filter_wait_timeout_ms, 5_000);
     }
 }

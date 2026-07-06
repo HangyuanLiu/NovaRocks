@@ -267,7 +267,6 @@ fn encode_prober_params(
 fn encode_query_options(src: &internal_service::TQueryOptions) -> novarocks::QueryOptions {
     novarocks::QueryOptions {
         batch_size: src.batch_size.unwrap_or_default(),
-        mem_limit: src.mem_limit.unwrap_or_default(),
         query_timeout: src.query_timeout.unwrap_or_default(),
         enable_profile: src.enable_profile.unwrap_or(false),
         pipeline_dop: src.pipeline_dop.unwrap_or_default(),

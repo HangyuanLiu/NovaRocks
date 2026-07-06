@@ -31,13 +31,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
-use arrow::datatypes::{DataType, Field, Schema};
-#[cfg(test)]
-use arrow::record_batch::RecordBatch;
-use thrift::protocol::{TBinaryOutputProtocol, TSerializable};
-use thrift::transport::{TBufferChannel, TIoChannel};
-
-#[cfg(test)]
 use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 #[cfg(test)]
@@ -53,6 +46,10 @@ use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
 use crate::thrift::data_sinks;
 use crate::thrift::internal_service;
 use crate::thrift::types;
+#[cfg(test)]
+use arrow::datatypes::{DataType, Field, Schema};
+#[cfg(test)]
+use arrow::record_batch::RecordBatch;
 use tracing::warn;
 
 static REMOTE_SUBMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -73,7 +70,7 @@ pub enum FetchOutcome {
 /// Fragment dispatcher trait.
 ///
 /// Implementations choose where and how fragments run.  The coordinator
-/// calls `submit_fragment` for each fragment (non-blocking), then polls
+/// calls `submit_fragment_submission` for each fragment (non-blocking), then polls
 /// `fetch_result` for the root fragment instance until `Eof` or `Err`.
 pub trait FragmentDispatcher: Send + Sync + 'static {
     #[cfg(test)]
@@ -90,8 +87,8 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
     /// Submit a fragment with optional NovaRocks-native sidecar payloads.
     ///
     /// Existing in-process and test dispatchers can keep implementing only the
-    /// legacy thrift method; the remote dispatcher overrides this to preserve
-    /// the legacy payload while attaching native plan/instance parameters.
+    /// legacy thrift method; the remote dispatcher overrides this to require
+    /// NovaRocks-native plan/instance parameters for gRPC submission.
     fn submit_fragment_submission(
         &self,
         backend_idx: usize,
@@ -143,27 +140,6 @@ pub(crate) fn compute_sink_pipeline_dop(session_dop: i32) -> i32 {
     crate::runtime::exec_env::calc_sink_pipeline_dop(session_dop)
 }
 
-fn serialize_thrift_binary<T: TSerializable>(value: &T) -> Result<Vec<u8>, String> {
-    const INITIAL_CAPACITY: usize = 256;
-    const MAX_CAPACITY: usize = 64 * 1024 * 1024;
-
-    let mut capacity = INITIAL_CAPACITY;
-    loop {
-        let channel = TBufferChannel::with_capacity(0, capacity);
-        let (_, w) = channel.split().map_err(|e| e.to_string())?;
-        let mut protocol = TBinaryOutputProtocol::new(w, true);
-        match value.write_to_out_protocol(&mut protocol) {
-            Ok(()) => return Ok(protocol.transport.write_bytes()),
-            Err(e) => {
-                if capacity >= MAX_CAPACITY {
-                    return Err(e.to_string());
-                }
-                capacity = capacity.saturating_mul(2).min(MAX_CAPACITY);
-            }
-        }
-    }
-}
-
 pub(crate) struct FragmentSubmission {
     thrift_params: internal_service::TExecPlanFragmentParams,
     native_plan: Option<crate::proto::plan::PlanFragment>,
@@ -200,17 +176,16 @@ impl FragmentSubmission {
     }
 
     fn into_submit_fragment_request(self) -> Result<SubmitFragmentRequest, String> {
-        let payload = if self.native_plan.is_none() && self.native_instance_params.is_none() {
-            serialize_thrift_binary(&self.thrift_params)
-                .map_err(|e| format!("serialize fragment params for remote submit failed: {e}"))?
-        } else {
-            Vec::new()
-        };
-        Ok(SubmitFragmentRequest {
-            exec_plan_fragment_params_thrift: payload,
-            plan: self.native_plan,
-            instance_params: self.native_instance_params,
-        })
+        match (self.native_plan, self.native_instance_params) {
+            (Some(plan), Some(instance_params)) => Ok(SubmitFragmentRequest {
+                plan: Some(plan),
+                instance_params: Some(instance_params),
+            }),
+            _ => Err(
+                "thrift-only fragment submission is no longer supported by NovaRocksGrpc SubmitFragment"
+                    .to_string(),
+            ),
+        }
     }
 }
 
@@ -570,18 +545,19 @@ mod tests {
     }
 
     #[test]
-    fn fragment_submission_thrift_only_request_has_no_native_sidecars() {
-        let request = FragmentSubmission::thrift_only(make_noop_sink_params(1, 2))
+    fn fragment_submission_thrift_only_request_is_rejected() {
+        let err = FragmentSubmission::thrift_only(make_noop_sink_params(1, 2))
             .into_submit_fragment_request()
-            .expect("serialize thrift-only request");
+            .expect_err("thrift-only native gRPC request must be rejected");
 
-        assert!(!request.exec_plan_fragment_params_thrift.is_empty());
-        assert!(request.plan.is_none());
-        assert!(request.instance_params.is_none());
+        assert!(
+            err.contains("thrift-only fragment submission is no longer supported"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn fragment_submission_proto_sidecar_omits_legacy_thrift_bytes() {
+    fn fragment_submission_proto_sidecar_carries_native_payload() {
         let request = FragmentSubmission::with_native(
             make_noop_sink_params(1, 2),
             crate::proto::plan::PlanFragment {
@@ -594,9 +570,8 @@ mod tests {
             },
         )
         .into_submit_fragment_request()
-        .expect("serialize proto sidecar request");
+        .expect("build proto request");
 
-        assert!(request.exec_plan_fragment_params_thrift.is_empty());
         assert_eq!(request.plan.as_ref().expect("native plan").fragment_id, 9);
         assert_eq!(
             request
@@ -796,9 +771,14 @@ mod tests {
         state.submit_code.store(1, Ordering::SeqCst);
         let addr = spawn_mock_server(Arc::clone(&state));
         let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
+        let submission = FragmentSubmission::with_native(
+            make_noop_sink_params(1, 2),
+            crate::proto::plan::PlanFragment::default(),
+            crate::proto::novarocks::InstanceParams::default(),
+        );
 
         let err = dispatcher
-            .submit_fragment(0, make_noop_sink_params(1, 2))
+            .submit_fragment_submission(0, submission)
             .expect_err("nonzero submit status should error");
 
         assert!(err.contains("submit failed"));

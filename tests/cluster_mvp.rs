@@ -239,7 +239,6 @@ fn assert_fe_report_only_endpoint_rejects_local_submit(port: u16) {
     let err = client
         .blocking_submit_fragment(
             novarocks::service::grpc_client::proto::novarocks::SubmitFragmentRequest {
-                exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
                 plan: None,
                 instance_params: None,
             },
