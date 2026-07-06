@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn novarocks_report_addr_uses_private_thrift_field_id() {
-        let idl = include_str!("../../idl/thrift/InternalService.thrift");
+        let idl = include_str!("../../idl/compat/thrift/InternalService.thrift");
         let struct_body = idl
             .split("struct TExecPlanFragmentParams {")
             .nth(1)
