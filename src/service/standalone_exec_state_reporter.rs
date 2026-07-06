@@ -23,9 +23,9 @@ use std::time::Duration;
 use crate::common::config;
 use crate::common::types::UniqueId;
 use crate::novarocks_logging::{error, warn};
+use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::query_context::QueryId;
 use crate::service::grpc_client::{NovaRocksGrpcRemoteClient, proto};
-use crate::thrift::types;
 
 const NORMAL_REPORT_QUEUE_LIMIT: usize = 1_000;
 
@@ -33,7 +33,7 @@ const NORMAL_REPORT_QUEUE_LIMIT: usize = 1_000;
 pub(crate) struct StandaloneExecStateReportTask {
     pub(crate) finst_id: UniqueId,
     pub(crate) query_id: QueryId,
-    pub(crate) coord: types::TNetworkAddress,
+    pub(crate) coord: RuntimeEndpoint,
     pub(crate) report: proto::novarocks::ExecStatusReport,
 }
 
@@ -226,31 +226,22 @@ fn interpret_report_exec_status_response(
     }
 }
 
-fn standalone_report_socket_addr(addr: &types::TNetworkAddress) -> Result<SocketAddr, String> {
-    let port = if (1..=i32::from(u16::MAX)).contains(&addr.port) {
-        addr.port as u16
-    } else {
-        return Err(format!(
-            "invalid standalone report port {}: must be in 1..={}",
-            addr.port,
-            u16::MAX
-        ));
-    };
-
-    let host = addr.hostname.trim();
+fn standalone_report_socket_addr(endpoint: &RuntimeEndpoint) -> Result<SocketAddr, String> {
+    let port = endpoint.port() as u16;
+    let host = endpoint.host().trim();
     if host.is_empty() {
         return Err("invalid standalone report host '': empty host".to_string());
     }
 
-    let endpoint = socket_lookup_endpoint(host, port);
-    endpoint
+    let lookup_endpoint = socket_lookup_endpoint(host, port);
+    lookup_endpoint
         .to_socket_addrs()
-        .map_err(|e| format!("invalid standalone report host '{}': {e}", addr.hostname))?
+        .map_err(|e| format!("invalid standalone report host '{}': {e}", endpoint.host()))?
         .next()
         .ok_or_else(|| {
             format!(
                 "invalid standalone report host '{}': no socket addresses resolved",
-                addr.hostname
+                endpoint.host()
             )
         })
 }
@@ -459,23 +450,23 @@ mod tests {
 
     #[test]
     fn report_socket_addr_accepts_ipv4_literal() {
-        let addr =
-            standalone_report_socket_addr(&network_addr("127.0.0.1", 18040)).expect("ipv4 literal");
+        let addr = standalone_report_socket_addr(&runtime_endpoint("127.0.0.1", 18040))
+            .expect("ipv4 literal");
 
         assert_eq!(addr.to_string(), "127.0.0.1:18040");
     }
 
     #[test]
     fn report_socket_addr_accepts_bare_ipv6_literal() {
-        let addr =
-            standalone_report_socket_addr(&network_addr("::1", 18040)).expect("bare ipv6 literal");
+        let addr = standalone_report_socket_addr(&runtime_endpoint("::1", 18040))
+            .expect("bare ipv6 literal");
 
         assert_eq!(addr.to_string(), "[::1]:18040");
     }
 
     #[test]
     fn report_socket_addr_accepts_bracketed_ipv6_literal() {
-        let addr = standalone_report_socket_addr(&network_addr("[::1]", 18040))
+        let addr = standalone_report_socket_addr(&runtime_endpoint("[::1]", 18040))
             .expect("bracketed ipv6 literal");
 
         assert_eq!(addr.to_string(), "[::1]:18040");
@@ -483,8 +474,8 @@ mod tests {
 
     #[test]
     fn report_socket_addr_accepts_localhost_hostname() {
-        let addr =
-            standalone_report_socket_addr(&network_addr("localhost", 18040)).expect("localhost");
+        let addr = standalone_report_socket_addr(&runtime_endpoint("localhost", 18040))
+            .expect("localhost");
 
         assert_eq!(addr.port(), 18040);
         assert!(addr.ip().is_loopback(), "{addr}");
@@ -492,7 +483,7 @@ mod tests {
 
     #[test]
     fn report_socket_addr_rejects_invalid_host() {
-        let err = standalone_report_socket_addr(&network_addr("bad host with spaces", 18040))
+        let err = standalone_report_socket_addr(&runtime_endpoint("bad host with spaces", 18040))
             .expect_err("invalid host must fail");
 
         assert!(err.contains("invalid standalone report host"), "{err}");
@@ -500,32 +491,27 @@ mod tests {
 
     #[test]
     fn report_socket_addr_rejects_zero_port() {
-        let err = standalone_report_socket_addr(&network_addr("127.0.0.1", 0))
-            .expect_err("port 0 must fail");
+        let err = RuntimeEndpoint::new("127.0.0.1", 0).expect_err("port 0 must fail");
 
-        assert!(err.contains("invalid standalone report port 0"), "{err}");
+        assert!(err.contains("must be in 1..=65535"), "{err}");
     }
 
     #[test]
     fn report_socket_addr_rejects_too_large_port() {
-        let err = standalone_report_socket_addr(&network_addr("127.0.0.1", 70_000))
-            .expect_err("too-large port must fail");
+        let err = RuntimeEndpoint::new("127.0.0.1", 70_000).expect_err("too-large port must fail");
 
-        assert!(
-            err.contains("invalid standalone report port 70000"),
-            "{err}"
-        );
+        assert!(err.contains("must be in 1..=65535"), "{err}");
     }
 
-    fn network_addr(host: &str, port: i32) -> types::TNetworkAddress {
-        types::TNetworkAddress::new(host.to_string(), port)
+    fn runtime_endpoint(host: &str, port: i32) -> RuntimeEndpoint {
+        RuntimeEndpoint::new(host, port).expect("runtime endpoint")
     }
 
     fn test_task() -> StandaloneExecStateReportTask {
         StandaloneExecStateReportTask {
             finst_id: UniqueId { hi: 301, lo: 401 },
             query_id: QueryId { hi: 501, lo: 601 },
-            coord: types::TNetworkAddress::new("127.0.0.1".to_string(), 18040),
+            coord: runtime_endpoint("127.0.0.1", 18040),
             report: proto::novarocks::ExecStatusReport {
                 query_id: Some(proto::common::UniqueId { hi: 501, lo: 601 }),
                 fragment_instance_id: Some(proto::common::UniqueId { hi: 301, lo: 401 }),

@@ -263,6 +263,7 @@ impl ExecutionCoordinator {
         let needs_fragment_status_report =
             dispatcher.needs_fragment_status_report() || collect_profiles;
         let mut novarocks_report_addr: Option<types::TNetworkAddress> = None;
+        let mut novarocks_report_endpoint: Option<crate::runtime::endpoint::RuntimeEndpoint> = None;
 
         // Snapshot the per-consumer-fragment instance destinations for CTE
         // multicast sub-sinks (each consumer fans out to all of its instances).
@@ -426,14 +427,19 @@ impl ExecutionCoordinator {
                 };
 
                 let fragment_has_write_sink = data_sink_requires_write_report(&output_sink);
-                let fragment_report_addr =
+                let (fragment_report_addr, fragment_report_endpoint) =
                     if fragment_has_write_sink || needs_fragment_status_report {
-                        if novarocks_report_addr.is_none() {
-                            novarocks_report_addr = Some(local_coordinator_report_addr()?);
+                        if novarocks_report_addr.is_none() || novarocks_report_endpoint.is_none() {
+                            let endpoint = local_coordinator_report_endpoint()?;
+                            novarocks_report_addr = Some(endpoint.to_network_address());
+                            novarocks_report_endpoint = Some(endpoint);
                         }
-                        novarocks_report_addr.clone()
+                        (
+                            novarocks_report_addr.clone(),
+                            novarocks_report_endpoint.clone(),
+                        )
                     } else {
-                        None
+                        (None, None)
                     };
                 // Align with StarRocks: a write/data-sink fragment (iceberg/hive/olap load/insert)
                 // runs at the lower sink DOP curve so it doesn't starve query CPU; compute fragments
@@ -544,11 +550,6 @@ impl ExecutionCoordinator {
                         } else {
                             0
                         };
-                        let fragment_report_endpoint = params
-                            .novarocks_report_addr
-                            .as_ref()
-                            .map(crate::runtime::endpoint::RuntimeEndpoint::from_network_address)
-                            .transpose()?;
                         let native_instance_params =
                             crate::sql::codegen::proto_encode::instance::encode_instance_params(
                                 &query_id,
@@ -1291,6 +1292,12 @@ fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
     let port =
         crate::service::grpc_server::grpc_server_bound_port().unwrap_or(cfg.server.grpc_port);
     Ok(types::TNetworkAddress::new(host, port as i32))
+}
+
+fn local_coordinator_report_endpoint() -> Result<crate::runtime::endpoint::RuntimeEndpoint, String>
+{
+    let addr = local_coordinator_report_addr()?;
+    crate::runtime::endpoint::RuntimeEndpoint::from_network_address(&addr)
 }
 
 fn current_plan_wire_format() -> PlanWireFormat {

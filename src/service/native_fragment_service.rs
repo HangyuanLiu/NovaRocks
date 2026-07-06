@@ -26,7 +26,7 @@ use crate::novarocks_logging::{error, info, warn};
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::native_fragment_wire::{
-    network_address_from_native, query_options_from_native, runtime_filter_params_from_native,
+    endpoint_from_native, query_options_from_native, runtime_filter_params_from_native,
 };
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{
@@ -278,17 +278,17 @@ pub fn submit_exec_plan_fragment_native(
     } else {
         None
     };
-    if let Some(report_addr) = instance_params
-        .report_addr
+    if let Some(report_endpoint) = instance_params
+        .report_endpoint
         .as_deref()
-        .filter(|addr| !addr.is_empty())
-        .map(network_address_from_native)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(endpoint_from_native)
         .transpose()?
     {
         fe_report::register_novarocks_instance(
             finst_id,
             query_id,
-            report_addr,
+            report_endpoint,
             instance_params.backend_num,
             enable_profile,
             profiler.clone(),
@@ -300,7 +300,7 @@ pub fn submit_exec_plan_fragment_native(
         warn!(
             target: "novarocks::report",
             finst_id = %finst_id,
-            "missing native report_addr for reportExecStatus"
+            "missing native report_endpoint for reportExecStatus"
         );
     }
 
