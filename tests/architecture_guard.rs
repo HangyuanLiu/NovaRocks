@@ -1305,6 +1305,8 @@ struct ProtoFieldSchema {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct ProtoEnumSchema {
     values: Vec<ProtoEnumValueSchema>,
+    reserved_numbers: BTreeSet<u32>,
+    reserved_names: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -1326,8 +1328,934 @@ struct ProtoRpcSchema {
     server_streaming: bool,
 }
 
-fn parse_proto_schema(_path: &str, _input: &str) -> Result<ProtoFileSchema, String> {
-    Err("not implemented".to_string())
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProtoParseContext {
+    Message(String),
+    Enum(String),
+    Service(String),
+    Oneof(String),
+}
+
+fn proto_context_label(context: &ProtoParseContext) -> String {
+    match context {
+        ProtoParseContext::Message(name) => format!("message {name}"),
+        ProtoParseContext::Enum(name) => format!("enum {name}"),
+        ProtoParseContext::Service(name) => format!("service {name}"),
+        ProtoParseContext::Oneof(name) => format!("oneof {name}"),
+    }
+}
+
+fn proto_parse_error(path: &str, statement: &str, detail: impl Into<String>) -> String {
+    format!(
+        "{}: failed to parse `{}`: {}",
+        path,
+        statement.trim(),
+        detail.into()
+    )
+}
+
+fn remove_proto_comments(path: &str, input: &str) -> Result<String, String> {
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_block_comment = false;
+
+    while idx < chars.len() {
+        let ch = chars[idx];
+        let next = chars.get(idx + 1).copied();
+
+        if in_block_comment {
+            if ch == '*' && next == Some('/') {
+                out.push(' ');
+                out.push(' ');
+                idx += 2;
+                in_block_comment = false;
+            } else {
+                out.push(if ch == '\n' { '\n' } else { ' ' });
+                idx += 1;
+            }
+            continue;
+        }
+
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            idx += 1;
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+            idx += 1;
+        } else if ch == '/' && next == Some('/') {
+            while idx < chars.len() && chars[idx] != '\n' {
+                out.push(' ');
+                idx += 1;
+            }
+        } else if ch == '/' && next == Some('*') {
+            out.push(' ');
+            out.push(' ');
+            idx += 2;
+            in_block_comment = true;
+        } else {
+            out.push(ch);
+            idx += 1;
+        }
+    }
+
+    if in_block_comment {
+        Err(format!(
+            "{path}: failed to parse comment: unterminated block comment"
+        ))
+    } else {
+        Ok(out)
+    }
+}
+
+fn normalize_proto_statement(statement: &str) -> String {
+    let mut out = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut pending_space = false;
+
+    for ch in statement.chars() {
+        if in_string {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            in_string = true;
+            out.push(ch);
+        } else if ch.is_whitespace() {
+            pending_space = true;
+        } else {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push(ch);
+        }
+    }
+
+    out.trim().to_string()
+}
+
+fn proto_logical_statements(input: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        current.push(ch);
+
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+        } else if matches!(ch, ';' | '{' | '}') {
+            let statement = normalize_proto_statement(&current);
+            if !statement.is_empty() {
+                statements.push(statement);
+            }
+            current.clear();
+        }
+    }
+
+    let trailing = normalize_proto_statement(&current);
+    if !trailing.is_empty() {
+        statements.push(trailing);
+    }
+
+    statements
+}
+
+fn proto_statement_body<'a>(statement: &'a str, suffix: &str) -> Option<&'a str> {
+    statement.trim().strip_suffix(suffix).map(str::trim)
+}
+
+fn proto_keyword_tail<'a>(statement: &'a str, keyword: &str) -> Option<&'a str> {
+    let tail = statement.trim().strip_prefix(keyword)?;
+    if tail
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        None
+    } else {
+        Some(tail.trim_start())
+    }
+}
+
+fn is_proto_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_proto_ident_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn is_proto_ident(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars.next().is_some_and(is_proto_ident_start) && chars.all(is_proto_ident_continue)
+}
+
+fn parse_proto_named_block(path: &str, statement: &str, keyword: &str) -> Result<String, String> {
+    let body = proto_statement_body(statement, "{")
+        .ok_or_else(|| proto_parse_error(path, statement, "expected block opener"))?;
+    let name = proto_keyword_tail(body, keyword)
+        .ok_or_else(|| proto_parse_error(path, statement, format!("expected `{keyword}`")))?;
+    if !is_proto_ident(name) {
+        Err(proto_parse_error(
+            path,
+            statement,
+            format!("invalid {keyword} name `{name}`"),
+        ))
+    } else {
+        Ok(name.to_string())
+    }
+}
+
+fn parse_proto_package(path: &str, statement: &str) -> Result<String, String> {
+    let body = proto_statement_body(statement, ";")
+        .ok_or_else(|| proto_parse_error(path, statement, "expected package terminator"))?;
+    let package = proto_keyword_tail(body, "package")
+        .ok_or_else(|| proto_parse_error(path, statement, "expected package name"))?;
+    if package.is_empty()
+        || !package
+            .chars()
+            .all(|ch| ch == '.' || ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        Err(proto_parse_error(
+            path,
+            statement,
+            format!("invalid package name `{package}`"),
+        ))
+    } else {
+        Ok(package.to_string())
+    }
+}
+
+fn current_proto_path(stack: &[String], name: &str) -> String {
+    if stack.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}.{}", stack.join("."), name)
+    }
+}
+
+fn truncate_proto_field_options(statement: &str) -> &str {
+    let mut angle_depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in statement.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' if angle_depth == 0 => return &statement[..idx],
+            _ => {}
+        }
+    }
+
+    statement
+}
+
+fn proto_split_once_top_level<'a>(input: &'a str, delimiter: char) -> Option<(&'a str, &'a str)> {
+    let mut angle_depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            ch if ch == delimiter && angle_depth == 0 => {
+                return Some((&input[..idx], &input[idx + ch.len_utf8()..]));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn parse_proto_u32(path: &str, statement: &str, value: &str) -> Result<u32, String> {
+    value
+        .trim()
+        .parse::<u32>()
+        .map_err(|err| proto_parse_error(path, statement, format!("invalid field number: {err}")))
+}
+
+fn parse_proto_i32(path: &str, statement: &str, value: &str) -> Result<i32, String> {
+    value
+        .trim()
+        .parse::<i32>()
+        .map_err(|err| proto_parse_error(path, statement, format!("invalid enum value: {err}")))
+}
+
+fn proto_take_label(input: &str) -> (&'static str, &str) {
+    for label in ["optional", "repeated"] {
+        if let Some(tail) = proto_keyword_tail(input, label) {
+            return (label, tail);
+        }
+    }
+    ("singular", input.trim())
+}
+
+fn proto_split_type_and_name<'a>(
+    path: &str,
+    statement: &str,
+    input: &'a str,
+) -> Result<(&'a str, &'a str), String> {
+    let input = input.trim();
+    let Some(name_start) = input
+        .char_indices()
+        .rev()
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx + ch.len_utf8()))
+    else {
+        return Err(proto_parse_error(
+            path,
+            statement,
+            "expected `<type> <name>` before `=`",
+        ));
+    };
+
+    let type_name = input[..name_start].trim();
+    let name = input[name_start..].trim();
+    if type_name.is_empty() || !is_proto_ident(name) {
+        Err(proto_parse_error(
+            path,
+            statement,
+            "expected valid field type and name",
+        ))
+    } else {
+        Ok((type_name, name))
+    }
+}
+
+fn parse_proto_field(
+    path: &str,
+    statement: &str,
+    oneof: Option<&str>,
+) -> Result<ProtoFieldSchema, String> {
+    let body = proto_statement_body(statement, ";")
+        .ok_or_else(|| proto_parse_error(path, statement, "expected field terminator"))?;
+    let body = truncate_proto_field_options(body).trim();
+    let (left, right) = proto_split_once_top_level(body, '=')
+        .ok_or_else(|| proto_parse_error(path, statement, "expected field number"))?;
+    let (number_text, tail) = proto_take_first_token(right)
+        .ok_or_else(|| proto_parse_error(path, statement, "missing field number"))?;
+    if !tail.is_empty() {
+        return Err(proto_parse_error(
+            path,
+            statement,
+            format!("unexpected field number suffix `{tail}`"),
+        ));
+    }
+    let number = parse_proto_u32(path, statement, number_text)?;
+    let (label, left) = proto_take_label(left);
+    let (type_name, name) = proto_split_type_and_name(path, statement, left)?;
+
+    Ok(ProtoFieldSchema {
+        number,
+        name: name.to_string(),
+        type_name: type_name.to_string(),
+        label: label.to_string(),
+        oneof: oneof.map(str::to_string),
+    })
+}
+
+fn proto_split_comma_list(input: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+        } else if ch == ',' {
+            parts.push(input[start..idx].trim());
+            start = idx + ch.len_utf8();
+        }
+    }
+    parts.push(input[start..].trim());
+    parts
+}
+
+fn parse_proto_string_literal(path: &str, statement: &str, value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if !(value.starts_with('"') && value.ends_with('"') && value.len() >= 2) {
+        return Err(proto_parse_error(
+            path,
+            statement,
+            format!("invalid reserved name literal `{value}`"),
+        ));
+    }
+
+    let inner = &value[1..value.len() - 1];
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    if escaped {
+        Err(proto_parse_error(
+            path,
+            statement,
+            "unterminated escape in string literal",
+        ))
+    } else {
+        Ok(out)
+    }
+}
+
+fn parse_proto_reserved(
+    path: &str,
+    statement: &str,
+) -> Result<(BTreeSet<u32>, BTreeSet<String>), String> {
+    let body = proto_statement_body(statement, ";")
+        .ok_or_else(|| proto_parse_error(path, statement, "expected reserved terminator"))?;
+    let body = proto_keyword_tail(body, "reserved")
+        .ok_or_else(|| proto_parse_error(path, statement, "expected reserved clause"))?;
+    let mut numbers = BTreeSet::new();
+    let mut names = BTreeSet::new();
+
+    for part in proto_split_comma_list(body) {
+        if part.is_empty() {
+            return Err(proto_parse_error(path, statement, "empty reserved item"));
+        }
+        if part.starts_with('"') {
+            names.insert(parse_proto_string_literal(path, statement, part)?);
+        } else if let Some((start, end)) = part.split_once(" to ") {
+            let start = parse_proto_u32(path, statement, start)?;
+            let end = parse_proto_u32(path, statement, end)?;
+            if start > end {
+                return Err(proto_parse_error(
+                    path,
+                    statement,
+                    "reserved range start is greater than end",
+                ));
+            }
+            numbers.extend(start..=end);
+        } else {
+            numbers.insert(parse_proto_u32(path, statement, part)?);
+        }
+    }
+
+    Ok((numbers, names))
+}
+
+fn proto_take_first_token(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    if input.is_empty() {
+        return None;
+    }
+
+    for (idx, ch) in input.char_indices() {
+        if ch.is_whitespace() {
+            return Some((&input[..idx], input[idx..].trim_start()));
+        }
+    }
+
+    Some((input, ""))
+}
+
+fn parse_proto_enum_value(path: &str, statement: &str) -> Result<ProtoEnumValueSchema, String> {
+    let body = proto_statement_body(statement, ";")
+        .ok_or_else(|| proto_parse_error(path, statement, "expected enum value terminator"))?;
+    let body = truncate_proto_field_options(body).trim();
+    let (name, right) = body
+        .split_once('=')
+        .ok_or_else(|| proto_parse_error(path, statement, "expected enum value number"))?;
+    let name = name.trim();
+    if !is_proto_ident(name) {
+        return Err(proto_parse_error(
+            path,
+            statement,
+            format!("invalid enum value name `{name}`"),
+        ));
+    }
+    let (number_text, tail) = proto_take_first_token(right)
+        .ok_or_else(|| proto_parse_error(path, statement, "missing enum value number"))?;
+    if !tail.is_empty() {
+        return Err(proto_parse_error(
+            path,
+            statement,
+            format!("unexpected enum value number suffix `{tail}`"),
+        ));
+    }
+    Ok(ProtoEnumValueSchema {
+        number: parse_proto_i32(path, statement, number_text)?,
+        name: name.to_string(),
+    })
+}
+
+fn proto_take_ident(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    let mut chars = input.char_indices();
+    let (_, first) = chars.next()?;
+    if !is_proto_ident_start(first) {
+        return None;
+    }
+
+    let mut end = first.len_utf8();
+    for (idx, ch) in chars {
+        if is_proto_ident_continue(ch) {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some((&input[..end], &input[end..]))
+}
+
+fn proto_take_parenthesized(
+    path: &str,
+    statement: &str,
+    input: &str,
+) -> Result<(String, String), String> {
+    let input = input.trim_start();
+    if !input.starts_with('(') {
+        return Err(proto_parse_error(path, statement, "expected `(`"));
+    }
+
+    let mut depth = 0isize;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let inside = input[1..idx].trim().to_string();
+                    let tail = input[idx + ch.len_utf8()..].trim_start().to_string();
+                    return Ok((inside, tail));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Err(proto_parse_error(
+        path,
+        statement,
+        "unterminated parenthesized type",
+    ))
+}
+
+fn parse_proto_stream_type(input: &str) -> (bool, String) {
+    if let Some(tail) = proto_keyword_tail(input, "stream") {
+        (true, tail.trim().to_string())
+    } else {
+        (false, input.trim().to_string())
+    }
+}
+
+fn parse_proto_rpc(path: &str, statement: &str) -> Result<(String, ProtoRpcSchema), String> {
+    let body = proto_statement_body(statement, ";")
+        .ok_or_else(|| proto_parse_error(path, statement, "expected rpc terminator"))?;
+    let body = proto_keyword_tail(body, "rpc")
+        .ok_or_else(|| proto_parse_error(path, statement, "expected rpc declaration"))?;
+    let (name, tail) = proto_take_ident(body)
+        .ok_or_else(|| proto_parse_error(path, statement, "expected rpc name"))?;
+    let (request, tail) = proto_take_parenthesized(path, statement, tail)?;
+    let tail = proto_keyword_tail(&tail, "returns")
+        .ok_or_else(|| proto_parse_error(path, statement, "expected returns clause"))?;
+    let (response, tail) = proto_take_parenthesized(path, statement, tail)?;
+    if !tail.trim().is_empty() {
+        return Err(proto_parse_error(
+            path,
+            statement,
+            format!("unexpected rpc suffix `{tail}`"),
+        ));
+    }
+
+    let (client_streaming, request) = parse_proto_stream_type(&request);
+    let (server_streaming, response) = parse_proto_stream_type(&response);
+    if request.is_empty() || response.is_empty() {
+        return Err(proto_parse_error(
+            path,
+            statement,
+            "rpc request and response types must be non-empty",
+        ));
+    }
+
+    Ok((
+        name.to_string(),
+        ProtoRpcSchema {
+            request,
+            response,
+            client_streaming,
+            server_streaming,
+        },
+    ))
+}
+
+fn parse_proto_schema(path: &str, input: &str) -> Result<ProtoFileSchema, String> {
+    let input = remove_proto_comments(path, input)?;
+    let statements = proto_logical_statements(&input);
+    let mut schema = ProtoFileSchema {
+        package: String::new(),
+        messages: BTreeMap::new(),
+        enums: BTreeMap::new(),
+        services: BTreeMap::new(),
+    };
+    let mut contexts = Vec::new();
+    let mut message_stack = Vec::new();
+    let mut enum_stack = Vec::new();
+    let mut service_stack = Vec::new();
+    let mut oneof_stack = Vec::new();
+    let mut last_statement = None;
+
+    for statement in statements {
+        last_statement = Some(statement.clone());
+        if statement == "}" {
+            match contexts.pop() {
+                Some(ProtoParseContext::Message(name)) => {
+                    let popped = message_stack.pop();
+                    if popped.as_deref() != Some(name.as_str()) {
+                        return Err(proto_parse_error(
+                            path,
+                            &statement,
+                            "message context stack became inconsistent",
+                        ));
+                    }
+                }
+                Some(ProtoParseContext::Enum(name)) => {
+                    let popped = enum_stack.pop();
+                    if popped.as_deref() != Some(name.as_str()) {
+                        return Err(proto_parse_error(
+                            path,
+                            &statement,
+                            "enum context stack became inconsistent",
+                        ));
+                    }
+                }
+                Some(ProtoParseContext::Service(name)) => {
+                    let popped = service_stack.pop();
+                    if popped.as_deref() != Some(name.as_str()) {
+                        return Err(proto_parse_error(
+                            path,
+                            &statement,
+                            "service context stack became inconsistent",
+                        ));
+                    }
+                }
+                Some(ProtoParseContext::Oneof(name)) => {
+                    let popped = oneof_stack.pop();
+                    if popped.as_deref() != Some(name.as_str()) {
+                        return Err(proto_parse_error(
+                            path,
+                            &statement,
+                            "oneof context stack became inconsistent",
+                        ));
+                    }
+                }
+                None => {
+                    return Err(proto_parse_error(
+                        path,
+                        &statement,
+                        "unexpected closing brace",
+                    ));
+                }
+            }
+            continue;
+        }
+
+        if proto_keyword_tail(&statement, "message").is_some() && statement.ends_with('{') {
+            let name = parse_proto_named_block(path, &statement, "message")?;
+            let key = current_proto_path(&message_stack, &name);
+            if schema
+                .messages
+                .insert(
+                    key.clone(),
+                    ProtoMessageSchema {
+                        fields: BTreeMap::new(),
+                        reserved_numbers: BTreeSet::new(),
+                        reserved_names: BTreeSet::new(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(proto_parse_error(
+                    path,
+                    &statement,
+                    format!("duplicate message `{key}`"),
+                ));
+            }
+            message_stack.push(name.clone());
+            contexts.push(ProtoParseContext::Message(name));
+            continue;
+        }
+
+        if proto_keyword_tail(&statement, "enum").is_some() && statement.ends_with('{') {
+            let name = parse_proto_named_block(path, &statement, "enum")?;
+            let key = current_proto_path(&message_stack, &name);
+            if schema
+                .enums
+                .insert(
+                    key.clone(),
+                    ProtoEnumSchema {
+                        values: Vec::new(),
+                        reserved_numbers: BTreeSet::new(),
+                        reserved_names: BTreeSet::new(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(proto_parse_error(
+                    path,
+                    &statement,
+                    format!("duplicate enum `{key}`"),
+                ));
+            }
+            enum_stack.push(key.clone());
+            contexts.push(ProtoParseContext::Enum(key));
+            continue;
+        }
+
+        if proto_keyword_tail(&statement, "service").is_some() && statement.ends_with('{') {
+            let name = parse_proto_named_block(path, &statement, "service")?;
+            if !message_stack.is_empty() || !enum_stack.is_empty() || !service_stack.is_empty() {
+                return Err(proto_parse_error(
+                    path,
+                    &statement,
+                    "service declarations must be top-level",
+                ));
+            }
+            if schema
+                .services
+                .insert(
+                    name.clone(),
+                    ProtoServiceSchema {
+                        rpcs: BTreeMap::new(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(proto_parse_error(
+                    path,
+                    &statement,
+                    format!("duplicate service `{name}`"),
+                ));
+            }
+            service_stack.push(name.clone());
+            contexts.push(ProtoParseContext::Service(name));
+            continue;
+        }
+
+        if proto_keyword_tail(&statement, "oneof").is_some() && statement.ends_with('{') {
+            let name = parse_proto_named_block(path, &statement, "oneof")?;
+            if message_stack.is_empty() || !enum_stack.is_empty() || !service_stack.is_empty() {
+                return Err(proto_parse_error(
+                    path,
+                    &statement,
+                    "oneof declarations must be inside a message",
+                ));
+            }
+            oneof_stack.push(name.clone());
+            contexts.push(ProtoParseContext::Oneof(name));
+            continue;
+        }
+
+        if statement.starts_with("syntax ") || statement.starts_with("import ") {
+            if statement.ends_with(';') {
+                continue;
+            }
+            return Err(proto_parse_error(
+                path,
+                &statement,
+                "expected statement terminator",
+            ));
+        }
+
+        if proto_keyword_tail(&statement, "package").is_some() {
+            schema.package = parse_proto_package(path, &statement)?;
+            continue;
+        }
+
+        if proto_keyword_tail(&statement, "reserved").is_some() {
+            let (numbers, names) = parse_proto_reserved(path, &statement)?;
+            if let Some(enum_key) = enum_stack.last() {
+                let enum_schema = schema.enums.get_mut(enum_key).ok_or_else(|| {
+                    proto_parse_error(path, &statement, "enum context is missing")
+                })?;
+                enum_schema.reserved_numbers.extend(numbers);
+                enum_schema.reserved_names.extend(names);
+            } else {
+                let message_key = current_proto_path(&message_stack, "");
+                let message_key = message_key.trim_end_matches('.');
+                let message = schema.messages.get_mut(message_key).ok_or_else(|| {
+                    proto_parse_error(path, &statement, "reserved clause must be inside a message")
+                })?;
+                message.reserved_numbers.extend(numbers);
+                message.reserved_names.extend(names);
+            }
+            continue;
+        }
+
+        if let Some(service_key) = service_stack.last() {
+            if proto_keyword_tail(&statement, "rpc").is_some() {
+                let (name, rpc) = parse_proto_rpc(path, &statement)?;
+                let service = schema.services.get_mut(service_key).ok_or_else(|| {
+                    proto_parse_error(path, &statement, "service context is missing")
+                })?;
+                if service.rpcs.insert(name.clone(), rpc).is_some() {
+                    return Err(proto_parse_error(
+                        path,
+                        &statement,
+                        format!("duplicate rpc `{name}`"),
+                    ));
+                }
+                continue;
+            }
+            return Err(proto_parse_error(
+                path,
+                &statement,
+                "unsupported service statement",
+            ));
+        }
+
+        if let Some(enum_key) = enum_stack.last() {
+            let value = parse_proto_enum_value(path, &statement)?;
+            let enum_schema = schema
+                .enums
+                .get_mut(enum_key)
+                .ok_or_else(|| proto_parse_error(path, &statement, "enum context is missing"))?;
+            enum_schema.values.push(value);
+            continue;
+        }
+
+        if !message_stack.is_empty() {
+            let message_key = current_proto_path(&message_stack, "");
+            let message_key = message_key.trim_end_matches('.');
+            let field =
+                parse_proto_field(path, &statement, oneof_stack.last().map(String::as_str))?;
+            let message = schema
+                .messages
+                .get_mut(message_key)
+                .ok_or_else(|| proto_parse_error(path, &statement, "message context is missing"))?;
+            if message.fields.insert(field.number, field).is_some() {
+                return Err(proto_parse_error(
+                    path,
+                    &statement,
+                    "duplicate field number",
+                ));
+            }
+            continue;
+        }
+
+        return Err(proto_parse_error(
+            path,
+            &statement,
+            "unsupported top-level statement",
+        ));
+    }
+
+    if !contexts.is_empty() {
+        let context = contexts
+            .iter()
+            .map(proto_context_label)
+            .collect::<Vec<_>>()
+            .join(" > ");
+        let statement = last_statement.unwrap_or_else(|| "<end of file>".to_string());
+        return Err(proto_parse_error(
+            path,
+            &statement,
+            format!("unclosed block context: {context}"),
+        ));
+    }
+
+    Ok(schema)
+}
+
+fn parse_current_novarocks_proto_schema() -> Result<ProtoSchema, String> {
+    let mut files = BTreeMap::new();
+    for file in proto_files(&Path::new(manifest_dir()).join("idl/novarocks")) {
+        let relative = rel(&file);
+        let input = fs::read_to_string(&file)
+            .map_err(|err| format!("{}: failed to read proto file: {err}", relative))?;
+        files.insert(relative.clone(), parse_proto_schema(&relative, &input)?);
+    }
+
+    Ok(ProtoSchema { version: 1, files })
 }
 
 #[test]
@@ -1339,6 +2267,9 @@ fn nidl_d3b_proto_schema_parser_handles_current_syntax() {
         message Outer {
           reserved 4, 6 to 8;
           reserved "old_name", "old_flag";
+          message Inner {
+            string value = 1;
+          }
           optional string name = 1;
           repeated int64 ids = 2;
           map<int32, novarocks.plan.ScanRangeList> ranges = 3;
@@ -1347,6 +2278,8 @@ fn nidl_d3b_proto_schema_parser_handles_current_syntax() {
           }
           enum InnerState {
             INNER_STATE_UNSPECIFIED = 0;
+            reserved 2, 4 to 5;
+            reserved "old_state";
             INNER_STATE_READY = 1;
           }
         }
@@ -1367,6 +2300,7 @@ fn nidl_d3b_proto_schema_parser_handles_current_syntax() {
         schema.messages["Outer"].fields[&3].type_name,
         "map<int32, novarocks.plan.ScanRangeList>"
     );
+    assert_eq!(schema.messages["Outer.Inner"].fields[&1].name, "value");
     assert_eq!(
         schema.messages["Outer"].fields[&5].oneof.as_deref(),
         Some("kind")
@@ -1378,6 +2312,16 @@ fn nidl_d3b_proto_schema_parser_handles_current_syntax() {
         schema.enums["Outer.InnerState"].values[0].name,
         "INNER_STATE_UNSPECIFIED"
     );
+    assert!(
+        schema.enums["Outer.InnerState"]
+            .reserved_numbers
+            .contains(&4)
+    );
+    assert!(
+        schema.enums["Outer.InnerState"]
+            .reserved_names
+            .contains("old_state")
+    );
     assert_eq!(
         schema.services["NovaRocksGrpc"].rpcs["TransmitRuntimeFilter"].request,
         "novarocks.filter.TransmitRuntimeFilterRequest"
@@ -1388,4 +2332,144 @@ fn nidl_d3b_proto_schema_parser_handles_current_syntax() {
     );
     assert!(schema.services["NovaRocksGrpc"].rpcs["Exchange"].client_streaming);
     assert!(schema.services["NovaRocksGrpc"].rpcs["Exchange"].server_streaming);
+}
+
+#[test]
+fn nidl_d3b_proto_schema_parser_parses_all_native_proto_files() {
+    let schema =
+        parse_current_novarocks_proto_schema().expect("current native proto schema should parse");
+    assert!(schema.files.contains_key("idl/novarocks/service.proto"));
+    assert!(
+        schema.files["idl/novarocks/service.proto"]
+            .services
+            .contains_key("NovaRocksGrpc")
+    );
+    assert!(
+        schema.files["idl/novarocks/service.proto"]
+            .messages
+            .contains_key("SubmitFragmentRequest")
+    );
+    assert!(
+        schema.files["idl/novarocks/service.proto"].enums["FetchResultResponse.Status"]
+            .reserved_numbers
+            .contains(&2)
+    );
+}
+
+#[test]
+fn nidl_d3b_proto_schema_parser_reports_unclosed_context_statement() {
+    let err = parse_proto_schema(
+        "idl/novarocks/broken.proto",
+        r#"
+        syntax = "proto3";
+        package novarocks.broken;
+        message Broken {
+          string value = 1;
+        "#,
+    )
+    .expect_err("unclosed message should fail");
+
+    assert!(err.contains("idl/novarocks/broken.proto"), "{err}");
+    assert!(err.contains("string value = 1;"), "{err}");
+    assert!(err.contains("message Broken"), "{err}");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_parser_rejects_unsupported_tails_and_bad_identifiers() {
+    for (name, input, expected_statement) in [
+        (
+            "field-tail",
+            r#"
+            syntax = "proto3";
+            package novarocks.bad;
+            message Bad {
+              string x = 1 unexpected;
+            }
+            "#,
+            "string x = 1 unexpected;",
+        ),
+        (
+            "enum-tail",
+            r#"
+            syntax = "proto3";
+            package novarocks.bad;
+            enum Bad {
+              FOO = 1 alias;
+            }
+            "#,
+            "FOO = 1 alias;",
+        ),
+        (
+            "message-digit-start",
+            r#"
+            syntax = "proto3";
+            package novarocks.bad;
+            message 1Bad {
+            }
+            "#,
+            "message 1Bad {",
+        ),
+        (
+            "field-digit-start",
+            r#"
+            syntax = "proto3";
+            package novarocks.bad;
+            message Bad {
+              string 1x = 1;
+            }
+            "#,
+            "string 1x = 1;",
+        ),
+        (
+            "field-bad-continue",
+            r#"
+            syntax = "proto3";
+            package novarocks.bad;
+            message Bad {
+              string x-y = 1;
+            }
+            "#,
+            "string x-y = 1;",
+        ),
+        (
+            "enum-value-digit-start",
+            r#"
+            syntax = "proto3";
+            package novarocks.bad;
+            enum Bad {
+              1FOO = 1;
+            }
+            "#,
+            "1FOO = 1;",
+        ),
+        (
+            "service-digit-start",
+            r#"
+            syntax = "proto3";
+            package novarocks.bad;
+            service 1Bad {
+            }
+            "#,
+            "service 1Bad {",
+        ),
+        (
+            "oneof-digit-start",
+            r#"
+            syntax = "proto3";
+            package novarocks.bad;
+            message Bad {
+              oneof 1kind {
+              }
+            }
+            "#,
+            "oneof 1kind {",
+        ),
+    ] {
+        let err = match parse_proto_schema("idl/novarocks/bad.proto", input) {
+            Ok(_) => panic!("{name} should fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("idl/novarocks/bad.proto"), "{name}: {err}");
+        assert!(err.contains(expected_statement), "{name}: {err}");
+    }
 }
