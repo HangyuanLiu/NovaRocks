@@ -100,7 +100,12 @@ fn module_declarations(text: &str) -> BTreeSet<String> {
     non_comment_trimmed_lines(text)
         .into_iter()
         .filter_map(|line| {
-            let module = line.strip_prefix("mod ")?.strip_suffix(';')?;
+            let declaration = line.strip_suffix(';')?;
+            let module = declaration
+                .strip_prefix("mod ")
+                .or_else(|| declaration.strip_prefix("pub mod "))
+                .or_else(|| declaration.strip_prefix("pub(crate) mod "))
+                .or_else(|| declaration.strip_prefix("pub(super) mod "))?;
             if module
                 .chars()
                 .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
@@ -111,6 +116,10 @@ fn module_declarations(text: &str) -> BTreeSet<String> {
             }
         })
         .collect()
+}
+
+fn has_module_declaration(text: &str, module: &str) -> bool {
+    module_declarations(text).contains(module)
 }
 
 fn non_test_line_hits<F>(path: &Path, mut predicate: F) -> Vec<(usize, String)>
@@ -811,12 +820,17 @@ mod tests;
 // comment between attribute and module
 mod tests;
 mod proto_contract;
+pub(crate) mod chunk;
 ";
     assert!(has_cfg_test_mod_tests(active));
     assert!(has_non_comment_line(active, "mod proto_contract;"));
     assert_eq!(
         module_declarations(active),
-        BTreeSet::from(["proto_contract".to_string(), "tests".to_string()])
+        BTreeSet::from([
+            "chunk".to_string(),
+            "proto_contract".to_string(),
+            "tests".to_string()
+        ])
     );
 }
 
@@ -1097,13 +1111,20 @@ fn nidl_d2d_common_lowering_has_no_wire_dependencies() {
 }
 
 #[test]
-fn nidl_d3a_proto_contract_tests_live_under_src_tests() {
+fn nidl_d3a_crate_internal_tests_live_under_src_tests() {
     let repo = Path::new(manifest_dir());
     let proto_contract_dir = repo.join("src/tests/proto_contract");
+    let testutil_dir = repo.join("src/tests/testutil");
     let mut violations = Vec::new();
     if repo.join("src/proto_contract").exists() {
         violations.push(
             "src/proto_contract must not be a top-level src module; move it to src/tests/proto_contract"
+                .to_string(),
+        );
+    }
+    if repo.join("src/testutil").exists() {
+        violations.push(
+            "src/testutil must not be a top-level src module; move it to src/tests/testutil"
                 .to_string(),
         );
     }
@@ -1115,6 +1136,13 @@ fn nidl_d3a_proto_contract_tests_live_under_src_tests() {
         violations.push(
             "src/tests/proto_contract/mod.rs must own native proto contract tests".to_string(),
         );
+    }
+    if !testutil_dir.join("mod.rs").is_file() {
+        violations.push("src/tests/testutil/mod.rs must own test utility modules".to_string());
+    }
+    if !testutil_dir.join("chunk.rs").is_file() {
+        violations
+            .push("chunk test utilities must live at src/tests/testutil/chunk.rs".to_string());
     }
 
     for file in [
@@ -1142,13 +1170,26 @@ fn nidl_d3a_proto_contract_tests_live_under_src_tests() {
                 .to_string(),
         );
     }
-    if has_non_comment_line(&lib, "mod proto_contract;") {
+    if has_module_declaration(&lib, "proto_contract") {
         violations.push("src/lib.rs must not keep the legacy proto_contract module".to_string());
+    }
+    if has_module_declaration(&lib, "testutil") {
+        violations.push("src/lib.rs must not keep the legacy testutil module".to_string());
     }
 
     if let Ok(root_mod) = fs::read_to_string(repo.join("src/tests/mod.rs")) {
-        if !has_non_comment_line(&root_mod, "mod proto_contract;") {
+        if !has_module_declaration(&root_mod, "proto_contract") {
             violations.push("src/tests/mod.rs must mount the proto contract suite".to_string());
+        }
+        if !has_module_declaration(&root_mod, "testutil") {
+            violations.push("src/tests/mod.rs must mount test utility modules".to_string());
+        }
+    }
+
+    if let Ok(testutil_mod) = fs::read_to_string(testutil_dir.join("mod.rs")) {
+        if !has_module_declaration(&testutil_mod, "chunk") {
+            violations
+                .push("src/tests/testutil/mod.rs must mount chunk test utilities".to_string());
         }
     }
 

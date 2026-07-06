@@ -16,3 +16,4 @@
 // under the License.
 
 mod proto_contract;
+pub(crate) mod testutil;
