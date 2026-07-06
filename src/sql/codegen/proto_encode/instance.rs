@@ -1,16 +1,21 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::proto::{common, novarocks};
+use crate::runtime::endpoint::{
+    FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
+};
 use crate::runtime::scheduler::FragmentInstancePlacement;
-use crate::thrift::{data_sinks, descriptors, internal_service, plan_nodes, runtime_filter, types};
+use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
 pub(crate) fn encode_instance_params(
     query_id: &types::TUniqueId,
     placement: &FragmentInstancePlacement,
     query_options: Option<&internal_service::TQueryOptions>,
-    runtime_filter_params: Option<&runtime_filter::TRuntimeFilterParams>,
+    runtime_filter_prober_params: &BTreeMap<i32, Vec<RuntimeFilterProberDestination>>,
+    runtime_filter_builder_number: &BTreeMap<i32, i32>,
+    runtime_filter_max_size: i64,
     backend_num: i32,
-    report_addr: Option<&types::TNetworkAddress>,
+    report_endpoint: Option<&RuntimeEndpoint>,
     typed_result_sink: bool,
 ) -> Result<novarocks::InstanceParams, String> {
     Ok(novarocks::InstanceParams {
@@ -42,11 +47,13 @@ pub(crate) fn encode_instance_params(
             .iter()
             .map(encode_destination)
             .collect::<Result<Vec<_>, _>>()?,
-        runtime_filter_params: runtime_filter_params
-            .map(encode_runtime_filter_params)
-            .transpose()?,
+        runtime_filter_params: encode_runtime_filter_params(
+            runtime_filter_prober_params,
+            runtime_filter_builder_number,
+            runtime_filter_max_size,
+        )?,
         query_options: query_options.map(encode_query_options),
-        report_addr: report_addr.map(format_network_address),
+        report_endpoint: report_endpoint.map(RuntimeEndpoint::as_host_port),
         typed_result_sink,
     })
 }
@@ -201,66 +208,54 @@ fn encode_datacache_options(
     }
 }
 
-fn encode_destination(
-    src: &data_sinks::TPlanFragmentDestination,
-) -> Result<novarocks::Destination, String> {
-    let brpc_addr = src.brpc_server.as_ref().ok_or_else(|| {
-        "TPlanFragmentDestination.brpc_server is required for native InstanceParams".to_string()
-    })?;
+fn encode_destination(src: &FragmentDestination) -> Result<novarocks::Destination, String> {
     Ok(novarocks::Destination {
-        finst_id: Some(encode_unique_id(&src.fragment_instance_id)),
-        brpc_addr: format_network_address(brpc_addr),
+        finst_id: Some(encode_unique_id(src.finst_id())),
+        grpc_endpoint: src.endpoint().as_host_port(),
     })
 }
 
 fn encode_runtime_filter_params(
-    src: &runtime_filter::TRuntimeFilterParams,
-) -> Result<novarocks::RuntimeFilterParams, String> {
-    Ok(novarocks::RuntimeFilterParams {
-        id_to_prober_params: src
-            .id_to_prober_params
-            .as_ref()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|(filter_id, params)| {
-                        Ok((
-                            *filter_id,
-                            novarocks::ProberParamsList {
-                                params: params
-                                    .iter()
-                                    .map(encode_prober_params)
-                                    .collect::<Result<Vec<_>, _>>()?,
-                            },
-                        ))
-                    })
-                    .collect::<Result<HashMap<_, _>, String>>()
+    prober_params: &BTreeMap<i32, Vec<RuntimeFilterProberDestination>>,
+    runtime_filter_builder_number: &BTreeMap<i32, i32>,
+    runtime_filter_max_size: i64,
+) -> Result<Option<novarocks::RuntimeFilterParams>, String> {
+    if prober_params.is_empty()
+        && runtime_filter_builder_number.is_empty()
+        && runtime_filter_max_size == 0
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(novarocks::RuntimeFilterParams {
+        id_to_prober_params: prober_params
+            .iter()
+            .map(|(filter_id, params)| {
+                Ok((
+                    *filter_id,
+                    novarocks::ProberParamsList {
+                        params: params
+                            .iter()
+                            .map(encode_prober_params)
+                            .collect::<Result<Vec<_>, _>>()?,
+                    },
+                ))
             })
-            .transpose()?
-            .unwrap_or_default(),
-        runtime_filter_builder_number: src
-            .runtime_filter_builder_number
-            .as_ref()
-            .map(|values| values.iter().map(|(k, v)| (*k, *v)).collect())
-            .unwrap_or_default(),
-        runtime_filter_max_size: src.runtime_filter_max_size.unwrap_or_default(),
-    })
+            .collect::<Result<HashMap<_, _>, String>>()?,
+        runtime_filter_builder_number: runtime_filter_builder_number
+            .iter()
+            .map(|(filter_id, count)| (*filter_id, *count))
+            .collect(),
+        runtime_filter_max_size,
+    }))
 }
 
 fn encode_prober_params(
-    src: &runtime_filter::TRuntimeFilterProberParams,
+    src: &RuntimeFilterProberDestination,
 ) -> Result<novarocks::ProberParams, String> {
-    let fragment_instance_id = src.fragment_instance_id.as_ref().ok_or_else(|| {
-        "TRuntimeFilterProberParams.fragment_instance_id is required for native encoding"
-            .to_string()
-    })?;
-    let address = src.fragment_instance_address.as_ref().ok_or_else(|| {
-        "TRuntimeFilterProberParams.fragment_instance_address is required for native encoding"
-            .to_string()
-    })?;
     Ok(novarocks::ProberParams {
-        fragment_instance_id: Some(encode_unique_id(fragment_instance_id)),
-        fragment_instance_address: format_network_address(address),
+        fragment_instance_id: Some(encode_unique_id(src.fragment_instance_id())),
+        grpc_endpoint: src.endpoint().as_host_port(),
     })
 }
 
@@ -324,8 +319,4 @@ fn encode_iceberg_file_content(src: &types::TIcebergFileContent) -> Result<&'sta
             i32::from(*src)
         )),
     }
-}
-
-fn format_network_address(src: &types::TNetworkAddress) -> String {
-    format!("{}:{}", src.hostname, src.port)
 }
