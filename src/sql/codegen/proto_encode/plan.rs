@@ -194,6 +194,9 @@ fn encoded_node_output_columns(
                     columns.extend(output_layout.aggregate_columns.clone());
                     Ok(columns)
                 }
+                Some(plan::plan_node::Kind::Values(values)) if values.columns.is_empty() => {
+                    Ok(Vec::new())
+                }
                 Some(kind) => Err(format!(
                     "native stream source node {} has no output columns for {:?}",
                     node.node_id, kind
@@ -2049,6 +2052,37 @@ mod tests {
     }
 
     #[test]
+    fn stream_sink_allows_zero_column_values_source() {
+        let plan = two_fragment_zero_column_stream_plan_for_test();
+
+        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
+
+        let source = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 1)
+            .expect("source fragment");
+        let Some(plan::data_sink::Kind::DataStream(sink)) =
+            source.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+        else {
+            panic!("expected DataStream sink");
+        };
+        assert!(sink.output_columns.is_empty());
+
+        let target = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 0)
+            .expect("target fragment");
+        let receiver = target.root.as_ref().expect("target root");
+        let Some(plan::distributed_node::Payload::Exchange(exchange)) = receiver.payload.as_ref()
+        else {
+            panic!("expected Exchange receiver");
+        };
+        assert!(exchange.output_columns.is_empty());
+    }
+
+    #[test]
     fn iceberg_delta_table_encoder_requires_mv_refresh_context() {
         use crate::sql::codegen::proto_encode::plan;
 
@@ -2228,6 +2262,85 @@ mod tests {
                 stream_kind: FragmentStreamKind::Gather,
                 edge_kind: FragmentEdgeKind::Stream,
                 output_slot_ids: vec![2, 1],
+            }],
+        }
+    }
+
+    fn two_fragment_zero_column_stream_plan_for_test() -> DistributedPlan {
+        DistributedPlan {
+            fragments: vec![
+                PlanFragment {
+                    fragment_id: 1,
+                    root: DistributedNode {
+                        node_id: 10,
+                        fragment_id: 1,
+                        tuple_ids: vec![10],
+                        nullable_tuple_ids: Vec::new(),
+                        limit: -1,
+                        build_runtime_filters: Vec::new(),
+                        probe_runtime_filters: Vec::new(),
+                        children: Vec::new(),
+                        stats: stats(),
+                        payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                            crate::sql::planner::plan::PlanValuesNode {
+                                rows: vec![Vec::new()],
+                                columns: Vec::new(),
+                            },
+                        )),
+                    },
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition::unpartitioned(),
+                    sink: DataSink::Noop,
+                    output_exprs: None,
+                    output_columns: Vec::new(),
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+                PlanFragment {
+                    fragment_id: 0,
+                    root: DistributedNode {
+                        node_id: 20,
+                        fragment_id: 0,
+                        tuple_ids: vec![20],
+                        nullable_tuple_ids: Vec::new(),
+                        limit: -1,
+                        build_runtime_filters: Vec::new(),
+                        probe_runtime_filters: Vec::new(),
+                        children: Vec::new(),
+                        stats: stats(),
+                        payload: DistributedPayload::Exchange(ExchangeReceiver {
+                            partition_type:
+                                crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                            partition_exprs: Vec::new(),
+                            source_fragment_id: 1,
+                            output_columns: Vec::new(),
+                            output_qualifier: None,
+                            flavor: ExchangeFlavor::Distribution,
+                        }),
+                    },
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition::unpartitioned(),
+                    sink: DataSink::Result,
+                    output_exprs: None,
+                    output_columns: Vec::new(),
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+            ],
+            root_fragment_id: 0,
+            edges: vec![FragmentEdge {
+                source_fragment_id: 1,
+                target_fragment_id: 0,
+                target_exchange_node_id: 20,
+                output_partition: crate::thrift::partitions::TDataPartition::new(
+                    crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                    None::<Vec<crate::thrift::exprs::TExpr>>,
+                    None::<Vec<crate::thrift::partitions::TRangePartition>>,
+                    None::<Vec<crate::thrift::partitions::TBucketProperty>>,
+                ),
+                stream_kind: FragmentStreamKind::Gather,
+                edge_kind: FragmentEdgeKind::Stream,
+                output_slot_ids: Vec::new(),
             }],
         }
     }
