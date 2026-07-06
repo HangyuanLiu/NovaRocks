@@ -21,14 +21,9 @@ use std::time::Duration;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan, push_down_local_runtime_filters};
 use crate::exec::row_position::RowPositionDescriptor;
-use crate::exec::spill::QuerySpillManager;
 use crate::novarocks_connectors::ConnectorRegistry;
 
-use crate::cache::CacheOptions;
-use crate::common::config::{
-    debug_exec_node_output, runtime_filter_scan_wait_time_ms_override,
-    runtime_filter_wait_timeout_ms_override,
-};
+use crate::common::config::debug_exec_node_output;
 use crate::common::types::UniqueId;
 use crate::exec::operators::{
     DataStreamSinkFactory, IcebergChangeStreamRouterSinkFactory, IcebergTableSinkFactory,
@@ -38,12 +33,16 @@ use crate::exec::operators::{
 use crate::exec::pipeline::executor::{
     execute_plan_with_pipeline, execute_plan_with_pipeline_with_root_sink_dop,
 };
-use crate::lower::compact::layout::{build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots};
+use crate::lower::common::fragment_runtime::{
+    RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
+};
+use crate::lower::compact::layout::{
+    build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots,
+};
 use crate::lower::compact::node::{Lowered, PlanOrigin, lower_plan};
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{QueryId, query_context_manager};
-use crate::runtime::runtime_state::RuntimeState;
 use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
 
 fn merge_row_pos_descs(
@@ -166,16 +165,7 @@ pub(crate) fn execute_fragment(
     typed_result_sink: bool,
     plan_origin: PlanOrigin,
 ) -> Result<FragmentOutput, String> {
-    let mut query_opts = query_opts.cloned();
-    if let Some(opts) = query_opts.as_mut() {
-        if let Some(ms) = runtime_filter_scan_wait_time_ms_override() {
-            opts.runtime_filter_scan_wait_time_ms = Some(ms);
-        }
-        if let Some(ms) = runtime_filter_wait_timeout_ms_override() {
-            let ms = i32::try_from(ms).unwrap_or(i32::MAX);
-            opts.runtime_filter_wait_timeout_ms = Some(ms);
-        }
-    }
+    let query_opts = apply_query_option_overrides(query_opts.cloned());
 
     let profile_name = fragment
         .plan
@@ -206,24 +196,17 @@ pub(crate) fn execute_fragment(
         hi: params.fragment_instance_id.hi,
         lo: params.fragment_instance_id.lo,
     });
-    let cache_options = CacheOptions::from_query_options(query_opts.as_ref())?;
-    let spill_config = crate::exec::spill::query_options_wire::spill_config_from_query_options(
-        query_opts.as_ref(),
+    let runtime_state = build_runtime_state(
+        RuntimeStateInputs {
+            query_options: query_opts.clone(),
+            query_id,
+            runtime_filter_params,
+            fragment_instance_id,
+            backend_num,
+            mem_tracker,
+        },
+        profiler.as_ref(),
     )?;
-    let spill_manager = spill_config
-        .as_ref()
-        .map(|config| Arc::new(QuerySpillManager::new(config.clone(), profiler.as_ref())));
-    let runtime_state = Arc::new(RuntimeState::new(
-        query_opts.clone(),
-        Some(cache_options),
-        query_id,
-        runtime_filter_params,
-        fragment_instance_id,
-        backend_num,
-        mem_tracker,
-        spill_config,
-        spill_manager,
-    ));
 
     if let Some(plan) = fragment.plan.as_ref() {
         let mut tuple_slots = build_tuple_slot_order(desc_tbl);

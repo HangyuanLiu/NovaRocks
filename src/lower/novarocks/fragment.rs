@@ -25,11 +25,7 @@ use thrift::OrderedFloat;
 
 use super::expr::lower_proto_expr;
 use super::node::{NodeLoweringContext, lower_proto_node};
-use crate::cache::CacheOptions;
-use crate::common::config::{
-    debug_exec_node_output, runtime_filter_scan_wait_time_ms_override,
-    runtime_filter_wait_timeout_ms_override,
-};
+use crate::common::config::debug_exec_node_output;
 use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
@@ -38,14 +34,15 @@ use crate::exec::operators::{
     MultiCastDataStreamSinkFactory, NoopSinkFactory, ResultBufferSinkFactory,
 };
 use crate::exec::pipeline::executor::execute_plan_with_pipeline;
-use crate::exec::spill::QuerySpillManager;
+use crate::lower::common::fragment_runtime::{
+    RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
+};
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::native_fragment_wire as native_wire;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::result_buffer;
-use crate::runtime::runtime_state::RuntimeState;
 use crate::{connector, proto};
 
 pub(crate) fn execute_fragment_native(
@@ -78,25 +75,18 @@ pub(crate) fn execute_fragment_native(
         .as_ref()
         .map(native_wire::runtime_filter_params_from_native)
         .transpose()?;
-    let cache_options = CacheOptions::from_query_options(query_options.as_ref())?;
-    let spill_config = crate::exec::spill::query_options_wire::spill_config_from_query_options(
-        query_options.as_ref(),
-    )?;
-    let spill_manager = spill_config
-        .as_ref()
-        .map(|config| Arc::new(QuerySpillManager::new(config.clone(), profiler.as_ref())));
     let result_buffer_tracker = mem_tracker.clone();
-    let runtime_state = Arc::new(RuntimeState::new(
-        query_options.clone(),
-        Some(cache_options),
-        Some(query_id),
-        runtime_filter_params,
-        Some(fragment_instance_id),
-        Some(instance_params.backend_num),
-        mem_tracker,
-        spill_config,
-        spill_manager,
-    ));
+    let runtime_state = build_runtime_state(
+        RuntimeStateInputs {
+            query_options: query_options.clone(),
+            query_id: Some(query_id),
+            runtime_filter_params,
+            fragment_instance_id: Some(fragment_instance_id),
+            backend_num: Some(instance_params.backend_num),
+            mem_tracker,
+        },
+        profiler.as_ref(),
+    )?;
 
     let root = fragment
         .root
@@ -177,20 +167,6 @@ fn query_id_from_native(src: &proto::common::UniqueId) -> QueryId {
         hi: src.hi,
         lo: src.lo,
     }
-}
-
-fn apply_query_option_overrides(
-    mut query_options: Option<native_wire::QueryOptions>,
-) -> Option<native_wire::QueryOptions> {
-    if let Some(opts) = query_options.as_mut() {
-        if let Some(ms) = runtime_filter_scan_wait_time_ms_override() {
-            opts.runtime_filter_scan_wait_time_ms = Some(ms);
-        }
-        if let Some(ms) = runtime_filter_wait_timeout_ms_override() {
-            opts.runtime_filter_wait_timeout_ms = Some(i32::try_from(ms).unwrap_or(i32::MAX));
-        }
-    }
-    query_options
 }
 
 fn node_context_from_instance_params(
