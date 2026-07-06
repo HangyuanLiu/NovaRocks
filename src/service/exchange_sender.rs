@@ -80,6 +80,24 @@ pub struct ExchangeSendTask {
     pub tracker: Arc<ExchangeSendTracker>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExchangeChunkTransport {
+    Grpc,
+    #[cfg(all(feature = "compat", not(test)))]
+    BrpcCompat,
+}
+
+fn exchange_chunk_transport_for_current_build() -> ExchangeChunkTransport {
+    #[cfg(all(feature = "compat", not(test)))]
+    {
+        ExchangeChunkTransport::BrpcCompat
+    }
+    #[cfg(not(all(feature = "compat", not(test))))]
+    {
+        ExchangeChunkTransport::Grpc
+    }
+}
+
 pub fn send_runtime_filter(
     dest_host: &str,
     dest_port: u16,
@@ -371,31 +389,31 @@ fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_byt
     // reservation symmetrically with the global one on completion.
     let dest_key = ExchangeSendKey::from_task(&task);
 
-    #[cfg(feature = "compat")]
-    let result = crate::service::internal_rpc_client::send_chunks(
-        &task.dest_host,
-        task.dest_port,
-        task.finst_id,
-        task.node_id,
-        task.sender_id,
-        task.be_number,
-        task.eos,
-        task.sequence,
-        task.payload,
-    );
-
-    #[cfg(not(feature = "compat"))]
-    let result = crate::service::grpc_client::send_chunks(
-        &task.dest_host,
-        task.dest_port,
-        task.finst_id,
-        task.node_id,
-        task.sender_id,
-        task.be_number,
-        task.eos,
-        task.sequence,
-        task.payload,
-    );
+    let result = match exchange_chunk_transport_for_current_build() {
+        #[cfg(all(feature = "compat", not(test)))]
+        ExchangeChunkTransport::BrpcCompat => crate::service::internal_rpc_client::send_chunks(
+            &task.dest_host,
+            task.dest_port,
+            task.finst_id,
+            task.node_id,
+            task.sender_id,
+            task.be_number,
+            task.eos,
+            task.sequence,
+            task.payload,
+        ),
+        ExchangeChunkTransport::Grpc => crate::service::grpc_client::send_chunks(
+            &task.dest_host,
+            task.dest_port,
+            task.finst_id,
+            task.node_id,
+            task.sender_id,
+            task.be_number,
+            task.eos,
+            task.sequence,
+            task.payload,
+        ),
+    };
     let send_ns = send_start.elapsed().as_nanos();
 
     if let Some(profile) = task.profiles.as_ref() {
@@ -507,6 +525,15 @@ mod tests {
 
     fn finst() -> UniqueId {
         UniqueId { hi: 1, lo: 1 }
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn rust_tests_use_grpc_for_exchange_chunk_transport_under_compat_builds() {
+        assert_eq!(
+            exchange_chunk_transport_for_current_build(),
+            ExchangeChunkTransport::Grpc
+        );
     }
 
     #[test]
