@@ -1997,34 +1997,6 @@ mod tests {
         })
     }
 
-    fn hdfs_range() -> novarocks::ScanRange {
-        novarocks::ScanRange {
-            kind: Some(novarocks::scan_range::Kind::Hdfs(
-                novarocks::HdfsScanRange {
-                    file_format: "PARQUET".to_string(),
-                    full_path: Some("s3://bucket/warehouse/db/t/data-1.parquet".to_string()),
-                    relative_path: None,
-                    table_id: None,
-                    offset: 0,
-                    length: 10,
-                    file_length: 10,
-                    delete_files: Vec::new(),
-                    deletion_vector_descriptor: None,
-                    first_row_id: None,
-                    data_sequence_number: None,
-                    modification_time: None,
-                    datacache_options: None,
-                    included_positions: Vec::new(),
-                    serialized_split: None,
-                    use_iceberg_jni_metadata_reader: false,
-                },
-            )),
-            volume_id: None,
-            empty: None,
-            has_more: None,
-        }
-    }
-
     fn file_range_with_deletion_vector() -> novarocks::ScanRangeParams {
         let mut range = file_range();
         let Some(novarocks::scan_range::Kind::File(file)) =

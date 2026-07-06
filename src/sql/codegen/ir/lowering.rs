@@ -747,6 +747,7 @@ fn lower_fragment_edges(
                     lowered_edge.output_slot_ids = lower_cte_receive_output_slot_ids(
                         exchange,
                         &source.scope,
+                        &source.output_columns,
                         "lower_fragment_edges",
                     )?;
                 } else {
@@ -945,6 +946,7 @@ fn lower_exchange_output_partition(
 fn lower_cte_receive_output_slot_ids(
     exchange: &super::kind::DistributedExchangeNode,
     source_scope: &ExprScope,
+    source_output_columns: &[AnalysisOutputColumn],
     edge_label: &str,
 ) -> Result<Vec<i32>, String> {
     let super::kind::ExchangeFlavor::CteMulticast {
@@ -960,9 +962,35 @@ fn lower_cte_receive_output_slot_ids(
             cte_id
         ));
     }
+    let physical_output_slots = source_output_columns
+        .iter()
+        .map(|column| {
+            source_scope
+                .resolve_by_id(column.column_id)
+                .map(|binding| binding.slot_id)
+                .ok_or_else(|| {
+                    format!(
+                        "CTE multicast source output column {} is not materialized by cte_id={} ({})",
+                        column.column_id.0, cte_id, edge_label
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut slots = Vec::with_capacity(receive_producer_column_ids.len());
-    for producer_id in receive_producer_column_ids {
-        let binding = source_scope.resolve_by_id(*producer_id).ok_or_else(|| {
+    for (idx, producer_id) in receive_producer_column_ids.iter().enumerate() {
+        let direct_binding = source_scope.resolve_by_id(*producer_id);
+        if let Some(binding) = direct_binding
+            && (physical_output_slots.is_empty()
+                || physical_output_slots.contains(&binding.slot_id))
+        {
+            slots.push(binding.slot_id);
+            continue;
+        }
+        if physical_output_slots.len() == receive_producer_column_ids.len() {
+            slots.push(physical_output_slots[idx]);
+            continue;
+        }
+        let binding = direct_binding.ok_or_else(|| {
             format!(
                 "CTE multicast receive column {} is not produced by cte_id={} ({})",
                 producer_id.0, cte_id, edge_label
@@ -6650,6 +6678,57 @@ mod tests {
             .and_then(|slot| slot.id)
             .expect("producer column c slot id");
         assert_eq!(edge.output_slot_ids, vec![expected_p2_slot_id]);
+    }
+
+    #[test]
+    fn cte_multicast_receive_uses_physical_output_slot_for_logical_alias() {
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            ColumnId::new_for_test(10),
+            None,
+            "sum_v".to_string(),
+            ColumnBinding {
+                tuple_id: 7,
+                slot_id: 10,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        scope.add_column_with_id(
+            ColumnId::new_for_test(13),
+            None,
+            "total".to_string(),
+            ColumnBinding {
+                tuple_id: 7,
+                slot_id: 13,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        let exchange = DistributedExchangeNode {
+            partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+            partition_exprs: Vec::new(),
+            source_fragment_id: 0,
+            output_columns: vec![output_col(13, "total", DataType::Int64, false)],
+            output_qualifier: None,
+            flavor: ExchangeFlavor::CteMulticast {
+                cte_id: 1,
+                receive_producer_column_ids: vec![ColumnId::new_for_test(13)],
+            },
+        };
+        let source_output_columns = vec![output_col(10, "sum_v", DataType::Int64, false)];
+
+        let slots = super::lower_cte_receive_output_slot_ids(
+            &exchange,
+            &scope,
+            &source_output_columns,
+            "test",
+        )
+        .expect("lower cte slots");
+
+        assert_eq!(slots, vec![10]);
     }
 
     #[test]

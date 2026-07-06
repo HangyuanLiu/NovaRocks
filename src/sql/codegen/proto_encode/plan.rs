@@ -157,7 +157,7 @@ fn stream_edge_output_columns(
     project_output_columns_for_edge(columns, &edge.output_slot_ids)
 }
 
-fn encoded_fragment_root_output_columns(
+pub(crate) fn encoded_fragment_root_output_columns(
     fragment: &plan::PlanFragment,
 ) -> Result<Vec<common::OutputColumn>, String> {
     let root = fragment
@@ -176,6 +176,32 @@ fn encoded_node_output_columns(
                 return Ok(physical.output_columns.clone());
             }
             match physical.kind.as_ref() {
+                Some(plan::plan_node::Kind::Project(project)) => project
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, item)| {
+                        let expr = item.expr.as_ref().ok_or_else(|| {
+                            format!(
+                                "native stream source project node {} item {} missing expr",
+                                node.node_id, idx
+                            )
+                        })?;
+                        let type_desc = expr.r#type.clone().ok_or_else(|| {
+                            format!(
+                                "native stream source project node {} item {} missing expr type",
+                                node.node_id, idx
+                            )
+                        })?;
+                        Ok(common::OutputColumn {
+                            column_id: item.output_column_id,
+                            name: item.output_name.clone(),
+                            r#type: Some(type_desc),
+                            nullable: expr.nullable,
+                            is_internal: false,
+                        })
+                    })
+                    .collect(),
                 Some(plan::plan_node::Kind::HashAggregate(aggregate)) => {
                     if !aggregate.output_columns.is_empty() {
                         return Ok(aggregate.output_columns.clone());
