@@ -4,14 +4,15 @@ use crate::proto::{common, novarocks};
 use crate::runtime::endpoint::{
     FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
 };
+use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range;
 use crate::runtime::scheduler::FragmentInstancePlacement;
-use crate::thrift::{internal_service, types};
+use crate::thrift::types;
 
 pub(crate) fn encode_instance_params(
     query_id: &types::TUniqueId,
     placement: &FragmentInstancePlacement,
-    query_options: Option<&internal_service::TQueryOptions>,
+    query_options: Option<&QueryOptions>,
     runtime_filter_prober_params: &BTreeMap<i32, Vec<RuntimeFilterProberDestination>>,
     runtime_filter_builder_number: &BTreeMap<i32, i32>,
     runtime_filter_max_size: i64,
@@ -231,41 +232,6 @@ fn encode_prober_params(
     })
 }
 
-fn encode_query_options(src: &internal_service::TQueryOptions) -> novarocks::QueryOptions {
-    novarocks::QueryOptions {
-        batch_size: src.batch_size.unwrap_or_default(),
-        query_timeout: src.query_timeout.unwrap_or_default(),
-        enable_profile: src.enable_profile.unwrap_or(false),
-        pipeline_dop: src.pipeline_dop.unwrap_or_default(),
-        query_mem_limit: src.query_mem_limit.unwrap_or_default(),
-        connector_io_tasks_per_scan_operator: src
-            .connector_io_tasks_per_scan_operator
-            .or(src.io_tasks_per_scan_operator)
-            .unwrap_or_default(),
-        runtime_filter_scan_wait_time_ms: src.runtime_filter_scan_wait_time_ms.unwrap_or_default(),
-        runtime_filter_wait_timeout_ms: src.runtime_filter_wait_timeout_ms.unwrap_or_default(),
-        allow_throw_exception: src.allow_throw_exception.unwrap_or(false),
-        group_concat_max_len: src.group_concat_max_len.unwrap_or_default(),
-        enable_spill: src.enable_spill.unwrap_or(false),
-        spill_options: src.spill_options.as_ref().map(encode_spill_options),
-    }
-}
-
-fn encode_spill_options(src: &internal_service::TSpillOptions) -> novarocks::SpillOptions {
-    novarocks::SpillOptions {
-        spill_mode: src.spill_mode.map(i32::from).unwrap_or_default(),
-        spill_mem_limit_threshold: src
-            .spill_mem_limit_threshold
-            .map(|value| value.into_inner())
-            .unwrap_or_default(),
-        spill_operator_min_bytes: src.spill_operator_min_bytes.unwrap_or_default(),
-        spill_operator_max_bytes: src.spill_operator_max_bytes.unwrap_or_default(),
-        spill_encode_level: src.spill_encode_level.unwrap_or_default(),
-        enable_spill_buffer_read: src.enable_spill_buffer_read.unwrap_or(false),
-        max_spill_read_buffer_bytes_per_driver: src
-            .max_spill_read_buffer_bytes_per_driver
-            .unwrap_or_default(),
-        spill_mem_table_size: src.spill_mem_table_size.unwrap_or_default(),
-        spill_mem_table_num: src.spill_mem_table_num.unwrap_or_default(),
-    }
+fn encode_query_options(src: &QueryOptions) -> novarocks::QueryOptions {
+    src.to_native()
 }

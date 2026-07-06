@@ -139,10 +139,10 @@ fn query_options() -> novarocks::QueryOptions {
         pipeline_dop: 8,
         query_mem_limit: 512 << 20,
         connector_io_tasks_per_scan_operator: 4,
-        runtime_filter_scan_wait_time_ms: 1500,
-        runtime_filter_wait_timeout_ms: 3000,
+        runtime_filter_scan_wait_time_ms: Some(1500),
+        runtime_filter_wait_timeout_ms: Some(3000),
         allow_throw_exception: true,
-        group_concat_max_len: 65_536,
+        group_concat_max_len: Some(65_536),
         enable_spill: true,
         spill_options: Some(novarocks::SpillOptions {
             spill_mode: 2,
@@ -155,6 +155,19 @@ fn query_options() -> novarocks::QueryOptions {
             spill_mem_table_size: 16 << 20,
             spill_mem_table_num: 3,
         }),
+        enable_scan_datacache: true,
+        enable_populate_datacache: true,
+        enable_datacache_async_populate_mode: true,
+        enable_datacache_io_adaptor: true,
+        enable_cache_select: true,
+        datacache_evict_probability: Some(75),
+        datacache_priority: 2,
+        datacache_ttl_seconds: 3600,
+        datacache_sharing_work_period: 10,
+        query_delivery_timeout: 30,
+        runtime_profile_report_interval: 7,
+        enable_join_runtime_bitset_filter: Some(true),
+        global_runtime_filter_build_max_size: 1 << 20,
         ..Default::default()
     }
 }
@@ -168,6 +181,18 @@ fn query_options_use_pre_release_reset_tags() {
     let fields = encoded_field_numbers(&query_mem_limit_only);
 
     assert_eq!(fields, vec![5], "query_mem_limit must use reset tag 5");
+}
+
+#[test]
+fn query_options_runtime_consumed_fields_use_native_tags() {
+    let mut fields = encoded_field_numbers(&query_options());
+    fields.sort_unstable();
+
+    assert_eq!(
+        fields,
+        (1..=25).collect::<Vec<_>>(),
+        "QueryOptions must keep native runtime consumed fields on tags 1..=25"
+    );
 }
 
 #[test]

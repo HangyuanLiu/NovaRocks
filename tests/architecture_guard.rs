@@ -208,6 +208,26 @@ fn source_and_test_rs_files() -> Vec<PathBuf> {
         .collect()
 }
 
+#[test]
+fn nidl_d3g_native_runtime_query_options_do_not_use_thrift_model() {
+    let forbidden = [
+        "src/runtime/runtime_state.rs",
+        "src/cache/mod.rs",
+        "src/exec/spill/query_options_wire.rs",
+        "src/runtime/coordinator.rs",
+        "src/runtime/native_fragment_wire.rs",
+        "src/sql/codegen/proto_encode/instance.rs",
+    ];
+    let repo = Path::new(manifest_dir());
+    for path in forbidden {
+        let text = fs::read_to_string(repo.join(path)).expect(path);
+        assert!(
+            !text.contains("TQueryOptions") && !text.contains("internal_service::TQueryOptions"),
+            "{path} must use runtime::query_options::QueryOptions, not thrift TQueryOptions"
+        );
+    }
+}
+
 fn rs_files_under(relative_roots: &[&str]) -> Vec<PathBuf> {
     let repo = Path::new(manifest_dir());
     let mut files = Vec::new();

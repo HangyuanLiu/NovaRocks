@@ -55,7 +55,7 @@ use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common, expr, novarocks, plan};
 use crate::runtime::exchange::ExchangeKey;
-use crate::runtime::runtime_state::QueryOptions;
+use crate::runtime::query_options::QueryOptions;
 use crate::sql::codegen::expr_compiler::infer_agg_function_types;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::types::wider_type;

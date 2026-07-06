@@ -38,6 +38,7 @@ pub mod profile;
 pub(crate) mod profile_correlate;
 pub(crate) mod query_cancel;
 pub mod query_context;
+pub(crate) mod query_options;
 pub mod query_result;
 pub(crate) mod query_state;
 pub(crate) mod registry_cleanup;

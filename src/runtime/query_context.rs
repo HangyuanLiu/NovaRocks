@@ -41,6 +41,7 @@ use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use crate::runtime::descriptor_snapshot_thrift::descriptor_snapshot_from_thrift;
 use crate::runtime::lookup::GlobalLateMaterializationContext;
 use crate::runtime::mem_tracker::{self, MemTracker};
+pub(crate) use crate::runtime::query_options::query_expire_durations;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 use crate::runtime::runtime_filter_worker::{
@@ -1482,24 +1483,6 @@ pub(crate) fn resolve_desc_tbl_for_instance(
         }
         Ok(ctx.desc_tbl.clone())
     })
-}
-
-pub(crate) fn query_expire_durations(
-    query_opts: Option<&internal_service::TQueryOptions>,
-) -> (Duration, Duration) {
-    let default_timeout = 300i32;
-    let query_timeout = query_opts
-        .and_then(|o| o.query_timeout)
-        .unwrap_or(default_timeout)
-        .max(1);
-    let delivery_timeout = query_opts
-        .and_then(|o| o.query_delivery_timeout)
-        .map(|v| v.max(1).min(query_timeout))
-        .unwrap_or(query_timeout);
-    (
-        Duration::from_secs(delivery_timeout as u64),
-        Duration::from_secs(query_timeout as u64),
-    )
 }
 
 #[cfg(test)]

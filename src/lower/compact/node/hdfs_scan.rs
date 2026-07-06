@@ -1185,7 +1185,10 @@ pub(crate) fn lower_hdfs_scan_node(
     let needs_first_row_id = row_position_spec.is_some() || iceberg_virtual_row_id_slot.is_some();
 
     let case_sensitive = hdfs.case_sensitive.unwrap_or(true);
-    let mut cache_options = CacheOptions::from_query_options(query_opts)?;
+    let runtime_query_opts = query_opts
+        .map(|opts| crate::runtime::query_options::QueryOptions::from_thrift(Some(opts)))
+        .transpose()?;
+    let mut cache_options = CacheOptions::from_query_options(runtime_query_opts.as_ref())?;
     if let Some(node_datacache_options) = hdfs.datacache_options.as_ref() {
         let node_range_options = ExternalDataCacheRangeOptions {
             modification_time: None,

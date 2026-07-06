@@ -69,7 +69,7 @@ impl FragmentContext {
     ) -> Self {
         let enable_profile = runtime_state
             .query_options()
-            .and_then(|opts| opts.enable_profile)
+            .map(|opts| opts.enable_profile)
             .unwrap_or(false);
         let runtime_profile_report_interval_ns = runtime_state.runtime_profile_report_interval_ns();
         Self {

@@ -20,9 +20,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(test)]
-use thrift::OrderedFloat;
-
 use super::expr::lower_proto_expr;
 use super::node::{NodeLoweringContext, lower_proto_node};
 use crate::common::config::debug_exec_node_output;
@@ -42,8 +39,8 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::native_fragment_wire as native_wire;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
+use crate::runtime::query_options::QueryOptions;
 use crate::runtime::result_buffer;
-use crate::runtime::runtime_state::QueryOptions;
 use crate::{connector, proto};
 
 pub(crate) fn execute_fragment_native(
@@ -101,7 +98,7 @@ pub(crate) fn execute_fragment_native(
     let mut arena = ExprArena::default();
     let allow_throw_exception = query_options
         .as_ref()
-        .and_then(|opts| opts.allow_throw_exception)
+        .map(|opts| opts.allow_throw_exception)
         .unwrap_or(false);
     arena.set_allow_throw_exception(allow_throw_exception);
     arena.set_session_time_zone(session_time_zone.map(str::to_string));
@@ -588,7 +585,7 @@ mod tests {
             enable_profile: true,
             query_mem_limit: 1 << 20,
             connector_io_tasks_per_scan_operator: 7,
-            runtime_filter_wait_timeout_ms: 123,
+            runtime_filter_wait_timeout_ms: Some(123),
             allow_throw_exception: true,
             enable_spill: true,
             spill_options: Some(proto::novarocks::SpillOptions {
@@ -603,16 +600,14 @@ mod tests {
         .expect("query options");
 
         assert_eq!(opts.batch_size, Some(8192));
-        assert_eq!(opts.enable_profile, Some(true));
-        assert_eq!(opts.query_mem_limit, Some(1 << 20));
-        assert_eq!(opts.io_tasks_per_scan_operator, Some(7));
+        assert!(opts.enable_profile);
+        assert_eq!(opts.exec_mem_limit, Some(1 << 20));
         assert_eq!(opts.connector_io_tasks_per_scan_operator, Some(7));
         assert_eq!(opts.runtime_filter_wait_timeout_ms, Some(123));
-        assert_eq!(opts.allow_throw_exception, Some(true));
-        assert_eq!(opts.enable_spill, Some(true));
-        let spill = opts.spill_options.expect("spill options");
-        assert_eq!(spill.spill_mode, Some(native_wire::SpillMode::FORCE));
-        assert_eq!(spill.spill_mem_limit_threshold, Some(OrderedFloat(0.5)));
+        assert!(opts.allow_throw_exception);
+        let spill = opts.spill.expect("spill options");
+        assert_eq!(spill.spill_mode, crate::exec::spill::SpillMode::Force);
+        assert_eq!(spill.spill_mem_limit_threshold, Some(0.5));
         assert_eq!(spill.spill_operator_min_bytes, Some(1024));
         assert_eq!(spill.spill_mem_table_size, Some(32));
     }

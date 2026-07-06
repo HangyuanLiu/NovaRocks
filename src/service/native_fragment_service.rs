@@ -29,9 +29,8 @@ use crate::runtime::native_fragment_wire::{
     endpoint_from_native, query_options_from_native, runtime_filter_params_from_native,
 };
 use crate::runtime::profile::Profiler;
-use crate::runtime::query_context::{
-    QueryContextManager, QueryId, query_context_manager, query_expire_durations,
-};
+use crate::runtime::query_context::{QueryContextManager, QueryId, query_context_manager};
+use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::runtime::result_buffer;
 use crate::service::fe_report;
 
@@ -112,6 +111,24 @@ fn prepare_native_result_buffer_if_needed(
         let tracker = MemTracker::new_child(label, root);
         result_buffer::set_mem_tracker(finst_id, tracker);
     }
+}
+
+fn profile_report_interval_ns(
+    enable_profile: bool,
+    query_opts: Option<&QueryOptions>,
+) -> Option<i64> {
+    if !enable_profile {
+        return None;
+    }
+    let from_query = query_opts
+        .and_then(|opts| opts.runtime_profile_report_interval)
+        .filter(|v| *v > 0)
+        .and_then(|v| v.checked_mul(1_000_000_000));
+    from_query.or_else(|| {
+        app_config::config()
+            .ok()
+            .map(|cfg| cfg.runtime.profile_report_interval.max(1) * 1_000_000_000)
+    })
 }
 
 fn spawn_exec_fragment_native(
@@ -264,20 +281,14 @@ pub fn submit_exec_plan_fragment_native(
     let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
     let enable_profile = query_opts
         .as_ref()
-        .and_then(|opts| opts.enable_profile)
+        .map(|opts| opts.enable_profile)
         .unwrap_or(false);
     let profiler = if enable_profile {
         Some(Profiler::new(profile_name_for_native_fragment(&fragment)))
     } else {
         None
     };
-    let report_interval_ns = if enable_profile {
-        app_config::config()
-            .ok()
-            .map(|cfg| cfg.runtime.profile_report_interval.max(1) * 1_000_000_000)
-    } else {
-        None
-    };
+    let report_interval_ns = profile_report_interval_ns(enable_profile, query_opts.as_ref());
     if let Some(report_endpoint) = instance_params
         .report_endpoint
         .as_deref()
@@ -321,4 +332,25 @@ pub fn submit_exec_plan_fragment_native(
         Arc::clone(&mgr),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::query_options::QueryOptions;
+
+    #[test]
+    fn native_fragment_profile_report_interval_uses_query_options_before_config() {
+        let query_opts = QueryOptions {
+            enable_profile: true,
+            runtime_profile_report_interval: Some(7),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            profile_report_interval_ns(true, Some(&query_opts)),
+            Some(7_000_000_000)
+        );
+        assert_eq!(profile_report_interval_ns(false, Some(&query_opts)), None);
+    }
 }

@@ -26,11 +26,10 @@ use crate::runtime::load_tracking;
 use crate::runtime::mem_tracker::{self, MemTracker};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::query_context::QueryId;
+use crate::runtime::query_options::QueryOptions;
 use crate::runtime::sink_commit;
-use crate::thrift::internal_service;
 use crate::thrift::runtime_filter;
 
-pub(crate) type QueryOptions = internal_service::TQueryOptions;
 pub(crate) type RuntimeFilterParams = runtime_filter::TRuntimeFilterParams;
 
 /// RuntimeState is a per-fragment-instance execution context, similar to StarRocks BE RuntimeState.
@@ -154,7 +153,7 @@ impl RuntimeState {
     }
 
     #[allow(dead_code)]
-    pub fn query_options(&self) -> Option<&QueryOptions> {
+    pub(crate) fn query_options(&self) -> Option<&QueryOptions> {
         self.query_options.as_ref()
     }
 
@@ -386,7 +385,7 @@ impl RuntimeState {
 
     /// Return the maximum row count per in-memory chunk/RecordBatch.
     ///
-    /// StarRocks BE uses `TQueryOptions.batch_size` (aka `RuntimeState::chunk_size()`).
+    /// StarRocks BE uses query option `batch_size` (aka `RuntimeState::chunk_size()`).
     pub fn chunk_size(&self) -> usize {
         self.query_options
             .as_ref()
@@ -399,7 +398,7 @@ impl RuntimeState {
 
     pub fn runtime_profile_report_interval_ns(&self) -> Option<i64> {
         let opts = self.query_options.as_ref()?;
-        if !opts.enable_profile.unwrap_or(false) {
+        if !opts.enable_profile {
             return None;
         }
         let interval_s = opts.runtime_profile_report_interval.unwrap_or(0);
