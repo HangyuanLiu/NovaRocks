@@ -2258,6 +2258,125 @@ fn parse_current_novarocks_proto_schema() -> Result<ProtoSchema, String> {
     Ok(ProtoSchema { version: 1, files })
 }
 
+fn compare_proto_schema_to_baseline(current: &ProtoSchema, baseline: &ProtoSchema) -> Vec<String> {
+    let _ = (current, baseline);
+    vec!["not implemented".to_string()]
+}
+
+fn test_proto_field(number: u32, name: &str, type_name: &str) -> ProtoFieldSchema {
+    ProtoFieldSchema {
+        number,
+        name: name.to_string(),
+        type_name: type_name.to_string(),
+        label: "singular".to_string(),
+        oneof: None,
+    }
+}
+
+fn test_proto_message_with_reserved(
+    fields: Vec<ProtoFieldSchema>,
+    reserved_numbers: &[u32],
+    reserved_names: &[&str],
+) -> ProtoMessageSchema {
+    ProtoMessageSchema {
+        fields: fields
+            .into_iter()
+            .map(|field| (field.number, field))
+            .collect(),
+        reserved_numbers: reserved_numbers.iter().copied().collect(),
+        reserved_names: reserved_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+    }
+}
+
+fn test_proto_message(fields: Vec<ProtoFieldSchema>) -> ProtoMessageSchema {
+    test_proto_message_with_reserved(fields, &[], &[])
+}
+
+fn test_proto_enum(values: Vec<(i32, &str)>) -> ProtoEnumSchema {
+    ProtoEnumSchema {
+        values: values
+            .into_iter()
+            .map(|(number, name)| ProtoEnumValueSchema {
+                number,
+                name: name.to_string(),
+            })
+            .collect(),
+        reserved_numbers: BTreeSet::new(),
+        reserved_names: BTreeSet::new(),
+    }
+}
+
+fn test_proto_rpc(request: &str, response: &str) -> ProtoRpcSchema {
+    ProtoRpcSchema {
+        request: request.to_string(),
+        response: response.to_string(),
+        client_streaming: false,
+        server_streaming: false,
+    }
+}
+
+fn test_proto_service(rpcs: Vec<(&str, ProtoRpcSchema)>) -> ProtoServiceSchema {
+    ProtoServiceSchema {
+        rpcs: rpcs
+            .into_iter()
+            .map(|(name, rpc)| (name.to_string(), rpc))
+            .collect(),
+    }
+}
+
+fn test_proto_schema(
+    messages: Vec<(&str, ProtoMessageSchema)>,
+    enums: Vec<(&str, ProtoEnumSchema)>,
+    services: Vec<(&str, ProtoServiceSchema)>,
+) -> ProtoSchema {
+    ProtoSchema {
+        version: 1,
+        files: BTreeMap::from([(
+            "idl/novarocks/test.proto".to_string(),
+            ProtoFileSchema {
+                package: "novarocks.test".to_string(),
+                messages: messages
+                    .into_iter()
+                    .map(|(name, message)| (name.to_string(), message))
+                    .collect(),
+                enums: enums
+                    .into_iter()
+                    .map(|(name, enum_schema)| (name.to_string(), enum_schema))
+                    .collect(),
+                services: services
+                    .into_iter()
+                    .map(|(name, service)| (name.to_string(), service))
+                    .collect(),
+            },
+        )]),
+    }
+}
+
+fn assert_proto_schema_comparator_rejects(
+    current: ProtoSchema,
+    baseline: ProtoSchema,
+    expected_violation: &str,
+) {
+    let violations = compare_proto_schema_to_baseline(&current, &baseline);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains(expected_violation)),
+        "expected proto schema comparator violation containing `{expected_violation}`, got: {violations:?}"
+    );
+}
+
+fn assert_proto_schema_comparator_accepts(current: ProtoSchema, baseline: ProtoSchema) {
+    let violations = compare_proto_schema_to_baseline(&current, &baseline);
+    assert!(
+        violations.is_empty(),
+        "expected proto schema comparator to accept compatible schema, got: {violations:?}"
+    );
+}
+
 #[test]
 fn nidl_d3b_proto_schema_parser_handles_current_syntax() {
     let input = r#"
@@ -2472,4 +2591,223 @@ fn nidl_d3b_proto_schema_parser_rejects_unsupported_tails_and_bad_identifiers() 
         assert!(err.contains("idl/novarocks/bad.proto"), "{name}: {err}");
         assert!(err.contains(expected_statement), "{name}: {err}");
     }
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_field_type_change() {
+    let baseline = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "plan", "PlanNode")]),
+        )],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "plan", "PlanFragment")]),
+        )],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "field type change");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_field_rename() {
+    let baseline = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "plan", "PlanNode")]),
+        )],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "query_plan", "PlanNode")]),
+        )],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "field rename");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_field_number_reuse() {
+    let baseline = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "plan", "PlanNode")]),
+        )],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "scan_node", "ScanNode")]),
+        )],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "field number reuse");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_deleted_field_without_reserved_number() {
+    let baseline = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "plan", "PlanNode")]),
+        )],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message_with_reserved(vec![], &[], &["plan"]),
+        )],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "reserved number");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_deleted_field_without_reserved_name() {
+    let baseline = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "plan", "PlanNode")]),
+        )],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message_with_reserved(vec![], &[2], &[]),
+        )],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "reserved name");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_accepts_deleted_field_with_reserved_number_and_name() {
+    let baseline = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "plan", "PlanNode")]),
+        )],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message_with_reserved(vec![], &[2], &["plan"]),
+        )],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_accepts(current, baseline);
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_enum_zero_value_drift() {
+    let baseline = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![(0, "STATUS_UNSPECIFIED"), (1, "OK")]),
+        )],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![(0, "STATUS_UNKNOWN"), (1, "OK")]),
+        )],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "enum zero value");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_rpc_signature_change() {
+    let baseline = test_proto_schema(
+        vec![],
+        vec![],
+        vec![(
+            "NovaRocksGrpc",
+            test_proto_service(vec![(
+                "FetchResult",
+                test_proto_rpc("FetchResultRequest", "FetchResultResponse"),
+            )]),
+        )],
+    );
+    let current = test_proto_schema(
+        vec![],
+        vec![],
+        vec![(
+            "NovaRocksGrpc",
+            test_proto_service(vec![(
+                "FetchResult",
+                test_proto_rpc("FetchResultRequestV2", "FetchResultResponse"),
+            )]),
+        )],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "rpc signature");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_new_service() {
+    let baseline = test_proto_schema(
+        vec![],
+        vec![],
+        vec![(
+            "NovaRocksGrpc",
+            test_proto_service(vec![(
+                "FetchResult",
+                test_proto_rpc("FetchResultRequest", "FetchResultResponse"),
+            )]),
+        )],
+    );
+    let current = test_proto_schema(
+        vec![],
+        vec![],
+        vec![
+            (
+                "NovaRocksGrpc",
+                test_proto_service(vec![(
+                    "FetchResult",
+                    test_proto_rpc("FetchResultRequest", "FetchResultResponse"),
+                )]),
+            ),
+            (
+                "AdminGrpc",
+                test_proto_service(vec![(
+                    "Reload",
+                    test_proto_rpc("ReloadRequest", "ReloadResponse"),
+                )]),
+            ),
+        ],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "new service");
 }
