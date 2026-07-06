@@ -750,8 +750,12 @@ fn lower_fragment_edges(
                         "lower_fragment_edges",
                     )?;
                 } else {
-                    lowered_edge.output_slot_ids =
-                        lower_stream_edge_output_slot_ids(edge, &source.scope)?;
+                    lowered_edge.output_slot_ids = lower_stream_edge_output_slot_ids_for_exchange(
+                        edge,
+                        exchange,
+                        &source.scope,
+                        &source.output_columns,
+                    )?;
                 }
             }
             crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
@@ -972,31 +976,115 @@ fn lower_cte_receive_output_slot_ids(
 fn lower_stream_edge_output_slot_ids(
     edge: &crate::sql::codegen::FragmentEdge,
     source_scope: &ExprScope,
+    source_output_columns: &[AnalysisOutputColumn],
 ) -> Result<Vec<i32>, String> {
     if edge.output_slot_ids.is_empty() {
         return Ok(Vec::new());
     }
+    let ordered_bindings = if edge.output_slot_ids.len() <= source_scope.iter_columns().count() {
+        Some(
+            source_scope
+                .iter_columns()
+                .map(|(_, binding)| binding)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
     edge.output_slot_ids
         .iter()
         .copied()
-        .map(|column_id| {
+        .enumerate()
+        .map(|(index, column_id)| {
             let column_id = u32::try_from(column_id).map_err(|_| {
                 format!(
                     "stream edge source fragment {} output column id {} cannot convert to ColumnId",
                     edge.source_fragment_id, column_id
                 )
             })?;
-            source_scope
-                .resolve_by_id(ColumnId(column_id))
-                .map(|binding| binding.slot_id)
-                .ok_or_else(|| {
-                    format!(
-                        "stream edge source fragment {} output column id {} has no materialized slot",
-                        edge.source_fragment_id, column_id
-                    )
-                })
+            let column_id = ColumnId(column_id);
+            if let Some(binding) = source_scope.resolve_by_id(column_id) {
+                return Ok(binding.slot_id);
+            }
+            if edge.output_slot_ids.len() == source_output_columns.len() {
+                let source_column = &source_output_columns[index];
+                if let Some(binding) = source_scope.resolve_by_id(source_column.column_id) {
+                    return Ok(binding.slot_id);
+                }
+            }
+            if let Some(bindings) = &ordered_bindings {
+                return Ok(bindings[index].slot_id);
+            }
+            let source_columns = source_output_columns
+                .iter()
+                .map(|column| format!("{}:{}", column.column_id.0, column.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let edge_output_ids = edge
+                .output_slot_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "stream edge source fragment {} output column id {} has no materialized slot; edge output ids [{}], source output columns [{}], scope bindings [{}]",
+                edge.source_fragment_id,
+                column_id.0,
+                edge_output_ids,
+                source_columns,
+                format_boundary_scope_bindings(source_scope)
+            ))
         })
         .collect()
+}
+
+fn lower_stream_edge_output_slot_ids_for_exchange(
+    edge: &crate::sql::codegen::FragmentEdge,
+    exchange: &super::kind::DistributedExchangeNode,
+    source_scope: &ExprScope,
+    source_output_columns: &[AnalysisOutputColumn],
+) -> Result<Vec<i32>, String> {
+    if exchange.output_columns.is_empty() {
+        return lower_stream_edge_output_slot_ids(edge, source_scope, source_output_columns);
+    }
+
+    let output_columns =
+        normalize_exchange_output_columns(&exchange.output_columns, source_output_columns);
+    let mut normalized_edge = edge.clone();
+    normalized_edge.output_slot_ids = output_columns
+        .iter()
+        .map(|column| {
+            i32::try_from(column.column_id.0).map_err(|_| {
+                format!(
+                    "stream edge source fragment {} output column id {} cannot convert to i32",
+                    edge.source_fragment_id, column.column_id.0
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    lower_stream_edge_output_slot_ids(&normalized_edge, source_scope, &output_columns)
+}
+
+fn normalize_exchange_output_columns(
+    requested: &[AnalysisOutputColumn],
+    source_output_columns: &[AnalysisOutputColumn],
+) -> Vec<AnalysisOutputColumn> {
+    if requested.is_empty() {
+        return Vec::new();
+    }
+
+    let source_ids = source_output_columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect::<BTreeSet<_>>();
+    if requested
+        .iter()
+        .all(|column| source_ids.contains(&column.column_id))
+    {
+        requested.to_vec()
+    } else {
+        source_output_columns.to_vec()
+    }
 }
 
 fn edge_boundary_schemas(
@@ -1862,11 +1950,26 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                         self.state
                             .ensure_fragment_lowered(exchange.source_fragment_id)?;
                     }
+                    let source = self
+                        .state
+                        .lowered_fragment_output(exchange.source_fragment_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "DistributedPlan Exchange node_id={} references source fragment id={} before it was lowered",
+                                node.node_id, exchange.source_fragment_id
+                            )
+                        })?;
+                    let output_columns = normalize_exchange_output_columns(
+                        &exchange.output_columns,
+                        &source.output_columns,
+                    );
                     let exchange_tuple_id = first_tuple_id(node, "Exchange")?;
                     let (scope, output_columns) = self.lower_exchange_output_scope(
                         exchange_tuple_id,
                         node.node_id,
-                        exchange,
+                        &output_columns,
+                        exchange.output_qualifier.clone(),
                         "Distribution",
                     )?;
                     Ok(LoweredDistributedNode {
@@ -1943,7 +2046,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 let (scope, output_columns) = self.lower_exchange_output_scope(
                     exchange_tuple_id,
                     node.node_id,
-                    exchange,
+                    &exchange.output_columns,
+                    exchange.output_qualifier.clone(),
                     "CTE multicast",
                 )?;
                 Ok(LoweredDistributedNode {
@@ -2356,16 +2460,17 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         exchange_tuple_id: i32,
         exchange_node_id: i32,
-        exchange: &super::kind::DistributedExchangeNode,
+        output_columns: &[AnalysisOutputColumn],
+        output_qualifier: Option<String>,
         context: &str,
     ) -> Result<(ExprScope, Vec<AnalysisOutputColumn>), String> {
-        if exchange.output_columns.is_empty() {
+        if output_columns.is_empty() {
             return Err(format!(
                 "DistributedPlan {context} Exchange node_id={exchange_node_id} has no output columns",
             ));
         }
         let mut scope = ExprScope::new();
-        for (idx, col) in exchange.output_columns.iter().enumerate() {
+        for (idx, col) in output_columns.iter().enumerate() {
             let slot_id = self.state.alloc_slot();
             self.state.desc_builder().add_slot(
                 slot_id,
@@ -2384,13 +2489,13 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             };
             scope.add_column_with_id(
                 col.column_id,
-                exchange.output_qualifier.clone(),
+                output_qualifier.clone(),
                 col.name.clone(),
                 binding,
             );
         }
         self.state.desc_builder().add_tuple(exchange_tuple_id, None);
-        Ok((scope, exchange.output_columns.clone()))
+        Ok((scope, output_columns.to_vec()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6900,9 +7005,99 @@ mod tests {
         let mut edge = fragment_edge(1, 2, 77);
         edge.output_slot_ids = vec![2, 1];
 
-        let lowered = super::lower_stream_edge_output_slot_ids(&edge, &scope).expect("lower slots");
+        let lowered =
+            super::lower_stream_edge_output_slot_ids(&edge, &scope, &[]).expect("lower slots");
 
         assert_eq!(lowered, vec![9, 12]);
+    }
+
+    #[test]
+    fn stream_edge_output_slot_ids_fall_back_to_lowered_source_outputs_by_ordinal() {
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            ColumnId::new_for_test(11),
+            None,
+            "second".to_string(),
+            ColumnBinding {
+                tuple_id: 7,
+                slot_id: 43,
+                data_type: DataType::Utf8,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        scope.add_column_with_id(
+            ColumnId::new_for_test(10),
+            None,
+            "first".to_string(),
+            ColumnBinding {
+                tuple_id: 7,
+                slot_id: 42,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        let source_output_columns = vec![
+            OutputColumn {
+                column_id: ColumnId::new_for_test(10),
+                name: "first".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: ColumnId::new_for_test(11),
+                name: "second".to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+                is_internal: false,
+            },
+        ];
+        let mut edge = fragment_edge(1, 2, 77);
+        edge.output_slot_ids = vec![2, 1];
+
+        let lowered =
+            super::lower_stream_edge_output_slot_ids(&edge, &scope, &source_output_columns)
+                .expect("lower slots");
+
+        assert_eq!(lowered, vec![42, 43]);
+    }
+
+    #[test]
+    fn stream_edge_output_slot_ids_fall_back_to_scope_order_for_join_outputs() {
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            ColumnId::new_for_test(10),
+            None,
+            "left_a".to_string(),
+            ColumnBinding {
+                tuple_id: 7,
+                slot_id: 42,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        scope.add_column_with_id(
+            ColumnId::new_for_test(11),
+            None,
+            "right_a".to_string(),
+            ColumnBinding {
+                tuple_id: 8,
+                slot_id: 43,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        let mut edge = fragment_edge(1, 2, 77);
+        edge.output_slot_ids = vec![2];
+
+        let lowered =
+            super::lower_stream_edge_output_slot_ids(&edge, &scope, &[]).expect("lower slots");
+
+        assert_eq!(lowered, vec![42]);
     }
 
     fn distributed_values_node(

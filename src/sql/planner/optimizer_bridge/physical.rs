@@ -282,7 +282,7 @@ impl BridgeCtx<'_> {
                 Ok(PhysicalPlanKind::Redistribute(RedistributeNode {
                     mode,
                     partition_exprs,
-                    output_columns: node.output_columns.clone(),
+                    output_columns: child.output_columns.clone(),
                 }))
             }
             op if op.is_logical() => Err(format!(
@@ -798,10 +798,7 @@ mod tests {
             }
         );
         assert!(redistribute.partition_exprs.is_empty());
-        assert_output_columns_eq(
-            &redistribute.output_columns,
-            &[output_column(7, "parent_k")],
-        );
+        assert_output_columns_eq(&redistribute.output_columns, &[output_column(7, "child_k")]);
         assert_eq!(physical.children.len(), 1);
         assert!(matches!(
             physical.children[0].kind,
