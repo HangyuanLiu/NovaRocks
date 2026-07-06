@@ -4957,7 +4957,7 @@
             },
             "2": {
               "number": 2,
-              "name": "brpc_addr",
+              "name": "grpc_endpoint",
               "type_name": "string",
               "label": "singular",
               "oneof": null
@@ -6089,7 +6089,7 @@
             },
             "2": {
               "number": 2,
-              "name": "brpc_addr",
+              "name": "grpc_endpoint",
               "type_name": "string",
               "label": "singular",
               "oneof": null
@@ -6816,7 +6816,7 @@
             },
             "9": {
               "number": 9,
-              "name": "report_addr",
+              "name": "report_endpoint",
               "type_name": "string",
               "label": "optional",
               "oneof": null
@@ -6938,7 +6938,7 @@
             },
             "2": {
               "number": 2,
-              "name": "fragment_instance_address",
+              "name": "grpc_endpoint",
               "type_name": "string",
               "label": "singular",
               "oneof": null

@@ -83,7 +83,7 @@ message InstanceParams {
   repeated Destination destinations = 6;
   RuntimeFilterParams runtime_filter_params = 7;
   QueryOptions query_options = 8;
-  optional string report_endpoint = 9;                 // novarocks_report_addr
+  optional string report_endpoint = 9;                 // NovaRocks coordinator gRPC endpoint.
   bool typed_result_sink = 10;                         // novarocks_typed_result_sink
 }
 
