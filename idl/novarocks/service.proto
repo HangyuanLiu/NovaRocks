@@ -66,11 +66,10 @@ message ExchangeResponse {
   int64 ack_sequence = 1;  // sequence value accepted for this request
 }
 
-// SubmitFragment payload. Thrift bytes today; NIDL-4 adds native fields.
+// SubmitFragment payload. Native plan + per-instance parameters only.
 message SubmitFragmentRequest {
-  bytes exec_plan_fragment_params_thrift = 1;  // legacy/compat path (retained)
-  novarocks.plan.PlanFragment plan = 2;        // native static plan shared across instances
-  InstanceParams instance_params = 3;          // native per-instance dynamic parameters
+  novarocks.plan.PlanFragment plan = 1;        // native static plan shared across instances
+  InstanceParams instance_params = 2;          // native per-instance dynamic parameters
 }
 
 // Native per-instance fragment parameters. Complements the static PlanFragment
@@ -183,21 +182,20 @@ message ProberParams {
   string fragment_instance_address = 2;
 }
 
-// TQueryOptions consumed subset.
+// TQueryOptions consumed subset, projected into NovaRocks native wire form.
 message QueryOptions {
   int32 batch_size = 1;
-  int64 mem_limit = 2;  // deprecated; query_mem_limit preferred
-  int32 query_timeout = 3;
-  bool enable_profile = 4;
-  int32 pipeline_dop = 5;
-  int64 query_mem_limit = 6;
-  int32 connector_io_tasks_per_scan_operator = 7;
-  int64 runtime_filter_scan_wait_time_ms = 8;
-  int32 runtime_filter_wait_timeout_ms = 9;
-  bool allow_throw_exception = 10;
-  int64 group_concat_max_len = 11;
-  bool enable_spill = 12;
-  optional SpillOptions spill_options = 13;
+  int32 query_timeout = 2;
+  bool enable_profile = 3;
+  int32 pipeline_dop = 4;
+  int64 query_mem_limit = 5;
+  int32 connector_io_tasks_per_scan_operator = 6;
+  int64 runtime_filter_scan_wait_time_ms = 7;
+  int32 runtime_filter_wait_timeout_ms = 8;
+  bool allow_throw_exception = 9;
+  int64 group_concat_max_len = 10;
+  bool enable_spill = 11;
+  optional SpillOptions spill_options = 12;
 }
 
 // TSpillOptions consumed subset.
@@ -221,9 +219,6 @@ message SubmitFragmentResponse {
 
 // Coordinator long-poll request for one fragment instance result stream.
 message FetchResultRequest {
-  reserved 3;
-  reserved "typed_result";
-
   novarocks.common.UniqueId finst_id = 1;  // instance to poll
   int64 max_wait_ms = 2;                   // server-side long-poll budget
 }
@@ -231,21 +226,18 @@ message FetchResultRequest {
 // FetchResult response containing readiness state plus one optional Arrow IPC payload.
 message FetchResultResponse {
   enum Status {
-    RESULT_STATUS_UNSPECIFIED = 0;  // NIDL-1: fixes former READY = 0 default hazard
-    reserved 1 to 3;                // retired NIDL-0 READY/NOT_READY/EOF values
-    READY = 4;
-    NOT_READY = 5;
-    EOF = 6;
-    ERROR = 7;
+    RESULT_STATUS_UNSPECIFIED = 0;
+    READY = 1;
+    NOT_READY = 2;
+    EOF = 3;
+    ERROR = 4;
   }
-  reserved 2;
-  reserved "result_batch_thrift";
 
   Status status = 1;             // result lifecycle state for this poll
-  string message = 3;            // error detail when status == ERROR
-  bytes result_arrow_ipc = 4;    // NRX1-framed Arrow IPC (sole data track)
-  int64 packet_seq = 5;          // was carried in the FetchResult struct
-  bool eos = 6;                  // end-of-stream marker
+  string message = 2;            // error detail when status == ERROR
+  bytes result_arrow_ipc = 3;    // NRX1-framed Arrow IPC (sole data track)
+  int64 packet_seq = 4;          // fetch packet sequence
+  bool eos = 5;                  // end-of-stream marker
 }
 
 // Coordinator cancellation request for active fragment instances.
@@ -403,10 +395,7 @@ message ExecStatusReport {
 
 // BE -> coordinator exec-status report.
 message ReportExecStatusRequest {
-  reserved 1;
-  reserved "report_exec_status_params_thrift";
-
-  ExecStatusReport report = 2;
+  ExecStatusReport report = 1;
 }
 
 // Result for one exec-status report accepted by the coordinator.
@@ -418,10 +407,7 @@ message ReportExecStatusResponse {
 
 // Batched exec-status reports from one BE to the coordinator.
 message BatchReportExecStatusRequest {
-  reserved 1;
-  reserved "report_exec_status_params_thrift";
-
-  repeated ExecStatusReport reports = 2;
+  repeated ExecStatusReport reports = 1;
 }
 
 // Aggregate result for a batch of exec-status reports.

@@ -11,6 +11,48 @@ where
     M::decode(value.encode_to_vec().as_slice()).expect("decode proto message")
 }
 
+fn encoded_field_numbers<M: Message>(message: &M) -> Vec<u32> {
+    let bytes = message.encode_to_vec();
+    let mut fields = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let key = read_varint(&bytes, &mut offset);
+        let field_number = (key >> 3) as u32;
+        let wire_type = (key & 0x7) as u8;
+        fields.push(field_number);
+        match wire_type {
+            0 => {
+                let _ = read_varint(&bytes, &mut offset);
+            }
+            1 => offset += 8,
+            2 => {
+                let len = read_varint(&bytes, &mut offset) as usize;
+                offset += len;
+            }
+            5 => offset += 4,
+            other => panic!("unsupported wire type {other} in encoded proto"),
+        }
+    }
+    fields
+}
+
+fn read_varint(bytes: &[u8], offset: &mut usize) -> u64 {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes
+            .get(*offset)
+            .unwrap_or_else(|| panic!("truncated varint at offset {}", *offset));
+        *offset += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return value;
+        }
+        shift += 7;
+        assert!(shift < 64, "varint overflow");
+    }
+}
+
 fn id(hi: i64, lo: i64) -> common::UniqueId {
     common::UniqueId { hi, lo }
 }
@@ -104,7 +146,6 @@ fn runtime_filter_params() -> novarocks::RuntimeFilterParams {
 fn query_options() -> novarocks::QueryOptions {
     novarocks::QueryOptions {
         batch_size: 4096,
-        mem_limit: 256 << 20,
         query_timeout: 300,
         enable_profile: true,
         pipeline_dop: 8,
@@ -126,7 +167,19 @@ fn query_options() -> novarocks::QueryOptions {
             spill_mem_table_size: 16 << 20,
             spill_mem_table_num: 3,
         }),
+        ..Default::default()
     }
+}
+
+#[test]
+fn query_options_use_pre_release_reset_tags() {
+    let query_mem_limit_only = novarocks::QueryOptions {
+        query_mem_limit: 512 << 20,
+        ..Default::default()
+    };
+    let fields = encoded_field_numbers(&query_mem_limit_only);
+
+    assert_eq!(fields, vec![5], "query_mem_limit must use reset tag 5");
 }
 
 #[test]
@@ -165,9 +218,8 @@ fn instance_params_survives_proto_roundtrip() {
 }
 
 #[test]
-fn submit_fragment_request_carries_legacy_and_native_fields() {
+fn submit_fragment_request_carries_native_fields_only() {
     let request = novarocks::SubmitFragmentRequest {
-        exec_plan_fragment_params_thrift: b"legacy thrift bytes".to_vec(),
         plan: Some(plan::PlanFragment::default()),
         instance_params: Some(novarocks::InstanceParams {
             query_id: Some(id(1, 2)),
@@ -181,7 +233,16 @@ fn submit_fragment_request_carries_legacy_and_native_fields() {
             report_addr: Some("10.0.0.10:9070".to_string()),
             typed_result_sink: true,
         }),
+        ..Default::default()
     };
+    let fields = encoded_field_numbers(&request);
+
+    assert!(fields.contains(&1), "plan must use reset tag 1");
+    assert!(fields.contains(&2), "instance_params must use reset tag 2");
+    assert!(
+        !fields.contains(&3),
+        "pre-release reset must not keep old instance_params tag 3"
+    );
 
     let decoded: novarocks::SubmitFragmentRequest = roundtrip_message(&request);
     assert_eq!(request, decoded);

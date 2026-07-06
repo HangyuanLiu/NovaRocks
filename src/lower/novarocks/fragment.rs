@@ -582,6 +582,7 @@ mod tests {
         let opts = native_wire::query_options_from_native(&proto::novarocks::QueryOptions {
             batch_size: 8192,
             enable_profile: true,
+            query_mem_limit: 1 << 20,
             connector_io_tasks_per_scan_operator: 7,
             runtime_filter_wait_timeout_ms: 123,
             allow_throw_exception: true,
@@ -599,6 +600,7 @@ mod tests {
 
         assert_eq!(opts.batch_size, Some(8192));
         assert_eq!(opts.enable_profile, Some(true));
+        assert_eq!(opts.query_mem_limit, Some(1 << 20));
         assert_eq!(opts.io_tasks_per_scan_operator, Some(7));
         assert_eq!(opts.connector_io_tasks_per_scan_operator, Some(7));
         assert_eq!(opts.runtime_filter_wait_timeout_ms, Some(123));

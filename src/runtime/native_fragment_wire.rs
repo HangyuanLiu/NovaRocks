@@ -47,7 +47,6 @@ pub(crate) fn query_options_from_native(
 ) -> Result<QueryOptions, String> {
     let mut opts = internal_service::TQueryOptions::default();
     opts.batch_size = (src.batch_size > 0).then_some(src.batch_size);
-    opts.mem_limit = (src.mem_limit > 0).then_some(src.mem_limit);
     opts.query_timeout = (src.query_timeout > 0).then_some(src.query_timeout);
     opts.enable_profile = Some(src.enable_profile);
     opts.pipeline_dop = (src.pipeline_dop > 0).then_some(src.pipeline_dop);

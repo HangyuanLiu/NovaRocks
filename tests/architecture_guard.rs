@@ -1008,8 +1008,12 @@ fn nidl_d1_pure_mode_gates_starrocks_compat_behavior() {
         "Starlet gRPC service must be compat-gated"
     );
     assert!(
-        grpc.contains("thrift SubmitFragment requires the compat feature"),
-        "pure SubmitFragment must reject thrift fallback explicitly"
+        grpc.contains("SubmitFragmentRequest requires native plan and instance_params"),
+        "NovaRocksGrpc SubmitFragment must require native plan and instance_params"
+    );
+    assert!(
+        !grpc.contains("exec_plan_fragment_params_thrift"),
+        "NovaRocksGrpc SubmitFragment must not retain thrift fallback payloads"
     );
 }
 
@@ -3205,11 +3209,24 @@ fn nidl_d3b_proto_schema_parser_parses_all_native_proto_files() {
             .messages
             .contains_key("SubmitFragmentRequest")
     );
-    assert!(
-        schema.files["idl/novarocks/service.proto"].enums["FetchResultResponse.Status"]
-            .reserved_numbers
-            .contains(&2)
+    let fetch_status =
+        &schema.files["idl/novarocks/service.proto"].enums["FetchResultResponse.Status"];
+    assert_eq!(
+        fetch_status
+            .values
+            .iter()
+            .map(|value| (value.number, value.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, "RESULT_STATUS_UNSPECIFIED"),
+            (1, "READY"),
+            (2, "NOT_READY"),
+            (3, "EOF"),
+            (4, "ERROR"),
+        ]
     );
+    assert!(fetch_status.reserved_numbers.is_empty());
+    assert!(fetch_status.reserved_names.is_empty());
 }
 
 #[test]

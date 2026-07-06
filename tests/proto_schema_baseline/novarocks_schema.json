@@ -5891,20 +5891,16 @@
       "messages": {
         "BatchReportExecStatusRequest": {
           "fields": {
-            "2": {
-              "number": 2,
+            "1": {
+              "number": 1,
               "name": "reports",
               "type_name": "ExecStatusReport",
               "label": "repeated",
               "oneof": null
             }
           },
-          "reserved_numbers": [
-            1
-          ],
-          "reserved_names": [
-            "report_exec_status_params_thrift"
-          ]
+          "reserved_numbers": [],
+          "reserved_names": []
         },
         "BatchReportExecStatusResponse": {
           "fields": {
@@ -6270,12 +6266,8 @@
               "oneof": null
             }
           },
-          "reserved_numbers": [
-            3
-          ],
-          "reserved_names": [
-            "typed_result"
-          ]
+          "reserved_numbers": [],
+          "reserved_names": []
         },
         "FetchResultResponse": {
           "fields": {
@@ -6286,41 +6278,37 @@
               "label": "singular",
               "oneof": null
             },
-            "3": {
-              "number": 3,
+            "2": {
+              "number": 2,
               "name": "message",
               "type_name": "string",
               "label": "singular",
               "oneof": null
             },
-            "4": {
-              "number": 4,
+            "3": {
+              "number": 3,
               "name": "result_arrow_ipc",
               "type_name": "bytes",
               "label": "singular",
               "oneof": null
             },
-            "5": {
-              "number": 5,
+            "4": {
+              "number": 4,
               "name": "packet_seq",
               "type_name": "int64",
               "label": "singular",
               "oneof": null
             },
-            "6": {
-              "number": 6,
+            "5": {
+              "number": 5,
               "name": "eos",
               "type_name": "bool",
               "label": "singular",
               "oneof": null
             }
           },
-          "reserved_numbers": [
-            2
-          ],
-          "reserved_names": [
-            "result_batch_thrift"
-          ]
+          "reserved_numbers": [],
+          "reserved_names": []
         },
         "HdfsScanRange": {
           "fields": {
@@ -7024,83 +7012,76 @@
             },
             "2": {
               "number": 2,
-              "name": "mem_limit",
-              "type_name": "int64",
-              "label": "singular",
-              "oneof": null
-            },
-            "3": {
-              "number": 3,
               "name": "query_timeout",
               "type_name": "int32",
               "label": "singular",
               "oneof": null
             },
-            "4": {
-              "number": 4,
+            "3": {
+              "number": 3,
               "name": "enable_profile",
               "type_name": "bool",
               "label": "singular",
               "oneof": null
             },
-            "5": {
-              "number": 5,
+            "4": {
+              "number": 4,
               "name": "pipeline_dop",
               "type_name": "int32",
               "label": "singular",
               "oneof": null
             },
-            "6": {
-              "number": 6,
+            "5": {
+              "number": 5,
               "name": "query_mem_limit",
               "type_name": "int64",
               "label": "singular",
               "oneof": null
             },
-            "7": {
-              "number": 7,
+            "6": {
+              "number": 6,
               "name": "connector_io_tasks_per_scan_operator",
               "type_name": "int32",
               "label": "singular",
               "oneof": null
             },
-            "8": {
-              "number": 8,
+            "7": {
+              "number": 7,
               "name": "runtime_filter_scan_wait_time_ms",
               "type_name": "int64",
               "label": "singular",
               "oneof": null
             },
-            "9": {
-              "number": 9,
+            "8": {
+              "number": 8,
               "name": "runtime_filter_wait_timeout_ms",
               "type_name": "int32",
               "label": "singular",
               "oneof": null
             },
-            "10": {
-              "number": 10,
+            "9": {
+              "number": 9,
               "name": "allow_throw_exception",
               "type_name": "bool",
               "label": "singular",
               "oneof": null
             },
-            "11": {
-              "number": 11,
+            "10": {
+              "number": 10,
               "name": "group_concat_max_len",
               "type_name": "int64",
               "label": "singular",
               "oneof": null
             },
-            "12": {
-              "number": 12,
+            "11": {
+              "number": 11,
               "name": "enable_spill",
               "type_name": "bool",
               "label": "singular",
               "oneof": null
             },
-            "13": {
-              "number": 13,
+            "12": {
+              "number": 12,
               "name": "spill_options",
               "type_name": "SpillOptions",
               "label": "optional",
@@ -7112,20 +7093,16 @@
         },
         "ReportExecStatusRequest": {
           "fields": {
-            "2": {
-              "number": 2,
+            "1": {
+              "number": 1,
               "name": "report",
               "type_name": "ExecStatusReport",
               "label": "singular",
               "oneof": null
             }
           },
-          "reserved_numbers": [
-            1
-          ],
-          "reserved_names": [
-            "report_exec_status_params_thrift"
-          ]
+          "reserved_numbers": [],
+          "reserved_names": []
         },
         "ReportExecStatusResponse": {
           "fields": {
@@ -7321,20 +7298,13 @@
           "fields": {
             "1": {
               "number": 1,
-              "name": "exec_plan_fragment_params_thrift",
-              "type_name": "bytes",
-              "label": "singular",
-              "oneof": null
-            },
-            "2": {
-              "number": 2,
               "name": "plan",
               "type_name": "novarocks.plan.PlanFragment",
               "label": "singular",
               "oneof": null
             },
-            "3": {
-              "number": 3,
+            "2": {
+              "number": 2,
               "name": "instance_params",
               "type_name": "InstanceParams",
               "label": "singular",
@@ -7373,27 +7343,23 @@
               "name": "RESULT_STATUS_UNSPECIFIED"
             },
             {
-              "number": 4,
+              "number": 1,
               "name": "READY"
             },
             {
-              "number": 5,
+              "number": 2,
               "name": "NOT_READY"
             },
             {
-              "number": 6,
+              "number": 3,
               "name": "EOF"
             },
             {
-              "number": 7,
+              "number": 4,
               "name": "ERROR"
             }
           ],
-          "reserved_numbers": [
-            1,
-            2,
-            3
-          ],
+          "reserved_numbers": [],
           "reserved_names": []
         },
         "IcebergFileContent": {

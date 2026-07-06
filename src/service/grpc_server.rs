@@ -303,7 +303,6 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             )));
         }
         let proto::novarocks::SubmitFragmentRequest {
-            exec_plan_fragment_params_thrift,
             plan,
             instance_params,
         } = request.into_inner();
@@ -318,30 +317,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             .map_err(|e| {
                 tonic::Status::internal(format!("submit_fragment handler panicked: {e}"))
             })?,
-            (Some(_), None) | (None, Some(_)) => Err(
-                "SubmitFragmentRequest native plan and instance_params must be provided together"
-                    .to_string(),
-            ),
-            (None, None) => {
-                #[cfg(feature = "compat")]
-                {
-                    // submit_exec_plan_fragment does thrift deserialization and pipeline setup,
-                    // which is CPU-bound. Offload to the blocking thread pool so tonic worker
-                    // threads remain free for I/O.
-                    tokio::task::spawn_blocking(move || {
-                        crate::submit_exec_plan_fragment(&exec_plan_fragment_params_thrift)
-                    })
-                    .await
-                    .map_err(|e| {
-                        tonic::Status::internal(format!("submit_fragment handler panicked: {e}"))
-                    })?
-                }
-                #[cfg(not(feature = "compat"))]
-                {
-                    let _ = exec_plan_fragment_params_thrift;
-                    Err("thrift SubmitFragment requires the compat feature".to_string())
-                }
-            }
+            _ => Err("SubmitFragmentRequest requires native plan and instance_params".to_string()),
         };
         match result {
             Ok(()) => Ok(tonic::Response::new(
@@ -1499,30 +1475,10 @@ mod pr3_tests {
         report
     }
 
-    #[cfg(feature = "compat")]
     #[tokio::test]
-    async fn submit_fragment_thrift_decode_error_returns_business_error() {
+    async fn submit_fragment_missing_native_payload_returns_business_error() {
         let svc = GrpcService::default();
         let req = Request::new(SubmitFragmentRequest {
-            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff], // illegal thrift
-            plan: None,
-            instance_params: None,
-        });
-        let resp = svc.submit_fragment(req).await.expect("RPC level success");
-        let body = resp.into_inner();
-        assert_ne!(
-            body.status_code, 0,
-            "should return business error for bad thrift"
-        );
-        assert!(!body.message.is_empty());
-    }
-
-    #[cfg(not(feature = "compat"))]
-    #[tokio::test]
-    async fn submit_fragment_thrift_request_requires_compat_feature() {
-        let svc = GrpcService::default();
-        let req = Request::new(SubmitFragmentRequest {
-            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
             plan: None,
             instance_params: None,
         });
@@ -1531,17 +1487,16 @@ mod pr3_tests {
         assert_ne!(body.status_code, 0);
         assert!(
             body.message
-                .contains("thrift SubmitFragment requires the compat feature"),
+                .contains("requires native plan and instance_params"),
             "{}",
             body.message
         );
     }
 
     #[tokio::test]
-    async fn submit_fragment_native_sidecar_ignores_bad_thrift_bytes() {
+    async fn submit_fragment_native_payload_validates_instance_params() {
         let svc = GrpcService::default();
         let req = Request::new(SubmitFragmentRequest {
-            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
             plan: Some(plan::PlanFragment::default()),
             instance_params: Some(novarocks::InstanceParams::default()),
         });
@@ -1550,16 +1505,15 @@ mod pr3_tests {
         assert_ne!(body.status_code, 0);
         assert!(
             body.message.contains("query_id"),
-            "native path should validate InstanceParams before thrift decode, got: {}",
+            "native path should validate InstanceParams, got: {}",
             body.message
         );
     }
 
     #[tokio::test]
-    async fn submit_fragment_rejects_partial_native_sidecar_before_thrift_decode() {
+    async fn submit_fragment_rejects_partial_native_payload() {
         let svc = GrpcService::default();
         let req = Request::new(SubmitFragmentRequest {
-            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
             plan: Some(plan::PlanFragment::default()),
             instance_params: None,
         });
@@ -1567,7 +1521,8 @@ mod pr3_tests {
         let body = resp.into_inner();
         assert_ne!(body.status_code, 0);
         assert!(
-            body.message.contains("provided together"),
+            body.message
+                .contains("requires native plan and instance_params"),
             "partial native sidecar should be rejected directly, got: {}",
             body.message
         );
@@ -1581,7 +1536,6 @@ mod pr3_tests {
         let finst = ProtoUniqueId { hi: 7101, lo: 7102 };
         let svc = GrpcService::default();
         let req = Request::new(SubmitFragmentRequest {
-            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
             plan: Some(plan::PlanFragment {
                 sink: Some(plan::DataSink {
                     kind: Some(plan::data_sink::Kind::Result(true)),
@@ -1617,10 +1571,9 @@ mod pr3_tests {
     }
 
     #[tokio::test]
-    async fn report_only_submit_fragment_is_rejected_before_thrift_decode() {
+    async fn report_only_submit_fragment_is_rejected_before_payload_handling() {
         let svc = GrpcService::report_only();
         let req = Request::new(SubmitFragmentRequest {
-            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
             plan: None,
             instance_params: None,
         });
