@@ -40,6 +40,7 @@ use crate::connector::iceberg::{
 use crate::connector::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig, ScanConfig};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprNode};
+use crate::exec::node::filter::FilterNode;
 use crate::exec::node::iceberg_delta_scan::{
     ApplyKeySource, BaseDataFileLineage, BaseTableIdent, DeletedFileVisibility,
     DeltaScanDeleteSide, DeltaScanDeleteSidePayload, DeltaSourceFile, DeltaSourceRole,
@@ -97,7 +98,7 @@ pub(crate) fn lower_scan_node(
             lower_iceberg_metadata_scan(node, scan, source, ctx, arena)
         }
         plan::scan_source::Kind::IcebergDeltaTable(source) => {
-            lower_iceberg_delta_table_scan(node, scan, source)
+            lower_iceberg_delta_table_scan(node, scan, source, arena)
         }
         plan::scan_source::Kind::IcebergVersionTable(_) => {
             unsupported_scan_source("IcebergVersionTable")
@@ -235,6 +236,7 @@ fn lower_iceberg_delta_table_scan(
     node: &plan::DistributedNode,
     scan: &plan::ScanNode,
     source: &plan::IcebergDeltaTable,
+    arena: &mut ExprArena,
 ) -> Result<LoweredNode, String> {
     let output_columns = scan_output_columns(scan)?;
     let layout = layout_from_output_columns(output_columns)?;
@@ -283,29 +285,39 @@ fn lower_iceberg_delta_table_scan(
     let delete_side =
         build_delta_delete_side_from_payload(delete_side_payload, object_store_config.as_ref())?;
 
-    Ok(LoweredNode {
-        node: ExecNode {
-            kind: ExecNodeKind::IcebergDeltaScan(IcebergDeltaScanNode {
-                base_table_ident: BaseTableIdent {
-                    catalog: table.catalog.clone(),
-                    namespace: table.namespace.clone(),
-                    table: table.table.clone(),
-                },
-                table_location: table_payload.table_location.clone(),
-                from_snapshot_id: source.from_snapshot_id,
-                to_snapshot_id: source.to_snapshot_id,
-                output_chunk_schema: output_schema.clone(),
-                apply_key_source: ApplyKeySource::BaseRowId,
-                change_files,
-                object_store_config,
-                iceberg_runtime: Arc::new(IcebergRuntimeHandles {
-                    table: table_payload,
-                    object_store_factory,
-                    delete_side,
-                }),
-                node_id: node.node_id,
+    let mut exec_node = ExecNode {
+        kind: ExecNodeKind::IcebergDeltaScan(IcebergDeltaScanNode {
+            base_table_ident: BaseTableIdent {
+                catalog: table.catalog.clone(),
+                namespace: table.namespace.clone(),
+                table: table.table.clone(),
+            },
+            table_location: table_payload.table_location.clone(),
+            from_snapshot_id: source.from_snapshot_id,
+            to_snapshot_id: source.to_snapshot_id,
+            output_chunk_schema: output_schema.clone(),
+            apply_key_source: ApplyKeySource::BaseRowId,
+            change_files,
+            object_store_config,
+            iceberg_runtime: Arc::new(IcebergRuntimeHandles {
+                table: table_payload,
+                object_store_factory,
+                delete_side,
             }),
-        },
+            node_id: node.node_id,
+        }),
+    };
+    if let Some(predicate) = lower_scan_predicate(scan, arena, &layout)? {
+        exec_node = ExecNode {
+            kind: ExecNodeKind::Filter(FilterNode {
+                input: Box::new(exec_node),
+                node_id: node.node_id,
+                predicate,
+            }),
+        };
+    }
+    Ok(LoweredNode {
+        node: exec_node,
         layout,
         output_schema,
     })
@@ -1930,6 +1942,89 @@ mod tests {
         }
     }
 
+    fn int_literal(value: i64) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&DataType::Int64)),
+            nullable: false,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::IntValue(value)),
+                }),
+            })),
+        }
+    }
+
+    fn greater_than(left: expr::Expr, right: expr::Expr) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&DataType::Boolean)),
+            nullable: true,
+            kind: Some(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                op: expr::BinaryOp::Gt as i32,
+                left: Some(Box::new(left)),
+                right: Some(Box::new(right)),
+            }))),
+        }
+    }
+
+    fn iceberg_delta_table_source() -> plan::scan_source::Kind {
+        plan::scan_source::Kind::IcebergDeltaTable(plan::IcebergDeltaTable {
+            table: Some(table_info()),
+            from_snapshot_id: 1,
+            to_snapshot_id: 2,
+            delta_plan: Some(plan::IcebergDeltaScanPlan {
+                table_location: "file:///tmp/novarocks-delta-table".to_string(),
+                data_columns: vec![plan::IcebergDeltaDataColumn {
+                    name: "id".to_string(),
+                    field_id: 10,
+                }],
+                cloud_properties: HashMap::new(),
+                change_files: vec![plan::IcebergDeltaSourceFile {
+                    path: "file:///tmp/novarocks-delta-table/data-1.parquet".to_string(),
+                    size: 10,
+                    role: plan::IcebergDeltaSourceRole::DataFile as i32,
+                    partition_spec_id: Some(0),
+                    partition_key: None,
+                    first_row_id: Some(100),
+                    data_sequence_number: Some(7),
+                    row_id_allow_list: Vec::new(),
+                    position_deletes: Vec::new(),
+                    equality_field_ids: Vec::new(),
+                    equality_targets: Vec::new(),
+                    deleted_file_visibility: None,
+                }],
+                delete_side: None,
+            }),
+        })
+    }
+
+    fn hdfs_range() -> novarocks::ScanRange {
+        novarocks::ScanRange {
+            kind: Some(novarocks::scan_range::Kind::Hdfs(
+                novarocks::HdfsScanRange {
+                    file_format: "PARQUET".to_string(),
+                    full_path: Some("s3://bucket/warehouse/db/t/data-1.parquet".to_string()),
+                    relative_path: None,
+                    table_id: None,
+                    offset: 0,
+                    length: 10,
+                    file_length: 10,
+                    delete_files: Vec::new(),
+                    deletion_vector_descriptor: None,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    modification_time: None,
+                    datacache_options: None,
+                    included_positions: Vec::new(),
+                    serialized_split: None,
+                    use_iceberg_jni_metadata_reader: false,
+                },
+            )),
+            volume_id: None,
+            empty: None,
+            has_more: None,
+        }
+    }
+
     fn file_range_with_deletion_vector() -> novarocks::ScanRangeParams {
         let mut range = file_range();
         let Some(novarocks::scan_range::Kind::File(file)) =
@@ -2140,36 +2235,7 @@ mod tests {
 
     #[test]
     fn lowers_iceberg_delta_table_scan_from_native_payload() {
-        let node = scan_node(plan::scan_source::Kind::IcebergDeltaTable(
-            plan::IcebergDeltaTable {
-                table: Some(table_info()),
-                from_snapshot_id: 1,
-                to_snapshot_id: 2,
-                delta_plan: Some(plan::IcebergDeltaScanPlan {
-                    table_location: "file:///tmp/novarocks-delta-table".to_string(),
-                    data_columns: vec![plan::IcebergDeltaDataColumn {
-                        name: "id".to_string(),
-                        field_id: 10,
-                    }],
-                    cloud_properties: HashMap::new(),
-                    change_files: vec![plan::IcebergDeltaSourceFile {
-                        path: "file:///tmp/novarocks-delta-table/data-1.parquet".to_string(),
-                        size: 10,
-                        role: plan::IcebergDeltaSourceRole::DataFile as i32,
-                        partition_spec_id: Some(0),
-                        partition_key: None,
-                        first_row_id: Some(100),
-                        data_sequence_number: Some(7),
-                        row_id_allow_list: Vec::new(),
-                        position_deletes: Vec::new(),
-                        equality_field_ids: Vec::new(),
-                        equality_targets: Vec::new(),
-                        deleted_file_visibility: None,
-                    }],
-                    delete_side: None,
-                }),
-            },
-        ));
+        let node = scan_node(iceberg_delta_table_source());
         let ctx = NodeLoweringContext::default();
         let mut arena = ExprArena::default();
         let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
@@ -2191,6 +2257,36 @@ mod tests {
             scan.change_files[0].role,
             DeltaSourceRole::DataFile
         ));
+    }
+
+    #[test]
+    fn lowers_iceberg_delta_table_scan_predicates_to_filter() {
+        let node = scan_node_with(
+            vec![output_column(1, "id", DataType::Int64)],
+            vec![greater_than(
+                column_ref(1, "id", DataType::Int64),
+                int_literal(10),
+            )],
+            Vec::new(),
+            iceberg_delta_table_source(),
+        );
+        let ctx = NodeLoweringContext::default();
+        let mut arena = ExprArena::default();
+        let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
+            .expect("lower native delta scan with predicate");
+        let ExecNodeKind::Filter(filter) = lowered.node.kind else {
+            panic!("expected Filter wrapper");
+        };
+        assert_eq!(filter.node_id, 10);
+        assert!(matches!(
+            arena.node(filter.predicate),
+            Some(ExprNode::Gt(_, _))
+        ));
+        let ExecNodeKind::IcebergDeltaScan(scan) = filter.input.kind else {
+            panic!("expected Filter input IcebergDeltaScan");
+        };
+        assert_eq!(scan.node_id, 10);
+        assert_eq!(scan.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
     }
 
     #[test]
