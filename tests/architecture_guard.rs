@@ -4,7 +4,7 @@
 //! modules may still build optimizer trees as inputs; production code may not
 //! leak optimizer physical types into planner/codegen main paths.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1270,4 +1270,122 @@ fn distributed_build_does_not_call_optimizer_cost_model() {
         "distributed build must not call optimizer cost model:\n{}",
         violations.join("\n")
     );
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct ProtoSchema {
+    version: u32,
+    files: BTreeMap<String, ProtoFileSchema>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct ProtoFileSchema {
+    package: String,
+    messages: BTreeMap<String, ProtoMessageSchema>,
+    enums: BTreeMap<String, ProtoEnumSchema>,
+    services: BTreeMap<String, ProtoServiceSchema>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct ProtoMessageSchema {
+    fields: BTreeMap<u32, ProtoFieldSchema>,
+    reserved_numbers: BTreeSet<u32>,
+    reserved_names: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct ProtoFieldSchema {
+    number: u32,
+    name: String,
+    type_name: String,
+    label: String,
+    oneof: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct ProtoEnumSchema {
+    values: Vec<ProtoEnumValueSchema>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct ProtoEnumValueSchema {
+    number: i32,
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct ProtoServiceSchema {
+    rpcs: BTreeMap<String, ProtoRpcSchema>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct ProtoRpcSchema {
+    request: String,
+    response: String,
+    client_streaming: bool,
+    server_streaming: bool,
+}
+
+fn parse_proto_schema(_path: &str, _input: &str) -> Result<ProtoFileSchema, String> {
+    Err("not implemented".to_string())
+}
+
+#[test]
+fn nidl_d3b_proto_schema_parser_handles_current_syntax() {
+    let input = r#"
+        syntax = "proto3";
+        package novarocks.plan;
+
+        message Outer {
+          reserved 4, 6 to 8;
+          reserved "old_name", "old_flag";
+          optional string name = 1;
+          repeated int64 ids = 2;
+          map<int32, novarocks.plan.ScanRangeList> ranges = 3;
+          oneof kind {
+            bool enabled = 5;
+          }
+          enum InnerState {
+            INNER_STATE_UNSPECIFIED = 0;
+            INNER_STATE_READY = 1;
+          }
+        }
+
+        service NovaRocksGrpc {
+          rpc TransmitRuntimeFilter(novarocks.filter.TransmitRuntimeFilterRequest)
+              returns (novarocks.filter.TransmitRuntimeFilterResponse);
+          rpc Exchange(stream ExchangeRequest) returns (stream ExchangeResponse);
+        }
+    "#;
+
+    let schema =
+        parse_proto_schema("idl/novarocks/sample.proto", input).expect("sample proto should parse");
+    assert_eq!(schema.package, "novarocks.plan");
+    assert_eq!(schema.messages["Outer"].fields[&1].label, "optional");
+    assert_eq!(schema.messages["Outer"].fields[&2].label, "repeated");
+    assert_eq!(
+        schema.messages["Outer"].fields[&3].type_name,
+        "map<int32, novarocks.plan.ScanRangeList>"
+    );
+    assert_eq!(
+        schema.messages["Outer"].fields[&5].oneof.as_deref(),
+        Some("kind")
+    );
+    assert!(schema.messages["Outer"].reserved_numbers.contains(&4));
+    assert!(schema.messages["Outer"].reserved_numbers.contains(&7));
+    assert!(schema.messages["Outer"].reserved_names.contains("old_name"));
+    assert_eq!(
+        schema.enums["Outer.InnerState"].values[0].name,
+        "INNER_STATE_UNSPECIFIED"
+    );
+    assert_eq!(
+        schema.services["NovaRocksGrpc"].rpcs["TransmitRuntimeFilter"].request,
+        "novarocks.filter.TransmitRuntimeFilterRequest"
+    );
+    assert_eq!(
+        schema.services["NovaRocksGrpc"].rpcs["TransmitRuntimeFilter"].response,
+        "novarocks.filter.TransmitRuntimeFilterResponse"
+    );
+    assert!(schema.services["NovaRocksGrpc"].rpcs["Exchange"].client_streaming);
+    assert!(schema.services["NovaRocksGrpc"].rpcs["Exchange"].server_streaming);
 }
