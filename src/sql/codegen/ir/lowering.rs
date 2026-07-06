@@ -1087,6 +1087,46 @@ fn normalize_exchange_output_columns(
     }
 }
 
+fn lowered_join_output_columns(
+    join_type: JoinKind,
+    left: Vec<AnalysisOutputColumn>,
+    right: Vec<AnalysisOutputColumn>,
+) -> Vec<AnalysisOutputColumn> {
+    match join_type {
+        JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left,
+        JoinKind::RightSemi | JoinKind::RightAnti => right,
+        JoinKind::LeftOuter => {
+            let mut out = left;
+            out.extend(nullable_analysis_output_columns(right));
+            out
+        }
+        JoinKind::RightOuter => {
+            let mut out = nullable_analysis_output_columns(left);
+            out.extend(right);
+            out
+        }
+        JoinKind::FullOuter => {
+            let mut out = nullable_analysis_output_columns(left);
+            out.extend(nullable_analysis_output_columns(right));
+            out
+        }
+        JoinKind::Inner | JoinKind::Cross => {
+            let mut out = left;
+            out.extend(right);
+            out
+        }
+    }
+}
+
+fn nullable_analysis_output_columns(
+    mut columns: Vec<AnalysisOutputColumn>,
+) -> Vec<AnalysisOutputColumn> {
+    for column in &mut columns {
+        column.nullable = true;
+    }
+    columns
+}
+
 fn edge_boundary_schemas(
     dp: &crate::sql::planner::DistributedPlan,
 ) -> Result<Vec<BoundarySchemaReport>, String> {
@@ -2104,14 +2144,25 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             plan_nodes: left_plan_nodes,
             scope: left_scope,
             tuple_ids: left_tuple_ids,
+            output_columns: left_output_columns,
             ..
         } = left;
         let LoweredDistributedNode {
             plan_nodes: right_plan_nodes,
             scope: right_scope,
             tuple_ids: right_tuple_ids,
+            output_columns: right_output_columns,
             ..
         } = right;
+        let output_columns = if hash_join.output_columns.is_empty() {
+            lowered_join_output_columns(
+                hash_join.join_type,
+                left_output_columns,
+                right_output_columns,
+            )
+        } else {
+            hash_join.output_columns.clone()
+        };
         let (join_plan_node, scope, tuple_ids) = self.lower_hash_join(
             node.node_id,
             &left_tuple_ids,
@@ -2129,7 +2180,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             plan_nodes,
             scope,
             tuple_ids,
-            output_columns: Vec::new(),
+            output_columns,
             ordering: OrderingSpec::Any,
         })
     }
@@ -2146,14 +2197,25 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             plan_nodes: left_plan_nodes,
             scope: left_scope,
             tuple_ids: left_tuple_ids,
+            output_columns: left_output_columns,
             ..
         } = left;
         let LoweredDistributedNode {
             plan_nodes: right_plan_nodes,
             scope: right_scope,
             tuple_ids: right_tuple_ids,
+            output_columns: right_output_columns,
             ..
         } = right;
+        let output_columns = if nest_loop.output_columns.is_empty() {
+            lowered_join_output_columns(
+                nest_loop.join_type,
+                left_output_columns,
+                right_output_columns,
+            )
+        } else {
+            nest_loop.output_columns.clone()
+        };
         let (join_plan_node, scope, tuple_ids) = self.lower_nest_loop_join(
             node.node_id,
             &left_tuple_ids,
@@ -2169,7 +2231,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             plan_nodes,
             scope,
             tuple_ids,
-            output_columns: Vec::new(),
+            output_columns,
             ordering: OrderingSpec::Any,
         })
     }
@@ -6168,6 +6230,7 @@ mod tests {
             distribution: JoinDistribution::Broadcast,
             execution_mode: None,
             build_runtime_filters: Vec::new(),
+            output_columns: Vec::new(),
         };
 
         let (plan_node, scope, tuple_ids) = {
@@ -6217,6 +6280,7 @@ mod tests {
             distribution: JoinDistribution::Broadcast,
             execution_mode: None,
             build_runtime_filters: Vec::new(),
+            output_columns: Vec::new(),
         };
 
         let plan_node = {
@@ -6255,6 +6319,7 @@ mod tests {
             distribution: JoinDistribution::Broadcast,
             execution_mode: None,
             build_runtime_filters: Vec::new(),
+            output_columns: Vec::new(),
         };
 
         let plan_node = {
@@ -6287,6 +6352,7 @@ mod tests {
             distribution: JoinDistribution::Broadcast,
             execution_mode: None,
             build_runtime_filters: Vec::new(),
+            output_columns: Vec::new(),
         };
         let runtime_filter = WiredRuntimeFilterBuild {
             filter_id: 17,
@@ -6471,6 +6537,34 @@ mod tests {
     }
 
     #[test]
+    fn lower_distribution_exchange_uses_hash_join_source_outputs() {
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        let dp = distributed_hash_join_multi_fragment_plan();
+
+        let result = super::lower_distributed_plan(&dp, &catalog, &connectors, None)
+            .expect("lower hash join exchange plan");
+
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].output_slot_ids.len(), 2);
+        let receiver_schema = result
+            .boundary_schemas
+            .iter()
+            .find(|schema| {
+                schema.boundary_kind == BoundaryKind::ExchangeReceiver && schema.node_id == 20
+            })
+            .expect("exchange receiver boundary schema");
+        assert_eq!(
+            receiver_schema
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["left_k", "right_k"]
+        );
+    }
+
+    #[test]
     fn lower_distributed_plan_lowers_root_iceberg_write_sink() {
         let catalog = DummyCatalog;
         let connectors = ConnectorRegistry::new();
@@ -6647,6 +6741,7 @@ mod tests {
         let op = PhysicalNestLoopJoinNode {
             join_type: JoinKind::NullAwareLeftAnti,
             condition: None,
+            output_columns: Vec::new(),
         };
 
         let (plan_node, scope, tuple_ids) = {
@@ -6895,6 +6990,95 @@ mod tests {
                     sink: DataSink::Result,
                     output_exprs: None,
                     output_columns: child_columns.clone(),
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+            ],
+            root_fragment_id: 1,
+            edges: vec![fragment_edge(0, 1, 20)],
+        }
+    }
+
+    fn distributed_hash_join_multi_fragment_plan() -> DistributedPlan {
+        let left_col = output_col(1, "left_k", DataType::Int64, false);
+        let right_col = output_col(3, "right_k", DataType::Int64, false);
+        let output_columns = vec![left_col.clone(), right_col.clone()];
+        let left = distributed_values_node(11, 0, 1, vec![left_col]);
+        let right = distributed_values_node(12, 0, 2, vec![right_col]);
+        let join = DistributedNode {
+            node_id: 10,
+            fragment_id: 0,
+            tuple_ids: vec![1, 2],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+            children: vec![left, right],
+            stats: distributed_stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::HashJoin(Box::new(
+                PhysicalHashJoinNode {
+                    join_type: JoinKind::Inner,
+                    eq_conditions: vec![PhysicalHashJoinEqCondition {
+                        left: qualified_column_ref(ColumnId::new_for_test(1), "l", "left_k", false),
+                        right: qualified_column_ref(
+                            ColumnId::new_for_test(3),
+                            "r",
+                            "right_k",
+                            false,
+                        ),
+                        null_safe: false,
+                    }],
+                    other_condition: None,
+                    distribution: JoinDistribution::Shuffle,
+                    execution_mode: Some(JoinExecutionMode::Partitioned),
+                    build_runtime_filters: Vec::new(),
+                    output_columns: output_columns.clone(),
+                },
+            ))),
+        };
+        let exchange = DistributedNode {
+            node_id: 20,
+            fragment_id: 1,
+            tuple_ids: vec![1, 2],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+            children: vec![],
+            stats: distributed_stats(),
+            payload: DistributedPayload::Exchange(DistributedExchangeNode {
+                partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                partition_exprs: vec![],
+                source_fragment_id: 0,
+                output_columns: output_columns.clone(),
+                output_qualifier: None,
+                flavor: ExchangeFlavor::Distribution,
+            }),
+        };
+        DistributedPlan {
+            fragments: vec![
+                PlanFragment {
+                    fragment_id: 0,
+                    root: join,
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition {
+                        kind: PartitionKind::Random,
+                        exprs: vec![],
+                    },
+                    sink: DataSink::Noop,
+                    output_exprs: None,
+                    output_columns: output_columns.clone(),
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+                PlanFragment {
+                    fragment_id: 1,
+                    root: exchange,
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition::unpartitioned(),
+                    sink: DataSink::Result,
+                    output_exprs: None,
+                    output_columns,
                     cte_id: None,
                     cte_exchange_nodes: Vec::new(),
                 },

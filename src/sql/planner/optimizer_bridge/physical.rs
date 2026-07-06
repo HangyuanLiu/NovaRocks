@@ -143,12 +143,14 @@ impl BridgeCtx<'_> {
                             ),
                         })
                         .collect(),
+                    output_columns: node.output_columns.clone(),
                 })))
             }
             Operator::PhysicalNestLoopJoin(op) => {
                 Ok(PhysicalPlanKind::NestLoopJoin(PhysicalNestLoopJoinNode {
                     join_type: op.join_type,
                     condition: op.condition.map(|expr| materialize(self.scalars, expr)),
+                    output_columns: node.output_columns.clone(),
                 }))
             }
             Operator::PhysicalValues(op) => Ok(PhysicalPlanKind::Values(PlanValuesNode {

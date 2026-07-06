@@ -323,6 +323,7 @@ pub(crate) struct PhysicalHashJoinNode {
     pub distribution: JoinDistribution,
     pub execution_mode: Option<crate::sql::planner::JoinExecutionMode>,
     pub build_runtime_filters: Vec<crate::sql::planner::RuntimeFilterBuildIntent>,
+    pub output_columns: Vec<OutputColumn>,
 }
 
 #[allow(dead_code)]
@@ -338,6 +339,7 @@ pub(crate) struct PhysicalHashJoinEqCondition {
 pub(crate) struct PhysicalNestLoopJoinNode {
     pub join_type: JoinKind,
     pub condition: Option<TypedExpr>,
+    pub output_columns: Vec<OutputColumn>,
 }
 
 #[allow(dead_code)]

@@ -566,10 +566,16 @@ impl DistributedPlanBuilder {
         let partition_type = partition_type_for_data_partition(&output_partition);
         let partition_exprs = output_partition.exprs.clone();
         let source_output_columns = stream_exchange_source_output_columns(child_plan);
-        let exchange_output_columns = normalize_stream_exchange_output_columns(
-            exchange_output_columns,
-            &source_output_columns,
-        );
+        let exchange_output_columns = if exchange_output_columns.is_empty()
+            && matches!(&flavor, ExchangeFlavor::Distribution)
+        {
+            source_output_columns.clone()
+        } else {
+            normalize_stream_exchange_output_columns(
+                exchange_output_columns,
+                &source_output_columns,
+            )
+        };
         let child_fragment_id = self.alloc_fragment_id();
         self.fragment_stack.push(child_fragment_id);
         let child_result = self.visit(child_plan);
@@ -831,10 +837,18 @@ fn stream_exchange_source_output_columns(plan: &PhysicalPlanNode) -> Vec<OutputC
         PhysicalPlanKind::TableFunction(table_function) => table_function.output_columns.clone(),
         PhysicalPlanKind::HashAggregate(aggregate) => aggregate.output_layout.full_output_columns(),
         PhysicalPlanKind::HashJoin(join) => {
-            join_source_output_columns(join.join_type, &plan.children)
+            if join.output_columns.is_empty() {
+                join_source_output_columns(join.join_type, &plan.children)
+            } else {
+                join.output_columns.clone()
+            }
         }
         PhysicalPlanKind::NestLoopJoin(join) => {
-            join_source_output_columns(join.join_type, &plan.children)
+            if join.output_columns.is_empty() {
+                join_source_output_columns(join.join_type, &plan.children)
+            } else {
+                join.output_columns.clone()
+            }
         }
         PhysicalPlanKind::SetOp(set_op) => set_op_payload_output_columns(plan, set_op),
         PhysicalPlanKind::ChangeEventExpand(expand) => expand.output_columns.clone(),
@@ -1617,6 +1631,7 @@ mod tests {
                 distribution: JoinDistribution::Unknown,
                 execution_mode: None,
                 build_runtime_filters: vec![],
+                output_columns: output_columns.clone(),
             })),
             children: vec![left, right],
             output_columns,
@@ -1698,6 +1713,10 @@ mod tests {
                     expr_order: 3,
                     execution_mode: JoinExecutionMode::Partitioned,
                 }],
+                output_columns: vec![
+                    output_col(1, "l_k", DataType::Int64, false),
+                    output_col(2, "r_k", DataType::Int64, false),
+                ],
             })),
             children: vec![left_redistribute, right],
             output_columns: vec![
@@ -1793,6 +1812,10 @@ mod tests {
                     expr_order: 0,
                     execution_mode: JoinExecutionMode::Partitioned,
                 }],
+                output_columns: vec![
+                    output_col(1, "l_k", DataType::Int64, false),
+                    output_col(2, "r_k", DataType::Int64, false),
+                ],
             })),
             children: vec![left_filter, right],
             output_columns: vec![
@@ -1833,6 +1856,10 @@ mod tests {
             kind: PhysicalPlanKind::NestLoopJoin(PhysicalNestLoopJoinNode {
                 join_type: JoinKind::Inner,
                 condition: None,
+                output_columns: vec![
+                    output_col(1, "l_k", DataType::Int64, false),
+                    output_col(2, "r_k", DataType::Int64, false),
+                ],
             }),
             children: vec![left, right],
             output_columns: vec![
@@ -2359,6 +2386,49 @@ mod tests {
     }
 
     #[test]
+    fn build_distributed_plan_empty_exchange_request_inherits_source_output() {
+        let source_columns = vec![output_col(1, "a", DataType::Int64, false)];
+        let mut scan = scan_node_with_columns(source_columns.clone());
+        scan.output_columns = Vec::new();
+        let redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Hash {
+                    cols: vec![ColumnId::new_for_test(1)],
+                    source: HashSource::ShuffleJoin,
+                },
+                partition_exprs: vec![column_ref_expr(1, "a", DataType::Int64, false)],
+                output_columns: Vec::new(),
+            }),
+            children: vec![scan],
+            output_columns: Vec::new(),
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
+
+        let edge = &dp.edges[0];
+        assert_eq!(edge.output_slot_ids, vec![1]);
+
+        let root = &dp.fragments[1].root;
+        let receiver = match &root.payload {
+            DistributedPayload::Exchange(receiver) => receiver,
+            other => panic!("expected Exchange root, got {other:?}"),
+        };
+        assert_eq!(
+            receiver
+                .output_columns
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            source_columns
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn build_distributed_plan_hash_redistribute_rejects_missing_partition_column() {
         let scan = scan_node(1, "k");
         let redistribute = PhysicalPlanNode {
@@ -2758,6 +2828,10 @@ mod tests {
                 distribution: JoinDistribution::Broadcast,
                 execution_mode: None,
                 build_runtime_filters: vec![],
+                output_columns: vec![
+                    output_col(2, "c_k", DataType::Int64, false),
+                    output_col(3, "c_k", DataType::Int64, false),
+                ],
             })),
             children: vec![left_consume, right_consume],
             output_columns: vec![
