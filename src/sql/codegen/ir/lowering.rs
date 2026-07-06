@@ -2185,14 +2185,15 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             output_columns: right_output_columns,
             ..
         } = right;
+        let derived_output_columns = lowered_join_output_columns(
+            hash_join.join_type,
+            left_output_columns,
+            right_output_columns,
+        );
         let output_columns = if hash_join.output_columns.is_empty() {
-            lowered_join_output_columns(
-                hash_join.join_type,
-                left_output_columns,
-                right_output_columns,
-            )
+            derived_output_columns
         } else {
-            hash_join.output_columns.clone()
+            normalize_exchange_output_columns(&hash_join.output_columns, &derived_output_columns)
         };
         let (join_plan_node, scope, tuple_ids) = self.lower_hash_join(
             node.node_id,
@@ -2238,14 +2239,15 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             output_columns: right_output_columns,
             ..
         } = right;
+        let derived_output_columns = lowered_join_output_columns(
+            nest_loop.join_type,
+            left_output_columns,
+            right_output_columns,
+        );
         let output_columns = if nest_loop.output_columns.is_empty() {
-            lowered_join_output_columns(
-                nest_loop.join_type,
-                left_output_columns,
-                right_output_columns,
-            )
+            derived_output_columns
         } else {
-            nest_loop.output_columns.clone()
+            normalize_exchange_output_columns(&nest_loop.output_columns, &derived_output_columns)
         };
         let (join_plan_node, scope, tuple_ids) = self.lower_nest_loop_join(
             node.node_id,
@@ -5793,6 +5795,79 @@ mod tests {
         .expect("boundary tuple ids");
 
         assert_eq!(tuple_ids, vec![2]);
+    }
+
+    #[test]
+    fn hash_join_lowering_falls_back_from_stale_explicit_output_columns() {
+        let left_col = output_col(1, "left_id", DataType::Int64, false);
+        let right_col = output_col(8, "right_id", DataType::Int64, false);
+        let stale_col = output_col(2, "stale_region", DataType::Utf8, true);
+        let left = distributed_values_node(11, 0, 1, vec![left_col.clone()]);
+        let right = distributed_values_node(12, 0, 2, vec![right_col.clone()]);
+        let join = DistributedNode {
+            node_id: 10,
+            fragment_id: 0,
+            tuple_ids: vec![1, 2],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+            children: vec![left, right],
+            stats: distributed_stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::HashJoin(Box::new(
+                PhysicalHashJoinNode {
+                    join_type: JoinKind::Inner,
+                    eq_conditions: vec![PhysicalHashJoinEqCondition {
+                        left: qualified_column_ref(
+                            ColumnId::new_for_test(1),
+                            "l",
+                            "left_id",
+                            false,
+                        ),
+                        right: qualified_column_ref(
+                            ColumnId::new_for_test(8),
+                            "r",
+                            "right_id",
+                            false,
+                        ),
+                        null_safe: false,
+                    }],
+                    other_condition: None,
+                    distribution: JoinDistribution::Broadcast,
+                    execution_mode: Some(JoinExecutionMode::Broadcast),
+                    build_runtime_filters: Vec::new(),
+                    output_columns: vec![stale_col],
+                },
+            ))),
+        };
+        let dp = DistributedPlan {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: join,
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns: vec![right_col],
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: vec![],
+        };
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+
+        let result = super::lower_distributed_plan(&dp, &catalog, &connectors, None)
+            .expect("stale join output columns should fall back to lowered child outputs");
+
+        let root = result
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == result.root_fragment_id)
+            .expect("root fragment");
+        assert_eq!(root.output_columns.len(), 1);
+        assert_eq!(root.output_columns[0].name, "right_id");
     }
 
     #[test]
