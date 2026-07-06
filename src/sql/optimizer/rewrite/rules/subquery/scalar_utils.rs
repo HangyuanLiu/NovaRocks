@@ -89,12 +89,35 @@ fn join_output_columns(
 ) -> Vec<OutputColumn> {
     match join_type {
         JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left,
-        _ => {
+        JoinKind::RightSemi | JoinKind::RightAnti => right,
+        JoinKind::LeftOuter => {
+            let mut out = left;
+            out.extend(make_nullable(right));
+            out
+        }
+        JoinKind::RightOuter => {
+            let mut out = make_nullable(left);
+            out.extend(right);
+            out
+        }
+        JoinKind::FullOuter => {
+            let mut out = make_nullable(left);
+            out.extend(make_nullable(right));
+            out
+        }
+        JoinKind::Inner | JoinKind::Cross => {
             let mut out = left;
             out.extend(right);
             out
         }
     }
+}
+
+fn make_nullable(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
+    for column in &mut columns {
+        column.nullable = true;
+    }
+    columns
 }
 
 pub(super) fn column_ref(arena: &mut ScalarArena, column: &OutputColumn) -> ScalarId {
@@ -599,6 +622,48 @@ mod tests {
         );
 
         assert!(is_count_aggregate_result(&aggregate, &arena, count_id));
+    }
+
+    #[test]
+    fn opt_output_columns_widens_outer_join_nullable_side() {
+        let arena = ScalarArena::new();
+        let left_col = output_column(ColumnId::new_for_test(1), "l");
+        let right_col = output_column(ColumnId::new_for_test(2), "r");
+        let left = OptExpr::new(
+            Operator::LogicalValues(crate::sql::optimizer::operator::ValuesOp {
+                columns: vec![left_col.clone()],
+                rows: vec![],
+            }),
+            vec![],
+        );
+        let right = OptExpr::new(
+            Operator::LogicalValues(crate::sql::optimizer::operator::ValuesOp {
+                columns: vec![right_col.clone()],
+                rows: vec![],
+            }),
+            vec![],
+        );
+
+        let left_outer = opt_output_columns(
+            &join(left.clone(), right.clone(), JoinKind::LeftOuter, None),
+            &arena,
+        )
+        .expect("left outer output columns");
+        assert!(!left_outer[0].nullable);
+        assert!(left_outer[1].nullable);
+
+        let right_outer = opt_output_columns(
+            &join(left.clone(), right.clone(), JoinKind::RightOuter, None),
+            &arena,
+        )
+        .expect("right outer output columns");
+        assert!(right_outer[0].nullable);
+        assert!(!right_outer[1].nullable);
+
+        let full_outer = opt_output_columns(&join(left, right, JoinKind::FullOuter, None), &arena)
+            .expect("full outer output columns");
+        assert!(full_outer[0].nullable);
+        assert!(full_outer[1].nullable);
     }
 }
 

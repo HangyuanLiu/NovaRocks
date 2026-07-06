@@ -26,7 +26,9 @@ use crate::exec::node::join::{
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
 use crate::lower::compact::expr::lower_t_expr;
-use crate::lower::compact::layout::{Layout, chunk_schema_for_layout};
+use crate::lower::compact::layout::{
+    Layout, chunk_schema_for_layout, chunk_schema_for_layout_with_nullable_tuples,
+};
 use crate::lower::compact::node::Lowered;
 use crate::novarocks_logging::warn;
 use crate::types::wider_type;
@@ -377,7 +379,12 @@ pub(crate) fn lower_hash_join_node(
     };
     let left_chunk_schema = chunk_schema_for_layout(desc_tbl, &left.layout)?;
     let right_chunk_schema = chunk_schema_for_layout(desc_tbl, &right.layout)?;
-    let join_scope_chunk_schema = chunk_schema_for_layout(desc_tbl, &layout)?;
+    let join_scope_chunk_schema = chunk_schema_for_layout_with_nullable_tuples(
+        desc_tbl,
+        &layout,
+        &node.row_tuples,
+        &node.nullable_tuples,
+    )?;
 
     Ok(Lowered {
         node: ExecNode {
@@ -404,6 +411,17 @@ pub(crate) fn lower_hash_join_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use arrow::array::Int64Array;
+    use arrow::record_batch::RecordBatch;
+
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::exec::node::ExecNodeKind;
+    use crate::exec::node::values::ValuesNode;
+    use crate::lower::compact::type_lowering::scalar_type_desc;
+    use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
 
     #[test]
     fn common_join_key_type_promotes_mixed_integers() {
@@ -433,5 +451,190 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn hash_join_scope_schema_honors_nullable_tuples() {
+        let desc_tbl = descriptors::TDescriptorTable::new(
+            Some(vec![
+                slot_desc(1, 11, "left_k", false),
+                slot_desc(2, 22, "count(1)", false),
+            ]),
+            vec![tuple_desc(1), tuple_desc(2)],
+            None::<Vec<descriptors::TTableDescriptor>>,
+            None::<bool>,
+        );
+        let node = crate::sql::codegen::nodes::build_hash_join_node(
+            7,
+            &[1],
+            &[2],
+            plan_nodes::TJoinOp::LEFT_OUTER_JOIN,
+            plan_nodes::TJoinDistributionMode::BROADCAST,
+            vec![plan_nodes::TEqJoinCondition {
+                left: slot_ref_expr(1, 11),
+                right: slot_ref_expr(2, 22),
+                opcode: None,
+            }],
+            Vec::new(),
+        );
+        assert_eq!(node.nullable_tuples, vec![false, true]);
+
+        let lowered = lower_hash_join_node(
+            vec![child(1, 11), child(2, 22)],
+            &node,
+            &mut ExprArena::default(),
+            Some(&desc_tbl),
+            None,
+            None,
+        )
+        .expect("lower hash join");
+
+        let ExecNodeKind::Join(join) = lowered.node.kind else {
+            panic!("expected Join node");
+        };
+        assert!(
+            !join.join_scope_chunk_schema.slots()[0].nullable(),
+            "preserved left side should remain non-nullable"
+        );
+        assert!(
+            join.join_scope_chunk_schema.slots()[1].nullable(),
+            "nullable_tuples must null-extend the right side even when slot descriptors are non-nullable"
+        );
+    }
+
+    fn type_desc() -> types::TTypeDesc {
+        scalar_type_desc(types::TPrimitiveType::BIGINT)
+    }
+
+    fn slot_desc(
+        tuple_id: types::TTupleId,
+        slot_id: types::TSlotId,
+        name: &str,
+        nullable: bool,
+    ) -> descriptors::TSlotDescriptor {
+        descriptors::TSlotDescriptor::new(
+            Some(slot_id),
+            Some(tuple_id),
+            Some(type_desc()),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(name.to_string()),
+            Some(0),
+            Some(true),
+            Some(true),
+            Some(nullable),
+            None::<i32>,
+            None::<String>,
+            None::<bool>,
+        )
+    }
+
+    fn tuple_desc(tuple_id: types::TTupleId) -> descriptors::TTupleDescriptor {
+        descriptors::TTupleDescriptor::new(
+            Some(tuple_id),
+            Some(8),
+            Some(1),
+            None::<types::TTableId>,
+            Some(1),
+        )
+    }
+
+    fn slot_ref_expr(tuple_id: types::TTupleId, slot_id: types::TSlotId) -> TExpr {
+        TExpr {
+            nodes: vec![TExprNode {
+                node_type: TExprNodeType::SLOT_REF,
+                type_: type_desc(),
+                num_children: 0,
+                slot_ref: Some(TSlotRef { slot_id, tuple_id }),
+                ..default_expr_node()
+            }],
+        }
+    }
+
+    fn default_expr_node() -> TExprNode {
+        TExprNode {
+            node_type: TExprNodeType::INT_LITERAL,
+            type_: type_desc(),
+            opcode: None,
+            num_children: 0,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: None,
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: None,
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: 0,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+        }
+    }
+
+    fn single_slot_layout(tuple_id: types::TTupleId, slot_id: types::TSlotId) -> Layout {
+        let mut index = HashMap::new();
+        index.insert((tuple_id, slot_id), 0);
+        Layout {
+            order: vec![(tuple_id, slot_id)],
+            index,
+        }
+    }
+
+    fn child(tuple_id: types::TTupleId, slot_id: types::TSlotId) -> Lowered {
+        let slot = SlotId::new(u32::try_from(slot_id).expect("test slot id"));
+        let field = Field::new("dummy", DataType::Int64, true);
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                slot,
+                field.clone(),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        let batch = RecordBatch::try_new(
+            chunk_schema.arrow_schema_ref(),
+            vec![Arc::new(Int64Array::from(Vec::<i64>::new()))],
+        )
+        .expect("record batch");
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+        Lowered {
+            node: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode {
+                    chunk,
+                    node_id: tuple_id,
+                }),
+            },
+            layout: single_slot_layout(tuple_id, slot_id),
+        }
     }
 }

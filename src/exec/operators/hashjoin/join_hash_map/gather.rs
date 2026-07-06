@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, UInt32Array, new_null_array};
 use arrow::compute::take;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::Chunk;
@@ -85,7 +85,32 @@ fn build_output_record_batch(
     context: &str,
 ) -> Result<RecordBatch, String> {
     assert_columns_match_schema(output_schema, &columns, context)?;
-    RecordBatch::try_new(Arc::clone(output_schema), columns).map_err(|e| e.to_string())
+    let schema = output_schema_for_columns(output_schema, &columns);
+    RecordBatch::try_new(schema, columns).map_err(|e| e.to_string())
+}
+
+fn output_schema_for_columns(output_schema: &SchemaRef, columns: &[ArrayRef]) -> SchemaRef {
+    let mut changed = false;
+    let fields = output_schema
+        .fields()
+        .iter()
+        .zip(columns.iter())
+        .map(|(field, column)| {
+            if !field.is_nullable() && column.null_count() > 0 {
+                changed = true;
+                field.as_ref().clone().with_nullable(true)
+            } else {
+                field.as_ref().clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    if !changed {
+        return Arc::clone(output_schema);
+    }
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        output_schema.metadata().clone(),
+    ))
 }
 
 pub(crate) fn gather_join_batch(
@@ -540,6 +565,26 @@ mod tests {
         assert_eq!(batch.num_rows(), left_indices.len());
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.column(1).len(), left_indices.len());
+        assert_eq!(batch.column(1).null_count(), left_indices.len());
+    }
+
+    #[test]
+    fn gather_left_with_null_right_widens_null_filled_output_field() {
+        let left = one_column_chunk("l", SlotId::new(1), vec![10, 20, 30, 40]);
+        let right_schema = Arc::new(Schema::new(vec![Field::new("r", DataType::Int32, false)]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("l", DataType::Int32, false),
+            Field::new("r", DataType::Int32, false),
+        ]));
+        let left_indices = vec![3, 0, 3];
+
+        let batch =
+            gather_left_with_null_right(&left, &left_indices, &right_schema, &output_schema)
+                .expect("left null right")
+                .expect("batch");
+
+        assert!(!batch.schema().field(0).is_nullable());
+        assert!(batch.schema().field(1).is_nullable());
         assert_eq!(batch.column(1).null_count(), left_indices.len());
     }
 

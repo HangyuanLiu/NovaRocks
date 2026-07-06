@@ -1073,15 +1073,28 @@ fn normalize_exchange_output_columns(
         return Vec::new();
     }
 
-    let source_ids = source_output_columns
+    let source_by_id = source_output_columns
         .iter()
-        .map(|column| column.column_id)
-        .collect::<BTreeSet<_>>();
+        .map(|column| (column.column_id, column))
+        .collect::<BTreeMap<_, _>>();
     if requested
         .iter()
-        .all(|column| source_ids.contains(&column.column_id))
+        .all(|column| source_by_id.contains_key(&column.column_id))
     {
-        requested.to_vec()
+        requested
+            .iter()
+            .map(|column| {
+                let mut normalized = column.clone();
+                if source_by_id
+                    .get(&column.column_id)
+                    .map(|source| source.nullable)
+                    .unwrap_or(false)
+                {
+                    normalized.nullable = true;
+                }
+                normalized
+            })
+            .collect()
     } else {
         source_output_columns.to_vec()
     }
@@ -1125,6 +1138,24 @@ fn nullable_analysis_output_columns(
         column.nullable = true;
     }
     columns
+}
+
+fn widen_join_output_scopes(
+    join_type: JoinKind,
+    left_scope: &mut ExprScope,
+    right_scope: &mut ExprScope,
+    left_tuple_ids: &[i32],
+    right_tuple_ids: &[i32],
+) {
+    match join_type {
+        JoinKind::LeftOuter => right_scope.widen_tuple_nullable(right_tuple_ids),
+        JoinKind::RightOuter => left_scope.widen_tuple_nullable(left_tuple_ids),
+        JoinKind::FullOuter => {
+            left_scope.widen_tuple_nullable(left_tuple_ids);
+            right_scope.widen_tuple_nullable(right_tuple_ids);
+        }
+        _ => {}
+    }
 }
 
 fn edge_boundary_schemas(
@@ -2684,6 +2715,15 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         let mut merged_tuple_ids = left_tuple_ids.to_vec();
         merged_tuple_ids.extend_from_slice(right_tuple_ids);
 
+        let mut left_scope = left_scope;
+        let mut right_scope = right_scope;
+        widen_join_output_scopes(
+            op.join_type,
+            &mut left_scope,
+            &mut right_scope,
+            left_tuple_ids,
+            right_tuple_ids,
+        );
         let merged_scope = match op.join_type {
             JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left_scope,
             JoinKind::RightSemi | JoinKind::RightAnti => right_scope,
@@ -2736,6 +2776,15 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         let mut merged_tuple_ids = left_tuple_ids.to_vec();
         merged_tuple_ids.extend_from_slice(right_tuple_ids);
 
+        let mut left_scope = left_scope;
+        let mut right_scope = right_scope;
+        widen_join_output_scopes(
+            op.join_type,
+            &mut left_scope,
+            &mut right_scope,
+            left_tuple_ids,
+            right_tuple_ids,
+        );
         let merged_scope = match op.join_type {
             JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left_scope,
             JoinKind::RightSemi | JoinKind::RightAnti => right_scope,
@@ -5955,6 +6004,20 @@ mod tests {
     }
 
     #[test]
+    fn normalize_exchange_output_columns_preserves_source_nullable_widening() {
+        let requested = vec![output_col(10, "count(1)", DataType::Int64, false)];
+        let source = vec![output_col(10, "count(1)", DataType::Int64, true)];
+
+        let normalized = super::normalize_exchange_output_columns(&requested, &source);
+
+        assert_eq!(normalized.len(), 1);
+        assert!(
+            normalized[0].nullable,
+            "exchange output must not narrow an upstream outer-join nullable column"
+        );
+    }
+
+    #[test]
     fn boundary_tuple_ids_use_project_ordered_prefix_for_hidden_extra_outputs() {
         let visible_c0 = ColumnId::new_for_test(10);
         let visible_c1 = ColumnId::new_for_test(11);
@@ -6262,6 +6325,50 @@ mod tests {
             .expect("right slot descriptor");
         assert_eq!(left_slot.is_nullable, Some(false));
         assert_eq!(right_slot.is_nullable, Some(true));
+    }
+
+    #[test]
+    fn left_outer_hash_join_widens_right_output_scope() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let (left_column_id, right_column_id, left_key, right_key, left_scope, right_scope) =
+            hash_join_test_inputs(&mut state);
+        let op = PhysicalHashJoinNode {
+            join_type: JoinKind::LeftOuter,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: left_key,
+                right: right_key,
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+            execution_mode: None,
+            build_runtime_filters: Vec::new(),
+            output_columns: Vec::new(),
+        };
+
+        let (plan_node, scope, tuple_ids) = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_hash_join(10, &[1], &[2], &op, left_scope, right_scope, None, &[])
+                .expect("lower hash join")
+        };
+
+        assert_eq!(tuple_ids, vec![1, 2]);
+        assert!(
+            !scope
+                .resolve_by_id(left_column_id)
+                .expect("left output should resolve")
+                .nullable,
+            "preserved side should keep its original nullability"
+        );
+        assert!(
+            scope
+                .resolve_by_id(right_column_id)
+                .expect("right output should resolve")
+                .nullable,
+            "null-extended side must be nullable in the output scope"
+        );
+        assert_eq!(plan_node.nullable_tuples, vec![false, true]);
     }
 
     #[test]

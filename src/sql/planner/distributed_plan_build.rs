@@ -884,11 +884,7 @@ fn join_source_output_columns(
             .get(1)
             .map(stream_exchange_source_output_columns)
             .unwrap_or_default(),
-        JoinKind::Inner
-        | JoinKind::LeftOuter
-        | JoinKind::RightOuter
-        | JoinKind::FullOuter
-        | JoinKind::Cross => {
+        JoinKind::Inner | JoinKind::Cross => {
             let mut columns = children
                 .first()
                 .map(stream_exchange_source_output_columns)
@@ -898,7 +894,50 @@ fn join_source_output_columns(
             }
             columns
         }
+        JoinKind::LeftOuter => {
+            let mut columns = children
+                .first()
+                .map(stream_exchange_source_output_columns)
+                .unwrap_or_default();
+            if let Some(right) = children.get(1) {
+                columns.extend(nullable_output_columns(
+                    stream_exchange_source_output_columns(right),
+                ));
+            }
+            columns
+        }
+        JoinKind::RightOuter => {
+            let mut columns = children
+                .first()
+                .map(stream_exchange_source_output_columns)
+                .map(nullable_output_columns)
+                .unwrap_or_default();
+            if let Some(right) = children.get(1) {
+                columns.extend(stream_exchange_source_output_columns(right));
+            }
+            columns
+        }
+        JoinKind::FullOuter => {
+            let mut columns = children
+                .first()
+                .map(stream_exchange_source_output_columns)
+                .map(nullable_output_columns)
+                .unwrap_or_default();
+            if let Some(right) = children.get(1) {
+                columns.extend(nullable_output_columns(
+                    stream_exchange_source_output_columns(right),
+                ));
+            }
+            columns
+        }
     }
+}
+
+fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
+    for column in &mut columns {
+        column.nullable = true;
+    }
+    columns
 }
 
 fn normalize_stream_exchange_output_columns(
@@ -1278,7 +1317,9 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
+    use super::{
+        build_distributed_plan, join_source_output_columns, union_distinct_must_be_rewritten_error,
+    };
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
@@ -1653,6 +1694,31 @@ mod tests {
         assert_eq!(root.children[0].tuple_ids, vec![1]);
         assert_eq!(root.children[1].node_id, 2);
         assert_eq!(root.children[1].tuple_ids, vec![2]);
+    }
+
+    #[test]
+    fn join_source_output_columns_widens_outer_nullable_side() {
+        let left_col = output_col(1, "l_k", DataType::Int64, false);
+        let right_col = output_col(2, "r_k", DataType::Int64, false);
+        let children = vec![
+            values_node(vec![left_col.clone()]),
+            values_node(vec![right_col.clone()]),
+        ];
+
+        let left_outer = join_source_output_columns(JoinKind::LeftOuter, &children);
+        assert_eq!(left_outer.len(), 2);
+        assert!(!left_outer[0].nullable);
+        assert!(left_outer[1].nullable);
+
+        let right_outer = join_source_output_columns(JoinKind::RightOuter, &children);
+        assert_eq!(right_outer.len(), 2);
+        assert!(right_outer[0].nullable);
+        assert!(!right_outer[1].nullable);
+
+        let full_outer = join_source_output_columns(JoinKind::FullOuter, &children);
+        assert_eq!(full_outer.len(), 2);
+        assert!(full_outer[0].nullable);
+        assert!(full_outer[1].nullable);
     }
 
     #[test]
