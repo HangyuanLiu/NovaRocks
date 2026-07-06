@@ -21,7 +21,7 @@
 //! products (data files / position-delete / equality-delete / deleted-data-file)
 //! and emits a unified chunk stream tagged with the A4 transparent
 //! `__change_op` column (+1 for INSERT, -1 for DELETE). Populated by
-//! `lower_iceberg_delta_scan` (in `src/lower/node/iceberg_delta_scan.rs`)
+//! `lower_iceberg_delta_scan` (in `src/lower/compact/node/iceberg_delta_scan.rs`)
 //! when the Thrift plan carries `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`.
 
 use std::sync::Arc;

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crate::cache::CacheOptions;
 use crate::common::app_config;
 use crate::common::types::UniqueId;
-use crate::lower_native::execute_fragment_native;
+use crate::lower::novarocks::execute_fragment_native;
 use crate::novarocks_logging::{error, info, warn};
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;

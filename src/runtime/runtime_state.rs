@@ -30,18 +30,21 @@ use crate::runtime::sink_commit;
 use crate::thrift::internal_service;
 use crate::thrift::runtime_filter;
 
+pub(crate) type QueryOptions = internal_service::TQueryOptions;
+pub(crate) type RuntimeFilterParams = runtime_filter::TRuntimeFilterParams;
+
 /// RuntimeState is a per-fragment-instance execution context, similar to StarRocks BE RuntimeState.
 ///
 /// Today it mainly provides access to frequently used query options (e.g. `batch_size` / chunk size).
 /// More execution-time parameters and state can be migrated here over time.
 #[derive(Debug)]
 pub struct RuntimeState {
-    query_options: Option<internal_service::TQueryOptions>,
+    query_options: Option<QueryOptions>,
     cache_options: Option<crate::cache::CacheOptions>,
     error_state: std::sync::Arc<RuntimeErrorState>,
     last_report_exec_state_ns: AtomicI64,
     query_id: Option<QueryId>,
-    runtime_filter_params: Option<runtime_filter::TRuntimeFilterParams>,
+    runtime_filter_params: Option<RuntimeFilterParams>,
     fragment_instance_id: Option<UniqueId>,
     backend_num: Option<i32>,
     mem_tracker: Option<std::sync::Arc<MemTracker>>,
@@ -107,10 +110,10 @@ impl Clone for RuntimeState {
 
 impl RuntimeState {
     pub(crate) fn new(
-        query_options: Option<internal_service::TQueryOptions>,
+        query_options: Option<QueryOptions>,
         cache_options: Option<crate::cache::CacheOptions>,
         query_id: Option<QueryId>,
-        runtime_filter_params: Option<runtime_filter::TRuntimeFilterParams>,
+        runtime_filter_params: Option<RuntimeFilterParams>,
         fragment_instance_id: Option<UniqueId>,
         backend_num: Option<i32>,
         mem_tracker: Option<std::sync::Arc<MemTracker>>,
@@ -151,7 +154,7 @@ impl RuntimeState {
     }
 
     #[allow(dead_code)]
-    pub fn query_options(&self) -> Option<&internal_service::TQueryOptions> {
+    pub fn query_options(&self) -> Option<&QueryOptions> {
         self.query_options.as_ref()
     }
 
@@ -333,7 +336,7 @@ impl RuntimeState {
         self.spill_manager.clone()
     }
 
-    pub(crate) fn runtime_filter_params(&self) -> Option<&runtime_filter::TRuntimeFilterParams> {
+    pub(crate) fn runtime_filter_params(&self) -> Option<&RuntimeFilterParams> {
         self.runtime_filter_params.as_ref()
     }
 

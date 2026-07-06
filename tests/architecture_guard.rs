@@ -101,8 +101,38 @@ where
     hits
 }
 
+fn source_line_hits<F>(path: &Path, mut predicate: F) -> Vec<(usize, String)>
+where
+    F: FnMut(&str) -> bool,
+{
+    let text = fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            if !is_comment_or_blank(line) && predicate(line) {
+                Some((idx + 1, line.trim().to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn non_test_optimizer_refs(path: &Path) -> Vec<(usize, String)> {
     non_test_line_hits(path, |line| line.contains("crate::sql::optimizer::"))
+}
+
+fn test_dir() -> PathBuf {
+    Path::new(manifest_dir()).join("tests")
+}
+
+fn source_and_test_rs_files() -> Vec<PathBuf> {
+    let mut files = rs_files(&src_dir());
+    files.extend(rs_files(&test_dir()));
+    files
+        .into_iter()
+        .filter(|path| rel(path) != "tests/architecture_guard.rs")
+        .collect()
 }
 
 #[test]
@@ -315,6 +345,108 @@ fn nidl_d1_pure_mode_gates_starrocks_compat_behavior() {
     assert!(
         grpc.contains("thrift SubmitFragment requires the compat feature"),
         "pure SubmitFragment must reject thrift fallback explicitly"
+    );
+}
+
+#[test]
+fn nidl_d2d_lowering_root_exposes_named_ownership_modules() {
+    let repo = Path::new(manifest_dir());
+    assert!(
+        !repo.join(concat!("src/lower", "_native")).exists(),
+        concat!(
+            "src/lower",
+            "_native must be deleted; native lowering lives under src/lower/novarocks"
+        )
+    );
+    for dir in [
+        "src/lower/common",
+        "src/lower/compact",
+        "src/lower/novarocks",
+    ] {
+        assert!(repo.join(dir).is_dir(), "{dir} must exist");
+    }
+
+    let lower_mod = fs::read_to_string(repo.join("src/lower/mod.rs")).unwrap();
+    for expected in [
+        "pub(crate) mod common;",
+        "pub(crate) mod compact;",
+        "pub(crate) mod novarocks;",
+    ] {
+        assert!(
+            lower_mod.contains(expected),
+            "src/lower/mod.rs must contain `{expected}`"
+        );
+    }
+    for forbidden in [
+        "pub(crate) mod expr;",
+        "pub(crate) mod fragment;",
+        "pub(crate) mod layout;",
+        "pub(crate) mod node;",
+        "pub(crate) mod sink;",
+        "pub(crate) mod type_lowering;",
+        "mod thrift",
+        "pub(crate) mod thrift",
+    ] {
+        assert!(
+            !lower_mod.contains(forbidden),
+            "src/lower/mod.rs must not keep legacy direct module `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn nidl_d2d_legacy_lowering_paths_do_not_remain() {
+    let forbidden = [
+        concat!("crate::", "lower", "_native"),
+        concat!("lower", "::thrift"),
+        concat!("crate::lower", "::fragment"),
+        concat!("crate::lower", "::expr"),
+        concat!("crate::lower", "::layout"),
+        concat!("crate::lower", "::node"),
+        concat!("crate::lower", "::sink"),
+        concat!("crate::lower", "::type_lowering"),
+    ];
+
+    let mut violations = Vec::new();
+    for file in source_and_test_rs_files() {
+        for needle in forbidden {
+            for (line, text) in source_line_hits(&file, |line| line.contains(needle)) {
+                violations.push(format!("{}:{}: {}", rel(&file), line, text));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "D2D lowering paths must use crate::lower::compact, crate::lower::novarocks, or crate::lower::common:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nidl_d2d_common_lowering_has_no_wire_dependencies() {
+    let common_dir = src_dir().join("lower/common");
+    let forbidden = [
+        "native_fragment_wire",
+        "crate::thrift",
+        "crate::proto",
+        "thrift::",
+        "proto::",
+    ];
+
+    let mut violations = Vec::new();
+    for file in rs_files(&common_dir) {
+        for needle in forbidden {
+            for (line, text) in source_line_hits(&file, |line| line.contains(needle)) {
+                violations.push(format!("{}:{}: {}", rel(&file), line, text));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "src/lower/common must stay protocol-neutral and must not depend on thrift/proto/native wire adapters:\n{}",
+        violations.join("\n")
     );
 }
 

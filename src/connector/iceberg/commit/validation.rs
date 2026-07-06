@@ -345,7 +345,7 @@ fn arrow_iceberg_types_compatible(
     use iceberg::spec::{PrimitiveType, Type};
     if matches!(iceberg_ty, Type::Primitive(PrimitiveType::Variant)) {
         // NovaRocks execution layer carries variants as LargeBinary
-        // (see src/lower/type_lowering.rs:89,170). The full struct shape
+        // (see src/lower/compact/type_lowering.rs:89,170). The full struct shape
         // is materialized later by transform_variant_columns_for_write.
         return matches!(arrow_ty, arrow::datatypes::DataType::LargeBinary);
     }

@@ -62,7 +62,7 @@ pub(crate) fn arrow_type_to_primitive(
         DataType::Utf8 | DataType::LargeUtf8 => Ok(types::TPrimitiveType::VARCHAR),
         DataType::Binary => Ok(types::TPrimitiveType::VARBINARY),
         // NovaRocks reserves arrow `LargeBinary` for the v3 variant payload
-        // (see src/lower/type_lowering.rs:170). Plain BINARY uses `Binary`.
+        // (see src/lower/compact/type_lowering.rs:170). Plain BINARY uses `Binary`.
         DataType::LargeBinary => Ok(types::TPrimitiveType::VARIANT),
         DataType::Date32 => Ok(types::TPrimitiveType::DATE),
         DataType::Timestamp(_, _) => Ok(types::TPrimitiveType::DATETIME),
