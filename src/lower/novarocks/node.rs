@@ -36,6 +36,10 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::aggregate::{AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode};
+use crate::exec::node::analytic::{
+    AnalyticNode, AnalyticOutputColumn, WindowBoundary, WindowFrame, WindowFunctionKind,
+    WindowFunctionSpec, WindowType,
+};
 use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
 use crate::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
@@ -166,7 +170,7 @@ pub(crate) fn lower_proto_node(
             lower_physical_node(node, physical, children, arena, ctx)
         }
         plan::distributed_node::Payload::Exchange(exchange) => {
-            lower_exchange_receiver(node, exchange, children, ctx)
+            lower_exchange_receiver(node, exchange, children, arena, ctx)
         }
     }
 }
@@ -209,7 +213,9 @@ fn lower_physical_node(
         plan::plan_node::Kind::NestLoopJoin(join) => {
             lower_nest_loop_join_node(node, join, children, arena)
         }
-        plan::plan_node::Kind::Window(_) => unsupported("Window"),
+        plan::plan_node::Kind::Window(window) => {
+            lower_window_node(node, physical, window, children, arena)
+        }
         plan::plan_node::Kind::Repeat(repeat) => lower_repeat_node(node, repeat, children),
         plan::plan_node::Kind::GenerateSeries(generate_series) => {
             lower_generate_series_node(node, generate_series, children, arena)
@@ -769,19 +775,6 @@ fn lower_sort_node(
     } else {
         &sort.output_columns
     };
-    let (layout, output_schema) = if output_columns.is_empty() {
-        (child.layout.clone(), child.output_schema.clone())
-    } else {
-        let layout = layout_from_output_columns(output_columns)?;
-        if layout.order() != child.layout.order() {
-            return Err(format!(
-                "SortNode output column reorder is not implemented for native proto lowering: child={:?} output={:?}",
-                child.layout.order(),
-                layout.order()
-            ));
-        }
-        (layout, chunk_schema_from_output_columns(output_columns)?)
-    };
     let order_by = lower_sort_items("SortNode", &sort.items, arena, &child.layout)?;
     let limit = parse_distributed_limit(node.limit, "SortNode DistributedNode.limit")?;
     let offset = parse_optional_nonnegative_i64(sort.offset, "SortNode.offset")?.unwrap_or(0);
@@ -808,20 +801,75 @@ fn lower_sort_node(
             node.node_id, topn_type, offset
         ));
     }
+    let sort_node = ExecNode {
+        kind: ExecNodeKind::Sort(SortNode {
+            input: Box::new(child.node),
+            node_id: node.node_id,
+            use_top_n,
+            order_by,
+            limit,
+            offset,
+            topn_type,
+            max_buffered_rows: None,
+            max_buffered_bytes: None,
+            partition_exprs,
+            partition_limit,
+        }),
+    };
+    let sorted = LoweredNode {
+        node: sort_node,
+        layout: child.layout.clone(),
+        output_schema: child.output_schema.clone(),
+    };
+    if output_columns.is_empty() {
+        return Ok(sorted);
+    }
+
+    let layout = layout_from_output_columns(output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    if layout.order() == child.layout.order() {
+        return Ok(LoweredNode {
+            node: sorted.node,
+            layout,
+            output_schema,
+        });
+    }
+
+    build_slot_projection("SortNode", sorted, output_columns, node.node_id, arena)
+}
+
+fn build_slot_projection(
+    label: &str,
+    input: LoweredNode,
+    output_columns: &[common::OutputColumn],
+    node_id: i32,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    let layout = layout_from_output_columns(output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let expr_slot_schemas = slot_schemas_from_output_columns(output_columns)?;
+    let mut exprs = Vec::with_capacity(layout.order().len());
+    for slot in layout.order().iter().copied() {
+        if !input.layout.contains_slot(slot) {
+            return Err(format!(
+                "{label} output column id {} has no input slot",
+                slot.as_u32()
+            ));
+        }
+        exprs.push(arena.push(ExprNode::SlotId(slot)));
+    }
+
     Ok(LoweredNode {
         node: ExecNode {
-            kind: ExecNodeKind::Sort(SortNode {
-                input: Box::new(child.node),
-                node_id: node.node_id,
-                use_top_n,
-                order_by,
-                limit,
-                offset,
-                topn_type,
-                max_buffered_rows: None,
-                max_buffered_bytes: None,
-                partition_exprs,
-                partition_limit,
+            kind: ExecNodeKind::Project(ProjectNode {
+                input: Box::new(input.node),
+                node_id,
+                is_subordinate: true,
+                exprs,
+                expr_slot_ids: layout.order().to_vec(),
+                expr_slot_schemas: Some(expr_slot_schemas),
+                output_indices: None,
+                output_chunk_schema: output_schema.clone(),
             }),
         },
         layout,
@@ -836,9 +884,6 @@ fn lower_topn_node(
     arena: &mut ExprArena,
 ) -> Result<LoweredNode, String> {
     check_exact_arity("TopNNode", 1, children.len())?;
-    if topn.is_split {
-        return unsupported("TopNNode split");
-    }
     let child = children.pop().expect("child");
     let payload_limit = parse_optional_nonnegative_i64(topn.limit, "TopNNode.limit")?;
     let outer_limit = parse_distributed_limit(node.limit, "TopNNode DistributedNode.limit")?;
@@ -851,6 +896,11 @@ fn lower_topn_node(
         .map_err(|_| format!("TopNNode unknown phase {}", topn.phase))?;
     if phase == plan::TopNPhase::TopnPhaseUnspecified {
         return Err("TopNNode phase is unspecified".to_string());
+    }
+    if topn.is_split && phase == plan::TopNPhase::TopnPhaseFinal {
+        return Err(
+            "TopNNode final split must be represented as ExchangeReceiver TopNSplit".to_string(),
+        );
     }
     let order_by = lower_sort_items("TopNNode", &topn.items, arena, &child.layout)?;
     Ok(LoweredNode {
@@ -872,6 +922,485 @@ fn lower_topn_node(
         layout: child.layout,
         output_schema: child.output_schema,
     })
+}
+
+fn lower_window_node(
+    node: &plan::DistributedNode,
+    physical: &plan::PlanNode,
+    window: &plan::WindowNode,
+    mut children: Vec<LoweredNode>,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    check_exact_arity("WindowNode", 1, children.len())?;
+    let child = children.pop().expect("child");
+    if window.window_exprs.is_empty() {
+        return Err("WindowNode has no window expressions".to_string());
+    }
+    let first = &window.window_exprs[0];
+    for (idx, expr) in window.window_exprs.iter().enumerate().skip(1) {
+        if !same_window_spec(first, expr) {
+            return Err(format!(
+                "WindowNode native proto lowering supports one window specification per node; expression {idx} has a different partition/order/frame"
+            ));
+        }
+    }
+
+    let output_columns = if !window.output_columns.is_empty() {
+        window.output_columns.as_slice()
+    } else {
+        physical.output_columns.as_slice()
+    };
+    if output_columns.is_empty() {
+        return Err("WindowNode output_columns missing".to_string());
+    }
+    let layout = layout_from_output_columns(output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+
+    let partition_exprs = first
+        .partition_by
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            lower_proto_expr(expr, arena, &child.layout)
+                .map_err(|err| format!("WindowNode partition_by[{idx}]: {err}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let order_by_exprs = first
+        .order_by
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let expr = item
+                .expr
+                .as_ref()
+                .ok_or_else(|| format!("WindowNode order_by[{idx}] expr missing"))?;
+            lower_proto_expr(expr, arena, &child.layout)
+                .map_err(|err| format!("WindowNode order_by[{idx}]: {err}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let frame = first
+        .window_frame
+        .as_ref()
+        .map(lower_window_frame)
+        .transpose()?;
+    validate_window_frame(&frame, order_by_exprs.is_empty())?;
+
+    let mut functions = Vec::with_capacity(window.window_exprs.len());
+    for (idx, expr) in window.window_exprs.iter().enumerate() {
+        functions.push(
+            lower_window_function(expr, arena, &child.layout)
+                .map_err(|err| format!("WindowNode function[{idx}]: {err}"))?,
+        );
+    }
+
+    let mut function_by_slot = HashMap::with_capacity(window.window_exprs.len());
+    for (idx, expr) in window.window_exprs.iter().enumerate() {
+        let slot = SlotId::new(expr.output_column_id);
+        if function_by_slot.insert(slot, idx).is_some() {
+            return Err(format!(
+                "WindowNode duplicate output_column_id {}",
+                expr.output_column_id
+            ));
+        }
+    }
+    let child_slots = child.layout.order().iter().copied().collect::<HashSet<_>>();
+    let mut analytic_output_columns = Vec::with_capacity(output_columns.len());
+    for col in output_columns {
+        let slot = SlotId::new(col.column_id);
+        if let Some(idx) = function_by_slot.get(&slot) {
+            analytic_output_columns.push(AnalyticOutputColumn::Window(*idx));
+        } else if child_slots.contains(&slot) {
+            analytic_output_columns.push(AnalyticOutputColumn::InputSlotId(slot));
+        } else {
+            return Err(format!(
+                "WindowNode output column id {} has no child slot or window result",
+                col.column_id
+            ));
+        }
+    }
+
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Analytic(AnalyticNode {
+                input: Box::new(child.node),
+                node_id: node.node_id,
+                partition_exprs,
+                order_by_exprs,
+                functions,
+                window: frame,
+                output_columns: analytic_output_columns,
+                output_chunk_schema: output_schema.clone(),
+            }),
+        },
+        layout,
+        output_schema,
+    })
+}
+
+fn same_window_spec(left: &plan::WindowExpr, right: &plan::WindowExpr) -> bool {
+    left.partition_by == right.partition_by
+        && left.order_by == right.order_by
+        && left.window_frame == right.window_frame
+}
+
+fn lower_window_function(
+    expr: &plan::WindowExpr,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+) -> Result<WindowFunctionSpec, String> {
+    let name = expr.name.to_ascii_lowercase();
+    let kind = window_function_kind(&name, expr.distinct, expr.ignore_nulls)?;
+    let return_type = expr
+        .result_type
+        .as_ref()
+        .ok_or_else(|| format!("window function {} result_type missing", expr.name))
+        .and_then(super::decode_type)?;
+    let mut args = expr
+        .args
+        .iter()
+        .enumerate()
+        .map(|(idx, arg)| {
+            lower_proto_expr(arg, arena, input_layout)
+                .map_err(|err| format!("window function {} arg {idx}: {err}", expr.name))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if matches!(
+        kind,
+        WindowFunctionKind::ArrayAgg { .. }
+            | WindowFunctionKind::MaxBy
+            | WindowFunctionKind::MaxByV2
+            | WindowFunctionKind::MinBy
+            | WindowFunctionKind::MinByV2
+    ) {
+        args = pack_window_function_inputs(args, arena)?;
+    }
+    validate_window_function_signature(&kind, &args, &return_type, arena)?;
+    Ok(WindowFunctionSpec {
+        kind,
+        args,
+        return_type,
+    })
+}
+
+fn window_function_kind(
+    name: &str,
+    distinct: bool,
+    ignore_nulls: bool,
+) -> Result<WindowFunctionKind, String> {
+    let base = name.split('|').next().unwrap_or(name);
+    match base {
+        "row_number" => Ok(WindowFunctionKind::RowNumber),
+        "rank" => Ok(WindowFunctionKind::Rank),
+        "dense_rank" => Ok(WindowFunctionKind::DenseRank),
+        "cume_dist" => Ok(WindowFunctionKind::CumeDist),
+        "percent_rank" => Ok(WindowFunctionKind::PercentRank),
+        "ntile" => Ok(WindowFunctionKind::Ntile),
+        "first_value" => Ok(WindowFunctionKind::FirstValue { ignore_nulls }),
+        "first_value_rewrite" => Ok(WindowFunctionKind::FirstValueRewrite { ignore_nulls }),
+        "last_value" => Ok(WindowFunctionKind::LastValue { ignore_nulls }),
+        "lead" => Ok(WindowFunctionKind::Lead { ignore_nulls }),
+        "lag" => Ok(WindowFunctionKind::Lag { ignore_nulls }),
+        "session_number" => Ok(WindowFunctionKind::SessionNumber),
+        "count" => Ok(WindowFunctionKind::Count),
+        "sum" => Ok(WindowFunctionKind::Sum),
+        "avg" => Ok(WindowFunctionKind::Avg),
+        "min" => Ok(WindowFunctionKind::Min),
+        "max" => Ok(WindowFunctionKind::Max),
+        "bitmap_union" => Ok(WindowFunctionKind::BitmapUnion),
+        "bitmap_union_count" => Ok(WindowFunctionKind::BitmapUnionCount),
+        "max_by" => Ok(WindowFunctionKind::MaxBy),
+        "max_by_v2" => Ok(WindowFunctionKind::MaxByV2),
+        "min_by" => Ok(WindowFunctionKind::MinBy),
+        "min_by_v2" => Ok(WindowFunctionKind::MinByV2),
+        "var_samp" | "variance_samp" => Ok(WindowFunctionKind::VarianceSamp),
+        "stddev_samp" => Ok(WindowFunctionKind::StddevSamp),
+        "bool_or" | "boolor_agg" => Ok(WindowFunctionKind::BoolOr),
+        "covar_pop" => Ok(WindowFunctionKind::CovarPop),
+        "covar_samp" => Ok(WindowFunctionKind::CovarSamp),
+        "corr" => Ok(WindowFunctionKind::Corr),
+        "array_agg" | "array_agg_distinct" | "array_unique_agg" => {
+            Ok(WindowFunctionKind::ArrayAgg {
+                is_distinct: distinct || matches!(base, "array_agg_distinct" | "array_unique_agg"),
+                is_asc_order: Vec::new(),
+                nulls_first: Vec::new(),
+            })
+        }
+        "approx_top_k" => Ok(WindowFunctionKind::ApproxTopK),
+        other => Err(format!("unsupported window function: {other}")),
+    }
+}
+
+fn lower_window_frame(frame: &expr::WindowFrame) -> Result<WindowFrame, String> {
+    let window_type = match expr::WindowFrameType::try_from(frame.frame_type)
+        .map_err(|_| format!("WindowNode unknown frame type {}", frame.frame_type))?
+    {
+        expr::WindowFrameType::Rows => WindowType::Rows,
+        expr::WindowFrameType::Range => WindowType::Range,
+        expr::WindowFrameType::Unspecified => {
+            return Err("WindowNode frame type is unspecified".to_string());
+        }
+    };
+    let start = match frame.start.as_ref() {
+        Some(bound) => lower_window_bound(bound, true, &window_type)?,
+        None => None,
+    };
+    let end = match frame.end.as_ref() {
+        Some(bound) => lower_window_bound(bound, false, &window_type)?,
+        None => None,
+    };
+    Ok(WindowFrame {
+        start,
+        end,
+        window_type,
+    })
+}
+
+fn lower_window_bound(
+    bound: &expr::WindowBound,
+    is_start: bool,
+    window_type: &WindowType,
+) -> Result<Option<WindowBoundary>, String> {
+    use expr::window_bound::Bound;
+
+    let label = if is_start { "start" } else { "end" };
+    let bound = bound
+        .bound
+        .as_ref()
+        .ok_or_else(|| format!("WindowNode {label} bound missing"))?;
+    match bound {
+        Bound::UnboundedPreceding(true) if is_start => Ok(None),
+        Bound::UnboundedFollowing(true) if !is_start => Ok(None),
+        Bound::CurrentRow(true) => Ok(Some(WindowBoundary::CurrentRow)),
+        Bound::Preceding(value) => {
+            if !matches!(window_type, WindowType::Rows) {
+                return Err("RANGE window boundary PRECEDING not supported".to_string());
+            }
+            Ok(Some(WindowBoundary::Preceding(*value)))
+        }
+        Bound::Following(value) => {
+            if !matches!(window_type, WindowType::Rows) {
+                return Err("RANGE window boundary FOLLOWING not supported".to_string());
+            }
+            Ok(Some(WindowBoundary::Following(*value)))
+        }
+        Bound::UnboundedPreceding(false)
+        | Bound::UnboundedFollowing(false)
+        | Bound::CurrentRow(false) => Err(format!(
+            "WindowNode {label} boolean bound marker must be true"
+        )),
+        Bound::UnboundedPreceding(true) => {
+            Err(format!("WindowNode {label} cannot be UNBOUNDED PRECEDING"))
+        }
+        Bound::UnboundedFollowing(true) => {
+            Err(format!("WindowNode {label} cannot be UNBOUNDED FOLLOWING"))
+        }
+    }
+}
+
+fn validate_window_frame(
+    frame: &Option<WindowFrame>,
+    order_by_is_empty: bool,
+) -> Result<(), String> {
+    let Some(frame) = frame.as_ref() else {
+        return Ok(());
+    };
+    if matches!(frame.window_type, WindowType::Range) {
+        if frame.start.is_some() {
+            return Err("RANGE window must have UNBOUNDED PRECEDING start".to_string());
+        }
+        if let Some(end) = frame.end.as_ref()
+            && !matches!(end, WindowBoundary::CurrentRow)
+        {
+            return Err("RANGE window end must be CURRENT ROW or UNBOUNDED FOLLOWING".to_string());
+        }
+        if order_by_is_empty {
+            return Err("RANGE window requires non-empty order_by_exprs".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn pack_window_function_inputs(
+    args: Vec<crate::exec::expr::ExprId>,
+    arena: &mut ExprArena,
+) -> Result<Vec<crate::exec::expr::ExprId>, String> {
+    if args.len() <= 1 {
+        return Ok(args);
+    }
+    let mut fields = Vec::with_capacity(args.len());
+    for (idx, expr_id) in args.iter().enumerate() {
+        let data_type = arena
+            .data_type(*expr_id)
+            .ok_or_else(|| "window function input type missing".to_string())?;
+        if matches!(data_type, DataType::Null) {
+            return Err("window function input type is null".to_string());
+        }
+        fields.push(Field::new(format!("f{idx}"), data_type.clone(), true));
+    }
+    let struct_type = DataType::Struct(Fields::from(fields));
+    let struct_expr = arena.push_typed(ExprNode::StructExpr { fields: args }, struct_type);
+    Ok(vec![struct_expr])
+}
+
+fn validate_window_function_signature(
+    kind: &WindowFunctionKind,
+    args: &[crate::exec::expr::ExprId],
+    return_type: &DataType,
+    arena: &ExprArena,
+) -> Result<(), String> {
+    match kind {
+        WindowFunctionKind::RowNumber
+        | WindowFunctionKind::Rank
+        | WindowFunctionKind::DenseRank
+        | WindowFunctionKind::Ntile
+        | WindowFunctionKind::SessionNumber
+        | WindowFunctionKind::Count => {
+            if !matches!(return_type, DataType::Int64) {
+                return Err(format!(
+                    "window function expects Int64 return type, got {:?}",
+                    return_type
+                ));
+            }
+        }
+        WindowFunctionKind::CumeDist
+        | WindowFunctionKind::PercentRank
+        | WindowFunctionKind::VarianceSamp
+        | WindowFunctionKind::StddevSamp
+        | WindowFunctionKind::CovarPop
+        | WindowFunctionKind::CovarSamp
+        | WindowFunctionKind::Corr => {
+            if !matches!(return_type, DataType::Float64) {
+                return Err(format!(
+                    "window function expects Float64 return type, got {:?}",
+                    return_type
+                ));
+            }
+        }
+        WindowFunctionKind::BoolOr => {
+            if !matches!(return_type, DataType::Boolean) {
+                return Err(format!(
+                    "window function expects Boolean return type, got {:?}",
+                    return_type
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    match kind {
+        WindowFunctionKind::RowNumber
+        | WindowFunctionKind::Rank
+        | WindowFunctionKind::DenseRank
+        | WindowFunctionKind::CumeDist
+        | WindowFunctionKind::PercentRank => {
+            if !args.is_empty() {
+                return Err("window function expects 0 arguments".to_string());
+            }
+        }
+        WindowFunctionKind::Ntile => {
+            if args.len() != 1 {
+                return Err("ntile expects 1 argument".to_string());
+            }
+        }
+        WindowFunctionKind::FirstValue { .. } | WindowFunctionKind::LastValue { .. } => {
+            if args.len() != 1 {
+                return Err("first_value/last_value expects 1 argument".to_string());
+            }
+            validate_window_arg_matches_return(args[0], return_type, arena)?;
+        }
+        WindowFunctionKind::FirstValueRewrite { .. } => {
+            if !(1..=2).contains(&args.len()) {
+                return Err("first_value_rewrite expects 1 or 2 arguments".to_string());
+            }
+            validate_window_arg_matches_return(args[0], return_type, arena)?;
+        }
+        WindowFunctionKind::Lead { .. } | WindowFunctionKind::Lag { .. } => {
+            if !(1..=3).contains(&args.len()) {
+                return Err("lead/lag expects 1 to 3 arguments".to_string());
+            }
+            validate_window_arg_matches_return(args[0], return_type, arena)?;
+        }
+        WindowFunctionKind::SessionNumber => {
+            if args.len() != 2 {
+                return Err("session_number expects 2 arguments".to_string());
+            }
+        }
+        WindowFunctionKind::Count => {
+            if args.len() > 1 {
+                return Err("count expects 0 or 1 arguments".to_string());
+            }
+        }
+        WindowFunctionKind::BitmapUnion | WindowFunctionKind::BitmapUnionCount => {
+            if args.len() != 1 {
+                return Err("bitmap_union/bitmap_union_count expects 1 argument".to_string());
+            }
+        }
+        WindowFunctionKind::MaxBy
+        | WindowFunctionKind::MaxByV2
+        | WindowFunctionKind::MinBy
+        | WindowFunctionKind::MinByV2 => {
+            if args.len() != 1 {
+                return Err(
+                    "max_by/max_by_v2/min_by/min_by_v2 expects 1 packed struct argument"
+                        .to_string(),
+                );
+            }
+        }
+        WindowFunctionKind::Sum
+        | WindowFunctionKind::Avg
+        | WindowFunctionKind::Min
+        | WindowFunctionKind::Max
+        | WindowFunctionKind::VarianceSamp
+        | WindowFunctionKind::StddevSamp
+        | WindowFunctionKind::BoolOr => {
+            if args.len() != 1 {
+                return Err("aggregate window function expects 1 argument".to_string());
+            }
+            if matches!(kind, WindowFunctionKind::Min | WindowFunctionKind::Max) {
+                validate_window_arg_matches_return(args[0], return_type, arena)?;
+            }
+        }
+        WindowFunctionKind::CovarPop | WindowFunctionKind::CovarSamp | WindowFunctionKind::Corr => {
+            if args.len() != 2 {
+                return Err("covar/corr window function expects 2 arguments".to_string());
+            }
+        }
+        WindowFunctionKind::ApproxTopK => {
+            if !(1..=3).contains(&args.len()) {
+                return Err("approx_top_k window function expects 1 to 3 arguments".to_string());
+            }
+        }
+        WindowFunctionKind::ArrayAgg { .. } => {
+            if args.len() != 1 {
+                return Err("array_agg window function expects 1 argument".to_string());
+            }
+            if !matches!(return_type, DataType::List(_)) {
+                return Err(format!(
+                    "array_agg window function expects LIST return type, got {:?}",
+                    return_type
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_window_arg_matches_return(
+    arg: crate::exec::expr::ExprId,
+    return_type: &DataType,
+    arena: &ExprArena,
+) -> Result<(), String> {
+    let arg_type = arena
+        .data_type(arg)
+        .ok_or_else(|| "missing arg type in arena".to_string())?;
+    if arg_type != return_type {
+        return Err(format!(
+            "window function return type mismatch: arg={:?} ret={:?}",
+            arg_type, return_type
+        ));
+    }
+    Ok(())
 }
 
 fn lower_sort_items(
@@ -918,6 +1447,7 @@ fn lower_exchange_receiver(
     node: &plan::DistributedNode,
     exchange: &plan::ExchangeReceiver,
     children: Vec<LoweredNode>,
+    arena: &mut ExprArena,
     ctx: &NodeLoweringContext,
 ) -> Result<LoweredNode, String> {
     check_exact_arity("ExchangeReceiver", 0, children.len())?;
@@ -934,9 +1464,7 @@ fn lower_exchange_receiver(
         plan::exchange_flavor::Kind::LimitOffset(_) => {
             return unsupported("ExchangeReceiver LimitOffset");
         }
-        plan::exchange_flavor::Kind::TopnSplit(_) => {
-            return unsupported("ExchangeReceiver TopNSplit");
-        }
+        plan::exchange_flavor::Kind::TopnSplit(_) => {}
         plan::exchange_flavor::Kind::CteMulticast(_) => {
             return unsupported("ExchangeReceiver CteMulticast");
         }
@@ -961,7 +1489,7 @@ fn lower_exchange_receiver(
     }
     let layout = layout_from_output_columns(&exchange.output_columns)?;
     let output_schema = chunk_schema_from_output_columns(&exchange.output_columns)?;
-    Ok(LoweredNode {
+    let mut lowered = LoweredNode {
         node: ExecNode {
             kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
                 key,
@@ -972,7 +1500,37 @@ fn lower_exchange_receiver(
         },
         layout,
         output_schema,
-    })
+    };
+
+    if let plan::exchange_flavor::Kind::TopnSplit(topn) = flavor {
+        let order_by = lower_sort_items(
+            "ExchangeReceiver TopNSplit",
+            &topn.items,
+            arena,
+            &lowered.layout,
+        )?;
+        let limit = parse_optional_nonnegative_i64(topn.limit, "ExchangeReceiver TopNSplit.limit")?;
+        let offset =
+            parse_optional_nonnegative_i64(topn.offset, "ExchangeReceiver TopNSplit.offset")?
+                .unwrap_or(0);
+        lowered.node = ExecNode {
+            kind: ExecNodeKind::Sort(SortNode {
+                input: Box::new(lowered.node),
+                node_id: node.node_id,
+                use_top_n: false,
+                order_by,
+                limit,
+                offset,
+                topn_type: SortTopNType::RowNumber,
+                max_buffered_rows: None,
+                max_buffered_bytes: None,
+                partition_exprs: Vec::new(),
+                partition_limit: None,
+            }),
+        };
+    }
+
+    Ok(lowered)
 }
 
 fn lower_set_op_node(
@@ -2569,6 +3127,37 @@ mod tests {
         }
     }
 
+    fn topn_exchange_node(node_id: i32) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Exchange(
+                plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Hash as i32,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 7,
+                    output_columns: vec![output_column(1, "id", DataType::Int64)],
+                    output_qualifier: None,
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::TopnSplit(
+                            plan::TopNSplitFlavor {
+                                items: vec![sort_item(1)],
+                                limit: Some(3),
+                                offset: Some(1),
+                            },
+                        )),
+                    }),
+                },
+            )),
+        }
+    }
+
     fn physical_node(
         node_id: i32,
         kind: plan::plan_node::Kind,
@@ -3039,7 +3628,71 @@ mod tests {
     }
 
     #[test]
-    fn rejects_split_topn() {
+    fn lowers_sort_output_reorder_as_subordinate_project() {
+        let sort = physical_node(
+            20,
+            plan::plan_node::Kind::Sort(plan::SortNode {
+                items: vec![sort_item(1)],
+                analytic_partition_by: Vec::new(),
+                output_columns: vec![
+                    output_column(2, "b", DataType::Int64),
+                    output_column(1, "a", DataType::Int64),
+                ],
+                offset: None,
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![
+                output_column(2, "b", DataType::Int64),
+                output_column(1, "a", DataType::Int64),
+            ],
+            vec![two_col_values_node(10)],
+        );
+
+        let lowered = lower(&sort);
+        let ExecNodeKind::Project(project) = lowered.node.kind else {
+            panic!("expected reorder project");
+        };
+        assert!(project.is_subordinate);
+        assert_eq!(project.node_id, 20);
+        assert_eq!(project.expr_slot_ids, vec![SlotId::new(2), SlotId::new(1)]);
+        assert_eq!(
+            project.output_chunk_schema.slot_ids(),
+            &[SlotId::new(2), SlotId::new(1)]
+        );
+        assert_eq!(lowered.layout.order(), &[SlotId::new(2), SlotId::new(1)]);
+        let ExecNodeKind::Sort(sort) = project.input.kind else {
+            panic!("expected Sort below reorder project");
+        };
+        assert_eq!(sort.order_by.len(), 1);
+        assert!(matches!(sort.input.kind, ExecNodeKind::Values(_)));
+    }
+
+    #[test]
+    fn lowers_partial_split_topn() {
+        let topn = physical_node(
+            30,
+            plan::plan_node::Kind::Topn(plan::TopNNode {
+                items: vec![sort_item(1)],
+                limit: Some(3),
+                offset: Some(0),
+                phase: plan::TopNPhase::TopnPhasePartial as i32,
+                is_split: true,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&topn);
+        let ExecNodeKind::Sort(topn) = lowered.node.kind else {
+            panic!("expected split TopN as Sort");
+        };
+        assert!(topn.use_top_n);
+        assert_eq!(topn.limit, Some(3));
+        assert_eq!(topn.offset, 0);
+    }
+
+    #[test]
+    fn rejects_final_split_topn_physical_node() {
         let topn = physical_node(
             30,
             plan::plan_node::Kind::Topn(plan::TopNNode {
@@ -3054,8 +3707,8 @@ mod tests {
         );
         let mut arena = ExprArena::default();
         let err = lower_proto_node(&topn, &mut arena, &NodeLoweringContext::default()).unwrap_err();
-        assert!(err.contains("TopNNode split"));
-        assert!(err.contains("not implemented"));
+        assert!(err.contains("TopNNode final split"));
+        assert!(err.contains("ExchangeReceiver TopNSplit"));
     }
 
     #[test]
@@ -3107,6 +3760,91 @@ mod tests {
         };
         assert_eq!(exchange.expected_senders, 2);
         assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_topn_split_exchange_receiver_as_merging_sort() {
+        let mut arena = ExprArena::default();
+        let lowered = lower_proto_node(
+            &topn_exchange_node(41),
+            &mut arena,
+            &NodeLoweringContext::default().with_exchange_sender_count(
+                ExchangeKey {
+                    finst_id_hi: 0,
+                    finst_id_lo: 0,
+                    node_id: 41,
+                },
+                2,
+            ),
+        )
+        .expect("TopNSplit exchange receiver");
+
+        let ExecNodeKind::Sort(sort) = lowered.node.kind else {
+            panic!("expected Sort");
+        };
+        assert_eq!(sort.node_id, 41);
+        assert_eq!(sort.limit, Some(3));
+        assert_eq!(sort.offset, 1);
+        assert_eq!(sort.order_by.len(), 1);
+        let ExecNodeKind::ExchangeSource(exchange) = sort.input.kind else {
+            panic!("expected ExchangeSource under Sort");
+        };
+        assert_eq!(exchange.expected_senders, 2);
+        assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_window_node_to_analytic_exec_node() {
+        let output_columns = vec![
+            output_column(1, "id", DataType::Int64),
+            output_column(2, "rn", DataType::Int64),
+        ];
+        let window = physical_node(
+            80,
+            plan::plan_node::Kind::Window(plan::WindowNode {
+                window_exprs: vec![plan::WindowExpr {
+                    name: "row_number".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    partition_by: Vec::new(),
+                    order_by: vec![sort_item(1)],
+                    window_frame: Some(expr::WindowFrame {
+                        frame_type: expr::WindowFrameType::Rows as i32,
+                        start: Some(expr::WindowBound {
+                            bound: Some(expr::window_bound::Bound::UnboundedPreceding(true)),
+                        }),
+                        end: Some(expr::WindowBound {
+                            bound: Some(expr::window_bound::Bound::CurrentRow(true)),
+                        }),
+                    }),
+                    result_type: Some(type_desc(&DataType::Int64)),
+                    output_name: "rn".to_string(),
+                    output_column_id: 2,
+                    ignore_nulls: false,
+                }],
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+
+        let lowered = lower(&window);
+        let ExecNodeKind::Analytic(analytic) = lowered.node.kind else {
+            panic!("expected Analytic");
+        };
+        assert_eq!(analytic.node_id, 80);
+        assert_eq!(analytic.functions.len(), 1);
+        assert!(matches!(
+            analytic.functions[0].kind,
+            crate::exec::node::analytic::WindowFunctionKind::RowNumber
+        ));
+        assert_eq!(analytic.order_by_exprs.len(), 1);
+        assert_eq!(
+            analytic.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1), SlotId::new(2)]);
     }
 
     #[test]
