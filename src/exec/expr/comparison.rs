@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::cast::cast_with_special_rules;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Builder, ListArray, MapArray, StringArray, StructArray,
@@ -1126,12 +1127,12 @@ fn normalize_comparison_types(
             let left_cast = if left_type == &target {
                 left
             } else {
-                cast(&left, &target).map_err(|e| e.to_string())?
+                cast_with_special_rules(&left, &target)?
             };
             let right_cast = if right_type == &target {
                 right
             } else {
-                cast(&right, &target).map_err(|e| e.to_string())?
+                cast_with_special_rules(&right, &target)?
             };
             Ok((left_cast, right_cast))
         }
@@ -1546,7 +1547,7 @@ pub fn eval_not(arena: &ExprArena, child: ExprId, chunk: &Chunk) -> Result<Array
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
+    use crate::common::{ids::SlotId, largeint};
     use crate::exec::expr::{ExprNode, LiteralValue};
     use arrow::array::{
         BooleanArray, Decimal128Array, DictionaryArray, Int32Array, Int32Builder, Int64Array,
@@ -1592,6 +1593,20 @@ mod tests {
             .expect("chunk schema");
             Chunk::new_with_chunk_schema(batch, chunk_schema)
         }
+    }
+
+    fn create_test_chunk_two_arrays(left: ArrayRef, right: ArrayRef) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l", left.data_type().clone(), true),
+            Field::new("r", right.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
     fn create_test_chunk_bool(l: Vec<Option<bool>>, r: Vec<Option<bool>>) -> Chunk {
@@ -2168,6 +2183,62 @@ mod tests {
         let (l, r) = normalize_comparison_types(left, right).unwrap();
         assert_eq!(l.data_type(), &DataType::Int64);
         assert_eq!(r.data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn bool_integer_comparison_uses_numeric_values() {
+        let chunk = create_test_chunk_two_arrays(
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false)])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(1_i64), Some(1_i64)])) as ArrayRef,
+        );
+        let mut arena = ExprArena::default();
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Boolean);
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int64);
+        let eq_expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
+        let lt_expr = arena.push_typed(ExprNode::Lt(l, r), DataType::Boolean);
+
+        let eq_out = arena.eval(eq_expr, &chunk).unwrap();
+        let lt_out = arena.eval(lt_expr, &chunk).unwrap();
+
+        assert_eq!(bool_values(&eq_out), vec![Some(true), Some(false)]);
+        assert_eq!(bool_values(&lt_out), vec![Some(false), Some(true)]);
+    }
+
+    #[test]
+    fn comparison_with_null_operand_returns_nulls() {
+        let chunk = create_test_chunk_two_arrays(
+            Arc::new(Int64Array::from(vec![Some(1_i64), Some(2_i64)])) as ArrayRef,
+            arrow::array::new_null_array(&DataType::Null, 2),
+        );
+        let mut arena = ExprArena::default();
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Null);
+        let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
+
+        let out = arena.eval(expr, &chunk).unwrap();
+
+        assert_eq!(bool_values(&out), vec![None, None]);
+    }
+
+    #[test]
+    fn largeint_integer_comparison_uses_largeint_values() {
+        let chunk = create_test_chunk_two_arrays(
+            largeint::array_from_i128(&[Some(9_223_372_036_854_775_808_i128), Some(5_i128)])
+                .unwrap(),
+            Arc::new(Int64Array::from(vec![
+                Some(9_223_372_036_854_775_807_i64),
+                Some(10_i64),
+            ])) as ArrayRef,
+        );
+        let mut arena = ExprArena::default();
+        let largeint_type = DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH);
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), largeint_type);
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int64);
+        let expr = arena.push_typed(ExprNode::Gt(l, r), DataType::Boolean);
+
+        let out = arena.eval(expr, &chunk).unwrap();
+
+        assert_eq!(bool_values(&out), vec![Some(true), Some(false)]);
     }
 
     #[test]
