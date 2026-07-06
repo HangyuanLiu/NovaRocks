@@ -169,7 +169,13 @@ pub fn run_standalone_fe_server_with_config(
     run_with_resolved_options(resolved)
 }
 
+pub fn configure_standalone_internal_rpc_transport() {
+    crate::service::internal_rpc_transport::use_grpc_internal_rpc_transport();
+}
+
 fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Result<(), String> {
+    configure_standalone_internal_rpc_transport();
+
     let opts = StandaloneOptions {
         config_path: resolved.config_path.clone(),
     };

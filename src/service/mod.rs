@@ -34,6 +34,7 @@ pub mod heartbeat_service;
 pub(crate) mod internal_rpc;
 #[cfg(feature = "compat")]
 pub(crate) mod internal_rpc_client;
+pub(crate) mod internal_rpc_transport;
 #[cfg(feature = "compat")]
 pub mod internal_service;
 pub mod load_tracking_http;

@@ -723,6 +723,9 @@ mod tests {
     #[test]
     #[cfg(feature = "compat")]
     fn test_handle_transmit_runtime_filter_partial_merge_broadcasts_on_completion() {
+        let _transport_guard =
+            crate::service::internal_rpc_transport::use_brpc_compat_internal_rpc_transport_for_test(
+            );
         let _hook_guard = internal_rpc_client::test_hook_lock();
         internal_rpc_client::clear_test_hooks();
 
@@ -802,6 +805,9 @@ mod tests {
     #[test]
     #[cfg(feature = "compat")]
     fn test_handle_transmit_runtime_filter_decimal_partial_uses_build_column_type() {
+        let _transport_guard =
+            crate::service::internal_rpc_transport::use_brpc_compat_internal_rpc_transport_for_test(
+            );
         let _hook_guard = internal_rpc_client::test_hook_lock();
         internal_rpc_client::clear_test_hooks();
 
@@ -897,6 +903,9 @@ mod tests {
     #[test]
     #[cfg(feature = "compat")]
     fn test_handle_transmit_runtime_filter_pending_decimal_partial_preserves_build_column_type() {
+        let _transport_guard =
+            crate::service::internal_rpc_transport::use_brpc_compat_internal_rpc_transport_for_test(
+            );
         let _hook_guard = internal_rpc_client::test_hook_lock();
         internal_rpc_client::clear_test_hooks();
 
