@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::connector::scan_planning::ConnectorScanPlanner;
-use crate::lower::expr::parse_min_max_conjuncts_with_column_resolver;
+use crate::lower::compact::expr::parse_min_max_conjuncts_with_column_resolver;
 use crate::sql::codegen::connector_scan_wire::{ThriftScanContext, to_thrift_scan};
 use crate::thrift::descriptors;
 use crate::thrift::exprs;
@@ -1326,7 +1326,7 @@ pub(crate) fn build_starrocks_scan_ranges_from_planned_scan(
 /// Build a single placeholder scan range that drives the native
 /// iceberg-rust metadata scan operator. The operator keys off
 /// `serialized_table` on the `THdfsScanNode`, so the per-range payload
-/// only needs to satisfy `lower::node::hdfs_scan` invariants: a
+/// only needs to satisfy `lower::compact::node::hdfs_scan` invariants: a
 /// non-empty path. (The earlier embedded-JVM bridge keyed the same
 /// way; that path has been replaced by `IcebergMetadataScanOp` —
 /// see `src/connector/iceberg/metadata.rs`.)

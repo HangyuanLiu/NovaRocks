@@ -105,6 +105,222 @@ fn non_test_optimizer_refs(path: &Path) -> Vec<(usize, String)> {
     non_test_line_hits(path, |line| line.contains("crate::sql::optimizer::"))
 }
 
+fn test_dir() -> PathBuf {
+    Path::new(manifest_dir()).join("tests")
+}
+
+fn source_and_test_rs_files() -> Vec<PathBuf> {
+    let mut files = rs_files(&src_dir());
+    files.extend(rs_files(&test_dir()));
+    files
+        .into_iter()
+        .filter(|path| rel(path) != "tests/architecture_guard.rs")
+        .collect()
+}
+
+const D2D_LEGACY_LOWER_MODULES: &[&str] = &[
+    "expr",
+    "fragment",
+    "layout",
+    "node",
+    "sink",
+    "thrift",
+    "type_lowering",
+];
+
+fn is_ident_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn entry_starts_with_legacy_lower_module(entry: &str) -> bool {
+    let entry = entry.trim_start();
+    D2D_LEGACY_LOWER_MODULES.iter().any(|module| {
+        entry
+            .strip_prefix(module)
+            .is_some_and(|rest| rest.chars().next().is_none_or(|ch| !is_ident_char(ch)))
+    })
+}
+
+fn legacy_lower_root_module_decls(text: &str) -> Vec<(usize, String)> {
+    let mut hits = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or_default();
+        if is_comment_or_blank(code) {
+            continue;
+        }
+        for module in D2D_LEGACY_LOWER_MODULES {
+            let file_mod = format!("mod {module};");
+            let inline_mod = format!("mod {module} {{");
+            if code.contains(&file_mod) || code.contains(&inline_mod) {
+                hits.push((idx + 1, line.trim().to_string()));
+            }
+        }
+    }
+    hits
+}
+
+fn root_group_entries_have_legacy_lower_module(text: &str) -> bool {
+    let mut depth = 0isize;
+    let mut entry_start = 0usize;
+    for (idx, ch) in text.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' if depth == 0 => {
+                return entry_starts_with_legacy_lower_module(&text[entry_start..idx]);
+            }
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                if entry_starts_with_legacy_lower_module(&text[entry_start..idx]) {
+                    return true;
+                }
+                entry_start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    entry_starts_with_legacy_lower_module(&text[entry_start..])
+}
+
+fn code_contains_legacy_lower_path(code: &str) -> bool {
+    for module in D2D_LEGACY_LOWER_MODULES {
+        let crate_needle = format!("{}::lower::{module}", "crate");
+        if code.match_indices(&crate_needle).any(|(idx, _)| {
+            code[idx + crate_needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !is_ident_char(ch))
+        }) {
+            return true;
+        }
+
+        let lower_needle = format!("{}::{module}", "lower");
+        if *module == "thrift"
+            && code.match_indices(&lower_needle).any(|(idx, _)| {
+                code[idx + lower_needle.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|ch| !is_ident_char(ch))
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn legacy_lower_path_hits(path: &Path) -> Vec<(usize, String)> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut hits = Vec::new();
+    let mut pending_cfg_test = false;
+    let mut test_depth = 0isize;
+    let mut lower_root_group_depth = 0isize;
+    let lower_root_group = format!("{}::lower::{{", "crate");
+
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+
+        if test_depth > 0 {
+            test_depth += brace_delta(line);
+            if test_depth < 0 {
+                test_depth = 0;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("#[cfg(test") {
+            pending_cfg_test = true;
+            let delta = brace_delta(line);
+            if delta > 0 {
+                test_depth = delta;
+                pending_cfg_test = false;
+            }
+            continue;
+        }
+
+        if pending_cfg_test {
+            let delta = brace_delta(line);
+            if delta > 0 {
+                test_depth = delta;
+            }
+            pending_cfg_test = false;
+            continue;
+        }
+
+        if is_comment_or_blank(line) {
+            continue;
+        }
+
+        let code = line.split("//").next().unwrap_or_default();
+        let mut hit = code_contains_legacy_lower_path(code);
+
+        if lower_root_group_depth > 0 {
+            if lower_root_group_depth == 1 && root_group_entries_have_legacy_lower_module(code) {
+                hit = true;
+            }
+            lower_root_group_depth += brace_delta(code);
+            if lower_root_group_depth < 0 {
+                lower_root_group_depth = 0;
+            }
+        }
+
+        if let Some(pos) = code.find(&lower_root_group) {
+            let suffix = &code[pos + lower_root_group.len()..];
+            if root_group_entries_have_legacy_lower_module(suffix) {
+                hit = true;
+            }
+            lower_root_group_depth = 1 + brace_delta(suffix);
+            if lower_root_group_depth < 0 {
+                lower_root_group_depth = 0;
+            }
+        }
+
+        if hit {
+            hits.push((idx + 1, line.trim().to_string()));
+        }
+    }
+
+    hits
+}
+
+#[test]
+fn nidl_d2d_detector_flags_visibility_variants_and_grouped_imports() {
+    let root_mod = concat!(
+        "pub mod ",
+        "expr;\n",
+        "pub(super) mod ",
+        "layout;\n",
+        "mod ",
+        "node;\n",
+    );
+    let root_hits = legacy_lower_root_module_decls(root_mod);
+    assert_eq!(root_hits.len(), 3, "{root_hits:?}");
+
+    let tmp = std::env::temp_dir().join(format!(
+        "nidl_d2d_guard_probe_{}_{}.rs",
+        std::process::id(),
+        "lower_paths"
+    ));
+    fs::write(
+        &tmp,
+        concat!(
+            "use crate::",
+            "lower::{compact::fragment, expr, layout};\n",
+            "use crate::",
+            "lower::{\n",
+            "    compact::{fragment, node},\n",
+            "    sink,\n",
+            "};\n",
+            "fn f() { let _ = crate::",
+            "lower::",
+            "thrift::PlanOrigin::StarRocksFeCompatible; }\n",
+        ),
+    )
+    .unwrap();
+    let path_hits = legacy_lower_path_hits(&tmp);
+    fs::remove_file(&tmp).ok();
+    assert_eq!(path_hits.len(), 3, "{path_hits:?}");
+}
+
 #[test]
 fn detector_flags_non_test_and_skips_cfg_test_blocks() {
     let tmp = std::env::temp_dir().join(format!(
@@ -315,6 +531,67 @@ fn nidl_d1_pure_mode_gates_starrocks_compat_behavior() {
     assert!(
         grpc.contains("thrift SubmitFragment requires the compat feature"),
         "pure SubmitFragment must reject thrift fallback explicitly"
+    );
+}
+
+#[test]
+fn nidl_d2d_lowering_root_exposes_named_ownership_modules() {
+    let repo = Path::new(manifest_dir());
+    let legacy_native_lowering_dir = ["src", concat!("lower", "_native")].join("/");
+    assert!(
+        !repo.join(&legacy_native_lowering_dir).exists(),
+        "{} must be deleted; native lowering lives under src/lower/novarocks",
+        legacy_native_lowering_dir
+    );
+    for dir in [
+        "src/lower/common",
+        "src/lower/compact",
+        "src/lower/novarocks",
+    ] {
+        assert!(repo.join(dir).is_dir(), "{dir} must exist");
+    }
+
+    let lower_mod = fs::read_to_string(repo.join("src/lower/mod.rs")).unwrap();
+    for expected in [
+        "pub(crate) mod common;",
+        "pub(crate) mod compact;",
+        "pub(crate) mod novarocks;",
+    ] {
+        assert!(
+            lower_mod.contains(expected),
+            "src/lower/mod.rs must contain `{expected}`"
+        );
+    }
+    let legacy_module_decls = legacy_lower_root_module_decls(&lower_mod)
+        .into_iter()
+        .map(|(line, text)| format!("src/lower/mod.rs:{line}: {text}"))
+        .collect::<Vec<_>>();
+    assert!(
+        legacy_module_decls.is_empty(),
+        "src/lower/mod.rs must not keep legacy direct modules:\n{}",
+        legacy_module_decls.join("\n")
+    );
+}
+
+#[test]
+fn nidl_d2d_legacy_lowering_paths_do_not_remain() {
+    let mut violations = Vec::new();
+    for file in source_and_test_rs_files() {
+        for (line, text) in non_test_line_hits(&file, |line| {
+            let legacy_native_path = format!("{}::{}{}", "crate", "lower", "_native");
+            line.contains(&legacy_native_path)
+        }) {
+            violations.push(format!("{}:{}: {}", rel(&file), line, text));
+        }
+        for (line, text) in legacy_lower_path_hits(&file) {
+            violations.push(format!("{}:{}: {}", rel(&file), line, text));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "D2D lowering paths must use crate::lower::compact, crate::lower::novarocks, or crate::lower::common:\n{}",
+        violations.join("\n")
     );
 }
 

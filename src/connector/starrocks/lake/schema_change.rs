@@ -53,8 +53,8 @@ use crate::formats::starrocks::writer::{
     StarRocksWriteFormat, build_single_segment_metadata, build_starrocks_native_segment_bytes,
     build_txn_data_file_name, sort_batch_for_native_write,
 };
-use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::{Layout, normalize_slot_name};
+use crate::lower::compact::expr::lower_t_expr;
+use crate::lower::compact::layout::{Layout, normalize_slot_name};
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::service::grpc_client::proto::starrocks::{
     CompactionStrategyPb, FlatJsonConfigPb, KeysType, MetadataUpdateInfoPb, PersistentIndexTypePb,

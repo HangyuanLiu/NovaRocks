@@ -1,0 +1,824 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+
+use crate::common::ids::SlotId;
+use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::exec::expr::{ExprArena, ExprNode};
+use crate::exec::node::project::ProjectNode;
+use crate::exec::node::{ExecNode, ExecNodeKind};
+use crate::lower::compact::expr::lower_t_expr;
+use crate::lower::compact::layout::{Layout, chunk_schema_for_layout, slot_arrow_type_lookup};
+use crate::lower::compact::node::{Lowered, PlanOrigin};
+use crate::lower::compact::type_lowering::arrow_type_from_desc;
+use crate::novarocks_logging::info;
+use crate::thrift::{data, descriptors, exprs, plan_nodes, types};
+
+pub(crate) type QueryGlobalDictMap = HashMap<types::TSlotId, Arc<HashMap<i32, Vec<u8>>>>;
+
+/// Convert a fragment's `QueryGlobalDictMap` (id -> bytes) into the scan-side
+/// encode map (bytes -> id) restricted to `output_slots`. Shared by the lake
+/// and HDFS/iceberg scan lowering.
+pub(crate) fn build_scan_query_global_dicts(
+    output_slots: &[SlotId],
+    query_global_dict_map: &QueryGlobalDictMap,
+) -> Result<crate::exec::dict_encode::QueryGlobalDictEncodeMap, String> {
+    let mut out = HashMap::new();
+    for slot_id in output_slots {
+        let raw_slot_id = i32::try_from(slot_id.as_u32()).map_err(|_| {
+            format!(
+                "slot id out of i32 range for query global dict: {}",
+                slot_id
+            )
+        })?;
+        let Some(dict_values) = query_global_dict_map.get(&raw_slot_id) else {
+            continue;
+        };
+        let mut value_to_id = HashMap::with_capacity(dict_values.len());
+        for (id, value) in dict_values.iter() {
+            if let Some(existing) = value_to_id.insert(value.clone(), *id)
+                && existing != *id
+            {
+                return Err(format!(
+                    "query global dict has duplicated string with different ids: slot_id={}, existing_id={}, new_id={}",
+                    slot_id, existing, id
+                ));
+            }
+        }
+        out.insert(*slot_id, Arc::new(value_to_id));
+    }
+    if !out.is_empty() {
+        info!(
+            "SCAN query global dict enabled for slots={:?}",
+            out.keys().collect::<Vec<_>>()
+        );
+    }
+    Ok(out)
+}
+
+pub(crate) fn build_query_global_dict_map(
+    query_global_dicts: Option<&[data::TGlobalDict]>,
+    query_global_dict_exprs: Option<&BTreeMap<i32, exprs::TExpr>>,
+) -> Result<QueryGlobalDictMap, String> {
+    let mut out = QueryGlobalDictMap::new();
+    let Some(dicts) = query_global_dicts else {
+        return Ok(out);
+    };
+    for dict in dicts {
+        let column_id = dict
+            .column_id
+            .ok_or_else(|| "query_global_dict missing column_id".to_string())?;
+        let strings = dict
+            .strings
+            .as_ref()
+            .ok_or_else(|| format!("query_global_dict column_id={} missing strings", column_id))?;
+        let ids = dict
+            .ids
+            .as_ref()
+            .ok_or_else(|| format!("query_global_dict column_id={} missing ids", column_id))?;
+        if strings.len() != ids.len() {
+            return Err(format!(
+                "query_global_dict column_id={} strings/ids length mismatch: {} vs {}",
+                column_id,
+                strings.len(),
+                ids.len()
+            ));
+        }
+        let mut dict_values = HashMap::with_capacity(ids.len());
+        let mut value_to_id = HashMap::<Vec<u8>, i32>::with_capacity(strings.len());
+        for (id, value) in ids.iter().zip(strings.iter()) {
+            if let Some(existing) = dict_values.insert(*id, value.clone())
+                && existing != *value
+            {
+                return Err(format!(
+                    "query_global_dict column_id={} duplicate id {} maps to different strings",
+                    column_id, id
+                ));
+            }
+            if let Some(existing_id) = value_to_id.insert(value.clone(), *id)
+                && existing_id != *id
+            {
+                return Err(format!(
+                    "query_global_dict column_id={} duplicate string maps to different ids: existing_id={}, new_id={}",
+                    column_id, existing_id, id
+                ));
+            }
+        }
+        if let Some(existing) = out.insert(column_id, Arc::new(dict_values)) {
+            return Err(format!(
+                "query_global_dict column_id={} appears more than once in the same fragment (existing_size={}, new_size={})",
+                column_id,
+                existing.len(),
+                ids.len()
+            ));
+        }
+    }
+
+    // FE may send derived dictionary expressions in `query_global_dict_exprs`, where target
+    // dict slots are defined from source dict slots (for example `upper(<placeholder>)`).
+    // We must derive target slot dictionary values from expression semantics instead of
+    // reusing source dictionaries directly.
+    if let Some(dict_exprs) = query_global_dict_exprs {
+        for (target_slot, expr) in dict_exprs {
+            if out.contains_key(target_slot) {
+                continue;
+            }
+            if let Some(derived_dict) = derive_query_global_dict_expr(expr, &out)? {
+                out.insert(*target_slot, Arc::new(derived_dict));
+                continue;
+            }
+
+            // Fallback for non-DICT_EXPR/unsupported derived exprs:
+            // reuse source dictionary only when there is a single referenced slot.
+            let mut referenced_slots = HashSet::new();
+            for node in &expr.nodes {
+                if node.node_type == exprs::TExprNodeType::SLOT_REF
+                    && let Some(slot_ref) = node.slot_ref.as_ref()
+                {
+                    referenced_slots.insert(slot_ref.slot_id);
+                }
+                if node.node_type == exprs::TExprNodeType::PLACEHOLDER_EXPR
+                    && let Some(slot_id) = node.vslot_ref.as_ref().and_then(|v| v.slot_id)
+                {
+                    referenced_slots.insert(slot_id);
+                }
+            }
+            if referenced_slots.len() != 1 {
+                continue;
+            }
+            let source_slot = *referenced_slots.iter().next().expect("single slot");
+            if let Some(source_dict) = out.get(&source_slot).cloned() {
+                out.insert(*target_slot, source_dict);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn walk_subtree_end(nodes: &[exprs::TExprNode], idx: &mut usize) -> Result<(), String> {
+    let node = nodes
+        .get(*idx)
+        .ok_or_else(|| format!("invalid expr node index {}", *idx))?;
+    *idx += 1;
+    for _ in 0..node.num_children {
+        walk_subtree_end(nodes, idx)?;
+    }
+    Ok(())
+}
+
+fn subtree_end(nodes: &[exprs::TExprNode], start: usize) -> Result<usize, String> {
+    let mut idx = start;
+    walk_subtree_end(nodes, &mut idx)?;
+    Ok(idx)
+}
+
+fn extract_dict_expr_source_and_mapped(
+    expr: &exprs::TExpr,
+) -> Result<Option<(types::TSlotId, exprs::TExpr)>, String> {
+    let Some(root) = expr.nodes.first() else {
+        return Ok(None);
+    };
+    if root.node_type != exprs::TExprNodeType::DICT_EXPR || root.num_children < 2 {
+        return Ok(None);
+    }
+
+    let nodes = &expr.nodes;
+    let first_child_start = 1usize;
+    let first_child_end = subtree_end(nodes, first_child_start)?;
+    let source_slot = nodes
+        .get(first_child_start)
+        .and_then(|n| n.slot_ref.as_ref())
+        .map(|s| s.slot_id)
+        .ok_or_else(|| "DICT_EXPR source child is not SLOT_REF".to_string())?;
+
+    let mapped_start = first_child_end;
+    let mapped_end = subtree_end(nodes, mapped_start)?;
+    let mapped_nodes = nodes[mapped_start..mapped_end].to_vec();
+
+    Ok(Some((
+        source_slot,
+        exprs::TExpr {
+            nodes: mapped_nodes,
+        },
+    )))
+}
+
+fn collect_expr_slot_inputs(
+    expr: &exprs::TExpr,
+) -> Result<Vec<(types::TSlotId, DataType)>, String> {
+    let mut slot_inputs: BTreeMap<types::TSlotId, DataType> = BTreeMap::new();
+    for node in &expr.nodes {
+        if node.node_type == exprs::TExprNodeType::PLACEHOLDER_EXPR {
+            let slot_id = node
+                .vslot_ref
+                .as_ref()
+                .and_then(|v| v.slot_id)
+                .ok_or_else(|| "PLACEHOLDER_EXPR missing vslot_ref.slot_id".to_string())?;
+            let data_type = arrow_type_from_desc(&node.type_).unwrap_or(DataType::Utf8);
+            match slot_inputs.get(&slot_id) {
+                Some(existing) if existing != &data_type => {
+                    return Err(format!(
+                        "dict expr slot {} has conflicting types {:?} vs {:?}",
+                        slot_id, existing, data_type
+                    ));
+                }
+                None => {
+                    slot_inputs.insert(slot_id, data_type);
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if node.node_type == exprs::TExprNodeType::SLOT_REF
+            && let Some(slot_ref) = node.slot_ref.as_ref()
+        {
+            let slot_id = slot_ref.slot_id;
+            let data_type = arrow_type_from_desc(&node.type_).unwrap_or(DataType::Int32);
+            match slot_inputs.get(&slot_id) {
+                Some(existing) if existing != &data_type => {
+                    return Err(format!(
+                        "dict expr slot {} has conflicting types {:?} vs {:?}",
+                        slot_id, existing, data_type
+                    ));
+                }
+                None => {
+                    slot_inputs.insert(slot_id, data_type);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(slot_inputs.into_iter().collect())
+}
+
+fn build_slot_array_for_dict_entries(
+    data_type: &DataType,
+    dict_entries: &[(i32, Option<Vec<u8>>)],
+) -> Result<ArrayRef, String> {
+    match data_type {
+        DataType::Utf8 => {
+            let mut values = Vec::with_capacity(dict_entries.len());
+            for (_code, bytes) in dict_entries {
+                let value = bytes
+                    .as_ref()
+                    .map(|b| {
+                        std::str::from_utf8(b)
+                            .map(|s| s.to_string())
+                            .map_err(|e| format!("dict entry is not valid utf8: {}", e))
+                    })
+                    .transpose()?;
+                values.push(value);
+            }
+            Ok(Arc::new(StringArray::from(values)))
+        }
+        DataType::LargeUtf8 => {
+            let mut values = Vec::with_capacity(dict_entries.len());
+            for (_code, bytes) in dict_entries {
+                let value = bytes
+                    .as_ref()
+                    .map(|b| {
+                        std::str::from_utf8(b)
+                            .map(|s| s.to_string())
+                            .map_err(|e| format!("dict entry is not valid utf8: {}", e))
+                    })
+                    .transpose()?;
+                values.push(value);
+            }
+            Ok(Arc::new(LargeStringArray::from(values)))
+        }
+        DataType::Binary => {
+            let values = dict_entries
+                .iter()
+                .map(|(_, bytes)| bytes.as_ref().map(|b| b.as_slice()))
+                .collect::<Vec<_>>();
+            Ok(Arc::new(BinaryArray::from(values)))
+        }
+        DataType::LargeBinary => {
+            let values = dict_entries
+                .iter()
+                .map(|(_, bytes)| bytes.as_ref().map(|b| b.as_slice()))
+                .collect::<Vec<_>>();
+            Ok(Arc::new(LargeBinaryArray::from(values)))
+        }
+        DataType::Int8 => {
+            let mut values = Vec::with_capacity(dict_entries.len());
+            for (code, bytes) in dict_entries {
+                if bytes.is_none() {
+                    values.push(None);
+                    continue;
+                }
+                values.push(Some(
+                    i8::try_from(*code).map_err(|_| format!("dict code {} overflows i8", code))?,
+                ));
+            }
+            Ok(Arc::new(Int8Array::from(values)))
+        }
+        DataType::Int16 => {
+            let mut values = Vec::with_capacity(dict_entries.len());
+            for (code, bytes) in dict_entries {
+                if bytes.is_none() {
+                    values.push(None);
+                    continue;
+                }
+                values.push(Some(
+                    i16::try_from(*code)
+                        .map_err(|_| format!("dict code {} overflows i16", code))?,
+                ));
+            }
+            Ok(Arc::new(Int16Array::from(values)))
+        }
+        DataType::Int32 => {
+            let values = dict_entries
+                .iter()
+                .map(|(code, bytes)| bytes.as_ref().map(|_| *code))
+                .collect::<Vec<_>>();
+            Ok(Arc::new(Int32Array::from(values)))
+        }
+        DataType::Int64 => {
+            let values = dict_entries
+                .iter()
+                .map(|(code, bytes)| bytes.as_ref().map(|_| i64::from(*code)))
+                .collect::<Vec<_>>();
+            Ok(Arc::new(Int64Array::from(values)))
+        }
+        DataType::UInt8 => {
+            let mut values = Vec::with_capacity(dict_entries.len());
+            for (code, bytes) in dict_entries {
+                if bytes.is_none() {
+                    values.push(None);
+                    continue;
+                }
+                values.push(Some(
+                    u8::try_from(*code).map_err(|_| format!("dict code {} overflows u8", code))?,
+                ));
+            }
+            Ok(Arc::new(UInt8Array::from(values)))
+        }
+        DataType::UInt16 => {
+            let mut values = Vec::with_capacity(dict_entries.len());
+            for (code, bytes) in dict_entries {
+                if bytes.is_none() {
+                    values.push(None);
+                    continue;
+                }
+                values.push(Some(
+                    u16::try_from(*code)
+                        .map_err(|_| format!("dict code {} overflows u16", code))?,
+                ));
+            }
+            Ok(Arc::new(UInt16Array::from(values)))
+        }
+        DataType::UInt32 => {
+            let mut values = Vec::with_capacity(dict_entries.len());
+            for (code, bytes) in dict_entries {
+                if bytes.is_none() {
+                    values.push(None);
+                    continue;
+                }
+                values.push(Some(
+                    u32::try_from(*code)
+                        .map_err(|_| format!("dict code {} overflows u32", code))?,
+                ));
+            }
+            Ok(Arc::new(UInt32Array::from(values)))
+        }
+        DataType::UInt64 => {
+            let mut values = Vec::with_capacity(dict_entries.len());
+            for (code, bytes) in dict_entries {
+                if bytes.is_none() {
+                    values.push(None);
+                    continue;
+                }
+                values.push(Some(
+                    u64::try_from(*code)
+                        .map_err(|_| format!("dict code {} overflows u64", code))?,
+                ));
+            }
+            Ok(Arc::new(UInt64Array::from(values)))
+        }
+        other => Err(format!(
+            "unsupported dict expr slot input type for derivation: {:?}",
+            other
+        )),
+    }
+}
+
+fn supports_dict_expr_derivation_slot_input_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
+}
+
+fn array_value_to_bytes(array: &ArrayRef, row: usize) -> Result<Option<Vec<u8>>, String> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    match array.data_type() {
+        DataType::Utf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "failed to downcast Utf8 result array".to_string())?;
+            Ok(Some(arr.value(row).as_bytes().to_vec()))
+        }
+        DataType::LargeUtf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| "failed to downcast LargeUtf8 result array".to_string())?;
+            Ok(Some(arr.value(row).as_bytes().to_vec()))
+        }
+        DataType::Binary => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| "failed to downcast Binary result array".to_string())?;
+            Ok(Some(arr.value(row).to_vec()))
+        }
+        DataType::LargeBinary => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| "failed to downcast LargeBinary result array".to_string())?;
+            Ok(Some(arr.value(row).to_vec()))
+        }
+        other => Err(format!(
+            "derived dict expression result type must be string/binary, got {:?}",
+            other
+        )),
+    }
+}
+
+fn derive_query_global_dict_expr(
+    dict_expr: &exprs::TExpr,
+    dict_map: &QueryGlobalDictMap,
+) -> Result<Option<HashMap<i32, Vec<u8>>>, String> {
+    let Some((source_slot, mapped_expr)) = extract_dict_expr_source_and_mapped(dict_expr)? else {
+        return Ok(None);
+    };
+    let Some(source_dict) = dict_map.get(&source_slot) else {
+        return Ok(None);
+    };
+
+    let mut dict_entries = source_dict
+        .iter()
+        .map(|(code, value)| (*code, Some(value.clone())))
+        .collect::<Vec<_>>();
+    // Dictionary id 0 is the null sentinel for encoded string slots. Add a synthetic null row so
+    // derived expressions (for example `if(<placeholder> IS NOT NULL, 'A', 'B')`) can decide
+    // whether null input maps to null or to a concrete output value.
+    if !dict_entries.iter().any(|(code, _)| *code == 0) {
+        dict_entries.push((0, None));
+    }
+    dict_entries.sort_by_key(|(code, _)| *code);
+    if dict_entries.is_empty() {
+        return Ok(Some(HashMap::new()));
+    }
+
+    let slot_inputs = collect_expr_slot_inputs(&mapped_expr)?;
+    if slot_inputs.is_empty() {
+        return Err("derived dict expression has no slot inputs".to_string());
+    }
+    if slot_inputs
+        .iter()
+        .any(|(_slot_id, data_type)| !supports_dict_expr_derivation_slot_input_type(data_type))
+    {
+        return Ok(None);
+    }
+
+    let mut fields = Vec::with_capacity(slot_inputs.len());
+    let mut columns = Vec::with_capacity(slot_inputs.len());
+    for (slot_id, data_type) in &slot_inputs {
+        let field = Field::new(format!("slot_{}", slot_id), data_type.clone(), true);
+        fields.push(field);
+        columns.push(build_slot_array_for_dict_entries(data_type, &dict_entries)?);
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| format!("failed to build dict expr input batch: {}", e))?;
+    let slot_ids = slot_inputs
+        .iter()
+        .map(|(slot_id, _)| {
+            let slot_id_u32 = u32::try_from(*slot_id)
+                .map_err(|_| format!("slot id {} overflows u32", slot_id))?;
+            Ok(SlotId::new(slot_id_u32))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let chunk = Chunk::new_with_chunk_schema(
+        batch,
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &slot_ids)?,
+    );
+
+    let mut arena = ExprArena::default();
+    let mapped_expr_id = lower_t_expr(
+        &mapped_expr,
+        &mut arena,
+        &Layout {
+            order: Vec::new(),
+            index: HashMap::new(),
+        },
+        None,
+        None,
+    )?;
+    let mapped_array = arena.eval(mapped_expr_id, &chunk)?;
+
+    let mut derived = HashMap::with_capacity(dict_entries.len());
+    for (row, (code, original)) in dict_entries.iter().enumerate() {
+        let mapped_value = array_value_to_bytes(&mapped_array, row)?;
+        if let Some(value) = mapped_value {
+            derived.insert(*code, value);
+            continue;
+        }
+        if let Some(original) = original {
+            // Keep previous fallback behavior for non-null source dictionary rows.
+            derived.insert(*code, original.clone());
+        }
+    }
+    Ok(Some(derived))
+}
+
+fn resolve_layout_slot_tuple_id(
+    layout: &Layout,
+    slot_id: types::TSlotId,
+    context: &str,
+) -> Result<types::TTupleId, String> {
+    let mut matches = layout
+        .order
+        .iter()
+        .filter_map(|(tuple_id, layout_slot_id)| (*layout_slot_id == slot_id).then_some(*tuple_id));
+    let tuple_id = matches
+        .next()
+        .ok_or_else(|| format!("{context} missing slot_id={slot_id} in layout"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "{context} ambiguous slot_id={} across multiple tuples",
+            slot_id
+        ));
+    }
+    Ok(tuple_id)
+}
+
+fn supports_dict_decode_input_type(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => true,
+        DataType::List(field) | DataType::LargeList(field) => {
+            supports_dict_decode_input_type(field.data_type())
+        }
+        _ => false,
+    }
+}
+
+fn dict_decode_input_supported_for_origin(
+    encoded_slot_id: types::TSlotId,
+    encoded_type: &DataType,
+    plan_origin: PlanOrigin,
+) -> Result<bool, String> {
+    if supports_dict_decode_input_type(encoded_type) {
+        return Ok(true);
+    }
+    if plan_origin == PlanOrigin::StarRocksFeCompatible {
+        return Err(format!(
+            "DECODE_NODE encoded slot_id={} has non-integer input type {:?} in FE-compatible global dict path",
+            encoded_slot_id, encoded_type
+        ));
+    }
+    Ok(false)
+}
+
+pub(crate) fn lower_decode_node(
+    child: Lowered,
+    node: &plan_nodes::TPlanNode,
+    out_layout: Layout,
+    arena: &mut ExprArena,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
+    query_global_dict_map: &QueryGlobalDictMap,
+    plan_origin: PlanOrigin,
+) -> Result<Lowered, String> {
+    let decode = node
+        .decode_node
+        .as_ref()
+        .ok_or_else(|| "DECODE_NODE missing decode_node payload".to_string())?;
+    let Some(dict_id_to_string_ids) = decode.dict_id_to_string_ids.as_ref() else {
+        // No remapping means decode is a no-op for novarocks.
+        return Ok(child);
+    };
+    if dict_id_to_string_ids.is_empty() {
+        return Ok(child);
+    }
+
+    let desc_tbl = desc_tbl
+        .ok_or_else(|| "DECODE_NODE requires descriptor table for output schema".to_string())?;
+    let slot_types = slot_arrow_type_lookup(desc_tbl)?;
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
+    // Output slot id -> encoded dict slot id.
+    let mut decode_input_slots = HashMap::with_capacity(dict_id_to_string_ids.len());
+    for (dict_slot_id, string_slot_id) in dict_id_to_string_ids {
+        decode_input_slots.insert(*string_slot_id, *dict_slot_id);
+    }
+
+    let mut exprs = Vec::with_capacity(out_layout.order.len());
+    let mut expr_slot_ids = Vec::with_capacity(out_layout.order.len());
+    for (output_tuple_id, output_slot_id) in &out_layout.order {
+        let output_slot = SlotId::try_from(*output_slot_id)?;
+        let output_type = slot_types
+            .get(&(*output_tuple_id, *output_slot_id))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "DECODE_NODE missing output slot type for tuple_id={} slot_id={}",
+                    output_tuple_id, output_slot_id
+                )
+            })?;
+        let expr_id = if let Some(encoded_slot_id) = decode_input_slots.get(output_slot_id) {
+            let dict_values = query_global_dict_map.get(encoded_slot_id).ok_or_else(|| {
+                format!(
+                    "missing query global dict for encoded slot_id={}",
+                    encoded_slot_id
+                )
+            })?;
+            let encoded_slot = SlotId::try_from(*encoded_slot_id)?;
+            let encoded_tuple_id =
+                resolve_layout_slot_tuple_id(&child.layout, *encoded_slot_id, "DECODE_NODE")?;
+            let encoded_type = slot_types
+                .get(&(encoded_tuple_id, *encoded_slot_id))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "DECODE_NODE missing encoded slot type for tuple_id={} slot_id={}",
+                        encoded_tuple_id, encoded_slot_id
+                    )
+                })?;
+            let encoded_expr =
+                arena.push_typed(ExprNode::SlotId(encoded_slot), encoded_type.clone());
+            if dict_decode_input_supported_for_origin(*encoded_slot_id, &encoded_type, plan_origin)?
+            {
+                arena.push_typed(
+                    ExprNode::DictDecode {
+                        child: encoded_expr,
+                        dict: Arc::clone(dict_values),
+                    },
+                    output_type,
+                )
+            } else {
+                // If upstream already materializes string values for the encoded slot,
+                // keep it as-is and just remap the slot id.
+                encoded_expr
+            }
+        } else {
+            // Keep passthrough slots unchanged.
+            arena.push_typed(ExprNode::SlotId(output_slot), output_type)
+        };
+        exprs.push(expr_id);
+        expr_slot_ids.push(output_slot);
+    }
+
+    let output_indices: Vec<usize> = (0..exprs.len()).collect();
+    Ok(Lowered {
+        node: ExecNode {
+            kind: ExecNodeKind::Project(ProjectNode {
+                input: Box::new(child.node),
+                node_id: node.node_id,
+                is_subordinate: false,
+                exprs,
+                expr_slot_ids,
+                expr_slot_schemas: None,
+                output_indices: Some(output_indices),
+                output_chunk_schema,
+            }),
+        },
+        layout: out_layout,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict(column_id: i32, strings: Vec<&str>, ids: Vec<i32>) -> data::TGlobalDict {
+        data::TGlobalDict::new(
+            Some(column_id),
+            Some(strings.into_iter().map(|s| s.as_bytes().to_vec()).collect()),
+            Some(ids),
+            None,
+        )
+    }
+
+    #[test]
+    fn fe_compatible_decode_rejects_non_integer_encoded_input() {
+        let err = dict_decode_input_supported_for_origin(
+            7,
+            &DataType::Utf8,
+            crate::lower::compact::node::PlanOrigin::StarRocksFeCompatible,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("DECODE_NODE encoded slot_id=7"), "{err}");
+        assert!(err.contains("FE-compatible"), "{err}");
+        assert!(err.contains("Utf8"), "{err}");
+    }
+
+    #[test]
+    fn native_decode_keeps_existing_noop_behavior_for_non_integer_input() {
+        let supported = dict_decode_input_supported_for_origin(
+            7,
+            &DataType::Utf8,
+            crate::lower::compact::node::PlanOrigin::NovaRocksGenerated,
+        )
+        .unwrap();
+
+        assert!(!supported);
+    }
+
+    #[test]
+    fn query_global_dict_rejects_duplicate_id_with_different_value() {
+        let err = build_query_global_dict_map(Some(&[dict(7, vec!["a", "b"], vec![1, 1])]), None)
+            .unwrap_err();
+        assert!(
+            err.contains("duplicate id") && err.contains("column_id=7"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn query_global_dict_rejects_duplicate_value_with_different_id() {
+        let err = build_query_global_dict_map(Some(&[dict(7, vec!["a", "a"], vec![1, 2])]), None)
+            .unwrap_err();
+        assert!(
+            err.contains("duplicate string") && err.contains("column_id=7"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn query_global_dict_rejects_duplicate_column_id_in_same_fragment() {
+        let err = build_query_global_dict_map(
+            Some(&[dict(7, vec!["a"], vec![1]), dict(7, vec!["b"], vec![2])]),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("column_id=7") && err.contains("appears more than once"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn query_global_dict_accepts_consistent_payload() {
+        let out = build_query_global_dict_map(Some(&[dict(7, vec!["a", "b"], vec![1, 2])]), None)
+            .expect("dict");
+        assert_eq!(out.get(&7).unwrap().get(&1).unwrap(), b"a");
+        assert_eq!(out.get(&7).unwrap().get(&2).unwrap(), b"b");
+    }
+
+    #[test]
+    fn query_global_dict_accepts_consistent_duplicate_entry() {
+        let out = build_query_global_dict_map(Some(&[dict(7, vec!["a", "a"], vec![1, 1])]), None)
+            .expect("dict");
+        let values = out.get(&7).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values.get(&1).unwrap(), b"a");
+    }
+}

@@ -420,7 +420,7 @@ fn incremental_change_op_from_thrift(
     let slot = SlotId::try_from(slot_id).map_err(|e| {
         format!("incremental hdfs scan range has invalid __change_op slot_id={slot_id}: {e}")
     })?;
-    crate::lower::node::hdfs_scan::extract_change_op_from_extended_columns(
+    crate::lower::compact::node::hdfs_scan::extract_change_op_from_extended_columns(
         -1,
         hdfs_range,
         Some(slot),
@@ -1528,7 +1528,7 @@ mod descriptor_snapshot_tests {
             Some(vec![descriptors::TSlotDescriptor {
                 id: Some(slot_id),
                 parent: Some(tuple_id),
-                slot_type: Some(crate::lower::type_lowering::scalar_type_desc(
+                slot_type: Some(crate::lower::compact::type_lowering::scalar_type_desc(
                     TPrimitiveType::INT,
                 )),
                 column_pos: None,

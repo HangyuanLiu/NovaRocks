@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use arrow::datatypes::DataType;
 
-use crate::lower::type_lowering::arrow_type_from_desc;
+use crate::lower::compact::type_lowering::arrow_type_from_desc;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn as AnalysisOutputColumn, TypedExpr,
 };
@@ -5337,7 +5337,7 @@ mod tests {
 
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::IcebergMetadataTableType;
-    use crate::lower::type_lowering::arrow_type_from_desc;
+    use crate::lower::compact::type_lowering::arrow_type_from_desc;
     use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergMvTargetStatePartitionConstraint,
