@@ -17,7 +17,7 @@
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkFieldSchema, ChunkSlotSchema};
-use crate::lower::type_lowering::arrow_field_from_desc;
+use crate::lower::compact::type_lowering::arrow_field_from_desc;
 use crate::thrift::types;
 
 pub(crate) fn chunk_field_schema_from_type_desc(

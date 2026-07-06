@@ -25,8 +25,8 @@ use crate::common::thrift::{thrift_binary_deserialize, thrift_named_json};
 
 use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
-use crate::lower::fragment::execute_fragment;
-use crate::lower::thrift::cache_iceberg_table_locations;
+use crate::lower::compact::fragment::execute_fragment;
+use crate::lower::compact::node::hdfs_scan::cache_iceberg_table_locations;
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
@@ -65,15 +65,15 @@ fn choose_nonempty_str<'a>(primary: Option<&'a str>, fallback: Option<&'a str>) 
 fn plan_origin_from_request(
     one: &internal_service::TExecPlanFragmentParams,
     common: Option<&internal_service::TExecPlanFragmentParams>,
-) -> crate::lower::thrift::PlanOrigin {
+) -> crate::lower::compact::node::PlanOrigin {
     let generated = one
         .novarocks_generated_plan
         .or_else(|| common.and_then(|c| c.novarocks_generated_plan))
         .unwrap_or(false);
     if generated {
-        crate::lower::thrift::PlanOrigin::NovaRocksGenerated
+        crate::lower::compact::node::PlanOrigin::NovaRocksGenerated
     } else {
-        crate::lower::thrift::PlanOrigin::StarRocksFeCompatible
+        crate::lower::compact::node::PlanOrigin::StarRocksFeCompatible
     }
 }
 
@@ -365,7 +365,7 @@ fn spawn_exec_fragment(
     fe_addr: Option<types::TNetworkAddress>,
     mem_tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
     typed_result_sink: bool,
-    plan_origin: crate::lower::thrift::PlanOrigin,
+    plan_origin: crate::lower::compact::node::PlanOrigin,
     mgr: Arc<QueryContextManager>,
 ) {
     let uses_fetch_result_buffer = matches!(
@@ -1240,7 +1240,7 @@ mod tests {
 
         assert_eq!(
             plan_origin_from_request(&params, None),
-            crate::lower::thrift::PlanOrigin::StarRocksFeCompatible
+            crate::lower::compact::node::PlanOrigin::StarRocksFeCompatible
         );
     }
 
@@ -1250,7 +1250,7 @@ mod tests {
         unique.novarocks_generated_plan = Some(true);
         assert_eq!(
             plan_origin_from_request(&unique, None),
-            crate::lower::thrift::PlanOrigin::NovaRocksGenerated
+            crate::lower::compact::node::PlanOrigin::NovaRocksGenerated
         );
 
         unique.novarocks_generated_plan = None;
@@ -1258,7 +1258,7 @@ mod tests {
         common.novarocks_generated_plan = Some(true);
         assert_eq!(
             plan_origin_from_request(&unique, Some(&common)),
-            crate::lower::thrift::PlanOrigin::NovaRocksGenerated
+            crate::lower::compact::node::PlanOrigin::NovaRocksGenerated
         );
     }
 
@@ -1271,7 +1271,7 @@ mod tests {
 
         assert_eq!(
             plan_origin_from_request(&unique, Some(&common)),
-            crate::lower::thrift::PlanOrigin::StarRocksFeCompatible
+            crate::lower::compact::node::PlanOrigin::StarRocksFeCompatible
         );
     }
 
