@@ -20,9 +20,10 @@
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
-use super::decode_type;
 use super::layout::Layout;
+use super::{decode_field_type, decode_type};
 use crate::common::ids::SlotId;
+use crate::exec::chunk::ChunkFieldSchema;
 use crate::exec::expr::function::{FunctionKind, function_metadata, lookup_function};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::proto::{common, expr};
@@ -39,7 +40,7 @@ pub(crate) fn lower_proto_expr(
         .as_ref()
         .ok_or_else(|| "Expr.kind missing".to_string())?;
 
-    match kind {
+    let id = match kind {
         expr::expr::Kind::ColumnRef(column) => {
             let slot_id = input_layout.resolve_column_id(column.column_id)?;
             Ok(arena.push_typed(ExprNode::SlotId(slot_id), data_type))
@@ -89,7 +90,9 @@ pub(crate) fn lower_proto_expr(
                 .to_string(),
         ),
         expr::expr::Kind::Nested(nested) => lower_nested(nested, arena, input_layout, data_type),
-    }
+    }?;
+    set_proto_field_schema(e, arena, id);
+    Ok(id)
 }
 
 fn decode_expr_type(e: &expr::Expr) -> Result<DataType, String> {
@@ -98,6 +101,18 @@ fn decode_expr_type(e: &expr::Expr) -> Result<DataType, String> {
         .as_ref()
         .ok_or_else(|| "Expr.type missing".to_string())?;
     decode_type(desc).map_err(|err| format!("Expr.type decode failed: {err}"))
+}
+
+fn set_proto_field_schema(e: &expr::Expr, arena: &mut ExprArena, id: ExprId) {
+    let Some(desc) = e.r#type.as_ref() else {
+        return;
+    };
+    let Ok(field) = decode_field_type("_expr", e.nullable, desc) else {
+        return;
+    };
+    if let Ok(field_schema) = ChunkFieldSchema::from_field(&field) {
+        arena.set_field_schema(id, field_schema);
+    }
 }
 
 fn lower_required_child(
@@ -700,7 +715,7 @@ fn push_zero_literal(arena: &mut ExprArena, data_type: &DataType) -> Result<Expr
 #[cfg(test)]
 mod tests {
     use arrow::array::{Array, BooleanArray, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
     use arrow_buffer::i256;
     use std::sync::Arc;
 
@@ -710,6 +725,7 @@ mod tests {
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue, function::FunctionKind};
     use crate::proto::{common, expr};
     use crate::sql::codegen::proto_encode::types::encode_type;
+    use crate::types::logical::{LogicalType, field_with_logical_type};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")
@@ -764,6 +780,23 @@ mod tests {
                 qualifier: None,
                 column: None,
             }),
+        )
+    }
+
+    fn map_string_json_type() -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Utf8, true)),
+                    Arc::new(field_with_logical_type(
+                        Field::new("value", DataType::Utf8, true),
+                        LogicalType::Json,
+                    )),
+                ])),
+                false,
+            )),
+            false,
         )
     }
 
@@ -970,6 +1003,26 @@ mod tests {
 
         let (arena, id) = lower_with_slots(&int_to_time, &[1, 7]);
         assert!(matches!(arena.node(id), Some(ExprNode::CastTime(_))));
+    }
+
+    #[test]
+    fn cast_preserves_nested_json_field_schema() {
+        let map_type = map_string_json_type();
+        let cast = scalar_expr(
+            map_type.clone(),
+            expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                operand: Some(Box::new(col(1, DataType::Utf8))),
+                target: Some(type_desc(&map_type)),
+            })),
+        );
+
+        let (arena, id) = lower_with_slots(&cast, &[1]);
+        let field_schema = arena.field_schema(id).expect("cast field schema");
+        assert!(
+            field_schema
+                .map_value()
+                .is_some_and(|schema| schema.json_semantic())
+        );
     }
 
     #[test]
