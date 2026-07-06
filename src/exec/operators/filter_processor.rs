@@ -86,19 +86,19 @@ impl OperatorFactory for FilterProcessorFactory {
 }
 
 #[derive(Clone, Debug, Default)]
-struct FilterEncodingPolicy {
+pub(crate) struct FilterEncodingPolicy {
     predicate_slots: HashSet<SlotId>,
     unsupported_predicate_slots: HashSet<SlotId>,
 }
 
 impl FilterEncodingPolicy {
-    fn from_predicate(arena: &ExprArena, predicate: ExprId) -> Self {
+    pub(crate) fn from_predicate(arena: &ExprArena, predicate: ExprId) -> Self {
         let mut policy = Self::default();
         policy.analyze_predicate(arena, predicate);
         policy
     }
 
-    fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
+    pub(crate) fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
         if !is_low_cardinality_string_dictionary(data_type) {
             return false;
         }
