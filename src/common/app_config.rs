@@ -615,6 +615,7 @@ impl StandaloneServerConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlanWireFormat {
+    #[cfg(feature = "compat")]
     Thrift,
     Proto,
 }
@@ -2063,15 +2064,33 @@ plan_wire_format = "proto"
         assert_eq!(cfg.runtime.plan_wire_format, PlanWireFormat::Proto);
     }
 
+    #[cfg(not(feature = "compat"))]
     #[test]
-    fn test_runtime_plan_wire_format_can_be_thrift() {
+    fn test_runtime_plan_wire_format_rejects_thrift_in_pure_mode() {
+        let err = match toml::from_str::<NovaRocksConfig>(
+            r#"
+[runtime]
+plan_wire_format = "thrift"
+"#,
+        ) {
+            Ok(_) => panic!("pure mode must reject the thrift plan-wire escape hatch"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("plan_wire_format"), "{err}");
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn test_runtime_plan_wire_format_accepts_thrift_with_compat() {
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
 [runtime]
 plan_wire_format = "thrift"
 "#,
         )
-        .expect("parse config");
+        .expect("compat mode must parse the thrift plan-wire escape hatch");
+
         assert_eq!(cfg.runtime.plan_wire_format, PlanWireFormat::Thrift);
     }
 

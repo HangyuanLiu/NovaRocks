@@ -75,7 +75,6 @@ enum RecordFrom {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum PlanWireFormatArg {
-    Thrift,
     Proto,
 }
 
@@ -270,7 +269,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = ClusterMode::AllInOne)]
     cluster_mode: ClusterMode,
 
-    /// FE plan wire format for the cross-process cluster: proto (default) or thrift.
+    /// FE plan wire format for the cross-process cluster. Proto is the only pure-mode format.
     #[arg(long, value_enum, default_value_t = PlanWireFormatArg::Proto)]
     plan_wire_format: PlanWireFormatArg,
 
@@ -3166,14 +3165,14 @@ mod tests {
     }
 
     #[test]
-    fn help_includes_plan_wire_format_option() {
+    fn help_includes_only_proto_plan_wire_format_option() {
         let help = <crate::Cli as clap::CommandFactory>::command()
             .render_long_help()
             .to_string();
 
         assert!(help.contains("--plan-wire-format <PLAN_WIRE_FORMAT>"));
-        assert!(help.contains("thrift"));
         assert!(help.contains("proto"));
+        assert!(!help.contains("thrift"));
     }
 
     #[test]
@@ -3196,15 +3195,17 @@ mod tests {
     }
 
     #[test]
-    fn cli_plan_wire_format_accepts_thrift_escape_hatch() {
-        let cli = crate::Cli::parse_from([
+    fn cli_plan_wire_format_rejects_thrift_escape_hatch() {
+        let err = crate::Cli::try_parse_from([
             "sql-tests",
             "--suite",
             "ssb",
             "--plan-wire-format",
             "thrift",
-        ]);
-        assert_eq!(cli.plan_wire_format, PlanWireFormatArg::Thrift);
+        ])
+        .expect_err("runner must reject the thrift plan-wire escape hatch");
+
+        assert!(err.to_string().contains("thrift"), "{err}");
     }
 
     #[test]
@@ -3295,7 +3296,7 @@ enable_path_style_access = true
             ClusterProcessRole::Fe,
             0,
             &runtime,
-            PlanWireFormatArg::Thrift,
+            PlanWireFormatArg::Proto,
         )
         .expect("render fe config");
         let be = render_cross_process_config(
@@ -3303,7 +3304,7 @@ enable_path_style_access = true
             ClusterProcessRole::Be,
             0,
             &runtime,
-            PlanWireFormatArg::Thrift,
+            PlanWireFormatArg::Proto,
         )
         .expect("render be config");
 

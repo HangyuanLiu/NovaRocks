@@ -200,8 +200,12 @@ impl FragmentSubmission {
     }
 
     fn into_submit_fragment_request(self) -> Result<SubmitFragmentRequest, String> {
-        let payload = serialize_thrift_binary(&self.thrift_params)
-            .map_err(|e| format!("serialize fragment params for remote submit failed: {e}"))?;
+        let payload = if self.native_plan.is_none() && self.native_instance_params.is_none() {
+            serialize_thrift_binary(&self.thrift_params)
+                .map_err(|e| format!("serialize fragment params for remote submit failed: {e}"))?
+        } else {
+            Vec::new()
+        };
         Ok(SubmitFragmentRequest {
             exec_plan_fragment_params_thrift: payload,
             plan: self.native_plan,
@@ -577,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn fragment_submission_proto_sidecar_retains_legacy_thrift_bytes() {
+    fn fragment_submission_proto_sidecar_omits_legacy_thrift_bytes() {
         let request = FragmentSubmission::with_native(
             make_noop_sink_params(1, 2),
             crate::proto::plan::PlanFragment {
@@ -592,7 +596,7 @@ mod tests {
         .into_submit_fragment_request()
         .expect("serialize proto sidecar request");
 
-        assert!(!request.exec_plan_fragment_params_thrift.is_empty());
+        assert!(request.exec_plan_fragment_params_thrift.is_empty());
         assert_eq!(request.plan.as_ref().expect("native plan").fragment_id, 9);
         assert_eq!(
             request
