@@ -1185,13 +1185,10 @@ mod tests {
         );
         let mut scan_ranges = BTreeMap::new();
         scan_ranges.insert(11, vec![scan_range]);
-        let destination_addr =
-            crate::thrift::types::TNetworkAddress::new("10.0.0.9".to_string(), 8060);
-        let destination = crate::thrift::data_sinks::TPlanFragmentDestination::new(
+        let destination = crate::runtime::endpoint::FragmentDestination::new(
             crate::thrift::types::TUniqueId::new(3, 4),
-            None::<crate::thrift::types::TNetworkAddress>,
-            Some(destination_addr.clone()),
-            None::<i32>,
+            crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.9", 8060)
+                .expect("destination endpoint"),
         );
         let mut per_exch_num_senders = BTreeMap::new();
         per_exch_num_senders.insert(42, 2);
@@ -1200,7 +1197,8 @@ mod tests {
             instance_index: 5,
             finst_id: crate::thrift::types::TUniqueId::new(1, 2),
             backend_idx: 7,
-            brpc_server: crate::thrift::types::TNetworkAddress::new("10.0.0.7".to_string(), 8060),
+            endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.7", 8060)
+                .expect("placement endpoint"),
             scan_ranges,
             destinations: vec![destination],
             runtime_filter_prober_params: BTreeMap::new(),
@@ -1219,34 +1217,30 @@ mod tests {
             group_concat_max_len: Some(65_535),
             ..Default::default()
         };
-        let runtime_filter_params = crate::thrift::runtime_filter::TRuntimeFilterParams::new(
-            Some(BTreeMap::from([(
-                9,
-                vec![
-                    crate::thrift::runtime_filter::TRuntimeFilterProberParams::new(
-                        Some(crate::thrift::types::TUniqueId::new(30, 40)),
-                        Some(crate::thrift::types::TNetworkAddress::new(
-                            "10.0.0.30".to_string(),
-                            8060,
-                        )),
-                    ),
-                ],
-            )])),
-            Some(BTreeMap::from([(9, 3)])),
-            Some(1 << 18),
-            None::<std::collections::BTreeSet<i32>>,
-        );
+        let runtime_filter_prober_params = BTreeMap::from([(
+            9,
+            vec![
+                crate::runtime::endpoint::RuntimeFilterProberDestination::new(
+                    crate::thrift::types::TUniqueId::new(30, 40),
+                    crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.30", 8060)
+                        .expect("prober endpoint"),
+                ),
+            ],
+        )]);
+        let runtime_filter_builder_number = BTreeMap::from([(9, 3)]);
 
         let encoded = instance::encode_instance_params(
             &crate::thrift::types::TUniqueId::new(100, 200),
             &placement,
             Some(&query_options),
-            Some(&runtime_filter_params),
+            &runtime_filter_prober_params,
+            &runtime_filter_builder_number,
+            1 << 18,
             5,
-            Some(&crate::thrift::types::TNetworkAddress::new(
-                "127.0.0.1".to_string(),
-                9030,
-            )),
+            Some(
+                &crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 9030)
+                    .expect("report endpoint"),
+            ),
             true,
         )
         .expect("encode instance params");
@@ -1262,8 +1256,8 @@ mod tests {
         );
         assert_eq!(encoded.backend_num, 5);
         assert_eq!(encoded.per_exch_num_senders.get(&42), Some(&2));
-        assert_eq!(encoded.destinations[0].brpc_addr, "10.0.0.9:8060");
-        assert_eq!(encoded.report_addr.as_deref(), Some("127.0.0.1:9030"));
+        assert_eq!(encoded.destinations[0].grpc_endpoint, "10.0.0.9:8060");
+        assert_eq!(encoded.report_endpoint.as_deref(), Some("127.0.0.1:9030"));
         assert!(encoded.typed_result_sink);
         let encoded_range = &encoded.per_node_scan_ranges[&11].ranges[0];
         assert_eq!(encoded_range.volume_id, Some(13));
@@ -1283,7 +1277,7 @@ mod tests {
             .expect("runtime filter params");
         assert_eq!(rf.runtime_filter_builder_number.get(&9), Some(&3));
         assert_eq!(
-            rf.id_to_prober_params[&9].params[0].fragment_instance_address,
+            rf.id_to_prober_params[&9].params[0].grpc_endpoint,
             "10.0.0.30:8060"
         );
         let opts = encoded.query_options.as_ref().expect("query options");

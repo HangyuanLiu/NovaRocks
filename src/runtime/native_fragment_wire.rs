@@ -284,7 +284,7 @@ pub(crate) fn stream_destinations_from_native(
         .collect()
 }
 
-fn plan_fragment_destination_from_runtime(
+pub(crate) fn plan_fragment_destination_from_runtime(
     destination: FragmentDestination,
 ) -> PlanFragmentDestination {
     data_sinks::TPlanFragmentDestination::new(
