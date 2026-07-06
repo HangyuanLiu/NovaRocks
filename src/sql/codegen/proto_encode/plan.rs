@@ -8,11 +8,13 @@ use super::types::encode_type;
 use crate::proto::{common, plan};
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog;
+use crate::sql::codegen::expr_compiler::infer_agg_function_types;
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::parser::ast::SqlType;
 use crate::sql::planner::plan::{
-    ExchangeFlavor, PhysicalPlanKind, PlanRowCountAssertion, PlanSetOpKind, RedistributeMode,
+    AggregateCall, ExchangeFlavor, PhysicalHashAggregateNode, PhysicalPlanKind,
+    PlanRowCountAssertion, PlanSetOpKind, RedistributeMode,
 };
 use crate::sql::planner::runtime_filter::{
     JoinExecutionMode, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
@@ -139,10 +141,18 @@ fn stream_edge_output_columns(
     encoded_source: &plan::PlanFragment,
     edge: &FragmentEdge,
 ) -> Result<Vec<common::OutputColumn>, String> {
-    let columns = if source.output_columns.is_empty() {
-        encoded_fragment_root_output_columns(encoded_source)?
-    } else {
-        encode_output_columns(&source.output_columns)?
+    let columns = match encoded_fragment_root_output_columns(encoded_source) {
+        Ok(columns) if !columns.is_empty() => columns,
+        Ok(_) if !source.output_columns.is_empty() => encode_output_columns(&source.output_columns)?,
+        Ok(_) => Vec::new(),
+        Err(root_err) if !source.output_columns.is_empty() => {
+            encode_output_columns(&source.output_columns).map_err(|source_err| {
+                format!(
+                    "native stream source root output unavailable ({root_err}); fragment output encoding failed: {source_err}"
+                )
+            })?
+        }
+        Err(root_err) => return Err(root_err),
     };
     project_output_columns_for_edge(columns, &edge.output_slot_ids)
 }
@@ -679,37 +689,36 @@ fn encode_physical_node(
                 is_split: node.is_split,
             }),
         ),
-        PhysicalPlanKind::HashAggregate(node) => (
-            encode_output_columns(&node.output_columns)?,
-            Kind::HashAggregate(plan::HashAggregateNode {
-                mode: encode_agg_mode(node.mode),
-                group_by: encode_exprs(&node.group_by)?,
-                aggregates: node
-                    .aggregates
-                    .iter()
-                    .map(|call| {
-                        Ok(plan::PlanAggregateCall {
-                            name: call.name.clone(),
-                            args: encode_exprs(&call.args)?,
-                            distinct: call.distinct,
-                            result_type: Some(encode_type(&call.result_type)?),
-                            order_by: encode_sort_items(&call.order_by)?,
-                            output_column_id: call.output_column_id.0,
+        PhysicalPlanKind::HashAggregate(node) => {
+            let wire = hash_aggregate_wire_output_columns(node)?;
+            (
+                encode_output_columns(&wire.output_columns)?,
+                Kind::HashAggregate(plan::HashAggregateNode {
+                    mode: encode_agg_mode(node.mode),
+                    group_by: encode_exprs(&node.group_by)?,
+                    aggregates: node
+                        .aggregates
+                        .iter()
+                        .map(|call| {
+                            Ok(plan::PlanAggregateCall {
+                                name: call.name.clone(),
+                                args: encode_exprs(&call.args)?,
+                                distinct: call.distinct,
+                                result_type: Some(encode_type(&call.result_type)?),
+                                order_by: encode_sort_items(&call.order_by)?,
+                                output_column_id: call.output_column_id.0,
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-                is_merge: node.is_merge.clone(),
-                output_layout: Some(plan::AggregateOutputLayout {
-                    group_key_columns: encode_output_columns(
-                        &node.output_layout.group_key_columns,
-                    )?,
-                    aggregate_columns: encode_output_columns(
-                        &node.output_layout.aggregate_columns,
-                    )?,
+                        .collect::<Result<Vec<_>, String>>()?,
+                    is_merge: node.is_merge.clone(),
+                    output_layout: Some(plan::AggregateOutputLayout {
+                        group_key_columns: encode_output_columns(&wire.group_key_columns)?,
+                        aggregate_columns: encode_output_columns(&wire.aggregate_columns)?,
+                    }),
+                    output_columns: encode_output_columns(&wire.output_columns)?,
                 }),
-                output_columns: encode_output_columns(&node.output_columns)?,
-            }),
-        ),
+            )
+        }
         PhysicalPlanKind::HashJoin(node) => (
             Vec::new(),
             Kind::HashJoin(plan::HashJoinNode {
@@ -834,6 +843,98 @@ fn encode_physical_node(
         output_columns,
         kind: Some(kind),
     })
+}
+
+struct HashAggregateWireOutputColumns {
+    group_key_columns: Vec<AnalysisOutputColumn>,
+    aggregate_columns: Vec<AnalysisOutputColumn>,
+    output_columns: Vec<AnalysisOutputColumn>,
+}
+
+fn hash_aggregate_wire_output_columns(
+    node: &PhysicalHashAggregateNode,
+) -> Result<HashAggregateWireOutputColumns, String> {
+    if node.output_layout.aggregate_columns.len() != node.aggregates.len() {
+        return Err(format!(
+            "native HashAggregate output_layout aggregate column count {} does not match aggregate count {}",
+            node.output_layout.aggregate_columns.len(),
+            node.aggregates.len()
+        ));
+    }
+
+    let group_key_columns = node.output_layout.group_key_columns.clone();
+    let mut aggregate_columns = node.output_layout.aggregate_columns.clone();
+    if hash_aggregate_outputs_intermediate(node.mode) {
+        for (idx, (column, call)) in aggregate_columns
+            .iter_mut()
+            .zip(node.aggregates.iter())
+            .enumerate()
+        {
+            column.data_type = aggregate_intermediate_type(call).map_err(|err| {
+                format!("native HashAggregate aggregate {idx} intermediate type: {err}")
+            })?;
+        }
+    }
+
+    let mut full_output_columns =
+        Vec::with_capacity(group_key_columns.len() + aggregate_columns.len());
+    full_output_columns.extend(group_key_columns.iter().cloned());
+    full_output_columns.extend(aggregate_columns.iter().cloned());
+
+    let output_columns = if node.output_columns.is_empty() {
+        full_output_columns
+    } else {
+        let data_type_by_id = full_output_columns
+            .iter()
+            .map(|column| (column.column_id, column.data_type.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut output_columns = node.output_columns.clone();
+        for column in &mut output_columns {
+            let data_type = data_type_by_id.get(&column.column_id).ok_or_else(|| {
+                format!(
+                    "native HashAggregate output column {} missing from output_layout",
+                    column.column_id.0
+                )
+            })?;
+            column.data_type = data_type.clone();
+        }
+        output_columns
+    };
+
+    Ok(HashAggregateWireOutputColumns {
+        group_key_columns,
+        aggregate_columns,
+        output_columns,
+    })
+}
+
+fn hash_aggregate_outputs_intermediate(mode: AggMode) -> bool {
+    !matches!(mode, AggMode::Single | AggMode::Global)
+}
+
+fn aggregate_intermediate_type(call: &AggregateCall) -> Result<DataType, String> {
+    let function_name = aggregate_function_name(call);
+    let arg_types = call
+        .args
+        .iter()
+        .map(|arg| arg.data_type.clone())
+        .collect::<Vec<_>>();
+    infer_agg_function_types(&function_name, &arg_types, call.distinct)?
+        .1
+        .ok_or_else(|| format!("{} does not expose an intermediate type", function_name))
+}
+
+fn aggregate_function_name(call: &AggregateCall) -> String {
+    let name = call.name.to_ascii_lowercase();
+    if !call.distinct {
+        return name;
+    }
+    match name.as_str() {
+        "count" => "multi_distinct_count".to_string(),
+        "sum" => "multi_distinct_sum".to_string(),
+        "array_agg" => "array_agg_distinct".to_string(),
+        _ => name,
+    }
 }
 
 fn encode_row_count_assertion(assertion: PlanRowCountAssertion) -> i32 {
