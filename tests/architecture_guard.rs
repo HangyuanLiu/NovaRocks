@@ -2259,8 +2259,452 @@ fn parse_current_novarocks_proto_schema() -> Result<ProtoSchema, String> {
 }
 
 fn compare_proto_schema_to_baseline(current: &ProtoSchema, baseline: &ProtoSchema) -> Vec<String> {
-    let _ = (current, baseline);
-    vec!["not implemented".to_string()]
+    let mut violations = Vec::new();
+
+    if current.version != 1 {
+        violations.push(format!(
+            "current proto schema version must be 1, got {}",
+            current.version
+        ));
+    }
+    if baseline.version != 1 {
+        violations.push(format!(
+            "baseline proto schema version must be 1, got {}",
+            baseline.version
+        ));
+    }
+
+    for path in baseline.files.keys() {
+        if !current.files.contains_key(path) {
+            violations.push(format!("{path} file removed from current proto schema"));
+        }
+    }
+
+    for path in current.files.keys() {
+        if !baseline.files.contains_key(path) {
+            violations.push(format!(
+                "{path} baseline stale: new file is missing from baseline; run the proto schema baseline write command"
+            ));
+        }
+    }
+
+    for (path, baseline_file) in &baseline.files {
+        let Some(current_file) = current.files.get(path) else {
+            continue;
+        };
+
+        if current_file.package != baseline_file.package {
+            violations.push(format!(
+                "{path} package changed from {} to {}",
+                baseline_file.package, current_file.package
+            ));
+        }
+
+        compare_proto_messages_to_baseline(path, current_file, baseline_file, &mut violations);
+        compare_proto_enums_to_baseline(path, current_file, baseline_file, &mut violations);
+        compare_proto_services_to_baseline(path, current_file, baseline_file, &mut violations);
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn compare_proto_messages_to_baseline(
+    path: &str,
+    current_file: &ProtoFileSchema,
+    baseline_file: &ProtoFileSchema,
+    violations: &mut Vec<String>,
+) {
+    for message_name in baseline_file.messages.keys() {
+        if !current_file.messages.contains_key(message_name) {
+            violations.push(format!("{path} message {message_name} removed"));
+        }
+    }
+
+    for message_name in current_file.messages.keys() {
+        if !baseline_file.messages.contains_key(message_name) {
+            violations.push(format!(
+                "{path} message {message_name} baseline stale: new message is missing from baseline; run the proto schema baseline write command"
+            ));
+        }
+    }
+
+    for (message_name, baseline_message) in &baseline_file.messages {
+        let Some(current_message) = current_file.messages.get(message_name) else {
+            continue;
+        };
+        compare_proto_message_to_baseline(
+            path,
+            message_name,
+            current_message,
+            baseline_message,
+            violations,
+        );
+    }
+}
+
+fn compare_proto_message_to_baseline(
+    path: &str,
+    message_name: &str,
+    current_message: &ProtoMessageSchema,
+    baseline_message: &ProtoMessageSchema,
+    violations: &mut Vec<String>,
+) {
+    for number in &baseline_message.reserved_numbers {
+        if !current_message.reserved_numbers.contains(number) {
+            violations.push(format!(
+                "{path} {message_name} reserved number {number} removed from current schema"
+            ));
+        }
+    }
+    for name in &baseline_message.reserved_names {
+        if !current_message.reserved_names.contains(name) {
+            violations.push(format!(
+                "{path} {message_name} reserved name {name} removed from current schema"
+            ));
+        }
+    }
+
+    for current_field in current_message.fields.values() {
+        if baseline_message
+            .reserved_numbers
+            .contains(&current_field.number)
+        {
+            violations.push(format!(
+                "{path} {message_name} field #{} {} uses baseline reserved number {}",
+                current_field.number, current_field.name, current_field.number
+            ));
+        }
+        if baseline_message
+            .reserved_names
+            .contains(&current_field.name)
+        {
+            violations.push(format!(
+                "{path} {message_name} field #{} {} uses baseline reserved name {}",
+                current_field.number, current_field.name, current_field.name
+            ));
+        }
+    }
+
+    let baseline_fields_by_name: BTreeMap<&str, u32> = baseline_message
+        .fields
+        .values()
+        .map(|field| (field.name.as_str(), field.number))
+        .collect();
+
+    for (number, baseline_field) in &baseline_message.fields {
+        let Some(current_field) = current_message.fields.get(number) else {
+            if !current_message.reserved_numbers.contains(number) {
+                violations.push(format!(
+                    "{path} {message_name} removed field #{number} {} without reserved number {number}",
+                    baseline_field.name
+                ));
+            }
+            if !current_message
+                .reserved_names
+                .contains(&baseline_field.name)
+            {
+                violations.push(format!(
+                    "{path} {message_name} removed field #{number} {} without reserved name {}",
+                    baseline_field.name, baseline_field.name
+                ));
+            }
+            continue;
+        };
+
+        let baseline_signature = proto_field_signature(baseline_field);
+        let current_signature = proto_field_signature(current_field);
+        if baseline_field.name != current_field.name
+            && baseline_field.type_name != current_field.type_name
+        {
+            violations.push(format!(
+                "{path} {message_name} field #{number} field number reuse: changed from {baseline_signature} to {current_signature}"
+            ));
+        } else if baseline_field.name != current_field.name {
+            violations.push(format!(
+                "{path} {message_name} field #{number} field rename: changed from {baseline_signature} to {current_signature}"
+            ));
+        } else if baseline_field.type_name != current_field.type_name {
+            violations.push(format!(
+                "{path} {message_name} field #{number} field type change: changed from {baseline_signature} to {current_signature}"
+            ));
+        }
+
+        if baseline_field.label != current_field.label {
+            violations.push(format!(
+                "{path} {message_name} field #{number} field label change: changed from {baseline_signature} to {current_signature}"
+            ));
+        }
+        if baseline_field.oneof != current_field.oneof {
+            violations.push(format!(
+                "{path} {message_name} field #{number} field oneof change: changed from {baseline_signature} to {current_signature}"
+            ));
+        }
+    }
+
+    for current_field in current_message.fields.values() {
+        if baseline_message.fields.contains_key(&current_field.number) {
+            continue;
+        }
+        if baseline_message
+            .reserved_numbers
+            .contains(&current_field.number)
+            || baseline_message
+                .reserved_names
+                .contains(&current_field.name)
+        {
+            continue;
+        }
+        if let Some(baseline_number) = baseline_fields_by_name.get(current_field.name.as_str()) {
+            violations.push(format!(
+                "{path} {message_name} field {} field renumbered from #{baseline_number} to #{}",
+                current_field.name, current_field.number
+            ));
+        } else {
+            violations.push(format!(
+                "{path} {message_name} field #{} {} baseline stale: new field is missing from baseline; run the proto schema baseline write command",
+                current_field.number, current_field.name
+            ));
+        }
+    }
+}
+
+fn compare_proto_enums_to_baseline(
+    path: &str,
+    current_file: &ProtoFileSchema,
+    baseline_file: &ProtoFileSchema,
+    violations: &mut Vec<String>,
+) {
+    for enum_name in baseline_file.enums.keys() {
+        if !current_file.enums.contains_key(enum_name) {
+            violations.push(format!("{path} enum {enum_name} removed"));
+        }
+    }
+
+    for (enum_name, current_enum) in &current_file.enums {
+        validate_proto_enum_zero_value(path, enum_name, current_enum, violations);
+        if !baseline_file.enums.contains_key(enum_name) {
+            violations.push(format!(
+                "{path} enum {enum_name} baseline stale: new enum is missing from baseline; run the proto schema baseline write command"
+            ));
+        }
+    }
+
+    for (enum_name, baseline_enum) in &baseline_file.enums {
+        let Some(current_enum) = current_file.enums.get(enum_name) else {
+            continue;
+        };
+        compare_proto_enum_to_baseline(path, enum_name, current_enum, baseline_enum, violations);
+    }
+}
+
+fn compare_proto_enum_to_baseline(
+    path: &str,
+    enum_name: &str,
+    current_enum: &ProtoEnumSchema,
+    baseline_enum: &ProtoEnumSchema,
+    violations: &mut Vec<String>,
+) {
+    for number in &baseline_enum.reserved_numbers {
+        if !current_enum.reserved_numbers.contains(number) {
+            violations.push(format!(
+                "{path} enum {enum_name} reserved number {number} removed from current schema"
+            ));
+        }
+    }
+    for name in &baseline_enum.reserved_names {
+        if !current_enum.reserved_names.contains(name) {
+            violations.push(format!(
+                "{path} enum {enum_name} reserved name {name} removed from current schema"
+            ));
+        }
+    }
+
+    let baseline_values_by_number: BTreeMap<i32, &ProtoEnumValueSchema> = baseline_enum
+        .values
+        .iter()
+        .map(|value| (value.number, value))
+        .collect();
+    let baseline_values_by_name: BTreeMap<&str, i32> = baseline_enum
+        .values
+        .iter()
+        .map(|value| (value.name.as_str(), value.number))
+        .collect();
+    let current_values_by_number: BTreeMap<i32, &ProtoEnumValueSchema> = current_enum
+        .values
+        .iter()
+        .map(|value| (value.number, value))
+        .collect();
+    let current_values_by_name: BTreeMap<&str, i32> = current_enum
+        .values
+        .iter()
+        .map(|value| (value.name.as_str(), value.number))
+        .collect();
+
+    for current_value in &current_enum.values {
+        if u32::try_from(current_value.number)
+            .ok()
+            .is_some_and(|number| baseline_enum.reserved_numbers.contains(&number))
+        {
+            violations.push(format!(
+                "{path} enum {enum_name} value {}={} uses baseline reserved number {}",
+                current_value.name, current_value.number, current_value.number
+            ));
+        }
+        if baseline_enum.reserved_names.contains(&current_value.name) {
+            violations.push(format!(
+                "{path} enum {enum_name} value {}={} uses baseline reserved name {}",
+                current_value.name, current_value.number, current_value.name
+            ));
+        }
+    }
+
+    for baseline_value in &baseline_enum.values {
+        if let Some(current_value) = current_values_by_number.get(&baseline_value.number) {
+            if current_value.name != baseline_value.name {
+                violations.push(format!(
+                    "{path} enum {enum_name} value #{} renamed from {} to {}",
+                    baseline_value.number, baseline_value.name, current_value.name
+                ));
+            }
+        } else if let Some(current_number) =
+            current_values_by_name.get(baseline_value.name.as_str())
+        {
+            violations.push(format!(
+                "{path} enum {enum_name} value {} renumbered from #{} to #{}",
+                baseline_value.name, baseline_value.number, current_number
+            ));
+        } else {
+            violations.push(format!(
+                "{path} enum {enum_name} value {}={} removed",
+                baseline_value.name, baseline_value.number
+            ));
+        }
+    }
+
+    for current_value in &current_enum.values {
+        if baseline_values_by_number.contains_key(&current_value.number)
+            || baseline_values_by_name.contains_key(current_value.name.as_str())
+            || u32::try_from(current_value.number)
+                .ok()
+                .is_some_and(|number| baseline_enum.reserved_numbers.contains(&number))
+            || baseline_enum.reserved_names.contains(&current_value.name)
+        {
+            continue;
+        }
+        violations.push(format!(
+            "{path} enum {enum_name} value {}={} baseline stale: new enum value is missing from baseline; run the proto schema baseline write command",
+            current_value.name, current_value.number
+        ));
+    }
+}
+
+fn validate_proto_enum_zero_value(
+    path: &str,
+    enum_name: &str,
+    current_enum: &ProtoEnumSchema,
+    violations: &mut Vec<String>,
+) {
+    if !current_enum
+        .values
+        .first()
+        .is_some_and(|value| value.number == 0 && value.name.ends_with("_UNSPECIFIED"))
+    {
+        violations.push(format!(
+            "{path} enum {enum_name} enum zero value: first value must be *_UNSPECIFIED = 0"
+        ));
+    }
+}
+
+fn compare_proto_services_to_baseline(
+    path: &str,
+    current_file: &ProtoFileSchema,
+    baseline_file: &ProtoFileSchema,
+    violations: &mut Vec<String>,
+) {
+    for service_name in baseline_file.services.keys() {
+        if !current_file.services.contains_key(service_name) {
+            violations.push(format!("{path} service {service_name} removed"));
+        }
+    }
+
+    for service_name in current_file.services.keys() {
+        if !baseline_file.services.contains_key(service_name) {
+            violations.push(format!(
+                "{path} service {service_name} new service is not allowed; D3B only allows extending existing NovaRocksGrpc"
+            ));
+        }
+    }
+
+    for (service_name, baseline_service) in &baseline_file.services {
+        let Some(current_service) = current_file.services.get(service_name) else {
+            continue;
+        };
+        compare_proto_service_to_baseline(
+            path,
+            service_name,
+            current_service,
+            baseline_service,
+            violations,
+        );
+    }
+}
+
+fn compare_proto_service_to_baseline(
+    path: &str,
+    service_name: &str,
+    current_service: &ProtoServiceSchema,
+    baseline_service: &ProtoServiceSchema,
+    violations: &mut Vec<String>,
+) {
+    for rpc_name in baseline_service.rpcs.keys() {
+        if !current_service.rpcs.contains_key(rpc_name) {
+            violations.push(format!(
+                "{path} service {service_name} rpc {rpc_name} removed"
+            ));
+        }
+    }
+
+    for (rpc_name, current_rpc) in &current_service.rpcs {
+        let Some(baseline_rpc) = baseline_service.rpcs.get(rpc_name) else {
+            violations.push(format!(
+                "{path} service {service_name} rpc {rpc_name} baseline stale: new rpc is missing from baseline; run the proto schema baseline write command"
+            ));
+            continue;
+        };
+
+        if current_rpc != baseline_rpc {
+            violations.push(format!(
+                "{path} service {service_name} rpc {rpc_name} signature changed: rpc signature changed from {} to {}",
+                proto_rpc_signature(baseline_rpc),
+                proto_rpc_signature(current_rpc)
+            ));
+        }
+    }
+}
+
+fn proto_field_signature(field: &ProtoFieldSchema) -> String {
+    let mut signature = format!("{}:{}/{}", field.name, field.type_name, field.label);
+    if let Some(oneof) = &field.oneof {
+        signature.push_str("/oneof=");
+        signature.push_str(oneof);
+    }
+    signature
+}
+
+fn proto_rpc_signature(rpc: &ProtoRpcSchema) -> String {
+    let request = if rpc.client_streaming {
+        format!("stream {}", rpc.request)
+    } else {
+        rpc.request.clone()
+    };
+    let response = if rpc.server_streaming {
+        format!("stream {}", rpc.response)
+    } else {
+        rpc.response.clone()
+    };
+    format!("{request} -> {response}")
 }
 
 fn test_proto_field(number: u32, name: &str, type_name: &str) -> ProtoFieldSchema {
@@ -2271,6 +2715,28 @@ fn test_proto_field(number: u32, name: &str, type_name: &str) -> ProtoFieldSchem
         label: "singular".to_string(),
         oneof: None,
     }
+}
+
+fn test_proto_field_with_label(
+    number: u32,
+    name: &str,
+    type_name: &str,
+    label: &str,
+) -> ProtoFieldSchema {
+    let mut field = test_proto_field(number, name, type_name);
+    field.label = label.to_string();
+    field
+}
+
+fn test_proto_field_with_oneof(
+    number: u32,
+    name: &str,
+    type_name: &str,
+    oneof: &str,
+) -> ProtoFieldSchema {
+    let mut field = test_proto_field(number, name, type_name);
+    field.oneof = Some(oneof.to_string());
+    field
 }
 
 fn test_proto_message_with_reserved(
@@ -2296,6 +2762,14 @@ fn test_proto_message(fields: Vec<ProtoFieldSchema>) -> ProtoMessageSchema {
 }
 
 fn test_proto_enum(values: Vec<(i32, &str)>) -> ProtoEnumSchema {
+    test_proto_enum_with_reserved(values, &[], &[])
+}
+
+fn test_proto_enum_with_reserved(
+    values: Vec<(i32, &str)>,
+    reserved_numbers: &[u32],
+    reserved_names: &[&str],
+) -> ProtoEnumSchema {
     ProtoEnumSchema {
         values: values
             .into_iter()
@@ -2304,8 +2778,11 @@ fn test_proto_enum(values: Vec<(i32, &str)>) -> ProtoEnumSchema {
                 name: name.to_string(),
             })
             .collect(),
-        reserved_numbers: BTreeSet::new(),
-        reserved_names: BTreeSet::new(),
+        reserved_numbers: reserved_numbers.iter().copied().collect(),
+        reserved_names: reserved_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
     }
 }
 
@@ -2332,26 +2809,42 @@ fn test_proto_schema(
     enums: Vec<(&str, ProtoEnumSchema)>,
     services: Vec<(&str, ProtoServiceSchema)>,
 ) -> ProtoSchema {
+    test_proto_schema_with_files(vec![(
+        "idl/novarocks/test.proto",
+        test_proto_file("novarocks.test", messages, enums, services),
+    )])
+}
+
+fn test_proto_file(
+    package: &str,
+    messages: Vec<(&str, ProtoMessageSchema)>,
+    enums: Vec<(&str, ProtoEnumSchema)>,
+    services: Vec<(&str, ProtoServiceSchema)>,
+) -> ProtoFileSchema {
+    ProtoFileSchema {
+        package: package.to_string(),
+        messages: messages
+            .into_iter()
+            .map(|(name, message)| (name.to_string(), message))
+            .collect(),
+        enums: enums
+            .into_iter()
+            .map(|(name, enum_schema)| (name.to_string(), enum_schema))
+            .collect(),
+        services: services
+            .into_iter()
+            .map(|(name, service)| (name.to_string(), service))
+            .collect(),
+    }
+}
+
+fn test_proto_schema_with_files(files: Vec<(&str, ProtoFileSchema)>) -> ProtoSchema {
     ProtoSchema {
         version: 1,
-        files: BTreeMap::from([(
-            "idl/novarocks/test.proto".to_string(),
-            ProtoFileSchema {
-                package: "novarocks.test".to_string(),
-                messages: messages
-                    .into_iter()
-                    .map(|(name, message)| (name.to_string(), message))
-                    .collect(),
-                enums: enums
-                    .into_iter()
-                    .map(|(name, enum_schema)| (name.to_string(), enum_schema))
-                    .collect(),
-                services: services
-                    .into_iter()
-                    .map(|(name, service)| (name.to_string(), service))
-                    .collect(),
-            },
-        )]),
+        files: files
+            .into_iter()
+            .map(|(path, file)| (path.to_string(), file))
+            .collect(),
     }
 }
 
@@ -2375,6 +2868,22 @@ fn assert_proto_schema_comparator_accepts(current: ProtoSchema, baseline: ProtoS
         violations.is_empty(),
         "expected proto schema comparator to accept compatible schema, got: {violations:?}"
     );
+}
+
+fn assert_proto_schema_comparator_rejects_all(
+    current: ProtoSchema,
+    baseline: ProtoSchema,
+    expected_violations: &[&str],
+) {
+    let violations = compare_proto_schema_to_baseline(&current, &baseline);
+    for expected_violation in expected_violations {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected_violation)),
+            "expected proto schema comparator violation containing `{expected_violation}`, got: {violations:?}"
+        );
+    }
 }
 
 #[test]
@@ -2594,6 +3103,224 @@ fn nidl_d3b_proto_schema_parser_rejects_unsupported_tails_and_bad_identifiers() 
 }
 
 #[test]
+fn nidl_d3b_proto_schema_comparator_rejects_version_drift() {
+    let mut baseline = test_proto_schema(vec![], vec![], vec![]);
+    let mut current = baseline.clone();
+    baseline.version = 0;
+    current.version = 2;
+
+    assert_proto_schema_comparator_rejects_all(
+        current,
+        baseline,
+        &[
+            "current proto schema version must be 1",
+            "baseline proto schema version must be 1",
+        ],
+    );
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_package_drift() {
+    let baseline = test_proto_schema_with_files(vec![(
+        "idl/novarocks/service.proto",
+        test_proto_file("novarocks.baseline", vec![], vec![], vec![]),
+    )]);
+    let current = test_proto_schema_with_files(vec![(
+        "idl/novarocks/service.proto",
+        test_proto_file("novarocks.current", vec![], vec![], vec![]),
+    )]);
+
+    assert_proto_schema_comparator_rejects(
+        current,
+        baseline,
+        "package changed from novarocks.baseline to novarocks.current",
+    );
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_baseline_file_missing_in_current() {
+    let baseline = test_proto_schema_with_files(vec![(
+        "idl/novarocks/service.proto",
+        test_proto_file("novarocks.test", vec![], vec![], vec![]),
+    )]);
+    let current = test_proto_schema_with_files(vec![]);
+
+    assert_proto_schema_comparator_rejects(current, baseline, "file removed");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_current_new_file_as_baseline_stale() {
+    let baseline = test_proto_schema_with_files(vec![]);
+    let current = test_proto_schema_with_files(vec![(
+        "idl/novarocks/new.proto",
+        test_proto_file("novarocks.test", vec![], vec![], vec![]),
+    )]);
+
+    assert_proto_schema_comparator_rejects(current, baseline, "new file is missing from baseline");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_baseline_message_missing_in_current() {
+    let baseline = test_proto_schema(
+        vec![("SubmitFragmentRequest", test_proto_message(vec![]))],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(vec![], vec![], vec![]);
+
+    assert_proto_schema_comparator_rejects(
+        current,
+        baseline,
+        "message SubmitFragmentRequest removed",
+    );
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_current_new_message_as_baseline_stale() {
+    let baseline = test_proto_schema(vec![], vec![], vec![]);
+    let current = test_proto_schema(
+        vec![("SubmitFragmentRequest", test_proto_message(vec![]))],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(
+        current,
+        baseline,
+        "new message is missing from baseline",
+    );
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_current_new_field_as_baseline_stale() {
+    let baseline = test_proto_schema(
+        vec![("SubmitFragmentRequest", test_proto_message(vec![]))],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(3, "fragment_plan", "bytes")]),
+        )],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "new field is missing from baseline");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_field_label_drift() {
+    let baseline = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "plan", "PlanNode")]),
+        )],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field_with_label(
+                2, "plan", "PlanNode", "repeated",
+            )]),
+        )],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "field label change");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_field_oneof_drift() {
+    let baseline = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field(2, "plan", "PlanNode")]),
+        )],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message(vec![test_proto_field_with_oneof(
+                2, "plan", "PlanNode", "payload",
+            )]),
+        )],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "field oneof change");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_missing_message_reserved_retention() {
+    let baseline = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message_with_reserved(vec![], &[7], &["old_plan"]),
+        )],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![("SubmitFragmentRequest", test_proto_message(vec![]))],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects_all(
+        current,
+        baseline,
+        &[
+            "reserved number 7 removed from current schema",
+            "reserved name old_plan removed from current schema",
+        ],
+    );
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_field_reusing_baseline_reserved_number_or_name() {
+    let baseline = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message_with_reserved(vec![], &[7], &["old_plan"]),
+        )],
+        vec![],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![(
+            "SubmitFragmentRequest",
+            test_proto_message_with_reserved(
+                vec![
+                    test_proto_field(7, "fragment_plan", "bytes"),
+                    test_proto_field(8, "old_plan", "bytes"),
+                ],
+                &[7],
+                &["old_plan"],
+            ),
+        )],
+        vec![],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects_all(
+        current,
+        baseline,
+        &[
+            "uses baseline reserved number 7",
+            "uses baseline reserved name old_plan",
+        ],
+    );
+}
+
+#[test]
 fn nidl_d3b_proto_schema_comparator_rejects_field_type_change() {
     let baseline = test_proto_schema(
         vec![(
@@ -2810,4 +3537,221 @@ fn nidl_d3b_proto_schema_comparator_rejects_new_service() {
     );
 
     assert_proto_schema_comparator_rejects(current, baseline, "new service");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_enum_deletion() {
+    let baseline = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![(0, "STATUS_UNSPECIFIED"), (1, "STATUS_OK")]),
+        )],
+        vec![],
+    );
+    let current = test_proto_schema(vec![], vec![], vec![]);
+
+    assert_proto_schema_comparator_rejects(
+        current,
+        baseline,
+        "enum FetchResultResponse.Status removed",
+    );
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_enum_renumber() {
+    let baseline = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![(0, "STATUS_UNSPECIFIED"), (1, "STATUS_OK")]),
+        )],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![(0, "STATUS_UNSPECIFIED"), (2, "STATUS_OK")]),
+        )],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "renumbered from #1 to #2");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_enum_rename() {
+    let baseline = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![(0, "STATUS_UNSPECIFIED"), (1, "STATUS_OK")]),
+        )],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![(0, "STATUS_UNSPECIFIED"), (1, "STATUS_DONE")]),
+        )],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(
+        current,
+        baseline,
+        "renamed from STATUS_OK to STATUS_DONE",
+    );
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_current_new_enum_value_as_baseline_stale() {
+    let baseline = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![(0, "STATUS_UNSPECIFIED")]),
+        )],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![(0, "STATUS_UNSPECIFIED"), (1, "STATUS_OK")]),
+        )],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects(
+        current,
+        baseline,
+        "new enum value is missing from baseline",
+    );
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_enum_reserved_retention_or_reuse() {
+    let baseline = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum_with_reserved(vec![(0, "STATUS_UNSPECIFIED")], &[2], &["STATUS_OLD"]),
+        )],
+        vec![],
+    );
+    let current = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![
+                (0, "STATUS_UNSPECIFIED"),
+                (2, "STATUS_REUSED_NUMBER"),
+                (3, "STATUS_OLD"),
+            ]),
+        )],
+        vec![],
+    );
+
+    assert_proto_schema_comparator_rejects_all(
+        current,
+        baseline,
+        &[
+            "reserved number 2 removed from current schema",
+            "reserved name STATUS_OLD removed from current schema",
+            "uses baseline reserved number 2",
+            "uses baseline reserved name STATUS_OLD",
+        ],
+    );
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_rpc_deletion() {
+    let baseline = test_proto_schema(
+        vec![],
+        vec![],
+        vec![(
+            "NovaRocksGrpc",
+            test_proto_service(vec![(
+                "FetchResult",
+                test_proto_rpc("FetchResultRequest", "FetchResultResponse"),
+            )]),
+        )],
+    );
+    let current = test_proto_schema(
+        vec![],
+        vec![],
+        vec![("NovaRocksGrpc", test_proto_service(vec![]))],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "rpc FetchResult removed");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_rejects_current_new_rpc_as_baseline_stale() {
+    let baseline = test_proto_schema(
+        vec![],
+        vec![],
+        vec![("NovaRocksGrpc", test_proto_service(vec![]))],
+    );
+    let current = test_proto_schema(
+        vec![],
+        vec![],
+        vec![(
+            "NovaRocksGrpc",
+            test_proto_service(vec![(
+                "FetchResult",
+                test_proto_rpc("FetchResultRequest", "FetchResultResponse"),
+            )]),
+        )],
+    );
+
+    assert_proto_schema_comparator_rejects(current, baseline, "new rpc is missing from baseline");
+}
+
+#[test]
+fn nidl_d3b_proto_schema_comparator_returns_stable_sorted_deduped_violations() {
+    let mut baseline = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![(0, "STATUS_UNSPECIFIED")]),
+        )],
+        vec![],
+    );
+    let mut current = test_proto_schema(
+        vec![],
+        vec![(
+            "FetchResultResponse.Status",
+            test_proto_enum(vec![
+                (0, "STATUS_UNSPECIFIED"),
+                (1, "STATUS_DUP"),
+                (1, "STATUS_DUP"),
+            ]),
+        )],
+        vec![],
+    );
+    baseline.version = 0;
+    current.version = 2;
+
+    let violations = compare_proto_schema_to_baseline(&current, &baseline);
+    let mut sorted_deduped = violations.clone();
+    sorted_deduped.sort();
+    sorted_deduped.dedup();
+
+    assert_eq!(violations, sorted_deduped);
+    assert_eq!(
+        violations
+            .iter()
+            .filter(|violation| violation.contains("STATUS_DUP=1 baseline stale"))
+            .count(),
+        1,
+        "expected duplicate enum-value violations to be deduped, got: {violations:?}"
+    );
+    assert!(
+        violations[0].starts_with("baseline proto schema version must be 1"),
+        "expected sorted output, got: {violations:?}"
+    );
 }
