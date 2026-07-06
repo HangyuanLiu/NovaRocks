@@ -1766,20 +1766,19 @@ fn lower_hash_aggregate_node(
         .output_layout
         .as_ref()
         .ok_or_else(|| "HashAggregateNode output_layout missing".to_string())?;
-    let synthesized_output_columns;
-    let output_columns = if !aggregate.output_columns.is_empty() {
+    let aggregate_output_columns = aggregate_output_columns_from_layout(
+        output_layout.group_key_columns.as_slice(),
+        output_layout.aggregate_columns.as_slice(),
+    );
+    let visible_output_columns = if !aggregate.output_columns.is_empty() {
         aggregate.output_columns.as_slice()
     } else if !physical.output_columns.is_empty() {
         physical.output_columns.as_slice()
     } else {
-        synthesized_output_columns = aggregate_output_columns_from_layout(
-            output_layout.group_key_columns.as_slice(),
-            output_layout.aggregate_columns.as_slice(),
-        );
-        synthesized_output_columns.as_slice()
+        aggregate_output_columns.as_slice()
     };
-    let layout = layout_from_output_columns(output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let aggregate_layout = layout_from_output_columns(&aggregate_output_columns)?;
+    let aggregate_output_schema = chunk_schema_from_output_columns(&aggregate_output_columns)?;
     if output_layout.aggregate_columns.len() != aggregate.aggregates.len() {
         return Err(format!(
             "HashAggregateNode output_layout aggregate column mismatch: columns={} aggregates={}",
@@ -1874,7 +1873,7 @@ fn lower_hash_aggregate_node(
 
     let input_is_intermediate = functions.iter().all(|f| f.input_is_intermediate);
     let need_finalize = matches!(mode, plan::AggMode::Single | plan::AggMode::Global);
-    Ok(LoweredNode {
+    let aggregate_node = LoweredNode {
         node: ExecNode {
             kind: ExecNodeKind::Aggregate(AggregateNode {
                 input: Box::new(child.node),
@@ -1883,14 +1882,25 @@ fn lower_hash_aggregate_node(
                 functions,
                 need_finalize,
                 input_is_intermediate,
-                output_chunk_schema: output_schema.clone(),
+                output_chunk_schema: aggregate_output_schema.clone(),
                 topn_rf_specs: Vec::new(),
                 streaming_preaggregation_mode: None,
             }),
         },
-        layout,
-        output_schema,
-    })
+        layout: aggregate_layout,
+        output_schema: aggregate_output_schema,
+    };
+    let visible_layout = layout_from_output_columns(visible_output_columns)?;
+    if visible_layout.order() == aggregate_node.layout.order() {
+        return Ok(aggregate_node);
+    }
+    build_slot_projection(
+        "HashAggregateNode",
+        aggregate_node,
+        visible_output_columns,
+        node.node_id,
+        arena,
+    )
 }
 
 fn aggregate_output_columns_from_layout(
@@ -3245,6 +3255,25 @@ mod tests {
         )
     }
 
+    fn three_col_values_node(node_id: i32) -> plan::DistributedNode {
+        let columns = vec![
+            output_column(1, "a", DataType::Int64),
+            output_column(2, "b", DataType::Int64),
+            output_column(3, "c", DataType::Int64),
+        ];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList {
+                    values: vec![int_literal(10), int_literal(20), int_literal(30)],
+                }],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
     fn lower(node: &plan::DistributedNode) -> super::LoweredNode {
         let mut arena = ExprArena::default();
         lower_proto_node(node, &mut arena, &NodeLoweringContext::default()).expect("lower node")
@@ -4121,6 +4150,58 @@ mod tests {
         assert!(aggregate.functions.is_empty());
         assert_eq!(aggregate.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
         assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn hash_aggregate_projects_visible_subset_after_full_layout_output() {
+        let group_a = output_column(1, "a", DataType::Int64);
+        let group_c = output_column(3, "c", DataType::Int64);
+        let sum_b = output_column(4, "sum_b", DataType::Int64);
+        let visible_output = vec![sum_b.clone()];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: vec![
+                    column_ref(1, DataType::Int64),
+                    column_ref(3, DataType::Int64),
+                ],
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "sum".to_string(),
+                    args: vec![column_ref(2, DataType::Int64)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Int64)),
+                    order_by: Vec::new(),
+                    output_column_id: 4,
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: vec![group_a, group_c],
+                    aggregate_columns: vec![sum_b],
+                }),
+                output_columns: visible_output.clone(),
+            }),
+            visible_output,
+            vec![three_col_values_node(10)],
+        );
+
+        let lowered = lower(&aggregate);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(4)]);
+        let ExecNodeKind::Project(project) = lowered.node.kind else {
+            panic!("expected visible-output projection");
+        };
+        assert!(project.is_subordinate);
+        assert_eq!(project.expr_slot_ids, vec![SlotId::new(4)]);
+        assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(4)]);
+        let ExecNodeKind::Aggregate(aggregate) = project.input.kind else {
+            panic!("expected Aggregate below visible-output projection");
+        };
+        assert_eq!(aggregate.group_by.len(), 2);
+        assert_eq!(aggregate.functions.len(), 1);
+        assert_eq!(
+            aggregate.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(3), SlotId::new(4)]
+        );
     }
 
     #[test]
