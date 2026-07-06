@@ -17,17 +17,12 @@
 
 //! Runtime wire adapters for native fragment submission.
 
-use std::collections::BTreeMap;
-
 use crate::proto;
-use crate::runtime::endpoint::{
-    FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
-};
+use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_options::QueryOptions;
-use crate::runtime::runtime_state::RuntimeFilterParams;
-use crate::thrift::{data_sinks, internal_service, partitions, runtime_filter, types};
+use crate::runtime::runtime_filter_params::RuntimeFilterParams;
+use crate::thrift::{data_sinks, internal_service, partitions, types};
 
-pub(crate) type NetworkAddress = types::TNetworkAddress;
 pub(crate) type DataStreamSink = data_sinks::TDataStreamSink;
 pub(crate) type IcebergChangeStreamRouterBranch = data_sinks::TIcebergChangeStreamRouterBranch;
 pub(crate) type IcebergChangeStreamRouterBranchKind =
@@ -53,59 +48,11 @@ pub(crate) fn query_options_from_native(
 pub(crate) fn runtime_filter_params_from_native(
     src: &proto::novarocks::RuntimeFilterParams,
 ) -> Result<RuntimeFilterParams, String> {
-    let id_to_prober_params = src
-        .id_to_prober_params
-        .iter()
-        .map(|(filter_id, list)| {
-            let params = list
-                .params
-                .iter()
-                .map(prober_params_from_native)
-                .map(|result| {
-                    result.map(|prober| {
-                        runtime_filter::TRuntimeFilterProberParams::new(
-                            prober.fragment_instance_id().clone(),
-                            prober.endpoint().to_network_address(),
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((*filter_id, params))
-        })
-        .collect::<Result<BTreeMap<_, _>, String>>()?;
-    let runtime_filter_builder_number = src
-        .runtime_filter_builder_number
-        .iter()
-        .map(|(filter_id, count)| (*filter_id, *count))
-        .collect::<BTreeMap<_, _>>();
-
-    Ok(runtime_filter::TRuntimeFilterParams::new(
-        (!id_to_prober_params.is_empty()).then_some(id_to_prober_params),
-        (!runtime_filter_builder_number.is_empty()).then_some(runtime_filter_builder_number),
-        (src.runtime_filter_max_size > 0).then_some(src.runtime_filter_max_size),
-        None,
-    ))
-}
-
-fn prober_params_from_native(
-    src: &proto::novarocks::ProberParams,
-) -> Result<RuntimeFilterProberDestination, String> {
-    let fragment_instance_id = src
-        .fragment_instance_id
-        .as_ref()
-        .ok_or_else(|| "native ProberParams missing fragment_instance_id".to_string())?;
-    Ok(RuntimeFilterProberDestination::new(
-        types::TUniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo),
-        endpoint_from_native(&src.grpc_endpoint)?,
-    ))
+    RuntimeFilterParams::from_native(src)
 }
 
 pub(crate) fn endpoint_from_native(src: &str) -> Result<RuntimeEndpoint, String> {
     RuntimeEndpoint::parse(src)
-}
-
-pub(crate) fn network_address_from_native(src: &str) -> Result<NetworkAddress, String> {
-    endpoint_from_native(src).map(|endpoint| endpoint.to_network_address())
 }
 
 pub(crate) fn destination_from_native(

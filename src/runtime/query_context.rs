@@ -44,12 +44,10 @@ use crate::runtime::mem_tracker::{self, MemTracker};
 pub(crate) use crate::runtime::query_options::query_expire_durations;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
-use crate::runtime::runtime_filter_worker::{
-    RuntimeFilterProberTarget, RuntimeFilterWorker, RuntimeFilterWorkerParams,
-};
+use crate::runtime::runtime_filter_params::RuntimeFilterParams;
+use crate::runtime::runtime_filter_worker::{RuntimeFilterWorker, RuntimeFilterWorkerParams};
 use crate::thrift::descriptors;
 use crate::thrift::internal_service;
-use crate::thrift::runtime_filter;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct QueryId {
@@ -82,7 +80,7 @@ pub(crate) struct QueryContext {
     pub(crate) query_deadline: Instant,
     pub(crate) exchange_senders: HashMap<i32, usize>,
     pub(crate) runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
-    pub(crate) runtime_filter_params: Option<runtime_filter::TRuntimeFilterParams>,
+    pub(crate) runtime_filter_params: Option<RuntimeFilterParams>,
     pub(crate) runtime_filter_worker_params: Option<RuntimeFilterWorkerParams>,
     pub(crate) runtime_filter_worker: Option<Arc<RuntimeFilterWorker>>,
     pub(crate) pending_runtime_filters: Vec<PendingRuntimeFilter>,
@@ -203,18 +201,14 @@ impl QueryContext {
         self.runtime_filter_hub.clone()
     }
 
-    pub(crate) fn set_runtime_filter_params(
-        &mut self,
-        params: runtime_filter::TRuntimeFilterParams,
-    ) {
+    pub(crate) fn set_runtime_filter_params(&mut self, params: RuntimeFilterParams) {
         if self.runtime_filter_params.is_none() {
-            self.runtime_filter_worker_params =
-                Some(runtime_filter_worker_params_from_thrift(&params));
+            self.runtime_filter_worker_params = Some(params.to_worker_params());
             self.runtime_filter_params = Some(params);
         }
     }
 
-    pub(crate) fn runtime_filter_params(&self) -> Option<runtime_filter::TRuntimeFilterParams> {
+    pub(crate) fn runtime_filter_params(&self) -> Option<RuntimeFilterParams> {
         self.runtime_filter_params.clone()
     }
 
@@ -807,7 +801,7 @@ impl QueryContextManager {
     pub(crate) fn set_runtime_filter_params(
         &self,
         query_id: QueryId,
-        params: runtime_filter::TRuntimeFilterParams,
+        params: RuntimeFilterParams,
     ) -> Result<(), String> {
         let pending = self.with_context_mut(query_id, |ctx| {
             ctx.set_runtime_filter_params(params);
@@ -830,7 +824,7 @@ impl QueryContextManager {
     pub(crate) fn get_runtime_filter_params(
         &self,
         query_id: QueryId,
-    ) -> Option<runtime_filter::TRuntimeFilterParams> {
+    ) -> Option<RuntimeFilterParams> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
         guard
             .active
@@ -1172,42 +1166,6 @@ impl QueryContextManager {
 fn remove_runtime_filter_lifecycle(query_id: QueryId) {
     RuntimeFilterLifecycleRegistry::global()
         .remove_query(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
-}
-
-fn runtime_filter_worker_params_from_thrift(
-    params: &runtime_filter::TRuntimeFilterParams,
-) -> RuntimeFilterWorkerParams {
-    let mut id_to_prober_targets = HashMap::new();
-    if let Some(id_to_prober_params) = params.id_to_prober_params.as_ref() {
-        for (filter_id, probers) in id_to_prober_params {
-            let targets = probers
-                .iter()
-                .filter_map(|prober| {
-                    let addr = prober.fragment_instance_address.as_ref()?;
-                    Some(RuntimeFilterProberTarget::new(
-                        addr.hostname.clone(),
-                        addr.port,
-                    ))
-                })
-                .collect::<Vec<_>>();
-            id_to_prober_targets.insert(*filter_id, targets);
-        }
-    }
-    let runtime_filter_builder_number = params
-        .runtime_filter_builder_number
-        .as_ref()
-        .map(|builder_numbers| {
-            builder_numbers
-                .iter()
-                .map(|(filter_id, count)| (*filter_id, *count))
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_default();
-    RuntimeFilterWorkerParams::new(
-        id_to_prober_targets,
-        runtime_filter_builder_number,
-        params.runtime_filter_max_size,
-    )
 }
 
 static QUERY_CONTEXT_MANAGER: OnceLock<Arc<QueryContextManager>> = OnceLock::new();

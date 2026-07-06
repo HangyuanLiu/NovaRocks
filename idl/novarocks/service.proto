@@ -171,7 +171,7 @@ message Destination {
   string grpc_endpoint = 2;  // NovaRocks gRPC runtime endpoint host:port.
 }
 
-// TRuntimeFilterParams consumed subset.
+// Native per-instance runtime filter routing parameters.
 message RuntimeFilterParams {
   map<int32, ProberParamsList> id_to_prober_params = 1;  // filter_id -> prober instances
   map<int32, int32> runtime_filter_builder_number = 2;   // filter_id -> builder count

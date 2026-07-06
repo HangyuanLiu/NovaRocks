@@ -61,11 +61,11 @@ impl RuntimeFilterWorkerParams {
         }
     }
 
-    fn runtime_filter_max_size(&self) -> Option<i64> {
+    pub(crate) fn runtime_filter_max_size(&self) -> Option<i64> {
         self.runtime_filter_max_size.filter(|v| *v > 0)
     }
 
-    fn expected_builders(&self, filter_id: i32) -> usize {
+    pub(crate) fn expected_builders(&self, filter_id: i32) -> usize {
         self.runtime_filter_builder_number
             .get(&filter_id)
             .copied()
@@ -73,7 +73,7 @@ impl RuntimeFilterWorkerParams {
             .max(1) as usize
     }
 
-    fn prober_targets(&self, filter_id: i32) -> Option<&[RuntimeFilterProberTarget]> {
+    pub(crate) fn prober_targets(&self, filter_id: i32) -> Option<&[RuntimeFilterProberTarget]> {
         self.id_to_prober_targets
             .get(&filter_id)
             .map(|targets| targets.as_slice())
@@ -94,11 +94,11 @@ impl RuntimeFilterProberTarget {
         }
     }
 
-    fn hostname(&self) -> &str {
+    pub(crate) fn hostname(&self) -> &str {
         &self.hostname
     }
 
-    fn port(&self) -> i32 {
+    pub(crate) fn port(&self) -> i32 {
         self.port
     }
 }

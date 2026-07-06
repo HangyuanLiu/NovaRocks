@@ -727,7 +727,7 @@ impl HashJoinBuildSinkOperator {
         };
         let id_to_probers = state
             .runtime_filter_params()
-            .and_then(|params| params.id_to_prober_params.as_ref());
+            .map(|params| params.id_to_prober_params());
         let filters: Vec<RuntimeMembershipFilter> = if filters.is_empty() {
             self.build_empty_remote_membership_filters(&remote_specs)?
         } else {
@@ -846,10 +846,8 @@ impl HashJoinBuildSinkOperator {
                     continue;
                 };
                 for prober in probers {
-                    let Some(addr) = prober.fragment_instance_address.as_ref() else {
-                        continue;
-                    };
-                    if !seen_hosts.insert(addr.hostname.clone()) {
+                    let endpoint = prober.endpoint();
+                    if !seen_hosts.insert(endpoint.host().to_string()) {
                         continue;
                     }
                     let req = crate::proto::filter::TransmitRuntimeFilterRequest {
@@ -863,17 +861,17 @@ impl HashJoinBuildSinkOperator {
                         build_be_number: 0,
                         column_type: None,
                     };
-                    let dest_port = addr.port as u16;
+                    let dest_port = endpoint.port() as u16;
                     if !recorded_sent {
                         self.record_sent_lifecycle(query_id, filter.filter_id(), data.len());
                         recorded_sent = true;
                     }
                     if let Err(e) =
-                        exchange_sender::send_runtime_filter(&addr.hostname, dest_port, req)
+                        exchange_sender::send_runtime_filter(endpoint.host(), dest_port, req)
                     {
                         warn!(
                             "send runtime filter failed: dest={} filter_id={} err={}",
-                            addr.hostname,
+                            endpoint.host(),
                             filter.filter_id(),
                             e
                         );

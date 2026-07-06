@@ -27,10 +27,8 @@ use crate::runtime::mem_tracker::{self, MemTracker};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
+use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::sink_commit;
-use crate::thrift::runtime_filter;
-
-pub(crate) type RuntimeFilterParams = runtime_filter::TRuntimeFilterParams;
 
 /// RuntimeState is a per-fragment-instance execution context, similar to StarRocks BE RuntimeState.
 ///
