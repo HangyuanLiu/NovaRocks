@@ -2013,7 +2013,9 @@ mod tests {
     fn int_expr(value: i64) -> exprs::TExpr {
         exprs::TExpr::new(vec![exprs::TExprNode {
             node_type: exprs::TExprNodeType::INT_LITERAL,
-            type_: crate::lower::compact::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT),
+            type_: crate::lower::compact::type_lowering::scalar_type_desc(
+                types::TPrimitiveType::BIGINT,
+            ),
             opcode: None,
             num_children: 0,
             agg_expr: None,
@@ -2060,7 +2062,9 @@ mod tests {
     fn default_expr_node() -> exprs::TExprNode {
         exprs::TExprNode {
             node_type: exprs::TExprNodeType::INT_LITERAL,
-            type_: crate::lower::compact::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT),
+            type_: crate::lower::compact::type_lowering::scalar_type_desc(
+                types::TPrimitiveType::BIGINT,
+            ),
             opcode: None,
             num_children: 0,
             agg_expr: None,
@@ -2193,7 +2197,9 @@ mod tests {
         descriptors::TSlotDescriptor::new(
             Some(id),
             Some(parent),
-            Some(crate::lower::compact::type_lowering::scalar_type_desc(primitive)),
+            Some(crate::lower::compact::type_lowering::scalar_type_desc(
+                primitive,
+            )),
             Some(id - 1),
             Some(0),
             Some(0),
@@ -2331,7 +2337,8 @@ mod tests {
     }
 
     fn test_slot_ref_expr(slot_id: i32, tuple_id: i32) -> exprs::TExpr {
-        let type_desc = crate::lower::compact::type_lowering::scalar_type_desc(types::TPrimitiveType::INT);
+        let type_desc =
+            crate::lower::compact::type_lowering::scalar_type_desc(types::TPrimitiveType::INT);
         exprs::TExpr::new(vec![exprs::TExprNode {
             node_type: exprs::TExprNodeType::SLOT_REF,
             type_: type_desc,
@@ -2342,7 +2349,8 @@ mod tests {
     }
 
     fn test_non_simple_slot_ref_expr(slot_id: i32, tuple_id: i32) -> exprs::TExpr {
-        let type_desc = crate::lower::compact::type_lowering::scalar_type_desc(types::TPrimitiveType::INT);
+        let type_desc =
+            crate::lower::compact::type_lowering::scalar_type_desc(types::TPrimitiveType::INT);
         exprs::TExpr::new(vec![
             exprs::TExprNode {
                 node_type: exprs::TExprNodeType::SLOT_REF,

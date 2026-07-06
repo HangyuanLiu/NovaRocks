@@ -464,8 +464,11 @@ mod tests {
     }
 
     fn union_plan_node(result_expr_lists: Vec<Vec<exprs::TExpr>>) -> plan_nodes::TPlanNode {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(9, plan_nodes::TPlanNodeType::UNION_NODE, 1);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            9,
+            plan_nodes::TPlanNodeType::UNION_NODE,
+            1,
+        );
         node.union_node = Some(plan_nodes::TUnionNode {
             tuple_id: 1,
             result_expr_lists,

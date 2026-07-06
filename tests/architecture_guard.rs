@@ -358,7 +358,11 @@ fn nidl_d2d_lowering_root_exposes_named_ownership_modules() {
             "_native must be deleted; native lowering lives under src/lower/novarocks"
         )
     );
-    for dir in ["src/lower/common", "src/lower/compact", "src/lower/novarocks"] {
+    for dir in [
+        "src/lower/common",
+        "src/lower/compact",
+        "src/lower/novarocks",
+    ] {
         assert!(repo.join(dir).is_dir(), "{dir} must exist");
     }
 

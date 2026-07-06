@@ -152,7 +152,8 @@ pub(crate) fn lower_lake_scan_node(
             let Some(slot_type) = s.slot_type.as_ref() else {
                 break 'check false;
             };
-            let Some(arrow_type) = crate::lower::compact::type_lowering::arrow_type_from_desc(slot_type)
+            let Some(arrow_type) =
+                crate::lower::compact::type_lowering::arrow_type_from_desc(slot_type)
             else {
                 break 'check false;
             };

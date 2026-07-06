@@ -423,8 +423,11 @@ mod tests {
 
     #[test]
     fn lower_change_event_expand_carries_route_slots_and_events() {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(9, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            9,
+            TPlanNodeType::CHANGE_EVENT_EXPAND_NODE,
+            1,
+        );
         node.change_event_expand_node = Some(TChangeEventExpandNode {
             events: vec![
                 TChangeEventSpec {
@@ -455,7 +458,8 @@ mod tests {
             data_route_slot_id: Some(31),
         });
 
-        let out_layout = crate::lower::compact::layout::layout_from_slot_ids(8, [20, 21, 22, 30, 31]);
+        let out_layout =
+            crate::lower::compact::layout::layout_from_slot_ids(8, [20, 21, 22, 30, 31]);
         let desc_tbl = output_desc_tbl(&[20, 21, 22, 30, 31]);
         let mut arena = ExprArena::default();
         let lowered = lower_change_event_expand_node(
@@ -515,8 +519,11 @@ mod tests {
 
     #[test]
     fn lower_change_event_expand_rejects_missing_output_layout_slot() {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(10, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            10,
+            TPlanNodeType::CHANGE_EVENT_EXPAND_NODE,
+            1,
+        );
         node.change_event_expand_node = Some(TChangeEventExpandNode {
             events: vec![TChangeEventSpec {
                 predicate: None,
@@ -553,8 +560,11 @@ mod tests {
 
     #[test]
     fn lower_change_event_expand_rejects_change_op_slot_missing_from_outputs() {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(11, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            11,
+            TPlanNodeType::CHANGE_EVENT_EXPAND_NODE,
+            1,
+        );
         node.change_event_expand_node = Some(TChangeEventExpandNode {
             events: vec![TChangeEventSpec {
                 predicate: None,
@@ -591,8 +601,11 @@ mod tests {
 
     #[test]
     fn lower_change_event_expand_rejects_data_route_slot_missing_from_outputs() {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(12, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            12,
+            TPlanNodeType::CHANGE_EVENT_EXPAND_NODE,
+            1,
+        );
         node.change_event_expand_node = Some(TChangeEventExpandNode {
             events: vec![TChangeEventSpec {
                 predicate: None,
@@ -629,8 +642,11 @@ mod tests {
 
     #[test]
     fn lower_change_event_expand_rejects_change_op_slot_missing_from_output_layout() {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(13, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            13,
+            TPlanNodeType::CHANGE_EVENT_EXPAND_NODE,
+            1,
+        );
         node.change_event_expand_node = Some(TChangeEventExpandNode {
             events: vec![TChangeEventSpec {
                 predicate: None,
@@ -667,8 +683,11 @@ mod tests {
 
     #[test]
     fn lower_change_event_expand_rejects_data_route_slot_missing_from_output_layout() {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(14, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            14,
+            TPlanNodeType::CHANGE_EVENT_EXPAND_NODE,
+            1,
+        );
         node.change_event_expand_node = Some(TChangeEventExpandNode {
             events: vec![TChangeEventSpec {
                 predicate: None,
@@ -705,8 +724,11 @@ mod tests {
 
     #[test]
     fn lower_change_event_expand_rejects_data_branch_without_route_slot() {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(15, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            15,
+            TPlanNodeType::CHANGE_EVENT_EXPAND_NODE,
+            1,
+        );
         node.change_event_expand_node = Some(TChangeEventExpandNode {
             events: vec![TChangeEventSpec {
                 predicate: None,
@@ -743,8 +765,11 @@ mod tests {
 
     #[test]
     fn lower_change_event_expand_rejects_equal_route_slots() {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(16, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            16,
+            TPlanNodeType::CHANGE_EVENT_EXPAND_NODE,
+            1,
+        );
         node.change_event_expand_node = Some(TChangeEventExpandNode {
             events: vec![TChangeEventSpec {
                 predicate: None,
@@ -783,8 +808,11 @@ mod tests {
 
     #[test]
     fn lower_change_event_expand_rejects_non_tinyint_change_op_slot() {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(17, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            17,
+            TPlanNodeType::CHANGE_EVENT_EXPAND_NODE,
+            1,
+        );
         node.change_event_expand_node = Some(TChangeEventExpandNode {
             events: vec![TChangeEventSpec {
                 predicate: None,
@@ -821,8 +849,11 @@ mod tests {
 
     #[test]
     fn lower_change_event_expand_rejects_non_integral_data_route_slot() {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(18, TPlanNodeType::CHANGE_EVENT_EXPAND_NODE, 1);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            18,
+            TPlanNodeType::CHANGE_EVENT_EXPAND_NODE,
+            1,
+        );
         node.change_event_expand_node = Some(TChangeEventExpandNode {
             events: vec![TChangeEventSpec {
                 predicate: None,

@@ -124,7 +124,8 @@ fn append_arrow_type_nodes(
             // carried (DATETIME descriptors are tz-less); the nanosecond value is
             // preserved regardless. Microsecond keeps time_unit absent so
             // FE-compat descriptors stay byte-identical.
-            let time_unit = crate::lower::compact::type_lowering::thrift_time_unit_for_arrow(*unit)?;
+            let time_unit =
+                crate::lower::compact::type_lowering::thrift_time_unit_for_arrow(*unit)?;
             let scalar = types::TScalarType::new(
                 types::TPrimitiveType::DATETIME,
                 None::<i32>,

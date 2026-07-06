@@ -3020,8 +3020,9 @@ mod tests {
             order: Vec::new(),
             index: HashMap::new(),
         };
-        let expr_id = crate::lower::compact::expr::lower_t_expr(expr, &mut arena, &layout, None, None)
-            .expect("lower predicate expr");
+        let expr_id =
+            crate::lower::compact::expr::lower_t_expr(expr, &mut arena, &layout, None, None)
+                .expect("lower predicate expr");
         SinkPredicatePlan {
             arena: Arc::new(arena),
             expr_id,

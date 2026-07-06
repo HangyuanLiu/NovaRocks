@@ -552,16 +552,18 @@ pub(crate) fn execute_fragment(
                 let desc_tbl = desc_tbl
                     .ok_or_else(|| format!("{sink_type_name} requires descriptor table"))?;
 
-                let sink_mode = crate::lower::compact::sink::iceberg::iceberg_sink_mode_for_type(sink.type_);
-                let sink_input = crate::lower::compact::sink::iceberg::lower_iceberg_sink_factory_input(
-                    iceberg_sink,
-                    sink_mode,
-                    output_exprs,
-                    &lowered.layout,
-                    desc_tbl,
-                    last_query_id,
-                    fe_addr,
-                )?;
+                let sink_mode =
+                    crate::lower::compact::sink::iceberg::iceberg_sink_mode_for_type(sink.type_);
+                let sink_input =
+                    crate::lower::compact::sink::iceberg::lower_iceberg_sink_factory_input(
+                        iceberg_sink,
+                        sink_mode,
+                        output_exprs,
+                        &lowered.layout,
+                        desc_tbl,
+                        last_query_id,
+                        fe_addr,
+                    )?;
                 let sink_factory = IcebergTableSinkFactory::try_new(sink_input)?;
                 let _exec_timer = profiler
                     .as_ref()
@@ -589,15 +591,16 @@ pub(crate) fn execute_fragment(
                     .olap_table_sink
                     .as_ref()
                     .ok_or_else(|| "OLAP_TABLE_SINK missing olap_table_sink payload".to_string())?;
-                let sink_input = crate::lower::compact::sink::starrocks::lower_starrocks_sink_factory_input(
-                    olap_sink,
-                    fragment.output_exprs.as_deref(),
-                    Some(&exec_plan),
-                    Some(&lowered.layout),
-                    last_query_id,
-                    session_time_zone,
-                    fe_addr,
-                )?;
+                let sink_input =
+                    crate::lower::compact::sink::starrocks::lower_starrocks_sink_factory_input(
+                        olap_sink,
+                        fragment.output_exprs.as_deref(),
+                        Some(&exec_plan),
+                        Some(&lowered.layout),
+                        last_query_id,
+                        session_time_zone,
+                        fe_addr,
+                    )?;
                 let sink_factory = OlapTableSinkFactory::try_new(sink_input)?;
                 let _exec_timer = profiler
                     .as_ref()
@@ -724,8 +727,11 @@ mod tests {
     }
 
     fn raw_values_plan_for_test() -> plan_nodes::TPlan {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(1, plan_nodes::TPlanNodeType::RAW_VALUES_NODE, 0);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            1,
+            plan_nodes::TPlanNodeType::RAW_VALUES_NODE,
+            0,
+        );
         node.raw_values_node = Some(plan_nodes::TRawValuesNode::new(
             0,
             scalar_type_desc(types::TPrimitiveType::INT),

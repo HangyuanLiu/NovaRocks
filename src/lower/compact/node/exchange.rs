@@ -317,8 +317,11 @@ mod tests {
     }
 
     fn exchange_plan_node(sort_info: plan_nodes::TSortInfo) -> plan_nodes::TPlanNode {
-        let mut node =
-            crate::lower::compact::node::test_plan_node(11, plan_nodes::TPlanNodeType::EXCHANGE_NODE, 0);
+        let mut node = crate::lower::compact::node::test_plan_node(
+            11,
+            plan_nodes::TPlanNodeType::EXCHANGE_NODE,
+            0,
+        );
         node.exchange_node = Some(plan_nodes::TExchangeNode {
             input_row_tuples: vec![0],
             sort_info: Some(sort_info),
