@@ -18,7 +18,7 @@ include!(concat!(env!("OUT_DIR"), "/thrift_root_mod.rs"));
 include!(concat!(env!("OUT_DIR"), "/proto_root_mod.rs"));
 
 #[cfg(test)]
-mod proto_contract;
+mod tests;
 
 pub mod cache;
 pub mod common;
