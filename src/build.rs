@@ -220,6 +220,9 @@ pub mod proto {
         tonic::include_proto!("novarocks");
     }
 
+    // Generated from idl/compat/proto for StarRocks compatibility and
+    // connector-private use. Keep proto::starrocks stable until consumers
+    // are renamed in a separate cleanup.
     pub mod starrocks {
         #![allow(clippy::doc_lazy_continuation, clippy::len_without_is_empty)]
         tonic::include_proto!("starrocks");
@@ -590,9 +593,9 @@ static C++ runtime is required.",
         std::env::set_var("PROTOC", protoc);
     }
 
-    // D2A: service.proto still has load-bearing StarRocks proto imports until
-    // D2B removes them, so native tonic generation temporarily includes the
-    // compat proto root. The native IDL files themselves remain in idl/novarocks.
+    // Native NovaRocks proto generation is rooted only at idl/novarocks.
+    // StarRocks protos are generated explicitly below for compat and
+    // connector-private consumers instead of being pulled through service.proto.
     let novarocks_protos = [
         idl_path(NOVAROCKS_IDL_DIR, "common.proto"),
         idl_path(NOVAROCKS_IDL_DIR, "expr.proto"),
@@ -603,8 +606,29 @@ static C++ runtime is required.",
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
-        .compile_protos(&novarocks_protos, &[NOVAROCKS_IDL_DIR, COMPAT_PROTO_DIR])
+        .compile_protos(&novarocks_protos, &[NOVAROCKS_IDL_DIR])
         .expect("compile novarocks common + expr + filter + plan + service protos");
+
+    // StarRocks protobuf generation is a compat/connector-private codegen
+    // entrypoint. The public Rust path remains crate::proto::starrocks for now.
+    let starrocks_protos = [
+        idl_path(COMPAT_PROTO_DIR, "status.proto"),
+        idl_path(COMPAT_PROTO_DIR, "types.proto"),
+        idl_path(COMPAT_PROTO_DIR, "data.proto"),
+        idl_path(COMPAT_PROTO_DIR, "binlog.proto"),
+        idl_path(COMPAT_PROTO_DIR, "olap_common.proto"),
+        idl_path(COMPAT_PROTO_DIR, "tablet_schema.proto"),
+        idl_path(COMPAT_PROTO_DIR, "olap_file.proto"),
+        idl_path(COMPAT_PROTO_DIR, "descriptors.proto"),
+        idl_path(COMPAT_PROTO_DIR, "lake_types.proto"),
+        idl_path(COMPAT_PROTO_DIR, "lake_service.proto"),
+        idl_path(COMPAT_PROTO_DIR, "internal_service.proto"),
+    ];
+    tonic_build::configure()
+        .build_client(true)
+        .build_server(true)
+        .compile_protos(&starrocks_protos, &[COMPAT_PROTO_DIR])
+        .expect("compile starrocks compat protos");
 
     let staros_protos = [
         idl_path(COMPAT_STAROS_DIR, "starlet.proto"),
