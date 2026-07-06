@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::connector::iceberg::scan_planner::{
@@ -8,11 +8,13 @@ use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connecto
 use crate::connector::starrocks::table::scan_planner::{
     StarRocksScanHandle, StarRocksSplit, starrocks_scan_handle, starrocks_split,
 };
+use crate::runtime::scan_range;
 use crate::sql::catalog::{
     ColumnDef, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
     IcebergDeleteFileInfo,
 };
 use crate::thrift::{descriptors, exprs, internal_service, partitions, plan_nodes, types};
+use arrow::datatypes::DataType;
 
 const DEFAULT_FE_CATALOG: &str = "default_catalog";
 const ICEBERG_SCAN_SPLIT_TARGET_BYTES: i64 = 128 * 1024 * 1024;
@@ -38,6 +40,12 @@ pub(crate) struct ThriftScanPlan {
     pub(crate) scan_ranges: Vec<internal_service::TScanRangeParams>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct NativeFileScanPlan {
+    pub(crate) node: Option<plan_nodes::TPlanNode>,
+    pub(crate) scan_ranges: Vec<scan_range::ScanRangeParams>,
+}
+
 pub(crate) fn to_thrift_scan(
     connector_id: &str,
     scan: &ScanHandle,
@@ -54,26 +62,58 @@ pub(crate) fn to_thrift_scan(
     }
 }
 
+pub(crate) fn to_native_file_scan(
+    connector_id: &str,
+    scan: &ScanHandle,
+    splits: &[Split],
+    ctx: ThriftScanContext,
+) -> Result<NativeFileScanPlan, String> {
+    validate_split_connectors(scan, splits)?;
+    match connector_id {
+        "iceberg" => iceberg_to_native_file_scan(scan, splits, ctx),
+        other => Err(format!(
+            "unsupported connector native file scan emitter: {other}"
+        )),
+    }
+}
+
 fn iceberg_to_thrift_scan(
     scan: &ScanHandle,
     splits: &[Split],
     ctx: ThriftScanContext,
 ) -> Result<ThriftScanPlan, String> {
+    let native = iceberg_to_native_file_scan(scan, splits, ctx)?;
+    let scan_ranges = native
+        .scan_ranges
+        .iter()
+        .map(scan_range::thrift_scan_range_params_from_native)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ThriftScanPlan {
+        node: native.node,
+        scan_ranges,
+    })
+}
+
+fn iceberg_to_native_file_scan(
+    scan: &ScanHandle,
+    splits: &[Split],
+    ctx: ThriftScanContext,
+) -> Result<NativeFileScanPlan, String> {
     validate_split_connectors(scan, splits)?;
     let scan = iceberg_scan_handle(scan)?;
-    let scan_ranges = build_iceberg_scan_ranges(scan, splits, &ctx)?;
+    let scan_ranges = build_iceberg_native_scan_ranges(scan, splits, &ctx)?;
     let node = build_iceberg_hdfs_scan_node(scan, &ctx);
-    Ok(ThriftScanPlan {
+    Ok(NativeFileScanPlan {
         node: Some(node),
         scan_ranges,
     })
 }
 
-fn build_iceberg_scan_ranges(
+fn build_iceberg_native_scan_ranges(
     scan: &IcebergScanHandle,
     splits: &[Split],
     ctx: &ThriftScanContext,
-) -> Result<Vec<internal_service::TScanRangeParams>, String> {
+) -> Result<Vec<scan_range::ScanRangeParams>, String> {
     let mut ranges = Vec::new();
     let scan_predicates =
         crate::connector::iceberg::file_pruning::min_max_predicates_to_scan_predicates(
@@ -81,7 +121,7 @@ fn build_iceberg_scan_ranges(
         );
     let mut pruning_counters =
         crate::connector::iceberg::file_pruning::IcebergFilePruningCounters::default();
-    let pruning_columns = pruning_columns_for_scan(scan, &ctx.columns);
+    let pruning_columns = pruning_columns_for_scan(scan, &ctx.columns)?;
     for split in splits {
         let file = &iceberg_split(split)?.data_file;
         if !crate::connector::iceberg::file_pruning::file_may_satisfy_scan_predicates(
@@ -91,7 +131,7 @@ fn build_iceberg_scan_ranges(
         ) {
             continue;
         }
-        ranges.extend(build_hdfs_scan_range_params_for_file(
+        ranges.extend(build_native_file_scan_range_params_for_file(
             file,
             ctx.change_op_slot,
             &pruning_columns,
@@ -100,15 +140,50 @@ fn build_iceberg_scan_ranges(
     Ok(ranges)
 }
 
-fn pruning_columns_for_scan(scan: &IcebergScanHandle, columns: &[ColumnDef]) -> Vec<ColumnDef> {
+#[derive(Clone, Debug)]
+struct PruningColumn {
+    schema_ordinal: i32,
+    column: ColumnDef,
+}
+
+fn pruning_columns_for_scan(
+    scan: &IcebergScanHandle,
+    columns: &[ColumnDef],
+) -> Result<Vec<PruningColumn>, String> {
     scan.table
-        .column_names
+        .table_info
+        .schema
+        .fields
         .iter()
-        .filter_map(|column_name| {
-            columns
+        .enumerate()
+        .filter_map(|(schema_ordinal, field)| {
+            scan.table
+                .column_names
                 .iter()
-                .find(|column| column.name.eq_ignore_ascii_case(column_name))
+                .any(|column_name| column_name.eq_ignore_ascii_case(&field.name))
+                .then_some((schema_ordinal, field))
+        })
+        .map(|(schema_ordinal, field)| {
+            let schema_ordinal = i32::try_from(schema_ordinal).map_err(|_| {
+                format!(
+                    "Iceberg table {}.{} schema field ordinal overflow for {}",
+                    scan.table.namespace, scan.table.table, field.name
+                )
+            })?;
+            let column = columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(&field.name))
                 .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "Iceberg table {}.{} scan column {} missing from resolved table columns",
+                        scan.table.namespace, scan.table.table, field.name
+                    )
+                })?;
+            Ok(PruningColumn {
+                schema_ordinal,
+                column,
+            })
         })
         .collect()
 }
@@ -177,21 +252,18 @@ fn build_iceberg_hdfs_scan_node(
     node
 }
 
-fn build_hdfs_scan_range_params_for_file(
+fn build_native_file_scan_range_params_for_file(
     file: &IcebergDataFileInfo,
     change_op_slot: Option<types::TSlotId>,
-    columns: &[ColumnDef],
-) -> Result<Vec<internal_service::TScanRangeParams>, String> {
+    columns: &[PruningColumn],
+) -> Result<Vec<scan_range::ScanRangeParams>, String> {
     validate_iceberg_delete_apply_cost(&file.path, &file.delete_files)?;
     let splits = plan_hdfs_file_splits(file);
-    let iceberg_file_pruning =
-        crate::connector::iceberg::file_pruning_wire::iceberg_file_pruning_metadata_to_thrift(
-            file, columns,
-        );
+    let file_pruning_min_max_values = native_file_pruning_min_max_values(file, columns);
     splits
         .into_iter()
         .map(|(offset, length)| {
-            build_hdfs_scan_range_params(
+            build_native_file_scan_range_params(
                 &file.path,
                 file.size,
                 offset,
@@ -202,8 +274,186 @@ fn build_hdfs_scan_range_params_for_file(
                 file.included_positions.as_ref(),
                 change_op_slot,
                 &file.delete_files,
-                iceberg_file_pruning.clone(),
+                file_pruning_min_max_values.clone(),
             )
+        })
+        .collect()
+}
+
+fn native_file_pruning_min_max_values(
+    file: &IcebergDataFileInfo,
+    columns: &[PruningColumn],
+) -> Option<BTreeMap<i32, scan_range::FilePruningMinMaxValue>> {
+    let stats = file.column_stats.as_ref()?;
+    if stats.is_empty() || columns.is_empty() {
+        return None;
+    }
+
+    let mut out = BTreeMap::new();
+    for column in columns {
+        let Some(stat) = find_column_stats(stats, &column.column.name) else {
+            continue;
+        };
+        let Some(value) = native_min_max_value_from_stats(stat, &column.column.data_type) else {
+            continue;
+        };
+        out.insert(column.schema_ordinal, value);
+    }
+
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn find_column_stats<'a>(
+    stats: &'a HashMap<String, crate::sql::catalog::IcebergColumnStats>,
+    column: &str,
+) -> Option<&'a crate::sql::catalog::IcebergColumnStats> {
+    stats.get(column).or_else(|| {
+        stats
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(column))
+            .map(|(_, stats)| stats)
+    })
+}
+
+fn native_min_max_value_from_stats(
+    stats: &crate::sql::catalog::IcebergColumnStats,
+    data_type: &DataType,
+) -> Option<scan_range::FilePruningMinMaxValue> {
+    let has_null = stats.null_count.unwrap_or(0) > 0;
+    let all_null = stats
+        .value_count
+        .zip(stats.null_count)
+        .is_some_and(|(value_count, null_count)| value_count > 0 && value_count == null_count);
+
+    match data_type {
+        DataType::Boolean => {
+            let lower = stats.lower_bound.as_deref().and_then(decode_bool_bound)?;
+            let upper = stats.upper_bound.as_deref().and_then(decode_bool_bound)?;
+            Some(scan_range::FilePruningMinMaxValue {
+                value_kind: scan_range::FilePruningValueKind::Bool,
+                has_null,
+                all_null,
+                min_int_value: Some(i64::from(lower)),
+                max_int_value: Some(i64::from(upper)),
+                min_float_value: None,
+                max_float_value: None,
+            })
+        }
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            let lower = stats
+                .lower_bound
+                .as_deref()
+                .and_then(|bytes| decode_int_bound_for_type(bytes, data_type))?;
+            let upper = stats
+                .upper_bound
+                .as_deref()
+                .and_then(|bytes| decode_int_bound_for_type(bytes, data_type))?;
+            Some(scan_range::FilePruningMinMaxValue {
+                value_kind: scan_range::FilePruningValueKind::Int,
+                has_null,
+                all_null,
+                min_int_value: Some(lower),
+                max_int_value: Some(upper),
+                min_float_value: None,
+                max_float_value: None,
+            })
+        }
+        DataType::Float32 | DataType::Float64 => {
+            let lower = stats
+                .lower_bound
+                .as_deref()
+                .and_then(|bytes| decode_float_bound_for_type(bytes, data_type))?;
+            let upper = stats
+                .upper_bound
+                .as_deref()
+                .and_then(|bytes| decode_float_bound_for_type(bytes, data_type))?;
+            if lower.is_nan() || upper.is_nan() {
+                return None;
+            }
+            Some(scan_range::FilePruningMinMaxValue {
+                value_kind: scan_range::FilePruningValueKind::Float,
+                has_null,
+                all_null,
+                min_int_value: None,
+                max_int_value: None,
+                min_float_value: Some(lower),
+                max_float_value: Some(upper),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn decode_bool_bound(bytes: &[u8]) -> Option<bool> {
+    match bytes {
+        [0] => Some(false),
+        [1] => Some(true),
+        _ => None,
+    }
+}
+
+fn decode_int_bound_for_type(bytes: &[u8], data_type: &DataType) -> Option<i64> {
+    match data_type {
+        DataType::Int8 => {
+            let arr: [u8; 1] = bytes.try_into().ok()?;
+            Some(i64::from(i8::from_le_bytes(arr)))
+        }
+        DataType::Int16 => {
+            let arr: [u8; 2] = bytes.try_into().ok()?;
+            Some(i64::from(i16::from_le_bytes(arr)))
+        }
+        DataType::Int32 => {
+            let arr: [u8; 4] = bytes.try_into().ok()?;
+            Some(i64::from(i32::from_le_bytes(arr)))
+        }
+        DataType::Int64 => {
+            let arr: [u8; 8] = bytes.try_into().ok()?;
+            Some(i64::from_le_bytes(arr))
+        }
+        _ => None,
+    }
+}
+
+fn decode_float_bound_for_type(bytes: &[u8], data_type: &DataType) -> Option<f64> {
+    match data_type {
+        DataType::Float32 => {
+            let arr: [u8; 4] = bytes.try_into().ok()?;
+            Some(f64::from(f32::from_le_bytes(arr)))
+        }
+        DataType::Float64 => {
+            let arr: [u8; 8] = bytes.try_into().ok()?;
+            Some(f64::from_le_bytes(arr))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn build_hdfs_scan_range_params_for_file(
+    file: &IcebergDataFileInfo,
+    change_op_slot: Option<types::TSlotId>,
+    columns: &[ColumnDef],
+) -> Result<Vec<internal_service::TScanRangeParams>, String> {
+    let pruning_columns = pruning_columns_from_column_order_for_test(columns)?;
+    build_native_file_scan_range_params_for_file(file, change_op_slot, &pruning_columns)?
+        .iter()
+        .map(scan_range::thrift_scan_range_params_from_native)
+        .collect()
+}
+
+#[cfg(test)]
+fn pruning_columns_from_column_order_for_test(
+    columns: &[ColumnDef],
+) -> Result<Vec<PruningColumn>, String> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(schema_ordinal, column)| {
+            Ok(PruningColumn {
+                schema_ordinal: i32::try_from(schema_ordinal)
+                    .map_err(|_| "test schema ordinal overflow".to_string())?,
+                column: column.clone(),
+            })
         })
         .collect()
 }
@@ -264,7 +514,7 @@ fn int_literal_expr(value: i64) -> exprs::TExpr {
     )])
 }
 
-pub(crate) fn build_hdfs_scan_range_params(
+pub(crate) fn build_native_file_scan_range_params(
     full_path: &str,
     file_len: i64,
     offset: i64,
@@ -275,8 +525,8 @@ pub(crate) fn build_hdfs_scan_range_params(
     included_positions: Option<&Vec<i64>>,
     change_op_slot: Option<types::TSlotId>,
     delete_files: &[IcebergDeleteFileInfo],
-    iceberg_file_pruning: Option<BTreeMap<i32, exprs::TExprMinMaxValue>>,
-) -> Result<internal_service::TScanRangeParams, String> {
+    file_pruning_min_max_values: Option<BTreeMap<i32, scan_range::FilePruningMinMaxValue>>,
+) -> Result<scan_range::ScanRangeParams, String> {
     let mut parquet_delete_files = Vec::new();
     let mut deletion_vector_descriptor = None;
     for delete_file in delete_files {
@@ -293,12 +543,24 @@ pub(crate) fn build_hdfs_scan_range_params(
                         types::TIcebergFileContent::EQUALITY_DELETES
                     }
                 };
-                parquet_delete_files.push(plan_nodes::TIcebergDeleteFile::new(
-                    Some(delete_file.path.clone()),
-                    Some(descriptors::THdfsFileFormat::PARQUET),
-                    Some(file_content),
-                    delete_file.length,
-                ));
+                parquet_delete_files.push(scan_range::IcebergDeleteFile {
+                    full_path: Some(delete_file.path.clone()),
+                    file_format: scan_range::IcebergFileFormat::Parquet,
+                    file_content: match file_content {
+                        types::TIcebergFileContent::POSITION_DELETES => {
+                            scan_range::IcebergFileContent::PositionDeletes
+                        }
+                        types::TIcebergFileContent::EQUALITY_DELETES => {
+                            scan_range::IcebergFileContent::EqualityDeletes
+                        }
+                        other => {
+                            return Err(format!(
+                                "unsupported Iceberg delete file content for native scan range: {other:?}"
+                            ));
+                        }
+                    },
+                    length: delete_file.length,
+                });
             }
             IcebergDeleteFileFormat::Puffin => {
                 if deletion_vector_descriptor.is_some() {
@@ -319,21 +581,16 @@ pub(crate) fn build_hdfs_scan_range_params(
                         delete_file.path, full_path
                     )
                 })?;
-                deletion_vector_descriptor = Some(plan_nodes::TDeletionVectorDescriptor::new(
-                    Some("PUFFIN".to_string()),
-                    Some(delete_file.path.clone()),
-                    Some(offset),
-                    Some(size),
-                    None::<i64>,
-                ));
+                deletion_vector_descriptor = Some(scan_range::DeletionVectorDescriptor {
+                    storage_type: Some("PUFFIN".to_string()),
+                    path_or_inline_dv: Some(delete_file.path.clone()),
+                    offset: Some(offset),
+                    size_in_bytes: Some(size),
+                    cardinality: None,
+                });
             }
         }
     }
-    let parquet_delete_files = if parquet_delete_files.is_empty() {
-        None
-    } else {
-        Some(parquet_delete_files)
-    };
     let extended_columns = match (ivm_change_op, change_op_slot) {
         (Some(op), Some(slot_id)) => {
             crate::exec::change_op::validate_change_op_value(op)?;
@@ -341,62 +598,59 @@ pub(crate) fn build_hdfs_scan_range_params(
         }
         _ => None,
     };
-    let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
-        None::<String>,
-        Some(offset),
-        Some(length),
-        None::<i64>,
-        Some(file_len),
-        Some(descriptors::THdfsFileFormat::PARQUET),
-        None::<descriptors::TTextFileDesc>,
-        Some(full_path.to_string()),
-        None::<Vec<String>>,
-        None::<bool>,
-        parquet_delete_files,
-        None::<i64>,
-        None::<bool>,
-        None::<String>,
-        None::<String>,
-        None::<i64>,
-        None::<crate::thrift::data_cache::TDataCacheOptions>,
-        None::<Vec<types::TSlotId>>,
-        None::<bool>,
-        None::<BTreeMap<String, String>>,
-        None::<Vec<types::TSlotId>>,
-        None::<bool>,
-        None::<String>,
-        None::<bool>,
-        None::<String>,
-        None::<String>,
-        None::<plan_nodes::TPaimonDeletionFile>,
-        extended_columns,
-        None::<descriptors::THdfsPartition>,
-        None::<types::TTableId>,
-        deletion_vector_descriptor,
-        None::<String>,
-        None::<i64>,
-        None::<bool>,
-        iceberg_file_pruning,
-        None::<i32>,
+    Ok(scan_range::ScanRangeParams::file(
+        scan_range::FileScanRange {
+            file_format: scan_range::FileFormat::Parquet,
+            full_path: Some(full_path.to_string()),
+            relative_path: None,
+            table_id: None,
+            offset,
+            length,
+            file_length: file_len,
+            delete_files: parquet_delete_files,
+            deletion_vector_descriptor,
+            first_row_id,
+            data_sequence_number,
+            modification_time: None,
+            datacache_options: None,
+            included_positions: included_positions.cloned().unwrap_or_default(),
+            serialized_split: None,
+            use_iceberg_jni_metadata_reader: false,
+            ivm_change_op,
+            file_pruning_min_max_values,
+            extended_columns,
+        },
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn build_hdfs_scan_range_params(
+    full_path: &str,
+    file_len: i64,
+    offset: i64,
+    length: i64,
+    first_row_id: Option<i64>,
+    data_sequence_number: Option<i64>,
+    ivm_change_op: Option<i8>,
+    included_positions: Option<&Vec<i64>>,
+    change_op_slot: Option<types::TSlotId>,
+    delete_files: &[IcebergDeleteFileInfo],
+    file_pruning_min_max_values: Option<BTreeMap<i32, scan_range::FilePruningMinMaxValue>>,
+) -> Result<internal_service::TScanRangeParams, String> {
+    let native = build_native_file_scan_range_params(
+        full_path,
+        file_len,
+        offset,
+        length,
         first_row_id,
         data_sequence_number,
-        included_positions.cloned(),
-    );
-
-    Ok(internal_service::TScanRangeParams::new(
-        plan_nodes::TScanRange::new(
-            None::<plan_nodes::TInternalScanRange>,
-            None::<Vec<u8>>,
-            None::<plan_nodes::TBrokerScanRange>,
-            None::<plan_nodes::TEsScanRange>,
-            Some(hdfs_scan_range),
-            None::<plan_nodes::TBinlogScanRange>,
-            None::<plan_nodes::TBenchmarkScanRange>,
-        ),
-        None::<i32>,
-        Some(false),
-        Some(false),
-    ))
+        ivm_change_op,
+        included_positions,
+        change_op_slot,
+        delete_files,
+        file_pruning_min_max_values,
+    )?;
+    scan_range::thrift_scan_range_params_from_native(&native)
 }
 
 fn starrocks_to_thrift_scan(
@@ -732,6 +986,32 @@ mod tests {
             column("score", DataType::Float64),
             column("name", DataType::Utf8),
         ];
+        let pruning_columns =
+            pruning_columns_from_column_order_for_test(&columns).expect("test pruning columns");
+
+        let native_ranges =
+            build_native_file_scan_range_params_for_file(&file, None, &pruning_columns)
+                .expect("native scan ranges");
+        let native_file = match &native_ranges[0].range {
+            scan_range::ScanRange::File(file) => file,
+        };
+        let native_values = native_file
+            .file_pruning_min_max_values
+            .as_ref()
+            .expect("native min max values");
+        assert_eq!(native_values.len(), 3);
+        assert_eq!(
+            native_values.get(&0).expect("flag stats").value_kind,
+            scan_range::FilePruningValueKind::Bool
+        );
+        assert_eq!(
+            native_values.get(&1).expect("id stats").value_kind,
+            scan_range::FilePruningValueKind::Int
+        );
+        assert_eq!(
+            native_values.get(&2).expect("score stats").value_kind,
+            scan_range::FilePruningValueKind::Float
+        );
 
         let ranges =
             build_hdfs_scan_range_params_for_file(&file, None, &columns).expect("scan ranges");

@@ -475,6 +475,7 @@ fn remap_plan_node_references(
             remap_plan_node_payload_references(node, node_id_map)?;
         }
         remap_btree_map_keys(&mut fragment.exec_params.per_node_scan_ranges, node_id_map)?;
+        remap_btree_map_keys(&mut fragment.native_scan_ranges, node_id_map)?;
         remap_btree_map_keys(&mut fragment.exec_params.per_exch_num_senders, node_id_map)?;
         if let Some(ranges) = fragment
             .exec_params
@@ -1473,6 +1474,7 @@ mod tests {
                 None::<bool>,
                 None::<Vec<crate::thrift::internal_service::TExecDebugOption>>,
             ),
+            native_scan_ranges: std::collections::BTreeMap::new(),
             output_sink: crate::thrift::data_sinks::TDataSink::new(
                 crate::thrift::data_sinks::TDataSinkType::RESULT_SINK,
                 None::<crate::thrift::data_sinks::TDataStreamSink>,
@@ -1705,6 +1707,9 @@ mod tests {
         ]);
         build_result.fragment_results[0].plan.nodes[1].local_rf_waiting_set =
             Some(std::collections::BTreeSet::from([20]));
+        build_result.fragment_results[0]
+            .native_scan_ranges
+            .insert(20, Vec::new());
 
         inject_dml_pre_expand_keyed_assert(&mut build_result, Some(&keyed_assert_for_test()))
             .expect("inject assert");
@@ -1733,6 +1738,18 @@ mod tests {
                 .as_ref()
                 .map(|set| set.iter().copied().collect::<Vec<_>>()),
             Some(vec![nodes[0].node_id])
+        );
+        assert!(
+            build_result.fragment_results[0]
+                .native_scan_ranges
+                .contains_key(&nodes[0].node_id),
+            "native scan range map must be remapped with TPlan node ids"
+        );
+        assert!(
+            !build_result.fragment_results[0]
+                .native_scan_ranges
+                .contains_key(&20),
+            "native scan range map must not retain stale TPlan node ids"
         );
         assert!(
             build_result.fragment_results[0]

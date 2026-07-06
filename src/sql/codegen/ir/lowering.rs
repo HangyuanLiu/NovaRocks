@@ -113,11 +113,12 @@ pub(crate) fn lower_distributed_plan(
 
     let desc_tbl =
         std::mem::replace(&mut state.desc_builder, DescriptorTableBuilder::new()).build();
-    let exec_params = nodes::build_exec_params_multi_with_refresh_context(
+    let scan_range_build = nodes::build_scan_ranges_multi_with_refresh_context(
         connectors,
         &state.scan_tables,
         mv_refresh_ctx,
     )?;
+    let exec_params = scan_range_build.exec_params;
 
     let mut fragment_results = Vec::with_capacity(prepared_fragments.len());
     for (fragment, lowered, output_sink, output_exprs, output_columns, root_node_id) in
@@ -134,6 +135,7 @@ pub(crate) fn lower_distributed_plan(
             plan: plan_nodes::TPlan::new(lowered.plan_nodes),
             desc_tbl: desc_tbl.clone(),
             exec_params: exec_params.clone(),
+            native_scan_ranges: scan_range_build.native_scan_ranges.clone(),
             output_sink,
             output_exprs,
             output_columns,

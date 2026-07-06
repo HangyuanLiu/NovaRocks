@@ -1160,29 +1160,43 @@ mod tests {
     fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() {
         use std::collections::BTreeMap;
 
-        let scan_range = crate::thrift::internal_service::TScanRangeParams::new(
-            crate::thrift::plan_nodes::TScanRange {
-                hdfs_scan_range: Some(crate::thrift::plan_nodes::THdfsScanRange {
-                    file_format: Some(crate::thrift::descriptors::THdfsFileFormat::PARQUET),
-                    full_path: Some("s3://bucket/data.parquet".to_string()),
-                    relative_path: Some("data.parquet".to_string()),
-                    table_id: Some(99),
-                    offset: Some(8),
-                    length: Some(16),
-                    file_length: Some(128),
-                    first_row_id: Some(1_000),
-                    data_sequence_number: Some(44),
-                    included_positions: Some(vec![3, 5, 8]),
-                    serialized_split: Some("{\"split\":1}".to_string()),
-                    use_iceberg_jni_metadata_reader: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
+        let mut scan_range = crate::runtime::scan_range::ScanRangeParams::file(
+            crate::runtime::scan_range::FileScanRange {
+                file_format: crate::runtime::scan_range::FileFormat::Parquet,
+                full_path: Some("s3://bucket/data.parquet".to_string()),
+                relative_path: Some("data.parquet".to_string()),
+                table_id: Some(99),
+                offset: 8,
+                length: 16,
+                file_length: 128,
+                delete_files: Vec::new(),
+                deletion_vector_descriptor: None,
+                first_row_id: Some(1_000),
+                data_sequence_number: Some(44),
+                modification_time: None,
+                datacache_options: None,
+                included_positions: vec![3, 5, 8],
+                serialized_split: Some("{\"split\":1}".to_string()),
+                use_iceberg_jni_metadata_reader: true,
+                ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_DELETE),
+                file_pruning_min_max_values: Some(BTreeMap::from([(
+                    0,
+                    crate::runtime::scan_range::FilePruningMinMaxValue {
+                        value_kind: crate::runtime::scan_range::FilePruningValueKind::Int,
+                        has_null: false,
+                        all_null: false,
+                        min_int_value: Some(10),
+                        max_int_value: Some(20),
+                        min_float_value: None,
+                        max_float_value: None,
+                    },
+                )])),
+                extended_columns: None,
             },
-            Some(13),
-            Some(true),
-            Some(false),
         );
+        scan_range.volume_id = Some(13);
+        scan_range.empty = Some(true);
+        scan_range.has_more = Some(false);
         let mut scan_ranges = BTreeMap::new();
         scan_ranges.insert(11, vec![scan_range]);
         let destination = crate::runtime::endpoint::FragmentDestination::new(
@@ -1263,14 +1277,26 @@ mod tests {
         assert_eq!(encoded_range.volume_id, Some(13));
         assert_eq!(encoded_range.empty, Some(true));
         assert_eq!(encoded_range.has_more, Some(false));
-        let hdfs = match encoded_range.kind.as_ref().expect("scan range kind") {
-            crate::proto::novarocks::scan_range::Kind::Hdfs(hdfs) => hdfs,
-            other => panic!("expected hdfs range, got {other:?}"),
-        };
-        assert_eq!(hdfs.file_format, "PARQUET");
-        assert_eq!(hdfs.full_path.as_deref(), Some("s3://bucket/data.parquet"));
-        assert_eq!(hdfs.included_positions, vec![3, 5, 8]);
-        assert!(hdfs.use_iceberg_jni_metadata_reader);
+        let crate::proto::novarocks::scan_range::Kind::File(file) = encoded_range
+            .range
+            .as_ref()
+            .and_then(|range| range.kind.as_ref())
+            .expect("scan range kind");
+        assert_eq!(file.file_format, "PARQUET");
+        assert_eq!(file.full_path.as_deref(), Some("s3://bucket/data.parquet"));
+        assert_eq!(file.included_positions, vec![3, 5, 8]);
+        assert!(file.use_iceberg_jni_metadata_reader);
+        assert_eq!(
+            file.change_op,
+            Some(i32::from(crate::exec::change_op::CHANGE_OP_DELETE))
+        );
+        let pruning = file
+            .file_pruning_min_max_values
+            .get(&0)
+            .expect("file pruning stats");
+        assert_eq!(pruning.value_kind, 2);
+        assert_eq!(pruning.min_int_value, Some(10));
+        assert_eq!(pruning.max_int_value, Some(20));
         let rf = encoded
             .runtime_filter_params
             .as_ref()

@@ -55,11 +55,11 @@ use std::net::SocketAddr;
 use crate::runtime::endpoint::{
     FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
 };
+use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
     RuntimeFilterPlanResult,
 };
-use crate::thrift::internal_service::TScanRangeParams;
 use crate::thrift::partitions::TPartitionType;
 use crate::thrift::types::TUniqueId;
 
@@ -84,7 +84,7 @@ pub(crate) struct FragmentInstancePlacement {
     /// Native runtime endpoint for this fragment instance.
     pub(crate) endpoint: RuntimeEndpoint,
     /// Scan ranges for this instance, keyed by plan node id.
-    pub(crate) scan_ranges: BTreeMap<i32, Vec<TScanRangeParams>>,
+    pub(crate) scan_ranges: BTreeMap<i32, Vec<ScanRangeParams>>,
     /// Destinations this instance should push its output to.
     pub(crate) destinations: Vec<FragmentDestination>,
     /// Runtime filter prober destinations, keyed by filter_id.
@@ -298,7 +298,7 @@ impl FragmentScheduler {
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Step 7 (Scheme C): partition scan ranges round-robin.
-            for (&node_id, all_ranges) in &fr.exec_params.per_node_scan_ranges {
+            for (&node_id, all_ranges) in &fr.native_scan_ranges {
                 for inst in instances.iter_mut() {
                     inst.scan_ranges.entry(node_id).or_default();
                 }
@@ -668,13 +668,11 @@ mod tests {
         make_query_id(1, 0)
     }
 
-    fn minimal_exec_params(
-        scan_ranges: BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
-    ) -> internal_service::TPlanFragmentExecParams {
+    fn minimal_exec_params() -> internal_service::TPlanFragmentExecParams {
         internal_service::TPlanFragmentExecParams {
             query_id: types::TUniqueId::new(0, 0),
             fragment_instance_id: types::TUniqueId::new(0, 0),
-            per_node_scan_ranges: scan_ranges,
+            per_node_scan_ranges: BTreeMap::new(),
             per_exch_num_senders: Default::default(),
             destinations: None,
             sender_id: None,
@@ -731,27 +729,32 @@ mod tests {
         )
     }
 
-    /// Build a minimal `TScanRange` (all optional fields None).
-    fn minimal_scan_range() -> plan_nodes::TScanRange {
-        plan_nodes::TScanRange::new(
-            None::<plan_nodes::TInternalScanRange>,
-            None::<Vec<u8>>,
-            None::<plan_nodes::TBrokerScanRange>,
-            None::<plan_nodes::TEsScanRange>,
-            None::<plan_nodes::THdfsScanRange>,
-            None::<plan_nodes::TBinlogScanRange>,
-            None::<plan_nodes::TBenchmarkScanRange>,
-        )
-    }
-
-    /// Build a `TScanRangeParams` with a distinguishable `volume_id` marker.
-    fn scan_range_params(marker: i32) -> internal_service::TScanRangeParams {
-        internal_service::TScanRangeParams::new(
-            minimal_scan_range(),
-            Some(marker),
-            None::<bool>,
-            None::<bool>,
-        )
+    fn scan_range_params(marker: i32) -> crate::runtime::scan_range::ScanRangeParams {
+        let mut params = crate::runtime::scan_range::ScanRangeParams::file(
+            crate::runtime::scan_range::FileScanRange {
+                file_format: crate::runtime::scan_range::FileFormat::Parquet,
+                full_path: Some(format!("s3://bucket/file-{marker}.parquet")),
+                relative_path: None,
+                table_id: None,
+                offset: 0,
+                length: 1,
+                file_length: 1,
+                delete_files: Vec::new(),
+                deletion_vector_descriptor: None,
+                first_row_id: None,
+                data_sequence_number: None,
+                modification_time: None,
+                datacache_options: None,
+                included_positions: Vec::new(),
+                serialized_split: None,
+                use_iceberg_jni_metadata_reader: false,
+                ivm_change_op: None,
+                file_pruning_min_max_values: None,
+                extended_columns: None,
+            },
+        );
+        params.volume_id = Some(marker);
+        params
     }
 
     /// Build a minimal `FragmentBuildResult`.
@@ -764,14 +767,14 @@ mod tests {
         scan_node_id: Option<i32>,
         n_ranges: usize,
     ) -> FragmentBuildResult {
-        let (nodes, scan_ranges) = match scan_node_id {
+        let (nodes, native_scan_ranges) = match scan_node_id {
             Some(node_id) => {
                 let mut node = crate::sql::codegen::nodes::default_plan_node();
                 node.node_id = node_id;
                 node.node_type = plan_nodes::TPlanNodeType::HDFS_SCAN_NODE;
-                let ranges: Vec<internal_service::TScanRangeParams> =
+                let ranges: Vec<crate::runtime::scan_range::ScanRangeParams> =
                     (0..n_ranges as i32).map(scan_range_params).collect();
-                let mut scan_map: BTreeMap<i32, Vec<internal_service::TScanRangeParams>> =
+                let mut scan_map: BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>> =
                     BTreeMap::new();
                 scan_map.insert(node_id, ranges);
                 (vec![node], scan_map)
@@ -788,7 +791,8 @@ mod tests {
             fragment_id: fid,
             plan: plan_nodes::TPlan { nodes },
             desc_tbl: minimal_desc_tbl(),
-            exec_params: minimal_exec_params(scan_ranges),
+            exec_params: minimal_exec_params(),
+            native_scan_ranges,
             output_sink: minimal_noop_sink(),
             output_exprs: None,
             output_columns: vec![],
@@ -1372,7 +1376,7 @@ mod tests {
             .expect("assign");
         let f0 = &plan.by_fragment[&0];
         assert_eq!(f0.len(), 2);
-        let empty: Vec<internal_service::TScanRangeParams> = vec![];
+        let empty: Vec<crate::runtime::scan_range::ScanRangeParams> = vec![];
         let mut all_markers: Vec<i32> = f0
             .iter()
             .flat_map(|inst| {

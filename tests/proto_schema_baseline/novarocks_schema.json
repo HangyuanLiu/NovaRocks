@@ -6310,7 +6310,62 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
-        "HdfsScanRange": {
+        "FilePruningMinMaxValue": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "value_kind",
+              "type_name": "FilePruningValueKind",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "has_null",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "all_null",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "min_int_value",
+              "type_name": "int64",
+              "label": "optional",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "max_int_value",
+              "type_name": "int64",
+              "label": "optional",
+              "oneof": null
+            },
+            "6": {
+              "number": 6,
+              "name": "min_float_value",
+              "type_name": "double",
+              "label": "optional",
+              "oneof": null
+            },
+            "7": {
+              "number": 7,
+              "name": "max_float_value",
+              "type_name": "double",
+              "label": "optional",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "FileScanRange": {
           "fields": {
             "1": {
               "number": 1,
@@ -6421,6 +6476,20 @@
               "number": 16,
               "name": "use_iceberg_jni_metadata_reader",
               "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "17": {
+              "number": 17,
+              "name": "change_op",
+              "type_name": "int32",
+              "label": "optional",
+              "oneof": null
+            },
+            "18": {
+              "number": 18,
+              "name": "file_pruning_min_max_values",
+              "type_name": "map<int32, FilePruningMinMaxValue>",
               "label": "singular",
               "oneof": null
             }
@@ -6858,75 +6927,6 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
-        "InternalScanRange": {
-          "fields": {
-            "1": {
-              "number": 1,
-              "name": "version",
-              "type_name": "int64",
-              "label": "singular",
-              "oneof": null
-            },
-            "2": {
-              "number": 2,
-              "name": "tablet_id",
-              "type_name": "int64",
-              "label": "singular",
-              "oneof": null
-            },
-            "3": {
-              "number": 3,
-              "name": "partition_id",
-              "type_name": "int64",
-              "label": "singular",
-              "oneof": null
-            },
-            "4": {
-              "number": 4,
-              "name": "db_name",
-              "type_name": "string",
-              "label": "optional",
-              "oneof": null
-            },
-            "5": {
-              "number": 5,
-              "name": "table_name",
-              "type_name": "string",
-              "label": "optional",
-              "oneof": null
-            },
-            "6": {
-              "number": 6,
-              "name": "catalog_name",
-              "type_name": "string",
-              "label": "optional",
-              "oneof": null
-            },
-            "7": {
-              "number": 7,
-              "name": "fill_data_cache",
-              "type_name": "bool",
-              "label": "singular",
-              "oneof": null
-            },
-            "8": {
-              "number": 8,
-              "name": "skip_page_cache",
-              "type_name": "bool",
-              "label": "singular",
-              "oneof": null
-            },
-            "9": {
-              "number": 9,
-              "name": "skip_disk_cache",
-              "type_name": "bool",
-              "label": "singular",
-              "oneof": null
-            }
-          },
-          "reserved_numbers": [],
-          "reserved_names": []
-        },
         "ProberParams": {
           "fields": {
             "1": {
@@ -7175,38 +7175,10 @@
           "fields": {
             "1": {
               "number": 1,
-              "name": "hdfs",
-              "type_name": "HdfsScanRange",
+              "name": "file",
+              "type_name": "FileScanRange",
               "label": "singular",
               "oneof": "kind"
-            },
-            "2": {
-              "number": 2,
-              "name": "internal",
-              "type_name": "InternalScanRange",
-              "label": "singular",
-              "oneof": "kind"
-            },
-            "3": {
-              "number": 3,
-              "name": "volume_id",
-              "type_name": "int32",
-              "label": "optional",
-              "oneof": null
-            },
-            "4": {
-              "number": 4,
-              "name": "empty",
-              "type_name": "bool",
-              "label": "optional",
-              "oneof": null
-            },
-            "5": {
-              "number": 5,
-              "name": "has_more",
-              "type_name": "bool",
-              "label": "optional",
-              "oneof": null
             }
           },
           "reserved_numbers": [],
@@ -7217,8 +7189,42 @@
             "1": {
               "number": 1,
               "name": "ranges",
-              "type_name": "ScanRange",
+              "type_name": "ScanRangeParams",
               "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "ScanRangeParams": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "range",
+              "type_name": "ScanRange",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "volume_id",
+              "type_name": "int32",
+              "label": "optional",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "empty",
+              "type_name": "bool",
+              "label": "optional",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "has_more",
+              "type_name": "bool",
+              "label": "optional",
               "oneof": null
             }
           },
@@ -7357,6 +7363,28 @@
             {
               "number": 4,
               "name": "ERROR"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "FilePruningValueKind": {
+          "values": [
+            {
+              "number": 0,
+              "name": "FILE_PRUNING_VALUE_KIND_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "FILE_PRUNING_BOOL"
+            },
+            {
+              "number": 2,
+              "name": "FILE_PRUNING_INT"
+            },
+            {
+              "number": 3,
+              "name": "FILE_PRUNING_FLOAT"
             }
           ],
           "reserved_numbers": [],

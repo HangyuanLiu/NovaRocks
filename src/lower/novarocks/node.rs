@@ -70,7 +70,7 @@ pub(crate) struct LoweredNode {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct NodeLoweringContext {
     exchange_sender_counts: HashMap<ExchangeKey, usize>,
-    scan_ranges: HashMap<i32, Vec<novarocks::ScanRange>>,
+    scan_ranges: HashMap<i32, Vec<novarocks::ScanRangeParams>>,
     query_options: Option<QueryOptions>,
     connectors: Option<Arc<crate::connector::ConnectorRegistry>>,
     fragment_instance_hi: i64,
@@ -95,7 +95,7 @@ impl NodeLoweringContext {
     pub(crate) fn with_scan_ranges(
         mut self,
         node_id: i32,
-        ranges: Vec<novarocks::ScanRange>,
+        ranges: Vec<novarocks::ScanRangeParams>,
     ) -> Self {
         self.scan_ranges.insert(node_id, ranges);
         self
@@ -116,7 +116,10 @@ impl NodeLoweringContext {
         self
     }
 
-    pub(crate) fn scan_ranges(&self, node_id: i32) -> Result<&[novarocks::ScanRange], String> {
+    pub(crate) fn scan_ranges(
+        &self,
+        node_id: i32,
+    ) -> Result<&[novarocks::ScanRangeParams], String> {
         self.scan_ranges
             .get(&node_id)
             .map(Vec::as_slice)

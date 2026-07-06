@@ -151,6 +151,7 @@ mod tests {
             plan: crate::thrift::plan_nodes::TPlan::new(vec![]),
             desc_tbl: descriptors::TDescriptorTable::new(vec![], vec![], vec![], false),
             exec_params,
+            native_scan_ranges: Default::default(),
             output_sink,
             output_exprs: None,
             output_columns: vec![OutputColumn {

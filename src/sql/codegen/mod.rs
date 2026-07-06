@@ -118,6 +118,8 @@ pub(crate) struct FragmentBuildResult {
     pub plan: plan_nodes::TPlan,
     pub desc_tbl: thrift_descriptors::TDescriptorTable,
     pub exec_params: internal_service::TPlanFragmentExecParams,
+    pub native_scan_ranges:
+        std::collections::BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>>,
     #[allow(dead_code)]
     // populated by fragment builder, will be read when standalone multi-fragment execution is wired
     pub output_sink: data_sinks::TDataSink,

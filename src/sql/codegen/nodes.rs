@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::connector::scan_planning::ConnectorScanPlanner;
 use crate::lower::compact::expr::parse_min_max_conjuncts_with_column_resolver;
-use crate::sql::codegen::connector_scan_wire::{ThriftScanContext, to_thrift_scan};
-use crate::thrift::descriptors;
+use crate::sql::codegen::connector_scan_wire::{
+    ThriftScanContext, to_native_file_scan, to_thrift_scan,
+};
 use crate::thrift::exprs;
 use crate::thrift::internal_service;
 use crate::thrift::partitions;
@@ -78,7 +79,7 @@ pub(crate) fn build_scan_node(
                 )
             })?;
             let planner = connectors.scan_planner("iceberg")?;
-            let plan = to_thrift_scan(
+            let plan = to_native_file_scan(
                 planner.name(),
                 &planned.scan,
                 &planned.splits,
@@ -96,7 +97,7 @@ pub(crate) fn build_scan_node(
             )?;
             plan.node.ok_or_else(|| {
                 format!(
-                    "Iceberg to_thrift_scan returned no node for {}.{}",
+                    "Iceberg to_native_file_scan returned no node for {}.{}",
                     resolved.database, resolved.table.name
                 )
             })
@@ -973,7 +974,7 @@ pub(crate) fn build_exec_params_multi(
     connectors: &crate::connector::ConnectorRegistry,
     scan_tables: &[PlannedScanTable],
 ) -> Result<internal_service::TPlanFragmentExecParams, String> {
-    build_exec_params_multi_with_refresh_context(connectors, scan_tables, None)
+    Ok(build_scan_ranges_multi_with_refresh_context(connectors, scan_tables, None)?.exec_params)
 }
 
 pub(crate) fn build_exec_params_multi_with_refresh_context(
@@ -981,12 +982,30 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
     scan_tables: &[PlannedScanTable],
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<internal_service::TPlanFragmentExecParams, String> {
+    Ok(
+        build_scan_ranges_multi_with_refresh_context(connectors, scan_tables, mv_refresh_ctx)?
+            .exec_params,
+    )
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScanRangeBuildResult {
+    pub(crate) exec_params: internal_service::TPlanFragmentExecParams,
+    pub(crate) native_scan_ranges: BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>>,
+}
+
+pub(crate) fn build_scan_ranges_multi_with_refresh_context(
+    connectors: &crate::connector::ConnectorRegistry,
+    scan_tables: &[PlannedScanTable],
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<ScanRangeBuildResult, String> {
     let mut per_node_scan_ranges = BTreeMap::new();
+    let mut native_scan_ranges = BTreeMap::new();
 
     for planned in scan_tables {
         let scan_node_id = planned.scan_node_id;
         let resolved = &planned.resolved;
-        let ranges = if matches!(
+        let (ranges, native_ranges, has_native_scan_ranges) = if matches!(
             resolved.table.source,
             crate::sql::catalog::ScanSource::StarRocks { .. }
         ) {
@@ -998,7 +1017,7 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
                     resolved.database, resolved.table.name
                 ));
             }
-            ranges
+            (ranges, Vec::new(), false)
         } else {
             match &resolved.table.source {
                 ScanSource::IcebergDataFiles {
@@ -1011,7 +1030,7 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
                         )
                     })?;
                     let planner = connectors.scan_planner("iceberg")?;
-                    let plan = to_thrift_scan(
+                    let plan = to_native_file_scan(
                         planner.name(),
                         &planned_scan.scan,
                         &planned_scan.splits,
@@ -1027,7 +1046,12 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
                             ..ThriftScanContext::default()
                         },
                     )?;
-                    plan.scan_ranges
+                    let ranges = plan
+                        .scan_ranges
+                        .iter()
+                        .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (ranges, plan.scan_ranges, true)
                 }
                 ScanSource::IcebergMetadataTable { .. } => {
                     // The native iceberg-rust metadata scan operator
@@ -1035,21 +1059,37 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
                     // `serialized_table`. We still need at least one
                     // scan range so the runtime allocates a morsel and
                     // dispatches to `IcebergMetadataScanOp`.
-                    vec![build_iceberg_metadata_scan_range_params()]
+                    let native = vec![build_iceberg_metadata_scan_range_params()];
+                    let ranges = native
+                        .iter()
+                        .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (ranges, native, true)
                 }
                 ScanSource::IcebergDeltaTable { .. } => {
                     // IVM delta-scan is a single-instance operator: the
                     // change-file enumeration happens inside lower_plan
                     // from `plan_changes`, so we emit one placeholder
                     // morsel for the runtime to dispatch on.
-                    vec![build_iceberg_metadata_scan_range_params()]
+                    let native = vec![build_iceberg_metadata_scan_range_params()];
+                    let ranges = native
+                        .iter()
+                        .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (ranges, native, true)
                 }
                 ScanSource::IcebergVersionTable { table, snapshot_id } => {
                     let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
                         "Iceberg version scan requires MV refresh context".to_string()
                     })?;
                     let source = refresh_ctx.version_scan_source(table, *snapshot_id)?;
-                    build_iceberg_scan_ranges_from_source(connectors, planned, &source, None)?
+                    let native =
+                        build_iceberg_scan_ranges_from_source(connectors, planned, &source, None)?;
+                    let ranges = native
+                        .iter()
+                        .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (ranges, native, true)
                 }
                 ScanSource::IcebergMvTargetState(scan) => {
                     let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
@@ -1057,12 +1097,17 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
                     })?;
                     let source = refresh_ctx.target_state_scan_source(scan)?;
                     reject_target_state_equality_deletes(&source)?;
-                    build_iceberg_scan_ranges_from_source(
+                    let native = build_iceberg_scan_ranges_from_source(
                         connectors,
                         planned,
                         &source,
                         Some(projected_target_state_column_names(scan)),
-                    )?
+                    )?;
+                    let ranges = native
+                        .iter()
+                        .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (ranges, native, true)
                 }
                 ScanSource::IcebergMvTargetLocator(scan) => {
                     let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
@@ -1070,12 +1115,17 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
                     })?;
                     let source = refresh_ctx.target_locator_scan_source(scan)?;
                     reject_target_state_equality_deletes(&source)?;
-                    build_iceberg_scan_ranges_from_source(
+                    let native = build_iceberg_scan_ranges_from_source(
                         connectors,
                         planned,
                         &source,
                         Some(projected_target_locator_column_names(scan)),
-                    )?
+                    )?;
+                    let ranges = native
+                        .iter()
+                        .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (ranges, native, true)
                 }
                 ScanSource::StarRocks { .. } => unreachable!(
                     "StarRocks scan source is handled by the planned-connector branch above"
@@ -1083,27 +1133,38 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
             }
         };
         per_node_scan_ranges.insert(scan_node_id, ranges);
+        if has_native_scan_ranges {
+            native_scan_ranges.insert(scan_node_id, native_ranges);
+        }
     }
 
-    Ok(internal_service::TPlanFragmentExecParams::new(
-        types::TUniqueId::new(1, 1),
-        types::TUniqueId::new(2, 2),
-        per_node_scan_ranges,
-        BTreeMap::new(),
-        None::<Vec<crate::thrift::data_sinks::TPlanFragmentDestination>>,
-        None::<i32>,
-        None::<i32>,
-        None::<bool>,
-        None::<bool>,
-        None::<crate::thrift::runtime_filter::TRuntimeFilterParams>,
-        None::<i32>,
-        None::<bool>,
-        None::<BTreeMap<types::TPlanNodeId, BTreeMap<i32, Vec<internal_service::TScanRangeParams>>>>,
-        None::<bool>,
-        None::<i32>,
-        None::<bool>,
-        None::<Vec<internal_service::TExecDebugOption>>,
-    ))
+    Ok(ScanRangeBuildResult {
+        exec_params: internal_service::TPlanFragmentExecParams::new(
+            types::TUniqueId::new(1, 1),
+            types::TUniqueId::new(2, 2),
+            per_node_scan_ranges,
+            BTreeMap::new(),
+            None::<Vec<crate::thrift::data_sinks::TPlanFragmentDestination>>,
+            None::<i32>,
+            None::<i32>,
+            None::<bool>,
+            None::<bool>,
+            None::<crate::thrift::runtime_filter::TRuntimeFilterParams>,
+            None::<i32>,
+            None::<bool>,
+            None::<
+                BTreeMap<
+                    types::TPlanNodeId,
+                    BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
+                >,
+            >,
+            None::<bool>,
+            None::<i32>,
+            None::<bool>,
+            None::<Vec<internal_service::TExecDebugOption>>,
+        ),
+        native_scan_ranges,
+    })
 }
 
 fn build_iceberg_scan_ranges_from_source(
@@ -1111,7 +1172,7 @@ fn build_iceberg_scan_ranges_from_source(
     planned: &PlannedScanTable,
     source: &ScanSource,
     column_names: Option<Vec<String>>,
-) -> Result<Vec<internal_service::TScanRangeParams>, String> {
+) -> Result<Vec<crate::runtime::scan_range::ScanRangeParams>, String> {
     let ScanSource::IcebergDataFiles {
         table,
         files,
@@ -1149,7 +1210,7 @@ fn build_iceberg_scan_ranges_from_source(
         &scan,
         crate::connector::scan_planning::SplitPlanningContext::default(),
     )?;
-    let plan = to_thrift_scan(
+    let plan = to_native_file_scan(
         planner.name(),
         &scan,
         &splits,
@@ -1330,62 +1391,28 @@ pub(crate) fn build_starrocks_scan_ranges_from_planned_scan(
 /// non-empty path. (The earlier embedded-JVM bridge keyed the same
 /// way; that path has been replaced by `IcebergMetadataScanOp` —
 /// see `src/connector/iceberg/metadata.rs`.)
-fn build_iceberg_metadata_scan_range_params() -> internal_service::TScanRangeParams {
-    let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
-        None::<String>,
-        Some(0),
-        Some(0),
-        None::<i64>,
-        Some(0),
-        Some(descriptors::THdfsFileFormat::PARQUET),
-        None::<descriptors::TTextFileDesc>,
-        Some("iceberg-metadata".to_string()),
-        None::<Vec<String>>,
-        None::<bool>,
-        None::<Vec<plan_nodes::TIcebergDeleteFile>>,
-        None::<i64>,
-        None::<bool>,
-        None::<String>,
-        None::<String>,
-        None::<i64>,
-        None::<crate::thrift::data_cache::TDataCacheOptions>,
-        None::<Vec<types::TSlotId>>,
-        None::<bool>,
-        None::<BTreeMap<String, String>>,
-        None::<Vec<types::TSlotId>>,
-        Some(true),
-        Some(String::new()),
-        None::<bool>,
-        None::<String>,
-        None::<String>,
-        None::<plan_nodes::TPaimonDeletionFile>,
-        None::<BTreeMap<types::TSlotId, exprs::TExpr>>,
-        None::<descriptors::THdfsPartition>,
-        None::<types::TTableId>,
-        None::<plan_nodes::TDeletionVectorDescriptor>,
-        None::<String>,
-        None::<i64>,
-        None::<bool>,
-        None::<BTreeMap<i32, exprs::TExprMinMaxValue>>,
-        None::<i32>,
-        None::<i64>,
-        None::<i64>,
-        None::<Vec<i64>>,
-    );
-    internal_service::TScanRangeParams::new(
-        plan_nodes::TScanRange::new(
-            None::<plan_nodes::TInternalScanRange>,
-            None::<Vec<u8>>,
-            None::<plan_nodes::TBrokerScanRange>,
-            None::<plan_nodes::TEsScanRange>,
-            Some(hdfs_scan_range),
-            None::<plan_nodes::TBinlogScanRange>,
-            None::<plan_nodes::TBenchmarkScanRange>,
-        ),
-        None::<i32>,
-        Some(false),
-        Some(false),
-    )
+fn build_iceberg_metadata_scan_range_params() -> crate::runtime::scan_range::ScanRangeParams {
+    crate::runtime::scan_range::ScanRangeParams::file(crate::runtime::scan_range::FileScanRange {
+        file_format: crate::runtime::scan_range::FileFormat::Parquet,
+        full_path: Some("iceberg-metadata".to_string()),
+        relative_path: None,
+        table_id: None,
+        offset: 0,
+        length: 0,
+        file_length: 0,
+        delete_files: Vec::new(),
+        deletion_vector_descriptor: None,
+        first_row_id: None,
+        data_sequence_number: None,
+        modification_time: None,
+        datacache_options: None,
+        included_positions: Vec::new(),
+        serialized_split: Some(String::new()),
+        use_iceberg_jni_metadata_reader: true,
+        ivm_change_op: None,
+        file_pruning_min_max_values: None,
+        extended_columns: None,
+    })
 }
 
 #[cfg(test)]
@@ -1663,6 +1690,21 @@ mod tests {
         let planner = registry
             .scan_planner("starrocks")
             .expect("starrocks scan planner");
+        let node = super::build_scan_node(
+            &registry,
+            None,
+            planned.scan_node_id,
+            planned.scan_tuple_id,
+            &planned.resolved,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .expect("build StarRocks scan node from planned connector scan");
+        assert_eq!(
+            node.node_type,
+            crate::thrift::plan_nodes::TPlanNodeType::LAKE_SCAN_NODE
+        );
 
         let ranges =
             super::build_starrocks_scan_ranges_from_planned_scan(planner.as_ref(), &planned)

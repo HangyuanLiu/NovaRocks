@@ -88,24 +88,23 @@ message InstanceParams {
 }
 
 message ScanRangeList {
-  repeated ScanRange ranges = 1;
+  repeated ScanRangeParams ranges = 1;
 }
 
-// Mirrors thrift TScanRange union. Pure-mode Iceberg file scans use hdfs;
-// internal (lake tablet) is StarRocks-lake. Verify at implementation time
-// whether pure-mode Iceberg reaches HdfsScanRange and drop internal if unused.
+message ScanRangeParams {
+  ScanRange range = 1;
+  optional int32 volume_id = 2;
+  optional bool empty = 3;
+  optional bool has_more = 4;
+}
+
 message ScanRange {
   oneof kind {
-    HdfsScanRange hdfs = 1;
-    InternalScanRange internal = 2;
+    FileScanRange file = 1;
   }
-  optional int32 volume_id = 3; // TScanRangeParams.volume_id wrapper value.
-  optional bool empty = 4;      // TScanRangeParams.empty continuation marker.
-  optional bool has_more = 5;   // TScanRangeParams.has_more continuation marker.
 }
 
-// THdfsScanRange consumed subset.
-message HdfsScanRange {
+message FileScanRange {
   string file_format = 1;  // PARQUET|ORC
   optional string full_path = 2;
   optional string relative_path = 3;
@@ -122,9 +121,28 @@ message HdfsScanRange {
   repeated int64 included_positions = 14;
   optional string serialized_split = 15;
   bool use_iceberg_jni_metadata_reader = 16;
+  optional int32 change_op = 17; // internal IVM change-op value for virtual __change_op.
+  map<int32, FilePruningMinMaxValue> file_pruning_min_max_values = 18; // column ordinal -> stats.
 }
 
-// TIcebergDeleteFile consumed subset.
+enum FilePruningValueKind {
+  FILE_PRUNING_VALUE_KIND_UNSPECIFIED = 0;
+  FILE_PRUNING_BOOL = 1;
+  FILE_PRUNING_INT = 2;
+  FILE_PRUNING_FLOAT = 3;
+}
+
+message FilePruningMinMaxValue {
+  FilePruningValueKind value_kind = 1;
+  bool has_null = 2;
+  bool all_null = 3;
+  optional int64 min_int_value = 4;
+  optional int64 max_int_value = 5;
+  optional double min_float_value = 6;
+  optional double max_float_value = 7;
+}
+
+// Delete-file metadata attached to a NovaRocks file scan.
 message IcebergDeleteFile {
   optional string full_path = 1;
   string file_format = 2;   // PARQUET for current consumed path.
@@ -132,32 +150,19 @@ message IcebergDeleteFile {
   optional int64 length = 4;
 }
 
-// TDeletionVectorDescriptor consumed subset.
+// Iceberg deletion-vector metadata attached to a NovaRocks file scan.
 message DeletionVectorDescriptor {
-  optional string storage_type = 1;       // thrift storageType
-  optional string path_or_inline_dv = 2;  // thrift pathOrInlineDv
+  optional string storage_type = 1;
+  optional string path_or_inline_dv = 2;
   optional int64 offset = 3;
   optional int64 size_in_bytes = 4;
   optional int64 cardinality = 5;
 }
 
-// TDataCacheOptions consumed subset.
+// Data cache behavior requested for a NovaRocks file scan.
 message DatacacheOptions {
   optional bool enable_populate_datacache = 1;
   optional int32 priority = 2;
-}
-
-// TInternalScanRange consumed subset.
-message InternalScanRange {
-  int64 version = 1;
-  int64 tablet_id = 2;
-  int64 partition_id = 3;
-  optional string db_name = 4;
-  optional string table_name = 5;
-  optional string catalog_name = 6;
-  bool fill_data_cache = 7;
-  bool skip_page_cache = 8;
-  bool skip_disk_cache = 9;
 }
 
 // Native runtime destination for one fragment instance.
