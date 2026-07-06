@@ -493,6 +493,7 @@ impl ExecutionCoordinator {
                 }
 
                 let submission = match plan_wire_format {
+                    #[cfg(feature = "compat")]
                     PlanWireFormat::Thrift => FragmentSubmission::thrift_only(params),
                     PlanWireFormat::Proto => {
                         let mut native_fragment =
@@ -1276,7 +1277,7 @@ fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
 fn current_plan_wire_format() -> PlanWireFormat {
     crate::novarocks_config::config()
         .map(|cfg| cfg.runtime.plan_wire_format)
-        .unwrap_or(PlanWireFormat::Thrift)
+        .unwrap_or(PlanWireFormat::Proto)
 }
 
 fn ensure_native_sidecar_sink_supported(
@@ -1301,7 +1302,7 @@ fn ensure_native_sidecar_sink_supported(
     let dynamic_sink = "dynamic fragment sink";
     Err(format!(
         "plan_wire_format=proto cannot encode {dynamic_sink} for fragment {fragment_id}; \
-         use plan_wire_format=thrift until the native sink contract carries dynamic destinations"
+         the native sink contract must carry dynamic destinations before this fragment can use proto submission"
     ))
 }
 
@@ -1310,6 +1311,7 @@ fn native_fragment_sidecars(
     native_plan: Option<&crate::sql::planner::DistributedPlan>,
 ) -> Result<BTreeMap<FragmentId, crate::proto::plan::PlanFragment>, String> {
     match wire_format {
+        #[cfg(feature = "compat")]
         PlanWireFormat::Thrift => Ok(BTreeMap::new()),
         PlanWireFormat::Proto => {
             let native_plan = native_plan.ok_or_else(|| {
@@ -2553,6 +2555,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
 
+    #[cfg(feature = "compat")]
     #[test]
     fn native_fragment_sidecars_thrift_allows_missing_native_plan() {
         let sidecars = native_fragment_sidecars(PlanWireFormat::Thrift, None)
@@ -2570,6 +2573,7 @@ mod tests {
         assert!(err.contains("native DistributedPlan"), "{err}");
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn native_sidecar_sink_support_allows_thrift_dynamic_stream_sink() {
         ensure_native_sidecar_sink_supported(
