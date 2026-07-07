@@ -427,7 +427,7 @@ impl ExecutionCoordinator {
             let is_terminal_write = stream_edge.is_none()
                 && router_edges.is_none()
                 && fr.cte_id.is_none()
-                && data_sink_requires_write_report(&fr.output_sink);
+                && fr.output_kind.is_terminal_write();
 
             // Classify the fragment once.
             if !is_root
@@ -534,7 +534,7 @@ impl ExecutionCoordinator {
                     (output_sink, unpartitioned_partition(), None)
                 };
 
-                let fragment_has_write_sink = data_sink_requires_write_report(&output_sink);
+                let fragment_has_write_sink = is_terminal_write;
                 let (fragment_report_addr, fragment_report_endpoint) =
                     if fragment_has_write_sink || needs_fragment_status_report {
                         if novarocks_report_addr.is_none() || novarocks_report_endpoint.is_none() {
@@ -1308,11 +1308,11 @@ fn is_write_sink(params: &crate::thrift::internal_service::TExecPlanFragmentPara
         .fragment
         .as_ref()
         .and_then(|fragment| fragment.output_sink.as_ref())
-        .map(data_sink_requires_write_report)
+        .map(compat_data_sink_requires_write_report)
         .unwrap_or(false)
 }
 
-fn data_sink_requires_write_report(sink: &data_sinks::TDataSink) -> bool {
+fn compat_data_sink_requires_write_report(sink: &data_sinks::TDataSink) -> bool {
     matches!(
         sink.type_,
         data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
@@ -3465,6 +3465,8 @@ mod tests {
         exec_params.per_node_scan_ranges = compact_ranges;
         crate::sql::codegen::FragmentBuildResult {
             fragment_id: 0,
+            has_scan_nodes: false,
+            output_kind: crate::sql::codegen::FragmentOutputKind::Result,
             plan: crate::thrift::plan_nodes::TPlan::new(Vec::new()),
             desc_tbl: crate::thrift::descriptors::TDescriptorTable::new(
                 Vec::new(),
@@ -3884,7 +3886,7 @@ mod tests {
             iceberg_change_stream_router_sink: Some(empty_router_sink_for_test()),
             ..empty_data_sink_for_test(data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK)
         };
-        assert!(!data_sink_requires_write_report(&sink));
+        assert!(!compat_data_sink_requires_write_report(&sink));
     }
 
     #[test]

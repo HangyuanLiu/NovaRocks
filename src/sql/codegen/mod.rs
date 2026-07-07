@@ -64,6 +64,19 @@ pub(crate) enum FragmentEdgeKind {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FragmentOutputKind {
+    Result,
+    TerminalWrite,
+    NonTerminal,
+}
+
+impl FragmentOutputKind {
+    pub(crate) fn is_terminal_write(self) -> bool {
+        matches!(self, FragmentOutputKind::TerminalWrite)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FragmentStreamKind {
     Gather,
@@ -80,7 +93,7 @@ pub(crate) struct FragmentEdge {
     #[allow(dead_code)]
     // Planner-native semantics used by native fragment wire.
     pub output_partition: crate::sql::planner::DataPartition,
-    // Thrift projection used by compact/compat sinks.
+    // Thrift projection used by compat sinks.
     pub compact_output_partition: partitions::TDataPartition,
     pub stream_kind: FragmentStreamKind,
     pub edge_kind: FragmentEdgeKind,
@@ -118,6 +131,8 @@ pub(crate) struct RuntimeFilterPlanResult {
 /// Physical emission result for a single fragment.
 pub(crate) struct FragmentBuildResult {
     pub fragment_id: FragmentId,
+    pub has_scan_nodes: bool,
+    pub output_kind: FragmentOutputKind,
     pub plan: plan_nodes::TPlan,
     pub desc_tbl: thrift_descriptors::TDescriptorTable,
     pub exec_params: internal_service::TPlanFragmentExecParams,
