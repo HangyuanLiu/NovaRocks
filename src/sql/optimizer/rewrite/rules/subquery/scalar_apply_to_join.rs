@@ -293,7 +293,9 @@ fn apply_opt(
     });
 
     // Build the assert_true condition: cnt IS NULL OR cnt <= 1
-    let cnt_ref = scalar_utils::column_ref(arena, &cnt_output);
+    let mut joined_cnt_output = cnt_output.clone();
+    joined_cnt_output.nullable = true;
+    let cnt_ref = scalar_utils::column_ref(arena, &joined_cnt_output);
     let cnt_is_null = arena.intern(
         ScalarNode::IsNull {
             child: cnt_ref,
@@ -1127,6 +1129,10 @@ mod tests {
             panic!("IS NULL expr must be ColumnRef");
         };
         assert_eq!(*isnull_id, cnt_id, "IS NULL must check cnt column");
+        assert!(
+            isnull_expr.nullable,
+            "LEFT OUTER JOIN can null-extend count(1), so the row-check reference must be nullable"
+        );
 
         // Right: cnt <= 1
         let ExprKind::BinaryOp {
@@ -1144,6 +1150,10 @@ mod tests {
             panic!("<= left must be ColumnRef");
         };
         assert_eq!(*le_id, cnt_id, "<= must check cnt column");
+        assert!(
+            le_left.nullable,
+            "LEFT OUTER JOIN can null-extend count(1), so the comparison reference must be nullable"
+        );
         let ExprKind::Literal(LiteralValue::Int(1)) = &le_right.kind else {
             panic!("<= right must be Literal(1)");
         };

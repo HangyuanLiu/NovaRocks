@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::cast::cast_with_special_rules;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Builder, ListArray, MapArray, StringArray, StructArray,
@@ -102,7 +103,7 @@ fn compare_scalar_non_null(
     right: &ArrayRef,
     right_idx: usize,
 ) -> Result<Ordering, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "list scalar compare type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -288,7 +289,7 @@ fn compare_value_recursive(
     right: &ArrayRef,
     right_idx: usize,
 ) -> Result<Option<Ordering>, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "list compare type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -340,7 +341,7 @@ fn compare_value_recursive_in_list(
     right: &ArrayRef,
     right_idx: usize,
 ) -> Result<Ordering, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "list compare type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -559,7 +560,7 @@ fn eq_value_recursive(
     right: &ArrayRef,
     right_idx: usize,
 ) -> Result<Option<bool>, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "eq type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -613,7 +614,7 @@ fn eq_value_recursive_nested(
     right: &ArrayRef,
     right_idx: usize,
 ) -> Result<NestedEq, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "nested eq type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -791,7 +792,7 @@ fn eq_value_recursive_null_safe(
     right: &ArrayRef,
     right_idx: usize,
 ) -> Result<bool, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "null-safe eq type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -944,7 +945,7 @@ fn eq_map_rows_null_safe(
 }
 
 fn eval_null_safe_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "null-safe eq type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -982,7 +983,7 @@ fn eval_nested_compare<F>(
 where
     F: Fn(Ordering) -> bool,
 {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "nested compare type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -1016,7 +1017,7 @@ where
 }
 
 fn eval_nested_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "nested eq type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -1049,7 +1050,7 @@ fn eval_nested_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String>
 }
 
 fn eval_nested_ne(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "nested ne type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -1090,7 +1091,7 @@ fn normalize_comparison_types(
     let right_type = right.data_type();
 
     // If types match, no conversion needed
-    if left_type == right_type {
+    if comparison_data_types_match(left_type, right_type) {
         return Ok((left, right));
     }
 
@@ -1126,12 +1127,12 @@ fn normalize_comparison_types(
             let left_cast = if left_type == &target {
                 left
             } else {
-                cast(&left, &target).map_err(|e| e.to_string())?
+                cast_with_special_rules(&left, &target)?
             };
             let right_cast = if right_type == &target {
                 right
             } else {
-                cast(&right, &target).map_err(|e| e.to_string())?
+                cast_with_special_rules(&right, &target)?
             };
             Ok((left_cast, right_cast))
         }
@@ -1140,6 +1141,45 @@ fn normalize_comparison_types(
             left_type, right_type
         )),
     }
+}
+
+fn comparison_data_types_match(left: &DataType, right: &DataType) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left, right) {
+        (DataType::List(left_item), DataType::List(right_item))
+        | (DataType::LargeList(left_item), DataType::LargeList(right_item)) => {
+            comparison_fields_match(left_item, right_item)
+        }
+        (
+            DataType::FixedSizeList(left_item, left_size),
+            DataType::FixedSizeList(right_item, right_size),
+        ) => left_size == right_size && comparison_fields_match(left_item, right_item),
+        (DataType::Struct(left_fields), DataType::Struct(right_fields)) => {
+            left_fields.len() == right_fields.len()
+                && left_fields
+                    .iter()
+                    .zip(right_fields.iter())
+                    .all(|(left_field, right_field)| {
+                        comparison_fields_match(left_field, right_field)
+                    })
+        }
+        (
+            DataType::Map(left_entries, left_ordered),
+            DataType::Map(right_entries, right_ordered),
+        ) => left_ordered == right_ordered && comparison_fields_match(left_entries, right_entries),
+        _ => false,
+    }
+}
+
+fn comparison_fields_match(
+    left: &arrow::datatypes::Field,
+    right: &arrow::datatypes::Field,
+) -> bool {
+    left.name() == right.name()
+        && left.is_nullable() == right.is_nullable()
+        && comparison_data_types_match(left.data_type(), right.data_type())
 }
 
 fn is_string_or_null_type(data_type: &DataType) -> bool {
@@ -1546,7 +1586,7 @@ pub fn eval_not(arena: &ExprArena, child: ExprId, chunk: &Chunk) -> Result<Array
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
+    use crate::common::{ids::SlotId, largeint};
     use crate::exec::expr::{ExprNode, LiteralValue};
     use arrow::array::{
         BooleanArray, Decimal128Array, DictionaryArray, Int32Array, Int32Builder, Int64Array,
@@ -1555,6 +1595,8 @@ mod tests {
     };
     use arrow::datatypes::{Field, Fields, Int8Type, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
+    use arrow_buffer::OffsetBuffer;
+    use std::collections::HashMap;
 
     fn create_test_chunk_int(values: Vec<i64>) -> Chunk {
         let array = Arc::new(Int64Array::from(values)) as ArrayRef;
@@ -1592,6 +1634,20 @@ mod tests {
             .expect("chunk schema");
             Chunk::new_with_chunk_schema(batch, chunk_schema)
         }
+    }
+
+    fn create_test_chunk_two_arrays(left: ArrayRef, right: ArrayRef) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l", left.data_type().clone(), true),
+            Field::new("r", right.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
     fn create_test_chunk_bool(l: Vec<Option<bool>>, r: Vec<Option<bool>>) -> Chunk {
@@ -2171,6 +2227,62 @@ mod tests {
     }
 
     #[test]
+    fn bool_integer_comparison_uses_numeric_values() {
+        let chunk = create_test_chunk_two_arrays(
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false)])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(1_i64), Some(1_i64)])) as ArrayRef,
+        );
+        let mut arena = ExprArena::default();
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Boolean);
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int64);
+        let eq_expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
+        let lt_expr = arena.push_typed(ExprNode::Lt(l, r), DataType::Boolean);
+
+        let eq_out = arena.eval(eq_expr, &chunk).unwrap();
+        let lt_out = arena.eval(lt_expr, &chunk).unwrap();
+
+        assert_eq!(bool_values(&eq_out), vec![Some(true), Some(false)]);
+        assert_eq!(bool_values(&lt_out), vec![Some(false), Some(true)]);
+    }
+
+    #[test]
+    fn comparison_with_null_operand_returns_nulls() {
+        let chunk = create_test_chunk_two_arrays(
+            Arc::new(Int64Array::from(vec![Some(1_i64), Some(2_i64)])) as ArrayRef,
+            arrow::array::new_null_array(&DataType::Null, 2),
+        );
+        let mut arena = ExprArena::default();
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Null);
+        let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
+
+        let out = arena.eval(expr, &chunk).unwrap();
+
+        assert_eq!(bool_values(&out), vec![None, None]);
+    }
+
+    #[test]
+    fn largeint_integer_comparison_uses_largeint_values() {
+        let chunk = create_test_chunk_two_arrays(
+            largeint::array_from_i128(&[Some(9_223_372_036_854_775_808_i128), Some(5_i128)])
+                .unwrap(),
+            Arc::new(Int64Array::from(vec![
+                Some(9_223_372_036_854_775_807_i64),
+                Some(10_i64),
+            ])) as ArrayRef,
+        );
+        let mut arena = ExprArena::default();
+        let largeint_type = DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH);
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), largeint_type);
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int64);
+        let expr = arena.push_typed(ExprNode::Gt(l, r), DataType::Boolean);
+
+        let out = arena.eval(expr, &chunk).unwrap();
+
+        assert_eq!(bool_values(&out), vec![Some(true), Some(false)]);
+    }
+
+    #[test]
     fn test_compare_timestamp_and_utf8_literal() {
         let ts_arr = Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
             Some(1_704_067_200_000_000_i64), // 2024-01-01 00:00:00
@@ -2233,6 +2345,42 @@ mod tests {
         assert!(out.value(0));
         assert!(!out.value(1));
         assert!(out.is_null(2));
+    }
+
+    #[test]
+    fn test_eq_list_arrays_ignores_item_field_metadata() {
+        let mut arena = ExprArena::default();
+        let left_item = Arc::new(Field::new("item", DataType::Int64, true).with_metadata(
+            HashMap::from([("PARQUET:field_id".to_string(), "6".to_string())]),
+        ));
+        let right_item = Arc::new(Field::new("item", DataType::Int64, true).with_metadata(
+            HashMap::from([("PARQUET:field_id".to_string(), "7".to_string())]),
+        ));
+        let left_type = DataType::List(left_item.clone());
+        let right_type = DataType::List(right_item.clone());
+        let left = ListArray::try_new(
+            left_item,
+            OffsetBuffer::new(vec![0_i32, 3, 6].into()),
+            Arc::new(Int64Array::from(vec![22_i64, 11, 33, 22, 11, 44])) as ArrayRef,
+            None,
+        )
+        .expect("left list");
+        let right = ListArray::try_new(
+            right_item,
+            OffsetBuffer::new(vec![0_i32, 3, 6].into()),
+            Arc::new(Int64Array::from(vec![22_i64, 11, 33, 22, 11, 33])) as ArrayRef,
+            None,
+        )
+        .expect("right list");
+        let chunk = create_test_chunk_two_arrays(Arc::new(left), Arc::new(right));
+
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), left_type);
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), right_type);
+        let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
+        let out = arena.eval(expr, &chunk).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(out.value(0));
+        assert!(!out.value(1));
     }
 
     #[test]

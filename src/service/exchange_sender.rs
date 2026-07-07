@@ -27,6 +27,9 @@ use crate::runtime::io::io_executor;
 use crate::runtime::mem_tracker::TrackedBytes;
 use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeErrorState;
+use crate::service::internal_rpc_transport::{
+    InternalRpcTransport, internal_rpc_transport_for_current_process,
+};
 
 pub struct ExchangeSendTracker {
     inflight_tasks: AtomicUsize,
@@ -85,14 +88,17 @@ pub fn send_runtime_filter(
     dest_port: u16,
     params: crate::proto::filter::TransmitRuntimeFilterRequest,
 ) -> Result<(), String> {
-    #[cfg(feature = "compat")]
-    {
-        return crate::service::internal_rpc_client::transmit_runtime_filter(
-            dest_host, dest_port, params,
-        );
+    match internal_rpc_transport_for_current_process() {
+        #[cfg(feature = "compat")]
+        InternalRpcTransport::BrpcCompat => {
+            crate::service::internal_rpc_client::transmit_runtime_filter(
+                dest_host, dest_port, params,
+            )
+        }
+        InternalRpcTransport::Grpc => {
+            crate::service::grpc_client::transmit_runtime_filter(dest_host, dest_port, params)
+        }
     }
-    #[cfg(not(feature = "compat"))]
-    crate::service::grpc_client::transmit_runtime_filter(dest_host, dest_port, params)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -371,31 +377,31 @@ fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_byt
     // reservation symmetrically with the global one on completion.
     let dest_key = ExchangeSendKey::from_task(&task);
 
-    #[cfg(feature = "compat")]
-    let result = crate::service::internal_rpc_client::send_chunks(
-        &task.dest_host,
-        task.dest_port,
-        task.finst_id,
-        task.node_id,
-        task.sender_id,
-        task.be_number,
-        task.eos,
-        task.sequence,
-        task.payload,
-    );
-
-    #[cfg(not(feature = "compat"))]
-    let result = crate::service::grpc_client::send_chunks(
-        &task.dest_host,
-        task.dest_port,
-        task.finst_id,
-        task.node_id,
-        task.sender_id,
-        task.be_number,
-        task.eos,
-        task.sequence,
-        task.payload,
-    );
+    let result = match internal_rpc_transport_for_current_process() {
+        #[cfg(feature = "compat")]
+        InternalRpcTransport::BrpcCompat => crate::service::internal_rpc_client::send_chunks(
+            &task.dest_host,
+            task.dest_port,
+            task.finst_id,
+            task.node_id,
+            task.sender_id,
+            task.be_number,
+            task.eos,
+            task.sequence,
+            task.payload,
+        ),
+        InternalRpcTransport::Grpc => crate::service::grpc_client::send_chunks(
+            &task.dest_host,
+            task.dest_port,
+            task.finst_id,
+            task.node_id,
+            task.sender_id,
+            task.be_number,
+            task.eos,
+            task.sequence,
+            task.payload,
+        ),
+    };
     let send_ns = send_start.elapsed().as_nanos();
 
     if let Some(profile) = task.profiles.as_ref() {
@@ -507,6 +513,15 @@ mod tests {
 
     fn finst() -> UniqueId {
         UniqueId { hi: 1, lo: 1 }
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn rust_tests_use_grpc_for_exchange_chunk_transport_under_compat_builds() {
+        assert_eq!(
+            internal_rpc_transport_for_current_process(),
+            InternalRpcTransport::Grpc
+        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray};
 use arrow::compute::{concat_batches, filter_record_batch};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use super::build_artifact::{BuildView, JoinBuildArtifact};
@@ -76,7 +76,35 @@ fn concat_compatible_batches(
             }
         }
     }
-    concat_batches(schema, batches).map_err(|e| e.to_string())
+    let concat_schema = concat_schema_for_batches(schema, batches);
+    concat_batches(&concat_schema, batches).map_err(|e| e.to_string())
+}
+
+fn concat_schema_for_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> SchemaRef {
+    let mut fields = schema
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let mut changed = false;
+
+    for batch in batches {
+        let batch_schema = batch.schema();
+        for (idx, field) in fields.iter_mut().enumerate() {
+            let nullable = field.is_nullable()
+                || batch_schema.field(idx).is_nullable()
+                || batch.column(idx).null_count() > 0;
+            if nullable != field.is_nullable() {
+                *field = field.clone().with_nullable(nullable);
+                changed = true;
+            }
+        }
+    }
+
+    if !changed {
+        return Arc::clone(schema);
+    }
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 /// Core hash-join probing engine that performs key lookup and join-type specific row assembly.
@@ -1665,7 +1693,7 @@ pub(crate) fn join_type_str(join_type: JoinType) -> &'static str {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Array, ArrayRef, Decimal128Array, Int32Array};
+    use arrow::array::{Array, ArrayRef, Decimal128Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
 
@@ -2425,6 +2453,37 @@ mod tests {
         );
         assert!(err.contains("Decimal128(10, 2)"), "err={err}");
         assert!(err.contains("Decimal128(38, 2)"), "err={err}");
+    }
+
+    #[test]
+    fn concat_compatible_batches_widens_nullable_batch_fields() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "count(1)",
+            DataType::Int64,
+            false,
+        )]));
+        let nullable_schema = Arc::new(Schema::new(vec![Field::new(
+            "count(1)",
+            DataType::Int64,
+            true,
+        )]));
+        let non_null_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef],
+        )
+        .expect("non-null batch");
+        let null_batch = RecordBatch::try_new(
+            nullable_schema,
+            vec![Arc::new(Int64Array::from(vec![None])) as ArrayRef],
+        )
+        .expect("nullable batch");
+
+        let batch =
+            super::concat_compatible_batches(&schema, &[non_null_batch, null_batch], "join merge")
+                .expect("join concat");
+
+        assert!(batch.schema().field(0).is_nullable());
+        assert_eq!(batch.column(0).null_count(), 1);
     }
 
     #[test]

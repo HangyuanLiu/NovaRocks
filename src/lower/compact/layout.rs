@@ -203,6 +203,42 @@ pub(crate) fn chunk_schema_for_layout(
     )?))
 }
 
+pub(crate) fn chunk_schema_for_layout_with_nullable_tuples(
+    desc_tbl: &descriptors::TDescriptorTable,
+    layout: &Layout,
+    row_tuples: &[types::TTupleId],
+    nullable_tuples: &[bool],
+) -> Result<ChunkSchemaRef, String> {
+    let mut slots = chunk_slot_schemas_for_layout(desc_tbl, layout)?;
+    if nullable_tuples.is_empty() {
+        return Ok(Arc::new(ChunkSchema::try_new(slots)?));
+    }
+    if row_tuples.len() != nullable_tuples.len() {
+        return Err(format!(
+            "nullable_tuples length {} does not match row_tuples length {}",
+            nullable_tuples.len(),
+            row_tuples.len()
+        ));
+    }
+
+    let nullable_tuple_ids = row_tuples
+        .iter()
+        .copied()
+        .zip(nullable_tuples.iter().copied())
+        .filter_map(|(tuple_id, nullable)| nullable.then_some(tuple_id))
+        .collect::<Vec<_>>();
+    if nullable_tuple_ids.is_empty() {
+        return Ok(Arc::new(ChunkSchema::try_new(slots)?));
+    }
+
+    for ((tuple_id, _), slot) in layout.order.iter().zip(slots.iter_mut()) {
+        if nullable_tuple_ids.contains(tuple_id) {
+            *slot = slot.with_nullable(true);
+        }
+    }
+    Ok(Arc::new(ChunkSchema::try_new(slots)?))
+}
+
 pub(crate) fn infer_tuple_slot_order(
     fragment: &planner::TPlanFragment,
 ) -> HashMap<types::TTupleId, Vec<types::TSlotId>> {

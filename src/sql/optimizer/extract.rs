@@ -232,14 +232,36 @@ fn join_output_columns(
         crate::sql::analysis::JoinKind::RightSemi | crate::sql::analysis::JoinKind::RightAnti => {
             children[1].output_columns.clone()
         }
-        _ => {
+        crate::sql::analysis::JoinKind::Inner | crate::sql::analysis::JoinKind::Cross => {
             let mut columns = children[0].output_columns.clone();
             columns.extend(children[1].output_columns.clone());
+            columns
+        }
+        crate::sql::analysis::JoinKind::LeftOuter => {
+            let mut columns = children[0].output_columns.clone();
+            columns.extend(nullable_output_columns(children[1].output_columns.clone()));
+            columns
+        }
+        crate::sql::analysis::JoinKind::RightOuter => {
+            let mut columns = nullable_output_columns(children[0].output_columns.clone());
+            columns.extend(children[1].output_columns.clone());
+            columns
+        }
+        crate::sql::analysis::JoinKind::FullOuter => {
+            let mut columns = nullable_output_columns(children[0].output_columns.clone());
+            columns.extend(nullable_output_columns(children[1].output_columns.clone()));
             columns
         }
     };
     output.dedup_by_key(|column| column.column_id);
     Some(output)
+}
+
+fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
+    for column in &mut columns {
+        column.nullable = true;
+    }
+    columns
 }
 
 fn project_output_columns(
@@ -614,6 +636,60 @@ mod tests {
                 .map(|column| column.column_id),
             Some(ColumnId(14))
         );
+    }
+
+    #[test]
+    fn extract_join_output_columns_widen_outer_nullable_side() {
+        let left_col = output_column_for_test(1, "l_k", false);
+        let right_col = output_column_for_test(2, "r_k", false);
+        let children = vec![
+            physical_node_with_outputs(vec![left_col.clone()]),
+            physical_node_with_outputs(vec![right_col.clone()]),
+        ];
+
+        let left_outer =
+            join_output_columns(JoinKind::LeftOuter, &children).expect("left outer outputs");
+        assert_eq!(left_outer.len(), 2);
+        assert!(!left_outer[0].nullable);
+        assert!(left_outer[1].nullable);
+
+        let right_outer =
+            join_output_columns(JoinKind::RightOuter, &children).expect("right outer outputs");
+        assert_eq!(right_outer.len(), 2);
+        assert!(right_outer[0].nullable);
+        assert!(!right_outer[1].nullable);
+
+        let full_outer =
+            join_output_columns(JoinKind::FullOuter, &children).expect("full outer outputs");
+        assert_eq!(full_outer.len(), 2);
+        assert!(full_outer[0].nullable);
+        assert!(full_outer[1].nullable);
+    }
+
+    fn output_column_for_test(id: u32, name: &str, nullable: bool) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId(id),
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    fn physical_node_with_outputs(output_columns: Vec<OutputColumn>) -> OptimizerPhysicalNode {
+        OptimizerPhysicalNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: output_columns.clone(),
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            explain_stats: OptimizerExplainStats::default(),
+            output_columns,
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
     }
 
     fn make_hash_join_winner_with_shuffle_child_props_for_test() -> (

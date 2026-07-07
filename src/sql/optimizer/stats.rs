@@ -2249,12 +2249,13 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::commo
             cols
         }
 
+        Operator::LogicalRepeat(repeat) => repeat_output_columns(memo, &expr.children, repeat),
+
         // Passthrough operators: inherit output columns from first child.
         Operator::LogicalFilter(_)
         | Operator::LogicalSort(_)
         | Operator::LogicalLimit(_)
         | Operator::LogicalTopN(_)
-        | Operator::LogicalRepeat(_)
         | Operator::LogicalAssertOneRow(_) => {
             if let Some(&child_id) = expr.children.first() {
                 memo.groups[child_id]
@@ -2323,12 +2324,12 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::commo
             cols.extend(tf.output_columns.clone());
             cols
         }
+        Operator::PhysicalRepeat(repeat) => repeat_output_columns(memo, &expr.children, repeat),
         Operator::PhysicalFilter(_)
         | Operator::PhysicalSort(_)
         | Operator::PhysicalLimit(_)
         | Operator::PhysicalTopN(_)
         | Operator::PhysicalDistribution(_)
-        | Operator::PhysicalRepeat(_)
         | Operator::PhysicalAssertOneRow(_) => {
             if let Some(&child_id) = expr.children.first() {
                 memo.groups[child_id]
@@ -2398,6 +2399,24 @@ fn child_output_columns(
         .and_then(|&child_id| memo.groups[child_id].logical_props.as_ref())
         .map(|props| props.output_columns.clone())
         .unwrap_or_default()
+}
+
+fn repeat_output_columns(
+    memo: &Memo,
+    children: &[usize],
+    repeat: &super::operator::RepeatOp,
+) -> Vec<crate::sql::common::OutputColumn> {
+    let mut columns = child_output_columns(memo, children, 0);
+    columns.extend(repeat.grouping_fn_ids.iter().map(|(name, column_id)| {
+        crate::sql::common::OutputColumn {
+            column_id: *column_id,
+            name: name.clone(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: true,
+        }
+    }));
+    columns
 }
 
 // ---------------------------------------------------------------------------

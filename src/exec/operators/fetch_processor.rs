@@ -292,10 +292,17 @@ impl FetchProcessor {
         }
         let port = lookup_async_internal_port(node_info)?;
 
-        #[cfg(not(feature = "compat"))]
-        let resp = crate::service::grpc_client::lookup(&node_info.host, port, req)?;
-        #[cfg(feature = "compat")]
-        let resp = crate::service::internal_rpc_client::lookup(&node_info.host, port, req)?;
+        let resp =
+            match crate::service::internal_rpc_transport::internal_rpc_transport_for_current_process(
+            ) {
+                #[cfg(feature = "compat")]
+                crate::service::internal_rpc_transport::InternalRpcTransport::BrpcCompat => {
+                    crate::service::internal_rpc_client::lookup(&node_info.host, port, req)?
+                }
+                crate::service::internal_rpc_transport::InternalRpcTransport::Grpc => {
+                    crate::service::grpc_client::lookup(&node_info.host, port, req)?
+                }
+            };
 
         if let Some(status) = resp.status.as_ref()
             && status.code != 0
@@ -328,6 +335,9 @@ mod tests {
 
     #[test]
     fn test_lookup_remote_uses_nodes_info_async_internal_port() {
+        let _transport_guard =
+            crate::service::internal_rpc_transport::use_brpc_compat_internal_rpc_transport_for_test(
+            );
         let _hook_guard = internal_rpc_client::test_hook_lock();
         internal_rpc_client::clear_test_hooks();
 

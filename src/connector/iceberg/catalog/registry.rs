@@ -2896,6 +2896,8 @@ pub(crate) fn logical_type_property_value(data_type: &SqlType) -> Option<String>
         SqlType::TinyInt => Some("tinyint".to_string()),
         SqlType::SmallInt => Some("smallint".to_string()),
         SqlType::Date => Some("date".to_string()),
+        SqlType::Bitmap => Some("bitmap".to_string()),
+        SqlType::Hll => Some("hll".to_string()),
         SqlType::Decimal { precision, scale } => Some(format!("decimal({precision},{scale})")),
         _ => None,
     }
@@ -2906,6 +2908,8 @@ fn parse_logical_type_property_value(value: &str) -> Option<SqlType> {
         "tinyint" => Some(SqlType::TinyInt),
         "smallint" => Some(SqlType::SmallInt),
         "date" => Some(SqlType::Date),
+        "bitmap" => Some(SqlType::Bitmap),
+        "hll" => Some(SqlType::Hll),
         _ => parse_decimal_logical_type(value),
     }
 }
@@ -3372,6 +3376,37 @@ mod table_property_tests {
             err.contains("unsupported iceberg format-version"),
             "error was: {err}"
         );
+    }
+
+    #[test]
+    fn bitmap_hll_columns_are_persisted_as_logical_type_properties() {
+        let columns = vec![
+            crate::sql::parser::ast::TableColumnDef {
+                name: "bm".to_string(),
+                data_type: SqlType::Bitmap,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            },
+            crate::sql::parser::ast::TableColumnDef {
+                name: "hv".to_string(),
+                data_type: SqlType::Hll,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            },
+        ];
+
+        let props = build_logical_type_properties(&columns).expect("logical properties");
+        assert!(props.contains(&(
+            "novarocks.logical_type.bm".to_string(),
+            "bitmap".to_string()
+        )));
+        assert!(props.contains(&("novarocks.logical_type.hv".to_string(), "hll".to_string())));
+
+        let parsed = parse_logical_type_properties(&props.into_iter().collect()).expect("parse");
+        assert_eq!(parsed.get("bm"), Some(&SqlType::Bitmap));
+        assert_eq!(parsed.get("hv"), Some(&SqlType::Hll));
     }
 
     #[test]

@@ -5,9 +5,10 @@ pub(crate) mod types;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use prost::Message;
 
     use super::expr::encode_expr;
@@ -922,6 +923,135 @@ mod tests {
     }
 
     #[test]
+    fn stream_edge_patches_local_avg_exchange_schema_to_intermediate_type() {
+        let group_column = planner_output_column(2, "c0", DataType::Int64);
+        let value_column = planner_output_column(3, "c1", DataType::Int64);
+        let avg_column = planner_output_column(15, "avg(c1)", DataType::Float64);
+        let source_root = crate::sql::planner::DistributedNode {
+            node_id: 11,
+            fragment_id: 0,
+            tuple_ids: vec![11],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: vec![values_distributed_node(
+                0,
+                10,
+                vec![group_column.clone(), value_column.clone()],
+            )],
+            stats: physical_stats(),
+            payload: crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::HashAggregate(Box::new(
+                    crate::sql::planner::plan::PhysicalHashAggregateNode {
+                        mode: crate::sql::planner::AggMode::Local,
+                        group_by: vec![column_expr(2, "c0", DataType::Int64)],
+                        aggregates: vec![crate::sql::planner::plan::AggregateCall {
+                            name: "avg".to_string(),
+                            args: vec![column_expr(3, "c1", DataType::Int64)],
+                            distinct: false,
+                            result_type: DataType::Float64,
+                            order_by: Vec::new(),
+                            output_column_id: crate::sql::column_id::ColumnId::new_for_test(15),
+                        }],
+                        is_merge: vec![false],
+                        output_layout: crate::sql::planner::AggregateOutputLayout::new(
+                            vec![group_column.clone()],
+                            vec![avg_column.clone()],
+                        ),
+                        output_columns: Vec::new(),
+                    },
+                )),
+            ),
+        };
+        let source = crate::sql::planner::PlanFragment {
+            fragment_id: 0,
+            root: source_root,
+            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::DataSink::Noop,
+            output_exprs: None,
+            output_columns: vec![group_column.clone(), avg_column],
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        let receiver = crate::sql::planner::DistributedNode {
+            node_id: 42,
+            fragment_id: 1,
+            tuple_ids: vec![42],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: physical_stats(),
+            payload: crate::sql::planner::DistributedPayload::Exchange(
+                crate::sql::planner::ExchangeReceiver {
+                    partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 0,
+                    output_columns: Vec::new(),
+                    output_qualifier: None,
+                    flavor: crate::sql::planner::plan::ExchangeFlavor::Distribution,
+                },
+            ),
+        };
+        let target = crate::sql::planner::PlanFragment {
+            fragment_id: 1,
+            root: receiver,
+            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::DataSink::Result,
+            output_exprs: None,
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        let plan = crate::sql::planner::DistributedPlan {
+            fragments: vec![source, target],
+            root_fragment_id: 1,
+            edges: vec![crate::sql::codegen::FragmentEdge {
+                source_fragment_id: 0,
+                target_fragment_id: 1,
+                target_exchange_node_id: 42,
+                output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+                compact_output_partition: crate::thrift::partitions::TDataPartition::new(
+                    crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                    None::<Vec<crate::thrift::exprs::TExpr>>,
+                    None::<Vec<crate::thrift::partitions::TRangePartition>>,
+                    None::<Vec<crate::thrift::partitions::TBucketProperty>>,
+                ),
+                stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
+                edge_kind: crate::sql::codegen::FragmentEdgeKind::Stream,
+                output_slot_ids: vec![2, 15],
+            }],
+        };
+
+        let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let target_fragment = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 1)
+            .expect("target fragment");
+        let root = target_fragment.root.as_ref().expect("target root");
+        let Some(crate::proto::plan::distributed_node::Payload::Exchange(exchange)) =
+            root.payload.as_ref()
+        else {
+            panic!("expected exchange receiver");
+        };
+        assert_eq!(exchange.output_columns.len(), 2);
+        assert_eq!(exchange.output_columns[1].column_id, 15);
+        let avg_type = decode_type(
+            exchange.output_columns[1]
+                .r#type
+                .as_ref()
+                .expect("avg column type"),
+        )
+        .expect("decode avg column type");
+        assert_eq!(avg_type, DataType::Utf8);
+    }
+
+    #[test]
     fn iceberg_write_fragment_uses_sink_output_contract_for_duplicate_input_columns() {
         let mut sink_spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
         sink_spec.target_columns = vec![
@@ -1105,6 +1235,82 @@ mod tests {
             .fields[0];
         assert_eq!(field.initial_default_json.as_deref(), Some("5"));
         assert_eq!(field.write_default_json.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn native_scan_encoder_preserves_iceberg_list_write_defaults_from_arrow_metadata() {
+        let list_type = DataType::List(Arc::new(
+            Field::new("element", DataType::Int32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "4".to_string(),
+            )])),
+        ));
+        let table = crate::sql::catalog::TableDef {
+            name: "orders".to_string(),
+            columns: vec![crate::sql::catalog::ColumnDef {
+                name: "tags".to_string(),
+                data_type: list_type.clone(),
+                nullable: true,
+                write_default: Some(iceberg::spec::Literal::List(vec![])),
+                logical_type: None,
+            }],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: crate::sql::catalog::ScanSource::IcebergDataFiles {
+                table: crate::sql::catalog::IcebergTableInfo {
+                    catalog: "ice".to_string(),
+                    namespace: "db".to_string(),
+                    table: "orders".to_string(),
+                    table_uuid: Some("uuid-orders".to_string()),
+                    current_snapshot_id: Some(10),
+                    schema_id: 1,
+                    location: "s3://warehouse/db/orders".to_string(),
+                    schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+                    serialized_metadata: None,
+                    serialized_metadata_rows: None,
+                },
+                files: vec![],
+                cloud_properties: std::collections::BTreeMap::new(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            },
+        };
+        let scan = crate::sql::planner::DistributedNode {
+            node_id: 7,
+            fragment_id: 0,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: physical_stats(),
+            payload: crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::Scan(
+                    crate::sql::planner::plan::PlanScanNode {
+                        database: "db".to_string(),
+                        table,
+                        alias: None,
+                        columns: vec![planner_output_column(10, "tags", list_type)],
+                        predicates: Vec::new(),
+                        required_columns: None,
+                        variant_columns: Vec::new(),
+                        mv_rewritten_from: None,
+                    },
+                ),
+            ),
+        };
+
+        let encoded = plan::encode_node(&scan).expect("encode scan node");
+        let Some(crate::proto::plan::distributed_node::Payload::Physical(physical)) =
+            encoded.payload.as_ref()
+        else {
+            panic!("expected physical node");
+        };
+        let Some(crate::proto::plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
+            panic!("expected scan node");
+        };
+        let table = scan.table.as_ref().expect("table");
+
+        assert_eq!(table.columns[0].write_default_json.as_deref(), Some("[]"));
     }
 
     #[test]

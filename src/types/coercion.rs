@@ -209,9 +209,10 @@ pub(crate) fn decimal_compare_type(left: &DataType, right: &DataType) -> Result<
 /// Comparison operand common type. Single authority shared by analyzer,
 /// execution `normalize_comparison_types`, and lower binary_pred / join-key.
 /// `Ok(None)`: operands already equal, OR pair is out of scope (temporal,
-/// largeint, cross-family) and is left to the caller.
-/// `Ok(Some(t))`: numeric / decimal / string-numeric pair -> cast BOTH operands
-/// to `t`.
+/// largeint-decimal, cross-family) and is left to the caller.
+/// `Ok(Some(t))`: nullable / numeric / decimal / string-numeric pair, including
+/// same-shape complex containers whose nested scalar fields have a common type,
+/// -> cast BOTH operands to `t`.
 /// `Err`: decimal-compatible pair whose common precision exceeds Decimal256
 /// (> 76).
 pub(crate) fn comparison_common_type(
@@ -221,15 +222,26 @@ pub(crate) fn comparison_common_type(
     if left == right {
         return Ok(None);
     }
+    if left == &DataType::Null {
+        return Ok(Some(right.clone()));
+    }
+    if right == &DataType::Null {
+        return Ok(Some(left.clone()));
+    }
+    if let Some(common) = comparison_common_complex_type(left, right)? {
+        return Ok(Some(common));
+    }
     let is_int = |dt: &DataType| {
         matches!(
             dt,
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
         )
     };
+    let is_bool = |dt: &DataType| matches!(dt, DataType::Boolean);
     let is_float = |dt: &DataType| matches!(dt, DataType::Float32 | DataType::Float64);
     let int_as_zero_scale_decimal = |dt: &DataType| -> Option<DataType> {
         match dt {
+            DataType::Boolean => Some(DataType::Decimal128(1, 0)),
             DataType::Int8 => Some(DataType::Decimal128(3, 0)),
             DataType::Int16 => Some(DataType::Decimal128(5, 0)),
             DataType::Int32 => Some(DataType::Decimal128(10, 0)),
@@ -240,6 +252,19 @@ pub(crate) fn comparison_common_type(
     let is_decimal =
         |dt: &DataType| matches!(dt, DataType::Decimal128(_, _) | DataType::Decimal256(_, _));
 
+    if (is_largeint(left) && (is_int(right) || is_bool(right)))
+        || ((is_int(left) || is_bool(left)) && is_largeint(right))
+    {
+        return Ok(Some(DataType::FixedSizeBinary(
+            crate::common::largeint::LARGEINT_BYTE_WIDTH,
+        )));
+    }
+    if (is_bool(left) && is_int(right)) || (is_int(left) && is_bool(right)) {
+        return Ok(Some(DataType::Int64));
+    }
+    if (is_bool(left) && is_float(right)) || (is_float(left) && is_bool(right)) {
+        return Ok(Some(DataType::Float64));
+    }
     if is_int(left) && is_int(right) {
         return Ok(Some(DataType::Int64));
     }
@@ -277,10 +302,152 @@ pub(crate) fn comparison_common_type(
     Ok(None)
 }
 
+fn comparison_common_complex_type(
+    left: &DataType,
+    right: &DataType,
+) -> Result<Option<DataType>, String> {
+    match (left, right) {
+        (DataType::List(left_item), DataType::List(right_item)) => {
+            let Some((item, changed)) = comparison_common_field(left_item, right_item)? else {
+                return Ok(None);
+            };
+            Ok(changed.then(|| DataType::List(item)))
+        }
+        (DataType::LargeList(left_item), DataType::LargeList(right_item)) => {
+            let Some((item, changed)) = comparison_common_field(left_item, right_item)? else {
+                return Ok(None);
+            };
+            Ok(changed.then(|| DataType::LargeList(item)))
+        }
+        (
+            DataType::FixedSizeList(left_item, left_size),
+            DataType::FixedSizeList(right_item, right_size),
+        ) if left_size == right_size => {
+            let Some((item, changed)) = comparison_common_field(left_item, right_item)? else {
+                return Ok(None);
+            };
+            Ok(changed.then(|| DataType::FixedSizeList(item, *left_size)))
+        }
+        (DataType::Struct(left_fields), DataType::Struct(right_fields))
+            if left_fields.len() == right_fields.len() =>
+        {
+            comparison_common_struct_type(left_fields, right_fields)
+        }
+        (
+            DataType::Map(left_entries, left_ordered),
+            DataType::Map(right_entries, right_ordered),
+        ) if left_ordered == right_ordered => {
+            let Some((entries, changed)) = comparison_common_field(left_entries, right_entries)?
+            else {
+                return Ok(None);
+            };
+            Ok(changed.then(|| DataType::Map(entries, *left_ordered)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn comparison_common_struct_type(
+    left_fields: &Fields,
+    right_fields: &Fields,
+) -> Result<Option<DataType>, String> {
+    if let Some(fields) = comparison_common_struct_fields_by_name(left_fields, right_fields)? {
+        return Ok(Some(DataType::Struct(fields)));
+    }
+
+    let mut fields = Vec::with_capacity(left_fields.len());
+    let mut changed_any = left_fields
+        .iter()
+        .zip(right_fields.iter())
+        .any(|(left_field, right_field)| left_field.name() != right_field.name());
+    for (left_field, right_field) in left_fields.iter().zip(right_fields.iter()) {
+        let Some((field, changed)) = comparison_common_field(left_field, right_field)? else {
+            return Ok(None);
+        };
+        changed_any |= changed;
+        fields.push(field);
+    }
+    Ok(changed_any.then(|| DataType::Struct(Fields::from(fields))))
+}
+
+fn comparison_common_struct_fields_by_name(
+    left_fields: &Fields,
+    right_fields: &Fields,
+) -> Result<Option<Fields>, String> {
+    let right_by_name = right_fields
+        .iter()
+        .map(|field| (field.name().as_str(), field))
+        .collect::<std::collections::HashMap<_, _>>();
+    if left_fields
+        .iter()
+        .any(|field| !right_by_name.contains_key(field.name().as_str()))
+    {
+        return Ok(None);
+    }
+
+    let mut fields = Vec::with_capacity(left_fields.len());
+    let mut changed_any = left_fields
+        .iter()
+        .zip(right_fields.iter())
+        .any(|(left_field, right_field)| left_field.name() != right_field.name());
+    for left_field in left_fields {
+        let right_field = right_by_name
+            .get(left_field.name().as_str())
+            .expect("right field exists by name");
+        let Some((field, changed)) = comparison_common_field(left_field, right_field)? else {
+            return Ok(None);
+        };
+        changed_any |= changed;
+        fields.push(field);
+    }
+    Ok(changed_any.then(|| Fields::from(fields)))
+}
+
+fn comparison_common_field(
+    left: &Field,
+    right: &Field,
+) -> Result<Option<(Arc<Field>, bool)>, String> {
+    let data_type = if left.data_type() == right.data_type() {
+        left.data_type().clone()
+    } else if let Some(common) =
+        comparison_common_nested_field_type(left.data_type(), right.data_type())?
+    {
+        common
+    } else {
+        return Ok(None);
+    };
+    let nullable = left.is_nullable() || right.is_nullable();
+    let changed = left.name() != right.name()
+        || left.is_nullable() != nullable
+        || right.is_nullable() != nullable
+        || left.data_type() != &data_type
+        || right.data_type() != &data_type;
+    Ok(Some((
+        Arc::new(Field::new(left.name(), data_type, nullable)),
+        changed,
+    )))
+}
+
+fn comparison_common_nested_field_type(
+    left: &DataType,
+    right: &DataType,
+) -> Result<Option<DataType>, String> {
+    let common = comparison_common_type(left, right)?;
+    if common.is_some() && (is_string_type(left) || is_string_type(right)) {
+        return Ok(Some(wider_type(left, right)));
+    }
+    Ok(common)
+}
+
+fn is_string_type(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Utf8 | DataType::LargeUtf8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field, Fields};
+    use std::sync::Arc;
 
     #[test]
     fn comparison_common_type_numeric_and_decimal() {
@@ -375,6 +542,123 @@ mod tests {
         assert_eq!(
             comparison_common_type(&DataType::Utf8, &DataType::Date32),
             Ok(None)
+        );
+    }
+
+    #[test]
+    fn comparison_common_type_recurses_into_complex_shapes() {
+        assert_eq!(
+            comparison_common_type(
+                &DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                &DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Decimal128(10, 2),
+                    true
+                ))),
+            ),
+            Ok(Some(DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Decimal128(12, 2),
+                true
+            )))))
+        );
+
+        assert_eq!(
+            comparison_common_type(
+                &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                &DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Decimal128(10, 2),
+                    true
+                ))),
+            ),
+            Ok(Some(DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Utf8,
+                true
+            )))))
+        );
+
+        assert_eq!(
+            comparison_common_type(
+                &DataType::Struct(Fields::from(vec![
+                    Field::new("c0", DataType::Decimal128(16, 3), true),
+                    Field::new("c1", DataType::Utf8, true),
+                ])),
+                &DataType::Struct(Fields::from(vec![
+                    Field::new("c0", DataType::Int32, true),
+                    Field::new("c1", DataType::Utf8, true),
+                ])),
+            ),
+            Ok(Some(DataType::Struct(Fields::from(vec![
+                Field::new("c0", DataType::Decimal128(16, 3), true),
+                Field::new("c1", DataType::Utf8, true),
+            ]))))
+        );
+
+        let decimal_map = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("key", DataType::Decimal128(16, 3), false),
+                    Field::new("value", DataType::Utf8, true),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let int_map = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("key", DataType::Int32, false),
+                    Field::new("value", DataType::Utf8, true),
+                ])),
+                false,
+            )),
+            false,
+        );
+        assert_eq!(
+            comparison_common_type(&decimal_map, &int_map),
+            Ok(Some(decimal_map))
+        );
+    }
+
+    #[test]
+    fn comparison_common_type_boolean_null_and_largeint_edges() {
+        let largeint = DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH);
+
+        assert_eq!(
+            comparison_common_type(&DataType::Boolean, &DataType::Int64),
+            Ok(Some(DataType::Int64))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Int32, &DataType::Boolean),
+            Ok(Some(DataType::Int64))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Boolean, &DataType::Float64),
+            Ok(Some(DataType::Float64))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Boolean, &DataType::Decimal128(10, 2)),
+            Ok(Some(DataType::Decimal128(10, 2)))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Int64, &DataType::Null),
+            Ok(Some(DataType::Int64))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Null, &DataType::Boolean),
+            Ok(Some(DataType::Boolean))
+        );
+        assert_eq!(
+            comparison_common_type(&largeint, &DataType::Int64),
+            Ok(Some(largeint.clone()))
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Int32, &largeint),
+            Ok(Some(largeint))
         );
     }
 

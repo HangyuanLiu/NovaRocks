@@ -70,6 +70,7 @@ pub use change_event_expand_processor::ChangeEventExpandProcessorFactory;
 pub(crate) use data_stream_sink::DataStreamSinkFactory;
 pub use exchange_source::ExchangeSourceFactory;
 pub use fetch_processor::FetchProcessorFactory;
+pub(crate) use filter_processor::FilterEncodingPolicy;
 pub use filter_processor::FilterProcessorFactory;
 pub use hashjoin::{
     BroadcastJoinProbeProcessorFactory, HashJoinBuildSinkFactory,

@@ -106,6 +106,27 @@ impl ExprScope {
         self.by_id.iter()
     }
 
+    pub fn widen_tuple_nullable(&mut self, tuple_ids: &[i32]) {
+        if tuple_ids.is_empty() {
+            return;
+        }
+        for (_, binding) in &mut self.ordered {
+            if tuple_ids.contains(&binding.tuple_id) {
+                binding.nullable = true;
+            }
+        }
+        for binding in self.by_id.values_mut() {
+            if tuple_ids.contains(&binding.tuple_id) {
+                binding.nullable = true;
+            }
+        }
+        for binding in self.internal_by_name.values_mut() {
+            if tuple_ids.contains(&binding.tuple_id) {
+                binding.nullable = true;
+            }
+        }
+    }
+
     pub fn debug_id_bindings(&self) -> Vec<String> {
         self.by_id
             .iter()
@@ -213,6 +234,42 @@ mod tests {
         assert!(
             scope.resolve_internal_by_name("a").is_err(),
             "semantic columns are not implicit internal bindings"
+        );
+    }
+
+    #[test]
+    fn widen_tuple_nullable_updates_all_binding_channels() {
+        let mut scope = ExprScope::new();
+        let semantic_column_id = ColumnId::new_for_test(10);
+        scope.add_column_with_id(
+            semantic_column_id,
+            None,
+            "a".to_string(),
+            binding(20, DataType::Int32),
+        );
+        scope.add_internal_column("__row_id__".to_string(), binding(21, DataType::Int64));
+
+        scope.widen_tuple_nullable(&[1]);
+
+        assert!(
+            scope
+                .resolve_by_id(semantic_column_id)
+                .expect("semantic binding")
+                .nullable
+        );
+        assert!(
+            scope
+                .iter_columns()
+                .next()
+                .expect("ordered binding")
+                .1
+                .nullable
+        );
+        assert!(
+            scope
+                .resolve_internal_by_name("__row_id__")
+                .expect("internal binding")
+                .nullable
         );
     }
 }

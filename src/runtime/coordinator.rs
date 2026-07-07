@@ -46,6 +46,7 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::codegen::{
     FragmentEdge, FragmentEdgeKind, FragmentId, MultiFragmentBuildResult, RuntimeFilterPlanResult,
 };
+use crate::sql::column_id::ColumnId;
 use crate::thrift::data_sinks;
 use crate::thrift::partitions;
 use crate::thrift::planner;
@@ -264,10 +265,16 @@ impl ExecutionCoordinator {
             }
         }
         // CTE id -> native consumer sidecars: (consumer_fragment_id, exchange_node_id,
-        // native partition, output_slot_ids).
+        // native partition, output_slot_ids, logical producer column ids).
         let mut cte_consumers: BTreeMap<
             CteId,
-            Vec<(FragmentId, i32, crate::proto::plan::DataPartition, Vec<i32>)>,
+            Vec<(
+                FragmentId,
+                i32,
+                crate::proto::plan::DataPartition,
+                Vec<i32>,
+                Vec<ColumnId>,
+            )>,
         > = BTreeMap::new();
         // CTE id -> compact thrift consumers used only for TMultiCastDataStreamSink.
         let mut compact_cte_consumers: BTreeMap<CteId, Vec<CompactCteConsumer>> = BTreeMap::new();
@@ -275,7 +282,10 @@ impl ExecutionCoordinator {
         for e in &edges {
             match &e.edge_kind {
                 FragmentEdgeKind::Stream => {}
-                FragmentEdgeKind::CteMulticast { cte_id, .. } => {
+                FragmentEdgeKind::CteMulticast {
+                    cte_id,
+                    receive_producer_column_ids,
+                } => {
                     let native_partition =
                         crate::sql::codegen::proto_encode::plan::encode_data_partition(
                             &e.output_partition,
@@ -285,6 +295,7 @@ impl ExecutionCoordinator {
                         e.target_exchange_node_id,
                         native_partition,
                         e.output_slot_ids.clone(),
+                        receive_producer_column_ids.clone(),
                     ));
                     compact_cte_consumers
                         .entry(*cte_id)
@@ -302,11 +313,11 @@ impl ExecutionCoordinator {
         // CTE consumers may also be expressed via `cte_exchange_nodes` on the
         // consumer fragment when no explicit edge carries them.
         for fr in &fragment_results {
-            for (cte_id, exchange_node_id, _receive_producer_column_ids) in &fr.cte_exchange_nodes {
+            for (cte_id, exchange_node_id, receive_producer_column_ids) in &fr.cte_exchange_nodes {
                 let consumers = cte_consumers.entry(*cte_id).or_default();
                 if !consumers
                     .iter()
-                    .any(|(fid, nid, _, _)| *fid == fr.fragment_id && *nid == *exchange_node_id)
+                    .any(|(fid, nid, _, _, _)| *fid == fr.fragment_id && *nid == *exchange_node_id)
                 {
                     consumers.push((
                         fr.fragment_id,
@@ -316,6 +327,7 @@ impl ExecutionCoordinator {
                             exprs: Vec::new(),
                         },
                         Vec::new(),
+                        receive_producer_column_ids.clone(),
                     ));
                 }
                 let compact_consumers = compact_cte_consumers.entry(*cte_id).or_default();
@@ -1602,7 +1614,13 @@ fn patch_native_cte_multicast_sink(
     fragment: &mut crate::proto::plan::PlanFragment,
     fragment_id: FragmentId,
     cte_id: CteId,
-    consumers: &[(FragmentId, i32, crate::proto::plan::DataPartition, Vec<i32>)],
+    consumers: &[(
+        FragmentId,
+        i32,
+        crate::proto::plan::DataPartition,
+        Vec<i32>,
+        Vec<ColumnId>,
+    )],
     consumer_dests: &BTreeMap<FragmentId, Vec<crate::runtime::endpoint::FragmentDestination>>,
 ) -> Result<(), String> {
     if consumers.is_empty() {
@@ -1610,11 +1628,26 @@ fn patch_native_cte_multicast_sink(
     }
     let mut sinks = Vec::with_capacity(consumers.len());
     let mut destinations = Vec::with_capacity(consumers.len());
-    for (consumer_fragment_id, exchange_node_id, partition, output_slot_ids) in consumers {
+    for (
+        consumer_fragment_id,
+        exchange_node_id,
+        partition,
+        output_slot_ids,
+        receive_producer_column_ids,
+    ) in consumers
+    {
+        let sink_output_columns = native_cte_multicast_sink_output_columns(
+            fragment,
+            cte_id,
+            *consumer_fragment_id,
+            *exchange_node_id,
+            output_slot_ids,
+            receive_producer_column_ids,
+        )?;
         sinks.push(crate::proto::plan::DataStreamSink {
             dest_node_id: *exchange_node_id,
             output_partition: Some(partition.clone()),
-            output_columns: output_slot_ids.clone(),
+            output_columns: sink_output_columns,
             limit: None,
         });
         let dests = consumer_dests.get(consumer_fragment_id).ok_or_else(|| {
@@ -1662,6 +1695,135 @@ fn native_stream_destination(
         }),
         endpoint: src.endpoint().as_host_port(),
     }
+}
+
+fn native_cte_multicast_sink_output_columns(
+    fragment: &crate::proto::plan::PlanFragment,
+    cte_id: CteId,
+    consumer_fragment_id: FragmentId,
+    exchange_node_id: i32,
+    requested_output_slot_ids: &[i32],
+    receive_producer_column_ids: &[ColumnId],
+) -> Result<Vec<i32>, String> {
+    if requested_output_slot_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let root_columns =
+        crate::sql::codegen::proto_encode::plan::encoded_fragment_root_output_columns(fragment)?;
+    let root_slot_ids = root_columns
+        .iter()
+        .map(|column| {
+            i32::try_from(column.column_id).map_err(|_| {
+                format!(
+                    "native CTE source output column {} cannot convert to slot id",
+                    column.column_id
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let root_slot_id_set = root_slot_ids.iter().copied().collect::<BTreeSet<_>>();
+    if requested_output_slot_ids
+        .iter()
+        .all(|slot_id| root_slot_id_set.contains(slot_id))
+    {
+        return Ok(requested_output_slot_ids.to_vec());
+    }
+    if receive_producer_column_ids.len() == requested_output_slot_ids.len()
+        && let Some(mapped) = receive_producer_column_ids
+            .iter()
+            .map(|column_id| {
+                let slot_id = i32::try_from(column_id.0).ok()?;
+                root_slot_id_set.contains(&slot_id).then_some(slot_id)
+            })
+            .collect::<Option<Vec<_>>>()
+    {
+        return Ok(mapped);
+    }
+    let contract_slot_map =
+        native_cte_multicast_contract_slot_map(fragment, &root_columns, &root_slot_id_set);
+    if let Some(mapped) = requested_output_slot_ids
+        .iter()
+        .map(|slot_id| contract_slot_map.get(slot_id).copied())
+        .collect::<Option<Vec<_>>>()
+    {
+        return Ok(mapped);
+    }
+    if requested_output_slot_ids.len() == root_slot_ids.len() {
+        return Ok(root_slot_ids);
+    }
+    Err(format!(
+        "native CTE multicast sink output columns for cte_id={cte_id} consumer_fragment={consumer_fragment_id} exchange_node_id={exchange_node_id} ({requested_output_slot_ids:?}) do not match source root output columns ({root_slot_ids:?})"
+    ))
+}
+
+fn native_cte_multicast_contract_slot_map(
+    fragment: &crate::proto::plan::PlanFragment,
+    root_columns: &[crate::proto::common::OutputColumn],
+    root_slot_id_set: &BTreeSet<i32>,
+) -> BTreeMap<i32, i32> {
+    let mut map = BTreeMap::new();
+
+    if fragment.output_exprs.len() == fragment.output_columns.len() {
+        for (output, expr) in fragment
+            .output_columns
+            .iter()
+            .zip(fragment.output_exprs.iter())
+        {
+            let Some(crate::proto::expr::expr::Kind::ColumnRef(column_ref)) = expr.kind.as_ref()
+            else {
+                continue;
+            };
+            let Ok(contract_id) = i32::try_from(output.column_id) else {
+                continue;
+            };
+            let Ok(root_id) = i32::try_from(column_ref.column_id) else {
+                continue;
+            };
+            if root_slot_id_set.contains(&root_id) {
+                map.insert(contract_id, root_id);
+            }
+        }
+    }
+
+    for output in &fragment.output_columns {
+        let Ok(contract_id) = i32::try_from(output.column_id) else {
+            continue;
+        };
+        if map.contains_key(&contract_id) {
+            continue;
+        }
+        let mut matches = root_columns.iter().filter(|root| {
+            root.name == output.name
+                && root.nullable == output.nullable
+                && root.r#type == output.r#type
+        });
+        let Some(root) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_some() {
+            continue;
+        }
+        if let Ok(root_id) = i32::try_from(root.column_id) {
+            map.insert(contract_id, root_id);
+        }
+    }
+
+    if fragment.output_columns.len() <= root_columns.len() {
+        for (output, root) in fragment.output_columns.iter().zip(root_columns.iter()) {
+            let Ok(contract_id) = i32::try_from(output.column_id) else {
+                continue;
+            };
+            if map.contains_key(&contract_id) {
+                continue;
+            }
+            if let Ok(root_id) = i32::try_from(root.column_id) {
+                map.insert(contract_id, root_id);
+            }
+        }
+    }
+
+    map
 }
 
 /// Assemble the per-instance runtime filter routing params from
@@ -3362,6 +3524,16 @@ mod tests {
         );
     }
 
+    fn fake_destination(
+        finst_lo: i64,
+        host: &str,
+    ) -> crate::runtime::endpoint::FragmentDestination {
+        crate::runtime::endpoint::FragmentDestination::new(
+            types::TUniqueId::new(11, finst_lo),
+            crate::runtime::endpoint::RuntimeEndpoint::new(host, 9010).expect("test endpoint"),
+        )
+    }
+
     fn is_write_sink_for_test(
         params: &crate::thrift::internal_service::TExecPlanFragmentParams,
     ) -> bool {
@@ -3937,6 +4109,184 @@ mod tests {
             err.contains("missing output_partition from native encoder"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn native_cte_multicast_patch_uses_source_root_output_slots() {
+        use crate::proto::{common, expr, plan as native_plan};
+
+        fn native_scalar_type(prim: common::PrimitiveType) -> common::TypeDesc {
+            common::TypeDesc {
+                kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+                    r#type: prim as i32,
+                    len: None,
+                    precision: None,
+                    scale: None,
+                    time_unit: None,
+                })),
+            }
+        }
+
+        let mut fragment = native_plan::PlanFragment {
+            fragment_id: 1,
+            root: Some(native_plan::DistributedNode {
+                node_id: 5,
+                fragment_id: 1,
+                tuple_ids: Vec::new(),
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: Vec::new(),
+                payload: Some(native_plan::distributed_node::Payload::Physical(
+                    native_plan::PlanNode {
+                        output_columns: Vec::new(),
+                        kind: Some(native_plan::plan_node::Kind::Project(
+                            native_plan::ProjectNode {
+                                items: vec![native_plan::ProjectItem {
+                                    expr: Some(expr::Expr {
+                                        r#type: Some(native_scalar_type(
+                                            common::PrimitiveType::Bigint,
+                                        )),
+                                        nullable: true,
+                                        kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                                            column_id: 20,
+                                            qualifier: None,
+                                            column: Some("sum(income)".to_string()),
+                                        })),
+                                    }),
+                                    output_name: "total".to_string(),
+                                    output_column_id: 10,
+                                }],
+                                output_qualifier: None,
+                            },
+                        )),
+                    },
+                )),
+            }),
+            data_partition: Some(native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            }),
+            output_partition: Some(native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            }),
+            sink: None,
+            output_exprs: Vec::new(),
+            output_columns: Vec::new(),
+            cte_id: Some(3),
+            cte_exchange_nodes: Vec::new(),
+        };
+        let consumers = vec![(
+            2,
+            77,
+            native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            },
+            vec![13],
+            vec![ColumnId::new_for_test(13)],
+        )];
+        let destinations = BTreeMap::from([(2, vec![fake_destination(200, "10.0.0.20")])]);
+
+        patch_native_cte_multicast_sink(&mut fragment, 1, 3, &consumers, &destinations)
+            .expect("patch native cte sink");
+
+        let Some(native_plan::data_sink::Kind::MultiCastDataStream(sink)) =
+            fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+        else {
+            panic!("expected native multicast sink");
+        };
+        assert_eq!(sink.sinks.len(), 1);
+        assert_eq!(sink.sinks[0].output_columns, vec![10]);
+    }
+
+    #[test]
+    fn native_cte_multicast_patch_maps_contract_subset_to_source_root_slots() {
+        use crate::proto::{common, plan as native_plan};
+
+        fn native_scalar_type(prim: common::PrimitiveType) -> common::TypeDesc {
+            common::TypeDesc {
+                kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+                    r#type: prim as i32,
+                    len: None,
+                    precision: None,
+                    scale: None,
+                    time_unit: None,
+                })),
+            }
+        }
+
+        fn native_output_column(column_id: u32, name: &str) -> common::OutputColumn {
+            common::OutputColumn {
+                column_id,
+                name: name.to_string(),
+                r#type: Some(native_scalar_type(common::PrimitiveType::Bigint)),
+                nullable: false,
+                is_internal: false,
+            }
+        }
+
+        let root_a = native_output_column(1, "a");
+        let root_b = native_output_column(2, "b");
+        let root_c = native_output_column(3, "c");
+        let mut fragment = native_plan::PlanFragment {
+            fragment_id: 1,
+            root: Some(native_plan::DistributedNode {
+                node_id: 5,
+                fragment_id: 1,
+                tuple_ids: Vec::new(),
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: Vec::new(),
+                payload: Some(native_plan::distributed_node::Payload::Physical(
+                    native_plan::PlanNode {
+                        output_columns: vec![root_a, root_b, root_c],
+                        kind: Some(native_plan::plan_node::Kind::Filter(
+                            native_plan::FilterNode { predicate: None },
+                        )),
+                    },
+                )),
+            }),
+            data_partition: Some(native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            }),
+            output_partition: Some(native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            }),
+            sink: None,
+            output_exprs: Vec::new(),
+            output_columns: vec![native_output_column(6, "a"), native_output_column(8, "c")],
+            cte_id: Some(3),
+            cte_exchange_nodes: Vec::new(),
+        };
+        let consumers = vec![(
+            2,
+            77,
+            native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            },
+            vec![6, 8],
+            vec![ColumnId::new_for_test(1), ColumnId::new_for_test(3)],
+        )];
+        let destinations = BTreeMap::from([(2, vec![fake_destination(200, "10.0.0.20")])]);
+
+        patch_native_cte_multicast_sink(&mut fragment, 1, 3, &consumers, &destinations)
+            .expect("patch native cte sink");
+
+        let Some(native_plan::data_sink::Kind::MultiCastDataStream(sink)) =
+            fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+        else {
+            panic!("expected native multicast sink");
+        };
+        assert_eq!(sink.sinks.len(), 1);
+        assert_eq!(sink.sinks[0].output_columns, vec![1, 3]);
     }
 
     #[test]

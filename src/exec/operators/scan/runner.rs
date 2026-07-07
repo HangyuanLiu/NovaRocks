@@ -34,10 +34,11 @@ use super::types::{
 };
 use crate::common::failpoint;
 use crate::connector::iceberg::equality_delete::{EqualityDeleteSet, equality_delete_keep_mask};
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema, hydrate_dictionary_columns_except};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanNode};
+use crate::exec::operators::FilterEncodingPolicy;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::exec::row_position::LakeRowPositionSpec;
@@ -136,6 +137,7 @@ pub(super) struct ScanAsyncRunner {
     runtime_filter_ctx: Option<Arc<RuntimeFilterContext>>,
     runtime_filters_loaded: bool,
     conjunct_predicate: Option<ExprId>,
+    conjunct_encoding_policy: Option<FilterEncodingPolicy>,
     arena: Arc<ExprArena>,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     last_progress: Instant,
@@ -312,8 +314,12 @@ impl ScanAsyncRunner {
         profiles: Option<crate::runtime::profile::OperatorProfiles>,
         driver_id: i32,
     ) -> Self {
+        let conjunct_predicate = scan.conjunct_predicate();
+        let conjunct_encoding_policy = conjunct_predicate
+            .map(|predicate| FilterEncodingPolicy::from_predicate(&arena, predicate));
         Self {
-            conjunct_predicate: scan.conjunct_predicate(),
+            conjunct_predicate,
+            conjunct_encoding_policy,
             name,
             scan,
             dispatch,
@@ -673,6 +679,14 @@ impl ScanAsyncRunner {
         if chunk.is_empty() {
             return Ok(Some(chunk));
         }
+
+        let chunk = if let Some(policy) = self.conjunct_encoding_policy.as_ref() {
+            hydrate_dictionary_columns_except(&chunk, |slot_id, data_type| {
+                policy.accepts_encoded_column(slot_id, data_type)
+            })?
+        } else {
+            chunk
+        };
 
         let predicate_array = self
             .arena
@@ -1660,6 +1674,7 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::exec::expr::function::FunctionKind;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::node::BoxedExecIter;
     use crate::exec::node::scan::{
@@ -1912,6 +1927,11 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct SingleChunkScanOp {
+        chunk: Chunk,
+    }
+
+    #[derive(Clone)]
     struct RuntimeFilterRecordingScanOp {
         observed_min_max_counts: Arc<Mutex<Vec<usize>>>,
     }
@@ -1986,6 +2006,37 @@ mod tests {
                     first_row_id: None,
                     data_sequence_number: None,
                     ivm_change_op: self.ivm_change_op,
+                    included_positions: None,
+                    external_datacache: None,
+                    delete_files: Vec::new(),
+                    iceberg_file_pruning: None,
+                }],
+                false,
+            ))
+        }
+    }
+
+    impl ScanOp for SingleChunkScanOp {
+        fn execute_iter(
+            &self,
+            _morsel: ScanMorsel,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _runtime_filters: Option<&RuntimeFilterContext>,
+        ) -> Result<BoxedExecIter, String> {
+            Ok(Box::new(std::iter::once(Ok(self.chunk.clone()))))
+        }
+
+        fn build_morsels(&self) -> Result<ScanMorsels, String> {
+            Ok(ScanMorsels::new(
+                vec![ScanMorsel::FileRange {
+                    path: "test".to_string(),
+                    file_len: 0,
+                    offset: 0,
+                    length: 0,
+                    scan_range_id: -1,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    ivm_change_op: None,
                     included_positions: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
@@ -2943,6 +2994,67 @@ mod tests {
             runner.next_chunk().expect("scan eof").is_none(),
             "runner should reach EOF after single morsel"
         );
+    }
+
+    #[test]
+    fn scan_conjunct_like_hydrates_dictionary_input() {
+        let mut arena = ExprArena::default();
+        let status = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let pattern = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("P%".to_string())),
+            DataType::Utf8,
+        );
+        let predicate = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Like,
+                args: vec![status, pattern],
+            },
+            DataType::Boolean,
+        );
+        let arena = Arc::new(arena);
+
+        let chunk = dictionary_status_chunk(
+            vec![Some(0), Some(1), Some(2), None],
+            Arc::new(StringArray::from(vec!["PAID", "PENDING", "web"])),
+        );
+        let scan_schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            DataType::Utf8,
+            true,
+        )]));
+        let scan = ScanNode::new(Arc::new(SingleChunkScanOp { chunk }))
+            .with_node_id(1)
+            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]))
+            .with_conjunct_predicate(Some(predicate));
+        let morsels = scan.build_morsels().expect("build morsels");
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            morsels.morsels,
+            morsels.has_more,
+        )));
+
+        let mut runner = ScanAsyncRunner::new(
+            "scan".to_string(),
+            scan,
+            dispatch,
+            SharedRuntimeFilterDecision::new(),
+            None,
+            HashMap::new(),
+            0,
+            arena,
+            None,
+            0,
+        );
+
+        let output = runner
+            .next_chunk()
+            .expect("scan next chunk")
+            .expect("scan chunk");
+
+        assert_eq!(
+            output_strings(&output),
+            vec![Some("PAID".to_string()), Some("PENDING".to_string())]
+        );
+        assert_eq!(output.columns()[0].data_type(), &DataType::Utf8);
     }
 
     #[test]

@@ -468,7 +468,9 @@ fn maybe_lookup_wire_hook(
 
 #[cfg(test)]
 pub(crate) fn test_hook_lock() -> std::sync::MutexGuard<'static, ()> {
-    test_hook_mutex().lock().expect("test hook global lock")
+    test_hook_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]

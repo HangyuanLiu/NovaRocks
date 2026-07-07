@@ -21,7 +21,9 @@ use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
 use crate::lower::compact::expr::lower_t_expr;
-use crate::lower::compact::layout::{Layout, chunk_schema_for_layout};
+use crate::lower::compact::layout::{
+    Layout, chunk_schema_for_layout, chunk_schema_for_layout_with_nullable_tuples,
+};
 use crate::lower::compact::node::Lowered;
 
 use crate::thrift::{descriptors, plan_nodes, types};
@@ -119,7 +121,12 @@ pub(crate) fn lower_nestloop_join_node(
     };
     let left_chunk_schema = chunk_schema_for_layout(desc_tbl, &left.layout)?;
     let right_chunk_schema = chunk_schema_for_layout(desc_tbl, &right.layout)?;
-    let join_scope_chunk_schema = chunk_schema_for_layout(desc_tbl, &layout)?;
+    let join_scope_chunk_schema = chunk_schema_for_layout_with_nullable_tuples(
+        desc_tbl,
+        &layout,
+        &node.row_tuples,
+        &node.nullable_tuples,
+    )?;
 
     Ok(Lowered {
         node: ExecNode {

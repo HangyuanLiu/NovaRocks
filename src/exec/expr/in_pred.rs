@@ -156,6 +156,64 @@ fn eq_dictionary_input_with_candidate(
     .map_err(|e| e.to_string())
 }
 
+fn is_signed_integer_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
+}
+
+fn signed_integer_value(array: &ArrayRef, row: usize) -> Result<i64, String> {
+    match array.data_type() {
+        DataType::Int8 => Ok(array
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .ok_or_else(|| "failed to downcast signed IN value to Int8Array".to_string())?
+            .value(row) as i64),
+        DataType::Int16 => Ok(array
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .ok_or_else(|| "failed to downcast signed IN value to Int16Array".to_string())?
+            .value(row) as i64),
+        DataType::Int32 => Ok(array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| "failed to downcast signed IN value to Int32Array".to_string())?
+            .value(row) as i64),
+        DataType::Int64 => Ok(array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| "failed to downcast signed IN value to Int64Array".to_string())?
+            .value(row)),
+        other => Err(format!("unsupported signed IN value type: {other:?}")),
+    }
+}
+
+fn eq_signed_integer_input_with_candidate(
+    array: &ArrayRef,
+    candidate: &ArrayRef,
+) -> Result<Option<BooleanArray>, String> {
+    if !is_signed_integer_type(array.data_type())
+        || !is_signed_integer_type(candidate.data_type())
+        || (candidate.len() != 1 && candidate.len() != array.len())
+    {
+        return Ok(None);
+    }
+
+    let mut builder = BooleanBuilder::with_capacity(array.len());
+    for row in 0..array.len() {
+        let candidate_row = row_index(row, candidate.len());
+        if array.is_null(row) || candidate.is_null(candidate_row) {
+            builder.append_null();
+            continue;
+        }
+        builder.append_value(
+            signed_integer_value(array, row)? == signed_integer_value(candidate, candidate_row)?,
+        );
+    }
+    Ok(Some(builder.finish()))
+}
+
 fn eq_with_candidate(
     array: &ArrayRef,
     candidate: &ArrayRef,
@@ -215,6 +273,9 @@ fn eq_with_candidate(
             &candidate.as_ref() as &dyn arrow::array::Datum,
         )
         .map_err(|e| e.to_string());
+    }
+    if let Some(result) = eq_signed_integer_input_with_candidate(array, candidate)? {
+        return Ok(result);
     }
     match candidate.data_type() {
         DataType::Int8 => {
@@ -985,6 +1046,43 @@ mod tests {
                 || err.contains("not support")
                 || err.contains("unsupported"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn int32_in_int64_literal_list_compares_by_signed_value() {
+        let input = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(2),
+            None,
+            Some(i32::MAX),
+        ])) as ArrayRef;
+        let chunk = create_test_chunk_status_array(input);
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let one = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
+        let max = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Int64(i32::MAX as i64)),
+            DataType::Int64,
+        );
+        let too_large = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Int64(i32::MAX as i64 + 1)),
+            DataType::Int64,
+        );
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![one, max, too_large],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+
+        let result = arena.eval(expr, &chunk).expect("integer IN coercion");
+
+        assert_eq!(
+            bool_values(&result),
+            vec![Some(true), Some(false), None, Some(true)]
         );
     }
 

@@ -17,15 +17,19 @@
 
 //! Proto expression lowering.
 
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use arrow_buffer::i256;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use super::decode_type;
 use super::layout::Layout;
+use super::{decode_field_type, decode_type};
 use crate::common::ids::SlotId;
+use crate::exec::chunk::ChunkFieldSchema;
 use crate::exec::expr::function::{FunctionKind, function_metadata, lookup_function};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::proto::{common, expr};
+use crate::types::comparison_common_type;
 
 #[allow(dead_code)]
 pub(crate) fn lower_proto_expr(
@@ -39,7 +43,7 @@ pub(crate) fn lower_proto_expr(
         .as_ref()
         .ok_or_else(|| "Expr.kind missing".to_string())?;
 
-    match kind {
+    let id = match kind {
         expr::expr::Kind::ColumnRef(column) => {
             let slot_id = input_layout.resolve_column_id(column.column_id)?;
             Ok(arena.push_typed(ExprNode::SlotId(slot_id), data_type))
@@ -84,12 +88,11 @@ pub(crate) fn lower_proto_expr(
             let slot_id = SlotId::try_from(param.slot_id)?;
             Ok(arena.push_typed(ExprNode::SlotId(slot_id), data_type))
         }
-        expr::expr::Kind::Lambda(_) => Err(
-            "native scalar expr lowering does not lower Lambda; lambda parameter slot ids are not carried by LambdaExpr"
-                .to_string(),
-        ),
+        expr::expr::Kind::Lambda(lambda) => lower_lambda(lambda, arena, input_layout, data_type),
         expr::expr::Kind::Nested(nested) => lower_nested(nested, arena, input_layout, data_type),
-    }
+    }?;
+    set_proto_field_schema(e, arena, id);
+    Ok(id)
 }
 
 fn decode_expr_type(e: &expr::Expr) -> Result<DataType, String> {
@@ -98,6 +101,18 @@ fn decode_expr_type(e: &expr::Expr) -> Result<DataType, String> {
         .as_ref()
         .ok_or_else(|| "Expr.type missing".to_string())?;
     decode_type(desc).map_err(|err| format!("Expr.type decode failed: {err}"))
+}
+
+fn set_proto_field_schema(e: &expr::Expr, arena: &mut ExprArena, id: ExprId) {
+    let Some(desc) = e.r#type.as_ref() else {
+        return;
+    };
+    let Ok(field) = decode_field_type("_expr", e.nullable, desc) else {
+        return;
+    };
+    if let Ok(field_schema) = ChunkFieldSchema::from_field(&field) {
+        arena.set_field_schema(id, field_schema);
+    }
 }
 
 fn lower_required_child(
@@ -217,6 +232,9 @@ fn lower_function_call(
     if call.function_name == "__array_literal" {
         return lower_array_literal(call, arena, input_layout, data_type);
     }
+    if call.function_name.eq_ignore_ascii_case("map") {
+        return lower_map_constructor(call, arena, input_layout, data_type);
+    }
     let kind = lookup_function(&call.function_name).ok_or_else(|| {
         format!(
             "unsupported native scalar function '{}'",
@@ -241,6 +259,101 @@ fn lower_array_literal(
     }
     let elements = lower_expr_list(&call.args, arena, input_layout)?;
     Ok(arena.push_typed(ExprNode::ArrayExpr { elements }, data_type))
+}
+
+fn lower_map_constructor(
+    call: &expr::FunctionCall,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+    data_type: DataType,
+) -> Result<ExprId, String> {
+    if !call.args.len().is_multiple_of(2) {
+        return Err(format!(
+            "MAP constructor expects an even number of arguments, got {}",
+            call.args.len()
+        ));
+    }
+
+    let DataType::Map(entry_field, _) = &data_type else {
+        return Err(format!(
+            "MAP constructor expects MAP output type, got {data_type:?}"
+        ));
+    };
+    let DataType::Struct(entry_fields) = entry_field.data_type() else {
+        return Err("MAP constructor entries type must be Struct".to_string());
+    };
+    if entry_fields.len() != 2 {
+        return Err(format!(
+            "MAP constructor entries type must have 2 fields, got {}",
+            entry_fields.len()
+        ));
+    }
+
+    let expected_key_type = entry_fields[0].data_type().clone();
+    let expected_value_type = entry_fields[1].data_type().clone();
+    let mut key_elements = Vec::with_capacity(call.args.len() / 2);
+    let mut value_elements = Vec::with_capacity(call.args.len() / 2);
+
+    for (idx, arg) in call.args.iter().enumerate() {
+        let child = lower_proto_expr(arg, arena, input_layout)?;
+        if idx % 2 == 0 {
+            key_elements.push(coerce_map_constructor_child(
+                arena,
+                child,
+                &expected_key_type,
+                idx,
+                "key",
+            )?);
+        } else {
+            value_elements.push(coerce_map_constructor_child(
+                arena,
+                child,
+                &expected_value_type,
+                idx,
+                "value",
+            )?);
+        }
+    }
+
+    let keys_array = arena.push_typed(
+        ExprNode::ArrayExpr {
+            elements: key_elements,
+        },
+        DataType::List(Arc::new(Field::new("item", expected_key_type, true))),
+    );
+    let values_array = arena.push_typed(
+        ExprNode::ArrayExpr {
+            elements: value_elements,
+        },
+        DataType::List(Arc::new(Field::new("item", expected_value_type, true))),
+    );
+
+    Ok(arena.push_typed(
+        ExprNode::FunctionCall {
+            kind: FunctionKind::Map("map"),
+            args: vec![keys_array, values_array],
+        },
+        data_type,
+    ))
+}
+
+fn coerce_map_constructor_child(
+    arena: &mut ExprArena,
+    child: ExprId,
+    expected_type: &DataType,
+    arg_idx: usize,
+    role: &str,
+) -> Result<ExprId, String> {
+    let child_type = arena.data_type(child).cloned().ok_or_else(|| {
+        format!(
+            "MAP constructor missing {role} child type at pair {}",
+            arg_idx / 2
+        )
+    })?;
+    if &child_type == expected_type || matches!(expected_type, DataType::Null) {
+        return Ok(child);
+    }
+    Ok(arena.push_typed(ExprNode::Cast(child), expected_type.clone()))
 }
 
 fn lower_cast(
@@ -336,8 +449,14 @@ fn lower_in_list(
     input_layout: &Layout,
     data_type: DataType,
 ) -> Result<ExprId, String> {
-    let child = lower_required_child(&in_list.operand, "InList.operand", arena, input_layout)?;
-    let values = lower_expr_list(&in_list.list, arena, input_layout)?;
+    let mut child = lower_required_child(&in_list.operand, "InList.operand", arena, input_layout)?;
+    let mut values = lower_expr_list(&in_list.list, arena, input_layout)?;
+    if let Some(compare_type) = in_list_comparison_type(arena, child, &values)? {
+        child = cast_to_type_if_needed(arena, child, &compare_type)?;
+        for value in &mut values {
+            *value = cast_to_type_if_needed(arena, *value, &compare_type)?;
+        }
+    }
     Ok(arena.push_typed(
         ExprNode::In {
             child,
@@ -346,6 +465,70 @@ fn lower_in_list(
         },
         data_type,
     ))
+}
+
+fn in_list_comparison_type(
+    arena: &ExprArena,
+    child: ExprId,
+    values: &[ExprId],
+) -> Result<Option<DataType>, String> {
+    let mut compare_type = arena
+        .data_type(child)
+        .cloned()
+        .ok_or_else(|| "IN list operand missing data type".to_string())?;
+    let mut changed = false;
+
+    for value in values {
+        let value_type = arena
+            .data_type(*value)
+            .ok_or_else(|| "IN list value missing data type".to_string())?;
+        if value_type == &compare_type {
+            continue;
+        }
+        let common_type = if is_string_type(&compare_type) && is_numeric_type(value_type) {
+            compare_type.clone()
+        } else if let Some(common_type) = comparison_common_type(&compare_type, value_type)? {
+            common_type
+        } else {
+            return Ok(None);
+        };
+        changed |= common_type != compare_type || value_type != &common_type;
+        compare_type = common_type;
+    }
+
+    Ok(changed.then_some(compare_type))
+}
+
+fn is_string_type(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Utf8 | DataType::LargeUtf8)
+}
+
+fn is_numeric_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
+}
+
+fn cast_to_type_if_needed(
+    arena: &mut ExprArena,
+    expr: ExprId,
+    target_type: &DataType,
+) -> Result<ExprId, String> {
+    let source_type = arena
+        .data_type(expr)
+        .ok_or_else(|| "expression missing data type for implicit cast".to_string())?;
+    if source_type == target_type {
+        return Ok(expr);
+    }
+    Ok(arena.push_typed(ExprNode::Cast(expr), target_type.clone()))
 }
 
 fn lower_between(
@@ -450,6 +633,328 @@ fn lower_is_truth(
     } else {
         Ok(arena.push_typed(ExprNode::Not(child), DataType::Boolean))
     }
+}
+
+fn lower_lambda(
+    lambda: &expr::LambdaExpr,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+    data_type: DataType,
+) -> Result<ExprId, String> {
+    let body_expr = lambda
+        .body
+        .as_ref()
+        .ok_or_else(|| "LambdaExpr.body missing".to_string())?;
+    let arg_slots = infer_lambda_arg_slots(lambda)?;
+    let body = lower_proto_expr(body_expr, arena, input_layout)?;
+    Ok(arena.push_typed(
+        ExprNode::LambdaFunction {
+            body,
+            arg_slots,
+            common_sub_exprs: Vec::new(),
+            is_nondeterministic: false,
+        },
+        data_type,
+    ))
+}
+
+fn infer_lambda_arg_slots(lambda: &expr::LambdaExpr) -> Result<Vec<SlotId>, String> {
+    let body = lambda
+        .body
+        .as_ref()
+        .ok_or_else(|| "LambdaExpr.body missing".to_string())?;
+    if lambda.params.is_empty() {
+        return Err("LambdaExpr.params is empty".to_string());
+    }
+
+    let mut ordered_params = Vec::with_capacity(lambda.params.len());
+    let mut target_names = HashSet::with_capacity(lambda.params.len());
+    for param in &lambda.params {
+        let name = normalize_lambda_param_name(param);
+        if name.is_empty() {
+            return Err("LambdaExpr.params contains an empty parameter name".to_string());
+        }
+        if !target_names.insert(name.clone()) {
+            return Err(format!("LambdaExpr duplicate parameter name '{name}'"));
+        }
+        ordered_params.push(name);
+    }
+
+    let mut slots_by_name = HashMap::new();
+    collect_lambda_param_slots(body, &target_names, &HashSet::new(), &mut slots_by_name)?;
+
+    ordered_params
+        .iter()
+        .map(|name| {
+            let slot_id = slots_by_name.get(name).ok_or_else(|| {
+                format!(
+                    "LambdaExpr parameter '{name}' has no LambdaParamRef in body; native lambda lowering requires parameter slot ids"
+                )
+            })?;
+            SlotId::try_from(*slot_id)
+        })
+        .collect()
+}
+
+fn collect_lambda_param_slots(
+    expr: &expr::Expr,
+    target_names: &HashSet<String>,
+    shadowed_names: &HashSet<String>,
+    slots_by_name: &mut HashMap<String, i32>,
+) -> Result<(), String> {
+    let Some(kind) = expr.kind.as_ref() else {
+        return Ok(());
+    };
+
+    match kind {
+        expr::expr::Kind::ColumnRef(_) | expr::expr::Kind::Literal(_) => Ok(()),
+        expr::expr::Kind::LambdaParamRef(param) => {
+            let name = match param.name.as_deref() {
+                Some(name) => normalize_lambda_param_name(name),
+                None if target_names.len() == 1 && shadowed_names.is_empty() => target_names
+                    .iter()
+                    .next()
+                    .cloned()
+                    .expect("target_names has one item"),
+                None => {
+                    return Err(
+                        "LambdaParamRef.name is required for multi-parameter native lambda lowering"
+                            .to_string(),
+                    );
+                }
+            };
+            if shadowed_names.contains(&name) || !target_names.contains(&name) {
+                return Ok(());
+            }
+            if let Some(previous) = slots_by_name.insert(name.clone(), param.slot_id)
+                && previous != param.slot_id
+            {
+                return Err(format!(
+                    "LambdaExpr parameter '{name}' maps to multiple slot ids: {previous} and {}",
+                    param.slot_id
+                ));
+            }
+            Ok(())
+        }
+        expr::expr::Kind::BinaryOp(binary) => {
+            collect_optional_box_lambda_param_slots(
+                &binary.left,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )?;
+            collect_optional_box_lambda_param_slots(
+                &binary.right,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )
+        }
+        expr::expr::Kind::UnaryOp(unary) => collect_optional_box_lambda_param_slots(
+            &unary.operand,
+            target_names,
+            shadowed_names,
+            slots_by_name,
+        ),
+        expr::expr::Kind::FunctionCall(call) => collect_lambda_param_slots_in_list(
+            &call.args,
+            target_names,
+            shadowed_names,
+            slots_by_name,
+        ),
+        expr::expr::Kind::AggregateCall(call) => {
+            collect_lambda_param_slots_in_list(
+                &call.args,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )?;
+            for item in &call.order_by {
+                collect_optional_unboxed_lambda_param_slots(
+                    &item.expr,
+                    target_names,
+                    shadowed_names,
+                    slots_by_name,
+                )?;
+            }
+            Ok(())
+        }
+        expr::expr::Kind::WindowCall(call) => {
+            collect_lambda_param_slots_in_list(
+                &call.args,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )?;
+            collect_lambda_param_slots_in_list(
+                &call.partition_by,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )?;
+            for item in &call.order_by {
+                collect_optional_unboxed_lambda_param_slots(
+                    &item.expr,
+                    target_names,
+                    shadowed_names,
+                    slots_by_name,
+                )?;
+            }
+            Ok(())
+        }
+        expr::expr::Kind::Cast(cast) => collect_optional_box_lambda_param_slots(
+            &cast.operand,
+            target_names,
+            shadowed_names,
+            slots_by_name,
+        ),
+        expr::expr::Kind::IsNull(is_null) => collect_optional_box_lambda_param_slots(
+            &is_null.operand,
+            target_names,
+            shadowed_names,
+            slots_by_name,
+        ),
+        expr::expr::Kind::InList(in_list) => {
+            collect_optional_box_lambda_param_slots(
+                &in_list.operand,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )?;
+            collect_lambda_param_slots_in_list(
+                &in_list.list,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )
+        }
+        expr::expr::Kind::Between(between) => {
+            collect_optional_box_lambda_param_slots(
+                &between.operand,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )?;
+            collect_optional_box_lambda_param_slots(
+                &between.low,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )?;
+            collect_optional_box_lambda_param_slots(
+                &between.high,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )
+        }
+        expr::expr::Kind::Like(like) => {
+            collect_optional_box_lambda_param_slots(
+                &like.operand,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )?;
+            collect_optional_box_lambda_param_slots(
+                &like.pattern,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )
+        }
+        expr::expr::Kind::CaseExpr(case_expr) => {
+            collect_optional_box_lambda_param_slots(
+                &case_expr.operand,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )?;
+            for branch in &case_expr.when_then {
+                collect_optional_unboxed_lambda_param_slots(
+                    &branch.when,
+                    target_names,
+                    shadowed_names,
+                    slots_by_name,
+                )?;
+                collect_optional_unboxed_lambda_param_slots(
+                    &branch.then,
+                    target_names,
+                    shadowed_names,
+                    slots_by_name,
+                )?;
+            }
+            collect_optional_box_lambda_param_slots(
+                &case_expr.else_expr,
+                target_names,
+                shadowed_names,
+                slots_by_name,
+            )
+        }
+        expr::expr::Kind::IsTruth(is_truth) => collect_optional_box_lambda_param_slots(
+            &is_truth.operand,
+            target_names,
+            shadowed_names,
+            slots_by_name,
+        ),
+        expr::expr::Kind::Lambda(lambda) => {
+            let mut nested_shadowed_names = shadowed_names.clone();
+            for param in &lambda.params {
+                nested_shadowed_names.insert(normalize_lambda_param_name(param));
+            }
+            collect_optional_box_lambda_param_slots(
+                &lambda.body,
+                target_names,
+                &nested_shadowed_names,
+                slots_by_name,
+            )
+        }
+        expr::expr::Kind::Nested(nested) => collect_optional_box_lambda_param_slots(
+            &nested.inner,
+            target_names,
+            shadowed_names,
+            slots_by_name,
+        ),
+    }
+}
+
+fn collect_lambda_param_slots_in_list(
+    exprs: &[expr::Expr],
+    target_names: &HashSet<String>,
+    shadowed_names: &HashSet<String>,
+    slots_by_name: &mut HashMap<String, i32>,
+) -> Result<(), String> {
+    for expr in exprs {
+        collect_lambda_param_slots(expr, target_names, shadowed_names, slots_by_name)?;
+    }
+    Ok(())
+}
+
+fn collect_optional_box_lambda_param_slots(
+    expr: &Option<Box<expr::Expr>>,
+    target_names: &HashSet<String>,
+    shadowed_names: &HashSet<String>,
+    slots_by_name: &mut HashMap<String, i32>,
+) -> Result<(), String> {
+    if let Some(expr) = expr {
+        collect_lambda_param_slots(expr, target_names, shadowed_names, slots_by_name)?;
+    }
+    Ok(())
+}
+
+fn collect_optional_unboxed_lambda_param_slots(
+    expr: &Option<expr::Expr>,
+    target_names: &HashSet<String>,
+    shadowed_names: &HashSet<String>,
+    slots_by_name: &mut HashMap<String, i32>,
+) -> Result<(), String> {
+    if let Some(expr) = expr {
+        collect_lambda_param_slots(expr, target_names, shadowed_names, slots_by_name)?;
+    }
+    Ok(())
+}
+
+fn normalize_lambda_param_name(name: &str) -> String {
+    name.to_lowercase()
 }
 
 fn lower_nested(
@@ -700,7 +1205,7 @@ fn push_zero_literal(arena: &mut ExprArena, data_type: &DataType) -> Result<Expr
 #[cfg(test)]
 mod tests {
     use arrow::array::{Array, BooleanArray, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
     use arrow_buffer::i256;
     use std::sync::Arc;
 
@@ -710,6 +1215,7 @@ mod tests {
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue, function::FunctionKind};
     use crate::proto::{common, expr};
     use crate::sql::codegen::proto_encode::types::encode_type;
+    use crate::types::logical::{LogicalType, field_with_logical_type};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")
@@ -756,6 +1262,17 @@ mod tests {
         )
     }
 
+    fn null_lit(data_type: DataType) -> expr::Expr {
+        scalar_expr(
+            data_type,
+            expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::NullValue(true)),
+                }),
+            }),
+        )
+    }
+
     fn col(column_id: u32, data_type: DataType) -> expr::Expr {
         scalar_expr(
             data_type,
@@ -764,6 +1281,23 @@ mod tests {
                 qualifier: None,
                 column: None,
             }),
+        )
+    }
+
+    fn map_string_json_type() -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Utf8, true)),
+                    Arc::new(field_with_logical_type(
+                        Field::new("value", DataType::Utf8, true),
+                        LogicalType::Json,
+                    )),
+                ])),
+                false,
+            )),
+            false,
         )
     }
 
@@ -973,6 +1507,26 @@ mod tests {
     }
 
     #[test]
+    fn cast_preserves_nested_json_field_schema() {
+        let map_type = map_string_json_type();
+        let cast = scalar_expr(
+            map_type.clone(),
+            expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                operand: Some(Box::new(col(1, DataType::Utf8))),
+                target: Some(type_desc(&map_type)),
+            })),
+        );
+
+        let (arena, id) = lower_with_slots(&cast, &[1]);
+        let field_schema = arena.field_schema(id).expect("cast field schema");
+        assert!(
+            field_schema
+                .map_value()
+                .is_some_and(|schema| schema.json_semantic())
+        );
+    }
+
+    #[test]
     fn cast_preserves_variant_guards() {
         let scalar_to_variant = scalar_expr(
             DataType::LargeBinary,
@@ -993,6 +1547,33 @@ mod tests {
         assert!(err.contains("CAST to VARIANT is not supported"));
         let err = lower_err_with_slots(&variant_to_decimal, &[1]);
         assert!(err.contains("CAST from VARIANT is not supported"));
+    }
+
+    #[test]
+    fn in_list_casts_numeric_candidates_to_string_operand_type() {
+        let in_list = scalar_expr(
+            DataType::Boolean,
+            expr::expr::Kind::InList(Box::new(expr::InListExpr {
+                operand: Some(Box::new(col(1, DataType::Utf8))),
+                list: vec![int_lit(1)],
+                negated: false,
+            })),
+        );
+
+        let (arena, id) = lower_with_slots(&in_list, &[1]);
+        let Some(ExprNode::In { child, values, .. }) = arena.node(id) else {
+            panic!("expected IN node");
+        };
+        assert_eq!(arena.data_type(*child), Some(&DataType::Utf8));
+        assert_eq!(values.len(), 1);
+        assert_eq!(arena.data_type(values[0]), Some(&DataType::Utf8));
+        let Some(ExprNode::Cast(inner)) = arena.node(values[0]) else {
+            panic!("expected numeric candidate cast to Utf8");
+        };
+        assert!(matches!(
+            arena.node(*inner),
+            Some(ExprNode::Literal(LiteralValue::Int64(1)))
+        ));
     }
 
     #[test]
@@ -1078,6 +1659,105 @@ mod tests {
     }
 
     #[test]
+    fn lowers_variadic_map_constructor_to_array_pair_call() {
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Int64, true)),
+                    Arc::new(Field::new("value", DataType::Utf8, true)),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let map = scalar_expr(
+            map_type.clone(),
+            expr::expr::Kind::FunctionCall(expr::FunctionCall {
+                function_name: "map".to_string(),
+                args: vec![int_lit(1), string_lit("a"), int_lit(2), string_lit("b")],
+                distinct: false,
+            }),
+        );
+
+        let (arena, id) = lower(&map);
+        let Some(ExprNode::FunctionCall { kind, args }) = arena.node(id) else {
+            panic!("expected map constructor to lower as function call");
+        };
+        assert_eq!(*kind, FunctionKind::Map("map"));
+        assert_eq!(args.len(), 2);
+        let Some(ExprNode::ArrayExpr { elements: keys }) = arena.node(args[0]) else {
+            panic!("expected map keys to lower as ArrayExpr");
+        };
+        let Some(ExprNode::ArrayExpr { elements: values }) = arena.node(args[1]) else {
+            panic!("expected map values to lower as ArrayExpr");
+        };
+        assert_eq!(keys.len(), 2);
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            arena.data_type(args[0]),
+            Some(&DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Int64,
+                true
+            ))))
+        );
+        assert_eq!(
+            arena.data_type(args[1]),
+            Some(&DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Utf8,
+                true
+            ))))
+        );
+        assert_eq!(arena.data_type(id), Some(&map_type));
+    }
+
+    #[test]
+    fn map_constructor_casts_null_children_to_entry_types() {
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Int64, true)),
+                    Arc::new(Field::new("value", DataType::Int64, true)),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let map = scalar_expr(
+            map_type,
+            expr::expr::Kind::FunctionCall(expr::FunctionCall {
+                function_name: "map".to_string(),
+                args: vec![
+                    null_lit(DataType::Null),
+                    int_lit(10),
+                    int_lit(2),
+                    null_lit(DataType::Null),
+                ],
+                distinct: false,
+            }),
+        );
+
+        let (arena, id) = lower(&map);
+        let Some(ExprNode::FunctionCall { args, .. }) = arena.node(id) else {
+            panic!("expected map constructor to lower as function call");
+        };
+        let Some(ExprNode::ArrayExpr { elements: keys }) = arena.node(args[0]) else {
+            panic!("expected map keys to lower as ArrayExpr");
+        };
+        let Some(ExprNode::ArrayExpr { elements: values }) = arena.node(args[1]) else {
+            panic!("expected map values to lower as ArrayExpr");
+        };
+
+        assert_eq!(arena.data_type(keys[0]), Some(&DataType::Int64));
+        assert!(matches!(arena.node(keys[0]), Some(ExprNode::Cast(_))));
+        assert_eq!(arena.data_type(values[1]), Some(&DataType::Int64));
+        assert!(matches!(arena.node(values[1]), Some(ExprNode::Cast(_))));
+    }
+
+    #[test]
     fn array_literal_requires_list_result_type() {
         let array = scalar_expr(
             DataType::Int64,
@@ -1090,6 +1770,73 @@ mod tests {
 
         let err = lower_err_with_slots(&array, &[]);
         assert!(err.contains("ARRAY literal expects List type"), "{err}");
+    }
+
+    #[test]
+    fn lowers_lambda_expr_to_lambda_function() {
+        let lambda_slot = 1_900_000_000;
+        let item_type = DataType::Int64;
+        let array_type = DataType::List(Arc::new(Field::new("item", item_type.clone(), true)));
+        let lambda_param = scalar_expr(
+            item_type.clone(),
+            expr::expr::Kind::LambdaParamRef(expr::LambdaParamRef {
+                slot_id: lambda_slot,
+                name: Some("x".to_string()),
+            }),
+        );
+        let body = scalar_expr(
+            item_type.clone(),
+            expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                op: expr::BinaryOp::Add as i32,
+                left: Some(Box::new(lambda_param)),
+                right: Some(Box::new(col(7, item_type.clone()))),
+            })),
+        );
+        let lambda = scalar_expr(
+            item_type.clone(),
+            expr::expr::Kind::Lambda(Box::new(expr::LambdaExpr {
+                params: vec!["x".to_string()],
+                body: Some(Box::new(body)),
+            })),
+        );
+        let call = scalar_expr(
+            array_type.clone(),
+            expr::expr::Kind::FunctionCall(expr::FunctionCall {
+                function_name: "array_map".to_string(),
+                args: vec![lambda, col(1, array_type)],
+                distinct: false,
+            }),
+        );
+
+        let (arena, id) = lower_with_slots(&call, &[1, 7]);
+        let Some(ExprNode::FunctionCall { kind, args }) = arena.node(id) else {
+            panic!("expected array_map function call");
+        };
+        assert_eq!(*kind, FunctionKind::ArrayMap);
+        assert_eq!(args.len(), 2);
+        let Some(ExprNode::LambdaFunction {
+            body,
+            arg_slots,
+            common_sub_exprs,
+            is_nondeterministic,
+        }) = arena.node(args[0])
+        else {
+            panic!("expected lowered lambda function");
+        };
+        assert_eq!(arg_slots, &[SlotId::new(lambda_slot as u32)]);
+        assert!(common_sub_exprs.is_empty());
+        assert!(!is_nondeterministic);
+        let Some(ExprNode::Add(left, right)) = arena.node(*body) else {
+            panic!("expected lambda body to keep captured-column add");
+        };
+        assert!(matches!(
+            arena.node(*left),
+            Some(ExprNode::SlotId(slot)) if *slot == SlotId::new(lambda_slot as u32)
+        ));
+        assert!(matches!(
+            arena.node(*right),
+            Some(ExprNode::SlotId(slot)) if *slot == SlotId::new(7)
+        ));
     }
 
     #[test]

@@ -34,8 +34,12 @@ use super::layout::{
 use crate::common::config::exchange_wait_ms;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::expr::{ExprArena, ExprNode};
+use crate::exec::expr::{ExprArena, ExprNode, cast_array_to_target};
 use crate::exec::node::aggregate::{AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode};
+use crate::exec::node::analytic::{
+    AnalyticNode, AnalyticOutputColumn, WindowBoundary, WindowFrame, WindowFunctionKind,
+    WindowFunctionSpec, WindowType,
+};
 use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
 use crate::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
@@ -161,14 +165,39 @@ pub(crate) fn lower_proto_node(
         .payload
         .as_ref()
         .ok_or_else(|| format!("DistributedNode node_id={} payload missing", node.node_id))?;
-    match payload {
+    let lowered = match payload {
         plan::distributed_node::Payload::Physical(physical) => {
             lower_physical_node(node, physical, children, arena, ctx)
         }
         plan::distributed_node::Payload::Exchange(exchange) => {
-            lower_exchange_receiver(node, exchange, children, ctx)
+            lower_exchange_receiver(node, exchange, children, arena, ctx)
         }
+    }?;
+    apply_distributed_limit_if_needed(node, lowered)
+}
+
+fn apply_distributed_limit_if_needed(
+    node: &plan::DistributedNode,
+    mut lowered: LoweredNode,
+) -> Result<LoweredNode, String> {
+    let Some(limit) = parse_distributed_limit(node.limit, "DistributedNode.limit")? else {
+        return Ok(lowered);
+    };
+    if matches!(
+        lowered.node.kind,
+        ExecNodeKind::Limit(_) | ExecNodeKind::Sort(_)
+    ) {
+        return Ok(lowered);
     }
+    lowered.node = ExecNode {
+        kind: ExecNodeKind::Limit(LimitNode {
+            input: Box::new(lowered.node),
+            node_id: node.node_id,
+            limit: Some(limit),
+            offset: 0,
+        }),
+    };
+    Ok(lowered)
 }
 
 fn lower_physical_node(
@@ -205,16 +234,22 @@ fn lower_physical_node(
         plan::plan_node::Kind::HashAggregate(aggregate) => {
             lower_hash_aggregate_node(node, physical, aggregate, children, arena)
         }
-        plan::plan_node::Kind::HashJoin(join) => lower_hash_join_node(node, join, children, arena),
-        plan::plan_node::Kind::NestLoopJoin(join) => {
-            lower_nest_loop_join_node(node, join, children, arena)
+        plan::plan_node::Kind::HashJoin(join) => {
+            lower_hash_join_node(node, physical, join, children, arena)
         }
-        plan::plan_node::Kind::Window(_) => unsupported("Window"),
+        plan::plan_node::Kind::NestLoopJoin(join) => {
+            lower_nest_loop_join_node(node, physical, join, children, arena)
+        }
+        plan::plan_node::Kind::Window(window) => {
+            lower_window_node(node, physical, window, children, arena)
+        }
         plan::plan_node::Kind::Repeat(repeat) => lower_repeat_node(node, repeat, children),
         plan::plan_node::Kind::GenerateSeries(generate_series) => {
             lower_generate_series_node(node, generate_series, children, arena)
         }
-        plan::plan_node::Kind::TableFunction(_) => unsupported("TableFunction"),
+        plan::plan_node::Kind::TableFunction(table_function) => {
+            lower_table_function_node(node, table_function, children, arena)
+        }
         plan::plan_node::Kind::Decode(_) => unsupported("Decode"),
         plan::plan_node::Kind::ChangeEventExpand(expand) => {
             lower_change_event_expand_node(node, physical, expand, children, arena)
@@ -317,6 +352,18 @@ fn materialize_values_chunk(
         return Chunk::try_new_with_chunk_schema(batch, output_schema);
     }
     let column_count = columns.len();
+    if output_schema.slots().len() != column_count {
+        return Err(format!(
+            "ValuesNode output schema width mismatch: columns={}, schema_slots={}",
+            column_count,
+            output_schema.slots().len()
+        ));
+    }
+    let target_types = output_schema
+        .slots()
+        .iter()
+        .map(|slot| slot.data_type().clone())
+        .collect::<Vec<_>>();
     let mut arrays_by_column = vec![Vec::<ArrayRef>::with_capacity(rows.len()); column_count];
     let input_layout = Layout::default();
     let one_row = empty_chunk_with_row_count(1)?;
@@ -340,6 +387,7 @@ fn materialize_values_chunk(
                     array.len()
                 ));
             }
+            let array = normalize_values_array(row_idx, col_idx, array, &target_types[col_idx])?;
             arrays_by_column[col_idx].push(array);
         }
     }
@@ -356,6 +404,24 @@ fn materialize_values_chunk(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Chunk::try_new_with_columns(output_schema, columns)
+}
+
+fn normalize_values_array(
+    row_idx: usize,
+    col_idx: usize,
+    array: ArrayRef,
+    target_type: &DataType,
+) -> Result<ArrayRef, String> {
+    if array.data_type() == target_type || matches!(target_type, DataType::Null) {
+        return Ok(array);
+    }
+    cast_array_to_target(&array, target_type).map_err(|err| {
+        format!(
+            "ValuesNode row {row_idx} column {col_idx} cast from {:?} to {:?} failed: {err}",
+            array.data_type(),
+            target_type
+        )
+    })
 }
 
 fn empty_chunk_with_row_count(row_count: usize) -> Result<Chunk, String> {
@@ -478,6 +544,323 @@ fn int64_literal_expr(value: i64) -> expr::Expr {
             }),
         })),
     }
+}
+
+fn lower_table_function_node(
+    node: &plan::DistributedNode,
+    table_function: &plan::TableFunctionNode,
+    mut children: Vec<LoweredNode>,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    check_exact_arity("TableFunctionNode", 1, children.len())?;
+    let child = children.pop().expect("child");
+    validate_table_function_signature(table_function)?;
+
+    let param_slots = table_function_param_slots(
+        &child.layout,
+        &table_function.output_columns,
+        &table_function.args,
+    )?;
+    let (param_types, param_slot_schemas) =
+        table_function_param_schemas(table_function, &param_slots)?;
+    let result_slot_schemas = slot_schemas_from_output_columns(&table_function.output_columns)?;
+    let ret_types = table_function_result_types(table_function)?;
+
+    let mut project_exprs = Vec::with_capacity(child.layout.order().len() + param_slots.len());
+    let mut project_slot_ids = Vec::with_capacity(project_exprs.capacity());
+    let mut project_slot_schemas =
+        Vec::with_capacity(child.output_schema.slots().len() + param_slot_schemas.len());
+    for slot_schema in child.output_schema.slots() {
+        let slot_id = slot_schema.slot_id();
+        project_exprs
+            .push(arena.push_typed(ExprNode::SlotId(slot_id), slot_schema.data_type().clone()));
+        project_slot_ids.push(slot_id);
+        project_slot_schemas.push(slot_schema.clone());
+    }
+    for ((idx, arg), slot_schema) in table_function
+        .args
+        .iter()
+        .enumerate()
+        .zip(param_slot_schemas.iter())
+    {
+        let expr = lower_proto_expr(arg, arena, &child.layout)
+            .map_err(|err| format!("TableFunctionNode arg {idx}: {err}"))?;
+        project_exprs.push(expr);
+        project_slot_ids.push(slot_schema.slot_id());
+        project_slot_schemas.push(slot_schema.clone());
+    }
+    let project_output_schema = Arc::new(ChunkSchema::try_new(project_slot_schemas)?);
+
+    let mut output_slot_schemas =
+        Vec::with_capacity(child.output_schema.slots().len() + result_slot_schemas.len());
+    let mut output_slot_sources =
+        Vec::with_capacity(child.output_schema.slots().len() + result_slot_schemas.len());
+    let mut outer_slots = Vec::with_capacity(child.output_schema.slots().len());
+    for slot_schema in child.output_schema.slots() {
+        let slot_id = slot_schema.slot_id();
+        outer_slots.push(slot_id);
+        output_slot_schemas.push(slot_schema.clone());
+        output_slot_sources.push(TableFunctionOutputSlot::Outer { slot: slot_id });
+    }
+    let mut fn_result_slots = Vec::with_capacity(result_slot_schemas.len());
+    for (idx, slot_schema) in result_slot_schemas.iter().enumerate() {
+        let slot_id = slot_schema.slot_id();
+        fn_result_slots.push(slot_id);
+        output_slot_schemas.push(slot_schema.clone());
+        output_slot_sources.push(TableFunctionOutputSlot::Result { index: idx });
+    }
+    let output_schema = Arc::new(ChunkSchema::try_new(output_slot_schemas)?);
+    let layout = Layout::for_slots(output_schema.slot_ids().iter().copied());
+
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::TableFunction(TableFunctionNode {
+                input: Box::new(ExecNode {
+                    kind: ExecNodeKind::Project(ProjectNode {
+                        input: Box::new(child.node),
+                        node_id: node.node_id,
+                        is_subordinate: true,
+                        exprs: project_exprs,
+                        expr_slot_ids: project_slot_ids,
+                        expr_slot_schemas: Some(project_output_schema.slots().to_vec()),
+                        output_indices: None,
+                        output_chunk_schema: project_output_schema,
+                    }),
+                }),
+                node_id: node.node_id,
+                function_name: table_function.function_name.clone(),
+                param_slots,
+                outer_slots,
+                fn_result_slots,
+                fn_result_required: true,
+                is_left_join: table_function.is_left_join,
+                param_types,
+                ret_types,
+                output_chunk_schema: output_schema.clone(),
+                output_slot_sources,
+            }),
+        },
+        layout,
+        output_schema,
+    })
+}
+
+fn validate_table_function_signature(
+    table_function: &plan::TableFunctionNode,
+) -> Result<(), String> {
+    let function_name = table_function.function_name.to_ascii_lowercase();
+    let param_types = table_function_arg_types(table_function)?;
+    let ret_types = table_function_result_types(table_function)?;
+    match function_name.as_str() {
+        "unnest" => validate_unnest_table_function(&param_types, &ret_types),
+        "unnest_bitmap" => {
+            validate_table_function_arity("unnest_bitmap", &param_types, &ret_types, 1, 1)?;
+            if !matches!(param_types.first(), Some(DataType::Binary)) {
+                return Err(format!(
+                    "table function unnest_bitmap param 0 expects Binary, got {:?}",
+                    param_types.first()
+                ));
+            }
+            if !matches!(ret_types.first(), Some(DataType::Int64)) {
+                return Err(format!(
+                    "table function unnest_bitmap return type expects Int64, got {:?}",
+                    ret_types.first()
+                ));
+            }
+            Ok(())
+        }
+        "subdivide_bitmap" => {
+            validate_table_function_arity("subdivide_bitmap", &param_types, &ret_types, 2, 1)?;
+            if !matches!(param_types.first(), Some(DataType::Binary)) {
+                return Err(format!(
+                    "table function subdivide_bitmap param 0 expects Binary, got {:?}",
+                    param_types.first()
+                ));
+            }
+            if !matches!(ret_types.first(), Some(DataType::Binary)) {
+                return Err(format!(
+                    "table function subdivide_bitmap return type expects Binary, got {:?}",
+                    ret_types.first()
+                ));
+            }
+            Ok(())
+        }
+        "generate_series" => {
+            if !(param_types.len() == 2 || param_types.len() == 3) || ret_types.len() != 1 {
+                return Err(format!(
+                    "table function generate_series expects 2 or 3 args and 1 output, got args={} outputs={}",
+                    param_types.len(),
+                    ret_types.len()
+                ));
+            }
+            if !ret_types.iter().all(is_table_function_integer_type) {
+                return Err(format!(
+                    "table function generate_series return type expects integer, got {:?}",
+                    ret_types.first()
+                ));
+            }
+            for (idx, param_type) in param_types.iter().enumerate() {
+                if !is_table_function_integer_type(param_type) {
+                    return Err(format!(
+                        "table function generate_series param {idx} expects integer, got {param_type:?}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "unsupported native table function: {}",
+            table_function.function_name
+        )),
+    }
+}
+
+fn validate_unnest_table_function(
+    param_types: &[DataType],
+    ret_types: &[DataType],
+) -> Result<(), String> {
+    if param_types.is_empty() {
+        return Err("table function unnest requires at least one argument".to_string());
+    }
+    if param_types.len() != ret_types.len() {
+        return Err(format!(
+            "table function unnest output column count mismatch: args={} outputs={}",
+            param_types.len(),
+            ret_types.len()
+        ));
+    }
+    for (idx, (param_type, ret_type)) in param_types.iter().zip(ret_types.iter()).enumerate() {
+        let DataType::List(item_field) = param_type else {
+            return Err(format!(
+                "table function unnest param {idx} expects List, got {param_type:?}"
+            ));
+        };
+        if item_field.data_type() != ret_type {
+            return Err(format!(
+                "table function unnest result type mismatch for param {idx}: item={:?} output={:?}",
+                item_field.data_type(),
+                ret_type
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_table_function_arity(
+    name: &str,
+    param_types: &[DataType],
+    ret_types: &[DataType],
+    expected_params: usize,
+    expected_results: usize,
+) -> Result<(), String> {
+    if param_types.len() != expected_params || ret_types.len() != expected_results {
+        return Err(format!(
+            "table function {name} expects {expected_params} args and {expected_results} outputs, got args={} outputs={}",
+            param_types.len(),
+            ret_types.len()
+        ));
+    }
+    Ok(())
+}
+
+fn is_table_function_integer_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
+}
+
+fn table_function_arg_types(
+    table_function: &plan::TableFunctionNode,
+) -> Result<Vec<DataType>, String> {
+    table_function
+        .args
+        .iter()
+        .enumerate()
+        .map(|(idx, arg)| {
+            let type_desc = arg
+                .r#type
+                .as_ref()
+                .ok_or_else(|| format!("TableFunctionNode arg {idx} type missing"))?;
+            super::decode_type(type_desc)
+                .map_err(|err| format!("TableFunctionNode arg {idx} type decode failed: {err}"))
+        })
+        .collect()
+}
+
+fn table_function_result_types(
+    table_function: &plan::TableFunctionNode,
+) -> Result<Vec<DataType>, String> {
+    table_function
+        .output_columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            let type_desc = column.r#type.as_ref().ok_or_else(|| {
+                format!(
+                    "TableFunctionNode output column {} '{}' type missing",
+                    idx, column.name
+                )
+            })?;
+            super::decode_type(type_desc).map_err(|err| {
+                format!(
+                    "TableFunctionNode output column {} '{}' type decode failed: {err}",
+                    idx, column.name
+                )
+            })
+        })
+        .collect()
+}
+
+fn table_function_param_schemas(
+    table_function: &plan::TableFunctionNode,
+    param_slots: &[SlotId],
+) -> Result<(Vec<DataType>, Vec<ChunkSlotSchema>), String> {
+    let mut param_types = Vec::with_capacity(table_function.args.len());
+    let mut slot_schemas = Vec::with_capacity(table_function.args.len());
+    for (idx, (arg, slot_id)) in table_function
+        .args
+        .iter()
+        .zip(param_slots.iter())
+        .enumerate()
+    {
+        let type_desc = arg
+            .r#type
+            .as_ref()
+            .ok_or_else(|| format!("TableFunctionNode arg {idx} type missing"))?;
+        let data_type = super::decode_type(type_desc)
+            .map_err(|err| format!("TableFunctionNode arg {idx} type decode failed: {err}"))?;
+        let field =
+            super::decode_field_type(&format!("__tf_arg_{idx}"), arg.nullable, type_desc)
+                .map_err(|err| format!("TableFunctionNode arg {idx} field decode failed: {err}"))?;
+        slot_schemas.push(ChunkSchema::slot_schema_from_arrow_field(*slot_id, &field)?);
+        param_types.push(data_type);
+    }
+    Ok((param_types, slot_schemas))
+}
+
+fn table_function_param_slots(
+    input_layout: &Layout,
+    output_columns: &[common::OutputColumn],
+    args: &[expr::Expr],
+) -> Result<Vec<SlotId>, String> {
+    let mut used = input_layout
+        .order()
+        .iter()
+        .map(|slot| slot.as_u32())
+        .collect::<HashSet<_>>();
+    used.extend(output_columns.iter().map(|column| column.column_id));
+    let mut slot = u32::MAX;
+    let mut slots = Vec::with_capacity(args.len());
+    while slots.len() < args.len() {
+        if used.insert(slot) {
+            slots.push(SlotId::new(slot));
+        }
+        slot = slot
+            .checked_sub(1)
+            .ok_or_else(|| "TableFunctionNode could not allocate internal slots".to_string())?;
+    }
+    Ok(slots)
 }
 
 fn lower_project_node(
@@ -769,19 +1152,6 @@ fn lower_sort_node(
     } else {
         &sort.output_columns
     };
-    let (layout, output_schema) = if output_columns.is_empty() {
-        (child.layout.clone(), child.output_schema.clone())
-    } else {
-        let layout = layout_from_output_columns(output_columns)?;
-        if layout.order() != child.layout.order() {
-            return Err(format!(
-                "SortNode output column reorder is not implemented for native proto lowering: child={:?} output={:?}",
-                child.layout.order(),
-                layout.order()
-            ));
-        }
-        (layout, chunk_schema_from_output_columns(output_columns)?)
-    };
     let order_by = lower_sort_items("SortNode", &sort.items, arena, &child.layout)?;
     let limit = parse_distributed_limit(node.limit, "SortNode DistributedNode.limit")?;
     let offset = parse_optional_nonnegative_i64(sort.offset, "SortNode.offset")?.unwrap_or(0);
@@ -808,20 +1178,75 @@ fn lower_sort_node(
             node.node_id, topn_type, offset
         ));
     }
+    let sort_node = ExecNode {
+        kind: ExecNodeKind::Sort(SortNode {
+            input: Box::new(child.node),
+            node_id: node.node_id,
+            use_top_n,
+            order_by,
+            limit,
+            offset,
+            topn_type,
+            max_buffered_rows: None,
+            max_buffered_bytes: None,
+            partition_exprs,
+            partition_limit,
+        }),
+    };
+    let sorted = LoweredNode {
+        node: sort_node,
+        layout: child.layout.clone(),
+        output_schema: child.output_schema.clone(),
+    };
+    if output_columns.is_empty() {
+        return Ok(sorted);
+    }
+
+    let layout = layout_from_output_columns(output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    if layout.order() == child.layout.order() {
+        return Ok(LoweredNode {
+            node: sorted.node,
+            layout,
+            output_schema,
+        });
+    }
+
+    build_slot_projection("SortNode", sorted, output_columns, node.node_id, arena)
+}
+
+fn build_slot_projection(
+    label: &str,
+    input: LoweredNode,
+    output_columns: &[common::OutputColumn],
+    node_id: i32,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    let layout = layout_from_output_columns(output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let expr_slot_schemas = slot_schemas_from_output_columns(output_columns)?;
+    let mut exprs = Vec::with_capacity(layout.order().len());
+    for slot in layout.order().iter().copied() {
+        if !input.layout.contains_slot(slot) {
+            return Err(format!(
+                "{label} output column id {} has no input slot",
+                slot.as_u32()
+            ));
+        }
+        exprs.push(arena.push(ExprNode::SlotId(slot)));
+    }
+
     Ok(LoweredNode {
         node: ExecNode {
-            kind: ExecNodeKind::Sort(SortNode {
-                input: Box::new(child.node),
-                node_id: node.node_id,
-                use_top_n,
-                order_by,
-                limit,
-                offset,
-                topn_type,
-                max_buffered_rows: None,
-                max_buffered_bytes: None,
-                partition_exprs,
-                partition_limit,
+            kind: ExecNodeKind::Project(ProjectNode {
+                input: Box::new(input.node),
+                node_id,
+                is_subordinate: true,
+                exprs,
+                expr_slot_ids: layout.order().to_vec(),
+                expr_slot_schemas: Some(expr_slot_schemas),
+                output_indices: None,
+                output_chunk_schema: output_schema.clone(),
             }),
         },
         layout,
@@ -836,9 +1261,6 @@ fn lower_topn_node(
     arena: &mut ExprArena,
 ) -> Result<LoweredNode, String> {
     check_exact_arity("TopNNode", 1, children.len())?;
-    if topn.is_split {
-        return unsupported("TopNNode split");
-    }
     let child = children.pop().expect("child");
     let payload_limit = parse_optional_nonnegative_i64(topn.limit, "TopNNode.limit")?;
     let outer_limit = parse_distributed_limit(node.limit, "TopNNode DistributedNode.limit")?;
@@ -851,6 +1273,11 @@ fn lower_topn_node(
         .map_err(|_| format!("TopNNode unknown phase {}", topn.phase))?;
     if phase == plan::TopNPhase::TopnPhaseUnspecified {
         return Err("TopNNode phase is unspecified".to_string());
+    }
+    if topn.is_split && phase == plan::TopNPhase::TopnPhaseFinal {
+        return Err(
+            "TopNNode final split must be represented as ExchangeReceiver TopNSplit".to_string(),
+        );
     }
     let order_by = lower_sort_items("TopNNode", &topn.items, arena, &child.layout)?;
     Ok(LoweredNode {
@@ -872,6 +1299,646 @@ fn lower_topn_node(
         layout: child.layout,
         output_schema: child.output_schema,
     })
+}
+
+fn lower_window_node(
+    node: &plan::DistributedNode,
+    physical: &plan::PlanNode,
+    window: &plan::WindowNode,
+    mut children: Vec<LoweredNode>,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    check_exact_arity("WindowNode", 1, children.len())?;
+    let child = children.pop().expect("child");
+    if window.window_exprs.is_empty() {
+        return Err("WindowNode has no window expressions".to_string());
+    }
+    let output_columns = if !window.output_columns.is_empty() {
+        window.output_columns.as_slice()
+    } else {
+        physical.output_columns.as_slice()
+    };
+    if output_columns.is_empty() {
+        return Err("WindowNode output_columns missing".to_string());
+    }
+    let final_layout = layout_from_output_columns(output_columns)?;
+    let final_output_schema = chunk_schema_from_output_columns(output_columns)?;
+
+    let groups = group_window_exprs_by_spec(&window.window_exprs);
+    if groups.is_empty() {
+        return Err("WindowNode produced no window expression groups".to_string());
+    }
+
+    let mut current = child;
+    let mut next_node_id = node.node_id;
+    for (group_idx, group_indices) in groups.iter().enumerate() {
+        let first_idx = group_indices
+            .first()
+            .copied()
+            .ok_or_else(|| format!("WindowNode group {group_idx} is empty"))?;
+        let first = &window.window_exprs[first_idx];
+        let is_last = group_idx + 1 == groups.len();
+
+        if group_idx > 0 && window_expr_has_sort_keys(first) {
+            current = sort_window_group_input(next_node_id, group_idx, first, current, arena)?;
+            next_node_id = next_node_id.checked_add(1).ok_or_else(|| {
+                format!("WindowNode node_id {next_node_id} overflows after sort group {group_idx}")
+            })?;
+        }
+
+        let (layout, output_schema) = if is_last {
+            (final_layout.clone(), final_output_schema.clone())
+        } else {
+            intermediate_window_output(&current, group_indices, window, &final_output_schema)
+                .map_err(|err| format!("WindowNode group {group_idx}: {err}"))?
+        };
+
+        let partition_exprs = first
+            .partition_by
+            .iter()
+            .enumerate()
+            .map(|(idx, expr)| {
+                lower_proto_expr(expr, arena, &current.layout).map_err(|err| {
+                    format!("WindowNode group {group_idx} partition_by[{idx}]: {err}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let order_by_exprs = first
+            .order_by
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                let expr = item.expr.as_ref().ok_or_else(|| {
+                    format!("WindowNode group {group_idx} order_by[{idx}] expr missing")
+                })?;
+                lower_proto_expr(expr, arena, &current.layout)
+                    .map_err(|err| format!("WindowNode group {group_idx} order_by[{idx}]: {err}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let frame = first
+            .window_frame
+            .as_ref()
+            .map(lower_window_frame)
+            .transpose()?;
+        validate_window_frame(&frame, order_by_exprs.is_empty())?;
+
+        let mut functions = Vec::with_capacity(group_indices.len());
+        for (local_idx, expr_idx) in group_indices.iter().copied().enumerate() {
+            let expr = &window.window_exprs[expr_idx];
+            functions.push(
+                lower_window_function(expr, arena, &current.layout).map_err(|err| {
+                    format!("WindowNode group {group_idx} function[{local_idx}]: {err}")
+                })?,
+            );
+        }
+
+        let mut function_by_slot = HashMap::with_capacity(group_indices.len());
+        for (local_idx, expr_idx) in group_indices.iter().copied().enumerate() {
+            let expr = &window.window_exprs[expr_idx];
+            let slot = SlotId::new(expr.output_column_id);
+            if function_by_slot.insert(slot, local_idx).is_some() {
+                return Err(format!(
+                    "WindowNode duplicate output_column_id {}",
+                    expr.output_column_id
+                ));
+            }
+        }
+        let analytic_output_columns =
+            window_analytic_output_columns(&layout, &current.layout, &function_by_slot, group_idx)?;
+        let group_node_id = next_node_id;
+        next_node_id = next_node_id.checked_add(1).ok_or_else(|| {
+            format!("WindowNode node_id {next_node_id} overflows after analytic group {group_idx}")
+        })?;
+
+        current = LoweredNode {
+            node: ExecNode {
+                kind: ExecNodeKind::Analytic(AnalyticNode {
+                    input: Box::new(current.node),
+                    node_id: group_node_id,
+                    partition_exprs,
+                    order_by_exprs,
+                    functions,
+                    window: frame,
+                    output_columns: analytic_output_columns,
+                    output_chunk_schema: output_schema.clone(),
+                }),
+            },
+            layout,
+            output_schema,
+        };
+    }
+
+    Ok(current)
+}
+
+fn window_expr_has_sort_keys(expr: &plan::WindowExpr) -> bool {
+    !expr.partition_by.is_empty() || !expr.order_by.is_empty()
+}
+
+fn sort_window_group_input(
+    node_id: i32,
+    group_idx: usize,
+    first: &plan::WindowExpr,
+    input: LoweredNode,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    let mut order_by = Vec::with_capacity(first.partition_by.len() + first.order_by.len());
+    for (idx, expr) in first.partition_by.iter().enumerate() {
+        let expr = lower_proto_expr(expr, arena, &input.layout).map_err(|err| {
+            format!("WindowNode group {group_idx} sort partition_by[{idx}]: {err}")
+        })?;
+        order_by.push(SortExpression {
+            expr,
+            asc: true,
+            nulls_first: true,
+        });
+    }
+    order_by.extend(lower_sort_items(
+        &format!("WindowNode group {group_idx} sort"),
+        &first.order_by,
+        arena,
+        &input.layout,
+    )?);
+
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Sort(SortNode {
+                input: Box::new(input.node),
+                node_id,
+                use_top_n: false,
+                order_by,
+                limit: None,
+                offset: 0,
+                topn_type: SortTopNType::RowNumber,
+                max_buffered_rows: None,
+                max_buffered_bytes: None,
+                partition_exprs: Vec::new(),
+                partition_limit: None,
+            }),
+        },
+        layout: input.layout,
+        output_schema: input.output_schema,
+    })
+}
+
+fn group_window_exprs_by_spec(exprs: &[plan::WindowExpr]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (idx, expr) in exprs.iter().enumerate() {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| same_window_spec(&exprs[group[0]], expr))
+        {
+            group.push(idx);
+        } else {
+            groups.push(vec![idx]);
+        }
+    }
+    groups
+}
+
+fn intermediate_window_output(
+    current: &LoweredNode,
+    group_indices: &[usize],
+    window: &plan::WindowNode,
+    final_output_schema: &ChunkSchema,
+) -> Result<(Layout, ChunkSchemaRef), String> {
+    let mut slot_ids = current.layout.order().to_vec();
+    let mut slots = Vec::with_capacity(slot_ids.len() + group_indices.len());
+    for slot_id in current.layout.order() {
+        let slot = current.output_schema.slot(*slot_id).cloned().ok_or_else(|| {
+            format!(
+                "current output schema missing input slot {} for intermediate WindowNode output",
+                slot_id
+            )
+        })?;
+        slots.push(slot);
+    }
+
+    for expr_idx in group_indices {
+        let expr = window
+            .window_exprs
+            .get(*expr_idx)
+            .ok_or_else(|| format!("window expression index {expr_idx} is out of bounds"))?;
+        let slot_id = SlotId::new(expr.output_column_id);
+        if slot_ids.contains(&slot_id) {
+            continue;
+        }
+        slot_ids.push(slot_id);
+        slots.push(window_expr_slot_schema(expr, final_output_schema)?);
+    }
+
+    Ok((
+        Layout::for_slots(slot_ids),
+        Arc::new(ChunkSchema::try_new(slots)?),
+    ))
+}
+
+fn window_expr_slot_schema(
+    expr: &plan::WindowExpr,
+    final_output_schema: &ChunkSchema,
+) -> Result<ChunkSlotSchema, String> {
+    let slot_id = SlotId::new(expr.output_column_id);
+    if let Some(slot) = final_output_schema.slot(slot_id) {
+        return Ok(slot.clone());
+    }
+
+    let type_desc = expr
+        .result_type
+        .as_ref()
+        .ok_or_else(|| format!("window function {} result_type missing", expr.name))?;
+    let data_type = super::decode_type(type_desc)?;
+    let field = Field::new(&expr.output_name, data_type, true);
+    ChunkSchema::slot_schema_from_arrow_field(slot_id, &field)
+}
+
+fn window_analytic_output_columns(
+    layout: &Layout,
+    input_layout: &Layout,
+    function_by_slot: &HashMap<SlotId, usize>,
+    group_idx: usize,
+) -> Result<Vec<AnalyticOutputColumn>, String> {
+    layout
+        .order()
+        .iter()
+        .map(|slot| {
+            if let Some(idx) = function_by_slot.get(slot) {
+                Ok(AnalyticOutputColumn::Window(*idx))
+            } else if input_layout.contains_slot(*slot) {
+                Ok(AnalyticOutputColumn::InputSlotId(*slot))
+            } else {
+                Err(format!(
+                    "WindowNode group {group_idx} output slot {} has no input slot or window result",
+                    slot
+                ))
+            }
+        })
+        .collect()
+}
+
+fn same_window_spec(left: &plan::WindowExpr, right: &plan::WindowExpr) -> bool {
+    left.partition_by == right.partition_by
+        && left.order_by == right.order_by
+        && left.window_frame == right.window_frame
+}
+
+fn lower_window_function(
+    expr: &plan::WindowExpr,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+) -> Result<WindowFunctionSpec, String> {
+    let name = expr.name.to_ascii_lowercase();
+    let kind = window_function_kind(&name, expr.distinct, expr.ignore_nulls)?;
+    let return_type = expr
+        .result_type
+        .as_ref()
+        .ok_or_else(|| format!("window function {} result_type missing", expr.name))
+        .and_then(super::decode_type)?;
+    let mut args = expr
+        .args
+        .iter()
+        .enumerate()
+        .map(|(idx, arg)| {
+            lower_proto_expr(arg, arena, input_layout)
+                .map_err(|err| format!("window function {} arg {idx}: {err}", expr.name))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if matches!(
+        kind,
+        WindowFunctionKind::ArrayAgg { .. }
+            | WindowFunctionKind::MaxBy
+            | WindowFunctionKind::MaxByV2
+            | WindowFunctionKind::MinBy
+            | WindowFunctionKind::MinByV2
+    ) {
+        args = pack_window_function_inputs(args, arena)?;
+    }
+    validate_window_function_signature(&kind, &args, &return_type, arena)?;
+    Ok(WindowFunctionSpec {
+        kind,
+        args,
+        return_type,
+    })
+}
+
+fn window_function_kind(
+    name: &str,
+    distinct: bool,
+    ignore_nulls: bool,
+) -> Result<WindowFunctionKind, String> {
+    let base = name.split('|').next().unwrap_or(name);
+    match base {
+        "row_number" => Ok(WindowFunctionKind::RowNumber),
+        "rank" => Ok(WindowFunctionKind::Rank),
+        "dense_rank" => Ok(WindowFunctionKind::DenseRank),
+        "cume_dist" => Ok(WindowFunctionKind::CumeDist),
+        "percent_rank" => Ok(WindowFunctionKind::PercentRank),
+        "ntile" => Ok(WindowFunctionKind::Ntile),
+        "first_value" => Ok(WindowFunctionKind::FirstValue { ignore_nulls }),
+        "first_value_rewrite" => Ok(WindowFunctionKind::FirstValueRewrite { ignore_nulls }),
+        "last_value" => Ok(WindowFunctionKind::LastValue { ignore_nulls }),
+        "lead" => Ok(WindowFunctionKind::Lead { ignore_nulls }),
+        "lag" => Ok(WindowFunctionKind::Lag { ignore_nulls }),
+        "session_number" => Ok(WindowFunctionKind::SessionNumber),
+        "count" => Ok(WindowFunctionKind::Count),
+        "sum" => Ok(WindowFunctionKind::Sum),
+        "avg" => Ok(WindowFunctionKind::Avg),
+        "min" => Ok(WindowFunctionKind::Min),
+        "max" => Ok(WindowFunctionKind::Max),
+        "bitmap_union" => Ok(WindowFunctionKind::BitmapUnion),
+        "bitmap_union_count" => Ok(WindowFunctionKind::BitmapUnionCount),
+        "max_by" => Ok(WindowFunctionKind::MaxBy),
+        "max_by_v2" => Ok(WindowFunctionKind::MaxByV2),
+        "min_by" => Ok(WindowFunctionKind::MinBy),
+        "min_by_v2" => Ok(WindowFunctionKind::MinByV2),
+        "var_samp" | "variance_samp" => Ok(WindowFunctionKind::VarianceSamp),
+        "stddev_samp" => Ok(WindowFunctionKind::StddevSamp),
+        "bool_or" | "boolor_agg" => Ok(WindowFunctionKind::BoolOr),
+        "covar_pop" => Ok(WindowFunctionKind::CovarPop),
+        "covar_samp" => Ok(WindowFunctionKind::CovarSamp),
+        "corr" => Ok(WindowFunctionKind::Corr),
+        "array_agg" | "array_agg_distinct" | "array_unique_agg" => {
+            Ok(WindowFunctionKind::ArrayAgg {
+                is_distinct: distinct || matches!(base, "array_agg_distinct" | "array_unique_agg"),
+                is_asc_order: Vec::new(),
+                nulls_first: Vec::new(),
+            })
+        }
+        "approx_top_k" => Ok(WindowFunctionKind::ApproxTopK),
+        other => Err(format!("unsupported window function: {other}")),
+    }
+}
+
+fn lower_window_frame(frame: &expr::WindowFrame) -> Result<WindowFrame, String> {
+    let window_type = match expr::WindowFrameType::try_from(frame.frame_type)
+        .map_err(|_| format!("WindowNode unknown frame type {}", frame.frame_type))?
+    {
+        expr::WindowFrameType::Rows => WindowType::Rows,
+        expr::WindowFrameType::Range => WindowType::Range,
+        expr::WindowFrameType::Unspecified => {
+            return Err("WindowNode frame type is unspecified".to_string());
+        }
+    };
+    let start = match frame.start.as_ref() {
+        Some(bound) => lower_window_bound(bound, true, &window_type)?,
+        None => None,
+    };
+    let end = match frame.end.as_ref() {
+        Some(bound) => lower_window_bound(bound, false, &window_type)?,
+        None => None,
+    };
+    Ok(WindowFrame {
+        start,
+        end,
+        window_type,
+    })
+}
+
+fn lower_window_bound(
+    bound: &expr::WindowBound,
+    is_start: bool,
+    window_type: &WindowType,
+) -> Result<Option<WindowBoundary>, String> {
+    use expr::window_bound::Bound;
+
+    let label = if is_start { "start" } else { "end" };
+    let bound = bound
+        .bound
+        .as_ref()
+        .ok_or_else(|| format!("WindowNode {label} bound missing"))?;
+    match bound {
+        Bound::UnboundedPreceding(true) if is_start => Ok(None),
+        Bound::UnboundedFollowing(true) if !is_start => Ok(None),
+        Bound::CurrentRow(true) => Ok(Some(WindowBoundary::CurrentRow)),
+        Bound::Preceding(value) => {
+            if !matches!(window_type, WindowType::Rows) {
+                return Err("RANGE window boundary PRECEDING not supported".to_string());
+            }
+            Ok(Some(WindowBoundary::Preceding(*value)))
+        }
+        Bound::Following(value) => {
+            if !matches!(window_type, WindowType::Rows) {
+                return Err("RANGE window boundary FOLLOWING not supported".to_string());
+            }
+            Ok(Some(WindowBoundary::Following(*value)))
+        }
+        Bound::UnboundedPreceding(false)
+        | Bound::UnboundedFollowing(false)
+        | Bound::CurrentRow(false) => Err(format!(
+            "WindowNode {label} boolean bound marker must be true"
+        )),
+        Bound::UnboundedPreceding(true) => {
+            Err(format!("WindowNode {label} cannot be UNBOUNDED PRECEDING"))
+        }
+        Bound::UnboundedFollowing(true) => {
+            Err(format!("WindowNode {label} cannot be UNBOUNDED FOLLOWING"))
+        }
+    }
+}
+
+fn validate_window_frame(
+    frame: &Option<WindowFrame>,
+    order_by_is_empty: bool,
+) -> Result<(), String> {
+    let Some(frame) = frame.as_ref() else {
+        return Ok(());
+    };
+    if matches!(frame.window_type, WindowType::Range) {
+        if frame.start.is_some() {
+            return Err("RANGE window must have UNBOUNDED PRECEDING start".to_string());
+        }
+        if let Some(end) = frame.end.as_ref()
+            && !matches!(end, WindowBoundary::CurrentRow)
+        {
+            return Err("RANGE window end must be CURRENT ROW or UNBOUNDED FOLLOWING".to_string());
+        }
+        if order_by_is_empty {
+            return Err("RANGE window requires non-empty order_by_exprs".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn pack_window_function_inputs(
+    args: Vec<crate::exec::expr::ExprId>,
+    arena: &mut ExprArena,
+) -> Result<Vec<crate::exec::expr::ExprId>, String> {
+    if args.len() <= 1 {
+        return Ok(args);
+    }
+    let mut fields = Vec::with_capacity(args.len());
+    for (idx, expr_id) in args.iter().enumerate() {
+        let data_type = arena
+            .data_type(*expr_id)
+            .ok_or_else(|| "window function input type missing".to_string())?;
+        if matches!(data_type, DataType::Null) {
+            return Err("window function input type is null".to_string());
+        }
+        fields.push(Field::new(format!("f{idx}"), data_type.clone(), true));
+    }
+    let struct_type = DataType::Struct(Fields::from(fields));
+    let struct_expr = arena.push_typed(ExprNode::StructExpr { fields: args }, struct_type);
+    Ok(vec![struct_expr])
+}
+
+fn validate_window_function_signature(
+    kind: &WindowFunctionKind,
+    args: &[crate::exec::expr::ExprId],
+    return_type: &DataType,
+    arena: &ExprArena,
+) -> Result<(), String> {
+    match kind {
+        WindowFunctionKind::RowNumber
+        | WindowFunctionKind::Rank
+        | WindowFunctionKind::DenseRank
+        | WindowFunctionKind::Ntile
+        | WindowFunctionKind::SessionNumber
+        | WindowFunctionKind::Count => {
+            if !matches!(return_type, DataType::Int64) {
+                return Err(format!(
+                    "window function expects Int64 return type, got {:?}",
+                    return_type
+                ));
+            }
+        }
+        WindowFunctionKind::CumeDist
+        | WindowFunctionKind::PercentRank
+        | WindowFunctionKind::VarianceSamp
+        | WindowFunctionKind::StddevSamp
+        | WindowFunctionKind::CovarPop
+        | WindowFunctionKind::CovarSamp
+        | WindowFunctionKind::Corr => {
+            if !matches!(return_type, DataType::Float64) {
+                return Err(format!(
+                    "window function expects Float64 return type, got {:?}",
+                    return_type
+                ));
+            }
+        }
+        WindowFunctionKind::BoolOr => {
+            if !matches!(return_type, DataType::Boolean) {
+                return Err(format!(
+                    "window function expects Boolean return type, got {:?}",
+                    return_type
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    match kind {
+        WindowFunctionKind::RowNumber
+        | WindowFunctionKind::Rank
+        | WindowFunctionKind::DenseRank
+        | WindowFunctionKind::CumeDist
+        | WindowFunctionKind::PercentRank => {
+            if !args.is_empty() {
+                return Err("window function expects 0 arguments".to_string());
+            }
+        }
+        WindowFunctionKind::Ntile => {
+            if args.len() != 1 {
+                return Err("ntile expects 1 argument".to_string());
+            }
+        }
+        WindowFunctionKind::FirstValue { .. } | WindowFunctionKind::LastValue { .. } => {
+            if args.len() != 1 {
+                return Err("first_value/last_value expects 1 argument".to_string());
+            }
+            validate_window_arg_matches_return(args[0], return_type, arena)?;
+        }
+        WindowFunctionKind::FirstValueRewrite { .. } => {
+            if !(1..=2).contains(&args.len()) {
+                return Err("first_value_rewrite expects 1 or 2 arguments".to_string());
+            }
+            validate_window_arg_matches_return(args[0], return_type, arena)?;
+        }
+        WindowFunctionKind::Lead { .. } | WindowFunctionKind::Lag { .. } => {
+            if !(1..=3).contains(&args.len()) {
+                return Err("lead/lag expects 1 to 3 arguments".to_string());
+            }
+            validate_window_arg_matches_return(args[0], return_type, arena)?;
+        }
+        WindowFunctionKind::SessionNumber => {
+            if args.len() != 2 {
+                return Err("session_number expects 2 arguments".to_string());
+            }
+        }
+        WindowFunctionKind::Count => {
+            if args.len() > 1 {
+                return Err("count expects 0 or 1 arguments".to_string());
+            }
+        }
+        WindowFunctionKind::BitmapUnion | WindowFunctionKind::BitmapUnionCount => {
+            if args.len() != 1 {
+                return Err("bitmap_union/bitmap_union_count expects 1 argument".to_string());
+            }
+        }
+        WindowFunctionKind::MaxBy
+        | WindowFunctionKind::MaxByV2
+        | WindowFunctionKind::MinBy
+        | WindowFunctionKind::MinByV2 => {
+            if args.len() != 1 {
+                return Err(
+                    "max_by/max_by_v2/min_by/min_by_v2 expects 1 packed struct argument"
+                        .to_string(),
+                );
+            }
+        }
+        WindowFunctionKind::Sum
+        | WindowFunctionKind::Avg
+        | WindowFunctionKind::Min
+        | WindowFunctionKind::Max
+        | WindowFunctionKind::VarianceSamp
+        | WindowFunctionKind::StddevSamp
+        | WindowFunctionKind::BoolOr => {
+            if args.len() != 1 {
+                return Err("aggregate window function expects 1 argument".to_string());
+            }
+            if matches!(kind, WindowFunctionKind::Min | WindowFunctionKind::Max) {
+                validate_window_arg_matches_return(args[0], return_type, arena)?;
+            }
+        }
+        WindowFunctionKind::CovarPop | WindowFunctionKind::CovarSamp | WindowFunctionKind::Corr => {
+            if args.len() != 2 {
+                return Err("covar/corr window function expects 2 arguments".to_string());
+            }
+        }
+        WindowFunctionKind::ApproxTopK => {
+            if !(1..=3).contains(&args.len()) {
+                return Err("approx_top_k window function expects 1 to 3 arguments".to_string());
+            }
+        }
+        WindowFunctionKind::ArrayAgg { .. } => {
+            if args.len() != 1 {
+                return Err("array_agg window function expects 1 argument".to_string());
+            }
+            if !matches!(return_type, DataType::List(_)) {
+                return Err(format!(
+                    "array_agg window function expects LIST return type, got {:?}",
+                    return_type
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_window_arg_matches_return(
+    arg: crate::exec::expr::ExprId,
+    return_type: &DataType,
+    arena: &ExprArena,
+) -> Result<(), String> {
+    let arg_type = arena
+        .data_type(arg)
+        .ok_or_else(|| "missing arg type in arena".to_string())?;
+    if arg_type != return_type {
+        return Err(format!(
+            "window function return type mismatch: arg={:?} ret={:?}",
+            arg_type, return_type
+        ));
+    }
+    Ok(())
 }
 
 fn lower_sort_items(
@@ -918,6 +1985,7 @@ fn lower_exchange_receiver(
     node: &plan::DistributedNode,
     exchange: &plan::ExchangeReceiver,
     children: Vec<LoweredNode>,
+    arena: &mut ExprArena,
     ctx: &NodeLoweringContext,
 ) -> Result<LoweredNode, String> {
     check_exact_arity("ExchangeReceiver", 0, children.len())?;
@@ -931,15 +1999,9 @@ fn lower_exchange_receiver(
         plan::exchange_flavor::Kind::Distribution(false) => {
             return Err("ExchangeReceiver distribution flavor must be true".to_string());
         }
-        plan::exchange_flavor::Kind::LimitOffset(_) => {
-            return unsupported("ExchangeReceiver LimitOffset");
-        }
-        plan::exchange_flavor::Kind::TopnSplit(_) => {
-            return unsupported("ExchangeReceiver TopNSplit");
-        }
-        plan::exchange_flavor::Kind::CteMulticast(_) => {
-            return unsupported("ExchangeReceiver CteMulticast");
-        }
+        plan::exchange_flavor::Kind::LimitOffset(_) => {}
+        plan::exchange_flavor::Kind::TopnSplit(_) => {}
+        plan::exchange_flavor::Kind::CteMulticast(_) => {}
     }
 
     let key = ctx.exchange_key(node.node_id);
@@ -961,7 +2023,7 @@ fn lower_exchange_receiver(
     }
     let layout = layout_from_output_columns(&exchange.output_columns)?;
     let output_schema = chunk_schema_from_output_columns(&exchange.output_columns)?;
-    Ok(LoweredNode {
+    let mut lowered = LoweredNode {
         node: ExecNode {
             kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
                 key,
@@ -972,7 +2034,62 @@ fn lower_exchange_receiver(
         },
         layout,
         output_schema,
-    })
+    };
+
+    match flavor {
+        plan::exchange_flavor::Kind::LimitOffset(limit_offset) => {
+            let limit = parse_optional_nonnegative_i64(
+                limit_offset.limit,
+                "ExchangeReceiver LimitOffset.limit",
+            )?;
+            let offset = parse_optional_nonnegative_i64(
+                limit_offset.offset,
+                "ExchangeReceiver LimitOffset.offset",
+            )?
+            .unwrap_or(0);
+            if limit.is_some() || offset > 0 {
+                lowered.node = ExecNode {
+                    kind: ExecNodeKind::Limit(LimitNode {
+                        input: Box::new(lowered.node),
+                        node_id: node.node_id,
+                        limit,
+                        offset,
+                    }),
+                };
+            }
+        }
+        plan::exchange_flavor::Kind::TopnSplit(topn) => {
+            let order_by = lower_sort_items(
+                "ExchangeReceiver TopNSplit",
+                &topn.items,
+                arena,
+                &lowered.layout,
+            )?;
+            let limit =
+                parse_optional_nonnegative_i64(topn.limit, "ExchangeReceiver TopNSplit.limit")?;
+            let offset =
+                parse_optional_nonnegative_i64(topn.offset, "ExchangeReceiver TopNSplit.offset")?
+                    .unwrap_or(0);
+            lowered.node = ExecNode {
+                kind: ExecNodeKind::Sort(SortNode {
+                    input: Box::new(lowered.node),
+                    node_id: node.node_id,
+                    use_top_n: false,
+                    order_by,
+                    limit,
+                    offset,
+                    topn_type: SortTopNType::RowNumber,
+                    max_buffered_rows: None,
+                    max_buffered_bytes: None,
+                    partition_exprs: Vec::new(),
+                    partition_limit: None,
+                }),
+            };
+        }
+        _ => {}
+    }
+
+    Ok(lowered)
 }
 
 fn lower_set_op_node(
@@ -1208,20 +2325,19 @@ fn lower_hash_aggregate_node(
         .output_layout
         .as_ref()
         .ok_or_else(|| "HashAggregateNode output_layout missing".to_string())?;
-    let synthesized_output_columns;
-    let output_columns = if !aggregate.output_columns.is_empty() {
+    let aggregate_output_columns = aggregate_output_columns_from_layout(
+        output_layout.group_key_columns.as_slice(),
+        output_layout.aggregate_columns.as_slice(),
+    );
+    let visible_output_columns = if !aggregate.output_columns.is_empty() {
         aggregate.output_columns.as_slice()
     } else if !physical.output_columns.is_empty() {
         physical.output_columns.as_slice()
     } else {
-        synthesized_output_columns = aggregate_output_columns_from_layout(
-            output_layout.group_key_columns.as_slice(),
-            output_layout.aggregate_columns.as_slice(),
-        );
-        synthesized_output_columns.as_slice()
+        aggregate_output_columns.as_slice()
     };
-    let layout = layout_from_output_columns(output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let aggregate_layout = layout_from_output_columns(&aggregate_output_columns)?;
+    let aggregate_output_schema = chunk_schema_from_output_columns(&aggregate_output_columns)?;
     if output_layout.aggregate_columns.len() != aggregate.aggregates.len() {
         return Err(format!(
             "HashAggregateNode output_layout aggregate column mismatch: columns={} aggregates={}",
@@ -1316,7 +2432,7 @@ fn lower_hash_aggregate_node(
 
     let input_is_intermediate = functions.iter().all(|f| f.input_is_intermediate);
     let need_finalize = matches!(mode, plan::AggMode::Single | plan::AggMode::Global);
-    Ok(LoweredNode {
+    let aggregate_node = LoweredNode {
         node: ExecNode {
             kind: ExecNodeKind::Aggregate(AggregateNode {
                 input: Box::new(child.node),
@@ -1325,14 +2441,25 @@ fn lower_hash_aggregate_node(
                 functions,
                 need_finalize,
                 input_is_intermediate,
-                output_chunk_schema: output_schema.clone(),
+                output_chunk_schema: aggregate_output_schema.clone(),
                 topn_rf_specs: Vec::new(),
                 streaming_preaggregation_mode: None,
             }),
         },
-        layout,
-        output_schema,
-    })
+        layout: aggregate_layout,
+        output_schema: aggregate_output_schema,
+    };
+    let visible_layout = layout_from_output_columns(visible_output_columns)?;
+    if visible_layout.order() == aggregate_node.layout.order() {
+        return Ok(aggregate_node);
+    }
+    build_slot_projection(
+        "HashAggregateNode",
+        aggregate_node,
+        visible_output_columns,
+        node.node_id,
+        arena,
+    )
 }
 
 fn aggregate_output_columns_from_layout(
@@ -1444,6 +2571,7 @@ fn pack_struct_inputs(
 
 fn lower_hash_join_node(
     node: &plan::DistributedNode,
+    physical: &plan::PlanNode,
     join: &plan::HashJoinNode,
     children: Vec<LoweredNode>,
     arena: &mut ExprArena,
@@ -1462,6 +2590,8 @@ fn lower_hash_join_node(
         left.output_schema.clone(),
         right.output_schema.clone(),
     ])?);
+    let output_schema =
+        join_output_chunk_schema(physical, join_scope_chunk_schema.clone(), "HashJoinNode")?;
 
     let mut probe_keys = Vec::with_capacity(join.eq_conditions.len());
     let mut build_keys = Vec::with_capacity(join.eq_conditions.len());
@@ -1522,7 +2652,7 @@ fn lower_hash_join_node(
                 distribution_mode,
                 left_chunk_schema: left.output_schema,
                 right_chunk_schema: right.output_schema,
-                join_scope_chunk_schema: join_scope_chunk_schema.clone(),
+                join_scope_chunk_schema: output_schema.clone(),
                 probe_keys,
                 build_keys,
                 eq_null_safe,
@@ -1531,8 +2661,24 @@ fn lower_hash_join_node(
             }),
         },
         layout: join_layout,
-        output_schema: join_scope_chunk_schema,
+        output_schema,
     })
+}
+
+fn join_output_chunk_schema(
+    physical: &plan::PlanNode,
+    fallback: ChunkSchemaRef,
+    node_kind: &str,
+) -> Result<ChunkSchemaRef, String> {
+    if physical.output_columns.is_empty() {
+        return Ok(fallback);
+    }
+    let output_schema = chunk_schema_from_output_columns(&physical.output_columns)
+        .map_err(|err| format!("{node_kind} output_columns: {err}"))?;
+    if output_schema.slot_ids() == fallback.slot_ids() {
+        return Ok(output_schema);
+    }
+    Ok(fallback)
 }
 
 fn hash_join_distribution_mode(join: &plan::HashJoinNode) -> Result<JoinDistributionMode, String> {
@@ -1895,26 +3041,65 @@ fn common_join_key_type(left: &DataType, right: &DataType) -> Result<Option<Data
 
 fn lower_nest_loop_join_node(
     node: &plan::DistributedNode,
+    physical: &plan::PlanNode,
     join: &plan::NestLoopJoinNode,
     children: Vec<LoweredNode>,
     arena: &mut ExprArena,
 ) -> Result<LoweredNode, String> {
     check_exact_arity("NestLoopJoinNode", 2, children.len())?;
     let mut it = children.into_iter();
-    let left = it.next().expect("left");
-    let right = it.next().expect("right");
-    let join_type = proto_nested_loop_join_type(join.join_type, "NestLoopJoinNode")?;
+    let mut left = it.next().expect("left");
+    let mut right = it.next().expect("right");
+    let join_kind = plan::JoinKind::try_from(join.join_type)
+        .map_err(|_| format!("NestLoopJoinNode unknown join_type {}", join.join_type))?;
+    let join_type = match join_kind {
+        plan::JoinKind::RightSemi => {
+            std::mem::swap(&mut left, &mut right);
+            NestedLoopJoinType::LeftSemi
+        }
+        plan::JoinKind::RightAnti => {
+            std::mem::swap(&mut left, &mut right);
+            NestedLoopJoinType::LeftAnti
+        }
+        _ => proto_nested_loop_join_type(join.join_type, "NestLoopJoinNode")?,
+    };
     let join_layout = concat_layouts(&left.layout, &right.layout)?;
     let join_scope_chunk_schema = Arc::new(ChunkSchema::concat(&[
         left.output_schema.clone(),
         right.output_schema.clone(),
     ])?);
+    let is_semi_anti = matches!(
+        join_type,
+        NestedLoopJoinType::LeftSemi
+            | NestedLoopJoinType::LeftAnti
+            | NestedLoopJoinType::NullAwareLeftAnti
+    );
+    let output_schema = if is_semi_anti && !physical.output_columns.is_empty() {
+        chunk_schema_from_output_columns(&physical.output_columns)
+            .map_err(|err| format!("NestLoopJoinNode output_columns: {err}"))?
+    } else {
+        join_output_chunk_schema(
+            physical,
+            join_scope_chunk_schema.clone(),
+            "NestLoopJoinNode",
+        )?
+    };
     let join_conjunct = join
         .condition
         .as_ref()
         .map(|expr| lower_proto_expr(expr, arena, &join_layout))
         .transpose()
         .map_err(|err| format!("NestLoopJoinNode condition: {err}"))?;
+    let output_layout = if is_semi_anti {
+        Layout::for_slots(output_schema.slot_ids().iter().copied())
+    } else {
+        join_layout.clone()
+    };
+    let execution_scope_chunk_schema = if is_semi_anti {
+        join_scope_chunk_schema
+    } else {
+        output_schema.clone()
+    };
 
     Ok(LoweredNode {
         node: ExecNode {
@@ -1926,11 +3111,11 @@ fn lower_nest_loop_join_node(
                 join_conjunct,
                 left_chunk_schema: left.output_schema,
                 right_chunk_schema: right.output_schema,
-                join_scope_chunk_schema: join_scope_chunk_schema.clone(),
+                join_scope_chunk_schema: execution_scope_chunk_schema,
             }),
         },
-        layout: join_layout,
-        output_schema: join_scope_chunk_schema,
+        layout: output_layout,
+        output_schema,
     })
 }
 
@@ -1965,7 +3150,7 @@ fn proto_nested_loop_join_type(value: i32, node_kind: &str) -> Result<NestedLoop
         plan::JoinKind::LeftAnti => Ok(NestedLoopJoinType::LeftAnti),
         plan::JoinKind::NullAwareLeftAnti => Ok(NestedLoopJoinType::NullAwareLeftAnti),
         plan::JoinKind::RightSemi | plan::JoinKind::RightAnti => Err(format!(
-            "{node_kind} right semi/anti requires input swapping; native lowering does not support it yet"
+            "{node_kind} right semi/anti must be rewritten before nested-loop join type lowering"
         )),
         plan::JoinKind::Unspecified => Err(format!("{node_kind} join_type is unspecified")),
     }
@@ -2485,8 +3670,10 @@ fn merge_limits(
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::DataType;
+    use std::sync::Arc;
+
+    use arrow::array::{Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field};
 
     use super::{NodeLoweringContext, lower_proto_node};
     use crate::common::ids::SlotId;
@@ -2495,6 +3682,7 @@ mod tests {
     use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
     use crate::exec::node::set_op::SetOpKind;
     use crate::exec::node::sort::SortTopNType;
+    use crate::exec::node::table_function::TableFunctionOutputSlot;
     use crate::proto::{common, expr, plan};
     use crate::runtime::exchange::ExchangeKey;
     use crate::sql::codegen::proto_encode::types::encode_type;
@@ -2503,14 +3691,23 @@ mod tests {
         encode_type(data_type).expect("encode type")
     }
 
-    fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
+    fn output_column_with_nullable(
+        column_id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> common::OutputColumn {
         common::OutputColumn {
             column_id,
             name: name.to_string(),
             r#type: Some(type_desc(&data_type)),
-            nullable: true,
+            nullable,
             is_internal: false,
         }
+    }
+
+    fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
+        output_column_with_nullable(column_id, name, data_type, true)
     }
 
     fn int_literal(value: i64) -> expr::Expr {
@@ -2549,6 +3746,18 @@ mod tests {
         }
     }
 
+    fn null_literal(data_type: DataType) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&data_type)),
+            nullable: true,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::NullValue(true)),
+                }),
+            })),
+        }
+    }
+
     fn column_ref(column_id: u32, data_type: DataType) -> expr::Expr {
         expr::Expr {
             r#type: Some(type_desc(&data_type)),
@@ -2566,6 +3775,98 @@ mod tests {
             expr: Some(column_ref(column_id, DataType::Int64)),
             asc: true,
             nulls_first: false,
+        }
+    }
+
+    fn topn_exchange_node(node_id: i32) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Exchange(
+                plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Hash as i32,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 7,
+                    output_columns: vec![output_column(1, "id", DataType::Int64)],
+                    output_qualifier: None,
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::TopnSplit(
+                            plan::TopNSplitFlavor {
+                                items: vec![sort_item(1)],
+                                limit: Some(3),
+                                offset: Some(1),
+                            },
+                        )),
+                    }),
+                },
+            )),
+        }
+    }
+
+    fn limit_offset_exchange_node(
+        node_id: i32,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: limit.unwrap_or(-1),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Exchange(
+                plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Unpartitioned as i32,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 7,
+                    output_columns: vec![output_column(1, "id", DataType::Int64)],
+                    output_qualifier: None,
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::LimitOffset(
+                            plan::LimitOffsetFlavor { limit, offset },
+                        )),
+                    }),
+                },
+            )),
+        }
+    }
+
+    fn cte_multicast_exchange_node(node_id: i32) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Exchange(
+                plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Unpartitioned as i32,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 7,
+                    output_columns: vec![output_column(1, "id", DataType::Int64)],
+                    output_qualifier: None,
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::CteMulticast(
+                            plan::CteMulticastFlavor {
+                                cte_id: 3,
+                                receive_producer_column_ids: vec![1],
+                            },
+                        )),
+                    }),
+                },
+            )),
         }
     }
 
@@ -2624,7 +3925,22 @@ mod tests {
         name: &str,
         value: i64,
     ) -> plan::DistributedNode {
-        let columns = vec![output_column(column_id, name, DataType::Int64)];
+        one_col_values_node_with_nullable(node_id, column_id, name, value, true)
+    }
+
+    fn one_col_values_node_with_nullable(
+        node_id: i32,
+        column_id: u32,
+        name: &str,
+        value: i64,
+        nullable: bool,
+    ) -> plan::DistributedNode {
+        let columns = vec![output_column_with_nullable(
+            column_id,
+            name,
+            DataType::Int64,
+            nullable,
+        )];
         physical_node(
             node_id,
             plan::plan_node::Kind::Values(plan::ValuesNode {
@@ -2648,6 +3964,25 @@ mod tests {
             plan::plan_node::Kind::Values(plan::ValuesNode {
                 rows: vec![plan::ExprList {
                     values: vec![int_literal(10), int_literal(20)],
+                }],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
+    fn three_col_values_node(node_id: i32) -> plan::DistributedNode {
+        let columns = vec![
+            output_column(1, "a", DataType::Int64),
+            output_column(2, "b", DataType::Int64),
+            output_column(3, "c", DataType::Int64),
+        ];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList {
+                    values: vec![int_literal(10), int_literal(20), int_literal(30)],
                 }],
                 columns: columns.clone(),
             }),
@@ -2700,6 +4035,43 @@ mod tests {
             .expect("utf8 name");
         assert_eq!(name.value(0), "alice");
         assert_eq!(name.value(1), "bob");
+    }
+
+    #[test]
+    fn values_casts_null_rows_to_declared_column_type_before_concat() {
+        let columns = vec![output_column(1, "id", DataType::Int64)];
+        let node = physical_node(
+            10,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![
+                    plan::ExprList {
+                        values: vec![int_literal(10)],
+                    },
+                    plan::ExprList {
+                        values: vec![null_literal(DataType::Null)],
+                    },
+                ],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        );
+
+        let lowered = lower(&node);
+        let ExecNodeKind::Values(values) = lowered.node.kind else {
+            panic!("expected Values");
+        };
+        let id_column = values
+            .chunk
+            .column_by_slot_id(SlotId::new(1))
+            .expect("id column");
+        assert_eq!(id_column.data_type(), &DataType::Int64);
+        let id = id_column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 id");
+        assert_eq!(id.value(0), 10);
+        assert!(id.is_null(1));
     }
 
     #[test]
@@ -2806,6 +4178,105 @@ mod tests {
     }
 
     #[test]
+    fn lowers_native_table_function_with_outer_and_result_slots() {
+        let array_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let child_columns = vec![
+            output_column(1, "id", DataType::Int64),
+            output_column(2, "arr", array_type.clone()),
+        ];
+        let child = physical_node(
+            10,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: Vec::new(),
+                columns: child_columns.clone(),
+            }),
+            child_columns,
+            Vec::new(),
+        );
+        let result_columns = vec![output_column(3, "unnest", DataType::Int64)];
+        let node = physical_node(
+            20,
+            plan::plan_node::Kind::TableFunction(plan::TableFunctionNode {
+                function_name: "unnest".to_string(),
+                args: vec![column_ref(2, array_type.clone())],
+                output_columns: result_columns.clone(),
+                alias: Some("u".to_string()),
+                is_left_join: false,
+            }),
+            result_columns,
+            vec![child],
+        );
+
+        let lowered = lower(&node);
+        assert_eq!(
+            lowered.layout.order(),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]
+        );
+        assert_eq!(
+            lowered.output_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]
+        );
+
+        let ExecNodeKind::TableFunction(table_function) = lowered.node.kind else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(table_function.node_id, 20);
+        assert_eq!(table_function.function_name, "unnest");
+        assert_eq!(table_function.param_types, vec![array_type]);
+        assert_eq!(table_function.ret_types, vec![DataType::Int64]);
+        assert_eq!(
+            table_function.outer_slots,
+            vec![SlotId::new(1), SlotId::new(2)]
+        );
+        assert_eq!(table_function.fn_result_slots, vec![SlotId::new(3)]);
+        assert!(table_function.fn_result_required);
+        assert!(!table_function.is_left_join);
+        assert_eq!(table_function.param_slots.len(), 1);
+        assert_ne!(table_function.param_slots[0], SlotId::new(1));
+        assert_ne!(table_function.param_slots[0], SlotId::new(2));
+        assert_ne!(table_function.param_slots[0], SlotId::new(3));
+        assert_eq!(
+            table_function.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]
+        );
+        assert_eq!(table_function.output_slot_sources.len(), 3);
+        match &table_function.output_slot_sources[0] {
+            TableFunctionOutputSlot::Outer { slot } => assert_eq!(*slot, SlotId::new(1)),
+            other => panic!("expected first outer slot, got {other:?}"),
+        }
+        match &table_function.output_slot_sources[1] {
+            TableFunctionOutputSlot::Outer { slot } => assert_eq!(*slot, SlotId::new(2)),
+            other => panic!("expected second outer slot, got {other:?}"),
+        }
+        match &table_function.output_slot_sources[2] {
+            TableFunctionOutputSlot::Result { index } => assert_eq!(*index, 0),
+            other => panic!("expected result slot, got {other:?}"),
+        }
+
+        let ExecNodeKind::Project(project) = table_function.input.kind else {
+            panic!("expected derived Project input");
+        };
+        assert!(project.is_subordinate);
+        assert_eq!(
+            project.expr_slot_ids,
+            vec![
+                SlotId::new(1),
+                SlotId::new(2),
+                table_function.param_slots[0],
+            ]
+        );
+        assert_eq!(
+            project.output_chunk_schema.slot_ids(),
+            &[
+                SlotId::new(1),
+                SlotId::new(2),
+                table_function.param_slots[0],
+            ]
+        );
+        assert!(matches!(project.input.kind, ExecNodeKind::Values(_)));
+    }
+
+    #[test]
     fn generate_series_rejects_zero_step_and_children() {
         let zero_step = physical_node(
             20,
@@ -2875,6 +4346,35 @@ mod tests {
         );
         assert_eq!(lowered.layout.order(), &[SlotId::new(7)]);
         assert!(matches!(project.input.kind, ExecNodeKind::Values(_)));
+    }
+
+    #[test]
+    fn wraps_project_distributed_limit_as_limit_node() {
+        let mut project = physical_node(
+            20,
+            plan::plan_node::Kind::Project(plan::ProjectNode {
+                items: vec![plan::ProjectItem {
+                    expr: Some(column_ref(1, DataType::Int64)),
+                    output_name: "projected_id".to_string(),
+                    output_column_id: 7,
+                }],
+                output_qualifier: None,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        project.limit = 1;
+
+        let lowered = lower(&project);
+        let ExecNodeKind::Limit(limit) = lowered.node.kind else {
+            panic!("expected Limit");
+        };
+        assert_eq!(limit.node_id, 20);
+        assert_eq!(limit.limit, Some(1));
+        assert_eq!(limit.offset, 0);
+        assert!(matches!(limit.input.kind, ExecNodeKind::Project(_)));
+        assert_eq!(lowered.layout.order(), &[SlotId::new(7)]);
+        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(7)]);
     }
 
     #[test]
@@ -3039,7 +4539,71 @@ mod tests {
     }
 
     #[test]
-    fn rejects_split_topn() {
+    fn lowers_sort_output_reorder_as_subordinate_project() {
+        let sort = physical_node(
+            20,
+            plan::plan_node::Kind::Sort(plan::SortNode {
+                items: vec![sort_item(1)],
+                analytic_partition_by: Vec::new(),
+                output_columns: vec![
+                    output_column(2, "b", DataType::Int64),
+                    output_column(1, "a", DataType::Int64),
+                ],
+                offset: None,
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![
+                output_column(2, "b", DataType::Int64),
+                output_column(1, "a", DataType::Int64),
+            ],
+            vec![two_col_values_node(10)],
+        );
+
+        let lowered = lower(&sort);
+        let ExecNodeKind::Project(project) = lowered.node.kind else {
+            panic!("expected reorder project");
+        };
+        assert!(project.is_subordinate);
+        assert_eq!(project.node_id, 20);
+        assert_eq!(project.expr_slot_ids, vec![SlotId::new(2), SlotId::new(1)]);
+        assert_eq!(
+            project.output_chunk_schema.slot_ids(),
+            &[SlotId::new(2), SlotId::new(1)]
+        );
+        assert_eq!(lowered.layout.order(), &[SlotId::new(2), SlotId::new(1)]);
+        let ExecNodeKind::Sort(sort) = project.input.kind else {
+            panic!("expected Sort below reorder project");
+        };
+        assert_eq!(sort.order_by.len(), 1);
+        assert!(matches!(sort.input.kind, ExecNodeKind::Values(_)));
+    }
+
+    #[test]
+    fn lowers_partial_split_topn() {
+        let topn = physical_node(
+            30,
+            plan::plan_node::Kind::Topn(plan::TopNNode {
+                items: vec![sort_item(1)],
+                limit: Some(3),
+                offset: Some(0),
+                phase: plan::TopNPhase::TopnPhasePartial as i32,
+                is_split: true,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&topn);
+        let ExecNodeKind::Sort(topn) = lowered.node.kind else {
+            panic!("expected split TopN as Sort");
+        };
+        assert!(topn.use_top_n);
+        assert_eq!(topn.limit, Some(3));
+        assert_eq!(topn.offset, 0);
+    }
+
+    #[test]
+    fn rejects_final_split_topn_physical_node() {
         let topn = physical_node(
             30,
             plan::plan_node::Kind::Topn(plan::TopNNode {
@@ -3054,8 +4618,8 @@ mod tests {
         );
         let mut arena = ExprArena::default();
         let err = lower_proto_node(&topn, &mut arena, &NodeLoweringContext::default()).unwrap_err();
-        assert!(err.contains("TopNNode split"));
-        assert!(err.contains("not implemented"));
+        assert!(err.contains("TopNNode final split"));
+        assert!(err.contains("ExchangeReceiver TopNSplit"));
     }
 
     #[test]
@@ -3107,6 +4671,248 @@ mod tests {
         };
         assert_eq!(exchange.expected_senders, 2);
         assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_topn_split_exchange_receiver_as_merging_sort() {
+        let mut arena = ExprArena::default();
+        let lowered = lower_proto_node(
+            &topn_exchange_node(41),
+            &mut arena,
+            &NodeLoweringContext::default().with_exchange_sender_count(
+                ExchangeKey {
+                    finst_id_hi: 0,
+                    finst_id_lo: 0,
+                    node_id: 41,
+                },
+                2,
+            ),
+        )
+        .expect("TopNSplit exchange receiver");
+
+        let ExecNodeKind::Sort(sort) = lowered.node.kind else {
+            panic!("expected Sort");
+        };
+        assert_eq!(sort.node_id, 41);
+        assert_eq!(sort.limit, Some(3));
+        assert_eq!(sort.offset, 1);
+        assert_eq!(sort.order_by.len(), 1);
+        let ExecNodeKind::ExchangeSource(exchange) = sort.input.kind else {
+            panic!("expected ExchangeSource under Sort");
+        };
+        assert_eq!(exchange.expected_senders, 2);
+        assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_limit_offset_exchange_receiver_as_limit_node() {
+        let mut arena = ExprArena::default();
+        let lowered = lower_proto_node(
+            &limit_offset_exchange_node(42, Some(3), Some(1)),
+            &mut arena,
+            &NodeLoweringContext::default().with_exchange_sender_count(
+                ExchangeKey {
+                    finst_id_hi: 0,
+                    finst_id_lo: 0,
+                    node_id: 42,
+                },
+                2,
+            ),
+        )
+        .expect("LimitOffset exchange receiver");
+
+        let ExecNodeKind::Limit(limit) = lowered.node.kind else {
+            panic!("expected Limit");
+        };
+        assert_eq!(limit.node_id, 42);
+        assert_eq!(limit.limit, Some(3));
+        assert_eq!(limit.offset, 1);
+        let ExecNodeKind::ExchangeSource(exchange) = limit.input.kind else {
+            panic!("expected ExchangeSource under Limit");
+        };
+        assert_eq!(exchange.expected_senders, 2);
+        assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_cte_multicast_exchange_receiver_as_exchange_source() {
+        let mut arena = ExprArena::default();
+        let lowered = lower_proto_node(
+            &cte_multicast_exchange_node(43),
+            &mut arena,
+            &NodeLoweringContext::default().with_exchange_sender_count(
+                ExchangeKey {
+                    finst_id_hi: 0,
+                    finst_id_lo: 0,
+                    node_id: 43,
+                },
+                2,
+            ),
+        )
+        .expect("CTE multicast exchange receiver");
+
+        let ExecNodeKind::ExchangeSource(exchange) = lowered.node.kind else {
+            panic!("expected ExchangeSource");
+        };
+        assert_eq!(exchange.expected_senders, 2);
+        assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_window_node_to_analytic_exec_node() {
+        let output_columns = vec![
+            output_column(1, "id", DataType::Int64),
+            output_column(2, "rn", DataType::Int64),
+        ];
+        let window = physical_node(
+            80,
+            plan::plan_node::Kind::Window(plan::WindowNode {
+                window_exprs: vec![plan::WindowExpr {
+                    name: "row_number".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    partition_by: Vec::new(),
+                    order_by: vec![sort_item(1)],
+                    window_frame: Some(expr::WindowFrame {
+                        frame_type: expr::WindowFrameType::Rows as i32,
+                        start: Some(expr::WindowBound {
+                            bound: Some(expr::window_bound::Bound::UnboundedPreceding(true)),
+                        }),
+                        end: Some(expr::WindowBound {
+                            bound: Some(expr::window_bound::Bound::CurrentRow(true)),
+                        }),
+                    }),
+                    result_type: Some(type_desc(&DataType::Int64)),
+                    output_name: "rn".to_string(),
+                    output_column_id: 2,
+                    ignore_nulls: false,
+                }],
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+
+        let lowered = lower(&window);
+        let ExecNodeKind::Analytic(analytic) = lowered.node.kind else {
+            panic!("expected Analytic");
+        };
+        assert_eq!(analytic.node_id, 80);
+        assert_eq!(analytic.functions.len(), 1);
+        assert!(matches!(
+            analytic.functions[0].kind,
+            crate::exec::node::analytic::WindowFunctionKind::RowNumber
+        ));
+        assert_eq!(analytic.order_by_exprs.len(), 1);
+        assert_eq!(
+            analytic.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1), SlotId::new(2)]);
+    }
+
+    #[test]
+    fn lowers_window_node_with_multiple_specs_as_analytic_chain() {
+        let output_columns = vec![
+            output_column(1, "id", DataType::Int64),
+            output_column(2, "rn", DataType::Int64),
+            output_column(3, "rnk", DataType::Int64),
+        ];
+        let mut descending_id = sort_item(1);
+        descending_id.asc = false;
+        let window = physical_node(
+            81,
+            plan::plan_node::Kind::Window(plan::WindowNode {
+                window_exprs: vec![
+                    plan::WindowExpr {
+                        name: "row_number".to_string(),
+                        args: Vec::new(),
+                        distinct: false,
+                        partition_by: Vec::new(),
+                        order_by: vec![sort_item(1)],
+                        window_frame: Some(expr::WindowFrame {
+                            frame_type: expr::WindowFrameType::Rows as i32,
+                            start: Some(expr::WindowBound {
+                                bound: Some(expr::window_bound::Bound::UnboundedPreceding(true)),
+                            }),
+                            end: Some(expr::WindowBound {
+                                bound: Some(expr::window_bound::Bound::CurrentRow(true)),
+                            }),
+                        }),
+                        result_type: Some(type_desc(&DataType::Int64)),
+                        output_name: "rn".to_string(),
+                        output_column_id: 2,
+                        ignore_nulls: false,
+                    },
+                    plan::WindowExpr {
+                        name: "rank".to_string(),
+                        args: Vec::new(),
+                        distinct: false,
+                        partition_by: Vec::new(),
+                        order_by: vec![descending_id],
+                        window_frame: Some(expr::WindowFrame {
+                            frame_type: expr::WindowFrameType::Rows as i32,
+                            start: Some(expr::WindowBound {
+                                bound: Some(expr::window_bound::Bound::UnboundedPreceding(true)),
+                            }),
+                            end: Some(expr::WindowBound {
+                                bound: Some(expr::window_bound::Bound::CurrentRow(true)),
+                            }),
+                        }),
+                        result_type: Some(type_desc(&DataType::Int64)),
+                        output_name: "rnk".to_string(),
+                        output_column_id: 3,
+                        ignore_nulls: false,
+                    },
+                ],
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+
+        let lowered = lower(&window);
+        let ExecNodeKind::Analytic(second) = lowered.node.kind else {
+            panic!("expected final Analytic");
+        };
+        assert_eq!(second.node_id, 83);
+        assert_eq!(second.functions.len(), 1);
+        assert!(matches!(
+            second.functions[0].kind,
+            crate::exec::node::analytic::WindowFunctionKind::Rank
+        ));
+        assert_eq!(
+            second.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]
+        );
+
+        let ExecNodeKind::Sort(sort) = second.input.kind else {
+            panic!("expected Sort under final Analytic");
+        };
+        assert_eq!(sort.node_id, 82);
+        assert_eq!(sort.order_by.len(), 1);
+        assert!(!sort.order_by[0].asc);
+
+        let ExecNodeKind::Analytic(first) = sort.input.kind else {
+            panic!("expected first Analytic under Sort");
+        };
+        assert_eq!(first.node_id, 81);
+        assert_eq!(first.functions.len(), 1);
+        assert!(matches!(
+            first.functions[0].kind,
+            crate::exec::node::analytic::WindowFunctionKind::RowNumber
+        ));
+        assert_eq!(
+            first.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert_eq!(
+            lowered.layout.order(),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]
+        );
     }
 
     #[test]
@@ -3356,6 +5162,113 @@ mod tests {
     }
 
     #[test]
+    fn hash_join_output_schema_uses_plan_output_nullability() {
+        let output_columns = vec![
+            output_column_with_nullable(1, "lhs", DataType::Int64, false),
+            output_column_with_nullable(2, "rhs", DataType::Int64, true),
+        ];
+        let join = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: plan::JoinKind::LeftOuter as i32,
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(column_ref(2, DataType::Int64)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: plan::JoinDistribution::Broadcast as i32,
+                execution_mode: None,
+                build_runtime_filters: Vec::new(),
+            }),
+            output_columns,
+            vec![
+                one_col_values_node_with_nullable(10, 1, "lhs", 10, false),
+                one_col_values_node_with_nullable(11, 2, "rhs", 10, false),
+            ],
+        );
+
+        let lowered = lower(&join);
+        assert_eq!(
+            lowered.output_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert!(!lowered.output_schema.slots()[0].nullable());
+        assert!(lowered.output_schema.slots()[1].nullable());
+        let ExecNodeKind::Join(join) = lowered.node.kind else {
+            panic!("expected Join");
+        };
+        assert!(!join.join_scope_chunk_schema.slots()[0].nullable());
+        assert!(join.join_scope_chunk_schema.slots()[1].nullable());
+    }
+
+    #[test]
+    fn nested_loop_join_output_schema_uses_plan_output_nullability() {
+        let output_columns = vec![
+            output_column_with_nullable(1, "lhs", DataType::Int64, false),
+            output_column_with_nullable(2, "rhs", DataType::Int64, true),
+        ];
+        let join = physical_node(
+            30,
+            plan::plan_node::Kind::NestLoopJoin(plan::NestLoopJoinNode {
+                join_type: plan::JoinKind::LeftOuter as i32,
+                condition: Some(bool_literal(true)),
+            }),
+            output_columns,
+            vec![
+                one_col_values_node_with_nullable(10, 1, "lhs", 10, false),
+                one_col_values_node_with_nullable(11, 2, "rhs", 10, false),
+            ],
+        );
+
+        let lowered = lower(&join);
+        assert_eq!(
+            lowered.output_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert!(!lowered.output_schema.slots()[0].nullable());
+        assert!(lowered.output_schema.slots()[1].nullable());
+        let ExecNodeKind::NestedLoopJoin(join) = lowered.node.kind else {
+            panic!("expected NestedLoopJoin");
+        };
+        assert!(!join.join_scope_chunk_schema.slots()[0].nullable());
+        assert!(join.join_scope_chunk_schema.slots()[1].nullable());
+    }
+
+    #[test]
+    fn nested_loop_right_semi_swaps_inputs_for_left_semi_execution() {
+        let right_output = vec![output_column(2, "rhs", DataType::Int64)];
+        let join = physical_node(
+            30,
+            plan::plan_node::Kind::NestLoopJoin(plan::NestLoopJoinNode {
+                join_type: plan::JoinKind::RightSemi as i32,
+                condition: Some(bool_literal(true)),
+            }),
+            right_output,
+            vec![
+                one_col_values_node_with(10, 1, "lhs", 10),
+                one_col_values_node_with(11, 2, "rhs", 20),
+            ],
+        );
+
+        let lowered = lower(&join);
+        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(2)]);
+        let ExecNodeKind::NestedLoopJoin(join) = lowered.node.kind else {
+            panic!("expected NestedLoopJoin");
+        };
+        assert!(matches!(
+            join.join_type,
+            crate::exec::node::nljoin::NestedLoopJoinType::LeftSemi
+        ));
+        assert_eq!(join.left_chunk_schema.slot_ids(), &[SlotId::new(2)]);
+        assert_eq!(join.right_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(
+            join.join_scope_chunk_schema.slot_ids(),
+            &[SlotId::new(2), SlotId::new(1)]
+        );
+    }
+
+    #[test]
     fn hash_aggregate_derives_output_columns_from_layout_sidecar() {
         let group_column = output_column(1, "id", DataType::Int64);
         let aggregate = physical_node(
@@ -3383,6 +5296,58 @@ mod tests {
         assert!(aggregate.functions.is_empty());
         assert_eq!(aggregate.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
         assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn hash_aggregate_projects_visible_subset_after_full_layout_output() {
+        let group_a = output_column(1, "a", DataType::Int64);
+        let group_c = output_column(3, "c", DataType::Int64);
+        let sum_b = output_column(4, "sum_b", DataType::Int64);
+        let visible_output = vec![sum_b.clone()];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: vec![
+                    column_ref(1, DataType::Int64),
+                    column_ref(3, DataType::Int64),
+                ],
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "sum".to_string(),
+                    args: vec![column_ref(2, DataType::Int64)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Int64)),
+                    order_by: Vec::new(),
+                    output_column_id: 4,
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: vec![group_a, group_c],
+                    aggregate_columns: vec![sum_b],
+                }),
+                output_columns: visible_output.clone(),
+            }),
+            visible_output,
+            vec![three_col_values_node(10)],
+        );
+
+        let lowered = lower(&aggregate);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(4)]);
+        let ExecNodeKind::Project(project) = lowered.node.kind else {
+            panic!("expected visible-output projection");
+        };
+        assert!(project.is_subordinate);
+        assert_eq!(project.expr_slot_ids, vec![SlotId::new(4)]);
+        assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(4)]);
+        let ExecNodeKind::Aggregate(aggregate) = project.input.kind else {
+            panic!("expected Aggregate below visible-output projection");
+        };
+        assert_eq!(aggregate.group_by.len(), 2);
+        assert_eq!(aggregate.functions.len(), 1);
+        assert_eq!(
+            aggregate.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(3), SlotId::new(4)]
+        );
     }
 
     #[test]

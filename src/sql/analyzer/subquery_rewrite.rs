@@ -527,7 +527,7 @@ impl<'a> AnalyzerContext<'a> {
                 column_id: marker_col_id,
                 name: marker_col_name,
                 data_type: DataType::Int32,
-                nullable: false,
+                nullable: true,
                 is_internal: false,
             }],
         };

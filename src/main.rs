@@ -301,6 +301,7 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     // path), so log_filter/log_level/sys_log_dir from the config are ignored.
     novarocks::common::app_config::install_preloaded_config(cfg.clone());
     novarocks_logging::init_with_level(&resolve_log_filter(&cfg));
+    novarocks::server::configure_standalone_internal_rpc_transport();
 
     // Spec (IW-4): role=fe must not execute local fragments, but it still
     // exposes the coordinator report-capable NovaRocksGrpc endpoint.
