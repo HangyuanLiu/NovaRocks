@@ -3048,25 +3048,58 @@ fn lower_nest_loop_join_node(
 ) -> Result<LoweredNode, String> {
     check_exact_arity("NestLoopJoinNode", 2, children.len())?;
     let mut it = children.into_iter();
-    let left = it.next().expect("left");
-    let right = it.next().expect("right");
-    let join_type = proto_nested_loop_join_type(join.join_type, "NestLoopJoinNode")?;
+    let mut left = it.next().expect("left");
+    let mut right = it.next().expect("right");
+    let join_kind = plan::JoinKind::try_from(join.join_type)
+        .map_err(|_| format!("NestLoopJoinNode unknown join_type {}", join.join_type))?;
+    let join_type = match join_kind {
+        plan::JoinKind::RightSemi => {
+            std::mem::swap(&mut left, &mut right);
+            NestedLoopJoinType::LeftSemi
+        }
+        plan::JoinKind::RightAnti => {
+            std::mem::swap(&mut left, &mut right);
+            NestedLoopJoinType::LeftAnti
+        }
+        _ => proto_nested_loop_join_type(join.join_type, "NestLoopJoinNode")?,
+    };
     let join_layout = concat_layouts(&left.layout, &right.layout)?;
     let join_scope_chunk_schema = Arc::new(ChunkSchema::concat(&[
         left.output_schema.clone(),
         right.output_schema.clone(),
     ])?);
-    let output_schema = join_output_chunk_schema(
-        physical,
-        join_scope_chunk_schema.clone(),
-        "NestLoopJoinNode",
-    )?;
+    let is_semi_anti = matches!(
+        join_type,
+        NestedLoopJoinType::LeftSemi
+            | NestedLoopJoinType::LeftAnti
+            | NestedLoopJoinType::NullAwareLeftAnti
+    );
+    let output_schema = if is_semi_anti && !physical.output_columns.is_empty() {
+        chunk_schema_from_output_columns(&physical.output_columns)
+            .map_err(|err| format!("NestLoopJoinNode output_columns: {err}"))?
+    } else {
+        join_output_chunk_schema(
+            physical,
+            join_scope_chunk_schema.clone(),
+            "NestLoopJoinNode",
+        )?
+    };
     let join_conjunct = join
         .condition
         .as_ref()
         .map(|expr| lower_proto_expr(expr, arena, &join_layout))
         .transpose()
         .map_err(|err| format!("NestLoopJoinNode condition: {err}"))?;
+    let output_layout = if is_semi_anti {
+        Layout::for_slots(output_schema.slot_ids().iter().copied())
+    } else {
+        join_layout.clone()
+    };
+    let execution_scope_chunk_schema = if is_semi_anti {
+        join_scope_chunk_schema
+    } else {
+        output_schema.clone()
+    };
 
     Ok(LoweredNode {
         node: ExecNode {
@@ -3078,10 +3111,10 @@ fn lower_nest_loop_join_node(
                 join_conjunct,
                 left_chunk_schema: left.output_schema,
                 right_chunk_schema: right.output_schema,
-                join_scope_chunk_schema: output_schema.clone(),
+                join_scope_chunk_schema: execution_scope_chunk_schema,
             }),
         },
-        layout: join_layout,
+        layout: output_layout,
         output_schema,
     })
 }
@@ -3117,7 +3150,7 @@ fn proto_nested_loop_join_type(value: i32, node_kind: &str) -> Result<NestedLoop
         plan::JoinKind::LeftAnti => Ok(NestedLoopJoinType::LeftAnti),
         plan::JoinKind::NullAwareLeftAnti => Ok(NestedLoopJoinType::NullAwareLeftAnti),
         plan::JoinKind::RightSemi | plan::JoinKind::RightAnti => Err(format!(
-            "{node_kind} right semi/anti requires input swapping; native lowering does not support it yet"
+            "{node_kind} right semi/anti must be rewritten before nested-loop join type lowering"
         )),
         plan::JoinKind::Unspecified => Err(format!("{node_kind} join_type is unspecified")),
     }
@@ -5200,6 +5233,39 @@ mod tests {
         };
         assert!(!join.join_scope_chunk_schema.slots()[0].nullable());
         assert!(join.join_scope_chunk_schema.slots()[1].nullable());
+    }
+
+    #[test]
+    fn nested_loop_right_semi_swaps_inputs_for_left_semi_execution() {
+        let right_output = vec![output_column(2, "rhs", DataType::Int64)];
+        let join = physical_node(
+            30,
+            plan::plan_node::Kind::NestLoopJoin(plan::NestLoopJoinNode {
+                join_type: plan::JoinKind::RightSemi as i32,
+                condition: Some(bool_literal(true)),
+            }),
+            right_output,
+            vec![
+                one_col_values_node_with(10, 1, "lhs", 10),
+                one_col_values_node_with(11, 2, "rhs", 20),
+            ],
+        );
+
+        let lowered = lower(&join);
+        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(2)]);
+        let ExecNodeKind::NestedLoopJoin(join) = lowered.node.kind else {
+            panic!("expected NestedLoopJoin");
+        };
+        assert!(matches!(
+            join.join_type,
+            crate::exec::node::nljoin::NestedLoopJoinType::LeftSemi
+        ));
+        assert_eq!(join.left_chunk_schema.slot_ids(), &[SlotId::new(2)]);
+        assert_eq!(join.right_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(
+            join.join_scope_chunk_schema.slot_ids(),
+            &[SlotId::new(2), SlotId::new(1)]
+        );
     }
 
     #[test]
