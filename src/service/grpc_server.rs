@@ -176,16 +176,8 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                         break;
                     }
                 };
-                if let Some(status) = result.status.as_ref()
-                    && status.code != 0
-                {
-                    let _ = tx
-                        .send(Err(tonic::Status::internal(status.message.clone())))
-                        .await;
-                    break;
-                }
-
                 let ack = result;
+                let handler_failed = ack.status.as_ref().is_some_and(|status| status.code != 0);
                 debug!(
                     "exchange ack SEND: finst={} node_id={} sender_id={} be_number={} eos={} seq={}",
                     format_uuid(finst_id_hi, finst_id_lo),
@@ -197,6 +189,9 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 );
 
                 if tx.send(Ok(ack)).await.is_err() {
+                    break;
+                }
+                if handler_failed {
                     break;
                 }
                 debug!(
@@ -225,11 +220,6 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             .map_err(|e| {
                 tonic::Status::internal(format!("exchange_unary handler panicked: {e}"))
             })?;
-        if let Some(status) = result.status.as_ref()
-            && status.code != 0
-        {
-            return Err(tonic::Status::internal(status.message.clone()));
-        }
         Ok(tonic::Response::new(result))
     }
 
@@ -1380,9 +1370,9 @@ mod pr3_tests {
     use super::proto::novarocks::fetch_result_response::Status as FetchStatus;
     use super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
     use super::proto::novarocks::{
-        CancelFragmentRequest, ExecStatusReport, FetchResultRequest, HeartbeatRequest,
-        IcebergCommitInfo, IcebergDataFile, IcebergFileContent, ReportExecStatusRequest,
-        SubmitFragmentRequest,
+        CancelFragmentRequest, ExchangeRequest, ExecStatusReport, FetchResultRequest,
+        HeartbeatRequest, IcebergCommitInfo, IcebergDataFile, IcebergFileContent,
+        ReportExecStatusRequest, SubmitFragmentRequest,
     };
     use super::proto::{novarocks, plan};
     use crate::thrift::types;
@@ -1441,6 +1431,33 @@ mod pr3_tests {
             message: message.to_string(),
         });
         report
+    }
+
+    #[tokio::test]
+    async fn exchange_unary_decode_error_returns_native_status_not_rpc_error() {
+        let svc = GrpcService::default();
+        let resp = svc
+            .exchange_unary(Request::new(ExchangeRequest {
+                finst_id_hi: 11,
+                finst_id_lo: 22,
+                node_id: 7,
+                sender_id: 3,
+                be_number: 9,
+                eos: false,
+                sequence: 42,
+                payload: vec![1, 2, 3],
+            }))
+            .await
+            .expect("handler status must not become tonic error");
+        let body = resp.into_inner();
+        assert_eq!(body.ack_sequence, 42);
+        let status = body.status.expect("exchange response status");
+        assert_ne!(status.code, 0);
+        assert!(
+            status.message.contains("exchange decode failed"),
+            "unexpected status message: {}",
+            status.message
+        );
     }
 
     #[tokio::test]

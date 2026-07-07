@@ -3645,6 +3645,18 @@ fn nidl_e5_native_exchange_rpc_paths_do_not_reference_starrocks_proto() {
         "native grpc_server exchange path must not reference proto::starrocks:\n{exchange_region}"
     );
 
+    let grpc_client =
+        fs::read_to_string(repo.join("src/service/grpc_client.rs")).expect("read grpc_client.rs");
+    let send_chunks_region = source_region(
+        &grpc_client,
+        "pub fn send_chunks(",
+        "pub fn transmit_runtime_filter(",
+    );
+    assert!(
+        !send_chunks_region.contains("proto::starrocks"),
+        "native grpc_client send_chunks path must not reference proto::starrocks:\n{send_chunks_region}"
+    );
+
     let internal_rpc =
         fs::read_to_string(repo.join("src/service/internal_rpc.rs")).expect("read internal_rpc.rs");
     let native_handler = source_region(
