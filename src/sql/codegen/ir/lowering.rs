@@ -1715,6 +1715,12 @@ struct LoweredDistributedNode {
     ordering: OrderingSpec,
 }
 
+#[derive(Clone, Debug)]
+struct SurvivingEqKeyExprs {
+    left: TypedExpr,
+    right: TypedExpr,
+}
+
 fn hash_aggregate_group_layout_column<'a>(
     op: &'a super::kind::DistributedHashAggregateNode,
     node_id: i32,
@@ -2654,7 +2660,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         let mut eq_join_conjuncts = Vec::new();
         let mut demoted_eq_exprs: Vec<TypedExpr> = Vec::new();
         let mut surviving_eq_origin: Vec<usize> = Vec::new();
-        let mut surviving_eq_build_exprs: Vec<TypedExpr> = Vec::new();
+        let mut surviving_eq_key_exprs: Vec<SurvivingEqKeyExprs> = Vec::new();
         for (eq_index, eq) in op.eq_conditions.iter().enumerate() {
             let expr_a = &eq.left;
             let expr_b = &eq.right;
@@ -2665,7 +2671,16 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ExprCompiler::new_strict_id(self.state.slot_allocator(), &right_scope)
                         .compile_typed(expr_b)
                         .ok()
-                        .map(|rt| (lt, rt, expr_b.clone()))
+                        .map(|rt| {
+                            (
+                                lt,
+                                rt,
+                                SurvivingEqKeyExprs {
+                                    left: expr_a.clone(),
+                                    right: expr_b.clone(),
+                                },
+                            )
+                        })
                 });
             let result = natural.or_else(|| {
                 ExprCompiler::new_strict_id(self.state.slot_allocator(), &left_scope)
@@ -2675,10 +2690,19 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                         ExprCompiler::new_strict_id(self.state.slot_allocator(), &right_scope)
                             .compile_typed(expr_a)
                             .ok()
-                            .map(|rt| (lt, rt, expr_a.clone()))
+                            .map(|rt| {
+                                (
+                                    lt,
+                                    rt,
+                                    SurvivingEqKeyExprs {
+                                        left: expr_b.clone(),
+                                        right: expr_a.clone(),
+                                    },
+                                )
+                            })
                     })
             });
-            if let Some((lt, rt, build_expr)) = result {
+            if let Some((lt, rt, key_exprs)) = result {
                 eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
                     left: lt,
                     right: rt,
@@ -2689,7 +2713,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     }),
                 });
                 surviving_eq_origin.push(eq_index);
-                surviving_eq_build_exprs.push(build_expr);
+                surviving_eq_key_exprs.push(key_exprs);
             } else {
                 demoted_eq_exprs.push(TypedExpr {
                     kind: ExprKind::BinaryOp {
@@ -2746,9 +2770,10 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         let rf_descs = self.build_rf_descriptors(
             build_runtime_filters,
             join_node_id,
+            &left_scope,
             &right_scope,
             &surviving_eq_origin,
-            &surviving_eq_build_exprs,
+            &surviving_eq_key_exprs,
         )?;
         if !rf_descs.is_empty()
             && let Some(hj) = join_plan_node.hash_join_node.as_mut()
@@ -2972,9 +2997,10 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         build_runtime_filters: &[WiredRuntimeFilterBuild],
         join_node_id: i32,
+        left_scope: &ExprScope,
         build_scope: &ExprScope,
         surviving_eq_origin: &[usize],
-        surviving_eq_build_exprs: &[TypedExpr],
+        surviving_eq_key_exprs: &[SurvivingEqKeyExprs],
     ) -> Result<Vec<crate::thrift::runtime_filter::TRuntimeFilterDescription>, String> {
         use crate::thrift::runtime_filter;
 
@@ -2997,16 +3023,21 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             if post_demote_expr_order >= surviving_eq_origin.len() {
                 continue;
             }
-            let Some(expected_build_expr) = surviving_eq_build_exprs.get(post_demote_expr_order)
-            else {
+            let Some(eq_key_exprs) = surviving_eq_key_exprs.get(post_demote_expr_order) else {
                 continue;
             };
-            if !rf_build_expr_matches_join_build_expr(&rf.build_expr, expected_build_expr) {
-                tracing::debug!(
-                    "skip runtime filter {filter_id}: build expr does not match join build key"
-                );
-                continue;
-            }
+            let build_scope =
+                if rf_build_expr_matches_join_build_expr(&rf.build_expr, &eq_key_exprs.right) {
+                    build_scope
+                } else if rf_build_expr_matches_join_build_expr(&rf.build_expr, &eq_key_exprs.left)
+                {
+                    left_scope
+                } else {
+                    tracing::debug!(
+                        "skip runtime filter {filter_id}: build expr does not match either join key"
+                    );
+                    continue;
+                };
 
             let build_texpr = match ExprCompiler::new(self.state.slot_allocator(), build_scope)
                 .compile_typed(&rf.build_expr)
@@ -6656,7 +6687,7 @@ mod tests {
     }
 
     #[test]
-    fn right_semi_hash_join_lowers_runtime_filter_on_execution_build_side() {
+    fn right_semi_hash_join_lowers_runtime_filter_from_left_existence_to_right_preserved_side() {
         let connectors = ConnectorRegistry::new();
         let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
         let (_, _, left_key, right_key, left_scope, right_scope) =
@@ -6678,8 +6709,8 @@ mod tests {
         };
         let runtime_filter = WiredRuntimeFilterBuild {
             filter_id: 17,
-            build_expr: right_key,
-            probe_expr: left_key,
+            build_expr: left_key,
+            probe_expr: right_key,
             expr_order: 0,
             execution_mode: JoinExecutionMode::Broadcast,
             source_fragment_id: 0,
@@ -6709,6 +6740,26 @@ mod tests {
 
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0].filter_id, Some(17));
+        let build_expr = filters[0]
+            .build_expr
+            .as_ref()
+            .expect("right semi RF should keep a build expr");
+        let build_node = build_expr
+            .nodes
+            .first()
+            .expect("right semi RF build expr should have a node");
+        let slot_ref = build_node
+            .slot_ref
+            .as_ref()
+            .expect("right semi RF build expr should lower as a slot ref");
+        assert_eq!(
+            slot_ref.tuple_id, 1,
+            "right semi RF build expr should compile against the left existence tuple"
+        );
+        assert_eq!(
+            slot_ref.slot_id, 11,
+            "right semi RF build expr should compile against the left existence slot"
+        );
     }
 
     fn cte_receive_distributed_plan_for_lowering_test(
