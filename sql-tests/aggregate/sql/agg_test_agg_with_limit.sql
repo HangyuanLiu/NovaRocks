@@ -234,9 +234,9 @@ USE ${case_db};
 analyze full table t5;
 
 -- query 45
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=DECODE
+-- R0 retired native low-cardinality DECODE plan nodes; after ANALYZE FULL,
+-- aggregate coverage must not reintroduce that legacy shape.
+-- @result_not_contains=DECODE
 -- @skip_result_check=true
 USE ${case_db};
 EXPLAIN VERBOSE SELECT DISTINCT c2 FROM t5;
