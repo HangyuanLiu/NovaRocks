@@ -63,7 +63,8 @@ message ExchangeRequest {
 
 // Ack for one ExchangeRequest.
 message ExchangeResponse {
-  int64 ack_sequence = 1;  // sequence value accepted for this request
+  int64 ack_sequence = 1;                 // sequence value accepted for this request
+  novarocks.common.Status status = 2;     // native exchange handler status; code 0 == OK
 }
 
 // SubmitFragment payload. Native plan + per-instance parameters only.

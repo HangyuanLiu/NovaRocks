@@ -3603,6 +3603,69 @@ fn nidl_d3b_current_schema_matches_baseline() {
     }
 }
 
+fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start_idx = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing start marker `{start}`"));
+    let after_start = &source[start_idx..];
+    let end_idx = after_start
+        .find(end)
+        .unwrap_or_else(|| panic!("missing end marker `{end}` after `{start}`"));
+    &after_start[..end_idx]
+}
+
+#[test]
+fn nidl_e5_native_exchange_response_has_common_status() {
+    let schema =
+        parse_current_novarocks_proto_schema().expect("current native proto schema should parse");
+    let service_proto = &schema.files["idl/novarocks/service.proto"];
+    let response = &service_proto.messages["ExchangeResponse"];
+    let status = response
+        .fields
+        .get(&2)
+        .expect("ExchangeResponse field 2 must be native status");
+
+    assert_eq!(status.name, "status");
+    assert_eq!(status.type_name, "novarocks.common.Status");
+    assert_eq!(status.label, "singular");
+}
+
+#[test]
+fn nidl_e5_native_exchange_rpc_paths_do_not_reference_starrocks_proto() {
+    let repo = Path::new(manifest_dir());
+    let grpc_server =
+        fs::read_to_string(repo.join("src/service/grpc_server.rs")).expect("read grpc_server.rs");
+    let exchange_region = source_region(
+        &grpc_server,
+        "async fn exchange(",
+        "async fn transmit_runtime_filter(",
+    );
+    assert!(
+        !exchange_region.contains("proto::starrocks"),
+        "native grpc_server exchange path must not reference proto::starrocks:\n{exchange_region}"
+    );
+
+    let internal_rpc =
+        fs::read_to_string(repo.join("src/service/internal_rpc.rs")).expect("read internal_rpc.rs");
+    let native_handler = source_region(
+        &internal_rpc,
+        "pub(crate) fn handle_transmit_chunk(",
+        "#[cfg(feature = \"compat\")]\npub(crate) fn handle_transmit_chunk_compat(",
+    );
+    assert!(
+        native_handler.contains("proto::novarocks::ExchangeRequest"),
+        "native transmit_chunk handler must accept ExchangeRequest:\n{native_handler}"
+    );
+    assert!(
+        native_handler.contains("proto::novarocks::ExchangeResponse"),
+        "native transmit_chunk handler must return ExchangeResponse:\n{native_handler}"
+    );
+    assert!(
+        !native_handler.contains("proto::starrocks"),
+        "native transmit_chunk handler must not reference proto::starrocks:\n{native_handler}"
+    );
+}
+
 #[test]
 fn nidl_d3e_native_runtime_routing_has_no_thrift_shaped_endpoint_model() {
     let repo = Path::new(manifest_dir());

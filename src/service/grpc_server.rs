@@ -197,6 +197,10 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
 
                 let ack = proto::novarocks::ExchangeResponse {
                     ack_sequence: req.sequence,
+                    status: Some(proto::common::Status {
+                        code: 0,
+                        message: String::new(),
+                    }),
                 };
                 debug!(
                     "exchange ack SEND: finst={} node_id={} sender_id={} be_number={} eos={} seq={}",
@@ -262,6 +266,10 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         }
         Ok(tonic::Response::new(proto::novarocks::ExchangeResponse {
             ack_sequence: req.sequence,
+            status: Some(proto::common::Status {
+                code: 0,
+                message: String::new(),
+            }),
         }))
     }
 

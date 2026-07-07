@@ -6168,6 +6168,13 @@
               "type_name": "int64",
               "label": "singular",
               "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "status",
+              "type_name": "novarocks.common.Status",
+              "label": "singular",
+              "oneof": null
             }
           },
           "reserved_numbers": [],
