@@ -3569,6 +3569,60 @@ fn nidl_d3j_native_delta_scan_sidecar_is_not_patched_from_thrift_plan() {
     );
 }
 
+#[test]
+fn nidl_d3k_native_dynamic_sink_partition_does_not_roundtrip_thrift_partition() {
+    let repo = Path::new(manifest_dir());
+    let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
+    let mut violations = Vec::new();
+
+    for forbidden in [
+        "native_data_partition_from_thrift",
+        "native_data_partition_from_thrift_with_exprs",
+    ] {
+        if coordinator.contains(forbidden) {
+            violations.push(format!(
+                "src/runtime/coordinator.rs: native dynamic sink patch must not use `{forbidden}`"
+            ));
+        }
+    }
+
+    if coordinator.contains("Vec<(FragmentId, i32, partitions::TDataPartition, Vec<i32>)>") {
+        violations.push(
+            "src/runtime/coordinator.rs: CTE native consumer index must not store thrift TDataPartition"
+                .to_string(),
+        );
+    }
+
+    let scheduler = fs::read_to_string(repo.join("src/runtime/scheduler.rs")).unwrap();
+    for forbidden in [
+        "use crate::thrift::partitions::TPartitionType;",
+        "Vec<(FragmentId, TPartitionType, FragmentStreamKind)>",
+        "e.compact_output_partition.type_",
+    ] {
+        if scheduler.contains(forbidden) {
+            violations.push(format!(
+                "src/runtime/scheduler.rs: scheduling topology must use native edge.output_partition, not compact thrift partition via `{forbidden}`"
+            ));
+        }
+    }
+
+    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
+    if !codegen_mod.contains("pub output_partition: crate::sql::planner::DataPartition")
+        || !codegen_mod.contains("pub compact_output_partition: partitions::TDataPartition")
+    {
+        violations.push(
+            "src/sql/codegen/mod.rs: FragmentEdge must split native output_partition from compact_output_partition"
+                .to_string(),
+        );
+    }
+
+    assert!(
+        violations.is_empty(),
+        "D3K native dynamic sink partition guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
 fn nidl_d3b_baseline_update_hint() -> String {
     format!(
         "To intentionally update the proto schema ledger, run:\n{}",

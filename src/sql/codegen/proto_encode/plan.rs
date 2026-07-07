@@ -924,7 +924,7 @@ fn encode_exchange_flavor(src: &ExchangeFlavor) -> Result<plan::ExchangeFlavor, 
     })
 }
 
-fn encode_data_partition(src: &DataPartition) -> Result<plan::DataPartition, String> {
+pub(crate) fn encode_data_partition(src: &DataPartition) -> Result<plan::DataPartition, String> {
     Ok(plan::DataPartition {
         kind: match src.kind {
             PartitionKind::Unpartitioned => plan::PartitionKind::Unpartitioned as i32,
@@ -1024,7 +1024,7 @@ fn encode_fragment_edge(src: &FragmentEdge) -> Result<plan::FragmentEdge, String
         source_fragment_id: src.source_fragment_id,
         target_fragment_id: src.target_fragment_id,
         target_exchange_node_id: src.target_exchange_node_id,
-        output_partition: encode_partition_type(src.output_partition.type_)?,
+        output_partition: encode_edge_partition_type(&src.output_partition),
         stream_kind: match src.stream_kind {
             FragmentStreamKind::Gather => plan::FragmentStreamKind::Gather as i32,
             FragmentStreamKind::Broadcast => plan::FragmentStreamKind::Broadcast as i32,
@@ -1691,6 +1691,14 @@ fn sql_scalar_type(src: &SqlType) -> Result<common::ScalarType, String> {
     })
 }
 
+fn encode_edge_partition_type(src: &DataPartition) -> i32 {
+    match src.kind {
+        PartitionKind::Unpartitioned => plan::PartitionType::Unpartitioned as i32,
+        PartitionKind::Random => plan::PartitionType::Random as i32,
+        PartitionKind::Hash => plan::PartitionType::Hash as i32,
+    }
+}
+
 fn encode_partition_type(src: crate::thrift::partitions::TPartitionType) -> Result<i32, String> {
     use crate::thrift::partitions::TPartitionType;
     Ok(match src {
@@ -2109,7 +2117,8 @@ mod tests {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
                 target_exchange_node_id: 20,
-                output_partition: crate::thrift::partitions::TDataPartition::new(
+                output_partition: DataPartition::unpartitioned(),
+                compact_output_partition: crate::thrift::partitions::TDataPartition::new(
                     crate::thrift::partitions::TPartitionType::UNPARTITIONED,
                     None::<Vec<crate::thrift::exprs::TExpr>>,
                     None::<Vec<crate::thrift::partitions::TRangePartition>>,

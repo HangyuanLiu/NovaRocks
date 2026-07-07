@@ -754,7 +754,11 @@ mod tests {
                 source_fragment_id: 0,
                 target_fragment_id: 1,
                 target_exchange_node_id: 42,
-                output_partition: crate::thrift::partitions::TDataPartition::new(
+                output_partition: crate::sql::planner::DataPartition {
+                    kind: crate::sql::planner::PartitionKind::Hash,
+                    exprs: vec![column_expr(10, "v", DataType::Int64)],
+                },
+                compact_output_partition: crate::thrift::partitions::TDataPartition::new(
                     crate::thrift::partitions::TPartitionType::HASH_PARTITIONED,
                     None::<Vec<crate::thrift::exprs::TExpr>>,
                     None::<Vec<crate::thrift::partitions::TRangePartition>>,
@@ -887,7 +891,8 @@ mod tests {
                 source_fragment_id: 0,
                 target_fragment_id: 1,
                 target_exchange_node_id: 42,
-                output_partition: crate::thrift::partitions::TDataPartition::new(
+                output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+                compact_output_partition: crate::thrift::partitions::TDataPartition::new(
                     crate::thrift::partitions::TPartitionType::UNPARTITIONED,
                     None::<Vec<crate::thrift::exprs::TExpr>>,
                     None::<Vec<crate::thrift::partitions::TRangePartition>>,

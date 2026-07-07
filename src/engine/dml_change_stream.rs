@@ -1973,7 +1973,8 @@ mod tests {
             source_fragment_id: 0,
             target_fragment_id: 1,
             target_exchange_node_id: 30,
-            output_partition: crate::thrift::partitions::TDataPartition::new(
+            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            compact_output_partition: crate::thrift::partitions::TDataPartition::new(
                 crate::thrift::partitions::TPartitionType::UNPARTITIONED,
                 None::<Vec<crate::thrift::exprs::TExpr>>,
                 None::<Vec<crate::thrift::partitions::TRangePartition>>,
@@ -2063,7 +2064,8 @@ mod tests {
             source_fragment_id: 0,
             target_fragment_id: 1,
             target_exchange_node_id: 30,
-            output_partition: crate::thrift::partitions::TDataPartition::new(
+            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            compact_output_partition: crate::thrift::partitions::TDataPartition::new(
                 crate::thrift::partitions::TPartitionType::UNPARTITIONED,
                 None::<Vec<crate::thrift::exprs::TExpr>>,
                 None::<Vec<crate::thrift::partitions::TRangePartition>>,

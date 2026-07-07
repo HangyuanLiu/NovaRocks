@@ -78,8 +78,10 @@ pub(crate) struct FragmentEdge {
     pub target_fragment_id: FragmentId,
     pub target_exchange_node_id: i32,
     #[allow(dead_code)]
-    // populated by fragment builder, will be read when partition-aware exchange is enabled
-    pub output_partition: partitions::TDataPartition,
+    // Planner-native semantics used by native fragment wire.
+    pub output_partition: crate::sql::planner::DataPartition,
+    // Thrift projection used by compact/compat sinks.
+    pub compact_output_partition: partitions::TDataPartition,
     pub stream_kind: FragmentStreamKind,
     pub edge_kind: FragmentEdgeKind,
     pub output_slot_ids: Vec<i32>,

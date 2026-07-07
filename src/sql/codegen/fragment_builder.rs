@@ -272,8 +272,8 @@ mod tests {
     use crate::sql::planner::plan::WindowExpr;
     use crate::sql::planner::{
         ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec, IcebergWriteFragmentSink,
-        IcebergWriteInputBinding, IcebergWriteSinkSpec, with_iceberg_change_stream_write,
-        with_iceberg_write_sink,
+        IcebergWriteInputBinding, IcebergWriteSinkSpec, PartitionKind,
+        with_iceberg_change_stream_write, with_iceberg_write_sink,
     };
     use crate::thrift::{exprs, plan_nodes};
 
@@ -2338,7 +2338,7 @@ mod tests {
             crate::sql::codegen::FragmentStreamKind::Broadcast
         );
         assert_eq!(
-            build.edges[0].output_partition.type_,
+            build.edges[0].compact_output_partition.type_,
             crate::thrift::partitions::TPartitionType::UNPARTITIONED
         );
     }
@@ -2843,11 +2843,12 @@ mod tests {
             crate::sql::codegen::FragmentStreamKind::Partitioned
         );
         assert_eq!(
-            edge.output_partition.type_,
+            edge.compact_output_partition.type_,
             crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
         );
+        assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
         assert_eq!(
-            edge.output_partition
+            edge.compact_output_partition
                 .partition_exprs
                 .as_ref()
                 .map(|v| v.len()),
@@ -3512,11 +3513,12 @@ mod tests {
             crate::sql::codegen::FragmentStreamKind::Partitioned
         );
         assert_eq!(
-            edge.output_partition.type_,
+            edge.compact_output_partition.type_,
             crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
         );
+        assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
         let partition_exprs = edge
-            .output_partition
+            .compact_output_partition
             .partition_exprs
             .as_ref()
             .expect("partition exprs");
@@ -3721,7 +3723,7 @@ mod tests {
                 .expect("writer fragment");
             assert_eq!(edge.source_fragment_id, build.root_fragment_id);
             assert_eq!(
-                edge.output_partition.type_,
+                edge.compact_output_partition.type_,
                 crate::thrift::partitions::TPartitionType::UNPARTITIONED
             );
             assert_eq!(writer.plan.nodes.len(), 1);
