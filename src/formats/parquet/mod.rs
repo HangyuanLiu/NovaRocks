@@ -3295,6 +3295,8 @@ mod tests {
         let specs = [crate::exec::node::join::JoinRuntimeFilterSpec {
             filter_id: 1,
             expr_order: 0,
+            probe_expr_id: crate::exec::expr::ExprId(0),
+            build_expr_id: crate::exec::expr::ExprId(0),
             probe_slot_id: SlotId::new(1),
             build_data_type: DataType::Int32,
             merge_nodes: Vec::new(),
@@ -3355,6 +3357,8 @@ mod tests {
             crate::exec::node::join::JoinRuntimeFilterSpec {
                 filter_id: 1,
                 expr_order: 0,
+                probe_expr_id: crate::exec::expr::ExprId(0),
+                build_expr_id: crate::exec::expr::ExprId(0),
                 probe_slot_id: SlotId::new(1),
                 build_data_type: DataType::Int32,
                 merge_nodes: Vec::new(),
@@ -3363,6 +3367,8 @@ mod tests {
             crate::exec::node::join::JoinRuntimeFilterSpec {
                 filter_id: 2,
                 expr_order: 1,
+                probe_expr_id: crate::exec::expr::ExprId(1),
+                build_expr_id: crate::exec::expr::ExprId(1),
                 probe_slot_id: SlotId::new(2),
                 build_data_type: DataType::Int64,
                 merge_nodes: Vec::new(),
@@ -3478,6 +3484,8 @@ mod tests {
             crate::exec::node::join::JoinRuntimeFilterSpec {
                 filter_id: 1,
                 expr_order: 0,
+                probe_expr_id: crate::exec::expr::ExprId(0),
+                build_expr_id: crate::exec::expr::ExprId(0),
                 probe_slot_id: SlotId::new(1),
                 build_data_type: DataType::Int32,
                 merge_nodes: Vec::new(),
@@ -3486,6 +3494,8 @@ mod tests {
             crate::exec::node::join::JoinRuntimeFilterSpec {
                 filter_id: 2,
                 expr_order: 1,
+                probe_expr_id: crate::exec::expr::ExprId(1),
+                build_expr_id: crate::exec::expr::ExprId(1),
                 probe_slot_id: SlotId::new(2),
                 build_data_type: DataType::Int64,
                 merge_nodes: Vec::new(),
@@ -4634,6 +4644,8 @@ mod tests {
         let specs = [crate::exec::node::join::JoinRuntimeFilterSpec {
             filter_id: 1,
             expr_order: 0,
+            probe_expr_id: crate::exec::expr::ExprId(0),
+            build_expr_id: crate::exec::expr::ExprId(0),
             probe_slot_id: SlotId::new(1),
             build_data_type: DataType::Int32,
             merge_nodes: Vec::new(),

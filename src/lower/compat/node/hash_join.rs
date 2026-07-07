@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 
-use crate::exec::expr::{ExprArena, ExprNode};
+use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::join::{
     JoinDistributionMode, JoinNode, JoinRuntimeFilterSpec, JoinType, RuntimeFilterMergeNode,
 };
@@ -73,6 +73,195 @@ fn lower_runtime_filter_merge_nodes(
             port: addr.port,
         })
         .collect()
+}
+
+fn validate_runtime_filter_intent(
+    desc: &runtime_filter::TRuntimeFilterDescription,
+    filter_id: i32,
+    expr_order: usize,
+    probe_layout: &Layout,
+    build_layout: &Layout,
+    expected_probe_key: ExprId,
+    expected_build_key: ExprId,
+    arena: &mut ExprArena,
+    last_query_id: Option<&str>,
+    fe_addr: Option<&types::TNetworkAddress>,
+) -> Result<(), String> {
+    let build_expr = desc
+        .build_expr
+        .as_ref()
+        .ok_or_else(|| format!("runtime filter {} missing build_expr", filter_id))?;
+    let build_expr_id = lower_t_expr(build_expr, arena, build_layout, last_query_id, fe_addr)
+        .map_err(|err| format!("runtime filter {} build_expr: {err}", filter_id))?;
+    if !exprs_equivalent(arena, build_expr_id, expected_build_key) {
+        return Err(format!(
+            "runtime filter {} build_expr does not match join key at expr_order {}",
+            filter_id, expr_order
+        ));
+    }
+
+    let target_exprs = desc
+        .plan_node_id_to_target_expr
+        .as_ref()
+        .filter(|targets| !targets.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "runtime filter {} missing plan_node_id_to_target_expr",
+                filter_id
+            )
+        })?;
+    for probe_expr in target_exprs.values() {
+        let probe_expr_id =
+            lower_t_expr(probe_expr, arena, probe_layout, last_query_id, fe_addr)
+                .map_err(|err| format!("runtime filter {} probe target_expr: {err}", filter_id))?;
+        if !exprs_equivalent(arena, probe_expr_id, expected_probe_key) {
+            return Err(format!(
+                "runtime filter {} probe target_expr does not match join key at expr_order {}",
+                filter_id, expr_order
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn exprs_equivalent(arena: &ExprArena, left: ExprId, right: ExprId) -> bool {
+    if arena.data_type(left) != arena.data_type(right) {
+        return false;
+    }
+    let Some(left_node) = arena.node(left) else {
+        return false;
+    };
+    let Some(right_node) = arena.node(right) else {
+        return false;
+    };
+    match (left_node, right_node) {
+        (ExprNode::Literal(left), ExprNode::Literal(right)) => {
+            format!("{left:?}") == format!("{right:?}")
+        }
+        (ExprNode::SlotId(left), ExprNode::SlotId(right)) => left == right,
+        (ExprNode::ArrayExpr { elements: left }, ExprNode::ArrayExpr { elements: right })
+        | (ExprNode::StructExpr { fields: left }, ExprNode::StructExpr { fields: right }) => {
+            expr_id_slices_equivalent(arena, left, right)
+        }
+        (
+            ExprNode::LambdaFunction {
+                body: left_body,
+                arg_slots: left_args,
+                common_sub_exprs: left_common,
+                is_nondeterministic: left_nondeterministic,
+            },
+            ExprNode::LambdaFunction {
+                body: right_body,
+                arg_slots: right_args,
+                common_sub_exprs: right_common,
+                is_nondeterministic: right_nondeterministic,
+            },
+        ) => {
+            left_args == right_args
+                && left_nondeterministic == right_nondeterministic
+                && exprs_equivalent(arena, *left_body, *right_body)
+                && common_sub_exprs_equivalent(arena, left_common, right_common)
+        }
+        (
+            ExprNode::DictDecode {
+                child: left,
+                dict: left_dict,
+            },
+            ExprNode::DictDecode {
+                child: right,
+                dict: right_dict,
+            },
+        ) => Arc::ptr_eq(left_dict, right_dict) && exprs_equivalent(arena, *left, *right),
+        (ExprNode::Cast(left), ExprNode::Cast(right))
+        | (ExprNode::CastTime(left), ExprNode::CastTime(right))
+        | (ExprNode::CastTimeFromDatetime(left), ExprNode::CastTimeFromDatetime(right))
+        | (ExprNode::Not(left), ExprNode::Not(right))
+        | (ExprNode::IsNull(left), ExprNode::IsNull(right))
+        | (ExprNode::IsNotNull(left), ExprNode::IsNotNull(right))
+        | (ExprNode::Clone(left), ExprNode::Clone(right)) => exprs_equivalent(arena, *left, *right),
+        (ExprNode::Add(ll, lr), ExprNode::Add(rl, rr))
+        | (ExprNode::Sub(ll, lr), ExprNode::Sub(rl, rr))
+        | (ExprNode::Mul(ll, lr), ExprNode::Mul(rl, rr))
+        | (ExprNode::Div(ll, lr), ExprNode::Div(rl, rr))
+        | (ExprNode::Mod(ll, lr), ExprNode::Mod(rl, rr))
+        | (ExprNode::Eq(ll, lr), ExprNode::Eq(rl, rr))
+        | (ExprNode::EqForNull(ll, lr), ExprNode::EqForNull(rl, rr))
+        | (ExprNode::Ne(ll, lr), ExprNode::Ne(rl, rr))
+        | (ExprNode::Lt(ll, lr), ExprNode::Lt(rl, rr))
+        | (ExprNode::Le(ll, lr), ExprNode::Le(rl, rr))
+        | (ExprNode::Gt(ll, lr), ExprNode::Gt(rl, rr))
+        | (ExprNode::Ge(ll, lr), ExprNode::Ge(rl, rr))
+        | (ExprNode::And(ll, lr), ExprNode::And(rl, rr))
+        | (ExprNode::Or(ll, lr), ExprNode::Or(rl, rr)) => {
+            exprs_equivalent(arena, *ll, *rl) && exprs_equivalent(arena, *lr, *rr)
+        }
+        (
+            ExprNode::In {
+                child: left_child,
+                values: left_values,
+                is_not_in: left_not,
+            },
+            ExprNode::In {
+                child: right_child,
+                values: right_values,
+                is_not_in: right_not,
+            },
+        ) => {
+            left_not == right_not
+                && exprs_equivalent(arena, *left_child, *right_child)
+                && expr_id_slices_equivalent(arena, left_values, right_values)
+        }
+        (
+            ExprNode::Case {
+                has_case_expr: left_has_case,
+                has_else_expr: left_has_else,
+                children: left_children,
+            },
+            ExprNode::Case {
+                has_case_expr: right_has_case,
+                has_else_expr: right_has_else,
+                children: right_children,
+            },
+        ) => {
+            left_has_case == right_has_case
+                && left_has_else == right_has_else
+                && expr_id_slices_equivalent(arena, left_children, right_children)
+        }
+        (
+            ExprNode::FunctionCall {
+                kind: left_kind,
+                args: left_args,
+            },
+            ExprNode::FunctionCall {
+                kind: right_kind,
+                args: right_args,
+            },
+        ) => left_kind == right_kind && expr_id_slices_equivalent(arena, left_args, right_args),
+        _ => false,
+    }
+}
+
+fn expr_id_slices_equivalent(arena: &ExprArena, left: &[ExprId], right: &[ExprId]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| exprs_equivalent(arena, *left, *right))
+}
+
+fn common_sub_exprs_equivalent(
+    arena: &ExprArena,
+    left: &[(crate::common::ids::SlotId, ExprId)],
+    right: &[(crate::common::ids::SlotId, ExprId)],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|((left_slot, left_expr), (right_slot, right_expr))| {
+                left_slot == right_slot && exprs_equivalent(arena, *left_expr, *right_expr)
+            })
 }
 
 /// Lower a HASH_JOIN_NODE plan node to a `Lowered` ExecNode.
@@ -132,6 +321,7 @@ pub(crate) fn lower_hash_join_node(
     let mut probe_keys = Vec::with_capacity(join.eq_join_conjuncts.len());
     let mut build_keys = Vec::with_capacity(join.eq_join_conjuncts.len());
     let mut eq_null_safe = Vec::with_capacity(join.eq_join_conjuncts.len());
+    let right_semi_physical_right_probe = join_type == JoinType::RightSemi;
     for cond in &join.eq_join_conjuncts {
         let null_safe = match cond.opcode {
             Some(op) if op == crate::thrift::opcodes::TExprOpcode::EQ_FOR_NULL => true,
@@ -144,21 +334,18 @@ pub(crate) fn lower_hash_join_node(
             }
         };
         eq_null_safe.push(null_safe);
-        probe_keys.push(lower_t_expr(
-            &cond.left,
-            arena,
-            &left.layout,
-            last_query_id,
-            fe_addr,
-        )?);
-        build_keys.push(lower_t_expr(
-            &cond.right,
-            arena,
-            &right.layout,
-            last_query_id,
-            fe_addr,
-        )?);
+        let left_key = lower_t_expr(&cond.left, arena, &left.layout, last_query_id, fe_addr)?;
+        let right_key = lower_t_expr(&cond.right, arena, &right.layout, last_query_id, fe_addr)?;
+        if right_semi_physical_right_probe {
+            probe_keys.push(right_key);
+            build_keys.push(left_key);
+        } else {
+            probe_keys.push(left_key);
+            build_keys.push(right_key);
+        }
     }
+    let raw_probe_keys = probe_keys.clone();
+    let raw_build_keys = build_keys.clone();
     for idx in 0..probe_keys.len() {
         let probe_expr = *probe_keys
             .get(idx)
@@ -286,6 +473,23 @@ pub(crate) fn lower_hash_join_node(
             let probe_key = probe_keys
                 .get(expr_order)
                 .ok_or_else(|| "runtime filter probe key missing".to_string())?;
+            let (probe_layout, build_layout) = if right_semi_physical_right_probe {
+                (&right.layout, &left.layout)
+            } else {
+                (&left.layout, &right.layout)
+            };
+            validate_runtime_filter_intent(
+                desc,
+                filter_id,
+                expr_order,
+                probe_layout,
+                build_layout,
+                raw_probe_keys[expr_order],
+                raw_build_keys[expr_order],
+                arena,
+                last_query_id,
+                fe_addr,
+            )?;
             let build_type = arena
                 .data_type(*build_key)
                 .ok_or_else(|| "runtime filter build key type missing".to_string())?;
@@ -324,6 +528,8 @@ pub(crate) fn lower_hash_join_node(
             runtime_filters.push(JoinRuntimeFilterSpec {
                 filter_id,
                 expr_order,
+                probe_expr_id: *probe_key,
+                build_expr_id: *build_key,
                 probe_slot_id: *probe_slot_id,
                 build_data_type: build_type.clone(),
                 merge_nodes,
@@ -410,18 +616,22 @@ pub(crate) fn lower_hash_join_node(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
+    use super::*;
     use arrow::array::Int64Array;
     use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::node::ExecNodeKind;
+    use crate::exec::node::lookup::LookUpNode;
     use crate::exec::node::values::ValuesNode;
     use crate::lower::compat::type_lowering::scalar_type_desc;
+    use crate::sql::codegen::descriptors::DescriptorTableBuilder;
+    use crate::sql::codegen::expr_compiler::build_slot_ref_texpr;
     use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
+    use crate::thrift::opcodes::TExprOpcode;
 
     #[test]
     fn common_join_key_type_promotes_mixed_integers() {
@@ -500,6 +710,115 @@ mod tests {
             join.join_scope_chunk_schema.slots()[1].nullable(),
             "nullable_tuples must null-extend the right side even when slot descriptors are non-nullable"
         );
+    }
+
+    #[test]
+    fn right_semi_hash_join_lowers_runtime_filter_from_left_build_to_right_probe() {
+        let mut desc_builder = DescriptorTableBuilder::new();
+        let arrow_int = DataType::Int32;
+        let thrift_int = scalar_type_desc(types::TPrimitiveType::INT);
+        desc_builder.add_slot(11, 1, "l_k", &arrow_int, false, 0);
+        desc_builder.add_tuple(1, None);
+        desc_builder.add_slot(22, 2, "r_k", &arrow_int, false, 0);
+        desc_builder.add_tuple(2, None);
+        let desc_tbl = desc_builder.build();
+
+        let left_layout = Layout {
+            order: vec![(1, 11)],
+            index: BTreeMap::from([((1, 11), 0)]).into_iter().collect(),
+        };
+        let right_layout = Layout {
+            order: vec![(2, 22)],
+            index: BTreeMap::from([((2, 22), 0)]).into_iter().collect(),
+        };
+        let left = Lowered {
+            node: ExecNode {
+                kind: ExecNodeKind::LookUp(LookUpNode {
+                    node_id: 101,
+                    row_pos_descs: Default::default(),
+                    output_chunk_schema: chunk_schema_for_layout(&desc_tbl, &left_layout)
+                        .expect("left schema"),
+                }),
+            },
+            layout: left_layout,
+        };
+        let right = Lowered {
+            node: ExecNode {
+                kind: ExecNodeKind::LookUp(LookUpNode {
+                    node_id: 202,
+                    row_pos_descs: Default::default(),
+                    output_chunk_schema: chunk_schema_for_layout(&desc_tbl, &right_layout)
+                        .expect("right schema"),
+                }),
+            },
+            layout: right_layout,
+        };
+
+        let left_key = build_slot_ref_texpr(11, 1, thrift_int.clone());
+        let right_key = build_slot_ref_texpr(22, 2, thrift_int);
+        let mut node = crate::lower::compat::node::test_plan_node(
+            10,
+            plan_nodes::TPlanNodeType::HASH_JOIN_NODE,
+            2,
+        );
+        node.row_tuples = vec![2];
+        node.hash_join_node = Some(plan_nodes::THashJoinNode {
+            join_op: plan_nodes::TJoinOp::RIGHT_SEMI_JOIN,
+            eq_join_conjuncts: vec![plan_nodes::TEqJoinCondition {
+                left: left_key.clone(),
+                right: right_key.clone(),
+                opcode: Some(TExprOpcode::EQ),
+            }],
+            other_join_conjuncts: None,
+            is_push_down: None,
+            add_probe_filters: None,
+            is_rewritten_from_not_in: None,
+            sql_join_predicates: None,
+            sql_predicates: None,
+            distribution_mode: Some(plan_nodes::TJoinDistributionMode::BROADCAST),
+            build_runtime_filters_from_planner: None,
+            partition_exprs: None,
+            output_columns: None,
+            interpolate_passthrough: None,
+            late_materialization: None,
+            enable_partition_hash_join: None,
+            is_skew_join: None,
+            common_slot_map: None,
+            asof_join_condition: None,
+            build_runtime_filters: Some(vec![runtime_filter::TRuntimeFilterDescription {
+                filter_id: Some(7),
+                expr_order: Some(0),
+                build_expr: Some(left_key),
+                plan_node_id_to_target_expr: Some(BTreeMap::from([(202, right_key)])),
+                filter_type: Some(runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER),
+                ..Default::default()
+            }]),
+        });
+
+        let mut arena = ExprArena::default();
+        let lowered = lower_hash_join_node(
+            vec![left, right],
+            &node,
+            &mut arena,
+            Some(&desc_tbl),
+            None,
+            None,
+        )
+        .expect("lower right semi hash join");
+        let ExecNodeKind::Join(join) = lowered.node.kind else {
+            panic!("expected join node");
+        };
+
+        assert_eq!(join.runtime_filters.len(), 1);
+        assert!(matches!(
+            arena.node(join.build_keys[0]),
+            Some(ExprNode::SlotId(slot)) if *slot == SlotId::new(11)
+        ));
+        assert!(matches!(
+            arena.node(join.probe_keys[0]),
+            Some(ExprNode::SlotId(slot)) if *slot == SlotId::new(22)
+        ));
+        assert_eq!(join.runtime_filters[0].probe_slot_id, SlotId::new(22));
     }
 
     fn type_desc() -> types::TTypeDesc {

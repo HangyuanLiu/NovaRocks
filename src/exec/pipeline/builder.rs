@@ -1086,11 +1086,12 @@ fn build_pipeline_for_node(
             let left_build = build_pipeline_for_node(left, ctx)?;
             let right_build = build_pipeline_for_node(right, ctx)?;
 
-            // StarRocks uses left child as probe and right child as build across join types.
-            // Keep the execution order aligned with the FE plan to avoid swapping runtime filters.
-            let probe_is_left = true;
-            let mut probe_build = left_build;
-            let mut build_build = right_build;
+            let probe_is_left = *join_type != JoinType::RightSemi;
+            let (mut probe_build, mut build_build) = if probe_is_left {
+                (left_build, right_build)
+            } else {
+                (right_build, left_build)
+            };
             let probe_keys = probe_keys.clone();
             let build_keys = build_keys.clone();
             let eq_null_safe = eq_null_safe.clone();
@@ -1496,6 +1497,9 @@ mod tests {
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
     use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
+    use crate::exec::node::join::{
+        JoinDistributionMode, JoinNode, JoinRuntimeFilterSpec, JoinType,
+    };
     use crate::exec::node::lookup::LookUpNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::pipeline::dependency::DependencyManager;
@@ -1509,6 +1513,16 @@ mod tests {
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
             .expect("chunk schema")
+    }
+
+    fn lookup_node(node_id: i32, output_chunk_schema: ChunkSchemaRef) -> ExecNode {
+        ExecNode {
+            kind: ExecNodeKind::LookUp(LookUpNode {
+                node_id,
+                row_pos_descs: HashMap::new(),
+                output_chunk_schema,
+            }),
+        }
     }
 
     #[test]
@@ -1610,6 +1624,118 @@ mod tests {
             .filter(|f| f.name().starts_with("LOCAL_EXCHANGE_SOURCE"))
             .count();
         assert_eq!(local_exchange_sources, 1);
+    }
+
+    #[test]
+    fn right_semi_pipeline_uses_right_probe_and_left_build_for_runtime_filters() {
+        let left_slot = SlotId::new(11);
+        let right_slot = SlotId::new(22);
+        let left_schema = Arc::new(Schema::new(vec![Field::new("l_k", DataType::Int32, false)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("r_k", DataType::Int32, false)]));
+        let join_scope_schema = Arc::new(Schema::new(vec![
+            Field::new("l_k", DataType::Int32, false),
+            Field::new("r_k", DataType::Int32, false),
+        ]));
+
+        let left_chunk_schema = chunk_schema_of(&left_schema, &[left_slot]);
+        let right_chunk_schema = chunk_schema_of(&right_schema, &[right_slot]);
+        let join_scope_chunk_schema = chunk_schema_of(&join_scope_schema, &[left_slot, right_slot]);
+        let mut arena = ExprArena::default();
+        let left_key = arena.push_typed(ExprNode::SlotId(left_slot), DataType::Int32);
+        let right_key = arena.push_typed(ExprNode::SlotId(right_slot), DataType::Int32);
+
+        let plan = ExecPlan {
+            arena,
+            root: ExecNode {
+                kind: ExecNodeKind::Join(JoinNode {
+                    left: Box::new(lookup_node(101, Arc::clone(&left_chunk_schema))),
+                    right: Box::new(lookup_node(202, Arc::clone(&right_chunk_schema))),
+                    node_id: 10,
+                    join_type: JoinType::RightSemi,
+                    distribution_mode: JoinDistributionMode::Broadcast,
+                    left_chunk_schema,
+                    right_chunk_schema,
+                    join_scope_chunk_schema,
+                    probe_keys: vec![right_key],
+                    build_keys: vec![left_key],
+                    eq_null_safe: vec![false],
+                    residual_predicate: None,
+                    runtime_filters: vec![JoinRuntimeFilterSpec {
+                        filter_id: 7,
+                        expr_order: 0,
+                        probe_expr_id: right_key,
+                        build_expr_id: left_key,
+                        probe_slot_id: right_slot,
+                        build_data_type: DataType::Int32,
+                        merge_nodes: Vec::new(),
+                        has_remote_targets: false,
+                    }],
+                }),
+            },
+        };
+
+        let graph = build_pipeline_graph_for_exec_plan_with_dop(
+            &plan,
+            false,
+            DependencyManager::new(),
+            None,
+            1,
+            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
+        )
+        .expect("build pipeline graph");
+
+        let root = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| pipeline.id == graph.root_id)
+            .expect("root pipeline");
+        let root_names: Vec<_> = root
+            .factories
+            .iter()
+            .map(|factory| factory.name().to_string())
+            .collect();
+        assert!(
+            root_names
+                .iter()
+                .any(|name| name == "LOOKUP_SOURCE (id=202)"),
+            "RightSemi probe pipeline must consume the preserved right child: {root_names:?}"
+        );
+        assert!(
+            !root_names
+                .iter()
+                .any(|name| name == "LOOKUP_SOURCE (id=101)"),
+            "RightSemi probe pipeline must not consume the left existence child: {root_names:?}"
+        );
+
+        let build_pipeline = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| {
+                pipeline.id != graph.root_id
+                    && !pipeline.needs_sink
+                    && pipeline
+                        .factories
+                        .iter()
+                        .any(|factory| factory.name() == "HASH_JOIN (id=10)")
+            })
+            .expect("build sink pipeline");
+        let build_names: Vec<_> = build_pipeline
+            .factories
+            .iter()
+            .map(|factory| factory.name().to_string())
+            .collect();
+        assert!(
+            build_names
+                .iter()
+                .any(|name| name == "LOOKUP_SOURCE (id=101)"),
+            "RightSemi build pipeline must produce RFs from the left existence child: {build_names:?}"
+        );
+        assert!(
+            !build_names
+                .iter()
+                .any(|name| name == "LOOKUP_SOURCE (id=202)"),
+            "RightSemi build pipeline must not produce RFs from the right preserved child: {build_names:?}"
+        );
     }
 
     #[test]

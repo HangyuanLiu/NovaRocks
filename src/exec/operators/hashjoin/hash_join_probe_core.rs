@@ -434,11 +434,21 @@ impl HashJoinProbeCore {
         let num_rows = probe_batch.num_rows();
         let output_start = std::time::Instant::now();
         let build_schema = self.build_chunk_schema();
-        let probe_col_count = probe_batch.num_columns();
-        let mut columns: Vec<arrow::array::ArrayRef> = probe_batch.columns().to_vec();
-        for slot in build_schema.slots() {
-            columns.push(new_null_array(slot.field().data_type(), num_rows));
-        }
+        let build_col_count = build_schema.slots().len();
+        let columns: Vec<arrow::array::ArrayRef> = if self.probe_is_left {
+            let mut columns = probe_batch.columns().to_vec();
+            for slot in build_schema.slots() {
+                columns.push(new_null_array(slot.field().data_type(), num_rows));
+            }
+            columns
+        } else {
+            let mut columns = Vec::with_capacity(build_col_count + probe_batch.num_columns());
+            for slot in build_schema.slots() {
+                columns.push(new_null_array(slot.field().data_type(), num_rows));
+            }
+            columns.extend(probe_batch.columns().iter().cloned());
+            columns
+        };
         // Build a ChunkSchema where the NULL-filled build-side slots are nullable,
         // so that downstream operators (LOCAL_EXCHANGE, SORT, etc.) that
         // reconstruct Arrow schemas from ChunkSchema do not reject the NULLs.
@@ -448,7 +458,12 @@ impl HashJoinProbeCore {
             .iter()
             .enumerate()
             .map(|(i, slot)| {
-                if i >= probe_col_count {
+                let build_side_column = if self.probe_is_left {
+                    i >= probe_batch.num_columns()
+                } else {
+                    i < build_col_count
+                };
+                if build_side_column {
                     slot.with_nullable(true)
                 } else {
                     slot.clone()

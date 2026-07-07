@@ -810,6 +810,8 @@ mod tests {
         let spec = JoinRuntimeFilterSpec {
             filter_id,
             expr_order: 0,
+            probe_expr_id: crate::exec::expr::ExprId(0),
+            build_expr_id: crate::exec::expr::ExprId(0),
             probe_slot_id: SlotId::new(1),
             build_data_type: DataType::Int32,
             merge_nodes: Vec::new(),
