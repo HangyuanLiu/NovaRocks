@@ -23,6 +23,7 @@ use crate::common::runtime_scan_predicate::{
     RuntimeScanPredicateBindings, RuntimeScanPredicateCounters, RuntimeScanPredicateOptions,
     runtime_filters_to_scan_predicates,
 };
+use crate::common::scan_predicate::ScanPredicate;
 use crate::connector::iceberg::delete_file::{IcebergDeleteFileSpec, IcebergFileContent};
 use crate::connector::iceberg::file_pruning::{
     IcebergFilePruningCounters, iceberg_range_may_satisfy_scan_predicates,
@@ -288,11 +289,15 @@ impl HdfsScanOp {
         !pruning_cfg.slot_to_column.is_empty() || !pruning_cfg.min_max_filter_columns.is_empty()
     }
 
-    fn can_materialize_iceberg_runtime_file_pruning(&self) -> bool {
+    fn iceberg_runtime_pruning_config(&self) -> Option<&HdfsIcebergRuntimePruningConfig> {
         self.cfg
             .iceberg_runtime_pruning
             .as_ref()
-            .is_some_and(Self::has_iceberg_runtime_pruning_bindings)
+            .filter(|cfg| Self::has_iceberg_runtime_pruning_bindings(cfg))
+    }
+
+    fn can_materialize_iceberg_runtime_file_pruning(&self) -> bool {
+        self.iceberg_runtime_pruning_config().is_some() && self.has_iceberg_file_pruning_metadata()
     }
 
     fn build_morsels_from_ordered_ranges(
@@ -317,6 +322,59 @@ impl HdfsScanOp {
             });
         }
         Ok(ScanMorsels::new(morsels, self.cfg.has_more))
+    }
+
+    fn iceberg_runtime_scan_predicates(
+        runtime_filters: &RuntimeFilterContext,
+        pruning_cfg: &HdfsIcebergRuntimePruningConfig,
+        predicate_counters: &mut RuntimeScanPredicateCounters,
+    ) -> Result<Vec<ScanPredicate>, String> {
+        runtime_filters_to_scan_predicates(
+            runtime_filters,
+            &RuntimeScanPredicateBindings {
+                slot_to_column: pruning_cfg.slot_to_column.clone(),
+                min_max_filter_columns: pruning_cfg.min_max_filter_columns.clone(),
+            },
+            RuntimeScanPredicateOptions {
+                discrete_set_max_values: pruning_cfg.discrete_set_max_values,
+                label: "iceberg",
+            },
+            predicate_counters,
+        )
+    }
+
+    fn file_range_from_morsel_for_runtime_pruning(morsel: &ScanMorsel) -> Option<FileScanRange> {
+        let ScanMorsel::FileRange {
+            path,
+            file_len,
+            offset,
+            length,
+            scan_range_id,
+            first_row_id,
+            data_sequence_number,
+            ivm_change_op,
+            included_positions,
+            external_datacache,
+            delete_files,
+            iceberg_file_pruning,
+        } = morsel
+        else {
+            return None;
+        };
+        Some(FileScanRange {
+            path: path.clone(),
+            file_len: *file_len,
+            offset: *offset,
+            length: *length,
+            scan_range_id: *scan_range_id,
+            first_row_id: *first_row_id,
+            data_sequence_number: *data_sequence_number,
+            ivm_change_op: *ivm_change_op,
+            included_positions: included_positions.clone(),
+            external_datacache: external_datacache.clone(),
+            delete_files: delete_files.clone(),
+            iceberg_file_pruning: iceberg_file_pruning.clone(),
+        })
     }
 
     fn flush_iceberg_runtime_pruning_profile(&self, profile: &RuntimeProfile) {
@@ -452,12 +510,9 @@ impl ScanOp for HdfsScanOp {
         &self,
         decision: ScanRuntimeFilterDecision<'_>,
     ) -> Result<ScanMorsels, String> {
-        let Some(pruning_cfg) = self.cfg.iceberg_runtime_pruning.as_ref() else {
+        let Some(pruning_cfg) = self.iceberg_runtime_pruning_config() else {
             return self.build_morsels();
         };
-        if !Self::has_iceberg_runtime_pruning_bindings(pruning_cfg) {
-            return self.build_morsels();
-        }
         if !self.has_iceberg_file_pruning_metadata() {
             self.iceberg_runtime_pruning_counters
                 .record_missing_metadata(self.cfg.ranges.len());
@@ -470,16 +525,9 @@ impl ScanOp for HdfsScanOp {
 
         let runtime_ctx = RuntimeFilterContext::from_snapshot(snapshot.clone());
         let mut predicate_counters = RuntimeScanPredicateCounters::default();
-        let predicates = runtime_filters_to_scan_predicates(
+        let predicates = Self::iceberg_runtime_scan_predicates(
             &runtime_ctx,
-            &RuntimeScanPredicateBindings {
-                slot_to_column: pruning_cfg.slot_to_column.clone(),
-                min_max_filter_columns: pruning_cfg.min_max_filter_columns.clone(),
-            },
-            RuntimeScanPredicateOptions {
-                discrete_set_max_values: pruning_cfg.discrete_set_max_values,
-                label: "iceberg",
-            },
+            pruning_cfg,
             &mut predicate_counters,
         )?;
         self.iceberg_runtime_pruning_counters
@@ -503,6 +551,42 @@ impl ScanOp for HdfsScanOp {
 
     fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
         self.flush_iceberg_runtime_pruning_profile(profile);
+    }
+
+    fn late_prune_morsel_with_runtime_filters(
+        &self,
+        morsel: &ScanMorsel,
+        runtime_filters: &RuntimeFilterContext,
+    ) -> Result<bool, String> {
+        let Some(pruning_cfg) = self.iceberg_runtime_pruning_config() else {
+            return Ok(false);
+        };
+        let Some(range) = Self::file_range_from_morsel_for_runtime_pruning(morsel) else {
+            return Ok(false);
+        };
+        if range.iceberg_file_pruning.is_none() {
+            return Ok(false);
+        }
+
+        let mut predicate_counters = RuntimeScanPredicateCounters::default();
+        let predicates = match Self::iceberg_runtime_scan_predicates(
+            runtime_filters,
+            pruning_cfg,
+            &mut predicate_counters,
+        ) {
+            Ok(predicates) => predicates,
+            Err(_) => return Ok(false),
+        };
+        if predicates.is_empty() {
+            return Ok(false);
+        }
+
+        let mut file_counters = IcebergFilePruningCounters::default();
+        Ok(!iceberg_range_may_satisfy_scan_predicates(
+            &range,
+            &predicates,
+            &mut file_counters,
+        ))
     }
 
     fn supports_incremental_scan_ranges(&self) -> bool {
@@ -822,8 +906,8 @@ mod tests {
     use crate::exec::expr::{ExprArena, ExprId};
     use crate::exec::node::RuntimeFilterProbeSpec;
     use crate::exec::node::scan::{
-        HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange, ScanMorsel, ScanNode,
-        ScanOp, ScanRuntimeFilterDecision,
+        HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange, RuntimeFilterContext,
+        ScanMorsel, ScanNode, ScanOp, ScanRuntimeFilterDecision,
     };
     use crate::exec::operators::scan::ScanSourceFactory;
     use crate::exec::pipeline::dependency::DependencyManager;
@@ -1059,6 +1143,18 @@ mod tests {
         ))
     }
 
+    fn runtime_filter_context_with_min_max_for_test(
+        filter_id: i32,
+        values: &[i32],
+    ) -> RuntimeFilterContext {
+        let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
+        let filter = RuntimeMinMaxFilter::from_arrays(RuntimeFilterType::Int32, &[array])
+            .expect("runtime min/max filter");
+        let mut snapshot = RuntimeFilterSnapshot::from_filters(Vec::new(), Vec::new());
+        snapshot.min_max_filters.push((filter_id, Arc::new(filter)));
+        RuntimeFilterContext::from_snapshot(snapshot)
+    }
+
     fn snapshot_with_runtime_in_filter_for_test(
         filter_id: i32,
         slot_id: SlotId,
@@ -1139,6 +1235,41 @@ mod tests {
         assert_eq!(counters.predicates, 1);
         assert_eq!(counters.unsupported, 0);
         assert_eq!(counters.unavailable, 0);
+    }
+
+    #[test]
+    fn iceberg_late_runtime_file_pruning_uses_direct_min_max_binding() {
+        let mut cfg = hdfs_cfg_with_two_iceberg_files_for_test();
+        let pruning_cfg = cfg
+            .iceberg_runtime_pruning
+            .as_mut()
+            .expect("iceberg pruning config");
+        pruning_cfg.slot_to_column.clear();
+        pruning_cfg
+            .min_max_filter_columns
+            .insert(7, "k1".to_string());
+        let op = HdfsScanOp::new(cfg);
+        let ctx = runtime_filter_context_with_min_max_for_test(7, &[100_i32, 100]);
+        let morsels = op.build_morsels().expect("build morsels");
+        let hit = morsels
+            .morsels
+            .iter()
+            .find(|morsel| morsel.describe().contains("hit.parquet"))
+            .expect("hit morsel");
+        let miss = morsels
+            .morsels
+            .iter()
+            .find(|morsel| morsel.describe().contains("miss.parquet"))
+            .expect("miss morsel");
+
+        assert!(
+            !ScanOp::late_prune_morsel_with_runtime_filters(&op, hit, &ctx)
+                .expect("late prune hit")
+        );
+        assert!(
+            ScanOp::late_prune_morsel_with_runtime_filters(&op, miss, &ctx)
+                .expect("late prune miss")
+        );
     }
 
     #[test]

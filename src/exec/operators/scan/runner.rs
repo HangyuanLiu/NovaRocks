@@ -612,6 +612,15 @@ impl ScanAsyncRunner {
                     self.last_progress = Instant::now();
                     return Ok(None);
                 };
+                self.refresh_self_subtree_filters();
+                if let Some(runtime_filters) = self.self_subtree_ctx.as_deref()
+                    && self
+                        .scan
+                        .late_prune_morsel_with_runtime_filters(&morsel, runtime_filters)?
+                {
+                    self.last_progress = Instant::now();
+                    continue;
+                }
                 self.current_morsel = Some(morsel.clone());
                 self.row_position_state = self.build_row_position_state(&morsel)?;
                 self.lake_row_position_state = self.build_lake_row_position_state(&morsel);
@@ -1987,6 +1996,18 @@ mod tests {
         observed_min_max_counts: Arc<Mutex<Vec<usize>>>,
     }
 
+    #[derive(Clone)]
+    struct LatePruneRecordingScanOp {
+        morsels: Vec<ScanMorsel>,
+        executed_paths: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl LatePruneRecordingScanOp {
+        fn output_for_path(path: &str) -> i32 {
+            if path.contains("kept") { 100 } else { 1 }
+        }
+    }
+
     impl ScanOp for RuntimeFilterRecordingScanOp {
         fn execute_iter(
             &self,
@@ -2021,6 +2042,100 @@ mod tests {
                 }],
                 false,
             ))
+        }
+    }
+
+    impl ScanOp for LatePruneRecordingScanOp {
+        fn execute_iter(
+            &self,
+            morsel: ScanMorsel,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _runtime_filters: Option<&RuntimeFilterContext>,
+        ) -> Result<BoxedExecIter, String> {
+            let ScanMorsel::FileRange { path, .. } = morsel else {
+                return Err("late prune test expected file morsel".to_string());
+            };
+            self.executed_paths
+                .lock()
+                .expect("executed path lock")
+                .push(path.clone());
+            Ok(Box::new(std::iter::once(Ok(single_value_chunk(
+                Self::output_for_path(&path),
+            )))))
+        }
+
+        fn build_morsels(&self) -> Result<ScanMorsels, String> {
+            Ok(ScanMorsels::new(self.morsels.clone(), false))
+        }
+
+        fn late_prune_morsel_with_runtime_filters(
+            &self,
+            morsel: &ScanMorsel,
+            runtime_filters: &RuntimeFilterContext,
+        ) -> Result<bool, String> {
+            let ScanMorsel::FileRange {
+                path,
+                file_len,
+                offset,
+                length,
+                scan_range_id,
+                first_row_id,
+                data_sequence_number,
+                ivm_change_op,
+                included_positions,
+                external_datacache,
+                delete_files,
+                iceberg_file_pruning,
+            } = morsel
+            else {
+                return Ok(false);
+            };
+            if iceberg_file_pruning.is_none() {
+                return Ok(false);
+            }
+
+            let mut predicate_counters =
+                crate::common::runtime_scan_predicate::RuntimeScanPredicateCounters::default();
+            let predicates =
+                crate::common::runtime_scan_predicate::runtime_filters_to_scan_predicates(
+                    runtime_filters,
+                    &crate::common::runtime_scan_predicate::RuntimeScanPredicateBindings {
+                        slot_to_column: HashMap::new(),
+                        min_max_filter_columns: HashMap::from([(7, "k1".to_string())]),
+                    },
+                    crate::common::runtime_scan_predicate::RuntimeScanPredicateOptions {
+                        discrete_set_max_values: 256,
+                        label: "test",
+                    },
+                    &mut predicate_counters,
+                )?;
+            if predicates.is_empty() {
+                return Ok(false);
+            }
+
+            let range = crate::fs::scan_context::FileScanRange {
+                path: path.clone(),
+                file_len: *file_len,
+                offset: *offset,
+                length: *length,
+                scan_range_id: *scan_range_id,
+                first_row_id: *first_row_id,
+                data_sequence_number: *data_sequence_number,
+                ivm_change_op: *ivm_change_op,
+                included_positions: included_positions.clone(),
+                external_datacache: external_datacache.clone(),
+                delete_files: delete_files.clone(),
+                iceberg_file_pruning: iceberg_file_pruning.clone(),
+            };
+            let mut file_counters =
+                crate::connector::iceberg::file_pruning::IcebergFilePruningCounters::default();
+            Ok(
+                !crate::connector::iceberg::file_pruning::iceberg_range_may_satisfy_scan_predicates(
+                    &range,
+                    &predicates,
+                    &mut file_counters,
+                ),
+            )
         }
     }
 
@@ -2123,6 +2238,44 @@ mod tests {
         )
         .expect("chunk schema");
         Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn iceberg_file_pruning_metadata_for_i32_range(
+        column: &str,
+        lower: i32,
+        upper: i32,
+    ) -> crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata {
+        crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata {
+            columns: HashMap::from([(
+                column.to_string(),
+                crate::sql::catalog::IcebergColumnStats {
+                    null_count: None,
+                    value_count: None,
+                    column_size: None,
+                    lower_bound: Some(lower.to_le_bytes().to_vec()),
+                    upper_bound: Some(upper.to_le_bytes().to_vec()),
+                },
+            )]),
+        }
+    }
+
+    fn late_prune_file_morsel(path: &str, lower: i32, upper: i32) -> ScanMorsel {
+        ScanMorsel::FileRange {
+            path: path.to_string(),
+            file_len: 1024,
+            offset: 0,
+            length: 1024,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: Some(iceberg_file_pruning_metadata_for_i32_range(
+                "k1", lower, upper,
+            )),
+        }
     }
 
     fn dictionary_status_chunk(keys: Vec<Option<i32>>, values: Arc<StringArray>) -> Chunk {
@@ -2590,6 +2743,98 @@ mod tests {
         assert_eq!(filter.applied_input_rows(), 4);
         assert_eq!(filter.applied_output_rows(), 3);
         assert_eq!(filter.applied_evals(), 1);
+        registry.remove_query(query_key);
+    }
+
+    #[test]
+    fn self_subtree_late_prunes_unread_file_morsels_before_execute_iter() {
+        let query_key = QueryKey::from_hi_lo(20_106, 1);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        let hub = RuntimeFilterHub::new_for_query(
+            DependencyManager::new(),
+            crate::runtime::query_context::QueryId {
+                hi: query_key.hi,
+                lo: query_key.lo,
+            },
+        );
+        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
+
+        let mut arena = ExprArena::default();
+        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let arena = Arc::new(arena);
+        let spec = crate::exec::node::RuntimeFilterProbeSpec {
+            filter_id: 7,
+            expr_id: expr,
+            slot_id: SlotId::new(1),
+            data_type: DataType::Int32,
+            self_subtree: true,
+        };
+        hub.register_probe_specs(42, std::slice::from_ref(&spec));
+
+        let executed_paths = Arc::new(Mutex::new(Vec::new()));
+        let op = LatePruneRecordingScanOp {
+            morsels: vec![
+                late_prune_file_morsel("s3://bucket/path/pruned.parquet", 1, 10),
+                late_prune_file_morsel("s3://bucket/path/kept.parquet", 90, 110),
+            ],
+            executed_paths: Arc::clone(&executed_paths),
+        };
+        let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let scan = ScanNode::new(Arc::new(op))
+            .with_node_id(42)
+            .with_runtime_filter_specs(vec![spec])
+            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
+        let morsels = scan.build_morsels().expect("build morsels");
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            morsels.morsels,
+            morsels.has_more,
+        )));
+        let mut runner = ScanAsyncRunner::new(
+            "scan".to_string(),
+            scan,
+            dispatch,
+            SharedRuntimeFilterDecision::new(),
+            Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
+            HashMap::from([(7, expr)]),
+            1,
+            0,
+            arena,
+            None,
+            0,
+        );
+        runner
+            .prepare_runtime_filters(&ScanAsyncState::new(
+                1,
+                "self-subtree-late-prune".to_string(),
+            ))
+            .expect("prepare runtime filters");
+
+        hub.publish_min_max_filter(7, pruning_min_max_filter(vec![100, 100]));
+
+        let chunk = runner
+            .next_chunk()
+            .expect("scan next chunk")
+            .expect("kept chunk");
+        let values = chunk
+            .columns()
+            .first()
+            .expect("first column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 values");
+        let actual = (0..values.len())
+            .map(|idx| values.value(idx))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, vec![100]);
+        assert!(
+            runner.next_chunk().expect("scan eof").is_none(),
+            "runner should finish after the kept morsel"
+        );
+        assert_eq!(
+            *executed_paths.lock().expect("executed path lock"),
+            vec!["s3://bucket/path/kept.parquet".to_string()]
+        );
         registry.remove_query(query_key);
     }
 
