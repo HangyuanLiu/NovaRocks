@@ -103,7 +103,7 @@ fn compare_scalar_non_null(
     right: &ArrayRef,
     right_idx: usize,
 ) -> Result<Ordering, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "list scalar compare type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -289,7 +289,7 @@ fn compare_value_recursive(
     right: &ArrayRef,
     right_idx: usize,
 ) -> Result<Option<Ordering>, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "list compare type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -341,7 +341,7 @@ fn compare_value_recursive_in_list(
     right: &ArrayRef,
     right_idx: usize,
 ) -> Result<Ordering, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "list compare type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -560,7 +560,7 @@ fn eq_value_recursive(
     right: &ArrayRef,
     right_idx: usize,
 ) -> Result<Option<bool>, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "eq type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -614,7 +614,7 @@ fn eq_value_recursive_nested(
     right: &ArrayRef,
     right_idx: usize,
 ) -> Result<NestedEq, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "nested eq type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -792,7 +792,7 @@ fn eq_value_recursive_null_safe(
     right: &ArrayRef,
     right_idx: usize,
 ) -> Result<bool, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "null-safe eq type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -945,7 +945,7 @@ fn eq_map_rows_null_safe(
 }
 
 fn eval_null_safe_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "null-safe eq type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -983,7 +983,7 @@ fn eval_nested_compare<F>(
 where
     F: Fn(Ordering) -> bool,
 {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "nested compare type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -1017,7 +1017,7 @@ where
 }
 
 fn eval_nested_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "nested eq type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -1050,7 +1050,7 @@ fn eval_nested_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String>
 }
 
 fn eval_nested_ne(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
-    if left.data_type() != right.data_type() {
+    if !comparison_data_types_match(left.data_type(), right.data_type()) {
         return Err(format!(
             "nested ne type mismatch: {:?} vs {:?}",
             left.data_type(),
@@ -1091,7 +1091,7 @@ fn normalize_comparison_types(
     let right_type = right.data_type();
 
     // If types match, no conversion needed
-    if left_type == right_type {
+    if comparison_data_types_match(left_type, right_type) {
         return Ok((left, right));
     }
 
@@ -1141,6 +1141,45 @@ fn normalize_comparison_types(
             left_type, right_type
         )),
     }
+}
+
+fn comparison_data_types_match(left: &DataType, right: &DataType) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left, right) {
+        (DataType::List(left_item), DataType::List(right_item))
+        | (DataType::LargeList(left_item), DataType::LargeList(right_item)) => {
+            comparison_fields_match(left_item, right_item)
+        }
+        (
+            DataType::FixedSizeList(left_item, left_size),
+            DataType::FixedSizeList(right_item, right_size),
+        ) => left_size == right_size && comparison_fields_match(left_item, right_item),
+        (DataType::Struct(left_fields), DataType::Struct(right_fields)) => {
+            left_fields.len() == right_fields.len()
+                && left_fields
+                    .iter()
+                    .zip(right_fields.iter())
+                    .all(|(left_field, right_field)| {
+                        comparison_fields_match(left_field, right_field)
+                    })
+        }
+        (
+            DataType::Map(left_entries, left_ordered),
+            DataType::Map(right_entries, right_ordered),
+        ) => left_ordered == right_ordered && comparison_fields_match(left_entries, right_entries),
+        _ => false,
+    }
+}
+
+fn comparison_fields_match(
+    left: &arrow::datatypes::Field,
+    right: &arrow::datatypes::Field,
+) -> bool {
+    left.name() == right.name()
+        && left.is_nullable() == right.is_nullable()
+        && comparison_data_types_match(left.data_type(), right.data_type())
 }
 
 fn is_string_or_null_type(data_type: &DataType) -> bool {
@@ -1556,6 +1595,8 @@ mod tests {
     };
     use arrow::datatypes::{Field, Fields, Int8Type, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
+    use arrow_buffer::OffsetBuffer;
+    use std::collections::HashMap;
 
     fn create_test_chunk_int(values: Vec<i64>) -> Chunk {
         let array = Arc::new(Int64Array::from(values)) as ArrayRef;
@@ -2304,6 +2345,42 @@ mod tests {
         assert!(out.value(0));
         assert!(!out.value(1));
         assert!(out.is_null(2));
+    }
+
+    #[test]
+    fn test_eq_list_arrays_ignores_item_field_metadata() {
+        let mut arena = ExprArena::default();
+        let left_item = Arc::new(Field::new("item", DataType::Int64, true).with_metadata(
+            HashMap::from([("PARQUET:field_id".to_string(), "6".to_string())]),
+        ));
+        let right_item = Arc::new(Field::new("item", DataType::Int64, true).with_metadata(
+            HashMap::from([("PARQUET:field_id".to_string(), "7".to_string())]),
+        ));
+        let left_type = DataType::List(left_item.clone());
+        let right_type = DataType::List(right_item.clone());
+        let left = ListArray::try_new(
+            left_item,
+            OffsetBuffer::new(vec![0_i32, 3, 6].into()),
+            Arc::new(Int64Array::from(vec![22_i64, 11, 33, 22, 11, 44])) as ArrayRef,
+            None,
+        )
+        .expect("left list");
+        let right = ListArray::try_new(
+            right_item,
+            OffsetBuffer::new(vec![0_i32, 3, 6].into()),
+            Arc::new(Int64Array::from(vec![22_i64, 11, 33, 22, 11, 33])) as ArrayRef,
+            None,
+        )
+        .expect("right list");
+        let chunk = create_test_chunk_two_arrays(Arc::new(left), Arc::new(right));
+
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), left_type);
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), right_type);
+        let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
+        let out = arena.eval(expr, &chunk).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(out.value(0));
+        assert!(!out.value(1));
     }
 
     #[test]
