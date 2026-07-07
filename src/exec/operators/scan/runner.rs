@@ -1575,6 +1575,7 @@ impl ScanAsyncRunner {
         let Some(chunk) = result else {
             return Ok(None);
         };
+        self.refresh_self_subtree_filters();
         let Some(snapshot) = self
             .self_subtree_ctx
             .as_ref()
@@ -2985,8 +2986,6 @@ mod tests {
         assert!(runner.acquired.is_none());
 
         hub.publish_min_max_filter(7, pruning_min_max_filter(vec![3, 4]));
-        runner.refresh_self_subtree_filters();
-        assert!(runner.self_subtree_ctx_for_test().is_some());
 
         let filtered = runner
             .apply_runtime_filters(int32_chunk(vec![1, 2, 3, 4]))
