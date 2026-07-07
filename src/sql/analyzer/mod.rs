@@ -6373,6 +6373,35 @@ mod tests {
     }
 
     #[test]
+    fn sum_avg_cast_varchar_arguments_to_double_in_analyzer_ir() {
+        let resolved =
+            parse_and_analyze("select sum(o_orderstatus), avg(o_orderstatus) from orders")
+                .expect("string aggregate arguments should analyze");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+
+        for expr in [&sel.projection[0].expr, &sel.projection[1].expr] {
+            assert_eq!(expr.data_type, arrow::datatypes::DataType::Float64);
+            let ExprKind::AggregateCall { name, args, .. } = &expr.kind else {
+                panic!("expected AggregateCall, got {:?}", expr.kind);
+            };
+            assert!(matches!(name.as_str(), "sum" | "avg"));
+            assert_eq!(args.len(), 1);
+            let ExprKind::Cast {
+                target,
+                expr: inner,
+            } = &args[0].kind
+            else {
+                panic!("expected aggregate argument cast, got {:?}", args[0].kind);
+            };
+            assert_eq!(target, &arrow::datatypes::DataType::Float64);
+            assert_eq!(args[0].data_type, arrow::datatypes::DataType::Float64);
+            assert_eq!(inner.data_type, arrow::datatypes::DataType::Utf8);
+        }
+    }
+
+    #[test]
     fn length_casts_numeric_argument_to_varchar() {
         let resolved = parse_and_analyze("select length(o_orderkey) from orders")
             .expect("length should analyze");

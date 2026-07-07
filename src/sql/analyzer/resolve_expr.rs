@@ -1999,6 +1999,10 @@ impl<'a> super::AnalyzerContext<'a> {
             };
         }
 
+        if is_aggregate_function(&name) && apply_implicit_aggregate_casts(&name, &mut args_typed) {
+            arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
+        }
+
         self.validate_percentile_arguments(&name, &args_typed)?;
         if is_aggregate_function(&name) {
             validate_aggregate_function_call(&name, &arg_types)?;
@@ -3439,6 +3443,41 @@ fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> b
         | "substr" | "substring" | "trim" | "upper" => cast_utf8_args(args, &[0]),
         _ => false,
     }
+}
+
+fn aggregate_arg_cast_type(name: &str, input_type: &DataType) -> Option<DataType> {
+    if matches!(name, "sum" | "avg") && matches!(input_type, DataType::Utf8 | DataType::LargeUtf8) {
+        Some(DataType::Float64)
+    } else {
+        None
+    }
+}
+
+fn apply_implicit_aggregate_casts(name: &str, args: &mut [TypedExpr]) -> bool {
+    let mut changed = false;
+    for arg in args {
+        let Some(target) = aggregate_arg_cast_type(name, &arg.data_type) else {
+            continue;
+        };
+        let inner = std::mem::replace(
+            arg,
+            TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Null),
+                data_type: DataType::Null,
+                nullable: true,
+            },
+        );
+        *arg = TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(inner),
+                target: target.clone(),
+            },
+            data_type: target,
+            nullable: true,
+        };
+        changed = true;
+    }
+    changed
 }
 
 fn validate_group_concat_separator_argument(

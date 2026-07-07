@@ -3019,7 +3019,9 @@ fn aggregate_arg_types_for_signature(agg_name: &str, args: &[TypedExpr]) -> Vec<
 }
 
 fn aggregate_arg_cast_type(agg_name: &str, input_type: &DataType) -> Option<DataType> {
-    if matches!(agg_name, "sum" | "avg") && matches!(input_type, DataType::Utf8) {
+    if matches!(agg_name, "sum" | "avg")
+        && matches!(input_type, DataType::Utf8 | DataType::LargeUtf8)
+    {
         Some(DataType::Float64)
     } else {
         None
@@ -4303,7 +4305,15 @@ mod tests {
             Some(DataType::Float64)
         );
         assert_eq!(
+            aggregate_arg_cast_type("sum", &DataType::LargeUtf8),
+            Some(DataType::Float64)
+        );
+        assert_eq!(
             aggregate_arg_cast_type("avg", &DataType::Utf8),
+            Some(DataType::Float64)
+        );
+        assert_eq!(
+            aggregate_arg_cast_type("avg", &DataType::LargeUtf8),
             Some(DataType::Float64)
         );
         assert_eq!(aggregate_arg_cast_type("count", &DataType::Utf8), None);
