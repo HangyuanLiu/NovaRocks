@@ -3016,12 +3016,12 @@ mod tests {
 
     fn sink_predicate_plan(expr: &exprs::TExpr) -> SinkPredicatePlan {
         let mut arena = ExprArena::default();
-        let layout = crate::lower::compact::layout::Layout {
+        let layout = crate::lower::compat::layout::Layout {
             order: Vec::new(),
             index: HashMap::new(),
         };
         let expr_id =
-            crate::lower::compact::expr::lower_t_expr(expr, &mut arena, &layout, None, None)
+            crate::lower::compat::expr::lower_t_expr(expr, &mut arena, &layout, None, None)
                 .expect("lower predicate expr");
         SinkPredicatePlan {
             arena: Arc::new(arena),

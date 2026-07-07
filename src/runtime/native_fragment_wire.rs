@@ -191,7 +191,7 @@ pub(crate) fn multi_cast_data_stream_sink_from_native(
         .map(|group| {
             group
                 .into_iter()
-                .map(crate::runtime::fragment_exec_params::compact_destination_from_runtime)
+                .map(crate::runtime::fragment_exec_params::compat_destination_from_runtime)
                 .collect()
         })
         .collect();

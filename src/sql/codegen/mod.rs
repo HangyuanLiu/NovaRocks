@@ -94,7 +94,7 @@ pub(crate) struct FragmentEdge {
     // Planner-native semantics used by native fragment wire.
     pub output_partition: crate::sql::planner::DataPartition,
     // Thrift projection used by compat sinks.
-    pub compact_output_partition: partitions::TDataPartition,
+    pub compat_output_partition: partitions::TDataPartition,
     pub stream_kind: FragmentStreamKind,
     pub edge_kind: FragmentEdgeKind,
     pub output_slot_ids: Vec<i32>,

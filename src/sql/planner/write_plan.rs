@@ -206,7 +206,7 @@ pub(crate) fn with_iceberg_change_stream_write(
             target_fragment_id: writer_fragment_id,
             target_exchange_node_id: exchange_node_id,
             output_partition,
-            compact_output_partition: tdata_partition_placeholder(partition_type),
+            compat_output_partition: tdata_partition_placeholder(partition_type),
             stream_kind,
             edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
                 router_group_id: 0,
@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(*column_id, ColumnId::new_for_test(3));
         assert_eq!(column, "delete_id");
         assert_eq!(
-            first_edge.compact_output_partition.type_,
+            first_edge.compat_output_partition.type_,
             crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
         );
         assert!(matches!(

@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use arrow::datatypes::DataType;
 
-use crate::lower::compact::type_lowering::arrow_type_from_desc;
+use crate::lower::compat::type_lowering::arrow_type_from_desc;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn as AnalysisOutputColumn, TypedExpr,
 };
@@ -25,7 +25,7 @@ use crate::sql::codegen::helpers::{
     typed_expr_display_name_without_qualifiers,
 };
 use crate::sql::codegen::iceberg_change_stream_router_wire::{
-    build_router_sink_thrift, compact_output_partition_for_ordinals,
+    build_router_sink_thrift, compat_output_partition_for_ordinals,
     native_output_partition_for_ordinals, output_slot_ids_for_ordinals,
 };
 use crate::sql::codegen::iceberg_write_sink_wire::{
@@ -119,7 +119,7 @@ pub(crate) fn lower_distributed_plan(
         &state.scan_tables,
         mv_refresh_ctx,
     )?;
-    let exec_params = scan_range_build.to_compact_exec_params()?;
+    let exec_params = scan_range_build.to_compat_exec_params()?;
 
     let mut fragment_results = Vec::with_capacity(prepared_fragments.len());
     for (fragment, lowered, output_sink, output_exprs, output_columns, root_node_id) in
@@ -761,7 +761,7 @@ fn lower_fragment_edges(
                         )
                     })?;
                 lowered_edge.output_partition = native_exchange_output_partition(exchange)?;
-                lowered_edge.compact_output_partition = lower_exchange_output_partition(
+                lowered_edge.compat_output_partition = lower_exchange_output_partition(
                     exchange,
                     &source.scope,
                     state.slot_allocator(),
@@ -816,7 +816,7 @@ fn lower_fragment_edges(
                     &route.output_partition_ordinals,
                     &format!("branch {:?} partition", route.branch_kind),
                 )?;
-                lowered_edge.compact_output_partition = compact_output_partition_for_ordinals(
+                lowered_edge.compat_output_partition = compat_output_partition_for_ordinals(
                     &source.scope,
                     &source_fragment.output_columns,
                     &route.output_partition_ordinals,
@@ -5650,7 +5650,7 @@ mod tests {
 
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::IcebergMetadataTableType;
-    use crate::lower::compact::type_lowering::arrow_type_from_desc;
+    use crate::lower::compat::type_lowering::arrow_type_from_desc;
     use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergMvTargetStatePartitionConstraint,
@@ -6992,7 +6992,7 @@ mod tests {
         assert_eq!(*column_id, ColumnId(3));
         assert_eq!(column, "delete_id");
         assert_eq!(
-            edge.compact_output_partition.type_,
+            edge.compat_output_partition.type_,
             crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
         );
 
@@ -7447,7 +7447,7 @@ mod tests {
             target_fragment_id,
             target_exchange_node_id,
             output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            compact_output_partition: crate::thrift::partitions::TDataPartition::new(
+            compat_output_partition: crate::thrift::partitions::TDataPartition::new(
                 crate::thrift::partitions::TPartitionType::UNPARTITIONED,
                 None::<Vec<crate::thrift::exprs::TExpr>>,
                 None::<Vec<crate::thrift::partitions::TRangePartition>>,

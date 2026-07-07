@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 
 use crate::common::largeint;
-use crate::lower::compact::type_lowering::scalar_type_desc;
+use crate::lower::compat::type_lowering::scalar_type_desc;
 use crate::thrift::exprs;
 use crate::thrift::opcodes;
 use crate::thrift::types;
@@ -3302,13 +3302,13 @@ mod tests {
         let child_type = binary_pred
             .child_type_desc
             .as_ref()
-            .and_then(crate::lower::compact::type_lowering::arrow_type_from_desc);
+            .and_then(crate::lower::compat::type_lowering::arrow_type_from_desc);
         assert_eq!(child_type, Some(DataType::Int32));
         assert_ne!(child_type, Some(DataType::Utf8));
 
         let has_int32_cast = compiled.nodes.iter().any(|node| {
             node.node_type == crate::thrift::exprs::TExprNodeType::CAST_EXPR
-                && crate::lower::compact::type_lowering::arrow_type_from_desc(&node.type_)
+                && crate::lower::compat::type_lowering::arrow_type_from_desc(&node.type_)
                     == Some(DataType::Int32)
         });
         assert!(
@@ -3367,7 +3367,7 @@ mod tests {
             .map(|node| {
                 node.child_type_desc
                     .as_ref()
-                    .and_then(crate::lower::compact::type_lowering::arrow_type_from_desc)
+                    .and_then(crate::lower::compat::type_lowering::arrow_type_from_desc)
             })
             .collect();
         assert_eq!(
@@ -3380,7 +3380,7 @@ mod tests {
             .iter()
             .filter(|node| {
                 node.node_type == crate::thrift::exprs::TExprNodeType::CAST_EXPR
-                    && crate::lower::compact::type_lowering::arrow_type_from_desc(&node.type_)
+                    && crate::lower::compat::type_lowering::arrow_type_from_desc(&node.type_)
                         == Some(DataType::Int32)
             })
             .count();
@@ -3582,13 +3582,13 @@ mod tests {
         let root = compiled.nodes.first().expect("aggregate root");
         let fn_ = root.fn_.as_ref().expect("aggregate function");
         let intermediate_type = fn_.aggregate_fn.as_ref().and_then(|agg_fn| {
-            crate::lower::compact::type_lowering::arrow_type_from_desc(&agg_fn.intermediate_type)
+            crate::lower::compat::type_lowering::arrow_type_from_desc(&agg_fn.intermediate_type)
         });
         let input_arg_type = fn_
             .arg_types
             .first()
-            .and_then(crate::lower::compact::type_lowering::arrow_type_from_desc);
-        let output_type = crate::lower::compact::type_lowering::arrow_type_from_desc(&fn_.ret_type);
+            .and_then(crate::lower::compat::type_lowering::arrow_type_from_desc);
+        let output_type = crate::lower::compat::type_lowering::arrow_type_from_desc(&fn_.ret_type);
         let function = crate::exec::node::aggregate::AggFunction {
             name: fn_.name.function_name.clone(),
             inputs: vec![],

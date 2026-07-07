@@ -1,6 +1,6 @@
 use arrow::datatypes::{DataType, Field};
 
-use crate::lower::compact::type_lowering::scalar_type_desc;
+use crate::lower::compat::type_lowering::scalar_type_desc;
 use crate::thrift::types;
 use crate::types::arrow_thrift::{arrow_type_to_primitive, field_logical_primitive};
 
@@ -124,8 +124,7 @@ fn append_arrow_type_nodes(
             // carried (DATETIME descriptors are tz-less); the nanosecond value is
             // preserved regardless. Microsecond keeps time_unit absent so
             // FE-compat descriptors stay byte-identical.
-            let time_unit =
-                crate::lower::compact::type_lowering::thrift_time_unit_for_arrow(*unit)?;
+            let time_unit = crate::lower::compat::type_lowering::thrift_time_unit_for_arrow(*unit)?;
             let scalar = types::TScalarType::new(
                 types::TPrimitiveType::DATETIME,
                 None::<i32>,
@@ -158,7 +157,7 @@ mod tests {
     use crate::types::logical::LogicalType;
 
     fn primitive_from_desc(desc: &types::TTypeDesc) -> Option<types::TPrimitiveType> {
-        crate::lower::compact::type_lowering::primitive_type_from_desc(desc)
+        crate::lower::compat::type_lowering::primitive_type_from_desc(desc)
     }
 
     fn logical_field(name: &str, data_type: DataType, logical_type: LogicalType) -> Field {
@@ -268,7 +267,7 @@ mod tests {
 
     #[test]
     fn timestamp_unit_roundtrips_through_thrift_desc() {
-        use crate::lower::compact::type_lowering::arrow_type_from_desc;
+        use crate::lower::compat::type_lowering::arrow_type_from_desc;
         use arrow::datatypes::{DataType, TimeUnit};
 
         // microsecond stays microsecond (FE-compat default)

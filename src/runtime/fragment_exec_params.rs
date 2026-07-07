@@ -70,10 +70,10 @@ impl FragmentExecParams {
         &self.destinations
     }
 
-    pub(crate) fn to_compact_exec_params(
+    pub(crate) fn to_compat_exec_params(
         &self,
     ) -> Result<internal_service::TPlanFragmentExecParams, String> {
-        compact_exec_params_from_parts(
+        compat_exec_params_from_parts(
             self.query_id,
             self.fragment_instance_id,
             scan_range::thrift_scan_range_map_from_native(&self.per_node_scan_ranges)?,
@@ -83,7 +83,7 @@ impl FragmentExecParams {
     }
 }
 
-pub(crate) fn compact_destination_from_runtime(
+pub(crate) fn compat_destination_from_runtime(
     destination: FragmentDestination,
 ) -> data_sinks::TPlanFragmentDestination {
     data_sinks::TPlanFragmentDestination::new(
@@ -94,7 +94,7 @@ pub(crate) fn compact_destination_from_runtime(
     )
 }
 
-pub(crate) fn compact_exec_params_from_parts(
+pub(crate) fn compat_exec_params_from_parts(
     query_id: UniqueId,
     fragment_instance_id: UniqueId,
     per_node_scan_ranges: BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
@@ -110,7 +110,7 @@ pub(crate) fn compact_exec_params_from_parts(
         destinations: destinations.map(|items| {
             items
                 .into_iter()
-                .map(compact_destination_from_runtime)
+                .map(compat_destination_from_runtime)
                 .collect()
         }),
         sender_id: None,

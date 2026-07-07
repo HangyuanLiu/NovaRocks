@@ -1206,7 +1206,7 @@ fn nidl_d2d_lowering_root_exposes_named_ownership_modules() {
     );
     for dir in [
         "src/lower/common",
-        "src/lower/compact",
+        "src/lower/compat",
         "src/lower/novarocks",
     ] {
         assert!(repo.join(dir).is_dir(), "{dir} must exist");
@@ -1215,7 +1215,7 @@ fn nidl_d2d_lowering_root_exposes_named_ownership_modules() {
     let lower_mod = fs::read_to_string(repo.join("src/lower/mod.rs")).unwrap();
     for expected in [
         "pub(crate) mod common;",
-        "pub(crate) mod compact;",
+        "pub(crate) mod compat;",
         "pub(crate) mod novarocks;",
     ] {
         assert!(
@@ -1264,7 +1264,86 @@ fn nidl_d2d_legacy_lowering_paths_do_not_remain() {
 
     assert!(
         violations.is_empty(),
-        "D2D lowering paths must use crate::lower::compact, crate::lower::novarocks, or crate::lower::common:\n{}",
+        "D2D lowering paths must use crate::lower::compat, crate::lower::novarocks, or crate::lower::common:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nidl_compat_boundary_names_use_compat_spelling() {
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+
+    let old_lower_dir = concat!("src/lower/", "compact");
+    if repo.join(old_lower_dir).exists() {
+        violations.push(format!(
+            "{old_lower_dir}: compat lowering directory must use compat spelling"
+        ));
+    }
+    let lower_mod = fs::read_to_string(repo.join("src/lower/mod.rs")).unwrap();
+    if lower_mod.contains(concat!("pub(crate) mod ", "compact")) {
+        violations
+            .push("src/lower/mod.rs: compat lowering module must use compat spelling".to_string());
+    }
+
+    let forbidden_terms = [
+        concat!("lower::", "compact"),
+        concat!("src/lower/", "compact"),
+        concat!("compact", "_output_partition"),
+        concat!("compact", "_exec_params_from_parts"),
+        concat!("compact", "_destination_from_runtime"),
+        concat!("to_", "compact", "_exec_params"),
+        concat!("compact", "_scan_ranges"),
+        concat!("compact", "_scan_range_for_test"),
+        concat!("compact", "_scan_ranges_for_placement"),
+        concat!("Compact", "CteConsumer"),
+        concat!("compact", "_cte"),
+        concat!("compact", "_consumers"),
+        concat!("compact", "_query_options"),
+        concat!("compact", "_ranges"),
+        concat!("compact", "_boundary"),
+        concat!("compact", "_projection"),
+        concat!("compact", "_only"),
+        concat!("compact", " projection"),
+        concat!("compact", " marker"),
+    ];
+
+    for file in source_and_test_rs_files() {
+        if rel(&file) == "tests/architecture_guard.rs" {
+            continue;
+        }
+        let text = fs::read_to_string(&file).unwrap();
+        for term in forbidden_terms {
+            for (line_no, line) in text.lines().enumerate() {
+                if line.contains(term) {
+                    violations.push(format!(
+                        "{}:{}: compat boundary typo `{term}`",
+                        rel(&file),
+                        line_no + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    for doc in ["AGENTS.md"] {
+        let path = repo.join(doc);
+        let text = fs::read_to_string(&path).unwrap();
+        for term in forbidden_terms {
+            for (line_no, line) in text.lines().enumerate() {
+                if line.contains(term) {
+                    violations.push(format!(
+                        "{doc}:{}: compat boundary typo `{term}`",
+                        line_no + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "compat boundary names must use compat spelling, not compact:\n{}",
         violations.join("\n")
     );
 }
@@ -3338,7 +3417,7 @@ fn nidl_d3f_scan_node_dispatch_keeps_native_file_emitter_on_iceberg_only() {
     assert!(
         starrocks_branch.contains("to_thrift_scan(")
             && !starrocks_branch.contains("to_native_file_scan("),
-        "StarRocks build_scan_node branch must stay on the compact thrift scan emitter"
+        "StarRocks build_scan_node branch must stay on the compat thrift scan emitter"
     );
 
     let after_iceberg = &source[iceberg_start..];
@@ -3717,21 +3796,21 @@ fn nidl_d3k_native_dynamic_sink_partition_does_not_roundtrip_thrift_partition() 
     for forbidden in [
         "use crate::thrift::partitions::TPartitionType;",
         "Vec<(FragmentId, TPartitionType, FragmentStreamKind)>",
-        "e.compact_output_partition.type_",
+        "e.compat_output_partition.type_",
     ] {
         if scheduler.contains(forbidden) {
             violations.push(format!(
-                "src/runtime/scheduler.rs: scheduling topology must use native edge.output_partition, not compact thrift partition via `{forbidden}`"
+                "src/runtime/scheduler.rs: scheduling topology must use native edge.output_partition, not compat thrift partition via `{forbidden}`"
             ));
         }
     }
 
     let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
     if !codegen_mod.contains("pub output_partition: crate::sql::planner::DataPartition")
-        || !codegen_mod.contains("pub compact_output_partition: partitions::TDataPartition")
+        || !codegen_mod.contains("pub compat_output_partition: partitions::TDataPartition")
     {
         violations.push(
-            "src/sql/codegen/mod.rs: FragmentEdge must split native output_partition from compact_output_partition"
+            "src/sql/codegen/mod.rs: FragmentEdge must split native output_partition from compat_output_partition"
                 .to_string(),
         );
     }
@@ -3825,8 +3904,8 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
         (
             "src/runtime/fragment_exec_params.rs",
             &[
-                "compact_exec_params_from_parts",
-                "compact_destination_from_runtime",
+                "compat_exec_params_from_parts",
+                "compat_destination_from_runtime",
             ][..],
         ),
         (

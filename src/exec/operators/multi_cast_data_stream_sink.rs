@@ -35,7 +35,7 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::lower::compact::layout::Layout;
+use crate::lower::compat::layout::Layout;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;

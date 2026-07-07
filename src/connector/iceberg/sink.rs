@@ -2654,7 +2654,7 @@ mod tests {
 
     #[test]
     fn delete_like_sinks_wire_explicit_snapshot_selection_into_call_sites() {
-        let lower_source = include_str!("../../lower/compact/sink/iceberg.rs");
+        let lower_source = include_str!("../../lower/compat/sink/iceberg.rs");
         let partition_index = lower_source
             .split("fn build_position_delete_data_file_partition_index")
             .nth(1)

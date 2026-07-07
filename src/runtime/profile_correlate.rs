@@ -168,7 +168,7 @@ pub(crate) fn collect_per_fragment_profile_summaries(
 
 /// The fragment's root (output) plan-node id — the unambiguous per-fragment key. It is encoded in
 /// the fragment profiler's root node name `execute_fragment (plan_node_id=N)` (see
-/// `src/lower/compact/fragment.rs`), where `N = fragment.plan.nodes.first().node_id`, and it equals the
+/// `src/lower/compat/fragment.rs`), where `N = fragment.plan.nodes.first().node_id`, and it equals the
 /// `DistributedPlan` `fragment.root.node_id` the renderer keys by. This is unique per fragment and
 /// is never a cross-fragment-shared exchange node id (the root is the fragment's output operator),
 /// so it avoids the collision that a min-over-nodes representative hits on shared exchange ids.

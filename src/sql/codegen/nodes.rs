@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::common::types::UniqueId;
 use crate::connector::scan_planning::ConnectorScanPlanner;
-use crate::lower::compact::expr::parse_min_max_conjuncts_with_column_resolver;
-use crate::runtime::fragment_exec_params::{FragmentExecParams, compact_exec_params_from_parts};
+use crate::lower::compat::expr::parse_min_max_conjuncts_with_column_resolver;
+use crate::runtime::fragment_exec_params::{FragmentExecParams, compat_exec_params_from_parts};
 use crate::sql::codegen::connector_scan_wire::{
     ThriftScanContext, to_native_file_scan, to_thrift_scan,
 };
@@ -591,7 +591,7 @@ pub(crate) fn build_exec_params_multi(
     scan_tables: &[PlannedScanTable],
 ) -> Result<internal_service::TPlanFragmentExecParams, String> {
     build_scan_ranges_multi_with_refresh_context(connectors, scan_tables, None)?
-        .to_compact_exec_params()
+        .to_compat_exec_params()
 }
 
 pub(crate) fn build_exec_params_multi_with_refresh_context(
@@ -600,13 +600,13 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<internal_service::TPlanFragmentExecParams, String> {
     build_scan_ranges_multi_with_refresh_context(connectors, scan_tables, mv_refresh_ctx)?
-        .to_compact_exec_params()
+        .to_compat_exec_params()
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScanRangeBuildResult {
     pub(crate) fragment_exec_params: FragmentExecParams,
-    compact_scan_ranges: BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
+    compat_scan_ranges: BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
 }
 
 impl ScanRangeBuildResult {
@@ -616,13 +616,13 @@ impl ScanRangeBuildResult {
         self.fragment_exec_params.per_node_scan_ranges()
     }
 
-    pub(crate) fn to_compact_exec_params(
+    pub(crate) fn to_compat_exec_params(
         &self,
     ) -> Result<internal_service::TPlanFragmentExecParams, String> {
-        compact_exec_params_from_parts(
+        compat_exec_params_from_parts(
             self.fragment_exec_params.query_id(),
             self.fragment_exec_params.fragment_instance_id(),
-            self.compact_scan_ranges.clone(),
+            self.compat_scan_ranges.clone(),
             self.fragment_exec_params.per_exch_num_senders().clone(),
             None,
         )
@@ -783,7 +783,7 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
 
     Ok(ScanRangeBuildResult {
         fragment_exec_params,
-        compact_scan_ranges: per_node_scan_ranges,
+        compat_scan_ranges: per_node_scan_ranges,
     })
 }
 
@@ -1007,7 +1007,7 @@ pub(crate) fn build_starrocks_scan_ranges_from_planned_scan(
 /// Build a single placeholder scan range that drives the native
 /// iceberg-rust metadata scan operator. The operator keys off
 /// `serialized_table` on the `THdfsScanNode`, so the per-range payload
-/// only needs to satisfy `lower::compact::node::hdfs_scan` invariants: a
+/// only needs to satisfy `lower::compat::node::hdfs_scan` invariants: a
 /// non-empty path. (The earlier embedded-JVM bridge keyed the same
 /// way; that path has been replaced by `IcebergMetadataScanOp` —
 /// see `src/connector/iceberg/metadata.rs`.)

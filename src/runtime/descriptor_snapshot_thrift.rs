@@ -44,7 +44,7 @@ pub(crate) fn descriptor_snapshot_from_thrift(
             continue;
         };
         let slot_id = SlotId::try_from(raw_slot_id)?;
-        let data_type = crate::lower::compact::type_lowering::arrow_type_from_desc(type_desc)
+        let data_type = crate::lower::compat::type_lowering::arrow_type_from_desc(type_desc)
             .ok_or_else(|| {
                 format!(
                     "unsupported descriptor slot type for tuple_id={} slot_id={}",
@@ -244,7 +244,7 @@ mod tests {
     };
 
     fn scalar(primitive: TPrimitiveType) -> TTypeDesc {
-        crate::lower::compact::type_lowering::scalar_type_desc(primitive)
+        crate::lower::compat::type_lowering::scalar_type_desc(primitive)
     }
 
     fn decimal256(precision: i32, scale: i32) -> TTypeDesc {

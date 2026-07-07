@@ -2338,7 +2338,7 @@ mod tests {
             crate::sql::codegen::FragmentStreamKind::Broadcast
         );
         assert_eq!(
-            build.edges[0].compact_output_partition.type_,
+            build.edges[0].compat_output_partition.type_,
             crate::thrift::partitions::TPartitionType::UNPARTITIONED
         );
     }
@@ -2843,12 +2843,12 @@ mod tests {
             crate::sql::codegen::FragmentStreamKind::Partitioned
         );
         assert_eq!(
-            edge.compact_output_partition.type_,
+            edge.compat_output_partition.type_,
             crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
         );
         assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
         assert_eq!(
-            edge.compact_output_partition
+            edge.compat_output_partition
                 .partition_exprs
                 .as_ref()
                 .map(|v| v.len()),
@@ -3513,12 +3513,12 @@ mod tests {
             crate::sql::codegen::FragmentStreamKind::Partitioned
         );
         assert_eq!(
-            edge.compact_output_partition.type_,
+            edge.compat_output_partition.type_,
             crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
         );
         assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
         let partition_exprs = edge
-            .compact_output_partition
+            .compat_output_partition
             .partition_exprs
             .as_ref()
             .expect("partition exprs");
@@ -3723,7 +3723,7 @@ mod tests {
                 .expect("writer fragment");
             assert_eq!(edge.source_fragment_id, build.root_fragment_id);
             assert_eq!(
-                edge.compact_output_partition.type_,
+                edge.compat_output_partition.type_,
                 crate::thrift::partitions::TPartitionType::UNPARTITIONED
             );
             assert_eq!(writer.plan.nodes.len(), 1);

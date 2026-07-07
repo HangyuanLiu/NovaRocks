@@ -281,7 +281,7 @@ fn sink_factory_from_native(
             let destinations =
                 native_wire::destinations_from_native(&instance_params.destinations)?;
             let exec_params = native_wire::exec_params_from_native(instance_params, destinations)?
-                .to_compact_exec_params()?;
+                .to_compat_exec_params()?;
             let root_plan_node_id = fragment
                 .root
                 .as_ref()
@@ -330,7 +330,7 @@ fn sink_factory_from_native(
                 .collect::<Result<Vec<_>, String>>()?;
             let multi_cast_sink = native_wire::multi_cast_data_stream_sink_from_native(multi_cast)?;
             let exec_params = native_wire::exec_params_from_native(instance_params, Vec::new())?
-                .to_compact_exec_params()?;
+                .to_compat_exec_params()?;
             let root_plan_node_id = fragment
                 .root
                 .as_ref()
@@ -365,7 +365,7 @@ fn sink_factory_from_native(
                     layout,
                 )?;
             let exec_params = native_wire::exec_params_from_native(instance_params, Vec::new())?
-                .to_compact_exec_params()?;
+                .to_compat_exec_params()?;
             let root_plan_node_id = fragment
                 .root
                 .as_ref()
@@ -451,7 +451,7 @@ fn lower_iceberg_change_stream_router_sink_from_native(
             .and_then(native_wire::stream_destinations_from_native)?;
         let branch_destinations = destinations
             .into_iter()
-            .map(crate::runtime::fragment_exec_params::compact_destination_from_runtime)
+            .map(crate::runtime::fragment_exec_params::compat_destination_from_runtime)
             .collect();
         branches.push(native_wire::IcebergChangeStreamRouterBranch::new(
             branch.branch_id,
