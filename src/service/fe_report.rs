@@ -29,6 +29,7 @@ use crate::common::types::UniqueId;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::{debug, warn};
 use crate::proto::novarocks;
+use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::load_tracking;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
@@ -47,7 +48,7 @@ use crate::thrift::{
 #[derive(Clone, Debug)]
 enum ReportDestination {
     StarRocksFrontend(types::TNetworkAddress),
-    NovaRocksCoordinator(types::TNetworkAddress),
+    NovaRocksCoordinator(RuntimeEndpoint),
 }
 
 #[derive(Clone, Debug)]
@@ -96,7 +97,7 @@ pub(crate) fn register_instance(
 pub(crate) fn register_novarocks_instance(
     finst_id: UniqueId,
     query_id: QueryId,
-    coord: types::TNetworkAddress,
+    coord: RuntimeEndpoint,
     backend_num: i32,
     enable_profile: bool,
     profiler: Option<Profiler>,
@@ -810,7 +811,7 @@ pub(crate) fn test_insert_report_instance(finst_id: UniqueId, query_id: QueryId)
 pub(crate) fn test_insert_standalone_report_instance(
     finst_id: UniqueId,
     query_id: QueryId,
-    coord: types::TNetworkAddress,
+    coord: RuntimeEndpoint,
     backend_num: i32,
 ) {
     let mut guard = registry().lock().expect("report registry lock");
@@ -974,13 +975,14 @@ mod tests {
     };
     use crate::common::types::UniqueId;
     use crate::proto::novarocks;
+    use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::load_tracking;
     use crate::runtime::profile::Profiler;
     use crate::runtime::query_context::QueryId;
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::service::exec_state_reporter;
     use crate::thrift::frontend_service;
-    use crate::thrift::{status, status_code, types};
+    use crate::thrift::{status, status_code};
 
     #[test]
     fn query_gone_status_is_treated_as_benign() {
@@ -1042,7 +1044,7 @@ mod tests {
         ReportHookGuard
     }
 
-    type CapturedReport = Option<(types::TNetworkAddress, novarocks::ExecStatusReport)>;
+    type CapturedReport = Option<(RuntimeEndpoint, novarocks::ExecStatusReport)>;
 
     fn capture_standalone_final_report(captured: Arc<Mutex<CapturedReport>>) -> ReportHookGuard {
         super::test_set_final_report_hook(Some(Box::new(|_| {
@@ -1107,7 +1109,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let finst_id = UniqueId { hi: 71, lo: 72 };
         let query_id = QueryId { hi: 81, lo: 82 };
-        let report_addr = types::TNetworkAddress::new("127.0.0.1".to_string(), 18040);
+        let report_addr = RuntimeEndpoint::new("127.0.0.1", 18040).expect("report endpoint");
         let captured = Arc::new(Mutex::new(None));
         let _hook = capture_standalone_final_report(Arc::clone(&captured));
 
@@ -1138,7 +1140,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let finst_id = UniqueId { hi: 73, lo: 74 };
         let query_id = QueryId { hi: 83, lo: 84 };
-        let report_addr = types::TNetworkAddress::new("127.0.0.1".to_string(), 18041);
+        let report_addr = RuntimeEndpoint::new("127.0.0.1", 18041).expect("report endpoint");
         let captured = Arc::new(Mutex::new(None));
         let _hook = capture_standalone_non_final_report(Arc::clone(&captured));
 
@@ -1169,7 +1171,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let finst_id = UniqueId { hi: 75, lo: 76 };
         let query_id = QueryId { hi: 85, lo: 86 };
-        let report_addr = types::TNetworkAddress::new("127.0.0.1".to_string(), 18042);
+        let report_addr = RuntimeEndpoint::new("127.0.0.1", 18042).expect("report endpoint");
         let captured = Arc::new(Mutex::new(None));
         let _hook = capture_standalone_final_report(Arc::clone(&captured));
 

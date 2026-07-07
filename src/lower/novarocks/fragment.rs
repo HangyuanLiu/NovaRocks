@@ -449,11 +449,15 @@ fn lower_iceberg_change_stream_router_sink_from_native(
                 )
             })
             .and_then(native_wire::stream_destinations_from_native)?;
+        let thrift_destinations = destinations
+            .into_iter()
+            .map(native_wire::plan_fragment_destination_from_runtime)
+            .collect();
         branches.push(native_wire::IcebergChangeStreamRouterBranch::new(
             branch.branch_id,
             native_wire::iceberg_change_stream_branch_kind_from_native(branch.branch_kind)?,
             stream_sink,
-            destinations,
+            thrift_destinations,
         ));
         pre_lowered_partitions.push((partition_arena, partition_exprs));
     }
@@ -633,7 +637,7 @@ mod tests {
                     proto::novarocks::ProberParamsList {
                         params: vec![proto::novarocks::ProberParams {
                             fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
-                            fragment_instance_address: "127.0.0.1:9050".to_string(),
+                            grpc_endpoint: "127.0.0.1:9050".to_string(),
                         }],
                     },
                 )]

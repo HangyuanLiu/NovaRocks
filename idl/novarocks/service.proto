@@ -30,8 +30,8 @@ service NovaRocksGrpc {
   rpc Lookup(novarocks.filter.LookupRequest)
       returns (novarocks.filter.LookupResponse);
 
-  // Coordinator -> BE fragment submission. payload is a thrift-encoded
-  // TExecPlanFragmentParams today; NIDL-4 adds native plan + instance_params.
+  // Coordinator -> BE fragment submission carrying native PlanFragment and
+  // InstanceParams over NovaRocks gRPC.
   rpc SubmitFragment(SubmitFragmentRequest) returns (SubmitFragmentResponse);
   // Coordinator polls a fragment instance for result batches.
   rpc FetchResult(FetchResultRequest) returns (FetchResultResponse);
@@ -83,7 +83,7 @@ message InstanceParams {
   repeated Destination destinations = 6;
   RuntimeFilterParams runtime_filter_params = 7;
   QueryOptions query_options = 8;
-  optional string report_addr = 9;                     // novarocks_report_addr
+  optional string report_endpoint = 9;                 // NovaRocks coordinator gRPC endpoint.
   bool typed_result_sink = 10;                         // novarocks_typed_result_sink
 }
 
@@ -160,10 +160,10 @@ message InternalScanRange {
   bool skip_disk_cache = 9;
 }
 
-// TPlanFragmentDestination consumed subset.
+// Native runtime destination for one fragment instance.
 message Destination {
   novarocks.common.UniqueId finst_id = 1;
-  string brpc_addr = 2;  // brpc_server host:port; deprecated_server is dropped.
+  string grpc_endpoint = 2;  // NovaRocks gRPC runtime endpoint host:port.
 }
 
 // TRuntimeFilterParams consumed subset.
@@ -179,7 +179,7 @@ message ProberParamsList {
 
 message ProberParams {
   novarocks.common.UniqueId fragment_instance_id = 1;
-  string fragment_instance_address = 2;
+  string grpc_endpoint = 2;
 }
 
 // TQueryOptions consumed subset, projected into NovaRocks native wire form.

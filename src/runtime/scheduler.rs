@@ -52,16 +52,16 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
+use crate::runtime::endpoint::{
+    FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
+};
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
     RuntimeFilterPlanResult,
 };
-use crate::thrift::data_sinks;
-use crate::thrift::data_sinks::TPlanFragmentDestination;
 use crate::thrift::internal_service::TScanRangeParams;
 use crate::thrift::partitions::TPartitionType;
-use crate::thrift::runtime_filter::TRuntimeFilterProberParams;
-use crate::thrift::types::{TNetworkAddress, TUniqueId};
+use crate::thrift::types::TUniqueId;
 
 type LiveBackend = (usize, SocketAddr);
 
@@ -81,14 +81,14 @@ pub(crate) struct FragmentInstancePlacement {
     pub(crate) finst_id: TUniqueId,
     /// Backend id from the scheduler's live backend snapshot.
     pub(crate) backend_idx: usize,
-    /// Internal brpc endpoint for this fragment instance.
-    pub(crate) brpc_server: TNetworkAddress,
+    /// Native runtime endpoint for this fragment instance.
+    pub(crate) endpoint: RuntimeEndpoint,
     /// Scan ranges for this instance, keyed by plan node id.
     pub(crate) scan_ranges: BTreeMap<i32, Vec<TScanRangeParams>>,
     /// Destinations this instance should push its output to.
-    pub(crate) destinations: Vec<TPlanFragmentDestination>,
-    /// Runtime filter prober params, keyed by filter_id.
-    pub(crate) runtime_filter_prober_params: BTreeMap<i32, Vec<TRuntimeFilterProberParams>>,
+    pub(crate) destinations: Vec<FragmentDestination>,
+    /// Runtime filter prober destinations, keyed by filter_id.
+    pub(crate) runtime_filter_prober_params: BTreeMap<i32, Vec<RuntimeFilterProberDestination>>,
     /// Number of upstream senders per exchange node id.
     pub(crate) per_exch_num_senders: BTreeMap<i32, i32>,
 }
@@ -287,10 +287,7 @@ impl FragmentScheduler {
                             instance_index,
                             finst_id,
                             backend_idx,
-                            brpc_server: TNetworkAddress::new(
-                                addr.ip().to_string(),
-                                addr.port() as i32,
-                            ),
+                            endpoint: RuntimeEndpoint::from_socket_addr(addr),
                             scan_ranges: BTreeMap::new(),
                             destinations: Vec::new(),
                             runtime_filter_prober_params: BTreeMap::new(),
@@ -338,8 +335,8 @@ impl FragmentScheduler {
     /// Fill `destinations` on each source-fragment instance for each edge.
     ///
     /// For each edge, the target fragment's instances are collected, their
-    /// `TPlanFragmentDestination` entries are built, and the full list is
-    /// appended to every source-fragment instance's `destinations` vec.
+    /// `FragmentDestination` entries are built, and the full list is appended
+    /// to every source-fragment instance's `destinations` vec.
     pub(crate) fn fill_destinations(&self, plan: &mut SchedulingPlan, edges: &[FragmentEdge]) {
         let live = self.full_live_snapshot();
         self.fill_destinations_with_live(plan, edges, &live)
@@ -365,18 +362,13 @@ impl FragmentScheduler {
                 })
                 .unwrap_or_default();
 
-            let dests: Vec<TPlanFragmentDestination> = target_placements
+            let dests: Vec<FragmentDestination> = target_placements
                 .into_iter()
                 .map(|(finst_id, backend_idx)| {
                     let addr = live_backend_addr(live, backend_idx)?;
-                    Ok::<TPlanFragmentDestination, String>(TPlanFragmentDestination::new(
+                    Ok::<FragmentDestination, String>(FragmentDestination::new(
                         finst_id,
-                        None::<TNetworkAddress>,
-                        Some(TNetworkAddress::new(
-                            addr.ip().to_string(),
-                            addr.port() as i32,
-                        )),
-                        None::<i32>,
+                        RuntimeEndpoint::from_socket_addr(addr),
                     ))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -434,16 +426,13 @@ impl FragmentScheduler {
             if let Some(build_instances) = plan.by_fragment.get_mut(build_frag_id) {
                 for filter_id in filter_ids {
                     if let Some(probe_list) = probe_instances_by_filter.get(filter_id) {
-                        let probers: Vec<TRuntimeFilterProberParams> = probe_list
+                        let probers: Vec<RuntimeFilterProberDestination> = probe_list
                             .iter()
                             .map(|(finst_id, backend_idx)| {
                                 let addr = live_backend_addr(live, *backend_idx)?;
-                                Ok(TRuntimeFilterProberParams::new(
-                                    Some(finst_id.clone()),
-                                    Some(TNetworkAddress::new(
-                                        addr.ip().to_string(),
-                                        addr.port() as i32,
-                                    )),
+                                Ok(RuntimeFilterProberDestination::new(
+                                    finst_id.clone(),
+                                    RuntimeEndpoint::from_socket_addr(addr),
                                 ))
                             })
                             .collect::<Result<Vec<_>, String>>()?;
@@ -594,15 +583,17 @@ fn select_execution_root_fragment(
     }
 }
 
-fn data_sink_is_terminal_write_sink(sink: &data_sinks::TDataSink) -> bool {
+fn data_sink_is_terminal_write_sink(sink: &crate::thrift::data_sinks::TDataSink) -> bool {
+    use crate::thrift::data_sinks::TDataSinkType;
+
     matches!(
         sink.type_,
-        data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
-            | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
-            | data_sinks::TDataSinkType::ICEBERG_DV_SINK
-            | data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK
-            | data_sinks::TDataSinkType::HIVE_TABLE_SINK
-            | data_sinks::TDataSinkType::OLAP_TABLE_SINK
+        TDataSinkType::ICEBERG_TABLE_SINK
+            | TDataSinkType::ICEBERG_DELETE_SINK
+            | TDataSinkType::ICEBERG_DV_SINK
+            | TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK
+            | TDataSinkType::HIVE_TABLE_SINK
+            | TDataSinkType::OLAP_TABLE_SINK
     )
 }
 
@@ -934,9 +925,9 @@ mod tests {
 
             for inst in placements {
                 let dest = inst.destinations.first().expect("root destination");
-                let brpc = dest.brpc_server.as_ref().expect("destination address");
-                assert_eq!(brpc.hostname, "10.0.0.3");
-                assert_eq!(brpc.port, 9010);
+                let endpoint = dest.endpoint();
+                assert_eq!(endpoint.host(), "10.0.0.3");
+                assert_eq!(endpoint.port(), 9010);
             }
         }
     }
@@ -1429,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_destinations_sets_brpc_server() {
+    fn fill_destinations_sets_runtime_endpoint() {
         // Verify hostname/port comes from backends[target.backend_idx].
         let backends = three_backends();
         let scheduler = FragmentScheduler::new(backends.clone());
@@ -1447,9 +1438,9 @@ mod tests {
 
         // F1 root backend: query_id.lo=0, n=3 -> backend 0 -> "10.0.0.1:9010"
         let root_dest = &plan.by_fragment[&0][0].destinations[0];
-        let brpc = root_dest.brpc_server.as_ref().expect("brpc_server set");
-        assert_eq!(brpc.hostname, "10.0.0.1");
-        assert_eq!(brpc.port, 9010);
+        let endpoint = root_dest.endpoint();
+        assert_eq!(endpoint.host(), "10.0.0.1");
+        assert_eq!(endpoint.port(), 9010);
     }
 
     #[test]
@@ -1498,12 +1489,9 @@ mod tests {
         // Verify addresses correspond to the 2 probe instances (F0: backends 0 and 1).
         let addrs: Vec<String> = probers
             .iter()
-            .filter_map(|p| {
-                p.fragment_instance_address
-                    .as_ref()
-                    .map(|a| a.hostname.clone())
-            })
+            .map(|p| p.endpoint().host().to_string())
             .collect();
+        let ports: Vec<i32> = probers.iter().map(|p| p.endpoint().port()).collect();
         assert!(
             addrs.contains(&"10.0.0.1".to_string()),
             "probe instance 0 on backend 0"
@@ -1511,6 +1499,11 @@ mod tests {
         assert!(
             addrs.contains(&"10.0.0.2".to_string()),
             "probe instance 1 on backend 1"
+        );
+        assert_eq!(
+            ports,
+            vec![9010, 9010],
+            "both probe endpoints use port 9010"
         );
     }
 

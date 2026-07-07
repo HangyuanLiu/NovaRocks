@@ -123,7 +123,7 @@ fn internal_scan_range() -> novarocks::ScanRange {
 fn destination() -> novarocks::Destination {
     novarocks::Destination {
         finst_id: Some(id(3, 4)),
-        brpc_addr: "10.0.0.8:8060".to_string(),
+        grpc_endpoint: "10.0.0.8:8060".to_string(),
     }
 }
 
@@ -134,7 +134,7 @@ fn runtime_filter_params() -> novarocks::RuntimeFilterParams {
             novarocks::ProberParamsList {
                 params: vec![novarocks::ProberParams {
                     fragment_instance_id: Some(id(5, 6)),
-                    fragment_instance_address: "10.0.0.9:9060".to_string(),
+                    grpc_endpoint: "10.0.0.9:9060".to_string(),
                 }],
             },
         )]),
@@ -183,6 +183,48 @@ fn query_options_use_pre_release_reset_tags() {
 }
 
 #[test]
+fn runtime_endpoint_fields_use_native_grpc_names_and_tags() {
+    let destination_value = destination();
+    let mut destination_fields = encoded_field_numbers(&destination_value);
+    destination_fields.sort_unstable();
+    assert_eq!(
+        destination_fields,
+        vec![1, 2],
+        "Destination must keep finst_id=1 and grpc_endpoint=2"
+    );
+
+    let prober = novarocks::ProberParams {
+        fragment_instance_id: Some(id(5, 6)),
+        grpc_endpoint: "10.0.0.9:9060".to_string(),
+    };
+    let mut prober_fields = encoded_field_numbers(&prober);
+    prober_fields.sort_unstable();
+    assert_eq!(
+        prober_fields,
+        vec![1, 2],
+        "ProberParams must keep fragment_instance_id=1 and grpc_endpoint=2"
+    );
+
+    let params = novarocks::InstanceParams {
+        query_id: Some(id(1, 2)),
+        fragment_instance_id: Some(id(3, 4)),
+        backend_num: 1,
+        per_node_scan_ranges: HashMap::new(),
+        per_exch_num_senders: HashMap::new(),
+        destinations: vec![destination()],
+        runtime_filter_params: Some(runtime_filter_params()),
+        query_options: Some(query_options()),
+        report_endpoint: Some("10.0.0.10:9070".to_string()),
+        typed_result_sink: true,
+    };
+    let params_fields = encoded_field_numbers(&params);
+    assert!(
+        params_fields.contains(&9),
+        "InstanceParams endpoint reporting field must keep tag 9 stable"
+    );
+}
+
+#[test]
 fn scan_range_arms_survive_proto_roundtrip() {
     let hdfs = hdfs_scan_range();
     let decoded_hdfs: novarocks::ScanRange = roundtrip_message(&hdfs);
@@ -209,7 +251,7 @@ fn instance_params_survives_proto_roundtrip() {
         destinations: vec![destination()],
         runtime_filter_params: Some(runtime_filter_params()),
         query_options: Some(query_options()),
-        report_addr: Some("10.0.0.10:9070".to_string()),
+        report_endpoint: Some("10.0.0.10:9070".to_string()),
         typed_result_sink: true,
     };
 
@@ -230,7 +272,7 @@ fn submit_fragment_request_carries_native_fields_only() {
             destinations: vec![destination()],
             runtime_filter_params: Some(runtime_filter_params()),
             query_options: Some(query_options()),
-            report_addr: Some("10.0.0.10:9070".to_string()),
+            report_endpoint: Some("10.0.0.10:9070".to_string()),
             typed_result_sink: true,
         }),
         ..Default::default()

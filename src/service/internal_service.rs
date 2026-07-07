@@ -642,10 +642,12 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             None
         };
         if let (Some(report_addr), Some(backend_num)) = (novarocks_report_addr, backend_num) {
+            let report_endpoint =
+                crate::runtime::endpoint::RuntimeEndpoint::from_network_address(&report_addr)?;
             fe_report::register_novarocks_instance(
                 finst_id,
                 query_id,
-                report_addr,
+                report_endpoint,
                 backend_num,
                 enable_profile,
                 profiler.clone(),
@@ -816,10 +818,12 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
         None
     };
     if let (Some(report_addr), Some(backend_num)) = (novarocks_report_addr, backend_num) {
+        let report_endpoint =
+            crate::runtime::endpoint::RuntimeEndpoint::from_network_address(&report_addr)?;
         fe_report::register_novarocks_instance(
             finst_id,
             query_id,
-            report_addr,
+            report_endpoint,
             backend_num,
             enable_profile,
             profiler.clone(),

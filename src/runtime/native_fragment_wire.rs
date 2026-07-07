@@ -22,6 +22,9 @@ use std::collections::BTreeMap;
 use thrift::OrderedFloat;
 
 use crate::proto;
+use crate::runtime::endpoint::{
+    FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
+};
 use crate::runtime::runtime_state::{QueryOptions, RuntimeFilterParams};
 use crate::thrift::{data_sinks, internal_service, partitions, runtime_filter, types};
 
@@ -107,6 +110,14 @@ pub(crate) fn runtime_filter_params_from_native(
                 .params
                 .iter()
                 .map(prober_params_from_native)
+                .map(|result| {
+                    result.map(|prober| {
+                        runtime_filter::TRuntimeFilterProberParams::new(
+                            prober.fragment_instance_id().clone(),
+                            prober.endpoint().to_network_address(),
+                        )
+                    })
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((*filter_id, params))
         })
@@ -127,55 +138,47 @@ pub(crate) fn runtime_filter_params_from_native(
 
 fn prober_params_from_native(
     src: &proto::novarocks::ProberParams,
-) -> Result<runtime_filter::TRuntimeFilterProberParams, String> {
+) -> Result<RuntimeFilterProberDestination, String> {
     let fragment_instance_id = src
         .fragment_instance_id
         .as_ref()
         .ok_or_else(|| "native ProberParams missing fragment_instance_id".to_string())?;
-    let fragment_instance_address = network_address_from_native(&src.fragment_instance_address)?;
-    Ok(runtime_filter::TRuntimeFilterProberParams::new(
+    Ok(RuntimeFilterProberDestination::new(
         types::TUniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo),
-        fragment_instance_address,
+        endpoint_from_native(&src.grpc_endpoint)?,
     ))
 }
 
+pub(crate) fn endpoint_from_native(src: &str) -> Result<RuntimeEndpoint, String> {
+    RuntimeEndpoint::parse(src)
+}
+
 pub(crate) fn network_address_from_native(src: &str) -> Result<NetworkAddress, String> {
-    let (host, port) = src
-        .rsplit_once(':')
-        .ok_or_else(|| format!("native network address must be host:port, got '{src}'"))?;
-    if host.is_empty() {
-        return Err(format!("native network address has empty host: '{src}'"));
-    }
-    let port = port
-        .parse::<i32>()
-        .map_err(|e| format!("native network address has invalid port '{src}': {e}"))?;
-    Ok(types::TNetworkAddress::new(host.to_string(), port))
+    endpoint_from_native(src).map(|endpoint| endpoint.to_network_address())
 }
 
 pub(crate) fn destination_from_native(
     src: &proto::novarocks::Destination,
-) -> Result<PlanFragmentDestination, String> {
+) -> Result<FragmentDestination, String> {
     let finst_id = src
         .finst_id
         .as_ref()
         .ok_or_else(|| "native Destination missing finst_id".to_string())?;
-    Ok(data_sinks::TPlanFragmentDestination::new(
+    Ok(FragmentDestination::new(
         types::TUniqueId::new(finst_id.hi, finst_id.lo),
-        None::<types::TNetworkAddress>,
-        Some(network_address_from_native(&src.brpc_addr)?),
-        None::<i32>,
+        endpoint_from_native(&src.grpc_endpoint)?,
     ))
 }
 
 pub(crate) fn destinations_from_native(
     src: &[proto::novarocks::Destination],
-) -> Result<Vec<PlanFragmentDestination>, String> {
+) -> Result<Vec<FragmentDestination>, String> {
     src.iter().map(destination_from_native).collect()
 }
 
 pub(crate) fn exec_params_from_native(
     src: &proto::novarocks::InstanceParams,
-    destinations: Vec<PlanFragmentDestination>,
+    destinations: Vec<FragmentDestination>,
 ) -> Result<PlanFragmentExecParams, String> {
     let query_id = src
         .query_id
@@ -197,7 +200,12 @@ pub(crate) fn exec_params_from_native(
             .iter()
             .map(|(node_id, count)| (*node_id, *count))
             .collect(),
-        destinations: Some(destinations),
+        destinations: Some(
+            destinations
+                .into_iter()
+                .map(plan_fragment_destination_from_runtime)
+                .collect(),
+        ),
         sender_id: None,
         num_senders: None,
         send_query_statistics_with_every_batch: None,
@@ -256,26 +264,35 @@ pub(crate) fn data_stream_sink_from_native(
 
 pub(crate) fn stream_destination_from_native(
     src: &proto::plan::StreamDestination,
-) -> Result<PlanFragmentDestination, String> {
+) -> Result<FragmentDestination, String> {
     let finst_id = src
         .finst_id
         .as_ref()
         .ok_or_else(|| "native StreamDestination missing finst_id".to_string())?;
-    Ok(data_sinks::TPlanFragmentDestination::new(
+    Ok(FragmentDestination::new(
         types::TUniqueId::new(finst_id.hi, finst_id.lo),
-        None::<types::TNetworkAddress>,
-        Some(network_address_from_native(&src.brpc_addr)?),
-        None::<i32>,
+        endpoint_from_native(&src.grpc_endpoint)?,
     ))
 }
 
 pub(crate) fn stream_destinations_from_native(
     src: &proto::plan::StreamDestinationList,
-) -> Result<Vec<PlanFragmentDestination>, String> {
+) -> Result<Vec<FragmentDestination>, String> {
     src.destinations
         .iter()
         .map(stream_destination_from_native)
         .collect()
+}
+
+pub(crate) fn plan_fragment_destination_from_runtime(
+    destination: FragmentDestination,
+) -> PlanFragmentDestination {
+    data_sinks::TPlanFragmentDestination::new(
+        destination.finst_id().clone(),
+        None::<types::TNetworkAddress>,
+        Some(destination.endpoint().to_network_address()),
+        None::<i32>,
+    )
 }
 
 pub(crate) fn multi_cast_data_stream_sink_from_native(
@@ -298,6 +315,15 @@ pub(crate) fn multi_cast_data_stream_sink_from_native(
         .iter()
         .map(stream_destinations_from_native)
         .collect::<Result<Vec<_>, _>>()?;
+    let destinations = destinations
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(plan_fragment_destination_from_runtime)
+                .collect()
+        })
+        .collect();
     Ok(data_sinks::TMultiCastDataStreamSink::new(
         sinks,
         destinations,

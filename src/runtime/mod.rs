@@ -20,6 +20,7 @@ pub(crate) mod coordinator;
 pub(crate) mod descriptor_snapshot;
 pub(crate) mod descriptor_snapshot_thrift;
 pub(crate) mod dispatcher;
+pub(crate) mod endpoint;
 pub mod exchange;
 pub mod exchange_scan;
 pub mod exec_env;

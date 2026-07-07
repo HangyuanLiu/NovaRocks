@@ -3271,6 +3271,61 @@ fn nidl_d3b_current_schema_matches_baseline() {
     }
 }
 
+#[test]
+fn nidl_d3e_native_runtime_routing_has_no_thrift_shaped_endpoint_model() {
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+
+    for proto in ["idl/novarocks/service.proto", "idl/novarocks/plan.proto"] {
+        let text = fs::read_to_string(repo.join(proto)).unwrap();
+        for forbidden in ["brpc_addr", "fragment_instance_address", "report_addr"] {
+            if text.contains(forbidden) {
+                violations.push(format!(
+                    "{proto}: native proto must not contain `{forbidden}`"
+                ));
+            }
+        }
+    }
+
+    let checked_sources = [
+        "src/runtime/scheduler.rs",
+        "src/sql/codegen/proto_encode/instance.rs",
+    ];
+    for source in checked_sources {
+        let path = repo.join(source);
+        let text = fs::read_to_string(&path).unwrap();
+        for forbidden in [
+            "TPlanFragmentDestination",
+            "TRuntimeFilterProberParams",
+            "brpc_server",
+            "fragment_instance_address",
+            "brpc_addr",
+        ] {
+            if text.contains(forbidden) {
+                violations.push(format!(
+                    "{source}: native runtime routing must not contain `{forbidden}`"
+                ));
+            }
+        }
+    }
+
+    let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
+    assert!(
+        coordinator.contains("fn thrift_destination_from_native"),
+        "coordinator must keep thrift destination conversion in a named compact boundary helper"
+    );
+    assert!(
+        coordinator.contains("fn native_stream_destination"),
+        "coordinator must encode native stream destinations without thrift roundtrip"
+    );
+
+    assert!(
+        violations.is_empty(),
+        "D3E native runtime endpoint guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
 fn nidl_d3b_baseline_update_hint() -> String {
     format!(
         "To intentionally update the proto schema ledger, run:\n{}",
