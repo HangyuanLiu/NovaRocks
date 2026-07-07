@@ -41,20 +41,31 @@ pub(crate) struct RuntimeFilterProbeIntent {
     pub probe_expr: TypedExpr,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeFilterKind {
+    Join,
+    TopN,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct WiredRuntimeFilterBuild {
     pub filter_id: i32,
+    pub filter_type: RuntimeFilterKind,
     pub build_expr: TypedExpr,
     pub probe_expr: TypedExpr,
     pub expr_order: usize,
-    pub execution_mode: JoinExecutionMode,
+    pub execution_mode: Option<JoinExecutionMode>,
     pub source_fragment_id: FragmentId,
     pub target_fragment_ids: Vec<FragmentId>,
+    pub limit: Option<i64>,
+    pub is_asc: Option<bool>,
+    pub is_nulls_first: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct WiredRuntimeFilterProbe {
     pub filter_id: i32,
+    pub filter_type: RuntimeFilterKind,
     pub probe_expr: TypedExpr,
     pub source_fragment_id: FragmentId,
 }

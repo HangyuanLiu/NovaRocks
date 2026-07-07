@@ -35,7 +35,7 @@ use crate::sql::codegen::{
 use crate::sql::planner::plan::{ExchangeFlavor, PhysicalPlanKind, PlanScanNode};
 use crate::sql::planner::{
     DataPartition, DistributedNode, DistributedPayload, DistributedPlan, PartitionKind,
-    PlanFragment, PlannedRuntimeFilter,
+    PlanFragment, PlannedRuntimeFilter, RuntimeFilterKind,
 };
 
 pub(crate) fn lower_distributed_plan(
@@ -809,6 +809,16 @@ fn collect_runtime_filter_builds(
     probe_side_filters: &mut HashMap<FragmentId, Vec<(i32, i32)>>,
 ) {
     for build in &node.build_runtime_filters {
+        if build.filter_type != RuntimeFilterKind::Join {
+            continue;
+        }
+        let Some(execution_mode) = build.execution_mode else {
+            tracing::debug!(
+                "skip runtime filter {}: join filter is missing execution mode",
+                build.filter_id
+            );
+            continue;
+        };
         let targets = probe_targets
             .get(&build.filter_id)
             .cloned()
@@ -824,7 +834,7 @@ fn collect_runtime_filter_builds(
                 build_plan_node_id: node.node_id,
                 probe_target_node_ids,
                 has_remote_targets,
-                execution_mode: build.execution_mode,
+                execution_mode,
                 expr_order: i32::try_from(build.expr_order).unwrap_or(i32::MAX),
             },
         );

@@ -35,7 +35,9 @@ use crate::common::config::exchange_wait_ms;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode, cast_array_to_target};
-use crate::exec::node::aggregate::{AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode};
+use crate::exec::node::aggregate::{
+    AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, TopNRuntimeFilterSpec,
+};
 use crate::exec::node::analytic::{
     AnalyticNode, AnalyticOutputColumn, WindowBoundary, WindowFrame, WindowFunctionKind,
     WindowFunctionSpec, WindowType,
@@ -57,6 +59,7 @@ use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSl
 use crate::exec::node::union_all::UnionAllNode;
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
+use crate::exec::runtime_filter::RuntimeFilterType;
 use crate::proto::{common, expr, novarocks, plan};
 use crate::runtime::exchange::ExchangeKey;
 use crate::runtime::query_options::QueryOptions;
@@ -1998,16 +2001,27 @@ fn lower_exchange_receiver(
         .as_ref()
         .and_then(|flavor| flavor.kind.as_ref())
         .ok_or_else(|| "ExchangeReceiver flavor missing".to_string())?;
+    let lowered = lower_exchange_source_receiver(node, exchange, ctx)?;
     match flavor {
-        plan::exchange_flavor::Kind::Distribution(true) => {}
+        plan::exchange_flavor::Kind::Distribution(true) => Ok(lowered),
         plan::exchange_flavor::Kind::Distribution(false) => {
-            return Err("ExchangeReceiver distribution flavor must be true".to_string());
+            Err("ExchangeReceiver distribution flavor must be true".to_string())
         }
-        plan::exchange_flavor::Kind::LimitOffset(_) => {}
-        plan::exchange_flavor::Kind::TopnSplit(_) => {}
-        plan::exchange_flavor::Kind::CteMulticast(_) => {}
+        plan::exchange_flavor::Kind::LimitOffset(limit_offset) => {
+            lower_limit_offset_exchange_receiver(node, lowered, limit_offset)
+        }
+        plan::exchange_flavor::Kind::TopnSplit(topn_split) => {
+            lower_topn_split_exchange_receiver(node, lowered, topn_split, arena)
+        }
+        plan::exchange_flavor::Kind::CteMulticast(_) => Ok(lowered),
     }
+}
 
+fn lower_exchange_source_receiver(
+    node: &plan::DistributedNode,
+    exchange: &plan::ExchangeReceiver,
+    ctx: &NodeLoweringContext,
+) -> Result<LoweredNode, String> {
     let key = ctx.exchange_key(node.node_id);
     let expected_senders = ctx
         .exchange_sender_counts
@@ -2027,7 +2041,7 @@ fn lower_exchange_receiver(
     }
     let layout = layout_from_output_columns(&exchange.output_columns)?;
     let output_schema = chunk_schema_from_output_columns(&exchange.output_columns)?;
-    let mut lowered = LoweredNode {
+    Ok(LoweredNode {
         node: ExecNode {
             kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
                 key,
@@ -2038,62 +2052,75 @@ fn lower_exchange_receiver(
         },
         layout,
         output_schema,
-    };
+    })
+}
 
-    match flavor {
-        plan::exchange_flavor::Kind::LimitOffset(limit_offset) => {
-            let limit = parse_optional_nonnegative_i64(
-                limit_offset.limit,
-                "ExchangeReceiver LimitOffset.limit",
-            )?;
-            let offset = parse_optional_nonnegative_i64(
-                limit_offset.offset,
-                "ExchangeReceiver LimitOffset.offset",
-            )?
+fn lower_limit_offset_exchange_receiver(
+    node: &plan::DistributedNode,
+    lowered: LoweredNode,
+    limit_offset: &plan::LimitOffsetFlavor,
+) -> Result<LoweredNode, String> {
+    let limit =
+        parse_optional_nonnegative_i64(limit_offset.limit, "ExchangeReceiver LimitOffset.limit")?;
+    let offset =
+        parse_optional_nonnegative_i64(limit_offset.offset, "ExchangeReceiver LimitOffset.offset")?
             .unwrap_or(0);
-            if limit.is_some() || offset > 0 {
-                lowered.node = ExecNode {
-                    kind: ExecNodeKind::Limit(LimitNode {
-                        input: Box::new(lowered.node),
-                        node_id: node.node_id,
-                        limit,
-                        offset,
-                    }),
-                };
-            }
-        }
-        plan::exchange_flavor::Kind::TopnSplit(topn) => {
-            let order_by = lower_sort_items(
-                "ExchangeReceiver TopNSplit",
-                &topn.items,
-                arena,
-                &lowered.layout,
-            )?;
-            let limit =
-                parse_optional_nonnegative_i64(topn.limit, "ExchangeReceiver TopNSplit.limit")?;
-            let offset =
-                parse_optional_nonnegative_i64(topn.offset, "ExchangeReceiver TopNSplit.offset")?
-                    .unwrap_or(0);
-            lowered.node = ExecNode {
-                kind: ExecNodeKind::Sort(SortNode {
-                    input: Box::new(lowered.node),
-                    node_id: node.node_id,
-                    use_top_n: false,
-                    order_by,
-                    limit,
-                    offset,
-                    topn_type: SortTopNType::RowNumber,
-                    max_buffered_rows: None,
-                    max_buffered_bytes: None,
-                    partition_exprs: Vec::new(),
-                    partition_limit: None,
-                }),
-            };
-        }
-        _ => {}
+    if limit.is_none() && offset == 0 {
+        return Ok(lowered);
     }
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Limit(LimitNode {
+                input: Box::new(lowered.node),
+                node_id: node.node_id,
+                limit,
+                offset,
+            }),
+        },
+        layout: lowered.layout,
+        output_schema: lowered.output_schema,
+    })
+}
 
-    Ok(lowered)
+fn lower_topn_split_exchange_receiver(
+    node: &plan::DistributedNode,
+    lowered: LoweredNode,
+    topn_split: &plan::TopNSplitFlavor,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    let order_by = lower_sort_items(
+        "ExchangeReceiver TopNSplit",
+        &topn_split.items,
+        arena,
+        &lowered.layout,
+    )?;
+    if order_by.is_empty() {
+        return Err("ExchangeReceiver TopNSplit requires at least one sort item".to_string());
+    }
+    let limit =
+        parse_optional_nonnegative_i64(topn_split.limit, "ExchangeReceiver TopNSplit.limit")?;
+    let offset =
+        parse_optional_nonnegative_i64(topn_split.offset, "ExchangeReceiver TopNSplit.offset")?
+            .unwrap_or(0);
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Sort(SortNode {
+                input: Box::new(lowered.node),
+                node_id: node.node_id,
+                use_top_n: false,
+                order_by,
+                limit,
+                offset,
+                topn_type: SortTopNType::RowNumber,
+                max_buffered_rows: None,
+                max_buffered_bytes: None,
+                partition_exprs: Vec::new(),
+                partition_limit: None,
+            }),
+        },
+        layout: lowered.layout,
+        output_schema: lowered.output_schema,
+    })
 }
 
 fn lower_set_op_node(
@@ -2432,6 +2459,7 @@ fn lower_hash_aggregate_node(
         });
     }
 
+    let topn_rf_specs = lower_topn_runtime_filter_specs(node, &group_by, arena)?;
     let input_is_intermediate = functions.iter().all(|f| f.input_is_intermediate);
     let aggregate_node = LoweredNode {
         node: ExecNode {
@@ -2443,7 +2471,7 @@ fn lower_hash_aggregate_node(
                 need_finalize,
                 input_is_intermediate,
                 output_chunk_schema: aggregate_output_schema.clone(),
-                topn_rf_specs: Vec::new(),
+                topn_rf_specs,
                 streaming_preaggregation_mode: None,
             }),
         },
@@ -2461,6 +2489,73 @@ fn lower_hash_aggregate_node(
         node.node_id,
         arena,
     )
+}
+
+fn lower_topn_runtime_filter_specs(
+    node: &plan::DistributedNode,
+    group_by: &[crate::exec::expr::ExprId],
+    arena: &ExprArena,
+) -> Result<Vec<TopNRuntimeFilterSpec>, String> {
+    let mut specs = Vec::new();
+    for rf in &node.build_runtime_filters {
+        let kind = super::scan::runtime_filter_kind_or_join(rf.kind, "RuntimeFilterBuild")?;
+        if kind != plan::RuntimeFilterKind::Topn {
+            continue;
+        }
+        let filter_id = rf.filter_id;
+        let expr_order = rf.expr_order as usize;
+        let build_expr_id = group_by.get(expr_order).ok_or_else(|| {
+            format!("TopN runtime filter {filter_id} expr_order {expr_order} out of range")
+        })?;
+        let build_data_type = arena.data_type(*build_expr_id).ok_or_else(|| {
+            format!("TopN runtime filter {filter_id} build expression type missing")
+        })?;
+        let build_type =
+            RuntimeFilterType::from_arrow_data_type(build_data_type).map_err(|err| {
+                format!(
+                    "TopN runtime filter {filter_id} unsupported build expression type {:?}: {err}",
+                    build_data_type
+                )
+            })?;
+        let limit = rf
+            .limit
+            .ok_or_else(|| format!("TopN runtime filter {filter_id} missing limit"))?;
+        if limit <= 0 {
+            return Err(format!(
+                "TopN runtime filter {filter_id} limit must be positive, got {limit}"
+            ));
+        }
+        let is_asc = rf
+            .is_asc
+            .ok_or_else(|| format!("TopN runtime filter {filter_id} missing is_asc"))?;
+        let is_nulls_first = rf
+            .is_nulls_first
+            .ok_or_else(|| format!("TopN runtime filter {filter_id} missing is_nulls_first"))?;
+        let probe_column_name = rf
+            .probe_expr
+            .as_ref()
+            .and_then(proto_column_ref_name)
+            .ok_or_else(|| {
+                format!("TopN runtime filter {filter_id} probe_expr must be a column ref")
+            })?;
+        specs.push(TopNRuntimeFilterSpec {
+            filter_id,
+            expr_order,
+            build_type,
+            probe_column_name,
+            limit: limit as usize,
+            is_asc,
+            is_nulls_first,
+        });
+    }
+    Ok(specs)
+}
+
+fn proto_column_ref_name(expr: &expr::Expr) -> Option<String> {
+    let Some(expr::expr::Kind::ColumnRef(column_ref)) = expr.kind.as_ref() else {
+        return None;
+    };
+    column_ref.column.clone()
 }
 
 fn aggregate_output_columns_from_layout(
@@ -3817,6 +3912,18 @@ mod tests {
         }
     }
 
+    fn column_ref_named(column_id: u32, name: &str, data_type: DataType) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&data_type)),
+            nullable: true,
+            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: Some(name.to_string()),
+            })),
+        }
+    }
+
     fn sort_item(column_id: u32) -> expr::SortItem {
         expr::SortItem {
             expr: Some(column_ref(column_id, DataType::Int64)),
@@ -4663,29 +4770,6 @@ mod tests {
     }
 
     #[test]
-    fn lowers_partial_split_topn() {
-        let topn = physical_node(
-            30,
-            plan::plan_node::Kind::Topn(plan::TopNNode {
-                items: vec![sort_item(1)],
-                limit: Some(3),
-                offset: Some(0),
-                phase: plan::TopNPhase::TopnPhasePartial as i32,
-                is_split: true,
-            }),
-            Vec::new(),
-            vec![one_col_values_node(10)],
-        );
-        let lowered = lower(&topn);
-        let ExecNodeKind::Sort(topn) = lowered.node.kind else {
-            panic!("expected split TopN as Sort");
-        };
-        assert!(topn.use_top_n);
-        assert_eq!(topn.limit, Some(3));
-        assert_eq!(topn.offset, 0);
-    }
-
-    #[test]
     fn rejects_final_split_topn_physical_node() {
         let topn = physical_node(
             30,
@@ -4703,6 +4787,30 @@ mod tests {
         let err = lower_proto_node(&topn, &mut arena, &NodeLoweringContext::default()).unwrap_err();
         assert!(err.contains("TopNNode final split"));
         assert!(err.contains("ExchangeReceiver TopNSplit"));
+    }
+
+    #[test]
+    fn lowers_partial_split_topn() {
+        let topn = physical_node(
+            31,
+            plan::plan_node::Kind::Topn(plan::TopNNode {
+                items: vec![sort_item(1)],
+                limit: Some(3),
+                offset: Some(0),
+                phase: plan::TopNPhase::TopnPhasePartial as i32,
+                is_split: true,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let lowered_topn = lower(&topn);
+        let ExecNodeKind::Sort(topn) = lowered_topn.node.kind else {
+            panic!("expected Partial TopN as Sort");
+        };
+        assert!(topn.use_top_n);
+        assert_eq!(topn.limit, Some(3));
+        assert_eq!(topn.offset, 0);
+        assert_eq!(topn.order_by.len(), 1);
     }
 
     #[test]
@@ -5431,6 +5539,58 @@ mod tests {
             aggregate.output_chunk_schema.slot_ids(),
             &[SlotId::new(1), SlotId::new(3), SlotId::new(4)]
         );
+    }
+
+    #[test]
+    fn hash_aggregate_lowers_topn_runtime_filter_from_node_wiring() {
+        let group_column = output_column(1, "id", DataType::Int64);
+        let mut aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: vec![column_ref(1, DataType::Int64)],
+                aggregates: Vec::new(),
+                is_merge: Vec::new(),
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: vec![group_column],
+                    aggregate_columns: Vec::new(),
+                }),
+                output_columns: Vec::new(),
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        aggregate.build_runtime_filters = vec![plan::RuntimeFilterBuild {
+            filter_id: 42,
+            build_expr: Some(column_ref(1, DataType::Int64)),
+            probe_expr: Some(column_ref_named(1, "id", DataType::Int64)),
+            expr_order: 0,
+            execution_mode: plan::JoinExecutionMode::Unspecified as i32,
+            source_fragment_id: 0,
+            target_fragment_ids: vec![0],
+            kind: plan::RuntimeFilterKind::Topn as i32,
+            limit: Some(7),
+            is_asc: Some(true),
+            is_nulls_first: Some(false),
+        }];
+
+        let lowered = lower(&aggregate);
+        let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
+            panic!("expected Aggregate");
+        };
+
+        assert_eq!(aggregate.topn_rf_specs.len(), 1);
+        let spec = &aggregate.topn_rf_specs[0];
+        assert_eq!(spec.filter_id, 42);
+        assert_eq!(spec.expr_order, 0);
+        assert_eq!(
+            spec.build_type,
+            crate::exec::runtime_filter::RuntimeFilterType::Int64
+        );
+        assert_eq!(spec.probe_column_name, "id");
+        assert_eq!(spec.limit, 7);
+        assert!(spec.is_asc);
+        assert!(!spec.is_nulls_first);
     }
 
     #[test]

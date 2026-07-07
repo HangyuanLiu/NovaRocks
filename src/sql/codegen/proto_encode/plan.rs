@@ -38,7 +38,7 @@ use crate::sql::planner::plan::{
     PlanRowCountAssertion, PlanSetOpKind, RedistributeMode,
 };
 use crate::sql::planner::runtime_filter::{
-    JoinExecutionMode, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+    JoinExecutionMode, RuntimeFilterKind, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
 };
 use crate::sql::planner::write_sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
@@ -1856,14 +1856,30 @@ fn encode_fragment_edge_kind(src: &FragmentEdgeKind) -> plan::FragmentEdgeKind {
 fn encode_wired_runtime_filter_build(
     src: &WiredRuntimeFilterBuild,
 ) -> Result<plan::RuntimeFilterBuild, String> {
+    let execution_mode = match src.filter_type {
+        RuntimeFilterKind::Join => {
+            let execution_mode = src.execution_mode.ok_or_else(|| {
+                format!(
+                    "join runtime filter {} missing execution mode",
+                    src.filter_id
+                )
+            })?;
+            encode_join_execution_mode(execution_mode)
+        }
+        RuntimeFilterKind::TopN => plan::JoinExecutionMode::Unspecified as i32,
+    };
     Ok(plan::RuntimeFilterBuild {
         filter_id: src.filter_id,
         build_expr: Some(encode_expr(&src.build_expr)?),
         probe_expr: Some(encode_expr(&src.probe_expr)?),
         expr_order: usize_to_u32(src.expr_order)?,
-        execution_mode: encode_join_execution_mode(src.execution_mode),
+        execution_mode,
         source_fragment_id: src.source_fragment_id,
         target_fragment_ids: src.target_fragment_ids.clone(),
+        kind: encode_runtime_filter_kind(src.filter_type),
+        limit: src.limit,
+        is_asc: src.is_asc,
+        is_nulls_first: src.is_nulls_first,
     })
 }
 
@@ -1874,7 +1890,15 @@ fn encode_wired_runtime_filter_probe(
         filter_id: src.filter_id,
         probe_expr: Some(encode_expr(&src.probe_expr)?),
         source_fragment_id: src.source_fragment_id,
+        kind: encode_runtime_filter_kind(src.filter_type),
     })
+}
+
+fn encode_runtime_filter_kind(kind: RuntimeFilterKind) -> i32 {
+    match kind {
+        RuntimeFilterKind::Join => plan::RuntimeFilterKind::Join as i32,
+        RuntimeFilterKind::TopN => plan::RuntimeFilterKind::Topn as i32,
+    }
 }
 
 fn encode_table_def(src: &catalog::TableDef) -> Result<plan::TableDef, String> {
@@ -4016,6 +4040,87 @@ mod tests {
                     .collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
             vec![vec![1, 3], vec![1, 3]]
+        );
+    }
+
+    #[test]
+    fn native_plan_encoder_preserves_topn_self_subtree_runtime_filters() {
+        let column = output_column(1, "k", DataType::Int64);
+        let expr = column_ref_expr_for_output_column(&column);
+        let node = DistributedNode {
+            node_id: 10,
+            fragment_id: 0,
+            tuple_ids: vec![10],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: vec![
+                WiredRuntimeFilterBuild {
+                    filter_id: 1,
+                    filter_type: RuntimeFilterKind::Join,
+                    build_expr: expr.clone(),
+                    probe_expr: expr.clone(),
+                    expr_order: 0,
+                    execution_mode: Some(JoinExecutionMode::Broadcast),
+                    source_fragment_id: 0,
+                    target_fragment_ids: vec![0],
+                    limit: None,
+                    is_asc: None,
+                    is_nulls_first: None,
+                },
+                WiredRuntimeFilterBuild {
+                    filter_id: 2,
+                    filter_type: RuntimeFilterKind::TopN,
+                    build_expr: expr.clone(),
+                    probe_expr: expr.clone(),
+                    expr_order: 0,
+                    execution_mode: None,
+                    source_fragment_id: 0,
+                    target_fragment_ids: vec![0],
+                    limit: Some(5),
+                    is_asc: Some(true),
+                    is_nulls_first: Some(false),
+                },
+            ],
+            probe_runtime_filters: vec![
+                WiredRuntimeFilterProbe {
+                    filter_id: 1,
+                    filter_type: RuntimeFilterKind::Join,
+                    probe_expr: expr.clone(),
+                    source_fragment_id: 0,
+                },
+                WiredRuntimeFilterProbe {
+                    filter_id: 2,
+                    filter_type: RuntimeFilterKind::TopN,
+                    probe_expr: expr,
+                    source_fragment_id: 0,
+                },
+            ],
+            children: Vec::new(),
+            stats: stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                crate::sql::planner::plan::PlanValuesNode {
+                    rows: Vec::new(),
+                    columns: vec![column],
+                },
+            )),
+        };
+
+        let encoded = encode_node(&node).expect("encode node");
+
+        assert_eq!(encoded.build_runtime_filters.len(), 2);
+        assert_eq!(encoded.build_runtime_filters[0].filter_id, 1);
+        assert_eq!(
+            encoded.build_runtime_filters[1].kind,
+            plan::RuntimeFilterKind::Topn as i32
+        );
+        assert_eq!(encoded.build_runtime_filters[1].limit, Some(5));
+        assert_eq!(encoded.build_runtime_filters[1].is_asc, Some(true));
+        assert_eq!(encoded.build_runtime_filters[1].is_nulls_first, Some(false));
+        assert_eq!(encoded.probe_runtime_filters.len(), 2);
+        assert_eq!(encoded.probe_runtime_filters[0].filter_id, 1);
+        assert_eq!(
+            encoded.probe_runtime_filters[1].kind,
+            plan::RuntimeFilterKind::Topn as i32
         );
     }
 

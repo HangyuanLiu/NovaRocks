@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use super::super::node::{LoweredNode, NodeLoweringContext};
 use super::common::{
-    lower_scan_predicate, parse_scan_limit, resolve_cloud_object_store_config, scan_batch_size,
-    scan_output_columns, table_location_map,
+    lower_node_probe_runtime_filter_specs, lower_scan_predicate, parse_scan_limit,
+    resolve_cloud_object_store_config, scan_batch_size, scan_output_columns, table_location_map,
 };
 use super::file_range::decode_file_scan_ranges;
 use super::read_plan::{maybe_project_data_scan_output, scan_read_plan};
@@ -89,7 +89,7 @@ pub(super) fn lower_iceberg_data_files_scan(
         iceberg_runtime_pruning,
     };
     let predicate = lower_scan_predicate(scan, arena, &read_plan.read_layout)?;
-    let scan_node = ctx
+    let mut scan_node = ctx
         .connectors()?
         .create_scan_node("hdfs", ScanConfig::Hdfs(Box::new(cfg)))?
         .with_node_id(node.node_id)
@@ -98,6 +98,9 @@ pub(super) fn lower_iceberg_data_files_scan(
         .with_conjunct_predicate(predicate)
         .with_iceberg_virtual(Some(read_plan.iceberg_virtual.clone()))
         .with_accept_empty_scan_ranges(true);
+    let runtime_filter_specs =
+        lower_node_probe_runtime_filter_specs(node, arena, &read_plan.read_layout)?;
+    scan_node.add_runtime_filter_specs(&runtime_filter_specs);
     let scan_lowered = LoweredNode {
         node: ExecNode {
             kind: ExecNodeKind::Scan(scan_node),

@@ -148,6 +148,13 @@ enum PartitionKind {
   PARTITION_KIND_HASH = 3;
 }
 
+// Runtime filter kind for node-level RF wiring.
+enum RuntimeFilterKind {
+  RUNTIME_FILTER_KIND_UNSPECIFIED = 0;
+  RUNTIME_FILTER_KIND_JOIN = 1;
+  RUNTIME_FILTER_KIND_TOPN = 2;
+}
+
 // Runtime filter build wiring after fragment assignment.
 // Owner: produced by the future FE/native plan encoder and consumed by the
 // future BE/native plan prepare layer.
@@ -159,6 +166,10 @@ message RuntimeFilterBuild {
   JoinExecutionMode execution_mode = 5;        // distribution mode for this filter.
   uint32 source_fragment_id = 6;               // build-side fragment id.
   repeated uint32 target_fragment_ids = 7;     // probe-side target fragment ids.
+  RuntimeFilterKind kind = 8;                  // runtime filter kind; unspecified means JOIN for legacy payloads.
+  optional int64 limit = 9;                    // TOPN limit.
+  optional bool is_asc = 10;                   // TOPN sort direction.
+  optional bool is_nulls_first = 11;           // TOPN null ordering.
 }
 
 // Runtime filter probe wiring after fragment assignment.
@@ -168,6 +179,7 @@ message RuntimeFilterProbe {
   int32 filter_id = 1;                // runtime filter id.
   novarocks.expr.Expr probe_expr = 2; // local probe expression.
   uint32 source_fragment_id = 3;      // build-side source fragment id.
+  RuntimeFilterKind kind = 4;         // runtime filter kind; unspecified means JOIN for legacy payloads.
 }
 
 // Directed data-flow edge between two fragments.

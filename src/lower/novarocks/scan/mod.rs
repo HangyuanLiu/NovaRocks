@@ -99,6 +99,18 @@ fn unsupported_scan_source(source: &str) -> Result<LoweredNode, String> {
     Err(format!("{source} native scan source is not implemented"))
 }
 
+pub(super) fn runtime_filter_kind_or_join(
+    kind: i32,
+    label: &str,
+) -> Result<plan::RuntimeFilterKind, String> {
+    let kind = plan::RuntimeFilterKind::try_from(kind)
+        .map_err(|_| format!("{label} has unknown runtime filter kind {kind}"))?;
+    Ok(match kind {
+        plan::RuntimeFilterKind::Unspecified => plan::RuntimeFilterKind::Join,
+        other => other,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -493,6 +505,39 @@ mod tests {
         };
         assert_eq!(scan.node_id(), Some(10));
         assert_eq!(scan.output_chunk_schema().slot_ids(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_topn_probe_runtime_filter_as_self_subtree_scan_spec() {
+        let mut node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
+            plan::IcebergDataFiles {
+                table: Some(table_info()),
+                files: Vec::new(),
+                cloud_properties: HashMap::new(),
+                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+            },
+        ));
+        node.probe_runtime_filters = vec![plan::RuntimeFilterProbe {
+            filter_id: 42,
+            probe_expr: Some(column_ref(1, "id", DataType::Int64)),
+            source_fragment_id: 0,
+            kind: plan::RuntimeFilterKind::Topn as i32,
+        }];
+        let ctx = NodeLoweringContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_scan_ranges(10, vec![file_range()]);
+        let mut arena = ExprArena::default();
+        let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
+            .expect("lower native scan");
+        let ExecNodeKind::Scan(scan) = lowered.node.kind else {
+            panic!("expected Scan");
+        };
+
+        let specs = scan.runtime_filter_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].filter_id, 42);
+        assert_eq!(specs[0].slot_id, SlotId::new(1));
+        assert!(specs[0].self_subtree);
     }
 
     #[test]

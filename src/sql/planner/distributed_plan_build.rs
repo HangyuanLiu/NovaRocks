@@ -37,15 +37,19 @@ use crate::sql::planner::plan::{
     PlanSetOpKind, RedistributeMode, RedistributeNode,
 };
 use crate::sql::planner::{
-    OrderingSpec, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
+    OrderingSpec, RuntimeFilterBuildIntent, RuntimeFilterKind, RuntimeFilterProbeIntent, TopNPhase,
     WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
 };
 
 pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<DistributedPlan, String> {
+    let initial_runtime_filter_id = max_runtime_filter_id(plan)
+        .map(|max_id| max_id.saturating_add(1).max(1))
+        .unwrap_or(1);
     let mut builder = DistributedPlanBuilder {
         next_node_id: 1,
         next_tuple_id: 1,
         next_fragment_id: 0,
+        next_runtime_filter_id: initial_runtime_filter_id,
         fragment_stack: Vec::new(),
         completed_fragments: Vec::new(),
         edges: Vec::new(),
@@ -99,6 +103,7 @@ struct DistributedPlanBuilder {
     next_node_id: i32,
     next_tuple_id: i32,
     next_fragment_id: FragmentId,
+    next_runtime_filter_id: i32,
     fragment_stack: Vec<FragmentId>,
     completed_fragments: Vec<PlanFragment>,
     edges: Vec<FragmentEdge>,
@@ -136,6 +141,12 @@ impl DistributedPlanBuilder {
         let fragment_id = self.next_fragment_id;
         self.next_fragment_id += 1;
         fragment_id
+    }
+
+    fn alloc_runtime_filter_id(&mut self) -> i32 {
+        let filter_id = self.next_runtime_filter_id;
+        self.next_runtime_filter_id = self.next_runtime_filter_id.saturating_add(1);
+        filter_id
     }
 
     fn current_fragment_id(&self) -> Result<FragmentId, String> {
@@ -548,7 +559,8 @@ impl DistributedPlanBuilder {
                 synthetic_exchange_stats(&node.stats),
             ),
             (TopNPhase::Final, false) | (TopNPhase::Partial, _) => {
-                let child = self.visit(child_plan)?;
+                let mut child = self.visit(child_plan)?;
+                self.inject_local_topn_runtime_filter(topn, child_plan, &mut child);
                 let node_id = self.alloc_node();
                 let tuple_ids = child.tuple_ids.clone();
                 let fragment_id = self.current_fragment_id()?;
@@ -558,6 +570,64 @@ impl DistributedPlanBuilder {
                 Ok(topn_node)
             }
         }
+    }
+
+    fn inject_local_topn_runtime_filter(
+        &mut self,
+        topn: &crate::sql::planner::plan::PhysicalTopNNode,
+        child_plan: &PhysicalPlanNode,
+        child: &mut DistributedNode,
+    ) {
+        let Some(limit) = topn.limit.filter(|limit| *limit > 0) else {
+            return;
+        };
+        if topn.offset.unwrap_or(0) != 0 || topn.items.len() != 1 {
+            return;
+        }
+        let PhysicalPlanKind::HashAggregate(agg_plan) = &child_plan.kind else {
+            return;
+        };
+        if !matches!(
+            &child.payload,
+            DistributedPayload::Physical(PhysicalPlanKind::HashAggregate(_))
+        ) {
+            return;
+        }
+        let Some((expr_order, build_expr)) =
+            local_topn_group_key_for_runtime_filter(topn, agg_plan)
+        else {
+            return;
+        };
+        let probe_expr = build_expr.clone();
+        let filter_id = self.alloc_runtime_filter_id();
+        let aggregate_fragment_id = child.fragment_id;
+        let scan_fragment_id = {
+            let Some(scan) = direct_scan_child_mut(child) else {
+                return;
+            };
+            let scan_fragment_id = scan.fragment_id;
+            scan.probe_runtime_filters.push(WiredRuntimeFilterProbe {
+                filter_id,
+                filter_type: RuntimeFilterKind::TopN,
+                probe_expr: probe_expr.clone(),
+                source_fragment_id: aggregate_fragment_id,
+            });
+            scan_fragment_id
+        };
+        let item = &topn.items[0];
+        child.build_runtime_filters.push(WiredRuntimeFilterBuild {
+            filter_id,
+            filter_type: RuntimeFilterKind::TopN,
+            build_expr,
+            probe_expr,
+            expr_order,
+            execution_mode: None,
+            source_fragment_id: aggregate_fragment_id,
+            target_fragment_ids: vec![scan_fragment_id],
+            limit: Some(limit),
+            is_asc: Some(item.asc),
+            is_nulls_first: Some(item.nulls_first),
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1369,6 +1439,66 @@ fn synthetic_exchange_stats(
     }
 }
 
+fn max_runtime_filter_id(node: &PhysicalPlanNode) -> Option<i32> {
+    let mut max_id = node
+        .probe_runtime_filters
+        .iter()
+        .map(|probe| probe.filter_id)
+        .max();
+    if let PhysicalPlanKind::HashJoin(join) = &node.kind
+        && let Some(build_max) = join
+            .build_runtime_filters
+            .iter()
+            .map(|build| build.filter_id)
+            .max()
+    {
+        max_id = Some(max_id.map_or(build_max, |current| current.max(build_max)));
+    }
+    for child in &node.children {
+        if let Some(child_max) = max_runtime_filter_id(child) {
+            max_id = Some(max_id.map_or(child_max, |current| current.max(child_max)));
+        }
+    }
+    max_id
+}
+
+fn local_topn_group_key_for_runtime_filter(
+    topn: &crate::sql::planner::plan::PhysicalTopNNode,
+    agg: &crate::sql::planner::plan::PhysicalHashAggregateNode,
+) -> Option<(usize, TypedExpr)> {
+    let sort_expr = &topn.items.first()?.expr;
+    let ExprKind::ColumnRef {
+        column_id: sort_column_id,
+        ..
+    } = &sort_expr.kind
+    else {
+        return None;
+    };
+    for (idx, group_output) in agg.output_layout.group_key_columns.iter().enumerate() {
+        if group_output.column_id != *sort_column_id {
+            continue;
+        }
+        let group_expr = agg.group_by.get(idx)?;
+        if matches!(group_expr.kind, ExprKind::ColumnRef { .. }) {
+            return Some((idx, group_expr.clone()));
+        }
+        return None;
+    }
+    None
+}
+
+fn direct_scan_child_mut(node: &mut DistributedNode) -> Option<&mut DistributedNode> {
+    let child = node.children.first_mut()?;
+    if matches!(
+        &child.payload,
+        DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
+    ) {
+        Some(child)
+    } else {
+        None
+    }
+}
+
 fn limit_stats_with_child_cost(
     limit_stats: &crate::sql::planner::PhysicalPlanStats,
     child_stats: &crate::sql::planner::PhysicalPlanStats,
@@ -1448,12 +1578,16 @@ fn wire_runtime_filters(
             .or_default()
             .push(WiredRuntimeFilterBuild {
                 filter_id: build.intent.filter_id,
+                filter_type: RuntimeFilterKind::Join,
                 build_expr: build.intent.build_expr.clone(),
                 probe_expr: build.intent.probe_expr.clone(),
                 expr_order: build.intent.expr_order,
-                execution_mode: build.intent.execution_mode,
+                execution_mode: Some(build.intent.execution_mode),
                 source_fragment_id: build.fragment_id,
                 target_fragment_ids,
+                limit: None,
+                is_asc: None,
+                is_nulls_first: None,
             });
     }
 
@@ -1472,6 +1606,7 @@ fn wire_runtime_filters(
         }
         probes.push(WiredRuntimeFilterProbe {
             filter_id: probe.intent.filter_id,
+            filter_type: RuntimeFilterKind::Join,
             probe_expr: probe.intent.probe_expr.clone(),
             source_fragment_id,
         });
@@ -1568,7 +1703,7 @@ mod tests {
     use crate::sql::planner::{
         AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
         PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate, RuntimeFilterBuildIntent,
-        RuntimeFilterProbeIntent, TopNPhase,
+        RuntimeFilterKind, RuntimeFilterProbeIntent, TopNPhase,
     };
 
     #[test]
@@ -1926,6 +2061,60 @@ mod tests {
     }
 
     #[test]
+    fn build_distributed_plan_topn_over_aggregate_injects_self_subtree_runtime_filter() {
+        let scan = scan_node(1, "k");
+        let group_key = column_ref_expr(1, "k", DataType::Int64, false);
+        let group_output = output_col(10, "k", DataType::Int64, false);
+        let aggregate = PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
+                mode: AggMode::Single,
+                group_by: vec![group_key.clone()],
+                aggregates: vec![],
+                is_merge: vec![],
+                output_layout: AggregateOutputLayout::new(vec![group_output.clone()], vec![]),
+                output_columns: vec![group_output.clone()],
+            })),
+            children: vec![scan],
+            output_columns: vec![group_output.clone()],
+            stats: stats_with_row_count(100.0),
+            probe_runtime_filters: vec![],
+        };
+        let topn = PhysicalPlanNode {
+            kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
+                items: vec![sort_item(column_ref_expr(10, "k", DataType::Int64, false))],
+                limit: Some(8),
+                offset: None,
+                phase: TopNPhase::Final,
+                is_split: false,
+            }),
+            children: vec![aggregate],
+            output_columns: vec![group_output],
+            stats: stats_with_row_count(8.0),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan(&topn).expect("build_distributed_plan");
+
+        let topn_node = &dp.fragments[0].root;
+        let aggregate_node = &topn_node.children[0];
+        assert_eq!(aggregate_node.build_runtime_filters.len(), 1);
+        let build = &aggregate_node.build_runtime_filters[0];
+        assert_eq!(build.filter_type, RuntimeFilterKind::TopN);
+        assert_eq!(build.expr_order, 0);
+        assert_eq!(build.limit, Some(8));
+        assert_eq!(build.is_asc, Some(true));
+        assert_eq!(build.is_nulls_first, Some(false));
+        assert_column_ref(&build.build_expr, 1, "k");
+
+        let scan_node = &aggregate_node.children[0];
+        assert_eq!(scan_node.probe_runtime_filters.len(), 1);
+        let probe = &scan_node.probe_runtime_filters[0];
+        assert_eq!(probe.filter_id, build.filter_id);
+        assert_eq!(probe.filter_type, RuntimeFilterKind::TopN);
+        assert_column_ref(&probe.probe_expr, 1, "k");
+    }
+
+    #[test]
     fn build_distributed_plan_hash_join_combines_child_tuples() {
         let left = scan_node(1, "l_k");
         let right = scan_node(2, "r_k");
@@ -2087,7 +2276,7 @@ mod tests {
         assert_column_ref(&build.build_expr, 2, "r_k");
         assert_column_ref(&build.probe_expr, 1, "l_k");
         assert_eq!(build.expr_order, 3);
-        assert_eq!(build.execution_mode, JoinExecutionMode::Partitioned);
+        assert_eq!(build.execution_mode, Some(JoinExecutionMode::Partitioned));
         assert_eq!(build.source_fragment_id, join_node.fragment_id);
         assert_eq!(build.target_fragment_ids, vec![probe_fragment.fragment_id]);
 

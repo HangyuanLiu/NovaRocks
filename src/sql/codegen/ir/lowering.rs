@@ -68,8 +68,8 @@ use crate::sql::planner::optimizer_bridge::property::{
 };
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 use crate::sql::planner::{
-    AggMode, JoinDistribution, JoinExecutionMode, OrderingSpec, PlannedRuntimeFilter, TopNPhase,
-    WiredRuntimeFilterBuild,
+    AggMode, JoinDistribution, JoinExecutionMode, OrderingSpec, PlannedRuntimeFilter,
+    RuntimeFilterKind, TopNPhase, WiredRuntimeFilterBuild,
 };
 use crate::thrift::data_sinks;
 use crate::thrift::exprs;
@@ -1976,6 +1976,19 @@ fn collect_predicate_column_ids_by_name(expr: &TypedExpr, out: &mut HashMap<Stri
     }
 }
 
+fn runtime_filter_kind_to_thrift(
+    kind: RuntimeFilterKind,
+) -> crate::thrift::runtime_filter::TRuntimeFilterBuildType {
+    match kind {
+        RuntimeFilterKind::Join => {
+            crate::thrift::runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER
+        }
+        RuntimeFilterKind::TopN => {
+            crate::thrift::runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER
+        }
+    }
+}
+
 impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     pub(crate) fn new(state: &'s mut S) -> Self {
         Self {
@@ -2389,8 +2402,18 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
         let child = self.lower_node(&node.children[0])?;
         let agg_tuple_id = first_tuple_id(node, "HashAggregate")?;
-        let (agg_plan_node, scope) =
+        let (mut agg_plan_node, scope) =
             self.lower_hash_aggregate(node.node_id, agg_tuple_id, agg, &child.scope)?;
+        let topn_rf_descs = self.build_topn_rf_descriptors(
+            &node.build_runtime_filters,
+            node.node_id,
+            &child.scope,
+        )?;
+        if !topn_rf_descs.is_empty()
+            && let Some(agg) = agg_plan_node.agg_node.as_mut()
+        {
+            agg.build_runtime_filters = Some(topn_rf_descs);
+        }
         let mut plan_nodes = vec![agg_plan_node];
         plan_nodes.extend(child.plan_nodes);
         Ok(LoweredDistributedNode {
@@ -3140,9 +3163,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             descs.push(crate::thrift::runtime_filter::TRuntimeFilterDescription {
                 filter_id: Some(probe.filter_id),
                 plan_node_id_to_target_expr: Some(BTreeMap::from([(thrift_node_id, probe_texpr)])),
-                filter_type: Some(
-                    crate::thrift::runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER,
-                ),
+                filter_type: Some(runtime_filter_kind_to_thrift(probe.filter_type)),
                 ..Default::default()
             });
         }
@@ -3181,6 +3202,67 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
     }
 
+    fn build_topn_rf_descriptors(
+        &mut self,
+        build_runtime_filters: &[WiredRuntimeFilterBuild],
+        agg_node_id: i32,
+        child_scope: &ExprScope,
+    ) -> Result<Vec<crate::thrift::runtime_filter::TRuntimeFilterDescription>, String> {
+        let mut descs = Vec::new();
+        for rf in build_runtime_filters
+            .iter()
+            .filter(|rf| rf.filter_type == RuntimeFilterKind::TopN)
+        {
+            let Some(limit) = rf.limit.filter(|limit| *limit > 0) else {
+                continue;
+            };
+            let (Some(is_asc), Some(is_nulls_first)) = (rf.is_asc, rf.is_nulls_first) else {
+                continue;
+            };
+            let build_texpr = ExprCompiler::new(self.state.slot_allocator(), child_scope)
+                .compile_typed(&rf.build_expr)
+                .map_err(|err| {
+                    format!(
+                        "failed to lower topn runtime filter build expression for aggregate node_id={} filter_id={}: {}",
+                        agg_node_id, rf.filter_id, err
+                    )
+                })?;
+            let probe_targets = self
+                .state
+                .rf_probe_targets()
+                .get(&rf.filter_id)
+                .cloned()
+                .unwrap_or_default();
+            if probe_targets.is_empty() {
+                tracing::debug!(
+                    "skip topn runtime filter {}: no probe target was lowered",
+                    rf.filter_id
+                );
+                continue;
+            }
+            let mut target_map = BTreeMap::new();
+            for target in probe_targets {
+                target_map.insert(target.thrift_node_id, target.probe_texpr);
+            }
+            let desc = crate::thrift::runtime_filter::TRuntimeFilterDescription {
+                filter_id: Some(rf.filter_id),
+                build_expr: Some(build_texpr),
+                expr_order: Some(rf.expr_order as i32),
+                plan_node_id_to_target_expr: Some(target_map),
+                build_plan_node_id: Some(agg_node_id),
+                filter_type: Some(
+                    crate::thrift::runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER,
+                ),
+                limit: Some(limit),
+                is_asc: Some(is_asc),
+                is_nulls_first: Some(is_nulls_first),
+                ..Default::default()
+            };
+            descs.push(desc);
+        }
+        Ok(descs)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_rf_descriptors(
         &mut self,
@@ -3203,6 +3285,16 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             Vec::with_capacity(build_runtime_filters.len());
 
         for rf in build_runtime_filters {
+            if rf.filter_type != RuntimeFilterKind::Join {
+                continue;
+            }
+            let Some(execution_mode) = rf.execution_mode else {
+                tracing::debug!(
+                    "skip runtime filter {}: join filter is missing execution mode",
+                    rf.filter_id
+                );
+                continue;
+            };
             let filter_id = rf.filter_id;
             let Some(post_demote_expr_order) =
                 remap_rf_expr_order(surviving_eq_origin, rf.expr_order)
@@ -3253,7 +3345,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             let has_remote_targets = probe_targets.iter().any(|t| t.fragment_id != join_fragment);
 
             let (build_join_mode, local_layout, global_layout) =
-                rf_layout_for_join_execution_mode(rf.execution_mode);
+                rf_layout_for_join_execution_mode(execution_mode);
 
             let layout = runtime_filter::TRuntimeFilterLayout::new(
                 filter_id,
@@ -3307,7 +3399,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     build_plan_node_id: join_node_id,
                     probe_target_node_ids,
                     has_remote_targets,
-                    execution_mode: rf.execution_mode,
+                    execution_mode,
                     expr_order: post_demote_expr_order as i32,
                 },
             );
@@ -5921,7 +6013,7 @@ mod tests {
     use crate::sql::planner::plan::{AggregateCall, PhysicalPlanKind, PlanScanNode};
     use crate::sql::planner::{
         AggMode, AggregateOutputLayout, JoinDistribution, JoinExecutionMode, PhysicalPlanStats,
-        PlannerConfidence, WiredRuntimeFilterBuild,
+        PlannerConfidence, RuntimeFilterKind, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
     };
     use crate::thrift::plan_nodes::TPlanNodeType;
     use crate::types::arrow_thrift::thrift_desc_to_arrow_type as arrow_type_from_desc;
@@ -6945,12 +7037,16 @@ mod tests {
         };
         let runtime_filter = WiredRuntimeFilterBuild {
             filter_id: 17,
+            filter_type: RuntimeFilterKind::Join,
             build_expr: left_key,
             probe_expr: right_key,
             expr_order: 0,
-            execution_mode: JoinExecutionMode::Broadcast,
+            execution_mode: Some(JoinExecutionMode::Broadcast),
             source_fragment_id: 0,
             target_fragment_ids: vec![0],
+            limit: None,
+            is_asc: None,
+            is_nulls_first: None,
         };
 
         let hash_join = {
@@ -6995,6 +7091,142 @@ mod tests {
         assert_eq!(
             slot_ref.slot_id, 11,
             "right semi RF build expr should compile against the left existence slot"
+        );
+    }
+
+    #[test]
+    fn lower_hash_aggregate_topn_runtime_filter_marks_probe_self_subtree() {
+        let filter_id = 91;
+        let scan_output = output_col(1, "k", DataType::Int64, false);
+        let group_output = output_col(10, "k", DataType::Int64, false);
+        let group_expr = column_ref_expr(1, "k", DataType::Int64, false);
+        let scan = DistributedNode {
+            node_id: 1,
+            fragment_id: 0,
+            tuple_ids: vec![1],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![WiredRuntimeFilterProbe {
+                filter_id,
+                filter_type: RuntimeFilterKind::TopN,
+                probe_expr: group_expr.clone(),
+                source_fragment_id: 0,
+            }],
+            children: vec![],
+            stats: distributed_stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::Scan(PlanScanNode {
+                database: "test_db".to_string(),
+                table: metadata_table_def(),
+                alias: Some("t".to_string()),
+                columns: vec![scan_output],
+                predicates: vec![],
+                required_columns: None,
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            })),
+        };
+        let aggregate = DistributedNode {
+            node_id: 2,
+            fragment_id: 0,
+            tuple_ids: vec![2],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            build_runtime_filters: vec![WiredRuntimeFilterBuild {
+                filter_id,
+                filter_type: RuntimeFilterKind::TopN,
+                build_expr: group_expr.clone(),
+                probe_expr: group_expr.clone(),
+                expr_order: 0,
+                execution_mode: None,
+                source_fragment_id: 0,
+                target_fragment_ids: vec![0],
+                limit: Some(8),
+                is_asc: Some(true),
+                is_nulls_first: Some(false),
+            }],
+            probe_runtime_filters: vec![],
+            children: vec![scan],
+            stats: distributed_stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::HashAggregate(Box::new(
+                DistributedHashAggregateNode {
+                    mode: AggMode::Single,
+                    group_by: vec![group_expr],
+                    aggregates: vec![],
+                    is_merge: vec![],
+                    output_layout: AggregateOutputLayout::new(vec![group_output.clone()], vec![]),
+                    output_columns: vec![group_output.clone()],
+                },
+            ))),
+        };
+        let dp = DistributedPlan {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: aggregate,
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns: vec![group_output],
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        };
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+
+        let result =
+            super::lower_distributed_plan(&dp, &catalog, &connectors, None).expect("lower plan");
+
+        assert!(
+            result.rf_plan.is_none(),
+            "local TopN self-subtree RF must not enter remote RF scheduling"
+        );
+        let fragment = &result.fragment_results[0];
+        let agg_plan_node = fragment
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_id == 2)
+            .expect("aggregate thrift node");
+        let topn_filters = agg_plan_node
+            .agg_node
+            .as_ref()
+            .and_then(|agg| agg.build_runtime_filters.as_ref())
+            .expect("topn build filters");
+        assert_eq!(topn_filters.len(), 1);
+        let topn_filter = &topn_filters[0];
+        assert_eq!(topn_filter.filter_id, Some(filter_id));
+        assert_eq!(
+            topn_filter.filter_type,
+            Some(crate::thrift::runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER)
+        );
+        assert_eq!(topn_filter.expr_order, Some(0));
+        assert_eq!(topn_filter.limit, Some(8));
+        assert_eq!(topn_filter.is_asc, Some(true));
+        assert_eq!(topn_filter.is_nulls_first, Some(false));
+
+        let scan_plan_node = fragment
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_id == 1)
+            .expect("scan thrift node");
+        let probe_filters = scan_plan_node
+            .probe_runtime_filters
+            .as_ref()
+            .expect("probe filters");
+        assert_eq!(probe_filters.len(), 1);
+        assert_eq!(probe_filters[0].filter_id, Some(filter_id));
+        assert_eq!(
+            probe_filters[0].filter_type,
+            Some(crate::thrift::runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER)
+        );
+        assert!(
+            scan_plan_node.local_rf_waiting_set.is_none(),
+            "self-subtree TopN RF must not enter local blocking waits"
         );
     }
 

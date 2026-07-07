@@ -45,7 +45,7 @@ use crate::sql::planner::stats::{
 use crate::sql::planner::{
     AggMode, DistributedNode, DistributedPayload, DistributedPlan, ExchangeReceiver,
     JoinDistribution, JoinExecutionMode, PartitionKind, PhysicalPlanStats, PlanFragment,
-    PlannerBroadcastDecision, PlannerConfidence, PlannerCostEstimate, TopNPhase,
+    PlannerBroadcastDecision, PlannerConfidence, PlannerCostEstimate, RuntimeFilterKind, TopNPhase,
     WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
 };
 
@@ -275,6 +275,7 @@ fn format_distributed_node(
         }
         DistributedPayload::Physical(PhysicalPlanKind::HashAggregate(agg)) => {
             format_hash_aggregate_node(node, agg, &pad, &costs_suffix, &stats_suffix, out);
+            push_build_rf_lines(&node.build_runtime_filters, level, &pad, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
             format_children(node, level, indent, actuals, out);
         }
@@ -1293,9 +1294,10 @@ fn push_build_rf_lines(
     out.push(format!("{pad}  build runtime filters:"));
     for rf in filters {
         out.push(format!(
-            "{pad}  - filter_id = {}, build_expr = ({})",
+            "{pad}  - filter_id = {}, build_expr = ({}){}",
             rf.filter_id,
             format_expr(&rf.build_expr),
+            runtime_filter_kind_suffix(rf.filter_type),
         ));
     }
 }
@@ -1312,10 +1314,18 @@ fn push_probe_rf_lines(
     out.push(format!("{pad}    probe runtime filters:"));
     for rf in filters {
         out.push(format!(
-            "{pad}    - filter_id = {}, probe_expr = ({})",
+            "{pad}    - filter_id = {}, probe_expr = ({}){}",
             rf.filter_id,
             format_expr(&rf.probe_expr),
+            runtime_filter_kind_suffix(rf.filter_type),
         ));
+    }
+}
+
+fn runtime_filter_kind_suffix(kind: RuntimeFilterKind) -> &'static str {
+    match kind {
+        RuntimeFilterKind::Join => "",
+        RuntimeFilterKind::TopN => ", type = TOPN",
     }
 }
 

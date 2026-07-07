@@ -68,6 +68,10 @@ const JOIN_RUNTIME_FILTER_HASH_TIME: &str = "JoinRuntimeFilterHashTime";
 const JOIN_RUNTIME_FILTER_INPUT_ROWS: &str = "JoinRuntimeFilterInputRows";
 const JOIN_RUNTIME_FILTER_OUTPUT_ROWS: &str = "JoinRuntimeFilterOutputRows";
 const JOIN_RUNTIME_FILTER_EVALUATE: &str = "JoinRuntimeFilterEvaluate";
+const SELF_SUBTREE_RUNTIME_FILTER_INPUT_ROWS: &str = "SelfSubtreeRuntimeFilterInputRows";
+const SELF_SUBTREE_RUNTIME_FILTER_OUTPUT_ROWS: &str = "SelfSubtreeRuntimeFilterOutputRows";
+const SELF_SUBTREE_RUNTIME_FILTER_PRUNED_ROWS: &str = "SelfSubtreeRuntimeFilterPrunedRows";
+const SELF_SUBTREE_RUNTIME_FILTER_EVALUATE: &str = "SelfSubtreeRuntimeFilterEvaluate";
 const RUNTIME_FILTER_NUM: &str = "RuntimeFilterNum";
 const RUNTIME_IN_FILTER_NUM: &str = "RuntimeInFilterNum";
 const RUNTIME_FILTER_PLANNED: &str = "RuntimeFilterPlanned";
@@ -479,6 +483,18 @@ impl ScanAsyncRunner {
             profile
                 .common
                 .add_counter(RUNTIME_FILTER_NUM, ProfileUnit::Unit);
+            profile
+                .common
+                .add_counter(SELF_SUBTREE_RUNTIME_FILTER_INPUT_ROWS, ProfileUnit::Unit);
+            profile
+                .common
+                .add_counter(SELF_SUBTREE_RUNTIME_FILTER_OUTPUT_ROWS, ProfileUnit::Unit);
+            profile
+                .common
+                .add_counter(SELF_SUBTREE_RUNTIME_FILTER_PRUNED_ROWS, ProfileUnit::Unit);
+            profile
+                .common
+                .add_counter(SELF_SUBTREE_RUNTIME_FILTER_EVALUATE, ProfileUnit::Unit);
             profile
                 .common
                 .add_counter(RUNTIME_IN_FILTER_NUM, ProfileUnit::Unit);
@@ -1586,7 +1602,40 @@ impl ScanAsyncRunner {
         if snapshot.is_empty() {
             return Ok(Some(chunk));
         }
-        self.apply_complete_runtime_filters(&snapshot, chunk)
+        let filters_len = (snapshot.in_filters().len()
+            + snapshot.membership_filters().len()
+            + snapshot.min_max_filters().len()) as i64;
+        let self_input_rows = chunk.len();
+        let result = self.apply_complete_runtime_filters(&snapshot, chunk)?;
+        if let Some(profile) = self.profiles.as_ref() {
+            let output_rows = result.as_ref().map(|c| c.len()).unwrap_or(0) as i64;
+            let pruned_rows = (self_input_rows as i64).saturating_sub(output_rows);
+            profile.common.counter_add(
+                SELF_SUBTREE_RUNTIME_FILTER_INPUT_ROWS,
+                ProfileUnit::Unit,
+                self_input_rows as i64,
+            );
+            profile.common.counter_add(
+                SELF_SUBTREE_RUNTIME_FILTER_OUTPUT_ROWS,
+                ProfileUnit::Unit,
+                output_rows,
+            );
+            if pruned_rows > 0 {
+                profile.common.counter_add(
+                    SELF_SUBTREE_RUNTIME_FILTER_PRUNED_ROWS,
+                    ProfileUnit::Unit,
+                    pruned_rows,
+                );
+            }
+            if filters_len > 0 {
+                profile.common.counter_add(
+                    SELF_SUBTREE_RUNTIME_FILTER_EVALUATE,
+                    ProfileUnit::Unit,
+                    filters_len,
+                );
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -3765,6 +3814,7 @@ mod tests {
             SharedRuntimeFilterDecision::new(),
             None,
             HashMap::new(),
+            0,
             0,
             arena,
             None,

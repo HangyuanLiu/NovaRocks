@@ -2806,6 +2806,15 @@ fn explain_analyze_query(
     {
         lines.push(counters);
     }
+    if let Some(counters) =
+        crate::runtime::profile_correlate::format_counter_sums_from_profile_trees(
+            &outcome.fragment_profiles,
+            SELF_SUBTREE_RUNTIME_FILTER_PRUNING_COUNTER_NAMES,
+            "SelfSubtreeRuntimeFilterPruningCounters",
+        )
+    {
+        lines.push(counters);
+    }
     lines.extend(explain_distributed_plan_analyze(
         &dp,
         ExplainLevel::Analyze,
@@ -2823,6 +2832,9 @@ const ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES: &[&str] = &[
     "IcebergRuntimeFilePruning/Unsupported",
     "IcebergRuntimeFilePruning/Unavailable",
 ];
+
+const SELF_SUBTREE_RUNTIME_FILTER_PRUNING_COUNTER_NAMES: &[&str] =
+    &["SelfSubtreeRuntimeFilterPrunedRows"];
 
 fn format_distributed_profile_summary(
     summary: &crate::runtime::profile_correlate::DistributedProfileSummary,

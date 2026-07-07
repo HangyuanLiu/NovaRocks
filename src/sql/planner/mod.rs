@@ -56,7 +56,8 @@ pub(crate) use physical_vocab::{
     AggMode, AggregateOutputLayout, HashSource, JoinDistribution, TopNPhase,
 };
 pub(crate) use runtime_filter::{
-    JoinExecutionMode, PlannedRuntimeFilter, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+    JoinExecutionMode, PlannedRuntimeFilter, RuntimeFilterBuildIntent, RuntimeFilterKind,
+    RuntimeFilterProbeIntent,
 };
 #[allow(unused_imports)]
 pub(crate) use runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};

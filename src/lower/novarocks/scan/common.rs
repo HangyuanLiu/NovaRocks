@@ -20,7 +20,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use arrow::datatypes::DataType;
 
 use super::super::expr::lower_proto_expr;
+use crate::common::ids::SlotId;
 use crate::exec::expr::{ExprArena, ExprNode};
+use crate::exec::node::RuntimeFilterProbeSpec;
 use crate::fs::object_store::{ObjectStoreConfig, apply_object_store_runtime_defaults};
 use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
 use crate::proto::{common, plan};
@@ -102,6 +104,105 @@ pub(super) fn lower_scan_predicate(
         });
     }
     Ok(predicate)
+}
+
+pub(super) fn lower_node_probe_runtime_filter_specs(
+    node: &plan::DistributedNode,
+    arena: &mut ExprArena,
+    layout: &super::super::layout::Layout,
+) -> Result<Vec<RuntimeFilterProbeSpec>, String> {
+    let mut specs = Vec::with_capacity(node.probe_runtime_filters.len());
+    for probe in &node.probe_runtime_filters {
+        let kind = super::runtime_filter_kind_or_join(probe.kind, "RuntimeFilterProbe")?;
+        let probe_expr = probe.probe_expr.as_ref().ok_or_else(|| {
+            format!(
+                "RuntimeFilterProbe node_id={} filter_id={} probe_expr missing",
+                node.node_id, probe.filter_id
+            )
+        })?;
+        let expr_id = lower_proto_expr(probe_expr, arena, layout).map_err(|err| {
+            format!(
+                "RuntimeFilterProbe node_id={} filter_id={} probe_expr: {}",
+                node.node_id, probe.filter_id, err
+            )
+        })?;
+        let slot_id = first_expr_slot(arena, expr_id).ok_or_else(|| {
+            format!(
+                "RuntimeFilterProbe node_id={} filter_id={} probe_expr must reference a scan slot",
+                node.node_id, probe.filter_id
+            )
+        })?;
+        let data_type = arena.data_type(expr_id).cloned().ok_or_else(|| {
+            format!(
+                "RuntimeFilterProbe node_id={} filter_id={} probe_expr type missing",
+                node.node_id, probe.filter_id
+            )
+        })?;
+        specs.push(RuntimeFilterProbeSpec {
+            filter_id: probe.filter_id,
+            expr_id,
+            slot_id,
+            data_type,
+            self_subtree: kind == plan::RuntimeFilterKind::Topn,
+        });
+    }
+    Ok(specs)
+}
+
+fn first_expr_slot(arena: &ExprArena, expr_id: crate::exec::expr::ExprId) -> Option<SlotId> {
+    let mut stack = vec![expr_id];
+    while let Some(id) = stack.pop() {
+        let Some(node) = arena.node(id) else {
+            continue;
+        };
+        match node {
+            ExprNode::SlotId(slot_id) => return Some(*slot_id),
+            ExprNode::ArrayExpr { elements } => stack.extend(elements.iter().copied()),
+            ExprNode::StructExpr { fields } => stack.extend(fields.iter().copied()),
+            ExprNode::LambdaFunction {
+                body,
+                common_sub_exprs,
+                ..
+            } => {
+                stack.push(*body);
+                stack.extend(common_sub_exprs.iter().map(|(_, expr)| *expr));
+            }
+            ExprNode::DictDecode { child, .. }
+            | ExprNode::Cast(child)
+            | ExprNode::CastTime(child)
+            | ExprNode::CastTimeFromDatetime(child)
+            | ExprNode::Not(child)
+            | ExprNode::IsNull(child)
+            | ExprNode::IsNotNull(child)
+            | ExprNode::Clone(child) => stack.push(*child),
+            ExprNode::Add(left, right)
+            | ExprNode::Sub(left, right)
+            | ExprNode::Mul(left, right)
+            | ExprNode::Div(left, right)
+            | ExprNode::Mod(left, right)
+            | ExprNode::Eq(left, right)
+            | ExprNode::EqForNull(left, right)
+            | ExprNode::Ne(left, right)
+            | ExprNode::Lt(left, right)
+            | ExprNode::Le(left, right)
+            | ExprNode::Gt(left, right)
+            | ExprNode::Ge(left, right)
+            | ExprNode::And(left, right)
+            | ExprNode::Or(left, right) => {
+                stack.push(*left);
+                stack.push(*right);
+            }
+            ExprNode::In { child, values, .. } => {
+                stack.push(*child);
+                stack.extend(values.iter().copied());
+            }
+            ExprNode::Case { children, .. } | ExprNode::FunctionCall { args: children, .. } => {
+                stack.extend(children.iter().copied());
+            }
+            ExprNode::Literal(_) => {}
+        }
+    }
+    None
 }
 
 pub(super) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, String> {
