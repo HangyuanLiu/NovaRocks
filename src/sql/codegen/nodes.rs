@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::common::min_max_predicate::MinMaxPredicate;
+use crate::common::types::UniqueId;
 use crate::connector::scan_planning::ConnectorScanPlanner;
 use crate::lower::compact::expr::parse_min_max_conjuncts_with_column_resolver;
+use crate::runtime::fragment_exec_params::{FragmentExecParams, compact_exec_params_from_parts};
 use crate::sql::codegen::connector_scan_wire::{
     ThriftScanContext, to_native_file_scan, to_thrift_scan,
 };
@@ -974,7 +976,8 @@ pub(crate) fn build_exec_params_multi(
     connectors: &crate::connector::ConnectorRegistry,
     scan_tables: &[PlannedScanTable],
 ) -> Result<internal_service::TPlanFragmentExecParams, String> {
-    Ok(build_scan_ranges_multi_with_refresh_context(connectors, scan_tables, None)?.exec_params)
+    build_scan_ranges_multi_with_refresh_context(connectors, scan_tables, None)?
+        .to_compact_exec_params()
 }
 
 pub(crate) fn build_exec_params_multi_with_refresh_context(
@@ -982,16 +985,34 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
     scan_tables: &[PlannedScanTable],
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<internal_service::TPlanFragmentExecParams, String> {
-    Ok(
-        build_scan_ranges_multi_with_refresh_context(connectors, scan_tables, mv_refresh_ctx)?
-            .exec_params,
-    )
+    build_scan_ranges_multi_with_refresh_context(connectors, scan_tables, mv_refresh_ctx)?
+        .to_compact_exec_params()
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScanRangeBuildResult {
-    pub(crate) exec_params: internal_service::TPlanFragmentExecParams,
-    pub(crate) native_scan_ranges: BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>>,
+    pub(crate) fragment_exec_params: FragmentExecParams,
+    compact_scan_ranges: BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
+}
+
+impl ScanRangeBuildResult {
+    pub(crate) fn native_scan_ranges(
+        &self,
+    ) -> &BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>> {
+        self.fragment_exec_params.per_node_scan_ranges()
+    }
+
+    pub(crate) fn to_compact_exec_params(
+        &self,
+    ) -> Result<internal_service::TPlanFragmentExecParams, String> {
+        compact_exec_params_from_parts(
+            self.fragment_exec_params.query_id(),
+            self.fragment_exec_params.fragment_instance_id(),
+            self.compact_scan_ranges.clone(),
+            self.fragment_exec_params.per_exch_num_senders().clone(),
+            None,
+        )
+    }
 }
 
 pub(crate) fn build_scan_ranges_multi_with_refresh_context(
@@ -1138,32 +1159,17 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
         }
     }
 
+    let fragment_exec_params = FragmentExecParams::new(
+        UniqueId { hi: 1, lo: 1 },
+        UniqueId { hi: 2, lo: 2 },
+        native_scan_ranges.clone(),
+        BTreeMap::new(),
+        Vec::new(),
+    )?;
+
     Ok(ScanRangeBuildResult {
-        exec_params: internal_service::TPlanFragmentExecParams::new(
-            types::TUniqueId::new(1, 1),
-            types::TUniqueId::new(2, 2),
-            per_node_scan_ranges,
-            BTreeMap::new(),
-            None::<Vec<crate::thrift::data_sinks::TPlanFragmentDestination>>,
-            None::<i32>,
-            None::<i32>,
-            None::<bool>,
-            None::<bool>,
-            None::<crate::thrift::runtime_filter::TRuntimeFilterParams>,
-            None::<i32>,
-            None::<bool>,
-            None::<
-                BTreeMap<
-                    types::TPlanNodeId,
-                    BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
-                >,
-            >,
-            None::<bool>,
-            None::<i32>,
-            None::<bool>,
-            None::<Vec<internal_service::TExecDebugOption>>,
-        ),
-        native_scan_ranges,
+        fragment_exec_params,
+        compact_scan_ranges: per_node_scan_ranges,
     })
 }
 

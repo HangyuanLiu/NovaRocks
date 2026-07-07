@@ -26,6 +26,7 @@ pub mod exchange_scan;
 pub mod exec_env;
 pub(crate) mod exec_params;
 pub mod execution_services;
+pub(crate) mod fragment_exec_params;
 pub(crate) mod fragment_output;
 pub mod global_async_runtime;
 pub mod heartbeat_mgr;

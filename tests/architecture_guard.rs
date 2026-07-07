@@ -3465,6 +3465,77 @@ fn nidl_d3e_native_runtime_routing_has_no_thrift_shaped_endpoint_model() {
     );
 }
 
+#[test]
+fn nidl_d3i_native_fragment_exec_params_are_not_thrift_shaped() {
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+
+    let native_wire = fs::read_to_string(repo.join("src/runtime/native_fragment_wire.rs")).unwrap();
+    for forbidden in ["TPlanFragmentExecParams", "TPlanFragmentDestination"] {
+        if native_wire.contains(forbidden) {
+            violations.push(format!(
+                "src/runtime/native_fragment_wire.rs: native fragment wire must not expose `{forbidden}`"
+            ));
+        }
+    }
+
+    let codegen_nodes = fs::read_to_string(repo.join("src/sql/codegen/nodes.rs")).unwrap();
+    if codegen_nodes.contains("pub(crate) exec_params: internal_service::TPlanFragmentExecParams") {
+        violations.push(
+            "src/sql/codegen/nodes.rs: ScanRangeBuildResult must not expose thrift exec_params as its native scan-range result".to_string(),
+        );
+    }
+    if codegen_nodes.contains("fragment_exec_params: internal_service::TPlanFragmentExecParams") {
+        violations.push(
+            "src/sql/codegen/nodes.rs: ScanRangeBuildResult.fragment_exec_params must be the native FragmentExecParams model".to_string(),
+        );
+    }
+
+    let fragment_exec_params =
+        fs::read_to_string(repo.join("src/runtime/fragment_exec_params.rs")).unwrap();
+    let struct_start = fragment_exec_params
+        .find("pub(crate) struct FragmentExecParams")
+        .expect("FragmentExecParams struct must exist");
+    let impl_start = fragment_exec_params[struct_start..]
+        .find("impl FragmentExecParams")
+        .expect("FragmentExecParams impl must exist");
+    let struct_body = &fragment_exec_params[struct_start..struct_start + impl_start];
+    for forbidden in ["TUniqueId", "types::TUniqueId"] {
+        if struct_body.contains(forbidden) {
+            violations.push(format!(
+                "src/runtime/fragment_exec_params.rs: FragmentExecParams fields must use native UniqueId, not `{forbidden}`"
+            ));
+        }
+    }
+    if !struct_body.contains("query_id: UniqueId")
+        || !struct_body.contains("fragment_instance_id: UniqueId")
+    {
+        violations.push(
+            "src/runtime/fragment_exec_params.rs: FragmentExecParams must keep query ids in crate::common::types::UniqueId".to_string(),
+        );
+    }
+
+    let new_signature_start = fragment_exec_params
+        .find("pub(crate) fn new(")
+        .expect("FragmentExecParams::new must exist");
+    let new_signature_end = fragment_exec_params[new_signature_start..]
+        .find(") -> Result<Self, String>")
+        .expect("FragmentExecParams::new signature must return Result");
+    let new_signature =
+        &fragment_exec_params[new_signature_start..new_signature_start + new_signature_end];
+    if new_signature.contains("TUniqueId") || new_signature.contains("types::TUniqueId") {
+        violations.push(
+            "src/runtime/fragment_exec_params.rs: FragmentExecParams::new must accept native UniqueId inputs".to_string(),
+        );
+    }
+
+    assert!(
+        violations.is_empty(),
+        "D3I native fragment exec params guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
 fn nidl_d3b_baseline_update_hint() -> String {
     format!(
         "To intentionally update the proto schema ledger, run:\n{}",
