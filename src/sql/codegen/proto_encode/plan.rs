@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use arrow::datatypes::{DataType, Field};
 use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, StructType, Type};
@@ -110,6 +113,17 @@ fn attach_stream_sinks(
                 )
             })?;
         let stream_output_columns = stream_edge_output_columns(source, &fragments[idx], edge)?;
+        let stream_output_slot_ids = stream_output_columns
+            .iter()
+            .map(|column| {
+                i32::try_from(column.column_id).map_err(|_| {
+                    format!(
+                        "native stream edge output column {} cannot convert to slot id",
+                        column.column_id
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let fragment = &mut fragments[idx];
         if !matches!(
             fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref()),
@@ -124,7 +138,7 @@ fn attach_stream_sinks(
             kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
                 dest_node_id: edge.target_exchange_node_id,
                 output_partition: Some(encode_data_partition(&source.output_partition)?),
-                output_columns: edge.output_slot_ids.clone(),
+                output_columns: stream_output_slot_ids,
                 limit: None,
             })),
         });
@@ -155,7 +169,7 @@ fn stream_edge_output_columns(
         }
         Err(root_err) => return Err(root_err),
     };
-    project_output_columns_for_edge(columns, &edge.output_slot_ids)
+    project_output_columns_for_edge(columns, &source.output_columns, &edge.output_slot_ids)
 }
 
 pub(crate) fn encoded_fragment_root_output_columns(
@@ -177,32 +191,14 @@ fn encoded_node_output_columns(
                 return Ok(physical.output_columns.clone());
             }
             match physical.kind.as_ref() {
-                Some(plan::plan_node::Kind::Project(project)) => project
-                    .items
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, item)| {
-                        let expr = item.expr.as_ref().ok_or_else(|| {
-                            format!(
-                                "native stream source project node {} item {} missing expr",
-                                node.node_id, idx
-                            )
-                        })?;
-                        let type_desc = expr.r#type.clone().ok_or_else(|| {
-                            format!(
-                                "native stream source project node {} item {} missing expr type",
-                                node.node_id, idx
-                            )
-                        })?;
-                        Ok(common::OutputColumn {
-                            column_id: item.output_column_id,
-                            name: item.output_name.clone(),
-                            r#type: Some(type_desc),
-                            nullable: expr.nullable,
-                            is_internal: false,
-                        })
-                    })
-                    .collect(),
+                Some(plan::plan_node::Kind::Project(project)) => {
+                    encoded_project_output_columns(node, project)
+                }
+                Some(plan::plan_node::Kind::Filter(_))
+                | Some(plan::plan_node::Kind::Limit(_))
+                | Some(plan::plan_node::Kind::Topn(_)) => {
+                    encoded_unary_passthrough_output_columns(node, "native stream source")
+                }
                 Some(plan::plan_node::Kind::HashAggregate(aggregate)) => {
                     if !aggregate.output_columns.is_empty() {
                         return Ok(aggregate.output_columns.clone());
@@ -244,8 +240,175 @@ fn encoded_node_output_columns(
     }
 }
 
+fn encoded_unary_passthrough_output_columns(
+    node: &plan::DistributedNode,
+    context: &str,
+) -> Result<Vec<common::OutputColumn>, String> {
+    let [child] = node.children.as_slice() else {
+        return Err(format!(
+            "{context} node {} expected one child for output columns, got {}",
+            node.node_id,
+            node.children.len()
+        ));
+    };
+    encoded_node_output_columns(child)
+}
+
+struct EncodedProjectItemOutput {
+    preferred_compute_column_id: u32,
+    output_column_id: u32,
+    can_reuse_input_slot: bool,
+    output_name: String,
+    r#type: common::TypeDesc,
+    nullable: bool,
+}
+
+fn encoded_project_output_columns(
+    node: &plan::DistributedNode,
+    project: &plan::ProjectNode,
+) -> Result<Vec<common::OutputColumn>, String> {
+    let item_outputs = project
+        .items
+        .iter()
+        .enumerate()
+        .map(encoded_project_item_output)
+        .collect::<Result<Vec<_>, _>>()?;
+    let input_column_ids = match node.children.as_slice() {
+        [] => HashSet::new(),
+        [child] => encoded_node_output_columns(child)?
+            .into_iter()
+            .map(|column| column.column_id)
+            .collect::<HashSet<_>>(),
+        _ => {
+            return Err(format!(
+                "native stream source project node {} expected at most one child, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+    };
+    let output_column_id_candidates = item_outputs
+        .iter()
+        .map(|item| item.output_column_id)
+        .collect::<HashSet<_>>();
+    let mut used_output_column_ids = HashSet::new();
+    let mut used_compute_column_ids = input_column_ids.clone();
+    let mut next_synthetic_column_id = output_column_id_candidates
+        .iter()
+        .chain(used_compute_column_ids.iter())
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut first_expr_index_by_column_id = HashMap::new();
+    let mut computed_columns = Vec::new();
+    let mut output_columns = Vec::with_capacity(project.items.len());
+
+    for item in item_outputs {
+        let preferred_compute_column_id = item.preferred_compute_column_id;
+        let mut compute_column_id = if item.can_reuse_input_slot
+            || !input_column_ids.contains(&preferred_compute_column_id)
+        {
+            preferred_compute_column_id
+        } else {
+            allocate_project_boundary_synthetic_column_id(
+                &mut next_synthetic_column_id,
+                &mut used_output_column_ids,
+                &mut used_compute_column_ids,
+            )?
+        };
+        if !item.can_reuse_input_slot && used_compute_column_ids.contains(&compute_column_id) {
+            compute_column_id = allocate_project_boundary_synthetic_column_id(
+                &mut next_synthetic_column_id,
+                &mut used_output_column_ids,
+                &mut used_compute_column_ids,
+            )?;
+        }
+
+        if item.can_reuse_input_slot
+            && first_expr_index_by_column_id.contains_key(&compute_column_id)
+        {
+            // Repeated slot-ref projections share the same computed value but
+            // still need distinct visible output slots below.
+        } else {
+            let computed_idx = computed_columns.len();
+            first_expr_index_by_column_id.insert(compute_column_id, computed_idx);
+            used_compute_column_ids.insert(compute_column_id);
+            computed_columns.push(compute_column_id);
+        }
+
+        let output_column_id = if used_output_column_ids.insert(item.output_column_id) {
+            item.output_column_id
+        } else {
+            allocate_project_boundary_synthetic_column_id(
+                &mut next_synthetic_column_id,
+                &mut used_output_column_ids,
+                &mut used_compute_column_ids,
+            )?
+        };
+        output_columns.push(common::OutputColumn {
+            column_id: output_column_id,
+            name: item.output_name,
+            r#type: Some(item.r#type),
+            nullable: item.nullable,
+            is_internal: false,
+        });
+    }
+
+    Ok(output_columns)
+}
+
+fn encoded_project_item_output(
+    (idx, item): (usize, &plan::ProjectItem),
+) -> Result<EncodedProjectItemOutput, String> {
+    let expr = item
+        .expr
+        .as_ref()
+        .ok_or_else(|| format!("native stream source project item {} missing expr", idx))?;
+    let r#type = expr.r#type.clone().ok_or_else(|| {
+        format!(
+            "native stream source project item {} missing expr type",
+            idx
+        )
+    })?;
+    let (preferred_compute_column_id, can_reuse_input_slot) = match expr.kind.as_ref() {
+        Some(crate::proto::expr::expr::Kind::ColumnRef(column)) => (column.column_id, true),
+        _ => (item.output_column_id, false),
+    };
+    Ok(EncodedProjectItemOutput {
+        preferred_compute_column_id,
+        output_column_id: item.output_column_id,
+        can_reuse_input_slot,
+        output_name: item.output_name.clone(),
+        r#type,
+        nullable: expr.nullable,
+    })
+}
+
+fn allocate_project_boundary_synthetic_column_id(
+    next_synthetic_column_id: &mut u32,
+    used_output_column_ids: &mut HashSet<u32>,
+    used_compute_column_ids: &mut HashSet<u32>,
+) -> Result<u32, String> {
+    while used_output_column_ids.contains(next_synthetic_column_id)
+        || used_compute_column_ids.contains(next_synthetic_column_id)
+    {
+        *next_synthetic_column_id = next_synthetic_column_id
+            .checked_add(1)
+            .ok_or_else(|| "ProjectNode cannot allocate synthetic output column id".to_string())?;
+    }
+    let synthetic = *next_synthetic_column_id;
+    used_output_column_ids.insert(synthetic);
+    used_compute_column_ids.insert(synthetic);
+    *next_synthetic_column_id = next_synthetic_column_id
+        .checked_add(1)
+        .ok_or_else(|| "ProjectNode cannot allocate synthetic output column id".to_string())?;
+    Ok(synthetic)
+}
+
 fn project_output_columns_for_edge(
     columns: Vec<common::OutputColumn>,
+    source_output_columns: &[AnalysisOutputColumn],
     output_slot_ids: &[i32],
 ) -> Result<Vec<common::OutputColumn>, String> {
     if output_slot_ids.is_empty() {
@@ -257,6 +420,37 @@ fn project_output_columns_for_edge(
             output_slot_ids.len(),
             columns.len()
         ));
+    }
+    if source_output_columns.len() == columns.len() {
+        let mut ordinals_by_column_id: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (idx, column) in source_output_columns.iter().enumerate() {
+            ordinals_by_column_id
+                .entry(column.column_id.0)
+                .or_default()
+                .push(idx);
+        }
+        let mut next_ordinal_by_column_id = HashMap::new();
+        let mut resolved = Vec::with_capacity(output_slot_ids.len());
+        let mut resolved_all_by_ordinal = true;
+        for slot_id in output_slot_ids {
+            let column_id = u32::try_from(*slot_id).map_err(|_| {
+                format!("native stream edge output slot id {slot_id} cannot convert to u32")
+            })?;
+            let next = next_ordinal_by_column_id.entry(column_id).or_insert(0);
+            let Some(ordinals) = ordinals_by_column_id.get(&column_id) else {
+                resolved_all_by_ordinal = false;
+                break;
+            };
+            let Some(ordinal) = ordinals.get(*next).copied() else {
+                resolved_all_by_ordinal = false;
+                break;
+            };
+            *next += 1;
+            resolved.push(columns[ordinal].clone());
+        }
+        if resolved_all_by_ordinal {
+            return Ok(resolved);
+        }
     }
     let columns_by_id = columns
         .into_iter()
@@ -292,6 +486,7 @@ fn patch_exchange_receiver_output_columns(
         target_exchange_node_id,
         &output_columns,
     ) {
+        normalize_encoded_subtree_output_columns(root)?;
         return Ok(());
     }
     Err(format!(
@@ -320,6 +515,15 @@ fn patch_exchange_receiver_output_columns_in_node(
     })
 }
 
+fn normalize_encoded_subtree_output_columns(
+    node: &mut plan::DistributedNode,
+) -> Result<(), String> {
+    for child in &mut node.children {
+        normalize_encoded_subtree_output_columns(child)?;
+    }
+    normalize_encoded_node_output_columns(node)
+}
+
 pub(crate) fn encode_plan_fragment(src: &PlanFragment) -> Result<plan::PlanFragment, String> {
     encode_plan_fragment_with_context(
         src,
@@ -333,10 +537,11 @@ fn encode_plan_fragment_with_context(
     src: &PlanFragment,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::PlanFragment, String> {
-    let (output_exprs, output_columns) = encode_fragment_output_contract(src)?;
+    let root = encode_node_with_context(&src.root, ctx)?;
+    let (output_exprs, output_columns) = encode_fragment_output_contract(src, &root)?;
     Ok(plan::PlanFragment {
         fragment_id: src.fragment_id,
-        root: Some(encode_node_with_context(&src.root, ctx)?),
+        root: Some(root),
         data_partition: Some(encode_data_partition(&src.data_partition)?),
         output_partition: Some(encode_data_partition(&src.output_partition)?),
         sink: Some(encode_data_sink(&src.sink, &src.output_columns)?),
@@ -357,6 +562,7 @@ fn encode_plan_fragment_with_context(
 
 fn encode_fragment_output_contract(
     src: &PlanFragment,
+    encoded_root: &plan::DistributedNode,
 ) -> Result<(Vec<crate::proto::expr::Expr>, Vec<common::OutputColumn>), String> {
     if let DataSink::IcebergWrite(sink) = &src.sink {
         let output_exprs = if let Some(exprs) = src.output_exprs.as_ref() {
@@ -394,8 +600,37 @@ fn encode_fragment_output_contract(
         .map(|exprs| encode_exprs(exprs))
         .transpose()?
         .unwrap_or_default();
-    let output_columns = encode_output_columns(&src.output_columns)?;
+    let output_columns = encode_fragment_execution_output_columns(src, encoded_root)?;
     Ok((output_exprs, output_columns))
+}
+
+fn encode_fragment_execution_output_columns(
+    src: &PlanFragment,
+    encoded_root: &plan::DistributedNode,
+) -> Result<Vec<common::OutputColumn>, String> {
+    if src.output_columns.is_empty() {
+        return Ok(Vec::new());
+    }
+    match encoded_node_output_columns(encoded_root) {
+        Ok(root_output_columns) if root_output_columns.is_empty() => {
+            encode_output_columns(&src.output_columns)
+        }
+        Ok(root_output_columns) if root_output_columns.len() == src.output_columns.len() => {
+            Ok(root_output_columns)
+        }
+        Ok(root_output_columns) => Err(format!(
+            "native fragment {} root output column count {} does not match fragment output column count {}",
+            src.fragment_id,
+            root_output_columns.len(),
+            src.output_columns.len()
+        )),
+        Err(root_err) => encode_output_columns(&src.output_columns).map_err(|source_err| {
+            format!(
+                "native fragment {} root output unavailable ({root_err}); fragment output encoding failed: {source_err}",
+                src.fragment_id
+            )
+        }),
+    }
 }
 
 fn iceberg_write_sink_columns_for_input(
@@ -464,6 +699,11 @@ fn encode_node_with_context(
     src: &DistributedNode,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::DistributedNode, String> {
+    let children = src
+        .children
+        .iter()
+        .map(|child| encode_node_with_context(child, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
     let payload = match &src.payload {
         DistributedPayload::Physical(physical) => {
             plan::distributed_node::Payload::Physical(encode_physical_node(physical, ctx)?)
@@ -472,7 +712,7 @@ fn encode_node_with_context(
             plan::distributed_node::Payload::Exchange(encode_exchange_receiver(exchange)?)
         }
     };
-    Ok(plan::DistributedNode {
+    let mut node = plan::DistributedNode {
         node_id: src.node_id,
         fragment_id: src.fragment_id,
         tuple_ids: src.tuple_ids.clone(),
@@ -488,13 +728,137 @@ fn encode_node_with_context(
             .iter()
             .map(encode_wired_runtime_filter_probe)
             .collect::<Result<Vec<_>, _>>()?,
-        children: src
-            .children
-            .iter()
-            .map(|child| encode_node_with_context(child, ctx))
-            .collect::<Result<Vec<_>, _>>()?,
+        children,
         payload: Some(payload),
-    })
+    };
+    normalize_encoded_node_output_columns(&mut node)?;
+    Ok(node)
+}
+
+fn normalize_encoded_node_output_columns(node: &mut plan::DistributedNode) -> Result<(), String> {
+    let normalized_scan_columns = match node.payload.as_ref() {
+        Some(plan::distributed_node::Payload::Physical(physical)) => match physical.kind.as_ref() {
+            Some(plan::plan_node::Kind::Scan(scan))
+                if output_columns_have_duplicate_ids(&scan.columns) =>
+            {
+                Some(deduplicate_output_columns_by_id(&scan.columns))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(output_columns) = normalized_scan_columns {
+        if let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut() {
+            physical.output_columns = output_columns.clone();
+            if let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_mut() {
+                scan.columns = output_columns;
+            }
+        }
+        return Ok(());
+    }
+
+    let normalized_set_op_child_columns = match node.payload.as_ref() {
+        Some(plan::distributed_node::Payload::Physical(physical)) => match physical.kind.as_ref() {
+            Some(plan::plan_node::Kind::SetOp(set_op))
+                if !set_op.child_output_columns.is_empty()
+                    && set_op.child_output_columns.len() == node.children.len() =>
+            {
+                let mut changed = false;
+                let mut child_output_columns =
+                    Vec::with_capacity(set_op.child_output_columns.len());
+                for (child_columns, child) in set_op.child_output_columns.iter().zip(&node.children)
+                {
+                    if output_columns_have_duplicate_ids(&child_columns.columns) {
+                        let normalized = encoded_node_output_columns(child)?;
+                        if normalized.len() != child_columns.columns.len() {
+                            return Err(format!(
+                                "SetOpNode child output column count {} does not match child output column count {}",
+                                child_columns.columns.len(),
+                                normalized.len()
+                            ));
+                        }
+                        child_output_columns.push(plan::OutputColumnList {
+                            columns: normalized,
+                        });
+                        changed = true;
+                    } else {
+                        child_output_columns.push(child_columns.clone());
+                    }
+                }
+                changed.then_some(child_output_columns)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(child_output_columns) = normalized_set_op_child_columns
+        && let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
+        && let Some(plan::plan_node::Kind::SetOp(set_op)) = physical.kind.as_mut()
+    {
+        set_op.child_output_columns = child_output_columns;
+    }
+
+    let normalized_output_columns = match node.payload.as_ref() {
+        Some(plan::distributed_node::Payload::Physical(physical)) => match physical.kind.as_ref() {
+            Some(plan::plan_node::Kind::Sort(sort)) => {
+                let requested = if sort.output_columns.is_empty() {
+                    physical.output_columns.as_slice()
+                } else {
+                    sort.output_columns.as_slice()
+                };
+                if output_columns_have_duplicate_ids(requested) {
+                    Some(encoded_passthrough_boundary_output_columns(
+                        node, requested, "SortNode",
+                    )?)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+
+    if let Some(output_columns) = normalized_output_columns
+        && let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
+    {
+        physical.output_columns = output_columns.clone();
+        if let Some(plan::plan_node::Kind::Sort(sort)) = physical.kind.as_mut() {
+            sort.output_columns = output_columns;
+        }
+    }
+    Ok(())
+}
+
+fn encoded_passthrough_boundary_output_columns(
+    node: &plan::DistributedNode,
+    requested: &[common::OutputColumn],
+    context: &str,
+) -> Result<Vec<common::OutputColumn>, String> {
+    let child_output_columns = encoded_unary_passthrough_output_columns(node, context)?;
+    if child_output_columns.len() != requested.len() {
+        return Err(format!(
+            "{context} node {} duplicate output column count {} does not match child output column count {}",
+            node.node_id,
+            requested.len(),
+            child_output_columns.len()
+        ));
+    }
+    Ok(child_output_columns)
+}
+
+fn output_columns_have_duplicate_ids(columns: &[common::OutputColumn]) -> bool {
+    let mut seen = HashSet::with_capacity(columns.len());
+    columns.iter().any(|column| !seen.insert(column.column_id))
+}
+
+fn deduplicate_output_columns_by_id(columns: &[common::OutputColumn]) -> Vec<common::OutputColumn> {
+    let mut seen = HashSet::with_capacity(columns.len());
+    columns
+        .iter()
+        .filter(|column| seen.insert(column.column_id))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -2147,6 +2511,140 @@ mod tests {
     }
 
     #[test]
+    fn stream_sink_projection_uses_unique_project_output_ids_for_duplicate_slots() {
+        let mut source = duplicate_projection_fragment_for_test(DataSink::Noop);
+        source.fragment_id = 1;
+        source.root.fragment_id = 1;
+        source.root.children[0].fragment_id = 1;
+
+        let target_output_columns = source.output_columns.clone();
+        let exchange = DistributedNode {
+            node_id: 20,
+            fragment_id: 0,
+            tuple_ids: vec![20],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: stats(),
+            payload: DistributedPayload::Exchange(ExchangeReceiver {
+                partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                partition_exprs: Vec::new(),
+                source_fragment_id: 1,
+                output_columns: target_output_columns.clone(),
+                output_qualifier: None,
+                flavor: ExchangeFlavor::Distribution,
+            }),
+        };
+        let target = PlanFragment {
+            fragment_id: 0,
+            root: DistributedNode {
+                node_id: 21,
+                fragment_id: 0,
+                tuple_ids: vec![21],
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: vec![exchange],
+                stats: stats(),
+                payload: DistributedPayload::Physical(PhysicalPlanKind::Sort(
+                    crate::sql::planner::plan::PlanSortNode {
+                        items: Vec::new(),
+                        analytic_partition_by: Vec::new(),
+                        output_columns: target_output_columns,
+                        offset: None,
+                        partition_limit: None,
+                        topn_type: None,
+                    },
+                )),
+            },
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::Result,
+            output_exprs: None,
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        let plan = DistributedPlan {
+            fragments: vec![source, target],
+            root_fragment_id: 0,
+            edges: vec![FragmentEdge {
+                source_fragment_id: 1,
+                target_fragment_id: 0,
+                target_exchange_node_id: 20,
+                output_partition: crate::thrift::partitions::TDataPartition::new(
+                    crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                    None::<Vec<crate::thrift::exprs::TExpr>>,
+                    None::<Vec<crate::thrift::partitions::TRangePartition>>,
+                    None::<Vec<crate::thrift::partitions::TBucketProperty>>,
+                ),
+                stream_kind: FragmentStreamKind::Gather,
+                edge_kind: FragmentEdgeKind::Stream,
+                output_slot_ids: vec![1, 1],
+            }],
+        };
+
+        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
+
+        let source = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 1)
+            .expect("source fragment");
+        let Some(plan::data_sink::Kind::DataStream(sink)) =
+            source.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+        else {
+            panic!("expected DataStream sink");
+        };
+        assert_eq!(sink.output_columns, vec![1, 3]);
+
+        let target = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 0)
+            .expect("target fragment");
+        let receiver = target.root.as_ref().expect("target root");
+        let Some(plan::distributed_node::Payload::Physical(physical)) = receiver.payload.as_ref()
+        else {
+            panic!("expected Sort root");
+        };
+        assert_eq!(
+            physical
+                .output_columns
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "c1"), (3, "c1")]
+        );
+        let Some(plan::plan_node::Kind::Sort(sort)) = physical.kind.as_ref() else {
+            panic!("expected Sort root");
+        };
+        assert_eq!(
+            sort.output_columns
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "c1"), (3, "c1")]
+        );
+        let receiver = receiver.children.first().expect("exchange child");
+        let Some(plan::distributed_node::Payload::Exchange(exchange)) = receiver.payload.as_ref()
+        else {
+            panic!("expected Exchange receiver");
+        };
+        assert_eq!(
+            exchange
+                .output_columns
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "c1"), (3, "c1")]
+        );
+    }
+
+    #[test]
     fn stream_sink_allows_zero_column_values_source() {
         let plan = two_fragment_zero_column_stream_plan_for_test();
 
@@ -2274,6 +2772,438 @@ mod tests {
                 to_snapshot_id: 2,
             },
         }
+    }
+
+    #[test]
+    fn project_root_output_columns_allocate_unique_ids_for_duplicate_projection_items() {
+        let child_columns = vec![
+            output_column(1, "c1", DataType::Int64),
+            output_column(2, "c2", DataType::Int64),
+        ];
+        let duplicate_project = DistributedNode {
+            node_id: 30,
+            fragment_id: 0,
+            tuple_ids: vec![30],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: vec![DistributedNode {
+                node_id: 29,
+                fragment_id: 0,
+                tuple_ids: vec![29],
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: Vec::new(),
+                stats: stats(),
+                payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                    crate::sql::planner::plan::PlanValuesNode {
+                        rows: Vec::new(),
+                        columns: child_columns,
+                    },
+                )),
+            }],
+            stats: stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::Project(
+                crate::sql::planner::plan::PlanProjectNode {
+                    items: vec![
+                        crate::sql::analysis::ProjectItem {
+                            expr: crate::sql::analysis::TypedExpr {
+                                kind: crate::sql::analysis::ExprKind::ColumnRef {
+                                    column_id: ColumnId::new_for_test(1),
+                                    qualifier: None,
+                                    column: "c1".to_string(),
+                                },
+                                data_type: DataType::Int64,
+                                nullable: false,
+                            },
+                            output_name: "c1".to_string(),
+                            output_column_id: ColumnId::new_for_test(1),
+                        },
+                        crate::sql::analysis::ProjectItem {
+                            expr: crate::sql::analysis::TypedExpr {
+                                kind: crate::sql::analysis::ExprKind::ColumnRef {
+                                    column_id: ColumnId::new_for_test(1),
+                                    qualifier: None,
+                                    column: "c1".to_string(),
+                                },
+                                data_type: DataType::Int64,
+                                nullable: false,
+                            },
+                            output_name: "c1".to_string(),
+                            output_column_id: ColumnId::new_for_test(1),
+                        },
+                    ],
+                    output_qualifier: None,
+                },
+            )),
+        };
+        let encoded = encode_node(&duplicate_project).expect("encode node");
+
+        let columns = encoded_fragment_root_output_columns(&plan::PlanFragment {
+            fragment_id: 0,
+            root: Some(encoded),
+            data_partition: None,
+            output_partition: None,
+            sink: None,
+            output_exprs: Vec::new(),
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        })
+        .expect("root output columns");
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].column_id, 1);
+        assert_eq!(columns[1].column_id, 3);
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c1", "c1"]
+        );
+    }
+
+    fn duplicate_projection_fragment_for_test(sink: DataSink) -> PlanFragment {
+        let child_columns = vec![
+            output_column(1, "c1", DataType::Int64),
+            output_column(2, "c2", DataType::Int64),
+        ];
+        let duplicate_output = vec![
+            output_column(1, "c1", DataType::Int64),
+            output_column(1, "c1", DataType::Int64),
+        ];
+        let root = DistributedNode {
+            node_id: 30,
+            fragment_id: 0,
+            tuple_ids: vec![30],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: vec![DistributedNode {
+                node_id: 29,
+                fragment_id: 0,
+                tuple_ids: vec![29],
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: Vec::new(),
+                stats: stats(),
+                payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                    crate::sql::planner::plan::PlanValuesNode {
+                        rows: Vec::new(),
+                        columns: child_columns,
+                    },
+                )),
+            }],
+            stats: stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::Project(
+                crate::sql::planner::plan::PlanProjectNode {
+                    items: duplicate_output
+                        .iter()
+                        .map(|column| crate::sql::analysis::ProjectItem {
+                            expr: crate::sql::analysis::TypedExpr {
+                                kind: crate::sql::analysis::ExprKind::ColumnRef {
+                                    column_id: column.column_id,
+                                    qualifier: None,
+                                    column: column.name.clone(),
+                                },
+                                data_type: column.data_type.clone(),
+                                nullable: column.nullable,
+                            },
+                            output_name: column.name.clone(),
+                            output_column_id: column.column_id,
+                        })
+                        .collect(),
+                    output_qualifier: None,
+                },
+            )),
+        };
+        PlanFragment {
+            fragment_id: 0,
+            root,
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink,
+            output_exprs: None,
+            output_columns: duplicate_output,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn result_fragment_output_columns_follow_project_root_unique_ids() {
+        let fragment = duplicate_projection_fragment_for_test(DataSink::Result);
+
+        let encoded = encode_plan_fragment(&fragment).expect("encode result fragment");
+
+        assert_eq!(
+            encoded
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(
+            encoded
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c1", "c1"]
+        );
+    }
+
+    #[test]
+    fn noop_fragment_output_columns_follow_project_root_unique_ids() {
+        let fragment = duplicate_projection_fragment_for_test(DataSink::Noop);
+
+        let encoded = encode_plan_fragment(&fragment).expect("encode noop fragment");
+
+        assert_eq!(
+            encoded
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(
+            encoded
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c1", "c1"]
+        );
+    }
+
+    #[test]
+    fn sort_output_columns_follow_child_unique_ids_for_duplicate_projection_items() {
+        let mut fragment = duplicate_projection_fragment_for_test(DataSink::Result);
+        let sort_output_columns = fragment.output_columns.clone();
+        let child = fragment.root;
+        fragment.root = DistributedNode {
+            node_id: 31,
+            fragment_id: 0,
+            tuple_ids: vec![31],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: vec![child],
+            stats: stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::Sort(
+                crate::sql::planner::plan::PlanSortNode {
+                    items: Vec::new(),
+                    analytic_partition_by: Vec::new(),
+                    output_columns: sort_output_columns,
+                    offset: None,
+                    partition_limit: None,
+                    topn_type: None,
+                },
+            )),
+        };
+
+        let encoded = encode_plan_fragment(&fragment).expect("encode sort fragment");
+        let root = encoded.root.as_ref().expect("encoded root");
+        let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_ref()
+        else {
+            panic!("expected physical sort root");
+        };
+        assert_eq!(
+            physical
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        let Some(plan::plan_node::Kind::Sort(sort)) = physical.kind.as_ref() else {
+            panic!("expected sort root");
+        };
+        assert_eq!(
+            sort.output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(
+            encoded
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn topn_root_output_columns_follow_child_unique_ids_for_duplicate_projection_items() {
+        let mut fragment = duplicate_projection_fragment_for_test(DataSink::Result);
+        let child = fragment.root;
+        fragment.root = DistributedNode {
+            node_id: 32,
+            fragment_id: 0,
+            tuple_ids: vec![32],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: vec![child],
+            stats: stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::TopN(
+                crate::sql::planner::plan::PhysicalTopNNode {
+                    items: Vec::new(),
+                    limit: Some(10),
+                    offset: None,
+                    phase: TopNPhase::Final,
+                    is_split: false,
+                },
+            )),
+        };
+
+        let encoded = encode_plan_fragment(&fragment).expect("encode topn fragment");
+
+        assert_eq!(
+            encoded
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(
+            encoded_fragment_root_output_columns(&encoded)
+                .expect("root output columns")
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn scan_output_columns_drop_duplicate_column_ids() {
+        let duplicate_scan_columns = vec![
+            output_column(1, "c1", DataType::Int64),
+            output_column(2, "c2", DataType::Int64),
+            output_column(1, "c1", DataType::Int64),
+        ];
+        let duplicate_scan_columns =
+            encode_output_columns(&duplicate_scan_columns).expect("encode output columns");
+        let mut node = plan::DistributedNode {
+            node_id: 10,
+            fragment_id: 0,
+            tuple_ids: vec![10],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                output_columns: duplicate_scan_columns.clone(),
+                kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
+                    database: "db".to_string(),
+                    table: None,
+                    alias: None,
+                    columns: duplicate_scan_columns,
+                    predicates: Vec::new(),
+                    required_columns: Vec::new(),
+                    dict_columns: Vec::new(),
+                    variant_columns: Vec::new(),
+                    mv_rewritten_from: None,
+                })),
+            })),
+        };
+
+        normalize_encoded_node_output_columns(&mut node).expect("normalize scan");
+
+        let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_ref()
+        else {
+            panic!("expected physical scan");
+        };
+        assert_eq!(
+            physical
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
+            panic!("expected scan");
+        };
+        assert_eq!(
+            scan.columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn set_op_child_output_columns_follow_child_unique_ids() {
+        let child = duplicate_projection_fragment_for_test(DataSink::Noop).root;
+        let duplicate_child_output_columns = vec![
+            output_column(1, "c1", DataType::Int64),
+            output_column(1, "c1", DataType::Int64),
+        ];
+        let set_op = DistributedNode {
+            node_id: 50,
+            fragment_id: 0,
+            tuple_ids: vec![50],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: vec![child.clone(), child],
+            stats: stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::SetOp(
+                crate::sql::planner::plan::PhysicalSetOpNode {
+                    kind: PlanSetOpKind::UnionAll,
+                    output_columns: vec![
+                        output_column(10, "c1", DataType::Int64),
+                        output_column(11, "c1", DataType::Int64),
+                    ],
+                    child_output_columns: vec![
+                        duplicate_child_output_columns.clone(),
+                        duplicate_child_output_columns,
+                    ],
+                },
+            )),
+        };
+
+        let encoded = encode_node(&set_op).expect("encode set op");
+
+        let Some(plan::distributed_node::Payload::Physical(physical)) = encoded.payload.as_ref()
+        else {
+            panic!("expected physical set op");
+        };
+        let Some(plan::plan_node::Kind::SetOp(set_op)) = physical.kind.as_ref() else {
+            panic!("expected set op");
+        };
+        assert_eq!(
+            set_op
+                .child_output_columns
+                .iter()
+                .map(|columns| columns
+                    .columns
+                    .iter()
+                    .map(|column| column.column_id)
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![1, 3], vec![1, 3]]
+        );
     }
 
     fn two_fragment_stream_plan_for_test() -> DistributedPlan {
