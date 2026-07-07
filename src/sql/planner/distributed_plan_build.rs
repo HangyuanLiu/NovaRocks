@@ -157,11 +157,12 @@ impl DistributedPlanBuilder {
                 if let DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) =
                     &mut child.payload
                 {
-                    scan.predicates.extend(
-                        split_and_conjuncts_typed(&filter.predicate)
-                            .into_iter()
-                            .cloned(),
-                    );
+                    let folded_predicates = split_and_conjuncts_typed(&filter.predicate)
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    merge_scan_required_columns_for_predicates(scan, &folded_predicates)?;
+                    scan.predicates.extend(folded_predicates);
                     child.stats = node.stats.clone();
                     self.record_probe_runtime_filter_intents(
                         child.node_id,
@@ -802,18 +803,8 @@ fn stream_exchange_output_columns(
         return requested_output_columns.to_vec();
     }
 
-    let actual_ids: HashSet<ColumnId> = actual_output_columns
-        .iter()
-        .map(|column| column.column_id)
-        .collect();
-    let mut seen_requested = HashSet::new();
-    let requested_projected: Vec<OutputColumn> = requested_output_columns
-        .iter()
-        .filter(|column| {
-            actual_ids.contains(&column.column_id) && seen_requested.insert(column.column_id)
-        })
-        .cloned()
-        .collect();
+    let requested_projected =
+        produced_exchange_output_columns(requested_output_columns, &actual_output_columns);
     if requested_projected.is_empty() {
         dedup_output_columns(actual_output_columns)
     } else {
@@ -838,18 +829,30 @@ fn stream_exchange_source_output_columns(plan: &PhysicalPlanNode) -> Vec<OutputC
             if sort.output_columns.is_empty() {
                 stream_exchange_source_output_columns(&plan.children[0])
             } else {
-                sort.output_columns.clone()
+                let child_output_columns = plan
+                    .children
+                    .first()
+                    .map(stream_exchange_source_output_columns)
+                    .unwrap_or_default();
+                projected_source_output_columns(&sort.output_columns, &child_output_columns)
             }
         }
-        PhysicalPlanKind::Filter(_)
-        | PhysicalPlanKind::Limit(_)
-        | PhysicalPlanKind::TopN(_)
-        | PhysicalPlanKind::AssertOneRow(_)
-        | PhysicalPlanKind::Redistribute(_) => plan
+        PhysicalPlanKind::Filter(_) => plan
             .children
             .first()
             .map(stream_exchange_source_output_columns)
             .unwrap_or_else(|| plan.output_columns.clone()),
+        PhysicalPlanKind::Limit(_)
+        | PhysicalPlanKind::TopN(_)
+        | PhysicalPlanKind::AssertOneRow(_)
+        | PhysicalPlanKind::Redistribute(_) => {
+            let child_output_columns = plan
+                .children
+                .first()
+                .map(stream_exchange_source_output_columns)
+                .unwrap_or_default();
+            projected_source_output_columns(&plan.output_columns, &child_output_columns)
+        }
         PhysicalPlanKind::Repeat(_) => plan.output_columns.clone(),
         PhysicalPlanKind::Window(window) => window.output_columns.clone(),
         PhysicalPlanKind::GenerateSeries(generate_series) => vec![OutputColumn {
@@ -865,14 +868,22 @@ fn stream_exchange_source_output_columns(plan: &PhysicalPlanNode) -> Vec<OutputC
             if join.output_columns.is_empty() {
                 join_source_output_columns(join.join_type, &plan.children)
             } else {
-                join.output_columns.clone()
+                join_requested_source_output_columns(
+                    join.join_type,
+                    &plan.children,
+                    &join.output_columns,
+                )
             }
         }
         PhysicalPlanKind::NestLoopJoin(join) => {
             if join.output_columns.is_empty() {
                 join_source_output_columns(join.join_type, &plan.children)
             } else {
-                join.output_columns.clone()
+                join_requested_source_output_columns(
+                    join.join_type,
+                    &plan.children,
+                    &join.output_columns,
+                )
             }
         }
         PhysicalPlanKind::SetOp(set_op) => set_op_payload_output_columns(plan, set_op),
@@ -880,6 +891,17 @@ fn stream_exchange_source_output_columns(plan: &PhysicalPlanNode) -> Vec<OutputC
         PhysicalPlanKind::CTEAnchor(_) => plan.output_columns.clone(),
         PhysicalPlanKind::CTEProduce(produce) => produce.output_columns.clone(),
         PhysicalPlanKind::CTEConsume(consume) => consume.output_columns.clone(),
+    }
+}
+
+fn projected_source_output_columns(
+    requested: &[OutputColumn],
+    source_output_columns: &[OutputColumn],
+) -> Vec<OutputColumn> {
+    if requested.is_empty() {
+        source_output_columns.to_vec()
+    } else {
+        produced_exchange_output_columns(requested, source_output_columns)
     }
 }
 
@@ -958,6 +980,15 @@ fn join_source_output_columns(
     }
 }
 
+fn join_requested_source_output_columns(
+    join_type: JoinKind,
+    children: &[PhysicalPlanNode],
+    requested: &[OutputColumn],
+) -> Vec<OutputColumn> {
+    let produced = join_source_output_columns(join_type, children);
+    projected_source_output_columns(requested, &produced)
+}
+
 fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
     for column in &mut columns {
         column.nullable = true;
@@ -987,12 +1018,34 @@ fn normalize_stream_exchange_output_columns(
     }
 }
 
+fn produced_exchange_output_columns(
+    requested: &[OutputColumn],
+    child_output_columns: &[OutputColumn],
+) -> Vec<OutputColumn> {
+    let produced = child_output_columns
+        .iter()
+        .map(|column| (column.column_id, column))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    requested
+        .iter()
+        .filter_map(|column| {
+            if seen.insert(column.column_id) {
+                produced.get(&column.column_id).copied()
+            } else {
+                None
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 fn scan_materialized_output_columns(
     scan: &PlanScanNode,
     plan: &PhysicalPlanNode,
 ) -> Vec<OutputColumn> {
     let Some(required_columns) = scan.required_columns.as_ref() else {
-        return plan.output_columns.clone();
+        return scan.columns.clone();
     };
     let required: HashSet<String> = required_columns
         .iter()
@@ -1060,6 +1113,125 @@ fn output_slot_ids_for_exchange(output_columns: &[OutputColumn]) -> Result<Vec<i
             })
         })
         .collect()
+}
+
+fn merge_scan_required_columns_for_predicates(
+    scan: &mut PlanScanNode,
+    predicates: &[TypedExpr],
+) -> Result<(), String> {
+    let Some(required_columns) = scan.required_columns.as_mut() else {
+        return Ok(());
+    };
+    let mut existing = required_columns
+        .iter()
+        .map(|name| name.to_lowercase())
+        .collect::<HashSet<_>>();
+    let columns_by_id = scan
+        .columns
+        .iter()
+        .map(|column| (column.column_id, column.name.clone()))
+        .collect::<HashMap<_, _>>();
+
+    let mut predicate_column_ids = Vec::new();
+    for predicate in predicates {
+        collect_typed_expr_column_ids(predicate, &mut predicate_column_ids);
+    }
+    for column_id in predicate_column_ids {
+        let Some(name) = columns_by_id.get(&column_id) else {
+            return Err(format!(
+                "build_distributed_plan: folded Scan predicate references unknown column id {}",
+                column_id.0
+            ));
+        };
+        if existing.insert(name.to_lowercase()) {
+            required_columns.push(name.clone());
+        }
+    }
+    Ok(())
+}
+
+fn collect_typed_expr_column_ids(expr: &TypedExpr, out: &mut Vec<ColumnId>) {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => {
+            if *column_id != ColumnId::UNSET && !out.contains(column_id) {
+                out.push(*column_id);
+            }
+        }
+        ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => {}
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_typed_expr_column_ids(left, out);
+            collect_typed_expr_column_ids(right, out);
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. }
+        | ExprKind::Nested(expr) => collect_typed_expr_column_ids(expr, out),
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for arg in args {
+                collect_typed_expr_column_ids(arg, out);
+            }
+            if let ExprKind::AggregateCall { order_by, .. } = &expr.kind {
+                for item in order_by {
+                    collect_typed_expr_column_ids(&item.expr, out);
+                }
+            }
+        }
+        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+            collect_typed_expr_column_ids(body, out);
+        }
+        ExprKind::InList { expr, list, .. } => {
+            collect_typed_expr_column_ids(expr, out);
+            for item in list {
+                collect_typed_expr_column_ids(item, out);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_typed_expr_column_ids(expr, out);
+            collect_typed_expr_column_ids(low, out);
+            collect_typed_expr_column_ids(high, out);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_typed_expr_column_ids(expr, out);
+            collect_typed_expr_column_ids(pattern, out);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_typed_expr_column_ids(operand, out);
+            }
+            for (when, then) in when_then {
+                collect_typed_expr_column_ids(when, out);
+                collect_typed_expr_column_ids(then, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_typed_expr_column_ids(else_expr, out);
+            }
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_typed_expr_column_ids(arg, out);
+            }
+            for item in partition_by {
+                collect_typed_expr_column_ids(item, out);
+            }
+            for item in order_by {
+                collect_typed_expr_column_ids(&item.expr, out);
+            }
+        }
+    }
 }
 
 fn data_partition_for_redistribute_node(
@@ -1368,7 +1540,7 @@ mod tests {
     use crate::sql::planner::distributed_fragment::{DataSink, PartitionKind};
     use crate::sql::planner::distributed_node::DistributedPayload;
     use crate::sql::planner::plan::{
-        DistributedChangeEventExpandNode, ExchangeFlavor, LogicalCTEAnchorNode,
+        AggregateCall, DistributedChangeEventExpandNode, ExchangeFlavor, LogicalCTEAnchorNode,
         LogicalCTEConsumeNode, LogicalCTEProduceNode, PhysicalHashAggregateNode,
         PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
         PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PhysicalTopNNode,
@@ -1559,6 +1731,50 @@ mod tests {
         assert_cmp_expr(&scan.predicates[1], 1, "k", BinOp::Gt, 10);
         assert_cmp_expr(&scan.predicates[2], 1, "k", BinOp::Lt, 20);
         assert_eq!(child.stats.output_row_count, 5.0);
+    }
+
+    #[test]
+    fn build_distributed_plan_folded_filter_extends_scan_required_columns() {
+        let scan_columns = vec![
+            output_col(1, "k", DataType::Int64, false),
+            output_col(2, "predicate_only", DataType::Int64, false),
+        ];
+        let scan = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Scan(PlanScanNode {
+                database: "db".to_string(),
+                table: table_def(),
+                alias: Some("t".to_string()),
+                columns: scan_columns.clone(),
+                predicates: vec![],
+                required_columns: Some(vec!["k".to_string()]),
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            children: vec![],
+            output_columns: scan_columns.clone(),
+            stats: stats_with_row_count(100.0),
+            probe_runtime_filters: vec![],
+        };
+        let filter = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Filter(PlanFilterNode {
+                predicate: cmp_expr(2, "predicate_only", BinOp::Gt, 10),
+            }),
+            children: vec![scan],
+            output_columns: scan_columns,
+            stats: stats_with_row_count(5.0),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan(&filter).expect("build_distributed_plan");
+
+        let scan = match &dp.fragments[0].root.payload {
+            DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) => scan,
+            other => panic!("expected folded Scan root, got {other:?}"),
+        };
+        assert_eq!(
+            scan.required_columns.as_ref(),
+            Some(&vec!["k".to_string(), "predicate_only".to_string()])
+        );
     }
 
     #[test]
@@ -2400,7 +2616,7 @@ mod tests {
                 output_columns: exchange_columns.clone(),
             }),
             children: vec![scan],
-            output_columns: source_columns.clone(),
+            output_columns: exchange_columns.clone(),
             stats: stats(),
             probe_runtime_filters: vec![],
         };
@@ -2436,30 +2652,36 @@ mod tests {
     }
 
     #[test]
-    fn build_distributed_plan_redistribute_uses_child_output_contract() {
-        let source_columns = vec![output_col(1, "a", DataType::Int64, false)];
-        let mut scan = scan_node_with_columns(source_columns.clone());
-        scan.output_columns = vec![
-            output_col(1, "a", DataType::Int64, false),
-            output_col(2, "hidden_join_side", DataType::Int64, false),
+    fn build_distributed_plan_redistribute_drops_non_child_output_columns() {
+        let source_columns = vec![
+            output_col(1, "old", DataType::Int64, false),
+            output_col(2, "delta", DataType::Int64, false),
         ];
-        let redistribute = PhysicalPlanNode {
-            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
-                mode: RedistributeMode::Hash {
-                    cols: vec![ColumnId::new_for_test(1)],
-                    source: HashSource::ShuffleJoin,
-                },
-                partition_exprs: vec![],
-                output_columns: vec![
-                    output_col(1, "a", DataType::Int64, false),
-                    output_col(2, "hidden_join_side", DataType::Int64, false),
-                ],
+        let predicate_only = output_col(3, "predicate_only", DataType::Int64, false);
+        let exchange_columns = vec![
+            source_columns[1].clone(),
+            predicate_only,
+            source_columns[0].clone(),
+        ];
+        let mut scan = scan_node_with_columns(source_columns.clone());
+        scan.output_columns = exchange_columns.clone();
+        let filter = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Filter(PlanFilterNode {
+                predicate: column_ref_expr(3, "predicate_only", DataType::Int64, false),
             }),
             children: vec![scan],
-            output_columns: vec![
-                output_col(1, "a", DataType::Int64, false),
-                output_col(2, "hidden_join_side", DataType::Int64, false),
-            ],
+            output_columns: exchange_columns.clone(),
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Broadcast,
+                partition_exprs: vec![],
+                output_columns: exchange_columns.clone(),
+            }),
+            children: vec![filter],
+            output_columns: exchange_columns,
             stats: stats(),
             probe_runtime_filters: vec![],
         };
@@ -2467,7 +2689,7 @@ mod tests {
         let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
 
         let edge = &dp.edges[0];
-        assert_eq!(edge.output_slot_ids, vec![1]);
+        assert_eq!(edge.output_slot_ids, vec![2, 1]);
 
         let root = &dp.fragments[1].root;
         let receiver = match &root.payload {
@@ -2480,26 +2702,41 @@ mod tests {
                 .iter()
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>(),
-            vec![ColumnId::new_for_test(1)]
+            vec![ColumnId::new_for_test(2), ColumnId::new_for_test(1)]
+        );
+
+        let child_fragment = &dp.fragments[0];
+        assert_eq!(
+            child_fragment
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId::new_for_test(1), ColumnId::new_for_test(2)]
         );
     }
 
     #[test]
-    fn build_distributed_plan_empty_exchange_request_inherits_source_output() {
-        let source_columns = vec![output_col(1, "a", DataType::Int64, false)];
+    fn build_distributed_plan_stream_edge_drops_scan_columns_pruned_from_required() {
+        let source_columns = vec![
+            output_col(1, "c0", DataType::Int64, false),
+            output_col(2, "c1", DataType::Utf8, true),
+            output_col(3, "c2", DataType::Utf8, true),
+            output_col(4, "c3", DataType::Int64, true),
+        ];
         let mut scan = scan_node_with_columns(source_columns.clone());
-        scan.output_columns = Vec::new();
+        if let PhysicalPlanKind::Scan(scan) = &mut scan.kind {
+            scan.required_columns =
+                Some(vec!["c0".to_string(), "c1".to_string(), "c3".to_string()]);
+        }
         let redistribute = PhysicalPlanNode {
             kind: PhysicalPlanKind::Redistribute(RedistributeNode {
-                mode: RedistributeMode::Hash {
-                    cols: vec![ColumnId::new_for_test(1)],
-                    source: HashSource::ShuffleJoin,
-                },
-                partition_exprs: vec![column_ref_expr(1, "a", DataType::Int64, false)],
-                output_columns: Vec::new(),
+                mode: RedistributeMode::Broadcast,
+                partition_exprs: vec![],
+                output_columns: source_columns.clone(),
             }),
             children: vec![scan],
-            output_columns: Vec::new(),
+            output_columns: source_columns,
             stats: stats(),
             probe_runtime_filters: vec![],
         };
@@ -2507,10 +2744,76 @@ mod tests {
         let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
 
         let edge = &dp.edges[0];
-        assert_eq!(edge.output_slot_ids, vec![1]);
+        assert_eq!(edge.output_slot_ids, vec![1, 2, 4]);
 
-        let root = &dp.fragments[1].root;
-        let receiver = match &root.payload {
+        let child_fragment = &dp.fragments[0];
+        assert_eq!(
+            child_fragment
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![
+                ColumnId::new_for_test(1),
+                ColumnId::new_for_test(2),
+                ColumnId::new_for_test(4)
+            ]
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_stream_edge_drops_join_columns_pruned_from_child_source() {
+        let left_columns = vec![
+            output_col(1, "l_c0", DataType::Int64, false),
+            output_col(2, "l_c1", DataType::Utf8, true),
+            output_col(3, "l_c2", DataType::Utf8, true),
+        ];
+        let right_columns = vec![output_col(4, "r_c0", DataType::Int64, false)];
+        let mut left = scan_node_with_columns(left_columns.clone());
+        if let PhysicalPlanKind::Scan(scan) = &mut left.kind {
+            scan.required_columns = Some(vec!["l_c0".to_string(), "l_c1".to_string()]);
+        }
+        let right = scan_node_with_columns(right_columns.clone());
+        let join_output_columns = vec![
+            left_columns[0].clone(),
+            left_columns[2].clone(),
+            right_columns[0].clone(),
+        ];
+        let join = PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+                execution_mode: None,
+                build_runtime_filters: vec![],
+                output_columns: join_output_columns.clone(),
+            })),
+            children: vec![left, right],
+            output_columns: join_output_columns.clone(),
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Broadcast,
+                partition_exprs: vec![],
+                output_columns: join_output_columns,
+            }),
+            children: vec![join],
+            output_columns: vec![
+                output_col(1, "l_c0", DataType::Int64, false),
+                output_col(3, "l_c2", DataType::Utf8, true),
+                output_col(4, "r_c0", DataType::Int64, false),
+            ],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
+
+        assert_eq!(dp.edges[0].output_slot_ids, vec![1, 4]);
+        let receiver = match &dp.fragments[1].root.payload {
             DistributedPayload::Exchange(receiver) => receiver,
             other => panic!("expected Exchange root, got {other:?}"),
         };
@@ -2518,13 +2821,247 @@ mod tests {
             receiver
                 .output_columns
                 .iter()
-                .map(|column| (column.column_id, column.name.as_str()))
+                .map(|column| column.column_id)
                 .collect::<Vec<_>>(),
-            source_columns
+            vec![ColumnId::new_for_test(1), ColumnId::new_for_test(4)]
+        );
+        assert_eq!(
+            dp.fragments[0]
+                .output_columns
                 .iter()
-                .map(|column| (column.column_id, column.name.as_str()))
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId::new_for_test(1), ColumnId::new_for_test(4)]
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_stream_edge_drops_redistribute_child_columns_pruned_from_source() {
+        let left_columns = vec![
+            output_col(1, "l_c0", DataType::Int64, false),
+            output_col(2, "l_c1", DataType::Utf8, true),
+        ];
+        let right_columns = vec![
+            output_col(9, "r_c0", DataType::Int64, false),
+            output_col(10, "r_c1", DataType::Utf8, true),
+            output_col(11, "r_c2", DataType::Utf8, true),
+            output_col(12, "r_c3", DataType::Int64, true),
+        ];
+        let left = scan_node_with_columns(left_columns.clone());
+        let mut right = scan_node_with_columns(right_columns.clone());
+        if let PhysicalPlanKind::Scan(scan) = &mut right.kind {
+            scan.required_columns = Some(vec![
+                "r_c0".to_string(),
+                "r_c1".to_string(),
+                "r_c3".to_string(),
+            ]);
+        }
+        let right_redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Gather,
+                partition_exprs: vec![],
+                output_columns: right_columns.clone(),
+            }),
+            children: vec![right],
+            output_columns: right_columns.clone(),
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let join_output_columns = vec![
+            left_columns[0].clone(),
+            right_columns[1].clone(),
+            right_columns[2].clone(),
+        ];
+        let join = PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+                execution_mode: None,
+                build_runtime_filters: vec![],
+                output_columns: join_output_columns.clone(),
+            })),
+            children: vec![left, right_redistribute],
+            output_columns: join_output_columns.clone(),
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Broadcast,
+                partition_exprs: vec![],
+                output_columns: join_output_columns,
+            }),
+            children: vec![join],
+            output_columns: vec![
+                left_columns[0].clone(),
+                right_columns[1].clone(),
+                right_columns[2].clone(),
+            ],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
+
+        assert_eq!(dp.edges.len(), 2);
+        assert_eq!(dp.edges[0].output_slot_ids, vec![9, 10, 12]);
+        assert_eq!(dp.edges[1].output_slot_ids, vec![1, 10]);
+        let receiver = match &dp.fragments[2].root.payload {
+            DistributedPayload::Exchange(receiver) => receiver,
+            other => panic!("expected Exchange root, got {other:?}"),
+        };
+        assert_eq!(
+            receiver
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId::new_for_test(1), ColumnId::new_for_test(10)]
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_stream_edge_uses_project_item_outputs() {
+        let scan_columns = vec![
+            output_col(1, "c0", DataType::Int64, false),
+            output_col(2, "c1", DataType::Utf8, true),
+            output_col(3, "c2", DataType::Utf8, true),
+        ];
+        let scan = scan_node_with_columns(scan_columns.clone());
+        let project_output_columns = vec![scan_columns[0].clone(), scan_columns[2].clone()];
+        let stale_node_output_columns = vec![
+            scan_columns[0].clone(),
+            scan_columns[1].clone(),
+            scan_columns[2].clone(),
+        ];
+        let project = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Project(PlanProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: column_ref_expr(1, "c0", DataType::Int64, false),
+                        output_name: "c0".to_string(),
+                        output_column_id: ColumnId::new_for_test(1),
+                    },
+                    ProjectItem {
+                        expr: column_ref_expr(3, "c2", DataType::Utf8, true),
+                        output_name: "c2".to_string(),
+                        output_column_id: ColumnId::new_for_test(3),
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            children: vec![scan],
+            output_columns: stale_node_output_columns.clone(),
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Broadcast,
+                partition_exprs: vec![],
+                output_columns: stale_node_output_columns,
+            }),
+            children: vec![project],
+            output_columns: vec![
+                scan_columns[0].clone(),
+                scan_columns[1].clone(),
+                scan_columns[2].clone(),
+            ],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
+
+        assert_eq!(dp.edges[0].output_slot_ids, vec![1, 3]);
+        let receiver = match &dp.fragments[1].root.payload {
+            DistributedPayload::Exchange(receiver) => receiver,
+            other => panic!("expected Exchange root, got {other:?}"),
+        };
+        assert_eq!(
+            receiver
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId::new_for_test(1), ColumnId::new_for_test(3)]
+        );
+        assert_eq!(
+            dp.fragments[0]
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            project_output_columns
+                .iter()
+                .map(|column| column.column_id)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn build_distributed_plan_local_aggregate_stream_uses_layout_output_types() {
+        let input_columns = vec![output_col(1, "v", DataType::Int64, true)];
+        let scan = scan_node_with_columns(input_columns);
+        let final_avg = output_col(20, "avg(v)", DataType::Float64, true);
+        let local_avg_state = output_col(20, "avg(v)", DataType::Utf8, true);
+        let aggregate = PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
+                mode: AggMode::Local,
+                group_by: vec![],
+                aggregates: vec![AggregateCall {
+                    name: "avg".to_string(),
+                    args: vec![column_ref_expr(1, "v", DataType::Int64, true)],
+                    distinct: false,
+                    result_type: DataType::Float64,
+                    order_by: vec![],
+                    output_column_id: ColumnId::new_for_test(20),
+                }],
+                is_merge: vec![false],
+                output_layout: AggregateOutputLayout::new(vec![], vec![local_avg_state.clone()]),
+                output_columns: vec![final_avg.clone()],
+            })),
+            children: vec![scan],
+            output_columns: vec![final_avg.clone()],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let redistribute = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Hash {
+                    cols: vec![ColumnId::new_for_test(20)],
+                    source: HashSource::ShuffleAgg,
+                },
+                partition_exprs: vec![column_ref_expr(20, "avg(v)", DataType::Utf8, true)],
+                output_columns: vec![final_avg],
+            }),
+            children: vec![aggregate],
+            output_columns: vec![output_col(20, "avg(v)", DataType::Float64, true)],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
+
+        assert_eq!(dp.edges[0].output_slot_ids, vec![20]);
+        let receiver = match &dp.fragments[1].root.payload {
+            DistributedPayload::Exchange(receiver) => receiver,
+            other => panic!("expected Exchange root, got {other:?}"),
+        };
+        assert_eq!(receiver.output_columns.len(), 1);
+        assert_eq!(
+            receiver.output_columns[0].column_id,
+            local_avg_state.column_id
+        );
+        assert_eq!(receiver.output_columns[0].data_type, DataType::Utf8);
+        assert_eq!(dp.fragments[0].output_columns.len(), 1);
+        assert_eq!(
+            dp.fragments[0].output_columns[0].column_id,
+            local_avg_state.column_id
+        );
+        assert_eq!(dp.fragments[0].output_columns[0].data_type, DataType::Utf8);
     }
 
     #[test]
@@ -3464,6 +4001,21 @@ mod tests {
         }
     }
 
+    fn table_def_with_columns(columns: &[OutputColumn]) -> TableDef {
+        TableDef {
+            name: "t".to_string(),
+            columns: columns
+                .iter()
+                .map(|column| column_def(&column.name, column.data_type.clone(), column.nullable))
+                .collect(),
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::StarRocks {
+                db_id: 1,
+                table_id: 2,
+            },
+        }
+    }
+
     fn scan_node(column_id: u32, column_name: &str) -> PhysicalPlanNode {
         let scan_columns = vec![output_col(column_id, column_name, DataType::Int64, false)];
         scan_node_with_columns(scan_columns)
@@ -3473,7 +4025,7 @@ mod tests {
         PhysicalPlanNode {
             kind: PhysicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
-                table: table_def(),
+                table: table_def_with_columns(&scan_columns),
                 alias: Some("t".to_string()),
                 columns: scan_columns.clone(),
                 predicates: vec![],

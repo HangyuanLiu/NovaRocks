@@ -58,15 +58,23 @@ fn apply_type_signature(
         output_type,
         sig.intermediate_type.as_ref(),
     )?;
-    if check_exact(&out.output_type, output_type).is_err() {
+    let output_matches_final = check_exact(&out.output_type, output_type).is_ok();
+    let output_matches_intermediate = !input_is_intermediate
+        && sig
+            .intermediate_type
+            .as_ref()
+            .map(|intermediate_type| check_exact(intermediate_type, output_type).is_ok())
+            .unwrap_or(false);
+    if !output_matches_final && !output_matches_intermediate {
         return Err(format!(
             "aggregate output type signature mismatch for {}: expected {:?}, got {:?}",
             func.name, out.output_type, output_type
         ));
     }
-    out.output_type = output_type.clone();
+    if output_matches_final {
+        out.output_type = output_type.clone();
+    }
 
-    let _ = input_is_intermediate;
     if let Some(intermediate_type) = sig.intermediate_type.as_ref() {
         if check_exact(&out.intermediate_type, intermediate_type).is_err() {
             return Err(format!(
@@ -111,6 +119,27 @@ fn validate_state_combinator_binary_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_signature_accepts_local_intermediate_output() {
+        let func = AggFunction {
+            name: "avg".to_string(),
+            inputs: vec![],
+            input_is_intermediate: false,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(DataType::Utf8),
+                output_type: Some(DataType::Utf8),
+                input_arg_type: Some(DataType::Int64),
+            }),
+            order: Default::default(),
+        };
+
+        let spec = build_spec_from_type(&func, Some(&DataType::Int64), false)
+            .expect("local aggregate signature may declare intermediate output");
+
+        assert_eq!(spec.output_type, DataType::Float64);
+        assert_eq!(spec.intermediate_type, DataType::Utf8);
+    }
 
     #[test]
     fn aggregate_signature_rejects_decimal_precision_drift() {

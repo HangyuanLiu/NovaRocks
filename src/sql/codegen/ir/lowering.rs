@@ -1238,7 +1238,13 @@ fn edge_boundary_schemas(
                     &exchange.output_columns
                 }
             }
-            crate::sql::codegen::FragmentEdgeKind::Stream => &source.output_columns,
+            crate::sql::codegen::FragmentEdgeKind::Stream => {
+                if exchange.output_columns.is_empty() {
+                    &source.output_columns
+                } else {
+                    &exchange.output_columns
+                }
+            }
             crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
                 &exchange.output_columns
             }
@@ -1785,6 +1791,100 @@ fn iceberg_field_id_for_column(table: &crate::sql::catalog::TableDef, column: &s
         .iter()
         .find(|field| field.name.eq_ignore_ascii_case(column))
         .map(|field| field.field_id)
+}
+
+fn predicate_column_ids_by_name(predicates: &[TypedExpr]) -> HashMap<String, ColumnId> {
+    let mut out = HashMap::new();
+    for predicate in predicates {
+        collect_predicate_column_ids_by_name(predicate, &mut out);
+    }
+    out
+}
+
+fn collect_predicate_column_ids_by_name(expr: &TypedExpr, out: &mut HashMap<String, ColumnId>) {
+    match &expr.kind {
+        ExprKind::ColumnRef {
+            column_id, column, ..
+        } => {
+            if *column_id != ColumnId::UNSET {
+                out.entry(column.to_lowercase()).or_insert(*column_id);
+            }
+        }
+        ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => {}
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_predicate_column_ids_by_name(left, out);
+            collect_predicate_column_ids_by_name(right, out);
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. }
+        | ExprKind::Nested(expr) => collect_predicate_column_ids_by_name(expr, out),
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for arg in args {
+                collect_predicate_column_ids_by_name(arg, out);
+            }
+            if let ExprKind::AggregateCall { order_by, .. } = &expr.kind {
+                for item in order_by {
+                    collect_predicate_column_ids_by_name(&item.expr, out);
+                }
+            }
+        }
+        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+            collect_predicate_column_ids_by_name(body, out);
+        }
+        ExprKind::InList { expr, list, .. } => {
+            collect_predicate_column_ids_by_name(expr, out);
+            for item in list {
+                collect_predicate_column_ids_by_name(item, out);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_predicate_column_ids_by_name(expr, out);
+            collect_predicate_column_ids_by_name(low, out);
+            collect_predicate_column_ids_by_name(high, out);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_predicate_column_ids_by_name(expr, out);
+            collect_predicate_column_ids_by_name(pattern, out);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_predicate_column_ids_by_name(operand, out);
+            }
+            for (when, then) in when_then {
+                collect_predicate_column_ids_by_name(when, out);
+                collect_predicate_column_ids_by_name(then, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_predicate_column_ids_by_name(else_expr, out);
+            }
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_predicate_column_ids_by_name(arg, out);
+            }
+            for item in partition_by {
+                collect_predicate_column_ids_by_name(item, out);
+            }
+            for item in order_by {
+                collect_predicate_column_ids_by_name(&item.expr, out);
+            }
+        }
+    }
 }
 
 impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
@@ -3199,11 +3299,13 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             }
             _ => None,
         };
+        let predicate_column_ids_by_name = predicate_column_ids_by_name(&op.predicates);
         let mut required: Option<std::collections::HashSet<String>> = op
             .required_columns
             .as_ref()
             .map(|cols| cols.iter().map(|c| c.to_lowercase()).collect());
         if let Some(required) = required.as_mut() {
+            required.extend(predicate_column_ids_by_name.keys().cloned());
             add_iceberg_equality_delete_required_columns(required, &table, planned_scan.as_ref())?;
             for variant_column in &op.variant_columns {
                 required.insert(variant_column.source_column.to_lowercase());
@@ -3250,18 +3352,20 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 type_desc: None,
                 nullable,
             };
-            // G1: pick up the per-column ColumnId from `op.columns` so the
-            // scope's by-id index is populated for base-table reads. This is
-            // what lets the optimizer's `DistributionSpec::HashPartitioned`
-            // (which is now a `Vec<ColumnId>`) resolve directly against the
-            // scan's child scope without having to round-trip through the
-            // display name.
+            // Pick up the per-column ColumnId from visible scan output first.
+            // Predicate-only required columns may be absent from `op.columns`,
+            // so recover their ids from folded scan predicates.
             let output_column = op
                 .columns
                 .iter()
                 .find(|oc| oc.name.eq_ignore_ascii_case(&col.name));
             let col_id = output_column
                 .map(|oc| oc.column_id)
+                .or_else(|| {
+                    predicate_column_ids_by_name
+                        .get(&col.name.to_lowercase())
+                        .copied()
+                })
                 .unwrap_or(crate::sql::column_id::ColumnId::UNSET);
             if let Some(output_column) = output_column {
                 scan_output_columns.push(output_column.clone());
@@ -5680,7 +5784,9 @@ mod tests {
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::lower::compat::type_lowering::arrow_type_from_desc;
-    use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergMvTargetStatePartitionConstraint,
         IcebergMvTargetStateRowFilter, IcebergMvTargetStateScan, IcebergSchemaDef,
@@ -5753,6 +5859,36 @@ mod tests {
             crate::thrift::exprs::TExprNodeType::SLOT_REF
         );
         node.slot_ref.as_ref().expect("slot ref").slot_id
+    }
+
+    #[test]
+    fn predicate_column_ids_by_name_finds_folded_required_column() {
+        let predicate_column_id = ColumnId::new_for_test(42);
+        let predicate = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: predicate_column_id,
+                        qualifier: Some("l".to_string()),
+                        column: "C3".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: true,
+                }),
+                op: BinOp::Gt,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(100)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        };
+
+        let ids = super::predicate_column_ids_by_name(&[predicate]);
+
+        assert_eq!(ids.get("c3").copied(), Some(predicate_column_id));
     }
 
     #[test]
@@ -7019,6 +7155,80 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["left_k", "right_k"]
         );
+    }
+
+    #[test]
+    fn stream_edge_boundary_schema_uses_explicit_exchange_outputs() {
+        let source_columns = vec![
+            output_col(1, "join_k", DataType::Int64, false),
+            output_col(2, "payload", DataType::Utf8, true),
+            output_col(3, "predicate_only", DataType::Float64, true),
+        ];
+        let exchange_columns = vec![source_columns[0].clone(), source_columns[1].clone()];
+        let mut exchange = distributed_exchange_node(20, 1, 10, 0);
+        let DistributedPayload::Exchange(exchange_payload) = &mut exchange.payload else {
+            panic!("expected exchange node");
+        };
+        exchange_payload.output_columns = exchange_columns;
+
+        let dp = DistributedPlan {
+            fragments: vec![
+                PlanFragment {
+                    fragment_id: 0,
+                    root: distributed_values_node(10, 0, 10, source_columns.clone()),
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition::unpartitioned(),
+                    sink: DataSink::Noop,
+                    output_exprs: None,
+                    output_columns: source_columns,
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+                PlanFragment {
+                    fragment_id: 1,
+                    root: exchange,
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition::unpartitioned(),
+                    sink: DataSink::Result,
+                    output_exprs: None,
+                    output_columns: Vec::new(),
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+            ],
+            root_fragment_id: 1,
+            edges: vec![fragment_edge(0, 1, 20)],
+        };
+
+        let reports = super::edge_boundary_schemas(&dp).expect("edge boundary schemas");
+
+        assert_eq!(reports.len(), 2);
+        for report in &reports {
+            assert!(
+                matches!(
+                    report.boundary_kind,
+                    BoundaryKind::ExchangeSender | BoundaryKind::ExchangeReceiver
+                ),
+                "unexpected boundary kind {:?}",
+                report.boundary_kind
+            );
+            assert_eq!(
+                report
+                    .columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["join_k", "payload"]
+            );
+            assert_eq!(
+                report
+                    .columns
+                    .iter()
+                    .map(|column| column.arrow_type.clone())
+                    .collect::<Vec<_>>(),
+                vec![DataType::Int64, DataType::Utf8]
+            );
+        }
     }
 
     #[test]
