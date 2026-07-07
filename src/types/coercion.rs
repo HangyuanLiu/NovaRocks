@@ -4,6 +4,27 @@ use arrow::datatypes::{DataType, Field, Fields};
 
 use crate::types::predicate::{is_integer, is_largeint};
 
+fn wider_decimal_type(
+    left_precision: u8,
+    left_scale: i8,
+    left_is_256: bool,
+    right_precision: u8,
+    right_scale: i8,
+    right_is_256: bool,
+) -> DataType {
+    let scale = left_scale.max(right_scale);
+    let left_int_digits = i16::from(left_precision) - i16::from(left_scale);
+    let right_int_digits = i16::from(right_precision) - i16::from(right_scale);
+    let precision =
+        (left_int_digits.max(right_int_digits).max(0) + i16::from(scale)).clamp(1, 76) as u8;
+
+    if left_is_256 || right_is_256 || precision > 38 {
+        DataType::Decimal256(precision, scale)
+    } else {
+        DataType::Decimal128(precision, scale)
+    }
+}
+
 /// Determine the wider type for unifying two types (comparisons, CASE, UNION, etc.).
 pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
     if a == b {
@@ -49,37 +70,53 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
         // pairs, and ARRAY/MAP/STRUCT common types recurse through this rule.
         (DataType::Utf8, _) | (_, DataType::Utf8) => DataType::Utf8,
         (DataType::LargeUtf8, _) | (_, DataType::LargeUtf8) => DataType::Utf8,
-        // Decimal + Decimal -> wider Decimal
+        // Decimal + Decimal -> wider Decimal. Promote to Decimal256 when the
+        // common precision exceeds Decimal128 or either side is already wide.
         (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => {
-            let scale = (*s1).max(*s2);
-            let precision = ((*p1 as i8 - *s1).max(*p2 as i8 - *s2) + scale).min(38) as u8;
-            DataType::Decimal128(precision, scale)
+            wider_decimal_type(*p1, *s1, false, *p2, *s2, false)
         }
-        // Decimal + Integer -> Decimal
+        (DataType::Decimal128(p1, s1), DataType::Decimal256(p2, s2)) => {
+            wider_decimal_type(*p1, *s1, false, *p2, *s2, true)
+        }
+        (DataType::Decimal256(p1, s1), DataType::Decimal128(p2, s2)) => {
+            wider_decimal_type(*p1, *s1, true, *p2, *s2, false)
+        }
+        (DataType::Decimal256(p1, s1), DataType::Decimal256(p2, s2)) => {
+            wider_decimal_type(*p1, *s1, true, *p2, *s2, true)
+        }
+        // Decimal + Integer -> Decimal. Keep the existing decimal metadata;
+        // integer literal narrowing happens before this common-type step.
         (
-            DataType::Decimal128(_, _),
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
             DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
         )
         | (
             DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
-            DataType::Decimal128(_, _),
-        ) => {
-            let (p, s) = match (a, b) {
-                (DataType::Decimal128(p, s), _) | (_, DataType::Decimal128(p, s)) => (*p, *s),
-                _ => unreachable!(),
-            };
-            DataType::Decimal128(p, s)
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
+        ) => match (a, b) {
+            (DataType::Decimal128(p, s), _) | (_, DataType::Decimal128(p, s)) => {
+                DataType::Decimal128(*p, *s)
+            }
+            (DataType::Decimal256(p, s), _) | (_, DataType::Decimal256(p, s)) => {
+                DataType::Decimal256(*p, *s)
+            }
+            _ => unreachable!(),
+        },
+        // Decimal + Float -> Float64 (StarRocks FE: promote to Double).
+        (
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
+            DataType::Float64 | DataType::Float32,
+        )
+        | (
+            DataType::Float64 | DataType::Float32,
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
+        ) => DataType::Float64,
+        // Decimal + other -> Decimal.
+        (DataType::Decimal128(p, s), _) | (_, DataType::Decimal128(p, s)) => {
+            DataType::Decimal128(*p, *s)
         }
-        // Decimal + Float -> Float64 (StarRocks FE: promote to Double)
-        (DataType::Decimal128(_, _), DataType::Float64 | DataType::Float32)
-        | (DataType::Float64 | DataType::Float32, DataType::Decimal128(_, _)) => DataType::Float64,
-        // Decimal + other -> Decimal
-        (DataType::Decimal128(_, _), _) | (_, DataType::Decimal128(_, _)) => {
-            let (p, s) = match (a, b) {
-                (DataType::Decimal128(p, s), _) | (_, DataType::Decimal128(p, s)) => (*p, *s),
-                _ => unreachable!(),
-            };
-            DataType::Decimal128(p, s)
+        (DataType::Decimal256(p, s), _) | (_, DataType::Decimal256(p, s)) => {
+            DataType::Decimal256(*p, *s)
         }
         // DATE + DATETIME -> DATETIME (StarRocks: only DATETIME signatures exist
         // for comparison/greatest/least/coalesce with mixed date+datetime input).
@@ -698,6 +735,19 @@ mod tests {
     fn wider_type_float32_vs_decimal_returns_float64() {
         let result = wider_type(&DataType::Float32, &DataType::Decimal128(18, 6));
         assert_eq!(result, DataType::Float64);
+    }
+
+    #[test]
+    fn wider_type_preserves_decimal256_with_integer_fallback() {
+        let wide = DataType::Decimal256(39, 9);
+
+        assert_eq!(wider_type(&wide, &DataType::Int64), wide);
+        assert_eq!(wider_type(&DataType::Int64, &wide), wide);
+        assert_eq!(
+            wider_type(&DataType::Decimal128(38, 9), &DataType::Decimal256(39, 9)),
+            DataType::Decimal256(39, 9)
+        );
+        assert_eq!(wider_type(&wide, &DataType::Float64), DataType::Float64);
     }
 
     #[test]

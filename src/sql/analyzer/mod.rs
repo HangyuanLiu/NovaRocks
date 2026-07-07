@@ -4457,6 +4457,54 @@ mod tests {
     }
 
     #[test]
+    fn decimal_literal_over_decimal128_precision_infers_decimal256() {
+        let resolved =
+            parse_raw_and_analyze("select 123456789012345678901234567890.123456789 as d")
+                .expect("wide decimal literal should analyze");
+
+        assert_eq!(
+            resolved.output_columns[0].data_type,
+            DataType::Decimal256(39, 9)
+        );
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(
+            select.projection[0].expr.data_type,
+            DataType::Decimal256(39, 9)
+        );
+    }
+
+    #[test]
+    fn decimal_literal_above_decimal256_precision_is_rejected() {
+        let err = parse_raw_and_analyze(
+            "select 12345678901234567890123456789012345678901234567890123456789012345678901234567.1",
+        )
+        .expect_err("decimal literal above Decimal256 precision should fail during analysis");
+
+        assert!(
+            err.contains("decimal literal precision 78 exceeds maximum precision 76"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn array_agg_window_decimal_literal_preserves_decimal256_item() {
+        let (resolved, _) = parse_and_analyze_with_registry(
+            "select array_agg(123456789012345678901234567890.123456789) \
+         over(partition by o_orderstatus order by o_orderkey) as arr from orders",
+        )
+        .expect("array_agg window over wide decimal literal should analyze");
+
+        let expected = DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Decimal256(39, 9),
+            true,
+        )));
+        assert_eq!(resolved.output_columns[0].data_type, expected);
+    }
+
+    #[test]
     fn hex_string_literal_analyzes_as_binary() {
         let resolved = parse_raw_and_analyze("SELECT X'AB01'").expect("analysis should succeed");
         assert_eq!(resolved.output_columns[0].data_type, DataType::Binary);
