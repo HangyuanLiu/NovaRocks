@@ -61,18 +61,15 @@ set pipeline_dop=2;
 USE ${case_db};
 select distinct c1,c2,c3,c4,c5,c6,c7,c8 from all_t0 order by 1,2,3,4,5,6,7,8 limit 100,3;
 
--- Trigger dictionary metadata collection for the low-cardinality string
--- columns before the EXPLAIN assertion below. Without this NovaRocks
--- standalone never builds dictionary snapshots and the rewrite cannot
--- fire (legacy StarRocks auto-collected stats; we require explicit ANALYZE).
+-- Populate stats before the EXPLAIN assertions below. R0 retired the
+-- standalone native low-cardinality rewrite, so string columns must not
+-- reintroduce FE-compatible DECODE plan nodes.
 -- @skip_result_check=true
 USE ${case_db};
 ANALYZE FULL TABLE all_t0;
 
 -- query 8
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=DECODE
+-- @result_not_contains=DECODE
 -- @skip_result_check=true
 USE ${case_db};
 EXPLAIN VERBOSE SELECT DISTINCT c8 FROM all_t0;
@@ -190,9 +187,7 @@ USE ${case_db};
 select distinct c17,c18,c19,c20,c21,c22,c23,c24 from all_t0 order by 1,2,3,4,5,6,7,8 limit 100,3;
 
 -- query 24
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=DECODE
+-- @result_not_contains=DECODE
 -- @skip_result_check=true
 USE ${case_db};
 EXPLAIN VERBOSE SELECT DISTINCT c20 FROM all_t0;
@@ -1025,8 +1020,8 @@ insert into all_t1 SELECT x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x FROM T
 USE ${case_db};
 select distinct c1, c2, c3, c4, c5, c6, c7, c8 from all_t1 order by 1,2,3,4,5,6,7,8 desc limit 1;
 
--- Populate dictionary + per-column stats before the min-max / DECODE
--- assertions below. NovaRocks standalone needs explicit ANALYZE FULL.
+-- Populate dictionary + per-column stats before the min-max assertions below.
+-- NovaRocks standalone needs explicit ANALYZE FULL.
 -- @skip_result_check=true
 USE ${case_db};
 ANALYZE FULL TABLE all_t1;

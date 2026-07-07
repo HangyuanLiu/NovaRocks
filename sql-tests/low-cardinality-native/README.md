@@ -16,3 +16,8 @@ cleanly mix Iceberg and native cases — hence the separate native suite (no
 
 - `compressed_key` / `compressed_key2`: legacy `test_agg` compressed-key
   coverage (DUPLICATE / AGGREGATE KEY tables, `LARGEINT`, scan min-max stats).
+
+After R0 retired the standalone native low-cardinality rewrite, this suite keeps
+the native storage and `LARGEINT`/min-max coverage, but it must not require
+legacy native `DECODE` plan nodes. `EXPLAIN` assertions in this suite should
+guard against reintroducing that shape rather than waiting for it.
