@@ -295,29 +295,22 @@ fn lower_map_constructor(
 
     for (idx, arg) in call.args.iter().enumerate() {
         let child = lower_proto_expr(arg, arena, input_layout)?;
-        let child_type = arena
-            .data_type(child)
-            .ok_or_else(|| format!("MAP constructor missing child type at index {idx}"))?;
         if idx % 2 == 0 {
-            if child_type != &expected_key_type {
-                return Err(format!(
-                    "MAP constructor key type mismatch at pair {}: expected {:?}, got {:?}",
-                    idx / 2,
-                    expected_key_type,
-                    child_type
-                ));
-            }
-            key_elements.push(child);
+            key_elements.push(coerce_map_constructor_child(
+                arena,
+                child,
+                &expected_key_type,
+                idx,
+                "key",
+            )?);
         } else {
-            if child_type != &expected_value_type {
-                return Err(format!(
-                    "MAP constructor value type mismatch at pair {}: expected {:?}, got {:?}",
-                    idx / 2,
-                    expected_value_type,
-                    child_type
-                ));
-            }
-            value_elements.push(child);
+            value_elements.push(coerce_map_constructor_child(
+                arena,
+                child,
+                &expected_value_type,
+                idx,
+                "value",
+            )?);
         }
     }
 
@@ -341,6 +334,25 @@ fn lower_map_constructor(
         },
         data_type,
     ))
+}
+
+fn coerce_map_constructor_child(
+    arena: &mut ExprArena,
+    child: ExprId,
+    expected_type: &DataType,
+    arg_idx: usize,
+    role: &str,
+) -> Result<ExprId, String> {
+    let child_type = arena.data_type(child).cloned().ok_or_else(|| {
+        format!(
+            "MAP constructor missing {role} child type at pair {}",
+            arg_idx / 2
+        )
+    })?;
+    if &child_type == expected_type || matches!(expected_type, DataType::Null) {
+        return Ok(child);
+    }
+    Ok(arena.push_typed(ExprNode::Cast(child), expected_type.clone()))
 }
 
 fn lower_cast(
@@ -1179,6 +1191,17 @@ mod tests {
         )
     }
 
+    fn null_lit(data_type: DataType) -> expr::Expr {
+        scalar_expr(
+            data_type,
+            expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::NullValue(true)),
+                }),
+            }),
+        )
+    }
+
     fn col(column_id: u32, data_type: DataType) -> expr::Expr {
         scalar_expr(
             data_type,
@@ -1590,6 +1613,50 @@ mod tests {
             ))))
         );
         assert_eq!(arena.data_type(id), Some(&map_type));
+    }
+
+    #[test]
+    fn map_constructor_casts_null_children_to_entry_types() {
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Int64, true)),
+                    Arc::new(Field::new("value", DataType::Int64, true)),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let map = scalar_expr(
+            map_type,
+            expr::expr::Kind::FunctionCall(expr::FunctionCall {
+                function_name: "map".to_string(),
+                args: vec![
+                    null_lit(DataType::Null),
+                    int_lit(10),
+                    int_lit(2),
+                    null_lit(DataType::Null),
+                ],
+                distinct: false,
+            }),
+        );
+
+        let (arena, id) = lower(&map);
+        let Some(ExprNode::FunctionCall { args, .. }) = arena.node(id) else {
+            panic!("expected map constructor to lower as function call");
+        };
+        let Some(ExprNode::ArrayExpr { elements: keys }) = arena.node(args[0]) else {
+            panic!("expected map keys to lower as ArrayExpr");
+        };
+        let Some(ExprNode::ArrayExpr { elements: values }) = arena.node(args[1]) else {
+            panic!("expected map values to lower as ArrayExpr");
+        };
+
+        assert_eq!(arena.data_type(keys[0]), Some(&DataType::Int64));
+        assert!(matches!(arena.node(keys[0]), Some(ExprNode::Cast(_))));
+        assert_eq!(arena.data_type(values[1]), Some(&DataType::Int64));
+        assert!(matches!(arena.node(values[1]), Some(ExprNode::Cast(_))));
     }
 
     #[test]

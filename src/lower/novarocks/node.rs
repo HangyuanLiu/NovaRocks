@@ -34,7 +34,7 @@ use super::layout::{
 use crate::common::config::exchange_wait_ms;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::expr::{ExprArena, ExprNode};
+use crate::exec::expr::{ExprArena, ExprNode, cast_array_to_target};
 use crate::exec::node::aggregate::{AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode};
 use crate::exec::node::analytic::{
     AnalyticNode, AnalyticOutputColumn, WindowBoundary, WindowFrame, WindowFunctionKind,
@@ -352,6 +352,18 @@ fn materialize_values_chunk(
         return Chunk::try_new_with_chunk_schema(batch, output_schema);
     }
     let column_count = columns.len();
+    if output_schema.slots().len() != column_count {
+        return Err(format!(
+            "ValuesNode output schema width mismatch: columns={}, schema_slots={}",
+            column_count,
+            output_schema.slots().len()
+        ));
+    }
+    let target_types = output_schema
+        .slots()
+        .iter()
+        .map(|slot| slot.data_type().clone())
+        .collect::<Vec<_>>();
     let mut arrays_by_column = vec![Vec::<ArrayRef>::with_capacity(rows.len()); column_count];
     let input_layout = Layout::default();
     let one_row = empty_chunk_with_row_count(1)?;
@@ -375,6 +387,7 @@ fn materialize_values_chunk(
                     array.len()
                 ));
             }
+            let array = normalize_values_array(row_idx, col_idx, array, &target_types[col_idx])?;
             arrays_by_column[col_idx].push(array);
         }
     }
@@ -391,6 +404,24 @@ fn materialize_values_chunk(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Chunk::try_new_with_columns(output_schema, columns)
+}
+
+fn normalize_values_array(
+    row_idx: usize,
+    col_idx: usize,
+    array: ArrayRef,
+    target_type: &DataType,
+) -> Result<ArrayRef, String> {
+    if array.data_type() == target_type || matches!(target_type, DataType::Null) {
+        return Ok(array);
+    }
+    cast_array_to_target(&array, target_type).map_err(|err| {
+        format!(
+            "ValuesNode row {row_idx} column {col_idx} cast from {:?} to {:?} failed: {err}",
+            array.data_type(),
+            target_type
+        )
+    })
 }
 
 fn empty_chunk_with_row_count(row_count: usize) -> Result<Chunk, String> {
@@ -3608,7 +3639,7 @@ fn merge_limits(
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field};
 
     use super::{NodeLoweringContext, lower_proto_node};
@@ -3677,6 +3708,18 @@ mod tests {
             kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
                 value: Some(common::LiteralValue {
                     value: Some(common::literal_value::Value::BoolValue(value)),
+                }),
+            })),
+        }
+    }
+
+    fn null_literal(data_type: DataType) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&data_type)),
+            nullable: true,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::NullValue(true)),
                 }),
             })),
         }
@@ -3959,6 +4002,43 @@ mod tests {
             .expect("utf8 name");
         assert_eq!(name.value(0), "alice");
         assert_eq!(name.value(1), "bob");
+    }
+
+    #[test]
+    fn values_casts_null_rows_to_declared_column_type_before_concat() {
+        let columns = vec![output_column(1, "id", DataType::Int64)];
+        let node = physical_node(
+            10,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![
+                    plan::ExprList {
+                        values: vec![int_literal(10)],
+                    },
+                    plan::ExprList {
+                        values: vec![null_literal(DataType::Null)],
+                    },
+                ],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        );
+
+        let lowered = lower(&node);
+        let ExecNodeKind::Values(values) = lowered.node.kind else {
+            panic!("expected Values");
+        };
+        let id_column = values
+            .chunk
+            .column_by_slot_id(SlotId::new(1))
+            .expect("id column");
+        assert_eq!(id_column.data_type(), &DataType::Int64);
+        let id = id_column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 id");
+        assert_eq!(id.value(0), 10);
+        assert!(id.is_null(1));
     }
 
     #[test]
