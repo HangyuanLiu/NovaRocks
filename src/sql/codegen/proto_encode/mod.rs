@@ -5,9 +5,10 @@ pub(crate) mod types;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use prost::Message;
 
     use super::expr::encode_expr;
@@ -1233,6 +1234,82 @@ mod tests {
             .fields[0];
         assert_eq!(field.initial_default_json.as_deref(), Some("5"));
         assert_eq!(field.write_default_json.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn native_scan_encoder_preserves_iceberg_list_write_defaults_from_arrow_metadata() {
+        let list_type = DataType::List(Arc::new(
+            Field::new("element", DataType::Int32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "4".to_string(),
+            )])),
+        ));
+        let table = crate::sql::catalog::TableDef {
+            name: "orders".to_string(),
+            columns: vec![crate::sql::catalog::ColumnDef {
+                name: "tags".to_string(),
+                data_type: list_type.clone(),
+                nullable: true,
+                write_default: Some(iceberg::spec::Literal::List(vec![])),
+                logical_type: None,
+            }],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: crate::sql::catalog::ScanSource::IcebergDataFiles {
+                table: crate::sql::catalog::IcebergTableInfo {
+                    catalog: "ice".to_string(),
+                    namespace: "db".to_string(),
+                    table: "orders".to_string(),
+                    table_uuid: Some("uuid-orders".to_string()),
+                    current_snapshot_id: Some(10),
+                    schema_id: 1,
+                    location: "s3://warehouse/db/orders".to_string(),
+                    schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+                    serialized_metadata: None,
+                    serialized_metadata_rows: None,
+                },
+                files: vec![],
+                cloud_properties: std::collections::BTreeMap::new(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            },
+        };
+        let scan = crate::sql::planner::DistributedNode {
+            node_id: 7,
+            fragment_id: 0,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: physical_stats(),
+            payload: crate::sql::planner::DistributedPayload::Physical(
+                crate::sql::planner::plan::PhysicalPlanKind::Scan(
+                    crate::sql::planner::plan::PlanScanNode {
+                        database: "db".to_string(),
+                        table,
+                        alias: None,
+                        columns: vec![planner_output_column(10, "tags", list_type)],
+                        predicates: Vec::new(),
+                        required_columns: None,
+                        variant_columns: Vec::new(),
+                        mv_rewritten_from: None,
+                    },
+                ),
+            ),
+        };
+
+        let encoded = plan::encode_node(&scan).expect("encode scan node");
+        let Some(crate::proto::plan::distributed_node::Payload::Physical(physical)) =
+            encoded.payload.as_ref()
+        else {
+            panic!("expected physical node");
+        };
+        let Some(crate::proto::plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
+            panic!("expected scan node");
+        };
+        let table = scan.table.as_ref().expect("table");
+
+        assert_eq!(table.columns[0].write_default_json.as_deref(), Some("[]"));
     }
 
     #[test]

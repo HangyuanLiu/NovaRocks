@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
-use arrow::datatypes::DataType;
-use iceberg::spec::{PrimitiveType, Type};
+use arrow::datatypes::{DataType, Field};
+use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, StructType, Type};
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::expr::{encode_expr, encode_sort_items, encode_window_frame};
 use super::types::encode_type;
@@ -1291,7 +1292,48 @@ fn iceberg_type_for_column_def(column: &catalog::ColumnDef) -> Result<Type, Stri
 }
 
 fn iceberg_type_for_arrow_data_type(data_type: &DataType) -> Result<Type, String> {
-    Ok(Type::Primitive(match data_type {
+    if let Some(primitive) = iceberg_primitive_type_for_arrow_data_type(data_type)? {
+        return Ok(Type::Primitive(primitive));
+    }
+
+    match data_type {
+        DataType::Struct(fields) => Ok(Type::Struct(StructType::new(
+            fields
+                .iter()
+                .map(|field| iceberg_nested_field_for_arrow_field(field.as_ref()))
+                .collect::<Result<Vec<_>, _>>()?,
+        ))),
+        DataType::List(element) | DataType::LargeList(element) => Ok(Type::List(ListType::new(
+            iceberg_nested_field_for_arrow_field(element.as_ref())?,
+        ))),
+        DataType::Map(entries, _sorted) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(format!(
+                    "native plan MAP entries field must be Struct, got {:?}",
+                    entries.data_type()
+                ));
+            };
+            if fields.len() != 2 {
+                return Err(format!(
+                    "native plan MAP entries Struct must have 2 fields, got {}",
+                    fields.len()
+                ));
+            }
+            Ok(Type::Map(MapType::new(
+                iceberg_nested_field_for_arrow_field(fields[0].as_ref())?,
+                iceberg_nested_field_for_arrow_field(fields[1].as_ref())?,
+            )))
+        }
+        other => Err(format!(
+            "native plan cannot encode write_default_json for Arrow type {other:?} without a logical Iceberg type"
+        )),
+    }
+}
+
+fn iceberg_primitive_type_for_arrow_data_type(
+    data_type: &DataType,
+) -> Result<Option<PrimitiveType>, String> {
+    Ok(Some(match data_type {
         DataType::Boolean => PrimitiveType::Boolean,
         DataType::Int8 | DataType::Int16 | DataType::Int32 => PrimitiveType::Int,
         DataType::Int64 => PrimitiveType::Long,
@@ -1314,12 +1356,39 @@ fn iceberg_type_for_arrow_data_type(data_type: &DataType) -> Result<Type, String
                 scale,
             }
         }
-        other => {
-            return Err(format!(
-                "native plan cannot encode write_default_json for Arrow type {other:?} without a logical Iceberg type"
-            ));
-        }
+        _ => return Ok(None),
     }))
+}
+
+fn iceberg_nested_field_for_arrow_field(
+    field: &Field,
+) -> Result<iceberg::spec::NestedFieldRef, String> {
+    let field_id = arrow_field_id(field)?;
+    let field_type = iceberg_type_for_arrow_data_type(field.data_type())?;
+    Ok(Arc::new(NestedField::new(
+        field_id,
+        field.name(),
+        field_type,
+        !field.is_nullable(),
+    )))
+}
+
+fn arrow_field_id(field: &Field) -> Result<i32, String> {
+    let raw = field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .ok_or_else(|| {
+            format!(
+                "native plan field {} is missing parquet field id metadata",
+                field.name()
+            )
+        })?;
+    raw.parse::<i32>().map_err(|err| {
+        format!(
+            "native plan field {} has invalid parquet field id {raw}: {err}",
+            field.name()
+        )
+    })
 }
 
 fn encode_scan_source(
