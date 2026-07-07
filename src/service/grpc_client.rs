@@ -49,7 +49,7 @@ impl NovaRocksGrpcRemoteClient {
         let host = addr.ip().to_string();
         let port = addr.port();
         // Eagerly verify the endpoint can be parsed; actual TCP setup is lazy.
-        grpc_endpoint(&host, port)
+        channel_endpoint(&host, port)
             .map_err(|e| format!("invalid BE endpoint {host}:{port}: {e}"))?;
         Ok(Self { host, port })
     }
@@ -211,15 +211,15 @@ fn channels() -> &'static ChannelCache {
     })
 }
 
-fn grpc_endpoint_uri(host: &str, port: u16) -> String {
+fn channel_endpoint_uri(host: &str, port: u16) -> String {
     format!("http://{}:{port}", format_host_for_url(host))
 }
 
-fn grpc_endpoint(
+fn channel_endpoint(
     host: &str,
     port: u16,
 ) -> Result<tonic::transport::Endpoint, tonic::transport::Error> {
-    grpc_endpoint_uri(host, port).parse::<tonic::transport::Endpoint>()
+    channel_endpoint_uri(host, port).parse::<tonic::transport::Endpoint>()
 }
 
 /// Return a cached channel for the given endpoint, creating one if needed.
@@ -236,7 +236,7 @@ async fn get_or_create_channel(host: &str, port: u16) -> Result<Channel, String>
             return Ok(ch);
         }
     }
-    let ch = grpc_endpoint(host, port)
+    let ch = channel_endpoint(host, port)
         .map_err(|e| format!("invalid endpoint: {e}"))?
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .timeout(Duration::from_secs(600))
@@ -269,12 +269,12 @@ mod pr3_tests {
     }
 
     #[test]
-    fn grpc_endpoint_uri_formats_ipv4_and_ipv6_hosts() {
+    fn channel_endpoint_uri_formats_ipv4_and_ipv6_hosts() {
         assert_eq!(
-            grpc_endpoint_uri("127.0.0.1", 9070),
+            channel_endpoint_uri("127.0.0.1", 9070),
             "http://127.0.0.1:9070"
         );
-        assert_eq!(grpc_endpoint_uri("::1", 9070), "http://[::1]:9070");
+        assert_eq!(channel_endpoint_uri("::1", 9070), "http://[::1]:9070");
     }
 
     #[test]

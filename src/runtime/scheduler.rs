@@ -561,7 +561,7 @@ fn select_execution_root_fragment(
         0 => Err("no root fragment found (every fragment has an outgoing edge)".into()),
         _ if terminal_fragments
             .iter()
-            .all(|fr| data_sink_is_terminal_write_sink(&fr.output_sink)) =>
+            .all(|fr| fragment_sink_is_terminal_write_sink(&fr.output_sink)) =>
         {
             let fragment_id = terminal_fragments
                 .iter()
@@ -583,7 +583,7 @@ fn select_execution_root_fragment(
     }
 }
 
-fn data_sink_is_terminal_write_sink(sink: &crate::thrift::data_sinks::TDataSink) -> bool {
+fn fragment_sink_is_terminal_write_sink(sink: &crate::thrift::data_sinks::TDataSink) -> bool {
     use crate::thrift::data_sinks::TDataSinkType;
 
     matches!(

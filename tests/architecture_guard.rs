@@ -3411,7 +3411,12 @@ fn nidl_d3e_native_runtime_routing_has_no_thrift_shaped_endpoint_model() {
 
     for proto in ["idl/novarocks/service.proto", "idl/novarocks/plan.proto"] {
         let text = fs::read_to_string(repo.join(proto)).unwrap();
-        for forbidden in ["brpc_addr", "fragment_instance_address", "report_addr"] {
+        for forbidden in [
+            "brpc_addr",
+            "fragment_instance_address",
+            "grpc_endpoint",
+            "report_addr",
+        ] {
             if text.contains(forbidden) {
                 violations.push(format!(
                     "{proto}: native proto must not contain `{forbidden}`"
@@ -3432,6 +3437,7 @@ fn nidl_d3e_native_runtime_routing_has_no_thrift_shaped_endpoint_model() {
             "TRuntimeFilterProberParams",
             "brpc_server",
             "fragment_instance_address",
+            "grpc_endpoint",
             "brpc_addr",
         ] {
             if text.contains(forbidden) {
@@ -3444,8 +3450,8 @@ fn nidl_d3e_native_runtime_routing_has_no_thrift_shaped_endpoint_model() {
 
     let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
     assert!(
-        coordinator.contains("fn thrift_destination_from_native"),
-        "coordinator must keep thrift destination conversion in a named compact boundary helper"
+        coordinator.contains("fn exec_destination_from_runtime"),
+        "coordinator must keep destination conversion in a named execution-parameter boundary helper"
     );
     assert!(
         coordinator.contains("fn native_stream_destination"),

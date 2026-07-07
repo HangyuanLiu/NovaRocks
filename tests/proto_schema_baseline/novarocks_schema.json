@@ -4957,7 +4957,7 @@
             },
             "2": {
               "number": 2,
-              "name": "grpc_endpoint",
+              "name": "endpoint",
               "type_name": "string",
               "label": "singular",
               "oneof": null
@@ -6089,7 +6089,7 @@
             },
             "2": {
               "number": 2,
-              "name": "grpc_endpoint",
+              "name": "endpoint",
               "type_name": "string",
               "label": "singular",
               "oneof": null
@@ -6938,7 +6938,7 @@
             },
             "2": {
               "number": 2,
-              "name": "grpc_endpoint",
+              "name": "endpoint",
               "type_name": "string",
               "label": "singular",
               "oneof": null
