@@ -17,9 +17,10 @@
 
 //! Proto expression lowering.
 
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use arrow_buffer::i256;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::layout::Layout;
 use super::{decode_field_type, decode_type};
@@ -230,6 +231,9 @@ fn lower_function_call(
     if call.function_name == "__array_literal" {
         return lower_array_literal(call, arena, input_layout, data_type);
     }
+    if call.function_name.eq_ignore_ascii_case("map") {
+        return lower_map_constructor(call, arena, input_layout, data_type);
+    }
     let kind = lookup_function(&call.function_name).ok_or_else(|| {
         format!(
             "unsupported native scalar function '{}'",
@@ -254,6 +258,89 @@ fn lower_array_literal(
     }
     let elements = lower_expr_list(&call.args, arena, input_layout)?;
     Ok(arena.push_typed(ExprNode::ArrayExpr { elements }, data_type))
+}
+
+fn lower_map_constructor(
+    call: &expr::FunctionCall,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+    data_type: DataType,
+) -> Result<ExprId, String> {
+    if !call.args.len().is_multiple_of(2) {
+        return Err(format!(
+            "MAP constructor expects an even number of arguments, got {}",
+            call.args.len()
+        ));
+    }
+
+    let DataType::Map(entry_field, _) = &data_type else {
+        return Err(format!(
+            "MAP constructor expects MAP output type, got {data_type:?}"
+        ));
+    };
+    let DataType::Struct(entry_fields) = entry_field.data_type() else {
+        return Err("MAP constructor entries type must be Struct".to_string());
+    };
+    if entry_fields.len() != 2 {
+        return Err(format!(
+            "MAP constructor entries type must have 2 fields, got {}",
+            entry_fields.len()
+        ));
+    }
+
+    let expected_key_type = entry_fields[0].data_type().clone();
+    let expected_value_type = entry_fields[1].data_type().clone();
+    let mut key_elements = Vec::with_capacity(call.args.len() / 2);
+    let mut value_elements = Vec::with_capacity(call.args.len() / 2);
+
+    for (idx, arg) in call.args.iter().enumerate() {
+        let child = lower_proto_expr(arg, arena, input_layout)?;
+        let child_type = arena
+            .data_type(child)
+            .ok_or_else(|| format!("MAP constructor missing child type at index {idx}"))?;
+        if idx % 2 == 0 {
+            if child_type != &expected_key_type {
+                return Err(format!(
+                    "MAP constructor key type mismatch at pair {}: expected {:?}, got {:?}",
+                    idx / 2,
+                    expected_key_type,
+                    child_type
+                ));
+            }
+            key_elements.push(child);
+        } else {
+            if child_type != &expected_value_type {
+                return Err(format!(
+                    "MAP constructor value type mismatch at pair {}: expected {:?}, got {:?}",
+                    idx / 2,
+                    expected_value_type,
+                    child_type
+                ));
+            }
+            value_elements.push(child);
+        }
+    }
+
+    let keys_array = arena.push_typed(
+        ExprNode::ArrayExpr {
+            elements: key_elements,
+        },
+        DataType::List(Arc::new(Field::new("item", expected_key_type, true))),
+    );
+    let values_array = arena.push_typed(
+        ExprNode::ArrayExpr {
+            elements: value_elements,
+        },
+        DataType::List(Arc::new(Field::new("item", expected_value_type, true))),
+    );
+
+    Ok(arena.push_typed(
+        ExprNode::FunctionCall {
+            kind: FunctionKind::Map("map"),
+            args: vec![keys_array, values_array],
+        },
+        data_type,
+    ))
 }
 
 fn lower_cast(
@@ -1448,6 +1535,61 @@ mod tests {
             arena.node(elements[2]),
             Some(ExprNode::Literal(LiteralValue::Null))
         ));
+    }
+
+    #[test]
+    fn lowers_variadic_map_constructor_to_array_pair_call() {
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Int64, true)),
+                    Arc::new(Field::new("value", DataType::Utf8, true)),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let map = scalar_expr(
+            map_type.clone(),
+            expr::expr::Kind::FunctionCall(expr::FunctionCall {
+                function_name: "map".to_string(),
+                args: vec![int_lit(1), string_lit("a"), int_lit(2), string_lit("b")],
+                distinct: false,
+            }),
+        );
+
+        let (arena, id) = lower(&map);
+        let Some(ExprNode::FunctionCall { kind, args }) = arena.node(id) else {
+            panic!("expected map constructor to lower as function call");
+        };
+        assert_eq!(*kind, FunctionKind::Map("map"));
+        assert_eq!(args.len(), 2);
+        let Some(ExprNode::ArrayExpr { elements: keys }) = arena.node(args[0]) else {
+            panic!("expected map keys to lower as ArrayExpr");
+        };
+        let Some(ExprNode::ArrayExpr { elements: values }) = arena.node(args[1]) else {
+            panic!("expected map values to lower as ArrayExpr");
+        };
+        assert_eq!(keys.len(), 2);
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            arena.data_type(args[0]),
+            Some(&DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Int64,
+                true
+            ))))
+        );
+        assert_eq!(
+            arena.data_type(args[1]),
+            Some(&DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Utf8,
+                true
+            ))))
+        );
+        assert_eq!(arena.data_type(id), Some(&map_type));
     }
 
     #[test]
