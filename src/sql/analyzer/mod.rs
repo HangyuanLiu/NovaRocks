@@ -7058,6 +7058,102 @@ mod tests {
     }
 
     #[test]
+    fn correlated_avg_scalar_subquery_comparison_preserves_float_type() {
+        use crate::sql::analysis::QueryBody;
+        use arrow::datatypes::DataType;
+
+        let resolved = parse_and_analyze_for_apply_specs(
+            "SELECT k1 FROM t1 \
+             WHERE k1 < (SELECT avg(k2) FROM t2 WHERE t2.k1 = t1.k1)",
+        )
+        .expect("analyze correlated AVG scalar subquery");
+
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(select.apply_specs.len(), 1);
+        let spec = &select.apply_specs[0];
+        assert_eq!(
+            spec.output_column.data_type,
+            DataType::Float64,
+            "AVG scalar subquery output must remain Float64"
+        );
+
+        let filter = select.filter.as_ref().expect("expected WHERE filter");
+        let ExprKind::BinaryOp {
+            left,
+            op: BinOp::Lt,
+            right,
+        } = &filter.kind
+        else {
+            panic!("expected k1 < scalar subquery comparison, got {filter:?}");
+        };
+
+        assert_eq!(
+            left.data_type,
+            DataType::Float64,
+            "left INT operand should be widened to Float64 for AVG comparison"
+        );
+        assert_eq!(
+            right.data_type,
+            DataType::Float64,
+            "scalar subquery RHS should stay Float64, not cast back to INT"
+        );
+        assert!(
+            !expr_casts_column_to_type(right, spec.output_column.column_id, &DataType::Int64)
+                && !expr_casts_column_to_type(
+                    right,
+                    spec.output_column.column_id,
+                    &DataType::Int32
+                ),
+            "RHS must not contain CAST(scalar_avg AS integer): {right:?}"
+        );
+    }
+
+    fn expr_casts_column_to_type(
+        expr: &TypedExpr,
+        column_id: crate::sql::column_id::ColumnId,
+        target: &arrow::datatypes::DataType,
+    ) -> bool {
+        match &expr.kind {
+            ExprKind::Cast {
+                expr: inner,
+                target: cast_target,
+            } => {
+                (cast_target == target && expr_refs_column(inner, column_id))
+                    || expr_casts_column_to_type(inner, column_id, target)
+            }
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_casts_column_to_type(left, column_id, target)
+                    || expr_casts_column_to_type(right, column_id, target)
+            }
+            ExprKind::Nested(inner)
+            | ExprKind::UnaryOp { expr: inner, .. }
+            | ExprKind::IsNull { expr: inner, .. } => {
+                expr_casts_column_to_type(inner, column_id, target)
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_refs_column(expr: &TypedExpr, column_id: crate::sql::column_id::ColumnId) -> bool {
+        match &expr.kind {
+            ExprKind::ColumnRef { column_id: id, .. } => *id == column_id,
+            ExprKind::Cast { expr: inner, .. }
+            | ExprKind::Nested(inner)
+            | ExprKind::UnaryOp { expr: inner, .. }
+            | ExprKind::IsNull { expr: inner, .. } => expr_refs_column(inner, column_id),
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_refs_column(left, column_id) || expr_refs_column(right, column_id)
+            }
+            ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+                args.iter().any(|arg| expr_refs_column(arg, column_id))
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
     fn in_subquery_derived_table_internal_refs_are_not_outer_refs() {
         use crate::sql::analysis::QueryBody;
 

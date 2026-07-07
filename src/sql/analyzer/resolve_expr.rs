@@ -566,7 +566,7 @@ impl<'a> super::AnalyzerContext<'a> {
             // Scalar subquery: (SELECT ...)
             sqlast::Expr::Subquery(subquery) => {
                 let id = self.alloc_subquery_id();
-                let data_type = self.infer_scalar_subquery_data_type(subquery);
+                let data_type = self.infer_scalar_subquery_data_type(subquery, scope);
                 let kind = SubqueryKind::Scalar;
                 self.collected_subqueries.borrow_mut().push(SubqueryInfo {
                     id,
@@ -799,7 +799,11 @@ impl<'a> super::AnalyzerContext<'a> {
         }
     }
 
-    fn infer_scalar_subquery_data_type(&self, subquery: &sqlast::Query) -> DataType {
+    fn infer_scalar_subquery_data_type(
+        &self,
+        subquery: &sqlast::Query,
+        outer_scope: &AnalyzerScope,
+    ) -> DataType {
         // `analyze_query` re-enters `analyze_select` which calls
         // `rewrite_subqueries` whenever `collected_subqueries` is non-empty.
         // That rewrite *drains* the shared `collected_subqueries` vec, so any
@@ -808,10 +812,11 @@ impl<'a> super::AnalyzerContext<'a> {
         // outer analyzer can still see and rewrite its own subqueries.
         let saved_collected: Vec<SubqueryInfo> = self.collected_subqueries.borrow().clone();
         let saved_next_subquery_id = self.next_subquery_id.get();
+        let saved_cte_registry = self.cte_registry.borrow().clone();
         let inferred = self
-            .analyze_query(subquery)
+            .analyze_query_with_outer_scope_inner(subquery, outer_scope)
             .ok()
-            .and_then(|query| {
+            .and_then(|(query, _inner_scope)| {
                 query
                     .output_columns
                     .first()
@@ -820,6 +825,9 @@ impl<'a> super::AnalyzerContext<'a> {
             .unwrap_or(DataType::Null);
         *self.collected_subqueries.borrow_mut() = saved_collected;
         self.next_subquery_id.set(saved_next_subquery_id);
+        self.cte_registry
+            .borrow_mut()
+            .clone_from(&saved_cte_registry);
         inferred
     }
 
