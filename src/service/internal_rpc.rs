@@ -187,11 +187,6 @@ pub(crate) fn handle_transmit_chunk_native(
         status: Some(ok_common_status()),
     };
 
-    if params.payload.is_empty() {
-        response.status = Some(error_common_status("missing payload for transmit_chunk"));
-        return response;
-    }
-
     let decode_start = std::time::Instant::now();
     let key = exchange::ExchangeKey {
         finst_id_hi: params.finst_id_hi,
@@ -526,8 +521,8 @@ mod tests {
         handle_lookup_compat, handle_transmit_runtime_filter_compat,
     };
     use super::{
-        decode_column_ipc, encode_column_ipc, handle_lookup, handle_transmit_chunk_native,
-        handle_transmit_runtime_filter, receive_total_runtime_filter,
+        decode_column_ipc, encode_column_ipc, handle_lookup, handle_transmit_chunk,
+        handle_transmit_chunk_native, handle_transmit_runtime_filter, receive_total_runtime_filter,
     };
     use crate::cache::CacheOptions;
     use crate::common::ids::SlotId;
@@ -552,7 +547,6 @@ mod tests {
     use crate::thrift::descriptors;
     use crate::thrift::types;
 
-    #[cfg(feature = "compat")]
     fn unique_id(hi: i64, lo: i64) -> proto::starrocks::PUniqueId {
         proto::starrocks::PUniqueId { hi, lo }
     }
@@ -568,7 +562,6 @@ mod tests {
         RuntimeFilterParams::from_thrift(&params).expect("runtime filter params")
     }
 
-    #[cfg(feature = "compat")]
     fn ok_status(status: Option<&proto::starrocks::StatusPb>) -> bool {
         status.map(|s| s.status_code).unwrap_or_default() == 0
     }
@@ -699,7 +692,7 @@ mod tests {
 
     #[test]
     fn test_handle_transmit_chunk_delivers_payload_and_eos() {
-        let finst_id = common_unique_id(11, 22);
+        let finst_id = common_unique_id(31, 42);
         let key = exchange::ExchangeKey {
             finst_id_hi: finst_id.hi,
             finst_id_lo: finst_id.lo,
@@ -745,11 +738,17 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_transmit_chunk_rejects_empty_payload_with_common_status() {
-        let response = handle_transmit_chunk_native(proto::novarocks::ExchangeRequest {
+    fn test_handle_transmit_chunk_empty_payload_marks_eos_sender_finished() {
+        let key = exchange::ExchangeKey {
             finst_id_hi: 11,
             finst_id_lo: 22,
             node_id: 7,
+        };
+
+        let response = handle_transmit_chunk_native(proto::novarocks::ExchangeRequest {
+            finst_id_hi: key.finst_id_hi,
+            finst_id_lo: key.finst_id_lo,
+            node_id: key.node_id,
             sender_id: 3,
             be_number: 9,
             eos: true,
@@ -758,10 +757,36 @@ mod tests {
         });
 
         assert_eq!(response.ack_sequence, 42);
-        assert!(!ok_common_status(response.status.as_ref()));
+        assert!(ok_common_status(response.status.as_ref()));
+        let snapshot =
+            exchange::snapshot_receiver_state(key).expect("receiver snapshot after empty EOS");
+        assert_eq!(snapshot.queued_chunks, 0);
+        assert_eq!(snapshot.queued_rows, 0);
+        assert_eq!(snapshot.finished_senders, 1);
+        exchange::cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn test_handle_transmit_chunk_legacy_wrapper_rejects_missing_payload() {
+        let response = handle_transmit_chunk(proto::starrocks::PTransmitChunkParams {
+            finst_id: Some(unique_id(1, 2)),
+            node_id: Some(7),
+            sender_id: Some(3),
+            be_number: Some(9),
+            eos: Some(true),
+            sequence: Some(42),
+            chunks: vec![proto::starrocks::ChunkPb::default()],
+            ..Default::default()
+        });
+
+        assert!(!ok_status(response.status.as_ref()));
         assert_eq!(
-            response.status.as_ref().map(|status| status.message.as_str()),
-            Some("missing payload for transmit_chunk")
+            response
+                .status
+                .as_ref()
+                .and_then(|status| status.error_msgs.first())
+                .map(String::as_str),
+            Some("missing chunks[0].data for transmit_chunk")
         );
     }
 
