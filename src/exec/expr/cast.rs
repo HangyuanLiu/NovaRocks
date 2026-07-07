@@ -3311,13 +3311,7 @@ pub fn eval(
 
     let casted =
         cast_with_special_rules_with_field_schema(&child_array, &target_type, target_field_schema)
-            .map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            })?;
+            .map_err(|e| format_cast_error(child_array.data_type(), &target_type, &e))?;
     if arena.allow_throw_exception() {
         if let Some(value) = first_float_to_int_overflow_value(&child_array, &casted, &target_type)?
         {
@@ -3343,6 +3337,13 @@ pub fn eval(
             target_type
         )
     })
+}
+
+fn format_cast_error(source_type: &DataType, target_type: &DataType, err: &str) -> String {
+    if err.starts_with("CAST STRUCT field count mismatch") {
+        return format!("{err}; CAST failed: from {source_type:?} to {target_type:?}");
+    }
+    format!("CAST failed: from {source_type:?} to {target_type:?}: {err}")
 }
 
 fn eval_time_internal(
@@ -4575,6 +4576,64 @@ mod tests {
         assert_eq!(a.value(1), -9_i64);
         assert_eq!(b.value(0), 1_i64);
         assert_eq!(b.value(1), -1_i64);
+    }
+
+    #[test]
+    fn cast_struct_field_count_mismatch_keeps_specific_error_first() {
+        let source_fields = Fields::from(vec![
+            Field::new("col1", DataType::Int64, true),
+            Field::new("col2", DataType::Utf8, true),
+            Field::new("col3", DataType::Null, true),
+            Field::new("col4", DataType::Null, true),
+        ]);
+        let source = Arc::new(StructArray::new(
+            source_fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(3)])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("")])) as ArrayRef,
+                arrow::array::new_null_array(&DataType::Null, 1),
+                arrow::array::new_null_array(&DataType::Null, 1),
+            ],
+            None,
+        )) as ArrayRef;
+        let source_type = DataType::Struct(source_fields);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            source_type.clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![source]).expect("batch");
+        let chunk = Chunk::new_with_chunk_schema(
+            batch,
+            Arc::new(
+                ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                    SlotId::new(1),
+                    Field::new("s", source_type.clone(), true),
+                    None,
+                    None,
+                )])
+                .expect("chunk schema"),
+            ),
+        );
+        let target_type = DataType::Struct(
+            vec![
+                Field::new("c0", DataType::Int32, true),
+                Field::new("c1", DataType::Utf8, true),
+            ]
+            .into(),
+        );
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), source_type);
+        let cast_expr = arena.push_typed(ExprNode::Cast(child), target_type);
+
+        let err = arena
+            .eval(cast_expr, &chunk)
+            .expect_err("field count mismatch");
+
+        assert!(
+            err.starts_with("CAST STRUCT field count mismatch"),
+            "got: {err}"
+        );
     }
 
     // IV3-7 Task 12: nanosecond timestamp cast semantics
