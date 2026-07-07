@@ -1,3 +1,6 @@
+use arrow::datatypes::DataType;
+
+use crate::sql::codegen::expr_compiler::infer_agg_function_types;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::memo::{MExpr, Memo};
@@ -158,14 +161,43 @@ fn local_output_columns(agg: &LogicalAggregateOp, arena: &ScalarArena) -> Vec<Ou
         OutputColumn {
             column_id: aggregate_output_column_id(&name, source_output),
             name,
-            data_type: source_output
-                .map(|output| output.data_type.clone())
-                .unwrap_or_else(|| arrow::datatypes::DataType::Null),
+            data_type: local_aggregate_intermediate_type(arena, call, source_output),
             nullable: true,
             is_internal: true,
         }
     }));
     columns
+}
+
+fn local_aggregate_intermediate_type(
+    arena: &ScalarArena,
+    call: &ScalarAggregateSpec,
+    source_output: Option<&OutputColumn>,
+) -> DataType {
+    let effective_name = if call.distinct {
+        match call.name.as_str() {
+            "count" => "multi_distinct_count",
+            "sum" => "multi_distinct_sum",
+            _ => call.name.as_str(),
+        }
+    } else {
+        call.name.as_str()
+    };
+    let mut input_types = call
+        .args
+        .iter()
+        .map(|expr| arena.data_type(*expr).clone())
+        .collect::<Vec<_>>();
+    input_types.extend(
+        call.order_by
+            .iter()
+            .map(|item| arena.data_type(item.expr).clone()),
+    );
+    infer_agg_function_types(effective_name, &input_types, call.distinct)
+        .ok()
+        .and_then(|(_, intermediate)| intermediate)
+        .or_else(|| source_output.map(|output| output.data_type.clone()))
+        .unwrap_or(DataType::Null)
 }
 
 pub(crate) fn group_key_output_column_id(

@@ -451,12 +451,6 @@ impl DistributedPlanBuilder {
         let child_plan = &node.children[0];
         let output_partition = data_partition_for_redistribute_node(redistribute)?;
         let stream_kind = stream_kind_for_redistribute_mode(&redistribute.mode);
-        let exchange_output_columns =
-            if redistribute.output_columns.len() == child_plan.output_columns.len() {
-                redistribute.output_columns.clone()
-            } else {
-                child_plan.output_columns.clone()
-            };
 
         self.emit_stream_exchange(
             child_plan,
@@ -464,7 +458,7 @@ impl DistributedPlanBuilder {
             stream_kind,
             ExchangeFlavor::Distribution,
             -1,
-            exchange_output_columns,
+            redistribute.output_columns.clone(),
             None,
             node.stats.clone(),
         )
@@ -2367,7 +2361,7 @@ mod tests {
                 output_columns: exchange_columns.clone(),
             }),
             children: vec![scan],
-            output_columns: exchange_columns.clone(),
+            output_columns: source_columns.clone(),
             stats: stats(),
             probe_runtime_filters: vec![],
         };

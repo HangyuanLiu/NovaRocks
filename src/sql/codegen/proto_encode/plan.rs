@@ -156,6 +156,9 @@ fn stream_edge_output_columns(
     encoded_source: &plan::PlanFragment,
     edge: &FragmentEdge,
 ) -> Result<Vec<common::OutputColumn>, String> {
+    if source.output_columns.is_empty() && edge.output_slot_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let columns = match encoded_fragment_root_output_columns(encoded_source) {
         Ok(columns) if !columns.is_empty() => columns,
         Ok(_) if !source.output_columns.is_empty() => encode_output_columns(&source.output_columns)?,
