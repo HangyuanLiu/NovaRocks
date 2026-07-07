@@ -1506,8 +1506,8 @@ impl ScanAsyncRunner {
 
     fn apply_runtime_filters(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
         let input_rows = chunk.len();
-        let snapshot = match self.acquired.as_ref() {
-            None => return Ok(Some(chunk)),
+        let result = match self.acquired.as_ref() {
+            None => Some(chunk),
             Some(AcquiredRuntimeFilters::Unavailable(_)) => {
                 if let Some(profile) = self.profiles.as_ref() {
                     profile.common.counter_add(
@@ -1521,55 +1521,71 @@ impl ScanAsyncRunner {
                         input_rows as i64,
                     );
                 }
-                return Ok(Some(chunk));
+                Some(chunk)
             }
-            Some(AcquiredRuntimeFilters::Complete(snapshot)) => snapshot.clone(),
+            Some(AcquiredRuntimeFilters::Complete(snapshot)) if snapshot.is_empty() => {
+                if let Some(profile) = self.profiles.as_ref() {
+                    profile.common.counter_add(
+                        JOIN_RUNTIME_FILTER_INPUT_ROWS,
+                        ProfileUnit::Unit,
+                        input_rows as i64,
+                    );
+                    profile.common.counter_add(
+                        JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
+                        ProfileUnit::Unit,
+                        input_rows as i64,
+                    );
+                }
+                Some(chunk)
+            }
+            Some(AcquiredRuntimeFilters::Complete(snapshot)) => {
+                let snapshot = snapshot.clone();
+                let filters_len = (snapshot.in_filters().len()
+                    + snapshot.membership_filters().len()
+                    + snapshot.min_max_filters().len()) as i64;
+                let result = if let Some(profile) = self.profiles.as_ref() {
+                    let _timer = profile.common.scoped_timer(JOIN_RUNTIME_FILTER_TIME);
+                    self.apply_complete_runtime_filters(&snapshot, chunk)
+                } else {
+                    self.apply_complete_runtime_filters(&snapshot, chunk)
+                }?;
+                if let Some(profile) = self.profiles.as_ref() {
+                    let output_rows = result.as_ref().map(|c| c.len()).unwrap_or(0) as i64;
+                    profile.common.counter_add(
+                        JOIN_RUNTIME_FILTER_INPUT_ROWS,
+                        ProfileUnit::Unit,
+                        input_rows as i64,
+                    );
+                    profile.common.counter_add(
+                        JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
+                        ProfileUnit::Unit,
+                        output_rows,
+                    );
+                    if filters_len > 0 {
+                        profile.common.counter_add(
+                            JOIN_RUNTIME_FILTER_EVALUATE,
+                            ProfileUnit::Unit,
+                            filters_len,
+                        );
+                    }
+                }
+                result
+            }
+        };
+        let Some(chunk) = result else {
+            return Ok(None);
+        };
+        let Some(snapshot) = self
+            .self_subtree_ctx
+            .as_ref()
+            .map(|runtime_filters| runtime_filters.snapshot())
+        else {
+            return Ok(Some(chunk));
         };
         if snapshot.is_empty() {
-            if let Some(profile) = self.profiles.as_ref() {
-                profile.common.counter_add(
-                    JOIN_RUNTIME_FILTER_INPUT_ROWS,
-                    ProfileUnit::Unit,
-                    input_rows as i64,
-                );
-                profile.common.counter_add(
-                    JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
-                    ProfileUnit::Unit,
-                    input_rows as i64,
-                );
-            }
             return Ok(Some(chunk));
         }
-        let filters_len = (snapshot.in_filters().len()
-            + snapshot.membership_filters().len()
-            + snapshot.min_max_filters().len()) as i64;
-        let result = if let Some(profile) = self.profiles.as_ref() {
-            let _timer = profile.common.scoped_timer(JOIN_RUNTIME_FILTER_TIME);
-            self.apply_complete_runtime_filters(&snapshot, chunk)
-        } else {
-            self.apply_complete_runtime_filters(&snapshot, chunk)
-        }?;
-        if let Some(profile) = self.profiles.as_ref() {
-            let output_rows = result.as_ref().map(|c| c.len()).unwrap_or(0) as i64;
-            profile.common.counter_add(
-                JOIN_RUNTIME_FILTER_INPUT_ROWS,
-                ProfileUnit::Unit,
-                input_rows as i64,
-            );
-            profile.common.counter_add(
-                JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
-                ProfileUnit::Unit,
-                output_rows,
-            );
-            if filters_len > 0 {
-                profile.common.counter_add(
-                    JOIN_RUNTIME_FILTER_EVALUATE,
-                    ProfileUnit::Unit,
-                    filters_len,
-                );
-            }
-        }
-        Ok(result)
+        self.apply_complete_runtime_filters(&snapshot, chunk)
     }
 }
 
@@ -2313,6 +2329,17 @@ mod tests {
             .collect()
     }
 
+    fn output_i32(chunk: &Chunk) -> Vec<i32> {
+        let values = chunk
+            .columns()
+            .first()
+            .expect("first column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 values");
+        (0..values.len()).map(|idx| values.value(idx)).collect()
+    }
+
     fn in_filter(filter_id: i32, values: Vec<i32>) -> Vec<RuntimeInFilter> {
         let spec = crate::exec::node::join::JoinRuntimeFilterSpec {
             filter_id,
@@ -2933,6 +2960,40 @@ mod tests {
         runner.refresh_self_subtree_filters();
 
         assert!(runner.self_subtree_ctx_for_test().is_some());
+        registry.remove_query(query_key);
+    }
+
+    #[test]
+    fn self_subtree_late_filter_is_applied_per_chunk() {
+        let query_key = QueryKey::from_hi_lo(20_107, 1);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        let hub = RuntimeFilterHub::new_for_query(
+            DependencyManager::new(),
+            crate::runtime::query_context::QueryId {
+                hi: query_key.hi,
+                lo: query_key.lo,
+            },
+        );
+        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
+
+        let (mut runner, _) = scan_runtime_filter_runner_self_subtree(7, query_key, &hub);
+        let state = ScanAsyncState::new(1, "self-subtree-late-row-filter-test".to_string());
+        runner
+            .prepare_runtime_filters(&state)
+            .expect("prepare runtime filters");
+        assert!(runner.acquired.is_none());
+
+        hub.publish_min_max_filter(7, pruning_min_max_filter(vec![3, 4]));
+        runner.refresh_self_subtree_filters();
+        assert!(runner.self_subtree_ctx_for_test().is_some());
+
+        let filtered = runner
+            .apply_runtime_filters(int32_chunk(vec![1, 2, 3, 4]))
+            .expect("apply runtime filters")
+            .expect("self-subtree min/max should keep rows");
+
+        assert_eq!(output_i32(&filtered), vec![3, 4]);
         registry.remove_query(query_key);
     }
 
