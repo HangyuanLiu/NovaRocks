@@ -49,7 +49,8 @@ use crate::sql::planner::optimizer_bridge::property::{
 };
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 use crate::sql::planner::{
-    AggMode, JoinDistribution, JoinExecutionMode, OrderingSpec, TopNPhase, WiredRuntimeFilterBuild,
+    AggMode, JoinDistribution, JoinExecutionMode, OrderingSpec, PlannedRuntimeFilter, TopNPhase,
+    WiredRuntimeFilterBuild,
 };
 use crate::thrift::data_sinks;
 use crate::thrift::exprs;
@@ -1464,9 +1465,7 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     fn scan_tables(&mut self) -> &mut Vec<nodes::PlannedScanTable>;
     fn fragment_stack(&self) -> &[FragmentId];
     fn rf_probe_targets(&mut self) -> &mut HashMap<i32, Vec<RfProbeTarget>>;
-    fn rf_all_filters(
-        &mut self,
-    ) -> &mut HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>;
+    fn rf_all_filters(&mut self) -> &mut HashMap<i32, PlannedRuntimeFilter>;
     fn rf_build_targets(&mut self) -> &mut Vec<(i32, i32, FragmentId)>;
     fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>>;
     fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>>;
@@ -1508,7 +1507,7 @@ pub(crate) struct OwnedLoweringState<'a> {
     next_slot_id: Rc<RefCell<i32>>,
     fragment_stack: Vec<FragmentId>,
     rf_probe_targets: HashMap<i32, Vec<RfProbeTarget>>,
-    rf_all_filters: HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>,
+    rf_all_filters: HashMap<i32, PlannedRuntimeFilter>,
     rf_build_targets: Vec<(i32, i32, FragmentId)>,
     rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
     rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
@@ -1658,9 +1657,7 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
         &mut self.rf_probe_targets
     }
 
-    fn rf_all_filters(
-        &mut self,
-    ) -> &mut HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription> {
+    fn rf_all_filters(&mut self) -> &mut HashMap<i32, PlannedRuntimeFilter> {
         &mut self.rf_all_filters
     }
 
@@ -3055,6 +3052,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             for target in &probe_targets {
                 target_map.insert(target.thrift_node_id, target.probe_texpr.clone());
             }
+            let probe_target_node_ids = target_map.keys().copied().collect();
 
             let desc = runtime_filter::TRuntimeFilterDescription::new(
                 filter_id,
@@ -3082,7 +3080,17 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             );
 
             descs.push(desc.clone());
-            self.state.rf_all_filters().insert(filter_id, desc);
+            self.state.rf_all_filters().insert(
+                filter_id,
+                PlannedRuntimeFilter {
+                    filter_id,
+                    build_plan_node_id: join_node_id,
+                    probe_target_node_ids,
+                    has_remote_targets,
+                    execution_mode: rf.execution_mode,
+                    expr_order: post_demote_expr_order as i32,
+                },
+            );
             self.state
                 .rf_build_targets()
                 .push((filter_id, join_node_id, join_fragment));

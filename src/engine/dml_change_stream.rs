@@ -503,7 +503,12 @@ fn remap_plan_node_references(
     }
     if let Some(rf_plan) = build_result.rf_plan.as_mut() {
         for desc in rf_plan.all_filters.values_mut() {
-            remap_runtime_filter_description(desc, node_id_map)?;
+            desc.build_plan_node_id = remap_node_id(desc.build_plan_node_id, node_id_map)?;
+            for target_node_id in &mut desc.probe_target_node_ids {
+                *target_node_id = remap_node_id(*target_node_id, node_id_map)?;
+            }
+            desc.probe_target_node_ids.sort_unstable();
+            desc.probe_target_node_ids.dedup();
         }
         for probes in rf_plan.probe_side_filters.values_mut() {
             for (_, probe_node_id) in probes {

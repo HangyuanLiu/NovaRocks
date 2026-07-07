@@ -42,3 +42,13 @@ pub(crate) struct WiredRuntimeFilterProbe {
     pub probe_expr: TypedExpr,
     pub source_fragment_id: FragmentId,
 }
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlannedRuntimeFilter {
+    pub filter_id: i32,
+    pub build_plan_node_id: i32,
+    pub probe_target_node_ids: Vec<i32>,
+    pub has_remote_targets: bool,
+    pub execution_mode: JoinExecutionMode,
+    pub expr_order: i32,
+}

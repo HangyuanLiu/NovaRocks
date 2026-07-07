@@ -116,16 +116,15 @@ pub(crate) struct MultiFragmentBuildResult {
     pub rf_plan: Option<RuntimeFilterPlanResult>,
 }
 
-/// Result of lowering runtime-filter annotations to thrift.
+/// Result of lowering runtime-filter annotations to execution wiring.
 ///
 /// Assembled by [`fragment_builder::PlanFragmentBuilder`] directly from the
 /// `RuntimeFilterDesc` / `RuntimeFilterProbe` annotations attached to the
 /// physical plan by `runtime_filter_pass`. Consumed by the execution
 /// coordinator (`setup_runtime_filter_params`).
 pub(crate) struct RuntimeFilterPlanResult {
-    /// filter_id -> RF description.
-    pub all_filters:
-        std::collections::HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>,
+    /// filter_id -> native RF descriptor for coordinator-side wiring.
+    pub all_filters: std::collections::HashMap<i32, crate::sql::planner::PlannedRuntimeFilter>,
     /// fragment_id -> build-side filter IDs in that fragment.
     pub build_side_filters: std::collections::HashMap<FragmentId, Vec<i32>>,
     /// fragment_id -> (filter_id, probe_target_node_id) for probe-side targets.
