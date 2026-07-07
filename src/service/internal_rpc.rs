@@ -502,6 +502,8 @@ mod tests {
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     #[cfg(feature = "compat")]
+    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
+    #[cfg(feature = "compat")]
     use crate::service::internal_rpc_client;
     use crate::thrift::descriptors;
     use crate::thrift::types;
@@ -512,6 +514,13 @@ mod tests {
 
     fn common_unique_id(hi: i64, lo: i64) -> proto::common::UniqueId {
         proto::common::UniqueId { hi, lo }
+    }
+
+    #[cfg(feature = "compat")]
+    fn runtime_filter_params_from_thrift_fixture(
+        params: crate::thrift::runtime_filter::TRuntimeFilterParams,
+    ) -> RuntimeFilterParams {
+        RuntimeFilterParams::from_thrift(&params).expect("runtime filter params")
     }
 
     fn ok_status(status: Option<&proto::starrocks::StatusPb>) -> bool {
@@ -729,21 +738,23 @@ mod tests {
         query_context_manager()
             .set_runtime_filter_params(
                 query_id,
-                crate::thrift::runtime_filter::TRuntimeFilterParams {
-                    id_to_prober_params: Some(BTreeMap::from([(
-                        7,
-                        vec![crate::thrift::runtime_filter::TRuntimeFilterProberParams {
-                            fragment_instance_id: None,
-                            fragment_instance_address: Some(types::TNetworkAddress::new(
-                                "probe-host".to_string(),
-                                9010,
-                            )),
-                        }],
-                    )])),
-                    runtime_filter_builder_number: Some(BTreeMap::from([(7, 2)])),
-                    runtime_filter_max_size: None,
-                    skew_join_runtime_filters: None,
-                },
+                runtime_filter_params_from_thrift_fixture(
+                    crate::thrift::runtime_filter::TRuntimeFilterParams {
+                        id_to_prober_params: Some(BTreeMap::from([(
+                            7,
+                            vec![crate::thrift::runtime_filter::TRuntimeFilterProberParams {
+                                fragment_instance_id: Some(types::TUniqueId::new(700, 701)),
+                                fragment_instance_address: Some(types::TNetworkAddress::new(
+                                    "probe-host".to_string(),
+                                    9010,
+                                )),
+                            }],
+                        )])),
+                        runtime_filter_builder_number: Some(BTreeMap::from([(7, 2)])),
+                        runtime_filter_max_size: None,
+                        skew_join_runtime_filters: None,
+                    },
+                ),
             )
             .expect("set runtime filter params");
 
@@ -806,21 +817,23 @@ mod tests {
         query_context_manager()
             .set_runtime_filter_params(
                 query_id,
-                crate::thrift::runtime_filter::TRuntimeFilterParams {
-                    id_to_prober_params: Some(BTreeMap::from([(
-                        9,
-                        vec![crate::thrift::runtime_filter::TRuntimeFilterProberParams {
-                            fragment_instance_id: None,
-                            fragment_instance_address: Some(types::TNetworkAddress::new(
-                                "probe-host".to_string(),
-                                9010,
-                            )),
-                        }],
-                    )])),
-                    runtime_filter_builder_number: Some(BTreeMap::from([(9, 2)])),
-                    runtime_filter_max_size: None,
-                    skew_join_runtime_filters: None,
-                },
+                runtime_filter_params_from_thrift_fixture(
+                    crate::thrift::runtime_filter::TRuntimeFilterParams {
+                        id_to_prober_params: Some(BTreeMap::from([(
+                            9,
+                            vec![crate::thrift::runtime_filter::TRuntimeFilterProberParams {
+                                fragment_instance_id: Some(types::TUniqueId::new(900, 901)),
+                                fragment_instance_address: Some(types::TNetworkAddress::new(
+                                    "probe-host".to_string(),
+                                    9010,
+                                )),
+                            }],
+                        )])),
+                        runtime_filter_builder_number: Some(BTreeMap::from([(9, 2)])),
+                        runtime_filter_max_size: None,
+                        skew_join_runtime_filters: None,
+                    },
+                ),
             )
             .expect("set runtime filter params");
 
@@ -926,21 +939,23 @@ mod tests {
         query_context_manager()
             .set_runtime_filter_params(
                 query_id,
-                crate::thrift::runtime_filter::TRuntimeFilterParams {
-                    id_to_prober_params: Some(BTreeMap::from([(
-                        10,
-                        vec![crate::thrift::runtime_filter::TRuntimeFilterProberParams {
-                            fragment_instance_id: None,
-                            fragment_instance_address: Some(types::TNetworkAddress::new(
-                                "probe-host".to_string(),
-                                9010,
-                            )),
-                        }],
-                    )])),
-                    runtime_filter_builder_number: Some(BTreeMap::from([(10, 2)])),
-                    runtime_filter_max_size: None,
-                    skew_join_runtime_filters: None,
-                },
+                runtime_filter_params_from_thrift_fixture(
+                    crate::thrift::runtime_filter::TRuntimeFilterParams {
+                        id_to_prober_params: Some(BTreeMap::from([(
+                            10,
+                            vec![crate::thrift::runtime_filter::TRuntimeFilterProberParams {
+                                fragment_instance_id: Some(types::TUniqueId::new(1000, 1001)),
+                                fragment_instance_address: Some(types::TNetworkAddress::new(
+                                    "probe-host".to_string(),
+                                    9010,
+                                )),
+                            }],
+                        )])),
+                        runtime_filter_builder_number: Some(BTreeMap::from([(10, 2)])),
+                        runtime_filter_max_size: None,
+                        skew_join_runtime_filters: None,
+                    },
+                ),
             )
             .expect("set runtime filter params");
         assert!(

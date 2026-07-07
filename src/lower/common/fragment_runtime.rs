@@ -27,7 +27,8 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
-use crate::runtime::runtime_state::{RuntimeFilterParams, RuntimeState};
+use crate::runtime::runtime_filter_params::RuntimeFilterParams;
+use crate::runtime::runtime_state::RuntimeState;
 
 pub(crate) struct RuntimeStateInputs {
     pub(crate) query_options: Option<QueryOptions>,

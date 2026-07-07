@@ -34,6 +34,7 @@ use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher, FragmentSubmi
 use crate::runtime::exec_params::{ExecPlanFragmentParamOptions, build_exec_plan_fragment_params};
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
+use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::scheduler::{
     FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
 };
@@ -48,7 +49,6 @@ use crate::sql::codegen::{
 use crate::thrift::data_sinks;
 use crate::thrift::partitions;
 use crate::thrift::planner;
-use crate::thrift::runtime_filter;
 use crate::thrift::types;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
@@ -473,11 +473,12 @@ impl ExecutionCoordinator {
                 exec_params.per_exch_num_senders = placement.per_exch_num_senders.clone();
                 exec_params.destinations = exec_destinations;
                 if let Some(rf) = rf_plan.as_ref() {
-                    exec_params.runtime_filter_params = Some(build_instance_runtime_filter_params(
+                    let rf_params = build_instance_runtime_filter_params(
                         rf,
                         &placement.runtime_filter_prober_params,
                         &instance_counts,
-                    ));
+                    );
+                    exec_params.runtime_filter_params = Some(rf_params.to_thrift());
                 }
 
                 let compact_query_options = query_options.as_ref().map(QueryOptions::to_thrift);
@@ -1936,8 +1937,8 @@ fn native_data_partition_from_thrift_with_exprs(
     })
 }
 
-/// Assemble the per-instance `TRuntimeFilterParams` from scheduler-provided
-/// prober params plus the global builder-number map.
+/// Assemble the per-instance runtime filter routing params from
+/// scheduler-provided prober params plus the global builder-number map.
 ///
 /// `instance_counts` maps fragment id to the number of instances the scheduler
 /// assigned to it. For each build fragment, every filter id it produces must
@@ -1952,31 +1953,12 @@ fn build_instance_runtime_filter_params(
         Vec<crate::runtime::endpoint::RuntimeFilterProberDestination>,
     >,
     instance_counts: &BTreeMap<FragmentId, usize>,
-) -> runtime_filter::TRuntimeFilterParams {
-    let thrift_probers: BTreeMap<i32, Vec<runtime_filter::TRuntimeFilterProberParams>> =
-        id_to_prober_params
-            .iter()
-            .map(|(filter_id, probers)| {
-                (
-                    *filter_id,
-                    probers
-                        .iter()
-                        .map(|prober| {
-                            runtime_filter::TRuntimeFilterProberParams::new(
-                                Some(prober.fragment_instance_id().clone()),
-                                Some(prober.endpoint().to_network_address()),
-                            )
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
+) -> RuntimeFilterParams {
     let builder_number = runtime_filter_builder_number_for_instance(Some(rf_plan), instance_counts);
-    runtime_filter::TRuntimeFilterParams::new(
-        (!thrift_probers.is_empty()).then_some(thrift_probers),
-        (!builder_number.is_empty()).then_some(builder_number),
+    RuntimeFilterParams::new(
+        id_to_prober_params.clone(),
+        builder_number,
         Some(16_i64 * 1024 * 1024),
-        None::<std::collections::BTreeSet<i32>>,
     )
 }
 

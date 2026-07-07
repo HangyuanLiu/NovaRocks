@@ -644,20 +644,14 @@ mod tests {
         )
         .expect("runtime filter params");
 
-        assert_eq!(rf.runtime_filter_max_size, Some(4096));
-        assert_eq!(rf.runtime_filter_builder_number.unwrap().get(&3), Some(&2));
-        let prober = &rf.id_to_prober_params.unwrap()[&3][0];
+        assert_eq!(rf.runtime_filter_max_size(), Some(4096));
+        assert_eq!(rf.runtime_filter_builder_number().get(&3), Some(&2));
+        let prober = &rf.id_to_prober_params()[&3][0];
         assert_eq!(
-            prober.fragment_instance_id,
-            Some(native_wire::UniqueId::new(1, 2))
+            prober.fragment_instance_id(),
+            &native_wire::UniqueId::new(1, 2)
         );
-        assert_eq!(
-            prober.fragment_instance_address,
-            Some(native_wire::NetworkAddress::new(
-                "127.0.0.1".to_string(),
-                9050
-            ))
-        );
+        assert_eq!(prober.endpoint().as_host_port(), "127.0.0.1:9050");
     }
 
     #[test]

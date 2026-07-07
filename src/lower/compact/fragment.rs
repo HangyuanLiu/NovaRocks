@@ -44,6 +44,7 @@ use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::query_options::QueryOptions;
+use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
 
 fn merge_row_pos_descs(
@@ -195,7 +196,10 @@ pub(crate) fn execute_fragment(
         hi: params.query_id.hi,
         lo: params.query_id.lo,
     });
-    let runtime_filter_params = exec_params.and_then(|params| params.runtime_filter_params.clone());
+    let runtime_filter_params = exec_params
+        .and_then(|params| params.runtime_filter_params.as_ref())
+        .map(RuntimeFilterParams::from_thrift)
+        .transpose()?;
     let fragment_instance_id = exec_params.map(|params| UniqueId {
         hi: params.fragment_instance_id.hi,
         lo: params.fragment_instance_id.lo,

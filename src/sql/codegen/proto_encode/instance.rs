@@ -5,6 +5,7 @@ use crate::runtime::endpoint::{
     FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
 };
 use crate::runtime::query_options::QueryOptions;
+use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::scan_range;
 use crate::runtime::scheduler::FragmentInstancePlacement;
 use crate::thrift::types;
@@ -193,43 +194,15 @@ fn encode_runtime_filter_params(
     runtime_filter_builder_number: &BTreeMap<i32, i32>,
     runtime_filter_max_size: i64,
 ) -> Result<Option<novarocks::RuntimeFilterParams>, String> {
-    if prober_params.is_empty()
-        && runtime_filter_builder_number.is_empty()
-        && runtime_filter_max_size == 0
-    {
+    let params = RuntimeFilterParams::new(
+        prober_params.clone(),
+        runtime_filter_builder_number.clone(),
+        (runtime_filter_max_size > 0).then_some(runtime_filter_max_size),
+    );
+    if params.is_empty() {
         return Ok(None);
     }
-
-    Ok(Some(novarocks::RuntimeFilterParams {
-        id_to_prober_params: prober_params
-            .iter()
-            .map(|(filter_id, params)| {
-                Ok((
-                    *filter_id,
-                    novarocks::ProberParamsList {
-                        params: params
-                            .iter()
-                            .map(encode_prober_params)
-                            .collect::<Result<Vec<_>, _>>()?,
-                    },
-                ))
-            })
-            .collect::<Result<HashMap<_, _>, String>>()?,
-        runtime_filter_builder_number: runtime_filter_builder_number
-            .iter()
-            .map(|(filter_id, count)| (*filter_id, *count))
-            .collect(),
-        runtime_filter_max_size,
-    }))
-}
-
-fn encode_prober_params(
-    src: &RuntimeFilterProberDestination,
-) -> Result<novarocks::ProberParams, String> {
-    Ok(novarocks::ProberParams {
-        fragment_instance_id: Some(encode_unique_id(src.fragment_instance_id())),
-        grpc_endpoint: src.endpoint().as_host_port(),
-    })
+    Ok(Some(params.to_native()))
 }
 
 fn encode_query_options(src: &QueryOptions) -> novarocks::QueryOptions {

@@ -50,6 +50,7 @@ pub(crate) mod write_coordinator_compat;
 pub mod result_buffer;
 pub mod runtime_filter_hub;
 pub mod runtime_filter_observability;
+pub(crate) mod runtime_filter_params;
 pub mod runtime_filter_worker;
 pub mod runtime_state;
 pub mod scan_executor;

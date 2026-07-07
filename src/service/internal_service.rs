@@ -37,6 +37,7 @@ use crate::runtime::query_context::{
 };
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::result_buffer;
+use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::service::fe_report;
 use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
 
@@ -693,6 +694,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         backfill_per_node_scan_ranges(&mut exec_params);
         validate_internal_addresses(&exec_params, Some(&fragment))?;
         if let Some(params) = exec_params.runtime_filter_params.clone() {
+            let params = RuntimeFilterParams::from_thrift(&params)?;
             let _ = mgr.set_runtime_filter_params(query_id, params);
         }
         spawn_exec_fragment(
@@ -865,6 +867,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     backfill_per_node_scan_ranges(&mut params);
     validate_internal_addresses(&params, Some(&fragment))?;
     if let Some(rf_params) = params.runtime_filter_params.clone() {
+        let rf_params = RuntimeFilterParams::from_thrift(&rf_params)?;
         let _ = mgr.set_runtime_filter_params(query_id, rf_params);
     }
     spawn_exec_fragment(
@@ -953,6 +956,7 @@ pub(crate) fn execute_plan_fragment_sync(
     backfill_per_node_scan_ranges(&mut params);
     validate_internal_addresses(&params, Some(&fragment))?;
     if let Some(rf_params) = params.runtime_filter_params.clone() {
+        let rf_params = RuntimeFilterParams::from_thrift(&rf_params)?;
         let _ = mgr.set_runtime_filter_params(query_id, rf_params);
     }
 
@@ -1031,7 +1035,7 @@ mod tests {
                 id_to_prober_params: Some(BTreeMap::from([(
                     7,
                     vec![runtime_filter::TRuntimeFilterProberParams {
-                        fragment_instance_id: None,
+                        fragment_instance_id: Some(unique_id(7, 8)),
                         fragment_instance_address: prober,
                     }],
                 )])),

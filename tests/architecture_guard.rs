@@ -228,6 +228,43 @@ fn nidl_d3g_native_runtime_query_options_do_not_use_thrift_model() {
     }
 }
 
+#[test]
+fn nidl_d3h_native_runtime_filter_params_do_not_use_thrift_model() {
+    let repo = Path::new(manifest_dir());
+    let guarded_files = [
+        "src/runtime/runtime_state.rs",
+        "src/runtime/query_context.rs",
+        "src/runtime/native_fragment_wire.rs",
+        "src/runtime/coordinator.rs",
+        "src/sql/codegen/proto_encode/instance.rs",
+        "src/lower/common/fragment_runtime.rs",
+        "src/exec/operators/hashjoin/hash_join_build_sink.rs",
+        "src/runtime/runtime_filter_worker.rs",
+    ];
+    let forbidden = [
+        "TRuntimeFilterParams",
+        "TRuntimeFilterProberParams",
+        "runtime_filter::TRuntimeFilterParams",
+        "runtime_filter::TRuntimeFilterProberParams",
+    ];
+    let mut violations = Vec::new();
+
+    for rel_path in guarded_files {
+        let path = repo.join(rel_path);
+        for (line, text) in source_line_hits(&path, |line| {
+            forbidden.iter().any(|symbol| line.contains(symbol))
+        }) {
+            violations.push(format!("{rel_path}:{line}: {text}"));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "native runtime filter params must use runtime::runtime_filter_params::RuntimeFilterParams, not thrift runtime filter models:\n{}",
+        violations.join("\n")
+    );
+}
+
 fn rs_files_under(relative_roots: &[&str]) -> Vec<PathBuf> {
     let repo = Path::new(manifest_dir());
     let mut files = Vec::new();
