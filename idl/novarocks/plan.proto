@@ -269,7 +269,7 @@ message DataStreamSink {
 // sink, such as multicast.
 message StreamDestination {
   novarocks.common.UniqueId finst_id = 1;
-  string grpc_endpoint = 2;
+  string endpoint = 2;  // NovaRocks gRPC runtime endpoint host:port.
 }
 
 message StreamDestinationList {

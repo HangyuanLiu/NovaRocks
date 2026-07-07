@@ -357,7 +357,7 @@ impl ExecutionCoordinator {
                     let exec_destinations = placement
                         .destinations
                         .iter()
-                        .map(thrift_destination_from_native)
+                        .map(exec_destination_from_runtime)
                         .collect();
                     (
                         output_sink,
@@ -416,7 +416,7 @@ impl ExecutionCoordinator {
                                 )
                             })?
                             .iter()
-                            .map(thrift_destination_from_native)
+                            .map(exec_destination_from_runtime)
                             .collect();
                         destinations.push(dests);
                     }
@@ -1121,7 +1121,7 @@ fn wrap_iceberg_change_stream_router_sink(
                     placement.finst_id.clone(),
                     placement.endpoint.clone(),
                 );
-                thrift_destination_from_native(&destination)
+                exec_destination_from_runtime(&destination)
             })
             .collect();
 
@@ -1872,7 +1872,7 @@ fn patch_native_cte_multicast_sink(
     Ok(())
 }
 
-fn thrift_destination_from_native(
+fn exec_destination_from_runtime(
     src: &crate::runtime::endpoint::FragmentDestination,
 ) -> data_sinks::TPlanFragmentDestination {
     data_sinks::TPlanFragmentDestination::new(
@@ -1891,7 +1891,7 @@ fn native_stream_destination(
             hi: src.finst_id().hi,
             lo: src.finst_id().lo,
         }),
-        grpc_endpoint: src.endpoint().as_host_port(),
+        endpoint: src.endpoint().as_host_port(),
     }
 }
 

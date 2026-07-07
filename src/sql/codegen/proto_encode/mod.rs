@@ -1285,7 +1285,7 @@ mod tests {
         );
         assert_eq!(encoded.backend_num, 5);
         assert_eq!(encoded.per_exch_num_senders.get(&42), Some(&2));
-        assert_eq!(encoded.destinations[0].grpc_endpoint, "10.0.0.9:8060");
+        assert_eq!(encoded.destinations[0].endpoint, "10.0.0.9:8060");
         assert_eq!(encoded.report_endpoint.as_deref(), Some("127.0.0.1:9030"));
         assert!(encoded.typed_result_sink);
         let encoded_range = &encoded.per_node_scan_ranges[&11].ranges[0];
@@ -1318,7 +1318,7 @@ mod tests {
             .expect("runtime filter params");
         assert_eq!(rf.runtime_filter_builder_number.get(&9), Some(&3));
         assert_eq!(
-            rf.id_to_prober_params[&9].params[0].grpc_endpoint,
+            rf.id_to_prober_params[&9].params[0].endpoint,
             "10.0.0.30:8060"
         );
         let opts = encoded.query_options.as_ref().expect("query options");

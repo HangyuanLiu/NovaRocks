@@ -216,7 +216,7 @@ fn prober_params_from_native(
         .ok_or_else(|| "native ProberParams missing fragment_instance_id".to_string())?;
     Ok(RuntimeFilterProberDestination::new(
         types::TUniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo),
-        RuntimeEndpoint::parse(&src.grpc_endpoint)?,
+        RuntimeEndpoint::parse(&src.endpoint)?,
     ))
 }
 
@@ -226,7 +226,7 @@ fn prober_params_to_native(src: &RuntimeFilterProberDestination) -> novarocks::P
             hi: src.fragment_instance_id().hi,
             lo: src.fragment_instance_id().lo,
         }),
-        grpc_endpoint: src.endpoint().as_host_port(),
+        endpoint: src.endpoint().as_host_port(),
     }
 }
 
@@ -367,7 +367,7 @@ mod tests {
                 novarocks::ProberParamsList {
                     params: vec![novarocks::ProberParams {
                         fragment_instance_id: None,
-                        grpc_endpoint: "10.0.0.19:8060".to_string(),
+                        endpoint: "10.0.0.19:8060".to_string(),
                     }],
                 },
             )]
@@ -389,7 +389,7 @@ mod tests {
                 novarocks::ProberParamsList {
                     params: vec![novarocks::ProberParams {
                         fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
-                        grpc_endpoint: String::new(),
+                        endpoint: String::new(),
                     }],
                 },
             )]

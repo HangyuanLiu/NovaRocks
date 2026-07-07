@@ -169,7 +169,7 @@ fn release_runtime_filter_params() -> novarocks::RuntimeFilterParams {
             novarocks::ProberParamsList {
                 params: vec![novarocks::ProberParams {
                     fragment_instance_id: Some(id(5, 6)),
-                    grpc_endpoint: "10.0.0.9:9060".to_string(),
+                    endpoint: "10.0.0.9:9060".to_string(),
                 }],
             },
         )]),
@@ -232,7 +232,7 @@ fn release_scan_range() -> novarocks::ScanRangeParams {
 fn release_destination() -> novarocks::Destination {
     novarocks::Destination {
         finst_id: Some(id(3, 4)),
-        grpc_endpoint: "10.0.0.8:8060".to_string(),
+        endpoint: "10.0.0.8:8060".to_string(),
     }
 }
 

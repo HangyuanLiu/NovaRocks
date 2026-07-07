@@ -168,7 +168,7 @@ message DatacacheOptions {
 // Native runtime destination for one fragment instance.
 message Destination {
   novarocks.common.UniqueId finst_id = 1;
-  string grpc_endpoint = 2;  // NovaRocks gRPC runtime endpoint host:port.
+  string endpoint = 2;  // NovaRocks gRPC runtime endpoint host:port.
 }
 
 // Native per-instance runtime filter routing parameters.
@@ -184,7 +184,7 @@ message ProberParamsList {
 
 message ProberParams {
   novarocks.common.UniqueId fragment_instance_id = 1;
-  string grpc_endpoint = 2;
+  string endpoint = 2;  // NovaRocks gRPC runtime endpoint host:port.
 }
 
 // Query options consumed by NovaRocks native runtime.

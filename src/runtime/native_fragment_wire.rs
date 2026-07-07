@@ -64,7 +64,7 @@ pub(crate) fn destination_from_native(
         .ok_or_else(|| "native Destination missing finst_id".to_string())?;
     Ok(FragmentDestination::new(
         types::TUniqueId::new(finst_id.hi, finst_id.lo),
-        endpoint_from_native(&src.grpc_endpoint)?,
+        endpoint_from_native(&src.endpoint)?,
     ))
 }
 
@@ -169,7 +169,7 @@ pub(crate) fn stream_destination_from_native(
         .ok_or_else(|| "native StreamDestination missing finst_id".to_string())?;
     Ok(FragmentDestination::new(
         types::TUniqueId::new(finst_id.hi, finst_id.lo),
-        endpoint_from_native(&src.grpc_endpoint)?,
+        endpoint_from_native(&src.endpoint)?,
     ))
 }
 
