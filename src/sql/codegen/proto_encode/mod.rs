@@ -1643,7 +1643,7 @@ mod tests {
                         max_float_value: None,
                     },
                 )])),
-                extended_columns: None,
+                compat_change_op_slot_id: None,
             },
         );
         scan_range.volume_id = Some(13);

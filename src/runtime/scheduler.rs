@@ -675,7 +675,7 @@ mod tests {
                 use_iceberg_jni_metadata_reader: false,
                 ivm_change_op: None,
                 file_pruning_min_max_values: None,
-                extended_columns: None,
+                compat_change_op_slot_id: None,
             },
         );
         params.volume_id = Some(marker);

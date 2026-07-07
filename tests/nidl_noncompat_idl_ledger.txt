@@ -31,6 +31,7 @@ src/engine/query_options_wire.rs
 src/exec/chunk/schema_thrift.rs
 src/exec/node/fetch.rs
 src/exec/operators/data_stream_sink.rs
+src/exec/operators/exchange_source.rs
 src/exec/operators/fetch_processor.rs
 src/exec/operators/iceberg_change_stream_router_sink.rs
 src/exec/operators/multi_cast_data_stream_sink.rs
@@ -96,13 +97,10 @@ src/runtime/descriptor_snapshot_thrift.rs
 src/runtime/dispatcher.rs
 src/runtime/endpoint.rs
 src/runtime/exec_params.rs
-src/runtime/fragment_exec_params.rs
 src/runtime/native_fragment_wire.rs
 src/runtime/query_context.rs
-src/runtime/query_options.rs
-src/runtime/runtime_filter_params.rs
+src/runtime/result_buffer.rs
 src/runtime/runtime_state.rs
-src/runtime/scan_range.rs
 src/runtime/scheduler.rs
 src/runtime/sink_commit.rs
 src/runtime/sink_commit_wire.rs

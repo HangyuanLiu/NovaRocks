@@ -52,6 +52,14 @@ fn brace_delta(line: &str) -> isize {
     })
 }
 
+fn paren_delta(line: &str) -> isize {
+    line.chars().fold(0, |delta, ch| match ch {
+        '(' => delta + 1,
+        ')' => delta - 1,
+        _ => delta,
+    })
+}
+
 fn is_comment_or_blank(line: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed.is_empty()
@@ -261,6 +269,7 @@ fn rust_production_text_without_cfg_test_or_compat(text: &str) -> String {
     let mut pending_skip_attr = false;
     let mut skipping_cfg_item = false;
     let mut skip_depth = 0isize;
+    let mut skip_paren_depth = 0isize;
 
     for line in text.lines() {
         let trimmed = line.trim_start();
@@ -270,18 +279,22 @@ fn rust_production_text_without_cfg_test_or_compat(text: &str) -> String {
             if skip_depth <= 0 {
                 skip_depth = 0;
                 skipping_cfg_item = false;
+                skip_paren_depth = 0;
             }
             production.push('\n');
             continue;
         }
 
         if skipping_cfg_item {
+            skip_paren_depth += paren_delta(line);
             let delta = brace_delta(line);
             if line.contains('{') {
                 skip_depth = delta.max(0);
                 skipping_cfg_item = skip_depth > 0;
-            } else if trimmed.ends_with(';') || trimmed.ends_with(',') {
+                skip_paren_depth = 0;
+            } else if skip_paren_depth <= 0 && (trimmed.ends_with(';') || trimmed.ends_with(',')) {
                 skipping_cfg_item = false;
+                skip_paren_depth = 0;
             }
             production.push('\n');
             continue;
@@ -297,8 +310,10 @@ fn rust_production_text_without_cfg_test_or_compat(text: &str) -> String {
             if line.contains('{') {
                 skip_depth = delta.max(0);
                 skipping_cfg_item = skip_depth > 0;
+                skip_paren_depth = 0;
             } else if !trimmed.ends_with(';') && !trimmed.ends_with(',') {
                 skipping_cfg_item = true;
+                skip_paren_depth = paren_delta(line).max(0);
             }
             pending_skip_attr = false;
             production.push('\n');
@@ -5332,6 +5347,11 @@ fn nidl_e6_ledger_detector_ignores_compat_cfg_items() {
     )
     .unwrap();
     fs::write(
+        dir.join("compat_multiline_fn.rs"),
+        "#[cfg(feature = \"compat\")]\nfn compat_multiline(\n    _id: i32,\n) -> crate::thrift::types::TUniqueId {\n    crate::thrift::types::TUniqueId::new(1, 2)\n}\n",
+    )
+    .unwrap();
+    fs::write(
         dir.join("compat_mod.rs"),
         "#[cfg(feature = \"compat\")]\nmod compat_only {\n    use crate::proto::starrocks;\n}\n",
     )
@@ -5382,6 +5402,10 @@ fn nidl_e6_ledger_detector_ignores_compat_cfg_items() {
     assert!(
         !names.iter().any(|n| n == "compat_fn.rs"),
         "must ignore compat-only functions; got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "compat_multiline_fn.rs"),
+        "must ignore multiline compat-only functions; got {names:?}"
     );
     assert!(
         !names.iter().any(|n| n == "compat_mod.rs"),
@@ -6308,7 +6332,7 @@ fn nidl_e2_noncompat_code_does_not_import_starrocks_connector_or_format_modules(
 }
 
 #[test]
-fn nidl_e6_query_options_and_runtime_filter_adapters_are_compat_only() {
+fn nidl_e6_runtime_adapters_are_compat_only() {
     let repo = Path::new(manifest_dir());
     let guarded = [
         (
@@ -6326,6 +6350,17 @@ fn nidl_e6_query_options_and_runtime_filter_adapters_are_compat_only() {
                 "crate::thrift",
                 "runtime_filter::TRuntimeFilterParams",
                 "runtime_filter::TRuntimeFilterProberParams",
+            ][..],
+        ),
+        (
+            "src/runtime/scan_range.rs",
+            &[
+                "crate::thrift",
+                "descriptors::",
+                "exprs::",
+                "internal_service::",
+                "plan_nodes::",
+                "types::",
             ][..],
         ),
     ];

@@ -165,6 +165,7 @@ pub(crate) fn stream_destinations_from_native(
         .collect()
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn multi_cast_data_stream_sink_from_native(
     src: &proto::plan::MultiCastDataStreamSink,
 ) -> Result<MultiCastDataStreamSink, String> {

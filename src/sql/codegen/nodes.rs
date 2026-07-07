@@ -2,13 +2,17 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::common::types::UniqueId;
+#[cfg(feature = "compat")]
 use crate::connector::scan_planning::ConnectorScanPlanner;
 use crate::lower::compat::expr::parse_min_max_conjuncts_with_column_resolver;
-use crate::runtime::fragment_exec_params::{FragmentExecParams, compat_exec_params_from_parts};
-use crate::sql::codegen::connector_scan_wire::{
-    ThriftScanContext, to_native_file_scan, to_thrift_scan,
-};
+use crate::runtime::fragment_exec_params::FragmentExecParams;
+#[cfg(feature = "compat")]
+use crate::runtime::fragment_exec_params::compat_exec_params_from_parts;
+#[cfg(feature = "compat")]
+use crate::sql::codegen::connector_scan_wire::to_thrift_scan;
+use crate::sql::codegen::connector_scan_wire::{ThriftScanContext, to_native_file_scan};
 use crate::thrift::exprs;
+#[cfg(feature = "compat")]
 use crate::thrift::internal_service;
 use crate::thrift::partitions;
 use crate::thrift::plan_nodes;
@@ -44,32 +48,39 @@ pub(crate) fn build_scan_node(
 ) -> Result<plan_nodes::TPlanNode, String> {
     match &resolved.table.source {
         ScanSource::StarRocks { .. } => {
-            let planned = resolved.planned_scan.as_ref().ok_or_else(|| {
-                format!(
-                    "StarRocks scan {}.{} reached build_scan_node without planned connector scan",
-                    resolved.database, resolved.table.name
-                )
-            })?;
-            let planner = connectors.scan_planner("starrocks")?;
-            let plan = to_thrift_scan(
-                planner.name(),
-                &planned.scan,
-                &planned.splits,
-                ThriftScanContext {
-                    database: resolved.database.clone(),
-                    table: resolved.table.name.clone(),
-                    node_id,
-                    scan_tuple_id,
-                    conjuncts,
-                    ..ThriftScanContext::default()
-                },
-            )?;
-            plan.node.ok_or_else(|| {
-                format!(
-                    "StarRocks to_thrift_scan returned no node for {}.{}",
-                    resolved.database, resolved.table.name
-                )
-            })
+            #[cfg(feature = "compat")]
+            {
+                let planned = resolved.planned_scan.as_ref().ok_or_else(|| {
+                    format!(
+                        "StarRocks scan {}.{} reached build_scan_node without planned connector scan",
+                        resolved.database, resolved.table.name
+                    )
+                })?;
+                let planner = connectors.scan_planner("starrocks")?;
+                let plan = to_thrift_scan(
+                    planner.name(),
+                    &planned.scan,
+                    &planned.splits,
+                    ThriftScanContext {
+                        database: resolved.database.clone(),
+                        table: resolved.table.name.clone(),
+                        node_id,
+                        scan_tuple_id,
+                        conjuncts,
+                        ..ThriftScanContext::default()
+                    },
+                )?;
+                plan.node.ok_or_else(|| {
+                    format!(
+                        "StarRocks to_thrift_scan returned no node for {}.{}",
+                        resolved.database, resolved.table.name
+                    )
+                })
+            }
+            #[cfg(not(feature = "compat"))]
+            {
+                Err("StarRocks scan nodes require feature compat".to_string())
+            }
         }
         ScanSource::IcebergDataFiles {
             cloud_properties, ..
@@ -586,6 +597,7 @@ pub(crate) fn build_sort_node_raw(
 // ---------------------------------------------------------------------------
 
 /// Build exec params for multiple scan nodes (used in JOIN queries).
+#[cfg(feature = "compat")]
 pub(crate) fn build_exec_params_multi(
     connectors: &crate::connector::ConnectorRegistry,
     scan_tables: &[PlannedScanTable],
@@ -594,6 +606,7 @@ pub(crate) fn build_exec_params_multi(
         .to_compat_exec_params()
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn build_exec_params_multi_with_refresh_context(
     connectors: &crate::connector::ConnectorRegistry,
     scan_tables: &[PlannedScanTable],
@@ -606,6 +619,7 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
 #[derive(Clone, Debug)]
 pub(crate) struct ScanRangeBuildResult {
     pub(crate) fragment_exec_params: FragmentExecParams,
+    #[cfg(feature = "compat")]
     compat_scan_ranges: BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
 }
 
@@ -616,6 +630,7 @@ impl ScanRangeBuildResult {
         self.fragment_exec_params.per_node_scan_ranges()
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn to_compat_exec_params(
         &self,
     ) -> Result<internal_service::TPlanFragmentExecParams, String> {
@@ -634,27 +649,37 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
     scan_tables: &[PlannedScanTable],
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<ScanRangeBuildResult, String> {
+    #[cfg(feature = "compat")]
     let mut per_node_scan_ranges = BTreeMap::new();
     let mut native_scan_ranges = BTreeMap::new();
 
     for planned in scan_tables {
         let scan_node_id = planned.scan_node_id;
         let resolved = &planned.resolved;
-        let (ranges, native_ranges, has_native_scan_ranges) = if matches!(
+        if matches!(
             resolved.table.source,
             crate::sql::catalog::ScanSource::StarRocks { .. }
         ) {
-            let planner = connectors.scan_planner("starrocks")?;
-            let ranges = build_starrocks_scan_ranges_from_planned_scan(planner.as_ref(), planned)?;
-            if ranges.is_empty() {
-                return Err(format!(
-                    "StarRocks table {}.{} has no selected tablet splits",
-                    resolved.database, resolved.table.name
-                ));
+            #[cfg(feature = "compat")]
+            {
+                let planner = connectors.scan_planner("starrocks")?;
+                let ranges =
+                    build_starrocks_scan_ranges_from_planned_scan(planner.as_ref(), planned)?;
+                if ranges.is_empty() {
+                    return Err(format!(
+                        "StarRocks table {}.{} has no selected tablet splits",
+                        resolved.database, resolved.table.name
+                    ));
+                }
+                per_node_scan_ranges.insert(scan_node_id, ranges);
+                continue;
             }
-            (ranges, Vec::new(), false)
+            #[cfg(not(feature = "compat"))]
+            {
+                return Err("StarRocks scan ranges require feature compat".to_string());
+            }
         } else {
-            match &resolved.table.source {
+            let native = match &resolved.table.source {
                 ScanSource::IcebergDataFiles {
                     cloud_properties, ..
                 } => {
@@ -681,12 +706,7 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
                             ..ThriftScanContext::default()
                         },
                     )?;
-                    let ranges = plan
-                        .scan_ranges
-                        .iter()
-                        .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    (ranges, plan.scan_ranges, true)
+                    plan.scan_ranges
                 }
                 ScanSource::IcebergMetadataTable { .. } => {
                     // The native iceberg-rust metadata scan operator
@@ -695,11 +715,7 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
                     // scan range so the runtime allocates a morsel and
                     // dispatches to `IcebergMetadataScanOp`.
                     let native = vec![build_iceberg_metadata_scan_range_params()];
-                    let ranges = native
-                        .iter()
-                        .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    (ranges, native, true)
+                    native
                 }
                 ScanSource::IcebergDeltaTable { .. } => {
                     // IVM delta-scan is a single-instance operator: the
@@ -707,11 +723,7 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
                     // from `plan_changes`, so we emit one placeholder
                     // morsel for the runtime to dispatch on.
                     let native = vec![build_iceberg_metadata_scan_range_params()];
-                    let ranges = native
-                        .iter()
-                        .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    (ranges, native, true)
+                    native
                 }
                 ScanSource::IcebergVersionTable { table, snapshot_id } => {
                     let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
@@ -720,11 +732,7 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
                     let source = refresh_ctx.version_scan_source(table, *snapshot_id)?;
                     let native =
                         build_iceberg_scan_ranges_from_source(connectors, planned, &source, None)?;
-                    let ranges = native
-                        .iter()
-                        .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    (ranges, native, true)
+                    native
                 }
                 ScanSource::IcebergMvTargetState(scan) => {
                     let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
@@ -738,11 +746,7 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
                         &source,
                         Some(projected_target_state_column_names(scan)),
                     )?;
-                    let ranges = native
-                        .iter()
-                        .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    (ranges, native, true)
+                    native
                 }
                 ScanSource::IcebergMvTargetLocator(scan) => {
                     let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
@@ -756,20 +760,21 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
                         &source,
                         Some(projected_target_locator_column_names(scan)),
                     )?;
-                    let ranges = native
-                        .iter()
-                        .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    (ranges, native, true)
+                    native
                 }
                 ScanSource::StarRocks { .. } => unreachable!(
                     "StarRocks scan source is handled by the planned-connector branch above"
                 ),
+            };
+            #[cfg(feature = "compat")]
+            {
+                let ranges = native
+                    .iter()
+                    .map(crate::runtime::scan_range::thrift_scan_range_params_from_native)
+                    .collect::<Result<Vec<_>, _>>()?;
+                per_node_scan_ranges.insert(scan_node_id, ranges);
             }
-        };
-        per_node_scan_ranges.insert(scan_node_id, ranges);
-        if has_native_scan_ranges {
-            native_scan_ranges.insert(scan_node_id, native_ranges);
+            native_scan_ranges.insert(scan_node_id, native);
         }
     }
 
@@ -783,6 +788,7 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
 
     Ok(ScanRangeBuildResult {
         fragment_exec_params,
+        #[cfg(feature = "compat")]
         compat_scan_ranges: per_node_scan_ranges,
     })
 }
@@ -974,6 +980,7 @@ pub(crate) fn planned_change_op_slot_from_state(
         })
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn build_starrocks_scan_ranges_from_planned_scan(
     planner: &dyn ConnectorScanPlanner,
     planned_table: &PlannedScanTable,
@@ -1031,12 +1038,127 @@ fn build_iceberg_metadata_scan_range_params() -> crate::runtime::scan_range::Sca
         use_iceberg_jni_metadata_reader: true,
         ivm_change_op: None,
         file_pruning_min_max_values: None,
-        extended_columns: None,
+        compat_change_op_slot_id: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_change_op_tag_records_plain_slot_metadata_without_thrift_expr() {
+        let native = crate::sql::codegen::connector_scan_wire::build_native_file_scan_range_params(
+            "s3://bucket/path/file.parquet",
+            1024,
+            0,
+            1024,
+            None,
+            None,
+            Some(crate::exec::change_op::CHANGE_OP_DELETE),
+            None,
+            Some(9),
+            &[],
+            None,
+        )
+        .expect("native scan range");
+        let crate::runtime::scan_range::ScanRange::File(file) = native.range;
+        assert_eq!(
+            file.ivm_change_op,
+            Some(crate::exec::change_op::CHANGE_OP_DELETE)
+        );
+        assert_eq!(file.compat_change_op_slot_id, Some(9));
+    }
+
+    #[test]
+    fn projected_target_state_uses_contract_row_id_column_name() {
+        let scan = test_target_state_scan();
+
+        assert_eq!(
+            super::projected_target_state_column_names(&scan),
+            vec![
+                "__row_id__".to_string(),
+                "k".to_string(),
+                "sum_v".to_string(),
+                "_file".to_string(),
+                "_pos".to_string(),
+                "_row_id".to_string(),
+                "_last_updated_sequence_number".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn projected_target_state_columns_include_branch_scope_column() {
+        let mut scan = test_target_state_scan();
+        scan.row_filter = crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            row_id_column_name: "__row_id__".to_string(),
+            branch_scope: Some(crate::sql::catalog::BranchScope {
+                branch_id_column_name: "__branch_id__".to_string(),
+                branch_id: 1,
+            }),
+        };
+        let projected = super::projected_target_state_column_names(&scan);
+        assert!(projected.iter().any(|name| name == "__branch_id__"));
+    }
+
+    fn test_target_state_scan() -> crate::sql::catalog::IcebergMvTargetStateScan {
+        crate::sql::catalog::IcebergMvTargetStateScan {
+            catalog: "ice".to_string(),
+            database: "db".to_string(),
+            table: "mv_b".to_string(),
+            target_table_uuid: "target-uuid".to_string(),
+            target_snapshot_id: Some(123),
+            aggregate_state_layout_version: 1,
+            columns: vec![
+                crate::sql::catalog::ColumnDef {
+                    name: "__row_id__".to_string(),
+                    data_type: arrow::datatypes::DataType::Utf8,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                crate::sql::catalog::ColumnDef {
+                    name: "k".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                crate::sql::catalog::ColumnDef {
+                    name: "visible_sum".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                },
+                crate::sql::catalog::ColumnDef {
+                    name: "sum_v".to_string(),
+                    data_type: arrow::datatypes::DataType::Binary,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+            ],
+            group_key_names: vec!["k".to_string()],
+            aggregate_state_names: vec!["sum_v".to_string()],
+            physical_column_names: vec![
+                "__row_id__".to_string(),
+                "k".to_string(),
+                "visible_sum".to_string(),
+                "sum_v".to_string(),
+            ],
+            row_id_column_name: "__row_id__".to_string(),
+            row_filter: crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name: "__row_id__".to_string(),
+                branch_scope: None,
+            },
+            partition_constraint:
+                crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "compat"))]
+mod compat_tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 

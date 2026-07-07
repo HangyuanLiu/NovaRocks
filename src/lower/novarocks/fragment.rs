@@ -20,16 +20,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "compat")]
 use super::expr::lower_proto_expr;
 use super::node::{NodeLoweringContext, lower_proto_node};
 use crate::common::config::debug_exec_node_output;
 use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
+#[cfg(feature = "compat")]
 use crate::exec::operators::{
-    DataStreamSinkFactory, IcebergChangeStreamRouterSinkFactory, IcebergTableSinkFactory,
-    MultiCastDataStreamSinkFactory, NoopSinkFactory, ResultBufferSinkFactory,
+    DataStreamSinkFactory, IcebergChangeStreamRouterSinkFactory, MultiCastDataStreamSinkFactory,
 };
+use crate::exec::operators::{IcebergTableSinkFactory, NoopSinkFactory, ResultBufferSinkFactory};
 use crate::exec::pipeline::executor::execute_plan_with_pipeline;
 use crate::lower::common::fragment_runtime::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
@@ -237,6 +239,8 @@ fn sink_factory_from_native(
     typed_result_sink: bool,
     layout: &super::layout::Layout,
 ) -> Result<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>, String> {
+    #[cfg(not(feature = "compat"))]
+    let _ = instance_params;
     let kind = sink
         .kind
         .as_ref()
@@ -263,44 +267,63 @@ fn sink_factory_from_native(
             Err("native NOOP sink marker must be true".to_string())
         }
         proto::plan::data_sink::Kind::DataStream(stream) => {
-            let mut partition_arena = ExprArena::default();
-            let partition_exprs = stream
-                .output_partition
-                .as_ref()
-                .ok_or_else(|| "native DATA_STREAM_SINK missing output_partition".to_string())?
-                .exprs
-                .iter()
-                .enumerate()
-                .map(|(idx, expr)| {
-                    lower_proto_expr(expr, &mut partition_arena, layout).map_err(|err| {
-                        format!("native DATA_STREAM_SINK partition expr[{idx}]: {err}")
+            #[cfg(not(feature = "compat"))]
+            {
+                let _ = stream;
+                Err("native DATA_STREAM_SINK compat exec params require feature compat".to_string())
+            }
+            #[cfg(feature = "compat")]
+            {
+                let mut partition_arena = ExprArena::default();
+                let partition_exprs = stream
+                    .output_partition
+                    .as_ref()
+                    .ok_or_else(|| "native DATA_STREAM_SINK missing output_partition".to_string())?
+                    .exprs
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, expr)| {
+                        lower_proto_expr(expr, &mut partition_arena, layout).map_err(|err| {
+                            format!("native DATA_STREAM_SINK partition expr[{idx}]: {err}")
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let stream_sink = native_wire::data_stream_sink_from_native(stream)?;
-            let destinations =
-                native_wire::destinations_from_native(&instance_params.destinations)?;
-            let exec_params = native_wire::exec_params_from_native(instance_params, destinations)?
-                .to_compat_exec_params()?;
-            let root_plan_node_id = fragment
-                .root
-                .as_ref()
-                .map(|node| node.node_id)
-                .unwrap_or(-1);
-            Ok(Box::new(
-                DataStreamSinkFactory::new_with_pre_lowered_partition(
-                    stream_sink,
-                    exec_params,
-                    root_plan_node_id,
-                    partition_arena,
-                    partition_exprs,
-                    None,
-                    None,
-                ),
-            ))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let stream_sink = native_wire::data_stream_sink_from_native(stream)?;
+                let destinations =
+                    native_wire::destinations_from_native(&instance_params.destinations)?;
+                let exec_params =
+                    native_wire::exec_params_from_native(instance_params, destinations)?
+                        .to_compat_exec_params()?;
+                let root_plan_node_id = fragment
+                    .root
+                    .as_ref()
+                    .map(|node| node.node_id)
+                    .unwrap_or(-1);
+                Ok(Box::new(
+                    DataStreamSinkFactory::new_with_pre_lowered_partition(
+                        stream_sink,
+                        exec_params,
+                        root_plan_node_id,
+                        partition_arena,
+                        partition_exprs,
+                        None,
+                        None,
+                    ),
+                ))
+            }
         }
         proto::plan::data_sink::Kind::MultiCastDataStream(multi_cast) => {
-            let pre_lowered_partitions = multi_cast
+            #[cfg(not(feature = "compat"))]
+            {
+                let _ = multi_cast;
+                Err(
+                    "native MULTI_CAST_DATA_STREAM_SINK compat exec params require feature compat"
+                        .to_string(),
+                )
+            }
+            #[cfg(feature = "compat")]
+            {
+                let pre_lowered_partitions = multi_cast
                 .sinks
                 .iter()
                 .enumerate()
@@ -328,24 +351,27 @@ fn sink_factory_from_native(
                     Ok((partition_arena, partition_exprs))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            let multi_cast_sink = native_wire::multi_cast_data_stream_sink_from_native(multi_cast)?;
-            let exec_params = native_wire::exec_params_from_native(instance_params, Vec::new())?
-                .to_compat_exec_params()?;
-            let root_plan_node_id = fragment
-                .root
-                .as_ref()
-                .map(|node| node.node_id)
-                .unwrap_or(-1);
-            Ok(Box::new(
-                MultiCastDataStreamSinkFactory::new_with_pre_lowered_partitions(
-                    multi_cast_sink,
-                    exec_params,
-                    pre_lowered_partitions,
-                    root_plan_node_id,
-                    None,
-                    None,
-                ),
-            ))
+                let multi_cast_sink =
+                    native_wire::multi_cast_data_stream_sink_from_native(multi_cast)?;
+                let exec_params =
+                    native_wire::exec_params_from_native(instance_params, Vec::new())?
+                        .to_compat_exec_params()?;
+                let root_plan_node_id = fragment
+                    .root
+                    .as_ref()
+                    .map(|node| node.node_id)
+                    .unwrap_or(-1);
+                Ok(Box::new(
+                    MultiCastDataStreamSinkFactory::new_with_pre_lowered_partitions(
+                        multi_cast_sink,
+                        exec_params,
+                        pre_lowered_partitions,
+                        root_plan_node_id,
+                        None,
+                        None,
+                    ),
+                ))
+            }
         }
         proto::plan::data_sink::Kind::IcebergWrite(iceberg) => {
             let (sink_input, _sink_mode) = super::sink::lower_iceberg_write_sink_factory_input(
@@ -357,34 +383,47 @@ fn sink_factory_from_native(
             Ok(Box::new(IcebergTableSinkFactory::try_new(sink_input)?))
         }
         proto::plan::data_sink::Kind::IcebergChangeStreamRouter(router) => {
-            let (router_sink, pre_lowered_partitions) =
-                lower_iceberg_change_stream_router_sink_from_native(
-                    router,
-                    &fragment.output_exprs,
-                    &fragment.output_columns,
-                    layout,
-                )?;
-            let exec_params = native_wire::exec_params_from_native(instance_params, Vec::new())?
-                .to_compat_exec_params()?;
-            let root_plan_node_id = fragment
-                .root
-                .as_ref()
-                .map(|node| node.node_id)
-                .unwrap_or(-1);
-            Ok(Box::new(
-                IcebergChangeStreamRouterSinkFactory::try_new_with_pre_lowered_partitions(
-                    router_sink,
-                    exec_params,
-                    pre_lowered_partitions,
-                    root_plan_node_id,
-                    None,
-                    None,
-                )?,
-            ))
+            #[cfg(not(feature = "compat"))]
+            {
+                let _ = router;
+                Err(
+                    "native ICEBERG_CHANGE_STREAM_ROUTER_SINK compat exec params require feature compat"
+                        .to_string(),
+                )
+            }
+            #[cfg(feature = "compat")]
+            {
+                let (router_sink, pre_lowered_partitions) =
+                    lower_iceberg_change_stream_router_sink_from_native(
+                        router,
+                        &fragment.output_exprs,
+                        &fragment.output_columns,
+                        layout,
+                    )?;
+                let exec_params =
+                    native_wire::exec_params_from_native(instance_params, Vec::new())?
+                        .to_compat_exec_params()?;
+                let root_plan_node_id = fragment
+                    .root
+                    .as_ref()
+                    .map(|node| node.node_id)
+                    .unwrap_or(-1);
+                Ok(Box::new(
+                    IcebergChangeStreamRouterSinkFactory::try_new_with_pre_lowered_partitions(
+                        router_sink,
+                        exec_params,
+                        pre_lowered_partitions,
+                        root_plan_node_id,
+                        None,
+                        None,
+                    )?,
+                ))
+            }
         }
     }
 }
 
+#[cfg(feature = "compat")]
 fn lower_iceberg_change_stream_router_sink_from_native(
     router: &proto::plan::IcebergChangeStreamRouterSink,
     output_exprs: &[proto::expr::Expr],

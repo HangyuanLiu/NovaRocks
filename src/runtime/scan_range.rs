@@ -17,7 +17,9 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(feature = "compat")]
 use crate::thrift::{descriptors, exprs, internal_service, plan_nodes, types};
+#[cfg(feature = "compat")]
 use thrift::OrderedFloat;
 
 #[derive(Clone, Debug)]
@@ -59,6 +61,7 @@ impl FileFormat {
         }
     }
 
+    #[cfg(feature = "compat")]
     fn to_thrift(self) -> descriptors::THdfsFileFormat {
         match self {
             Self::Parquet => descriptors::THdfsFileFormat::PARQUET,
@@ -87,7 +90,7 @@ pub(crate) struct FileScanRange {
     pub(crate) use_iceberg_jni_metadata_reader: bool,
     pub(crate) ivm_change_op: Option<i8>,
     pub(crate) file_pruning_min_max_values: Option<BTreeMap<i32, FilePruningMinMaxValue>>,
-    pub(crate) extended_columns: Option<BTreeMap<types::TSlotId, exprs::TExpr>>,
+    pub(crate) compat_change_op_slot_id: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,6 +105,7 @@ impl IcebergFileFormat {
         }
     }
 
+    #[cfg(feature = "compat")]
     fn to_thrift(self) -> descriptors::THdfsFileFormat {
         match self {
             Self::Parquet => descriptors::THdfsFileFormat::PARQUET,
@@ -123,6 +127,7 @@ impl IcebergFileContent {
         }
     }
 
+    #[cfg(feature = "compat")]
     fn to_thrift(self) -> types::TIcebergFileContent {
         match self {
             Self::PositionDeletes => types::TIcebergFileContent::POSITION_DELETES,
@@ -172,6 +177,7 @@ pub(crate) struct FilePruningMinMaxValue {
     pub(crate) max_float_value: Option<f64>,
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn thrift_scan_range_params_from_native(
     src: &ScanRangeParams,
 ) -> Result<internal_service::TScanRangeParams, String> {
@@ -194,6 +200,7 @@ pub(crate) fn thrift_scan_range_params_from_native(
     ))
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn thrift_scan_range_map_from_native(
     src: &BTreeMap<i32, Vec<ScanRangeParams>>,
 ) -> Result<BTreeMap<i32, Vec<internal_service::TScanRangeParams>>, String> {
@@ -210,6 +217,7 @@ pub(crate) fn thrift_scan_range_map_from_native(
         .collect()
 }
 
+#[cfg(feature = "compat")]
 fn thrift_hdfs_scan_range_from_native(
     src: &FileScanRange,
 ) -> Result<plan_nodes::THdfsScanRange, String> {
@@ -252,7 +260,7 @@ fn thrift_hdfs_scan_range_from_native(
         None::<String>,
         None::<String>,
         None::<plan_nodes::TPaimonDeletionFile>,
-        src.extended_columns.clone(),
+        thrift_extended_columns_from_native(src)?,
         None::<descriptors::THdfsPartition>,
         src.table_id,
         src.deletion_vector_descriptor
@@ -276,6 +284,7 @@ fn thrift_hdfs_scan_range_from_native(
     ))
 }
 
+#[cfg(feature = "compat")]
 fn thrift_delete_file_from_native(
     src: &IcebergDeleteFile,
 ) -> Result<plan_nodes::TIcebergDeleteFile, String> {
@@ -287,6 +296,7 @@ fn thrift_delete_file_from_native(
     ))
 }
 
+#[cfg(feature = "compat")]
 fn thrift_deletion_vector_from_native(
     src: &DeletionVectorDescriptor,
 ) -> plan_nodes::TDeletionVectorDescriptor {
@@ -299,12 +309,14 @@ fn thrift_deletion_vector_from_native(
     )
 }
 
+#[cfg(feature = "compat")]
 fn thrift_datacache_options_from_native(
     src: &DatacacheOptions,
 ) -> crate::thrift::data_cache::TDataCacheOptions {
     crate::thrift::data_cache::TDataCacheOptions::new(src.enable_populate_datacache, src.priority)
 }
 
+#[cfg(feature = "compat")]
 fn thrift_file_pruning_min_max_values_from_native(
     src: &BTreeMap<i32, FilePruningMinMaxValue>,
 ) -> Result<BTreeMap<i32, exprs::TExprMinMaxValue>, String> {
@@ -326,6 +338,7 @@ fn thrift_file_pruning_min_max_values_from_native(
         .collect()
 }
 
+#[cfg(feature = "compat")]
 fn thrift_file_pruning_value_kind(kind: FilePruningValueKind) -> exprs::TExprNodeType {
     match kind {
         FilePruningValueKind::Bool => exprs::TExprNodeType::BOOL_LITERAL,
@@ -334,8 +347,31 @@ fn thrift_file_pruning_value_kind(kind: FilePruningValueKind) -> exprs::TExprNod
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(feature = "compat")]
+fn thrift_int_literal_expr(value: i64) -> exprs::TExpr {
+    exprs::TExpr::new(vec![crate::sql::codegen::expr_compiler::int_literal_node(
+        value,
+    )])
+}
+
+#[cfg(feature = "compat")]
+fn thrift_extended_columns_from_native(
+    src: &FileScanRange,
+) -> Result<Option<BTreeMap<types::TSlotId, exprs::TExpr>>, String> {
+    match (src.ivm_change_op, src.compat_change_op_slot_id) {
+        (Some(op), Some(slot_id)) => {
+            crate::exec::change_op::validate_change_op_value(op)?;
+            Ok(Some(BTreeMap::from([(
+                slot_id,
+                thrift_int_literal_expr(op as i64),
+            )])))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(all(test, feature = "compat"))]
+mod compat_tests {
     use super::*;
 
     fn native_file_range() -> ScanRangeParams {
@@ -398,7 +434,7 @@ mod tests {
                         },
                     ),
                 ])),
-                extended_columns: None,
+                compat_change_op_slot_id: None,
             }),
             volume_id: Some(13),
             empty: Some(false),

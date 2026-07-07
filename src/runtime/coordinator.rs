@@ -578,8 +578,18 @@ impl ExecutionCoordinator {
                 let mut exec_params = fr.exec_params.clone();
                 exec_params.query_id = query_id.clone();
                 exec_params.fragment_instance_id = placement.finst_id.clone();
-                exec_params.per_node_scan_ranges =
-                    compat_scan_ranges_for_placement(fr, placement, placements.len())?;
+                #[cfg(feature = "compat")]
+                {
+                    exec_params.per_node_scan_ranges =
+                        compat_scan_ranges_for_placement(fr, placement, placements.len())?;
+                }
+                #[cfg(not(feature = "compat"))]
+                if !placement.scan_ranges.is_empty() {
+                    return Err(
+                        "coordinator scan range thrift projection requires feature compat"
+                            .to_string(),
+                    );
+                }
                 exec_params.per_exch_num_senders = placement.per_exch_num_senders.clone();
                 exec_params.destinations = exec_destinations;
                 #[cfg(feature = "compat")]
@@ -1276,6 +1286,7 @@ fn wrap_iceberg_change_stream_router_sink(
     ))
 }
 
+#[cfg(feature = "compat")]
 fn compat_scan_ranges_for_placement(
     fragment: &crate::sql::codegen::FragmentBuildResult,
     placement: &FragmentInstancePlacement,
@@ -3531,7 +3542,7 @@ mod tests {
                 use_iceberg_jni_metadata_reader: false,
                 ivm_change_op: None,
                 file_pruning_min_max_values: None,
-                extended_columns: None,
+                compat_change_op_slot_id: None,
             },
         );
         params.volume_id = Some(marker);
@@ -3590,6 +3601,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn compat_scan_ranges_for_placement_merges_native_and_compat_only_nodes() {
         let fragment = fragment_for_scan_range_merge_test(BTreeMap::from([

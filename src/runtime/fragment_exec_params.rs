@@ -19,7 +19,10 @@ use std::collections::BTreeMap;
 
 use crate::common::types::UniqueId;
 use crate::runtime::endpoint::FragmentDestination;
-use crate::runtime::scan_range::{self, ScanRangeParams};
+#[cfg(feature = "compat")]
+use crate::runtime::scan_range;
+use crate::runtime::scan_range::ScanRangeParams;
+#[cfg(feature = "compat")]
 use crate::thrift::{data_sinks, internal_service, types};
 
 #[derive(Clone, Debug)]
@@ -70,6 +73,7 @@ impl FragmentExecParams {
         &self.destinations
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn to_compat_exec_params(
         &self,
     ) -> Result<internal_service::TPlanFragmentExecParams, String> {
@@ -83,6 +87,7 @@ impl FragmentExecParams {
     }
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn compat_destination_from_runtime(
     destination: FragmentDestination,
 ) -> data_sinks::TPlanFragmentDestination {
@@ -94,6 +99,7 @@ pub(crate) fn compat_destination_from_runtime(
     )
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn compat_exec_params_from_parts(
     query_id: UniqueId,
     fragment_instance_id: UniqueId,
@@ -140,6 +146,7 @@ fn validate_sender_counts(per_exch_num_senders: &BTreeMap<i32, i32>) -> Result<(
     Ok(())
 }
 
+#[cfg(feature = "compat")]
 fn thrift_unique_id(id: UniqueId) -> types::TUniqueId {
     types::TUniqueId::new(id.hi, id.lo)
 }
