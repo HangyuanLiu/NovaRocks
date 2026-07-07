@@ -1076,7 +1076,7 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
         )?;
         let crate::engine::PlannedIcebergChangeStreamWrite {
             build_result,
-            distributed_plan,
+            native_sidecars,
             commit_plan,
             #[cfg(test)]
             topology,
@@ -1091,7 +1091,7 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
         }
         let result = crate::engine::execute_planned_iceberg_change_stream_write(
             build_result,
-            distributed_plan,
+            native_sidecars,
             None,
         )?;
         if let Some(commit) = result.write_commit.as_ref()
@@ -1151,7 +1151,7 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
         )?;
         let crate::engine::PlannedIcebergChangeStreamWrite {
             build_result,
-            distributed_plan,
+            native_sidecars,
             commit_plan,
             #[cfg(test)]
             topology,
@@ -1166,7 +1166,7 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
         }
         let result = crate::engine::execute_planned_iceberg_change_stream_write(
             build_result,
-            distributed_plan,
+            native_sidecars,
             None,
         )?;
         if let Some(commit) = result.write_commit.as_ref()

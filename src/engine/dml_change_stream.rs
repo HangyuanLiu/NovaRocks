@@ -693,7 +693,7 @@ pub(crate) fn execute_dml_change_stream_write(
 ) -> Result<DmlChangeStreamWriteExecution, String> {
     let crate::engine::PlannedIcebergChangeStreamWrite {
         build_result,
-        distributed_plan,
+        native_sidecars,
         commit_plan,
         #[cfg(test)]
         topology,
@@ -704,7 +704,7 @@ pub(crate) fn execute_dml_change_stream_write(
     }
     let result = crate::engine::execute_planned_iceberg_change_stream_write(
         build_result,
-        distributed_plan,
+        native_sidecars,
         query_opts.cloned(),
     )?;
     dml_change_stream_write_execution(result, commit_plan)
@@ -715,31 +715,35 @@ pub(crate) fn plan_dml_change_stream_write(
     target: &crate::engine::backend_resolver::TargetBackend,
     plan: &mut DmlChangeStreamWritePlan,
 ) -> Result<crate::engine::PlannedIcebergChangeStreamWrite, String> {
-    let planned = crate::engine::build_physical_plan_as_iceberg_change_stream_write(
+    let native_keyed_assert = plan.pre_expand_keyed_assert.clone();
+    let planned =
+        crate::engine::build_physical_plan_as_iceberg_change_stream_write_with_native_plan_mutation(
         state,
         Some(&target.catalog),
         &target.namespace,
         &plan.producer,
         &mut plan.dag,
         None,
+        native_keyed_assert.map(|keyed_assert| {
+            Box::new(move |native_plan: &mut crate::sql::planner::DistributedPlan| {
+                inject_dml_pre_expand_keyed_assert_into_native_plan(native_plan, &keyed_assert)
+            })
+                as Box<
+                    dyn FnOnce(&mut crate::sql::planner::DistributedPlan) -> Result<(), String>,
+                >
+        }),
     )?;
     let crate::engine::PlannedIcebergChangeStreamWrite {
         mut build_result,
-        mut distributed_plan,
+        native_sidecars,
         commit_plan,
         #[cfg(test)]
         topology,
     } = planned;
     inject_dml_pre_expand_keyed_assert(&mut build_result, plan.pre_expand_keyed_assert.as_ref())?;
-    if let (Some(distributed_plan), Some(keyed_assert)) = (
-        distributed_plan.as_mut(),
-        plan.pre_expand_keyed_assert.as_ref(),
-    ) {
-        inject_dml_pre_expand_keyed_assert_into_native_plan(distributed_plan, keyed_assert)?;
-    }
     Ok(crate::engine::PlannedIcebergChangeStreamWrite {
         build_result,
-        distributed_plan,
+        native_sidecars,
         commit_plan,
         #[cfg(test)]
         topology,

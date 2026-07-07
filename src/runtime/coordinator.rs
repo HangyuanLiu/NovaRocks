@@ -66,6 +66,44 @@ pub(crate) struct CoordinatedQueryResult {
     pub(crate) fragment_profiles: Vec<crate::thrift::runtime_profile::TRuntimeProfileTree>,
 }
 
+pub(crate) struct NativePlanSidecars {
+    pub(crate) fragments_by_id:
+        std::collections::BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
+}
+
+pub(crate) fn prepare_native_plan_sidecars(
+    native_plan: &crate::sql::planner::DistributedPlan,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<NativePlanSidecars, String> {
+    let encoded = crate::sql::codegen::proto_encode::plan::encode_distributed_plan_with_context(
+        native_plan,
+        crate::sql::codegen::proto_encode::plan::NativePlanEncodeContext { mv_refresh_ctx },
+    )?;
+    let mut fragments_by_id = BTreeMap::new();
+    for fragment in encoded.fragments {
+        if fragments_by_id
+            .insert(fragment.fragment_id, fragment)
+            .is_some()
+        {
+            return Err("native DistributedPlan encoded duplicate fragment ids".to_string());
+        }
+    }
+    Ok(NativePlanSidecars { fragments_by_id })
+}
+
+pub(crate) fn prepare_native_plan_sidecars_for_current_wire_format(
+    native_plan: &crate::sql::planner::DistributedPlan,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<Option<NativePlanSidecars>, String> {
+    match current_plan_wire_format() {
+        #[cfg(feature = "compat")]
+        PlanWireFormat::Thrift => Ok(None),
+        PlanWireFormat::Proto => {
+            prepare_native_plan_sidecars(native_plan, mv_refresh_ctx).map(Some)
+        }
+    }
+}
+
 /// Coordinates multi-fragment query execution across one or more backends.
 ///
 /// Drives all fragment wiring from [`FragmentScheduler`] placements and submits
@@ -73,7 +111,7 @@ pub(crate) struct CoordinatedQueryResult {
 /// polling the dispatcher for the root fragment's chunks.
 pub(crate) struct ExecutionCoordinator {
     build_result: MultiFragmentBuildResult,
-    native_plan: Option<crate::sql::planner::DistributedPlan>,
+    native_sidecars: Option<NativePlanSidecars>,
     dispatcher: Arc<dyn FragmentDispatcher>,
     scheduler: Arc<FragmentScheduler>,
     query_options: Option<QueryOptions>,
@@ -88,23 +126,39 @@ impl ExecutionCoordinator {
     ) -> Self {
         Self {
             build_result,
-            native_plan: None,
+            native_sidecars: None,
             dispatcher,
             scheduler,
             query_options,
         }
     }
 
-    pub(crate) fn new_with_native_plan(
+    pub(crate) fn new_with_native_plan_sidecars(
         build_result: MultiFragmentBuildResult,
-        native_plan: crate::sql::planner::DistributedPlan,
+        native_sidecars: NativePlanSidecars,
+        dispatcher: Arc<dyn FragmentDispatcher>,
+        scheduler: Arc<FragmentScheduler>,
+        query_options: Option<QueryOptions>,
+    ) -> Self {
+        Self::new_with_optional_native_plan_sidecars(
+            build_result,
+            Some(native_sidecars),
+            dispatcher,
+            scheduler,
+            query_options,
+        )
+    }
+
+    pub(crate) fn new_with_optional_native_plan_sidecars(
+        build_result: MultiFragmentBuildResult,
+        native_sidecars: Option<NativePlanSidecars>,
         dispatcher: Arc<dyn FragmentDispatcher>,
         scheduler: Arc<FragmentScheduler>,
         query_options: Option<QueryOptions>,
     ) -> Self {
         Self {
             build_result,
-            native_plan: Some(native_plan),
+            native_sidecars,
             dispatcher,
             scheduler,
             query_options,
@@ -130,13 +184,13 @@ impl ExecutionCoordinator {
             boundary_schemas: _,
             rf_plan,
         } = self.build_result;
-        let native_plan = self.native_plan;
+        let native_sidecars = self.native_sidecars;
         let query_options = self.query_options;
         let dispatcher = self.dispatcher;
         let scheduler = self.scheduler;
         let plan_wire_format = current_plan_wire_format();
         let native_fragments_by_id =
-            native_fragment_sidecars(plan_wire_format, native_plan.as_ref())?;
+            native_fragment_sidecars(plan_wire_format, native_sidecars.as_ref())?;
         // ---------------------------------------------------------------
         // 1. Allocate query id and run the scheduler.
         // ---------------------------------------------------------------
@@ -539,7 +593,6 @@ impl ExecutionCoordinator {
                                 )?;
                             }
                         }
-                        patch_native_iceberg_delta_scan_payloads(&mut native_fragment, &fr.plan)?;
                         params.params.as_ref().ok_or_else(|| {
                             format!(
                                 "fragment {fragment_id} missing exec params while plan_wire_format=proto"
@@ -1375,327 +1428,17 @@ fn ensure_native_sidecar_sink_supported(
 
 fn native_fragment_sidecars(
     wire_format: PlanWireFormat,
-    native_plan: Option<&crate::sql::planner::DistributedPlan>,
+    native_sidecars: Option<&NativePlanSidecars>,
 ) -> Result<BTreeMap<FragmentId, crate::proto::plan::PlanFragment>, String> {
     match wire_format {
         #[cfg(feature = "compat")]
         PlanWireFormat::Thrift => Ok(BTreeMap::new()),
         PlanWireFormat::Proto => {
-            let native_plan = native_plan.ok_or_else(|| {
-                "plan_wire_format=proto requires a native DistributedPlan, but this execution path only supplied thrift fragments".to_string()
+            let native_sidecars = native_sidecars.ok_or_else(|| {
+                "plan_wire_format=proto requires native sidecars encoded from a native DistributedPlan, but this execution path only supplied thrift fragments".to_string()
             })?;
-            let encoded =
-                crate::sql::codegen::proto_encode::plan::encode_distributed_plan(native_plan)?;
-            let mut by_id = BTreeMap::new();
-            for fragment in encoded.fragments {
-                if by_id.insert(fragment.fragment_id, fragment).is_some() {
-                    return Err("native DistributedPlan encoded duplicate fragment ids".to_string());
-                }
-            }
-            Ok(by_id)
+            Ok(native_sidecars.fragments_by_id.clone())
         }
-    }
-}
-
-fn patch_native_iceberg_delta_scan_payloads(
-    fragment: &mut crate::proto::plan::PlanFragment,
-    thrift_plan: &crate::thrift::plan_nodes::TPlan,
-) -> Result<(), String> {
-    let delta_payloads = thrift_plan
-        .nodes
-        .iter()
-        .filter_map(|node| {
-            node.iceberg_delta_scan_node
-                .as_ref()
-                .map(|payload| (node.node_id, payload))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
-    if delta_payloads.is_empty() {
-        return Ok(());
-    }
-
-    let root = fragment
-        .root
-        .as_mut()
-        .ok_or_else(|| format!("native fragment {} missing root", fragment.fragment_id))?;
-    let patched = patch_native_iceberg_delta_scan_payloads_in_node(root, &delta_payloads)?;
-    if patched == 0 {
-        return Err(format!(
-            "native fragment {} has thrift IcebergDeltaScan payloads but no matching native IcebergDeltaTable scan",
-            fragment.fragment_id
-        ));
-    }
-    Ok(())
-}
-
-fn patch_native_iceberg_delta_scan_payloads_in_node(
-    node: &mut crate::proto::plan::DistributedNode,
-    delta_payloads: &std::collections::HashMap<
-        i32,
-        &crate::thrift::plan_nodes::TIcebergDeltaScanNode,
-    >,
-) -> Result<usize, String> {
-    let mut patched = 0;
-    if let Some(crate::proto::plan::distributed_node::Payload::Physical(physical)) =
-        node.payload.as_mut()
-        && let Some(crate::proto::plan::plan_node::Kind::Scan(scan)) = physical.kind.as_mut()
-        && let Some(table) = scan.table.as_mut()
-        && let Some(source) = table.source.as_mut()
-        && let Some(crate::proto::plan::scan_source::Kind::IcebergDeltaTable(delta)) =
-            source.kind.as_mut()
-    {
-        let payload = delta_payloads.get(&node.node_id).ok_or_else(|| {
-            format!(
-                "native IcebergDeltaTable scan node_id={} has no matching thrift delta payload",
-                node.node_id
-            )
-        })?;
-        delta.delta_plan = Some(encode_native_delta_scan_plan(&payload.delta_plan)?);
-        patched += 1;
-    }
-    for child in &mut node.children {
-        patched += patch_native_iceberg_delta_scan_payloads_in_node(child, delta_payloads)?;
-    }
-    Ok(patched)
-}
-
-fn encode_native_delta_scan_plan(
-    src: &crate::thrift::plan_nodes::TIcebergDeltaScanPlan,
-) -> Result<crate::proto::plan::IcebergDeltaScanPlan, String> {
-    Ok(crate::proto::plan::IcebergDeltaScanPlan {
-        table_location: src.table_location.clone(),
-        data_columns: src
-            .data_columns
-            .iter()
-            .map(|column| crate::proto::plan::IcebergDeltaDataColumn {
-                name: column.name.clone(),
-                field_id: column.field_id,
-            })
-            .collect(),
-        cloud_properties: src
-            .cloud_configuration
-            .as_ref()
-            .and_then(|cloud| cloud.cloud_properties.clone())
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
-        change_files: src
-            .change_files
-            .iter()
-            .map(encode_native_delta_source_file)
-            .collect::<Result<Vec<_>, _>>()?,
-        delete_side: src
-            .delete_side
-            .as_ref()
-            .map(encode_native_delta_delete_side)
-            .transpose()?,
-    })
-}
-
-fn encode_native_delta_source_file(
-    src: &crate::thrift::plan_nodes::TIcebergDeltaSourceFile,
-) -> Result<crate::proto::plan::IcebergDeltaSourceFile, String> {
-    Ok(crate::proto::plan::IcebergDeltaSourceFile {
-        path: src.path.clone(),
-        size: src.size,
-        role: encode_native_delta_source_role(src.role)? as i32,
-        partition_spec_id: src.partition_spec_id,
-        partition_key: src.partition_key.clone(),
-        first_row_id: src.first_row_id,
-        data_sequence_number: src.data_sequence_number,
-        row_id_allow_list: src
-            .row_id_allow_list
-            .as_ref()
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default(),
-        position_deletes: src
-            .position_deletes
-            .as_ref()
-            .map(|deletes| {
-                deletes
-                    .iter()
-                    .map(encode_native_position_delete_source)
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?
-            .unwrap_or_default(),
-        equality_field_ids: src.equality_field_ids.clone().unwrap_or_default(),
-        equality_targets: src
-            .equality_targets
-            .as_ref()
-            .map(|targets| {
-                targets
-                    .iter()
-                    .map(encode_native_equality_delete_target)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
-        deleted_file_visibility: src.deleted_file_visibility.as_ref().map(|visibility| {
-            crate::proto::plan::IcebergDeltaDeletedFileVisibility {
-                already_deleted_positions: visibility.already_deleted_positions.clone(),
-            }
-        }),
-    })
-}
-
-fn encode_native_delta_source_role(
-    src: crate::thrift::plan_nodes::TIcebergDeltaSourceRole,
-) -> Result<crate::proto::plan::IcebergDeltaSourceRole, String> {
-    use crate::thrift::plan_nodes::TIcebergDeltaSourceRole as T;
-    match src {
-        T::DATA_FILE => Ok(crate::proto::plan::IcebergDeltaSourceRole::DataFile),
-        T::POSITION_DELETE => Ok(crate::proto::plan::IcebergDeltaSourceRole::PositionDelete),
-        T::EQUALITY_DELETE => Ok(crate::proto::plan::IcebergDeltaSourceRole::EqualityDelete),
-        T::DELETED_DATA_FILE => Ok(crate::proto::plan::IcebergDeltaSourceRole::DeletedDataFile),
-        other => Err(format!(
-            "unsupported thrift IcebergDeltaSourceRole {other:?}"
-        )),
-    }
-}
-
-fn encode_native_position_delete_source(
-    src: &crate::thrift::plan_nodes::TIcebergDeltaPositionDeleteSource,
-) -> Result<crate::proto::plan::IcebergDeltaPositionDeleteSource, String> {
-    Ok(crate::proto::plan::IcebergDeltaPositionDeleteSource {
-        delete_file_path: src.delete_file_path.clone(),
-        delete_file_size: src.delete_file_size,
-        referenced_data_file: src.referenced_data_file.clone(),
-        file_format: encode_native_position_delete_format(src.file_format)? as i32,
-        content_offset: src.content_offset,
-        content_size_in_bytes: src.content_size_in_bytes,
-    })
-}
-
-fn encode_native_position_delete_format(
-    src: crate::thrift::plan_nodes::TIcebergDeltaPositionDeleteFileFormat,
-) -> Result<crate::proto::plan::IcebergDeltaPositionDeleteFileFormat, String> {
-    use crate::thrift::plan_nodes::TIcebergDeltaPositionDeleteFileFormat as T;
-    match src {
-        T::PARQUET => Ok(crate::proto::plan::IcebergDeltaPositionDeleteFileFormat::Parquet),
-        T::PUFFIN => Ok(crate::proto::plan::IcebergDeltaPositionDeleteFileFormat::Puffin),
-        other => Err(format!(
-            "unsupported thrift IcebergDeltaPositionDeleteFileFormat {other:?}"
-        )),
-    }
-}
-
-fn encode_native_equality_delete_target(
-    src: &crate::thrift::plan_nodes::TIcebergDeltaEqualityDeleteTarget,
-) -> crate::proto::plan::IcebergDeltaEqualityDeleteTarget {
-    crate::proto::plan::IcebergDeltaEqualityDeleteTarget {
-        data_file_path: src.data_file_path.clone(),
-        data_file_size: src.data_file_size,
-        data_file_first_row_id: src.data_file_first_row_id,
-        data_file_sequence_number: src.data_file_sequence_number,
-    }
-}
-
-fn encode_native_delta_delete_side(
-    src: &crate::thrift::plan_nodes::TIcebergDeltaDeleteSidePlan,
-) -> Result<crate::proto::plan::IcebergDeltaDeleteSidePlan, String> {
-    Ok(crate::proto::plan::IcebergDeltaDeleteSidePlan {
-        base_data_file_lineage: src
-            .base_data_file_lineage
-            .iter()
-            .map(|(path, lineage)| (path.clone(), encode_native_base_lineage(lineage)))
-            .collect(),
-        previous_data_file_lineage: src
-            .previous_data_file_lineage
-            .iter()
-            .map(|(path, lineage)| (path.clone(), encode_native_base_lineage(lineage)))
-            .collect(),
-        previous_delete_visibility_data_files: src
-            .previous_delete_visibility_data_files
-            .iter()
-            .map(encode_native_delete_visibility_data_file)
-            .collect::<Result<Vec<_>, _>>()?,
-        previously_deleted_positions_per_file: src
-            .previously_deleted_positions_per_file
-            .iter()
-            .map(|(path, positions)| {
-                Ok((
-                    path.clone(),
-                    crate::proto::plan::IcebergDeltaPositionList {
-                        positions: positions
-                            .iter()
-                            .map(|position| {
-                                u64::try_from(*position).map_err(|_| {
-                                    format!(
-                                        "negative IcebergDelta previous deleted position for {}: {}",
-                                        path, position
-                                    )
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                    },
-                ))
-            })
-            .collect::<Result<_, String>>()?,
-        deleted_data_file_paths: src.deleted_data_file_paths.iter().cloned().collect(),
-    })
-}
-
-fn encode_native_base_lineage(
-    src: &crate::thrift::plan_nodes::TIcebergDeltaBaseDataFileLineage,
-) -> crate::proto::plan::IcebergDeltaBaseDataFileLineage {
-    crate::proto::plan::IcebergDeltaBaseDataFileLineage {
-        first_row_id: src.first_row_id,
-        data_sequence_number: src.data_sequence_number,
-    }
-}
-
-fn encode_native_delete_visibility_data_file(
-    src: &crate::thrift::plan_nodes::TIcebergDeltaDeleteVisibilityDataFile,
-) -> Result<crate::proto::plan::IcebergDeltaDeleteVisibilityDataFile, String> {
-    Ok(crate::proto::plan::IcebergDeltaDeleteVisibilityDataFile {
-        path: src.path.clone(),
-        size: src.size,
-        first_row_id: src.first_row_id,
-        data_sequence_number: src.data_sequence_number,
-        delete_files: src
-            .delete_files
-            .iter()
-            .map(encode_native_delete_visibility_delete_file)
-            .collect::<Result<Vec<_>, _>>()?,
-    })
-}
-
-fn encode_native_delete_visibility_delete_file(
-    src: &crate::thrift::plan_nodes::TIcebergDeltaDeleteVisibilityDeleteFile,
-) -> Result<crate::proto::plan::IcebergDeltaDeleteVisibilityDeleteFile, String> {
-    Ok(crate::proto::plan::IcebergDeltaDeleteVisibilityDeleteFile {
-        path: src.path.clone(),
-        file_format: encode_native_delete_file_format(src.file_format)? as i32,
-        file_content: encode_native_delete_file_content(src.file_content)? as i32,
-        length: src.length,
-        content_offset: src.content_offset,
-        content_size_in_bytes: src.content_size_in_bytes,
-    })
-}
-
-fn encode_native_delete_file_format(
-    src: crate::thrift::plan_nodes::TIcebergDeltaDeleteFileFormat,
-) -> Result<crate::proto::plan::IcebergDeltaDeleteFileFormat, String> {
-    use crate::thrift::plan_nodes::TIcebergDeltaDeleteFileFormat as T;
-    match src {
-        T::PARQUET => Ok(crate::proto::plan::IcebergDeltaDeleteFileFormat::Parquet),
-        T::PUFFIN => Ok(crate::proto::plan::IcebergDeltaDeleteFileFormat::Puffin),
-        other => Err(format!(
-            "unsupported thrift IcebergDeltaDeleteFileFormat {other:?}"
-        )),
-    }
-}
-
-fn encode_native_delete_file_content(
-    src: crate::thrift::plan_nodes::TIcebergDeltaDeleteFileContent,
-) -> Result<crate::proto::plan::IcebergDeltaDeleteFileContent, String> {
-    use crate::thrift::plan_nodes::TIcebergDeltaDeleteFileContent as T;
-    match src {
-        T::POSITION => Ok(crate::proto::plan::IcebergDeltaDeleteFileContent::Position),
-        T::EQUALITY => Ok(crate::proto::plan::IcebergDeltaDeleteFileContent::Equality),
-        other => Err(format!(
-            "unsupported thrift IcebergDeltaDeleteFileContent {other:?}"
-        )),
     }
 }
 
@@ -2635,20 +2378,30 @@ mod tests {
 
     #[cfg(feature = "compat")]
     #[test]
-    fn native_fragment_sidecars_thrift_allows_missing_native_plan() {
+    fn native_fragment_sidecars_thrift_allows_missing_native_sidecars() {
         let sidecars = native_fragment_sidecars(PlanWireFormat::Thrift, None)
-            .expect("thrift mode must not require native plan");
+            .expect("thrift mode must not require native sidecars");
+
+        assert!(sidecars.is_empty());
+        let empty_sidecars = NativePlanSidecars {
+            fragments_by_id: BTreeMap::new(),
+        };
+        let sidecars = native_fragment_sidecars(PlanWireFormat::Thrift, Some(&empty_sidecars))
+            .expect("thrift mode must allow empty native sidecars");
 
         assert!(sidecars.is_empty());
     }
 
     #[test]
-    fn native_fragment_sidecars_proto_requires_native_plan() {
+    fn native_fragment_sidecars_proto_requires_native_sidecars() {
         let err = native_fragment_sidecars(PlanWireFormat::Proto, None)
-            .expect_err("proto mode must require native plan");
+            .expect_err("proto mode must require native sidecars");
 
         assert!(err.contains("plan_wire_format=proto"), "{err}");
-        assert!(err.contains("native DistributedPlan"), "{err}");
+        assert!(
+            err.contains("native DistributedPlan") || err.contains("native sidecar"),
+            "{err}"
+        );
     }
 
     #[cfg(feature = "compat")]

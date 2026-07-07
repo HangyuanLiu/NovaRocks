@@ -2716,14 +2716,19 @@ fn explain_analyze_query(
     let execution_start = std::time::Instant::now();
     let query_opts =
         crate::engine::query_options_wire::standalone_query_options_to_runtime(&query_opts);
-    let outcome = crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
-        build_result,
-        dp.clone(),
-        dispatcher,
-        scheduler,
-        Some(query_opts),
-    )
-    .execute_with_profile_outcome()?;
+    let native_sidecars =
+        crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
+            &dp, None,
+        )?;
+    let outcome =
+        crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
+            build_result,
+            native_sidecars,
+            dispatcher,
+            scheduler,
+            Some(query_opts),
+        )
+        .execute_with_profile_outcome()?;
     let execution_elapsed = execution_start.elapsed();
     if let Some(abort) = outcome.write_abort.as_ref() {
         return Err(abort.reason.clone());
@@ -3103,9 +3108,13 @@ pub(crate) fn execute_query_as_iceberg_write(
         ),
     )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
+    let native_sidecars =
+        crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
+            &dp, None,
+        )?;
+    crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
         build_result,
-        dp,
+        native_sidecars,
         dispatcher,
         scheduler,
         crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
@@ -3226,12 +3235,15 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 
 pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) build_result: crate::sql::codegen::MultiFragmentBuildResult,
-    pub(crate) distributed_plan: Option<crate::sql::planner::DistributedPlan>,
+    pub(crate) native_sidecars: Option<crate::runtime::coordinator::NativePlanSidecars>,
     pub(crate) commit_plan:
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan,
     #[cfg(test)]
     pub(crate) topology: crate::sql::planner::IcebergChangeStreamWriteTopology,
 }
+
+type ChangeStreamNativePlanMutation<'a> =
+    Box<dyn FnOnce(&mut crate::sql::planner::DistributedPlan) -> Result<(), String> + 'a>;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
@@ -3241,6 +3253,27 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     physical_plan: &crate::sql::optimizer::OptimizerPhysicalNode,
     dag: &mut crate::sql::planner::ChangeStreamWriteDagSpec,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<PlannedIcebergChangeStreamWrite, String> {
+    build_physical_plan_as_iceberg_change_stream_write_with_native_plan_mutation(
+        state,
+        _current_catalog,
+        current_database,
+        physical_plan,
+        dag,
+        mv_refresh_ctx,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_plan_mutation(
+    state: &Arc<StandaloneState>,
+    _current_catalog: Option<&str>,
+    current_database: &str,
+    physical_plan: &crate::sql::optimizer::OptimizerPhysicalNode,
+    dag: &mut crate::sql::planner::ChangeStreamWriteDagSpec,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    native_plan_mutation: Option<ChangeStreamNativePlanMutation<'_>>,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
     let catalog_snapshot = state
         .catalog
@@ -3269,9 +3302,17 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
             mv_refresh_ctx,
         ),
     )?;
-    let native_distributed_plan =
+    let mut native_distributed_plan =
         crate::sql::codegen::ir::refresh_distributed_plan_for_native_sidecar(
             &distributed_plan,
+            mv_refresh_ctx,
+        )?;
+    if let Some(mutate_native_plan) = native_plan_mutation {
+        mutate_native_plan(&mut native_distributed_plan)?;
+    }
+    let native_sidecars =
+        crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
+            &native_distributed_plan,
             mv_refresh_ctx,
         )?;
     let commit_plan =
@@ -3280,7 +3321,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         )?;
     Ok(PlannedIcebergChangeStreamWrite {
         build_result,
-        distributed_plan: Some(native_distributed_plan),
+        native_sidecars,
         commit_plan,
         #[cfg(test)]
         topology,
@@ -3289,7 +3330,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
 
 pub(crate) fn execute_planned_iceberg_change_stream_write(
     build_result: crate::sql::codegen::MultiFragmentBuildResult,
-    distributed_plan: Option<crate::sql::planner::DistributedPlan>,
+    native_sidecars: Option<crate::runtime::coordinator::NativePlanSidecars>,
     query_opts: Option<StandaloneQueryOptions>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
     let (dispatcher, scheduler) = coordinated_execution_services()?;
@@ -3297,11 +3338,11 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
         crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
             query_opts.as_ref(),
         );
-    match distributed_plan {
-        Some(distributed_plan) => {
-            crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
+    match native_sidecars {
+        Some(native_sidecars) => {
+            crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan_sidecars(
                 build_result,
-                distributed_plan,
+                native_sidecars,
                 dispatcher,
                 scheduler,
                 query_options,
@@ -3341,7 +3382,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     }
     execute_planned_iceberg_change_stream_write(
         planned.build_result,
-        planned.distributed_plan,
+        planned.native_sidecars,
         query_opts,
     )
 }
@@ -3684,10 +3725,15 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     )?;
     let native_dp =
         crate::sql::codegen::ir::refresh_distributed_plan_for_native_sidecar(&dp, mv_refresh_ctx)?;
+    let native_sidecars =
+        crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
+            &native_dp,
+            mv_refresh_ctx,
+        )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
+    crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
         build_result,
-        native_dp,
+        native_sidecars,
         dispatcher,
         scheduler,
         crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
@@ -3749,10 +3795,15 @@ pub(crate) fn execute_logical_plan_with_options(
     )?;
     let native_dp =
         crate::sql::codegen::ir::refresh_distributed_plan_for_native_sidecar(&dp, mv_refresh_ctx)?;
+    let native_sidecars =
+        crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
+            &native_dp,
+            mv_refresh_ctx,
+        )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
+    crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
         build_result,
-        native_dp,
+        native_sidecars,
         dispatcher,
         scheduler,
         crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
