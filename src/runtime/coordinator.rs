@@ -71,6 +71,14 @@ pub(crate) struct NativePlanSidecars {
         std::collections::BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
 }
 
+#[derive(Clone)]
+struct CompactCteConsumer {
+    fragment_id: FragmentId,
+    exchange_node_id: i32,
+    partition: partitions::TDataPartition,
+    output_slot_ids: Vec<i32>,
+}
+
 pub(crate) fn prepare_native_plan_sidecars(
     native_plan: &crate::sql::planner::DistributedPlan,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -222,7 +230,7 @@ impl ExecutionCoordinator {
                         "IcebergChangeStreamRouter"
                     }
                 },
-                e.output_partition.type_,
+                e.compact_output_partition.type_,
             );
         }
 
@@ -255,22 +263,38 @@ impl ExecutionCoordinator {
                 ));
             }
         }
-        // CTE id -> list of (consumer_fragment_id, exchange_node_id, partition, output_slot_ids).
+        // CTE id -> native consumer sidecars: (consumer_fragment_id, exchange_node_id,
+        // native partition, output_slot_ids).
         let mut cte_consumers: BTreeMap<
             CteId,
-            Vec<(FragmentId, i32, partitions::TDataPartition, Vec<i32>)>,
+            Vec<(FragmentId, i32, crate::proto::plan::DataPartition, Vec<i32>)>,
         > = BTreeMap::new();
+        // CTE id -> compact thrift consumers used only for TMultiCastDataStreamSink.
+        let mut compact_cte_consumers: BTreeMap<CteId, Vec<CompactCteConsumer>> = BTreeMap::new();
 
         for e in &edges {
             match &e.edge_kind {
                 FragmentEdgeKind::Stream => {}
                 FragmentEdgeKind::CteMulticast { cte_id, .. } => {
+                    let native_partition =
+                        crate::sql::codegen::proto_encode::plan::encode_data_partition(
+                            &e.output_partition,
+                        )?;
                     cte_consumers.entry(*cte_id).or_default().push((
                         e.target_fragment_id,
                         e.target_exchange_node_id,
-                        e.output_partition.clone(),
+                        native_partition,
                         e.output_slot_ids.clone(),
                     ));
+                    compact_cte_consumers
+                        .entry(*cte_id)
+                        .or_default()
+                        .push(CompactCteConsumer {
+                            fragment_id: e.target_fragment_id,
+                            exchange_node_id: e.target_exchange_node_id,
+                            partition: e.compact_output_partition.clone(),
+                            output_slot_ids: e.output_slot_ids.clone(),
+                        });
                 }
                 FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {}
             }
@@ -287,9 +311,24 @@ impl ExecutionCoordinator {
                     consumers.push((
                         fr.fragment_id,
                         *exchange_node_id,
-                        unpartitioned_partition(),
+                        crate::proto::plan::DataPartition {
+                            kind: crate::proto::plan::PartitionKind::Unpartitioned as i32,
+                            exprs: Vec::new(),
+                        },
                         Vec::new(),
                     ));
+                }
+                let compact_consumers = compact_cte_consumers.entry(*cte_id).or_default();
+                if !compact_consumers.iter().any(|consumer| {
+                    consumer.fragment_id == fr.fragment_id
+                        && consumer.exchange_node_id == *exchange_node_id
+                }) {
+                    compact_consumers.push(CompactCteConsumer {
+                        fragment_id: fr.fragment_id,
+                        exchange_node_id: *exchange_node_id,
+                        partition: unpartitioned_partition(),
+                        output_slot_ids: Vec::new(),
+                    });
                 }
             }
         }
@@ -415,7 +454,7 @@ impl ExecutionCoordinator {
                         .collect();
                     (
                         output_sink,
-                        edge.output_partition.clone(),
+                        edge.compact_output_partition.clone(),
                         Some(exec_destinations),
                     )
                 } else if let Some((router_group_id, branch_edges)) = router_edges {
@@ -443,30 +482,32 @@ impl ExecutionCoordinator {
                     let cte_id = fr
                         .cte_id
                         .ok_or_else(|| "CTE fragment missing cte_id".to_string())?;
-                    let consumers = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
+                    let consumers = compact_cte_consumers
+                        .get(&cte_id)
+                        .cloned()
+                        .unwrap_or_default();
                     if consumers.is_empty() {
                         return Err(format!("CTE fragment (cte_id={cte_id}) has no consumers"));
                     }
                     let mut sinks = Vec::with_capacity(consumers.len());
                     let mut destinations = Vec::with_capacity(consumers.len());
-                    for (consumer_fragment_id, exchange_node_id, partition, output_slot_ids) in
-                        &consumers
-                    {
+                    for consumer in &consumers {
                         let stream_sink = data_sinks::TDataStreamSink::new(
-                            *exchange_node_id,
-                            partition.clone(),
+                            consumer.exchange_node_id,
+                            consumer.partition.clone(),
                             None::<bool>,
                             None::<bool>,
                             None::<i32>,
-                            stream_sink_output_columns(output_slot_ids),
+                            stream_sink_output_columns(&consumer.output_slot_ids),
                             None::<i64>,
                         );
                         sinks.push(stream_sink);
                         let dests = consumer_dests
-                            .get(consumer_fragment_id)
+                            .get(&consumer.fragment_id)
                             .ok_or_else(|| {
                                 format!(
-                                    "CTE consumer fragment {consumer_fragment_id} has no placements"
+                                    "CTE consumer fragment {} has no placements",
+                                    consumer.fragment_id
                                 )
                             })?
                             .iter()
@@ -965,7 +1006,7 @@ fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks
 fn build_stream_sink_for_edge(edge: &FragmentEdge) -> data_sinks::TDataStreamSink {
     data_sinks::TDataStreamSink::new(
         edge.target_exchange_node_id,
-        edge.output_partition.clone(),
+        edge.compact_output_partition.clone(),
         None::<bool>,
         None::<bool>,
         None::<i32>,
@@ -1155,7 +1196,7 @@ fn wrap_iceberg_change_stream_router_sink(
 
         let mut stream_sink = template_branch.stream_sink.clone();
         stream_sink.dest_node_id = edge.target_exchange_node_id;
-        stream_sink.output_partition = edge.output_partition.clone();
+        stream_sink.output_partition = edge.compact_output_partition.clone();
         let destinations = placements
             .get(&edge.target_fragment_id)
             .ok_or_else(|| {
@@ -1500,26 +1541,11 @@ fn patch_native_iceberg_change_stream_router_sink(
         route.target_exchange_node_id = edge.target_exchange_node_id;
 
         if route.output_partition.is_none() {
-            let partition_exprs = route
-                .output_partition_ordinals
-                .iter()
-                .map(|ordinal| {
-                    let idx = usize::try_from(*ordinal).map_err(|_| {
-                        format!(
-                            "native Iceberg change-stream router partition ordinal {ordinal} overflows usize"
-                        )
-                    })?;
-                    fragment.output_exprs.get(idx).cloned().ok_or_else(|| {
-                        format!(
-                            "native Iceberg change-stream router partition ordinal {ordinal} is out of range"
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            route.output_partition = Some(native_data_partition_from_thrift_with_exprs(
-                &edge.output_partition,
-                partition_exprs,
-            )?);
+            return Err(format!(
+                "native Iceberg change-stream router source={} group={} branch_id={} \
+                 branch_kind={:?} missing output_partition from native encoder",
+                fragment_id, router_group_id, branch_id, branch_kind
+            ));
         }
 
         let dests = placements.get(&edge.target_fragment_id).ok_or_else(|| {
@@ -1576,7 +1602,7 @@ fn patch_native_cte_multicast_sink(
     fragment: &mut crate::proto::plan::PlanFragment,
     fragment_id: FragmentId,
     cte_id: CteId,
-    consumers: &[(FragmentId, i32, partitions::TDataPartition, Vec<i32>)],
+    consumers: &[(FragmentId, i32, crate::proto::plan::DataPartition, Vec<i32>)],
     consumer_dests: &BTreeMap<FragmentId, Vec<crate::runtime::endpoint::FragmentDestination>>,
 ) -> Result<(), String> {
     if consumers.is_empty() {
@@ -1587,7 +1613,7 @@ fn patch_native_cte_multicast_sink(
     for (consumer_fragment_id, exchange_node_id, partition, output_slot_ids) in consumers {
         sinks.push(crate::proto::plan::DataStreamSink {
             dest_node_id: *exchange_node_id,
-            output_partition: Some(native_data_partition_from_thrift(partition)?),
+            output_partition: Some(partition.clone()),
             output_columns: output_slot_ids.clone(),
             limit: None,
         });
@@ -1636,48 +1662,6 @@ fn native_stream_destination(
         }),
         endpoint: src.endpoint().as_host_port(),
     }
-}
-
-fn native_data_partition_from_thrift(
-    src: &partitions::TDataPartition,
-) -> Result<crate::proto::plan::DataPartition, String> {
-    native_data_partition_from_thrift_with_exprs(src, Vec::new())
-}
-
-fn native_data_partition_from_thrift_with_exprs(
-    src: &partitions::TDataPartition,
-    exprs: Vec<crate::proto::expr::Expr>,
-) -> Result<crate::proto::plan::DataPartition, String> {
-    if src
-        .partition_exprs
-        .as_ref()
-        .is_some_and(|exprs| !exprs.is_empty())
-        && exprs.is_empty()
-    {
-        return Err(
-            "native dynamic stream sink does not yet convert thrift partition exprs".to_string(),
-        );
-    }
-    let kind = match src.type_ {
-        partitions::TPartitionType::UNPARTITIONED => {
-            crate::proto::plan::PartitionKind::Unpartitioned
-        }
-        partitions::TPartitionType::RANDOM => crate::proto::plan::PartitionKind::Random,
-        partitions::TPartitionType::HASH_PARTITIONED
-        | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
-            crate::proto::plan::PartitionKind::Hash
-        }
-        other => {
-            return Err(format!(
-                "native CTE multicast sink unsupported partition type {:?}",
-                other
-            ));
-        }
-    };
-    Ok(crate::proto::plan::DataPartition {
-        kind: kind as i32,
-        exprs,
-    })
 }
 
 /// Assemble the per-instance runtime filter routing params from
@@ -3183,7 +3167,8 @@ mod tests {
             source_fragment_id,
             target_fragment_id,
             target_exchange_node_id,
-            output_partition: unpartitioned_partition(),
+            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            compact_output_partition: unpartitioned_partition(),
             stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
@@ -3202,7 +3187,8 @@ mod tests {
             source_fragment_id,
             target_fragment_id,
             target_exchange_node_id,
-            output_partition: unpartitioned_partition(),
+            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            compact_output_partition: unpartitioned_partition(),
             stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
                 router_group_id,
@@ -3734,7 +3720,7 @@ mod tests {
         use crate::sql::common::ChangeStreamBranchKind;
 
         let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
-        edge.output_partition = partitions::TDataPartition::new(
+        edge.compact_output_partition = partitions::TDataPartition::new(
             partitions::TPartitionType::HASH_PARTITIONED,
             None::<Vec<crate::thrift::exprs::TExpr>>,
             None::<Vec<partitions::TRangePartition>>,
@@ -3807,7 +3793,7 @@ mod tests {
         use crate::sql::common::ChangeStreamBranchKind;
 
         let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
-        edge.output_partition = partitions::TDataPartition::new(
+        edge.compact_output_partition = partitions::TDataPartition::new(
             partitions::TPartitionType::HASH_PARTITIONED,
             None::<Vec<crate::thrift::exprs::TExpr>>,
             None::<Vec<partitions::TRangePartition>>,
@@ -3893,6 +3879,64 @@ mod tests {
             panic!("expected preserved column ref");
         };
         assert_eq!(column_ref.column_id, 42);
+    }
+
+    #[test]
+    fn native_router_patch_rejects_missing_output_partition() {
+        use crate::proto::plan as native_plan;
+        use crate::sql::common::ChangeStreamBranchKind;
+
+        let edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
+        let mut fragment = native_plan::PlanFragment {
+            fragment_id: 1,
+            root: None,
+            data_partition: Some(native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            }),
+            output_partition: Some(native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            }),
+            sink: Some(native_plan::DataSink {
+                kind: Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(
+                    native_plan::IcebergChangeStreamRouterSink {
+                        group_id: 7,
+                        change_op_output_ordinal: 0,
+                        data_route_output_ordinal: None,
+                        branches: vec![native_plan::IcebergChangeStreamBranchRoute {
+                            branch_id: 0,
+                            branch_kind: native_plan::ChangeStreamBranchKind::DeleteDv as i32,
+                            target_fragment_id: 0,
+                            target_exchange_node_id: -1,
+                            output_ordinals: vec![0],
+                            output_partition_ordinals: vec![0],
+                            output_partition: None,
+                            destinations: None,
+                        }],
+                    },
+                )),
+            }),
+            output_exprs: Vec::new(),
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        let placements = BTreeMap::new();
+
+        let err = patch_native_iceberg_change_stream_router_sink(
+            &mut fragment,
+            1,
+            7,
+            &[&edge],
+            &placements,
+        )
+        .expect_err("native router patch must not reconstruct partition from thrift");
+
+        assert!(
+            err.contains("missing output_partition from native encoder"),
+            "{err}"
+        );
     }
 
     #[test]

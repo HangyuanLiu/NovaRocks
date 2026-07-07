@@ -25,7 +25,8 @@ use crate::sql::codegen::helpers::{
     typed_expr_display_name_without_qualifiers,
 };
 use crate::sql::codegen::iceberg_change_stream_router_wire::{
-    build_router_sink_thrift, output_partition_for_ordinals, output_slot_ids_for_ordinals,
+    build_router_sink_thrift, compact_output_partition_for_ordinals,
+    native_output_partition_for_ordinals, output_slot_ids_for_ordinals,
 };
 use crate::sql::codegen::iceberg_write_sink_wire::{
     add_iceberg_sink_target_table_to_desc_builder, build_iceberg_write_sink_thrift,
@@ -733,7 +734,8 @@ fn lower_fragment_edges(
                             edge.source_fragment_id
                         )
                     })?;
-                lowered_edge.output_partition = lower_exchange_output_partition(
+                lowered_edge.output_partition = native_exchange_output_partition(exchange)?;
+                lowered_edge.compact_output_partition = lower_exchange_output_partition(
                     exchange,
                     &source.scope,
                     state.slot_allocator(),
@@ -778,7 +780,12 @@ fn lower_fragment_edges(
                             edge.source_fragment_id
                         )
                     })?;
-                lowered_edge.output_partition = output_partition_for_ordinals(
+                lowered_edge.output_partition = native_output_partition_for_ordinals(
+                    &source_fragment.output_columns,
+                    &route.output_partition_ordinals,
+                    &format!("branch {:?} partition", route.branch_kind),
+                )?;
+                lowered_edge.compact_output_partition = compact_output_partition_for_ordinals(
                     &source.scope,
                     &source_fragment.output_columns,
                     &route.output_partition_ordinals,
@@ -802,6 +809,38 @@ fn lower_fragment_edges(
     }
 
     Ok(lowered_edges)
+}
+
+fn native_exchange_output_partition(
+    exchange: &super::kind::DistributedExchangeNode,
+) -> Result<crate::sql::planner::DataPartition, String> {
+    let kind = match exchange.partition_type {
+        partitions::TPartitionType::UNPARTITIONED => {
+            crate::sql::planner::PartitionKind::Unpartitioned
+        }
+        partitions::TPartitionType::RANDOM => crate::sql::planner::PartitionKind::Random,
+        partitions::TPartitionType::HASH_PARTITIONED
+        | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
+            crate::sql::planner::PartitionKind::Hash
+        }
+        other => {
+            return Err(format!(
+                "DistributedPlan Exchange cannot encode native output partition for {:?}",
+                other
+            ));
+        }
+    };
+    if matches!(kind, crate::sql::planner::PartitionKind::Hash)
+        && exchange.partition_exprs.is_empty()
+    {
+        return Err(
+            "DistributedPlan HASH Exchange has no native partition expressions".to_string(),
+        );
+    }
+    Ok(crate::sql::planner::DataPartition {
+        kind,
+        exprs: exchange.partition_exprs.clone(),
+    })
 }
 
 fn router_route_for_edge<'a>(
@@ -6439,8 +6478,24 @@ mod tests {
         assert_eq!(edge.target_fragment_id, 1);
         assert_eq!(edge.output_slot_ids, vec![3]);
         assert_eq!(edge.stream_kind, FragmentStreamKind::Partitioned);
+        assert!(matches!(
+            edge.output_partition.kind,
+            crate::sql::planner::PartitionKind::Hash
+        ));
+        assert_eq!(edge.output_partition.exprs.len(), 1);
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &edge.output_partition.exprs[0].kind
+        else {
+            panic!(
+                "expected native hash partition to keep the branch partition column, got {:?}",
+                edge.output_partition.exprs[0]
+            );
+        };
+        assert_eq!(*column_id, ColumnId(3));
+        assert_eq!(column, "delete_id");
         assert_eq!(
-            edge.output_partition.type_,
+            edge.compact_output_partition.type_,
             crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
         );
 
@@ -6802,7 +6857,8 @@ mod tests {
             source_fragment_id,
             target_fragment_id,
             target_exchange_node_id,
-            output_partition: crate::thrift::partitions::TDataPartition::new(
+            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            compact_output_partition: crate::thrift::partitions::TDataPartition::new(
                 crate::thrift::partitions::TPartitionType::UNPARTITIONED,
                 None::<Vec<crate::thrift::exprs::TExpr>>,
                 None::<Vec<crate::thrift::partitions::TRangePartition>>,

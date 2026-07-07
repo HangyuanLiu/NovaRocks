@@ -1,7 +1,9 @@
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
+use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::expr_compiler;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
 use crate::sql::common::ChangeStreamBranchKind;
+use crate::sql::planner::{DataPartition, PartitionKind};
 use crate::thrift::data_sinks;
 use crate::thrift::exprs;
 use crate::thrift::partitions;
@@ -43,7 +45,7 @@ pub(in crate::sql::codegen) fn build_router_sink_thrift(
         let label = format!("branch {:?} output", branch.branch_kind);
         let output_slots =
             output_slot_ids_for_ordinals(scope, output_columns, &branch.output_ordinals, &label)?;
-        let partition = output_partition_for_ordinals(
+        let partition = compact_output_partition_for_ordinals(
             scope,
             output_columns,
             &branch.output_partition_ordinals,
@@ -91,7 +93,7 @@ pub(in crate::sql::codegen) fn build_router_sink_thrift(
     ))
 }
 
-pub(in crate::sql::codegen) fn output_partition_for_ordinals(
+pub(in crate::sql::codegen) fn compact_output_partition_for_ordinals(
     scope: &ExprScope,
     output_columns: &[AnalysisOutputColumn],
     ordinals: &[usize],
@@ -117,6 +119,39 @@ pub(in crate::sql::codegen) fn output_partition_for_ordinals(
         None::<Vec<partitions::TRangePartition>>,
         None::<Vec<partitions::TBucketProperty>>,
     ))
+}
+
+pub(in crate::sql::codegen) fn native_output_partition_for_ordinals(
+    output_columns: &[AnalysisOutputColumn],
+    ordinals: &[usize],
+    label: &str,
+) -> Result<DataPartition, String> {
+    if ordinals.is_empty() {
+        return Ok(DataPartition::unpartitioned());
+    }
+
+    let exprs = ordinals
+        .iter()
+        .copied()
+        .map(|ordinal| {
+            output_columns
+                .get(ordinal)
+                .ok_or_else(|| format!("{label} ordinal {ordinal} is out of range"))
+                .map(|column| TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: column.column_id,
+                        qualifier: None,
+                        column: column.name.clone(),
+                    },
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DataPartition {
+        kind: PartitionKind::Hash,
+        exprs,
+    })
 }
 
 pub(in crate::sql::codegen) fn output_slot_ids_for_ordinals(

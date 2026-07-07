@@ -1,10 +1,12 @@
+use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 use crate::sql::planner::plan::ExchangeFlavor;
 use crate::sql::planner::{
     ChangeStreamWriteDagSpec, DataPartition, DataSink, DistributedNode, DistributedPayload,
     ExchangeReceiver, IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
     IcebergChangeStreamWriteTopology, IcebergChangeStreamWriterBranch, IcebergWriteFragmentSink,
-    IcebergWriteInputBinding, PlanFragment, PlannedIcebergChangeStreamDistributedPlan,
+    IcebergWriteInputBinding, PartitionKind, PlanFragment,
+    PlannedIcebergChangeStreamDistributedPlan,
 };
 use crate::thrift::partitions;
 
@@ -158,6 +160,11 @@ pub(crate) fn with_iceberg_change_stream_write(
         let exchange_tuple_id = next_tuple_id;
         next_tuple_id += 1;
         let partition_type = partition_type_for_ordinals(&branch.output_partition_ordinals);
+        let output_partition = data_partition_for_ordinals(
+            &source_fragment.output_columns,
+            &branch.output_partition_ordinals,
+            &format!("branch {:?} partition", branch.branch_kind),
+        )?;
         let stream_kind = stream_kind_for_partition_type(partition_type);
 
         writer_fragments.push(PlanFragment {
@@ -198,7 +205,8 @@ pub(crate) fn with_iceberg_change_stream_write(
             source_fragment_id: root_fragment_id,
             target_fragment_id: writer_fragment_id,
             target_exchange_node_id: exchange_node_id,
-            output_partition: tdata_partition_placeholder(partition_type),
+            output_partition,
+            compact_output_partition: tdata_partition_placeholder(partition_type),
             stream_kind,
             edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
                 router_group_id: 0,
@@ -331,6 +339,40 @@ fn partition_type_for_ordinals(ordinals: &[usize]) -> partitions::TPartitionType
     }
 }
 
+fn data_partition_for_ordinals(
+    output_columns: &[OutputColumn],
+    ordinals: &[usize],
+    label: &str,
+) -> Result<DataPartition, String> {
+    if ordinals.is_empty() {
+        return Ok(DataPartition::unpartitioned());
+    }
+
+    let exprs = ordinals
+        .iter()
+        .copied()
+        .map(|ordinal| {
+            let column = output_columns.get(ordinal).ok_or_else(|| {
+                format!("Iceberg change-stream {label} output ordinal {ordinal} is out of range")
+            })?;
+            Ok(TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: column.column_id,
+                    qualifier: None,
+                    column: column.name.clone(),
+                },
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(DataPartition {
+        kind: PartitionKind::Hash,
+        exprs,
+    })
+}
+
 fn stream_kind_for_partition_type(
     partition_type: partitions::TPartitionType,
 ) -> FragmentStreamKind {
@@ -359,7 +401,7 @@ fn tdata_partition_placeholder(
 mod tests {
     use arrow::datatypes::DataType;
 
-    use crate::sql::analysis::OutputColumn;
+    use crate::sql::analysis::{ExprKind, OutputColumn};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ChangeStreamBranchKind;
     use crate::sql::planner::{
@@ -465,8 +507,23 @@ mod tests {
             first_edge.stream_kind,
             crate::sql::codegen::FragmentStreamKind::Partitioned
         );
+        assert!(matches!(
+            first_edge.output_partition.kind,
+            crate::sql::planner::PartitionKind::Hash
+        ));
+        let [partition_expr] = first_edge.output_partition.exprs.as_slice() else {
+            panic!("expected native hash partition expr");
+        };
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &partition_expr.kind
+        else {
+            panic!("expected native partition expr to be a column ref");
+        };
+        assert_eq!(*column_id, ColumnId::new_for_test(3));
+        assert_eq!(column, "delete_id");
         assert_eq!(
-            first_edge.output_partition.type_,
+            first_edge.compact_output_partition.type_,
             crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
         );
         assert!(matches!(

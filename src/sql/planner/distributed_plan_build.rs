@@ -582,7 +582,8 @@ impl DistributedPlanBuilder {
             source_fragment_id: child_fragment_id,
             target_fragment_id: parent_fragment_id,
             target_exchange_node_id: exchange_node_id,
-            output_partition: tdata_partition_placeholder(partition_type),
+            output_partition: output_partition.clone(),
+            compact_output_partition: tdata_partition_placeholder(partition_type),
             stream_kind,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: output_slot_ids_for_exchange(&exchange_output_columns)?,
@@ -684,7 +685,8 @@ impl DistributedPlanBuilder {
             source_fragment_id: cte_fragment_id,
             target_fragment_id,
             target_exchange_node_id: exchange_node_id,
-            output_partition: tdata_partition_placeholder(
+            output_partition: DataPartition::unpartitioned(),
+            compact_output_partition: tdata_partition_placeholder(
                 partitions::TPartitionType::UNPARTITIONED,
             ),
             stream_kind: FragmentStreamKind::Broadcast,
@@ -2118,8 +2120,10 @@ mod tests {
             child_fragment.output_columns[0].column_id,
             ColumnId::new_for_test(1)
         );
+        assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
+        assert_eq!(edge.output_partition.exprs.len(), 1);
         assert_eq!(
-            edge.output_partition.type_,
+            edge.compact_output_partition.type_,
             TPartitionType::HASH_PARTITIONED
         );
         assert!(matches!(
@@ -2258,8 +2262,12 @@ mod tests {
         assert!(exchange_receiver.partition_exprs.is_empty());
         assert_eq!(dp.edges[0].stream_kind, FragmentStreamKind::Broadcast);
         assert!(matches!(dp.edges[0].edge_kind, FragmentEdgeKind::Stream));
+        assert!(matches!(
+            dp.edges[0].output_partition.kind,
+            PartitionKind::Unpartitioned
+        ));
         assert_eq!(
-            dp.edges[0].output_partition.type_,
+            dp.edges[0].compact_output_partition.type_,
             TPartitionType::UNPARTITIONED
         );
         assert_no_physical_redistribute(root);
@@ -2404,7 +2412,14 @@ mod tests {
         assert_eq!(edge.target_fragment_id, dp.root_fragment_id);
         assert_eq!(edge.target_exchange_node_id, exchange.node_id);
         assert_eq!(edge.stream_kind, FragmentStreamKind::Broadcast);
-        assert_eq!(edge.output_partition.type_, TPartitionType::UNPARTITIONED);
+        assert!(matches!(
+            edge.output_partition.kind,
+            PartitionKind::Unpartitioned
+        ));
+        assert_eq!(
+            edge.compact_output_partition.type_,
+            TPartitionType::UNPARTITIONED
+        );
         assert!(edge.output_slot_ids.is_empty());
         match &edge.edge_kind {
             FragmentEdgeKind::CteMulticast {
@@ -2665,7 +2680,14 @@ mod tests {
         assert_eq!(edge.target_exchange_node_id, exchange.node_id);
         assert_eq!(edge.stream_kind, FragmentStreamKind::Gather);
         assert!(matches!(edge.edge_kind, FragmentEdgeKind::Stream));
-        assert_eq!(edge.output_partition.type_, TPartitionType::UNPARTITIONED);
+        assert!(matches!(
+            edge.output_partition.kind,
+            PartitionKind::Unpartitioned
+        ));
+        assert_eq!(
+            edge.compact_output_partition.type_,
+            TPartitionType::UNPARTITIONED
+        );
         assert!(edge.output_slot_ids.is_empty());
 
         let child_fragment = dp
@@ -2754,7 +2776,14 @@ mod tests {
         assert_eq!(edge.target_exchange_node_id, exchange.node_id);
         assert_eq!(edge.stream_kind, FragmentStreamKind::Gather);
         assert!(matches!(edge.edge_kind, FragmentEdgeKind::Stream));
-        assert_eq!(edge.output_partition.type_, TPartitionType::UNPARTITIONED);
+        assert!(matches!(
+            edge.output_partition.kind,
+            PartitionKind::Unpartitioned
+        ));
+        assert_eq!(
+            edge.compact_output_partition.type_,
+            TPartitionType::UNPARTITIONED
+        );
 
         let child_fragment = dp
             .fragments

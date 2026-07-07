@@ -60,10 +60,17 @@ use crate::sql::codegen::{
     FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
     RuntimeFilterPlanResult,
 };
-use crate::thrift::partitions::TPartitionType;
+use crate::sql::planner::PartitionKind;
 use crate::thrift::types::TUniqueId;
 
 type LiveBackend = (usize, SocketAddr);
+
+#[derive(Clone, Copy, Debug)]
+struct IncomingEdge {
+    source_fragment_id: FragmentId,
+    is_native_hash_partitioned: bool,
+    stream_kind: FragmentStreamKind,
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -185,22 +192,25 @@ impl FragmentScheduler {
             fragments.iter().map(|fr| (fr.fragment_id, fr)).collect();
 
         // Step 3: compute instance counts in topo order.
-        // Incoming edges: target -> [(source, partition_type, stream_kind)].
-        let mut incoming: BTreeMap<
-            FragmentId,
-            Vec<(FragmentId, TPartitionType, FragmentStreamKind)>,
-        > = BTreeMap::new();
+        // Incoming edges are driven by planner-owned native partition semantics.
+        let mut incoming: BTreeMap<FragmentId, Vec<IncomingEdge>> = BTreeMap::new();
         for e in edges {
             let stream_kind = match e.edge_kind {
                 FragmentEdgeKind::Stream => e.stream_kind,
                 FragmentEdgeKind::CteMulticast { .. } => FragmentStreamKind::Broadcast,
                 FragmentEdgeKind::IcebergChangeStreamRouter { .. } => e.stream_kind,
             };
-            incoming.entry(e.target_fragment_id).or_default().push((
-                e.source_fragment_id,
-                e.output_partition.type_,
-                stream_kind,
-            ));
+            incoming
+                .entry(e.target_fragment_id)
+                .or_default()
+                .push(IncomingEdge {
+                    source_fragment_id: e.source_fragment_id,
+                    is_native_hash_partitioned: matches!(
+                        e.output_partition.kind,
+                        PartitionKind::Hash
+                    ),
+                    stream_kind,
+                });
         }
 
         let mut instance_counts: BTreeMap<FragmentId, usize> = BTreeMap::new();
@@ -213,7 +223,7 @@ impl FragmentScheduler {
                 .get(&fid)
                 .map(|ins| {
                     ins.iter()
-                        .any(|(_, _, stream_kind)| *stream_kind == FragmentStreamKind::Gather)
+                        .any(|edge| edge.stream_kind == FragmentStreamKind::Gather)
                 })
                 .unwrap_or(false);
 
@@ -228,11 +238,9 @@ impl FragmentScheduler {
                     .get(&fid)
                     .map(|ins| {
                         ins.iter()
-                            .filter_map(|(src_id, ptype, _)| {
-                                if *ptype == TPartitionType::HASH_PARTITIONED
-                                    || *ptype == TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED
-                                {
-                                    instance_counts.get(src_id).copied()
+                            .filter_map(|edge| {
+                                if edge.is_native_hash_partitioned {
+                                    instance_counts.get(&edge.source_fragment_id).copied()
                                 } else {
                                     None
                                 }
@@ -556,7 +564,9 @@ fn select_execution_root_fragment(
     match terminal_fragments.len() {
         1 => Ok(ExecutionRootSelection {
             fragment_id: terminal_fragments[0].fragment_id,
-            force_single_instance: true,
+            force_single_instance: !fragment_sink_is_terminal_write_sink(
+                &terminal_fragments[0].output_sink,
+            ),
         }),
         0 => Err("no root fragment found (every fragment has an outgoing edge)".into()),
         _ if terminal_fragments
@@ -633,6 +643,7 @@ mod tests {
     use crate::sql::codegen::{
         FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
+    use crate::sql::planner::{DataPartition, PartitionKind};
     use crate::thrift::data_sinks;
     use crate::thrift::descriptors as thrift_descriptors;
     use crate::thrift::internal_service;
@@ -853,7 +864,8 @@ mod tests {
             source_fragment_id: src,
             target_fragment_id: tgt,
             target_exchange_node_id: exch_node_id,
-            output_partition: partitions::TDataPartition::new(
+            output_partition: native_partition_for_test(ptype),
+            compact_output_partition: partitions::TDataPartition::new(
                 ptype,
                 None::<Vec<crate::thrift::exprs::TExpr>>,
                 None::<Vec<partitions::TRangePartition>>,
@@ -862,6 +874,19 @@ mod tests {
             stream_kind,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
+        }
+    }
+
+    fn native_partition_for_test(ptype: partitions::TPartitionType) -> DataPartition {
+        let kind = match ptype {
+            partitions::TPartitionType::HASH_PARTITIONED
+            | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => PartitionKind::Hash,
+            partitions::TPartitionType::RANDOM => PartitionKind::Random,
+            _ => PartitionKind::Unpartitioned,
+        };
+        DataPartition {
+            kind,
+            exprs: Vec::new(),
         }
     }
 
@@ -1051,6 +1076,40 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_uses_native_partition_for_instance_count() {
+        let backends = two_backends();
+        let scheduler = FragmentScheduler::new(backends);
+        let fragments = vec![
+            fake_fragment(0, Some(1), 4),
+            fake_fragment(1, None, 0),
+            fake_fragment(2, None, 0),
+        ];
+        let mut hash_edge = fake_edge(0, 1, partitions::TPartitionType::HASH_PARTITIONED, 10);
+        hash_edge.compact_output_partition = partitions::TDataPartition::new(
+            partitions::TPartitionType::UNPARTITIONED,
+            None::<Vec<crate::thrift::exprs::TExpr>>,
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
+        );
+        let edges = vec![
+            hash_edge,
+            fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),
+        ];
+
+        let plan = scheduler
+            .assign(&fragments, &edges, make_query_id(1, 1))
+            .expect("assign");
+
+        assert_eq!(plan.by_fragment[&0].len(), 2, "scan: 2 instances");
+        assert_eq!(
+            plan.by_fragment[&1].len(),
+            2,
+            "scheduler must derive hash fanout from native edge.output_partition"
+        );
+        assert_eq!(plan.by_fragment[&2].len(), 1, "root: forced to 1");
+    }
+
+    #[test]
     fn bucket_shuffle_consumer_inherits_upstream_n() {
         // Topology: F0(scan) -> BUCKET_SHUFFLE_HASH -> F1(non-root consumer) -> UNPARTITIONED -> F2(root)
         // F0 has 2 backends so F1 should inherit 2 instances.
@@ -1229,6 +1288,41 @@ mod tests {
             "write anchor is not forced to a single instance"
         );
         assert_eq!(plan.by_fragment[&11].len(), 3);
+        assert_eq!(plan.root_backend_idx, plan.by_fragment[&10][0].backend_idx);
+        assert_eq!(plan.root_finst_id, plan.by_fragment[&10][0].finst_id);
+    }
+
+    #[test]
+    fn single_terminal_write_dag_keeps_writer_parallelism() {
+        let backends = three_backends();
+        let scheduler = FragmentScheduler::new(backends);
+        let fragments = vec![
+            fake_fragment(0, Some(1), 6),
+            fake_write_fragment(10, None, 0),
+        ];
+        let edges = vec![fake_router_edge(
+            0,
+            10,
+            partitions::TPartitionType::HASH_PARTITIONED,
+            100,
+            FragmentStreamKind::Partitioned,
+        )];
+
+        let plan = scheduler
+            .assign(&fragments, &edges, make_query_id(5, 5))
+            .expect("assign");
+
+        assert_eq!(plan.root_fragment_id, 10);
+        assert_eq!(
+            plan.by_fragment[&0].len(),
+            3,
+            "scan source stays distributed"
+        );
+        assert_eq!(
+            plan.by_fragment[&10].len(),
+            3,
+            "single terminal writer is not forced to a single instance"
+        );
         assert_eq!(plan.root_backend_idx, plan.by_fragment[&10][0].backend_idx);
         assert_eq!(plan.root_finst_id, plan.by_fragment[&10][0].finst_id);
     }
