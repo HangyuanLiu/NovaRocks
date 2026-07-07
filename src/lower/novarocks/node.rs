@@ -1282,15 +1282,6 @@ fn lower_window_node(
     if window.window_exprs.is_empty() {
         return Err("WindowNode has no window expressions".to_string());
     }
-    let first = &window.window_exprs[0];
-    for (idx, expr) in window.window_exprs.iter().enumerate().skip(1) {
-        if !same_window_spec(first, expr) {
-            return Err(format!(
-                "WindowNode native proto lowering supports one window specification per node; expression {idx} has a different partition/order/frame"
-            ));
-        }
-    }
-
     let output_columns = if !window.output_columns.is_empty() {
         window.output_columns.as_slice()
     } else {
@@ -1299,88 +1290,258 @@ fn lower_window_node(
     if output_columns.is_empty() {
         return Err("WindowNode output_columns missing".to_string());
     }
-    let layout = layout_from_output_columns(output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let final_layout = layout_from_output_columns(output_columns)?;
+    let final_output_schema = chunk_schema_from_output_columns(output_columns)?;
 
-    let partition_exprs = first
-        .partition_by
-        .iter()
-        .enumerate()
-        .map(|(idx, expr)| {
-            lower_proto_expr(expr, arena, &child.layout)
-                .map_err(|err| format!("WindowNode partition_by[{idx}]: {err}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let order_by_exprs = first
-        .order_by
-        .iter()
-        .enumerate()
-        .map(|(idx, item)| {
-            let expr = item
-                .expr
-                .as_ref()
-                .ok_or_else(|| format!("WindowNode order_by[{idx}] expr missing"))?;
-            lower_proto_expr(expr, arena, &child.layout)
-                .map_err(|err| format!("WindowNode order_by[{idx}]: {err}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let frame = first
-        .window_frame
-        .as_ref()
-        .map(lower_window_frame)
-        .transpose()?;
-    validate_window_frame(&frame, order_by_exprs.is_empty())?;
-
-    let mut functions = Vec::with_capacity(window.window_exprs.len());
-    for (idx, expr) in window.window_exprs.iter().enumerate() {
-        functions.push(
-            lower_window_function(expr, arena, &child.layout)
-                .map_err(|err| format!("WindowNode function[{idx}]: {err}"))?,
-        );
+    let groups = group_window_exprs_by_spec(&window.window_exprs);
+    if groups.is_empty() {
+        return Err("WindowNode produced no window expression groups".to_string());
     }
 
-    let mut function_by_slot = HashMap::with_capacity(window.window_exprs.len());
-    for (idx, expr) in window.window_exprs.iter().enumerate() {
-        let slot = SlotId::new(expr.output_column_id);
-        if function_by_slot.insert(slot, idx).is_some() {
-            return Err(format!(
-                "WindowNode duplicate output_column_id {}",
-                expr.output_column_id
-            ));
+    let mut current = child;
+    let mut next_node_id = node.node_id;
+    for (group_idx, group_indices) in groups.iter().enumerate() {
+        let first_idx = group_indices
+            .first()
+            .copied()
+            .ok_or_else(|| format!("WindowNode group {group_idx} is empty"))?;
+        let first = &window.window_exprs[first_idx];
+        let is_last = group_idx + 1 == groups.len();
+
+        if group_idx > 0 && window_expr_has_sort_keys(first) {
+            current = sort_window_group_input(next_node_id, group_idx, first, current, arena)?;
+            next_node_id = next_node_id.checked_add(1).ok_or_else(|| {
+                format!("WindowNode node_id {next_node_id} overflows after sort group {group_idx}")
+            })?;
         }
-    }
-    let child_slots = child.layout.order().iter().copied().collect::<HashSet<_>>();
-    let mut analytic_output_columns = Vec::with_capacity(output_columns.len());
-    for col in output_columns {
-        let slot = SlotId::new(col.column_id);
-        if let Some(idx) = function_by_slot.get(&slot) {
-            analytic_output_columns.push(AnalyticOutputColumn::Window(*idx));
-        } else if child_slots.contains(&slot) {
-            analytic_output_columns.push(AnalyticOutputColumn::InputSlotId(slot));
+
+        let (layout, output_schema) = if is_last {
+            (final_layout.clone(), final_output_schema.clone())
         } else {
-            return Err(format!(
-                "WindowNode output column id {} has no child slot or window result",
-                col.column_id
-            ));
+            intermediate_window_output(&current, group_indices, window, &final_output_schema)
+                .map_err(|err| format!("WindowNode group {group_idx}: {err}"))?
+        };
+
+        let partition_exprs = first
+            .partition_by
+            .iter()
+            .enumerate()
+            .map(|(idx, expr)| {
+                lower_proto_expr(expr, arena, &current.layout).map_err(|err| {
+                    format!("WindowNode group {group_idx} partition_by[{idx}]: {err}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let order_by_exprs = first
+            .order_by
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                let expr = item.expr.as_ref().ok_or_else(|| {
+                    format!("WindowNode group {group_idx} order_by[{idx}] expr missing")
+                })?;
+                lower_proto_expr(expr, arena, &current.layout)
+                    .map_err(|err| format!("WindowNode group {group_idx} order_by[{idx}]: {err}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let frame = first
+            .window_frame
+            .as_ref()
+            .map(lower_window_frame)
+            .transpose()?;
+        validate_window_frame(&frame, order_by_exprs.is_empty())?;
+
+        let mut functions = Vec::with_capacity(group_indices.len());
+        for (local_idx, expr_idx) in group_indices.iter().copied().enumerate() {
+            let expr = &window.window_exprs[expr_idx];
+            functions.push(
+                lower_window_function(expr, arena, &current.layout).map_err(|err| {
+                    format!("WindowNode group {group_idx} function[{local_idx}]: {err}")
+                })?,
+            );
         }
+
+        let mut function_by_slot = HashMap::with_capacity(group_indices.len());
+        for (local_idx, expr_idx) in group_indices.iter().copied().enumerate() {
+            let expr = &window.window_exprs[expr_idx];
+            let slot = SlotId::new(expr.output_column_id);
+            if function_by_slot.insert(slot, local_idx).is_some() {
+                return Err(format!(
+                    "WindowNode duplicate output_column_id {}",
+                    expr.output_column_id
+                ));
+            }
+        }
+        let analytic_output_columns =
+            window_analytic_output_columns(&layout, &current.layout, &function_by_slot, group_idx)?;
+        let group_node_id = next_node_id;
+        next_node_id = next_node_id.checked_add(1).ok_or_else(|| {
+            format!("WindowNode node_id {next_node_id} overflows after analytic group {group_idx}")
+        })?;
+
+        current = LoweredNode {
+            node: ExecNode {
+                kind: ExecNodeKind::Analytic(AnalyticNode {
+                    input: Box::new(current.node),
+                    node_id: group_node_id,
+                    partition_exprs,
+                    order_by_exprs,
+                    functions,
+                    window: frame,
+                    output_columns: analytic_output_columns,
+                    output_chunk_schema: output_schema.clone(),
+                }),
+            },
+            layout,
+            output_schema,
+        };
     }
+
+    Ok(current)
+}
+
+fn window_expr_has_sort_keys(expr: &plan::WindowExpr) -> bool {
+    !expr.partition_by.is_empty() || !expr.order_by.is_empty()
+}
+
+fn sort_window_group_input(
+    node_id: i32,
+    group_idx: usize,
+    first: &plan::WindowExpr,
+    input: LoweredNode,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    let mut order_by = Vec::with_capacity(first.partition_by.len() + first.order_by.len());
+    for (idx, expr) in first.partition_by.iter().enumerate() {
+        let expr = lower_proto_expr(expr, arena, &input.layout).map_err(|err| {
+            format!("WindowNode group {group_idx} sort partition_by[{idx}]: {err}")
+        })?;
+        order_by.push(SortExpression {
+            expr,
+            asc: true,
+            nulls_first: true,
+        });
+    }
+    order_by.extend(lower_sort_items(
+        &format!("WindowNode group {group_idx} sort"),
+        &first.order_by,
+        arena,
+        &input.layout,
+    )?);
 
     Ok(LoweredNode {
         node: ExecNode {
-            kind: ExecNodeKind::Analytic(AnalyticNode {
-                input: Box::new(child.node),
-                node_id: node.node_id,
-                partition_exprs,
-                order_by_exprs,
-                functions,
-                window: frame,
-                output_columns: analytic_output_columns,
-                output_chunk_schema: output_schema.clone(),
+            kind: ExecNodeKind::Sort(SortNode {
+                input: Box::new(input.node),
+                node_id,
+                use_top_n: false,
+                order_by,
+                limit: None,
+                offset: 0,
+                topn_type: SortTopNType::RowNumber,
+                max_buffered_rows: None,
+                max_buffered_bytes: None,
+                partition_exprs: Vec::new(),
+                partition_limit: None,
             }),
         },
-        layout,
-        output_schema,
+        layout: input.layout,
+        output_schema: input.output_schema,
     })
+}
+
+fn group_window_exprs_by_spec(exprs: &[plan::WindowExpr]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (idx, expr) in exprs.iter().enumerate() {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| same_window_spec(&exprs[group[0]], expr))
+        {
+            group.push(idx);
+        } else {
+            groups.push(vec![idx]);
+        }
+    }
+    groups
+}
+
+fn intermediate_window_output(
+    current: &LoweredNode,
+    group_indices: &[usize],
+    window: &plan::WindowNode,
+    final_output_schema: &ChunkSchema,
+) -> Result<(Layout, ChunkSchemaRef), String> {
+    let mut slot_ids = current.layout.order().to_vec();
+    let mut slots = Vec::with_capacity(slot_ids.len() + group_indices.len());
+    for slot_id in current.layout.order() {
+        let slot = current.output_schema.slot(*slot_id).cloned().ok_or_else(|| {
+            format!(
+                "current output schema missing input slot {} for intermediate WindowNode output",
+                slot_id
+            )
+        })?;
+        slots.push(slot);
+    }
+
+    for expr_idx in group_indices {
+        let expr = window
+            .window_exprs
+            .get(*expr_idx)
+            .ok_or_else(|| format!("window expression index {expr_idx} is out of bounds"))?;
+        let slot_id = SlotId::new(expr.output_column_id);
+        if slot_ids.contains(&slot_id) {
+            continue;
+        }
+        slot_ids.push(slot_id);
+        slots.push(window_expr_slot_schema(expr, final_output_schema)?);
+    }
+
+    Ok((
+        Layout::for_slots(slot_ids),
+        Arc::new(ChunkSchema::try_new(slots)?),
+    ))
+}
+
+fn window_expr_slot_schema(
+    expr: &plan::WindowExpr,
+    final_output_schema: &ChunkSchema,
+) -> Result<ChunkSlotSchema, String> {
+    let slot_id = SlotId::new(expr.output_column_id);
+    if let Some(slot) = final_output_schema.slot(slot_id) {
+        return Ok(slot.clone());
+    }
+
+    let type_desc = expr
+        .result_type
+        .as_ref()
+        .ok_or_else(|| format!("window function {} result_type missing", expr.name))?;
+    let data_type = super::decode_type(type_desc)?;
+    let field = Field::new(&expr.output_name, data_type, true);
+    ChunkSchema::slot_schema_from_arrow_field(slot_id, &field)
+}
+
+fn window_analytic_output_columns(
+    layout: &Layout,
+    input_layout: &Layout,
+    function_by_slot: &HashMap<SlotId, usize>,
+    group_idx: usize,
+) -> Result<Vec<AnalyticOutputColumn>, String> {
+    layout
+        .order()
+        .iter()
+        .map(|slot| {
+            if let Some(idx) = function_by_slot.get(slot) {
+                Ok(AnalyticOutputColumn::Window(*idx))
+            } else if input_layout.contains_slot(*slot) {
+                Ok(AnalyticOutputColumn::InputSlotId(*slot))
+            } else {
+                Err(format!(
+                    "WindowNode group {group_idx} output slot {} has no input slot or window result",
+                    slot
+                ))
+            }
+        })
+        .collect()
 }
 
 fn same_window_spec(left: &plan::WindowExpr, right: &plan::WindowExpr) -> bool {
@@ -4538,6 +4699,107 @@ mod tests {
             &[SlotId::new(1), SlotId::new(2)]
         );
         assert_eq!(lowered.layout.order(), &[SlotId::new(1), SlotId::new(2)]);
+    }
+
+    #[test]
+    fn lowers_window_node_with_multiple_specs_as_analytic_chain() {
+        let output_columns = vec![
+            output_column(1, "id", DataType::Int64),
+            output_column(2, "rn", DataType::Int64),
+            output_column(3, "rnk", DataType::Int64),
+        ];
+        let mut descending_id = sort_item(1);
+        descending_id.asc = false;
+        let window = physical_node(
+            81,
+            plan::plan_node::Kind::Window(plan::WindowNode {
+                window_exprs: vec![
+                    plan::WindowExpr {
+                        name: "row_number".to_string(),
+                        args: Vec::new(),
+                        distinct: false,
+                        partition_by: Vec::new(),
+                        order_by: vec![sort_item(1)],
+                        window_frame: Some(expr::WindowFrame {
+                            frame_type: expr::WindowFrameType::Rows as i32,
+                            start: Some(expr::WindowBound {
+                                bound: Some(expr::window_bound::Bound::UnboundedPreceding(true)),
+                            }),
+                            end: Some(expr::WindowBound {
+                                bound: Some(expr::window_bound::Bound::CurrentRow(true)),
+                            }),
+                        }),
+                        result_type: Some(type_desc(&DataType::Int64)),
+                        output_name: "rn".to_string(),
+                        output_column_id: 2,
+                        ignore_nulls: false,
+                    },
+                    plan::WindowExpr {
+                        name: "rank".to_string(),
+                        args: Vec::new(),
+                        distinct: false,
+                        partition_by: Vec::new(),
+                        order_by: vec![descending_id],
+                        window_frame: Some(expr::WindowFrame {
+                            frame_type: expr::WindowFrameType::Rows as i32,
+                            start: Some(expr::WindowBound {
+                                bound: Some(expr::window_bound::Bound::UnboundedPreceding(true)),
+                            }),
+                            end: Some(expr::WindowBound {
+                                bound: Some(expr::window_bound::Bound::CurrentRow(true)),
+                            }),
+                        }),
+                        result_type: Some(type_desc(&DataType::Int64)),
+                        output_name: "rnk".to_string(),
+                        output_column_id: 3,
+                        ignore_nulls: false,
+                    },
+                ],
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+
+        let lowered = lower(&window);
+        let ExecNodeKind::Analytic(second) = lowered.node.kind else {
+            panic!("expected final Analytic");
+        };
+        assert_eq!(second.node_id, 83);
+        assert_eq!(second.functions.len(), 1);
+        assert!(matches!(
+            second.functions[0].kind,
+            crate::exec::node::analytic::WindowFunctionKind::Rank
+        ));
+        assert_eq!(
+            second.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]
+        );
+
+        let ExecNodeKind::Sort(sort) = second.input.kind else {
+            panic!("expected Sort under final Analytic");
+        };
+        assert_eq!(sort.node_id, 82);
+        assert_eq!(sort.order_by.len(), 1);
+        assert!(!sort.order_by[0].asc);
+
+        let ExecNodeKind::Analytic(first) = sort.input.kind else {
+            panic!("expected first Analytic under Sort");
+        };
+        assert_eq!(first.node_id, 81);
+        assert_eq!(first.functions.len(), 1);
+        assert!(matches!(
+            first.functions[0].kind,
+            crate::exec::node::analytic::WindowFunctionKind::RowNumber
+        ));
+        assert_eq!(
+            first.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert_eq!(
+            lowered.layout.order(),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]
+        );
     }
 
     #[test]
