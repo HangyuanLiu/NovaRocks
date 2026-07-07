@@ -248,17 +248,19 @@ fn rust_production_text_without_cfg_test(text: &str) -> String {
     production
 }
 
-fn nidl_e2_is_cfg_test_or_compat_attr(trimmed: &str) -> bool {
-    trimmed.starts_with("#[cfg(test")
-        || trimmed == "#[cfg(feature = \"compat\")]"
-        || trimmed == "#[cfg(feature=\"compat\")]"
-        || trimmed.starts_with("#[cfg(all(feature = \"compat\"")
-        || trimmed.starts_with("#[cfg(any(feature = \"compat\"")
+fn is_cfg_test_or_compat_attr(trimmed: &str) -> bool {
+    if trimmed.starts_with("#[cfg(test") {
+        return true;
+    }
+    if !trimmed.starts_with("#[cfg(") {
+        return false;
+    }
+    compact_line(trimmed).contains("feature=\"compat\"")
 }
 
-fn nidl_e2_rust_text_without_cfg_test_or_compat(text: &str) -> String {
+fn rust_production_text_without_cfg_test_or_compat(text: &str) -> String {
     let mut production = String::with_capacity(text.len());
-    let mut pending_cfg = false;
+    let mut pending_skip_attr = false;
     let mut skipping_cfg_item = false;
     let mut skip_depth = 0isize;
 
@@ -287,7 +289,7 @@ fn nidl_e2_rust_text_without_cfg_test_or_compat(text: &str) -> String {
             continue;
         }
 
-        if pending_cfg {
+        if pending_skip_attr {
             if trimmed.is_empty() || trimmed.starts_with("#[") {
                 production.push('\n');
                 continue;
@@ -300,13 +302,13 @@ fn nidl_e2_rust_text_without_cfg_test_or_compat(text: &str) -> String {
             } else if !trimmed.ends_with(';') {
                 skipping_cfg_item = true;
             }
-            pending_cfg = false;
+            pending_skip_attr = false;
             production.push('\n');
             continue;
         }
 
-        if nidl_e2_is_cfg_test_or_compat_attr(trimmed) {
-            pending_cfg = true;
+        if is_cfg_test_or_compat_attr(trimmed) {
+            pending_skip_attr = true;
             production.push('\n');
             continue;
         }
@@ -316,6 +318,10 @@ fn nidl_e2_rust_text_without_cfg_test_or_compat(text: &str) -> String {
     }
 
     production
+}
+
+fn nidl_e2_rust_text_without_cfg_test_or_compat(text: &str) -> String {
+    rust_production_text_without_cfg_test_or_compat(text)
 }
 
 fn push_forbidden_terms(
@@ -5199,12 +5205,15 @@ fn nidl_e0_is_in_compat_scope(rel_path: &str) -> bool {
 fn nidl_e0_offenders_in(dir: &Path) -> Vec<PathBuf> {
     let mut offenders = Vec::new();
     for path in rs_files(dir) {
-        let hits = non_test_line_hits(&path, |line| {
-            nidl_e0_starrocks_idl_terms()
-                .iter()
-                .any(|term| line.contains(*term))
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let production = rust_production_text_without_cfg_test_or_compat(&text);
+        let has_hit = production.lines().any(|line| {
+            !is_comment_or_blank(line)
+                && nidl_e0_starrocks_idl_terms()
+                    .iter()
+                    .any(|term| line.contains(*term))
         });
-        if !hits.is_empty() {
+        if has_hit {
             offenders.push(path);
         }
     }
@@ -5307,6 +5316,49 @@ fn nidl_e0_detector_flags_starrocks_idl_and_ignores_native_and_tests() {
     assert!(
         !names.iter().any(|n| n == "test_only.rs"),
         "must ignore #[cfg(test)] module references; got {names:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nidl_e6_ledger_detector_ignores_compat_cfg_items() {
+    let dir = std::env::temp_dir().join("nidl_e6_detector");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("compat_fn.rs"),
+        "#[cfg(feature = \"compat\")]\nfn compat_only() {\n    let _ = crate::thrift::types::TUniqueId::new(1, 2);\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("compat_mod.rs"),
+        "#[cfg(feature = \"compat\")]\nmod compat_only {\n    use crate::proto::starrocks;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("offender.rs"),
+        "fn default_build_offender() {\n    let _ = crate::thrift::types::TUniqueId::new(3, 4);\n}\n",
+    )
+    .unwrap();
+
+    let offenders = nidl_e0_offenders_in(&dir);
+    let names: Vec<String> = offenders
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        names.iter().any(|n| n == "offender.rs"),
+        "must keep default-build offenders; got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "compat_fn.rs"),
+        "must ignore compat-only functions; got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "compat_mod.rs"),
+        "must ignore compat-only modules; got {names:?}"
     );
 
     let _ = fs::remove_dir_all(&dir);
