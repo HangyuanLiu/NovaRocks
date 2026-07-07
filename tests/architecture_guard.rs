@@ -3101,6 +3101,82 @@ fn assert_proto_schema_baseline_merge_rejects(
 }
 
 #[test]
+fn nidl_d3f_native_scan_range_proto_is_file_only() {
+    let repo = Path::new(manifest_dir());
+    let service_proto =
+        fs::read_to_string(repo.join("idl/novarocks/service.proto")).expect("read service.proto");
+
+    for forbidden in ["HdfsScanRange", "InternalScanRange", "TScanRangeParams"] {
+        assert!(
+            !service_proto.contains(forbidden),
+            "idl/novarocks/service.proto must not expose thrift-shaped native scan range symbol `{forbidden}`"
+        );
+    }
+    assert!(
+        service_proto.contains("message ScanRangeParams")
+            && service_proto.contains("FileScanRange file = 1"),
+        "idl/novarocks/service.proto must expose native ScanRangeParams -> FileScanRange"
+    );
+}
+
+#[test]
+fn nidl_d3f_native_runtime_layers_do_not_import_thrift_scan_ranges() {
+    let repo = Path::new(manifest_dir());
+    let guarded_files = [
+        "src/runtime/scheduler.rs",
+        "src/sql/codegen/proto_encode/instance.rs",
+    ];
+    let forbidden = ["TScanRangeParams", "THdfsScanRange", "TInternalScanRange"];
+    let mut violations = Vec::new();
+
+    for rel_path in guarded_files {
+        let path = repo.join(rel_path);
+        for (line, text) in source_line_hits(&path, |line| {
+            forbidden.iter().any(|symbol| line.contains(symbol))
+        }) {
+            violations.push(format!("{rel_path}:{line}: {text}"));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "native scheduling/proto encoding must use runtime::scan_range, not thrift scan range types:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nidl_d3f_scan_node_dispatch_keeps_native_file_emitter_on_iceberg_only() {
+    let repo = Path::new(manifest_dir());
+    let source =
+        fs::read_to_string(repo.join("src/sql/codegen/nodes.rs")).expect("read codegen nodes");
+    let starrocks_start = source
+        .find("ScanSource::StarRocks { .. } => {")
+        .expect("find StarRocks scan node branch");
+    let iceberg_start = source[starrocks_start..]
+        .find("ScanSource::IcebergDataFiles")
+        .map(|offset| starrocks_start + offset)
+        .expect("find Iceberg scan node branch");
+    let starrocks_branch = &source[starrocks_start..iceberg_start];
+    assert!(
+        starrocks_branch.contains("to_thrift_scan(")
+            && !starrocks_branch.contains("to_native_file_scan("),
+        "StarRocks build_scan_node branch must stay on the compact thrift scan emitter"
+    );
+
+    let after_iceberg = &source[iceberg_start..];
+    let iceberg_end = after_iceberg
+        .find("ScanSource::IcebergDeltaTable")
+        .expect("find end of Iceberg data-file scan node branch");
+    let iceberg_branch = &after_iceberg[..iceberg_end];
+    assert!(
+        iceberg_branch.contains("to_native_file_scan(")
+            && !iceberg_branch.contains("to_thrift_scan("),
+        "Iceberg data-file build_scan_node branch must use the native file scan emitter"
+    );
+}
+
+#[test]
 fn nidl_d3b_proto_schema_parser_handles_current_syntax() {
     let input = r#"
         syntax = "proto3";

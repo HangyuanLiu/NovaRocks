@@ -57,66 +57,54 @@ fn id(hi: i64, lo: i64) -> common::UniqueId {
     common::UniqueId { hi, lo }
 }
 
-fn hdfs_scan_range() -> novarocks::ScanRange {
-    novarocks::ScanRange {
-        kind: Some(novarocks::scan_range::Kind::Hdfs(
-            novarocks::HdfsScanRange {
-                file_format: "PARQUET".to_string(),
-                full_path: Some("s3://warehouse/t/data-000.parquet".to_string()),
-                relative_path: Some("data-000.parquet".to_string()),
-                table_id: Some(42),
-                offset: 128,
-                length: 4096,
-                file_length: 8192,
-                delete_files: vec![novarocks::IcebergDeleteFile {
-                    full_path: Some("s3://warehouse/t/delete-000.parquet".to_string()),
+fn file_scan_range() -> novarocks::ScanRangeParams {
+    novarocks::ScanRangeParams {
+        range: Some(novarocks::ScanRange {
+            kind: Some(novarocks::scan_range::Kind::File(
+                novarocks::FileScanRange {
                     file_format: "PARQUET".to_string(),
-                    file_content: "POSITION_DELETES".to_string(),
-                    length: Some(256),
-                }],
-                deletion_vector_descriptor: Some(novarocks::DeletionVectorDescriptor {
-                    storage_type: Some("PUFFIN".to_string()),
-                    path_or_inline_dv: Some("s3://warehouse/t/dv.puffin".to_string()),
-                    offset: Some(12),
-                    size_in_bytes: Some(34),
-                    cardinality: Some(5),
-                }),
-                first_row_id: Some(1000),
-                data_sequence_number: Some(7),
-                modification_time: Some(1_717_171_717),
-                datacache_options: Some(novarocks::DatacacheOptions {
-                    enable_populate_datacache: Some(true),
-                    priority: Some(3),
-                }),
-                included_positions: vec![1000, 1003, 1008],
-                serialized_split: Some("manifest-entry".to_string()),
-                use_iceberg_jni_metadata_reader: true,
-            },
-        )),
-        volume_id: None,
-        empty: None,
-        has_more: None,
-    }
-}
-
-fn internal_scan_range() -> novarocks::ScanRange {
-    novarocks::ScanRange {
-        kind: Some(novarocks::scan_range::Kind::Internal(
-            novarocks::InternalScanRange {
-                version: 11,
-                tablet_id: 22,
-                partition_id: 33,
-                db_name: Some("db1".to_string()),
-                table_name: Some("tbl1".to_string()),
-                catalog_name: Some("internal".to_string()),
-                fill_data_cache: true,
-                skip_page_cache: false,
-                skip_disk_cache: true,
-            },
-        )),
-        volume_id: None,
-        empty: None,
-        has_more: None,
+                    full_path: Some("s3://bucket/data.parquet".to_string()),
+                    relative_path: Some("data.parquet".to_string()),
+                    table_id: Some(99),
+                    offset: 8,
+                    length: 16,
+                    file_length: 128,
+                    delete_files: vec![novarocks::IcebergDeleteFile {
+                        full_path: Some("s3://bucket/delete.parquet".to_string()),
+                        file_format: "PARQUET".to_string(),
+                        file_content: "POSITION_DELETES".to_string(),
+                        length: Some(64),
+                    }],
+                    deletion_vector_descriptor: None,
+                    first_row_id: Some(1_000),
+                    data_sequence_number: Some(44),
+                    modification_time: Some(123_456),
+                    datacache_options: Some(novarocks::DatacacheOptions {
+                        enable_populate_datacache: Some(true),
+                        priority: Some(3),
+                    }),
+                    included_positions: vec![3, 5, 8],
+                    serialized_split: Some("{\"split\":1}".to_string()),
+                    use_iceberg_jni_metadata_reader: true,
+                    change_op: Some(-1),
+                    file_pruning_min_max_values: HashMap::from([(
+                        1,
+                        novarocks::FilePruningMinMaxValue {
+                            value_kind: 2,
+                            has_null: true,
+                            all_null: false,
+                            min_int_value: Some(10),
+                            max_int_value: Some(20),
+                            min_float_value: None,
+                            max_float_value: None,
+                        },
+                    )]),
+                },
+            )),
+        }),
+        volume_id: Some(13),
+        empty: Some(false),
+        has_more: Some(false),
     }
 }
 
@@ -225,14 +213,11 @@ fn runtime_endpoint_fields_use_native_grpc_names_and_tags() {
 }
 
 #[test]
-fn scan_range_arms_survive_proto_roundtrip() {
-    let hdfs = hdfs_scan_range();
-    let decoded_hdfs: novarocks::ScanRange = roundtrip_message(&hdfs);
-    assert_eq!(hdfs, decoded_hdfs);
-
-    let internal = internal_scan_range();
-    let decoded_internal: novarocks::ScanRange = roundtrip_message(&internal);
-    assert_eq!(internal, decoded_internal);
+fn file_scan_range_survives_proto_roundtrip() {
+    let decoded: novarocks::ScanRangeParams = roundtrip_message(&file_scan_range());
+    assert_eq!(decoded, file_scan_range());
+    let fields = encoded_field_numbers(&decoded);
+    assert_eq!(fields, vec![1, 2, 3, 4]);
 }
 
 #[test]
@@ -244,7 +229,7 @@ fn instance_params_survives_proto_roundtrip() {
         per_node_scan_ranges: HashMap::from([(
             10,
             novarocks::ScanRangeList {
-                ranges: vec![hdfs_scan_range(), internal_scan_range()],
+                ranges: vec![file_scan_range()],
             },
         )]),
         per_exch_num_senders: HashMap::from([(20, 3)]),

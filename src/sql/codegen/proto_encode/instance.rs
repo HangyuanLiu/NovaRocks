@@ -4,8 +4,9 @@ use crate::proto::{common, novarocks};
 use crate::runtime::endpoint::{
     FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
 };
+use crate::runtime::scan_range;
 use crate::runtime::scheduler::FragmentInstancePlacement;
-use crate::thrift::{descriptors, internal_service, plan_nodes, types};
+use crate::thrift::{internal_service, types};
 
 pub(crate) fn encode_instance_params(
     query_id: &types::TUniqueId,
@@ -66,72 +67,39 @@ fn encode_unique_id(src: &types::TUniqueId) -> common::UniqueId {
 }
 
 fn encode_scan_range_params(
-    src: &internal_service::TScanRangeParams,
-) -> Result<novarocks::ScanRange, String> {
-    let mut range = encode_scan_range(&src.scan_range)?;
-    range.volume_id = src.volume_id;
-    range.empty = src.empty;
-    range.has_more = src.has_more;
-    Ok(range)
+    src: &scan_range::ScanRangeParams,
+) -> Result<novarocks::ScanRangeParams, String> {
+    Ok(novarocks::ScanRangeParams {
+        range: Some(encode_scan_range(&src.range)?),
+        volume_id: src.volume_id,
+        empty: src.empty,
+        has_more: src.has_more,
+    })
 }
 
-fn encode_scan_range(src: &plan_nodes::TScanRange) -> Result<novarocks::ScanRange, String> {
-    let mut populated_arms = 0;
-    populated_arms += src.hdfs_scan_range.is_some() as usize;
-    populated_arms += src.internal_scan_range.is_some() as usize;
-    populated_arms += src.kudu_scan_token.is_some() as usize;
-    populated_arms += src.broker_scan_range.is_some() as usize;
-    populated_arms += src.es_scan_range.is_some() as usize;
-    populated_arms += src.binlog_scan_range.is_some() as usize;
-    populated_arms += src.benchmark_scan_range.is_some() as usize;
-    if populated_arms != 1 {
-        return Err(format!(
-            "TScanRange must have exactly one populated arm for native encoding, found {populated_arms}"
-        ));
-    }
-
-    if let Some(hdfs) = src.hdfs_scan_range.as_ref() {
-        return Ok(novarocks::ScanRange {
-            kind: Some(novarocks::scan_range::Kind::Hdfs(encode_hdfs_scan_range(
-                hdfs,
+fn encode_scan_range(src: &scan_range::ScanRange) -> Result<novarocks::ScanRange, String> {
+    match src {
+        scan_range::ScanRange::File(file) => Ok(novarocks::ScanRange {
+            kind: Some(novarocks::scan_range::Kind::File(encode_file_scan_range(
+                file,
             )?)),
-            volume_id: None,
-            empty: None,
-            has_more: None,
-        });
+        }),
     }
-    if let Some(internal) = src.internal_scan_range.as_ref() {
-        return Ok(novarocks::ScanRange {
-            kind: Some(novarocks::scan_range::Kind::Internal(
-                encode_internal_scan_range(internal)?,
-            )),
-            volume_id: None,
-            empty: None,
-            has_more: None,
-        });
-    }
-
-    Err("native InstanceParams only supports HDFS and internal scan ranges".to_string())
 }
 
-fn encode_hdfs_scan_range(
-    src: &plan_nodes::THdfsScanRange,
-) -> Result<novarocks::HdfsScanRange, String> {
-    Ok(novarocks::HdfsScanRange {
-        file_format: encode_hdfs_file_format(src.file_format.as_ref().ok_or_else(|| {
-            "THdfsScanRange.file_format is required for native InstanceParams".to_string()
-        })?)?
-        .to_string(),
+fn encode_file_scan_range(
+    src: &scan_range::FileScanRange,
+) -> Result<novarocks::FileScanRange, String> {
+    Ok(novarocks::FileScanRange {
+        file_format: src.file_format.as_native_name().to_string(),
         full_path: src.full_path.clone(),
         relative_path: src.relative_path.clone(),
         table_id: src.table_id,
-        offset: src.offset.unwrap_or_default(),
-        length: src.length.unwrap_or_default(),
-        file_length: src.file_length.unwrap_or_default(),
+        offset: src.offset,
+        length: src.length,
+        file_length: src.file_length,
         delete_files: src
             .delete_files
-            .as_deref()
-            .unwrap_or_default()
             .iter()
             .map(encode_iceberg_delete_file)
             .collect::<Result<Vec<_>, _>>()?,
@@ -143,52 +111,58 @@ fn encode_hdfs_scan_range(
         data_sequence_number: src.data_sequence_number,
         modification_time: src.modification_time,
         datacache_options: src.datacache_options.as_ref().map(encode_datacache_options),
-        included_positions: src.included_positions.clone().unwrap_or_default(),
+        included_positions: src.included_positions.clone(),
         serialized_split: src.serialized_split.clone(),
-        use_iceberg_jni_metadata_reader: src.use_iceberg_jni_metadata_reader.unwrap_or(false),
+        use_iceberg_jni_metadata_reader: src.use_iceberg_jni_metadata_reader,
+        change_op: src.ivm_change_op.map(i32::from),
+        file_pruning_min_max_values: src
+            .file_pruning_min_max_values
+            .as_ref()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|(ordinal, value)| (*ordinal, encode_file_pruning_min_max_value(value)))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
-fn encode_internal_scan_range(
-    src: &plan_nodes::TInternalScanRange,
-) -> Result<novarocks::InternalScanRange, String> {
-    let version = src.version.parse::<i64>().map_err(|e| {
-        format!(
-            "TInternalScanRange.version must be an i64-compatible string for native encoding: {e}"
-        )
-    })?;
-    Ok(novarocks::InternalScanRange {
-        version,
-        tablet_id: src.tablet_id,
-        partition_id: src.partition_id.unwrap_or_default(),
-        db_name: Some(src.db_name.clone()),
-        table_name: src.table_name.clone(),
-        catalog_name: src.catalog_name.clone(),
-        fill_data_cache: src.fill_data_cache.unwrap_or(false),
-        skip_page_cache: src.skip_page_cache.unwrap_or(false),
-        skip_disk_cache: src.skip_disk_cache.unwrap_or(false),
-    })
+fn encode_file_pruning_min_max_value(
+    src: &scan_range::FilePruningMinMaxValue,
+) -> novarocks::FilePruningMinMaxValue {
+    novarocks::FilePruningMinMaxValue {
+        value_kind: encode_file_pruning_value_kind(src.value_kind),
+        has_null: src.has_null,
+        all_null: src.all_null,
+        min_int_value: src.min_int_value,
+        max_int_value: src.max_int_value,
+        min_float_value: src.min_float_value,
+        max_float_value: src.max_float_value,
+    }
+}
+
+fn encode_file_pruning_value_kind(src: scan_range::FilePruningValueKind) -> i32 {
+    match src {
+        scan_range::FilePruningValueKind::Bool => 1,
+        scan_range::FilePruningValueKind::Int => 2,
+        scan_range::FilePruningValueKind::Float => 3,
+    }
 }
 
 fn encode_iceberg_delete_file(
-    src: &plan_nodes::TIcebergDeleteFile,
+    src: &scan_range::IcebergDeleteFile,
 ) -> Result<novarocks::IcebergDeleteFile, String> {
     Ok(novarocks::IcebergDeleteFile {
         full_path: src.full_path.clone(),
-        file_format: encode_hdfs_file_format(src.file_format.as_ref().ok_or_else(|| {
-            "TIcebergDeleteFile.file_format is required for native InstanceParams".to_string()
-        })?)?
-        .to_string(),
-        file_content: encode_iceberg_file_content(src.file_content.as_ref().ok_or_else(|| {
-            "TIcebergDeleteFile.file_content is required for native InstanceParams".to_string()
-        })?)?
-        .to_string(),
+        file_format: src.file_format.as_native_name().to_string(),
+        file_content: src.file_content.as_native_name().to_string(),
         length: src.length,
     })
 }
 
 fn encode_deletion_vector_descriptor(
-    src: &plan_nodes::TDeletionVectorDescriptor,
+    src: &scan_range::DeletionVectorDescriptor,
 ) -> novarocks::DeletionVectorDescriptor {
     novarocks::DeletionVectorDescriptor {
         storage_type: src.storage_type.clone(),
@@ -199,9 +173,7 @@ fn encode_deletion_vector_descriptor(
     }
 }
 
-fn encode_datacache_options(
-    src: &crate::thrift::data_cache::TDataCacheOptions,
-) -> novarocks::DatacacheOptions {
+fn encode_datacache_options(src: &scan_range::DatacacheOptions) -> novarocks::DatacacheOptions {
     novarocks::DatacacheOptions {
         enable_populate_datacache: src.enable_populate_datacache,
         priority: src.priority,
@@ -295,28 +267,5 @@ fn encode_spill_options(src: &internal_service::TSpillOptions) -> novarocks::Spi
             .unwrap_or_default(),
         spill_mem_table_size: src.spill_mem_table_size.unwrap_or_default(),
         spill_mem_table_num: src.spill_mem_table_num.unwrap_or_default(),
-    }
-}
-
-fn encode_hdfs_file_format(src: &descriptors::THdfsFileFormat) -> Result<&'static str, String> {
-    match *src {
-        descriptors::THdfsFileFormat::PARQUET => Ok("PARQUET"),
-        descriptors::THdfsFileFormat::ORC => Ok("ORC"),
-        _ => Err(format!(
-            "unsupported HDFS file format for native InstanceParams: {}",
-            i32::from(*src)
-        )),
-    }
-}
-
-fn encode_iceberg_file_content(src: &types::TIcebergFileContent) -> Result<&'static str, String> {
-    match *src {
-        types::TIcebergFileContent::POSITION_DELETES => Ok("POSITION_DELETES"),
-        types::TIcebergFileContent::EQUALITY_DELETES => Ok("EQUALITY_DELETES"),
-        types::TIcebergFileContent::DATA => Ok("DATA"),
-        _ => Err(format!(
-            "unsupported Iceberg file content for native InstanceParams: {}",
-            i32::from(*src)
-        )),
     }
 }

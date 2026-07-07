@@ -467,7 +467,8 @@ impl ExecutionCoordinator {
                 let mut exec_params = fr.exec_params.clone();
                 exec_params.query_id = query_id.clone();
                 exec_params.fragment_instance_id = placement.finst_id.clone();
-                exec_params.per_node_scan_ranges = placement.scan_ranges.clone();
+                exec_params.per_node_scan_ranges =
+                    compact_scan_ranges_for_placement(fr, placement, placements.len())?;
                 exec_params.per_exch_num_senders = placement.per_exch_num_senders.clone();
                 exec_params.destinations = exec_destinations;
                 if let Some(rf) = rf_plan.as_ref() {
@@ -1154,6 +1155,43 @@ fn wrap_iceberg_change_stream_router_sink(
         None::<data_sinks::TSplitDataStreamSink>,
         Some(router_sink),
     ))
+}
+
+fn compact_scan_ranges_for_placement(
+    fragment: &crate::sql::codegen::FragmentBuildResult,
+    placement: &FragmentInstancePlacement,
+    placement_count: usize,
+) -> Result<BTreeMap<i32, Vec<crate::thrift::internal_service::TScanRangeParams>>, String> {
+    let mut assigned =
+        crate::runtime::scan_range::thrift_scan_range_map_from_native(&placement.scan_ranges)?;
+
+    let compact_ranges = &fragment.exec_params.per_node_scan_ranges;
+    if compact_ranges.is_empty() {
+        return Ok(assigned);
+    }
+    if placement_count == 0 {
+        return Err(format!(
+            "fragment {} has scan ranges but no placements",
+            fragment.fragment_id
+        ));
+    }
+
+    for (node_id, ranges) in compact_ranges {
+        if assigned.contains_key(node_id) {
+            continue;
+        }
+        assigned.insert(
+            *node_id,
+            ranges
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, range)| {
+                    (idx % placement_count == placement.instance_index).then_some(range.clone())
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    Ok(assigned)
 }
 
 fn is_write_sink(params: &crate::thrift::internal_service::TExecPlanFragmentParams) -> bool {
@@ -3482,6 +3520,123 @@ mod tests {
             runtime_filter_prober_params: BTreeMap::new(),
             per_exch_num_senders: BTreeMap::new(),
         }
+    }
+
+    fn native_file_scan_range_for_test(marker: i32) -> crate::runtime::scan_range::ScanRangeParams {
+        let mut params = crate::runtime::scan_range::ScanRangeParams::file(
+            crate::runtime::scan_range::FileScanRange {
+                file_format: crate::runtime::scan_range::FileFormat::Parquet,
+                full_path: Some(format!("s3://bucket/native-{marker}.parquet")),
+                relative_path: None,
+                table_id: None,
+                offset: 0,
+                length: 1,
+                file_length: 1,
+                delete_files: Vec::new(),
+                deletion_vector_descriptor: None,
+                first_row_id: None,
+                data_sequence_number: None,
+                modification_time: None,
+                datacache_options: None,
+                included_positions: Vec::new(),
+                serialized_split: None,
+                use_iceberg_jni_metadata_reader: false,
+                ivm_change_op: None,
+                file_pruning_min_max_values: None,
+                extended_columns: None,
+            },
+        );
+        params.volume_id = Some(marker);
+        params
+    }
+
+    fn compact_scan_range_for_test(
+        marker: i32,
+    ) -> crate::thrift::internal_service::TScanRangeParams {
+        crate::thrift::internal_service::TScanRangeParams::new(
+            crate::thrift::plan_nodes::TScanRange::new(
+                None::<crate::thrift::plan_nodes::TInternalScanRange>,
+                None::<Vec<u8>>,
+                None::<crate::thrift::plan_nodes::TBrokerScanRange>,
+                None::<crate::thrift::plan_nodes::TEsScanRange>,
+                None::<crate::thrift::plan_nodes::THdfsScanRange>,
+                None::<crate::thrift::plan_nodes::TBinlogScanRange>,
+                None::<crate::thrift::plan_nodes::TBenchmarkScanRange>,
+            ),
+            Some(marker),
+            Some(false),
+            Some(false),
+        )
+    }
+
+    fn fragment_for_scan_range_merge_test(
+        compact_ranges: BTreeMap<i32, Vec<crate::thrift::internal_service::TScanRangeParams>>,
+    ) -> crate::sql::codegen::FragmentBuildResult {
+        let mut params = make_params_with_finst(1, 1);
+        let exec_params = params
+            .params
+            .as_mut()
+            .expect("exec params for scan range merge test");
+        exec_params.per_node_scan_ranges = compact_ranges;
+        crate::sql::codegen::FragmentBuildResult {
+            fragment_id: 0,
+            plan: crate::thrift::plan_nodes::TPlan::new(Vec::new()),
+            desc_tbl: crate::thrift::descriptors::TDescriptorTable::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+            exec_params: exec_params.clone(),
+            native_scan_ranges: BTreeMap::new(),
+            output_sink: empty_data_sink_for_test(data_sinks::TDataSinkType::RESULT_SINK),
+            output_exprs: None,
+            output_columns: Vec::new(),
+            boundary_schemas: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+            query_global_dicts: None,
+            query_global_dict_exprs: None,
+        }
+    }
+
+    #[test]
+    fn compact_scan_ranges_for_placement_merges_native_and_compact_only_nodes() {
+        let fragment = fragment_for_scan_range_merge_test(BTreeMap::from([
+            (10, vec![compact_scan_range_for_test(999)]),
+            (
+                20,
+                vec![
+                    compact_scan_range_for_test(201),
+                    compact_scan_range_for_test(202),
+                    compact_scan_range_for_test(203),
+                ],
+            ),
+        ]));
+        let mut placement = fake_placement(0, 1, 200, "10.0.0.20");
+        placement
+            .scan_ranges
+            .insert(10, vec![native_file_scan_range_for_test(101)]);
+
+        let merged = compact_scan_ranges_for_placement(&fragment, &placement, 2)
+            .expect("merge native and compact scan ranges");
+
+        assert_eq!(
+            merged[&10]
+                .iter()
+                .map(|range| range.volume_id.expect("native marker"))
+                .collect::<Vec<_>>(),
+            vec![101],
+            "native scan range key must not be replaced by compact projection"
+        );
+        assert_eq!(
+            merged[&20]
+                .iter()
+                .map(|range| range.volume_id.expect("compact marker"))
+                .collect::<Vec<_>>(),
+            vec![202],
+            "compact-only scan range key must still be assigned round-robin"
+        );
     }
 
     fn is_write_sink_for_test(

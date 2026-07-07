@@ -35,6 +35,7 @@ use crate::connector::iceberg::metadata::{
 use crate::connector::iceberg::{
     IcebergArrowColumn, IcebergSchemaDescriptor, IcebergSchemaFieldDescriptor,
     IcebergTableDescriptor, build_projected_output_schema,
+    file_pruning::IcebergFilePruningMetadata,
 };
 use crate::connector::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig, ScanConfig};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
@@ -55,6 +56,7 @@ use crate::fs::object_store::{ObjectStoreConfig, apply_object_store_runtime_defa
 use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
 use crate::fs::scan_context::FileScanRange;
 use crate::proto::{common, novarocks, plan};
+use crate::sql::catalog::IcebergColumnStats;
 
 pub(crate) fn lower_scan_node(
     node: &plan::DistributedNode,
@@ -1295,59 +1297,67 @@ fn scan_batch_size(
 fn decode_file_scan_ranges(
     node_id: i32,
     table: &plan::IcebergTableInfo,
-    ranges: &[novarocks::ScanRange],
+    ranges: &[novarocks::ScanRangeParams],
 ) -> Result<Vec<FileScanRange>, String> {
     ranges
         .iter()
         .enumerate()
-        .filter_map(|(idx, range)| {
+        .map(|(idx, range)| {
+            if range.has_more.unwrap_or(false) {
+                return Err(format!(
+                    "ScanNode node_id={node_id} range {idx} has_more is not supported by native lowering"
+                ));
+            }
             if range.empty.unwrap_or(false) {
-                None
+                Ok(None)
             } else {
-                Some(decode_file_scan_range(node_id, table, idx, range))
+                decode_file_scan_range(node_id, table, idx, range).map(Some)
             }
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()
+        .map(|ranges| ranges.into_iter().flatten().collect())
 }
 
 fn decode_file_scan_range(
     node_id: i32,
     table: &plan::IcebergTableInfo,
     idx: usize,
-    range: &novarocks::ScanRange,
+    range: &novarocks::ScanRangeParams,
 ) -> Result<FileScanRange, String> {
     if range.has_more.unwrap_or(false) {
         return Err(format!(
             "ScanNode node_id={node_id} range {idx} has_more is not supported by native lowering"
         ));
     }
-    let Some(novarocks::scan_range::Kind::Hdfs(hdfs)) = range.kind.as_ref() else {
+    let Some(novarocks::scan_range::Kind::File(file)) =
+        range.range.as_ref().and_then(|range| range.kind.as_ref())
+    else {
         return Err(format!(
-            "ScanNode node_id={node_id} range {idx} expected HDFS range"
+            "ScanNode node_id={node_id} range {idx} expected file range"
         ));
     };
-    if !hdfs.file_format.eq_ignore_ascii_case("PARQUET") {
+    if !file.file_format.eq_ignore_ascii_case("PARQUET") {
         return Err(format!(
             "ScanNode node_id={node_id} range {idx} unsupported file_format {}; only PARQUET is supported",
-            hdfs.file_format
+            file.file_format
         ));
     }
-    let path = hdfs_range_path(table, hdfs)?;
-    let file_len = nonnegative_u64(hdfs.file_length, "file_length")?;
-    let offset = nonnegative_u64(hdfs.offset, "offset")?;
+    let path = file_range_path(table, file)?;
+    let file_len = nonnegative_u64(file.file_length, "file_length")?;
+    let offset = nonnegative_u64(file.offset, "offset")?;
     if offset > file_len {
         return Err(format!(
             "ScanNode node_id={node_id} range {idx} offset {} exceeds file_length {}",
-            hdfs.offset, hdfs.file_length
+            file.offset, file.file_length
         ));
     }
-    let length = if hdfs.length > 0 {
-        nonnegative_u64(hdfs.length, "length")?
+    let length = if file.length > 0 {
+        nonnegative_u64(file.length, "length")?
     } else {
         file_len - offset
     };
-    let mut delete_files = decode_delete_files(node_id, idx, &hdfs.delete_files)?;
-    if let Some(dv) = hdfs.deletion_vector_descriptor.as_ref() {
+    let mut delete_files = decode_delete_files(node_id, idx, &file.delete_files)?;
+    if let Some(dv) = file.deletion_vector_descriptor.as_ref() {
         delete_files.push(decode_deletion_vector_descriptor(node_id, idx, dv)?);
     }
     Ok(FileScanRange {
@@ -1357,35 +1367,175 @@ fn decode_file_scan_range(
         length,
         scan_range_id: i32::try_from(idx)
             .map_err(|_| format!("ScanNode node_id={node_id} range index overflow"))?,
-        first_row_id: hdfs.first_row_id,
-        data_sequence_number: hdfs.data_sequence_number,
-        ivm_change_op: None,
-        included_positions: if hdfs.included_positions.is_empty() {
+        first_row_id: file.first_row_id,
+        data_sequence_number: file.data_sequence_number,
+        ivm_change_op: decode_change_op(node_id, idx, file.change_op)?,
+        included_positions: if file.included_positions.is_empty() {
             None
         } else {
-            Some(hdfs.included_positions.clone())
+            Some(file.included_positions.clone())
         },
-        external_datacache: hdfs_external_datacache(hdfs),
+        external_datacache: file_external_datacache(file),
         delete_files,
-        iceberg_file_pruning: None,
+        iceberg_file_pruning: file_pruning_metadata_from_native(
+            node_id,
+            idx,
+            table,
+            &file.file_pruning_min_max_values,
+        )?,
     })
 }
 
-fn hdfs_range_path(
+fn decode_change_op(node_id: i32, idx: usize, value: Option<i32>) -> Result<Option<i8>, String> {
+    value
+        .map(|value| {
+            let change_op = i8::try_from(value).map_err(|_| {
+                format!("ScanNode node_id={node_id} range {idx} change_op {value} exceeds i8 range")
+            })?;
+            crate::exec::change_op::validate_change_op_value(change_op)?;
+            Ok(change_op)
+        })
+        .transpose()
+}
+
+fn file_pruning_metadata_from_native(
+    node_id: i32,
+    range_idx: usize,
     table: &plan::IcebergTableInfo,
-    hdfs: &novarocks::HdfsScanRange,
+    values: &HashMap<i32, novarocks::FilePruningMinMaxValue>,
+) -> Result<Option<IcebergFilePruningMetadata>, String> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let Some(schema) = table.schema.as_ref() else {
+        return Ok(None);
+    };
+    let mut columns = HashMap::new();
+    for (ordinal, value) in values {
+        let ordinal_usize = usize::try_from(*ordinal).map_err(|_| {
+            format!(
+                "ScanNode node_id={node_id} range {range_idx} file pruning ordinal {ordinal} must be non-negative"
+            )
+        })?;
+        let Some(field) = schema.fields.get(ordinal_usize) else {
+            return Err(format!(
+                "ScanNode node_id={node_id} range {range_idx} file pruning ordinal {ordinal} exceeds Iceberg schema field count {}",
+                schema.fields.len()
+            ));
+        };
+        let Some(stats) = column_stats_from_native_min_max_value(node_id, range_idx, value)? else {
+            continue;
+        };
+        columns.insert(field.name.clone(), stats);
+    }
+    if columns.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(IcebergFilePruningMetadata { columns }))
+    }
+}
+
+fn column_stats_from_native_min_max_value(
+    node_id: i32,
+    range_idx: usize,
+    value: &novarocks::FilePruningMinMaxValue,
+) -> Result<Option<IcebergColumnStats>, String> {
+    let (lower_bound, upper_bound) = match value.value_kind {
+        1 => {
+            let lower = bool_bound_to_byte(value.min_int_value.ok_or_else(|| {
+                format!(
+                    "ScanNode node_id={node_id} range {range_idx} bool file pruning min_int_value missing"
+                )
+            })?)?;
+            let upper = bool_bound_to_byte(value.max_int_value.ok_or_else(|| {
+                format!(
+                    "ScanNode node_id={node_id} range {range_idx} bool file pruning max_int_value missing"
+                )
+            })?)?;
+            (vec![lower], vec![upper])
+        }
+        2 => (
+            value
+                .min_int_value
+                .ok_or_else(|| {
+                    format!(
+                        "ScanNode node_id={node_id} range {range_idx} int file pruning min_int_value missing"
+                    )
+                })?
+                .to_le_bytes()
+                .to_vec(),
+            value
+                .max_int_value
+                .ok_or_else(|| {
+                    format!(
+                        "ScanNode node_id={node_id} range {range_idx} int file pruning max_int_value missing"
+                    )
+                })?
+                .to_le_bytes()
+                .to_vec(),
+        ),
+        3 => {
+            let lower = value.min_float_value.ok_or_else(|| {
+                format!(
+                    "ScanNode node_id={node_id} range {range_idx} float file pruning min_float_value missing"
+                )
+            })?;
+            let upper = value.max_float_value.ok_or_else(|| {
+                format!(
+                    "ScanNode node_id={node_id} range {range_idx} float file pruning max_float_value missing"
+                )
+            })?;
+            if lower.is_nan() || upper.is_nan() {
+                return Ok(None);
+            }
+            (lower.to_le_bytes().to_vec(), upper.to_le_bytes().to_vec())
+        }
+        0 => {
+            return Err(format!(
+                "ScanNode node_id={node_id} range {range_idx} file pruning value_kind is unspecified"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "ScanNode node_id={node_id} range {range_idx} unsupported file pruning value_kind {other}"
+            ));
+        }
+    };
+
+    Ok(Some(IcebergColumnStats {
+        null_count: Some(if value.has_null { 1 } else { 0 }),
+        value_count: None,
+        column_size: None,
+        lower_bound: Some(lower_bound),
+        upper_bound: Some(upper_bound),
+    }))
+}
+
+fn bool_bound_to_byte(value: i64) -> Result<u8, String> {
+    match value {
+        0 => Ok(0),
+        1 => Ok(1),
+        _ => Err(format!(
+            "bool file pruning bound must be 0 or 1, got {value}"
+        )),
+    }
+}
+
+fn file_range_path(
+    table: &plan::IcebergTableInfo,
+    file: &novarocks::FileScanRange,
 ) -> Result<String, String> {
-    if let Some(path) = hdfs.full_path.as_deref()
+    if let Some(path) = file.full_path.as_deref()
         && !path.is_empty()
     {
         return Ok(path.to_string());
     }
-    let Some(relative_path) = hdfs
+    let Some(relative_path) = file
         .relative_path
         .as_deref()
         .filter(|path| !path.is_empty())
     else {
-        return Err("HDFS range missing full_path/relative_path".to_string());
+        return Err("file range missing full_path/relative_path".to_string());
     };
     if table.location.is_empty() {
         return Err("HDFS relative_path requires Iceberg table location".to_string());
@@ -1399,16 +1549,16 @@ fn hdfs_range_path(
 
 fn nonnegative_u64(value: i64, field: &str) -> Result<u64, String> {
     u64::try_from(value)
-        .map_err(|_| format!("HDFS range {field} must be non-negative, got {value}"))
+        .map_err(|_| format!("file range {field} must be non-negative, got {value}"))
 }
 
-fn hdfs_external_datacache(
-    hdfs: &novarocks::HdfsScanRange,
+fn file_external_datacache(
+    file: &novarocks::FileScanRange,
 ) -> Option<ExternalDataCacheRangeOptions> {
-    hdfs.datacache_options
+    file.datacache_options
         .as_ref()
         .map(|opts| ExternalDataCacheRangeOptions {
-            modification_time: hdfs.modification_time,
+            modification_time: file.modification_time,
             enable_populate_datacache: opts.enable_populate_datacache,
             datacache_priority: opts.priority,
             candidate_node: None,
@@ -1492,7 +1642,7 @@ fn decode_deletion_vector_descriptor(
 }
 
 fn decode_metadata_scan_ranges(
-    ranges: &[novarocks::ScanRange],
+    ranges: &[novarocks::ScanRangeParams],
 ) -> Result<Vec<IcebergMetadataScanRange>, String> {
     if ranges.is_empty() {
         return Ok(vec![IcebergMetadataScanRange {
@@ -1509,17 +1659,23 @@ fn decode_metadata_scan_ranges(
                     "IcebergMetadataTable range {idx} has_more is not supported by native lowering"
                 ));
             }
-            let Some(novarocks::scan_range::Kind::Hdfs(hdfs)) = range.kind.as_ref() else {
+            if range.empty.unwrap_or(false) {
+                return Ok(None);
+            }
+            let Some(novarocks::scan_range::Kind::File(file)) =
+                range.range.as_ref().and_then(|range| range.kind.as_ref())
+            else {
                 return Err(format!(
-                    "IcebergMetadataTable range {idx} expected HDFS range"
+                    "IcebergMetadataTable range {idx} expected file range"
                 ));
             };
-            Ok(IcebergMetadataScanRange {
-                path: hdfs.full_path.clone().unwrap_or_default(),
-                serialized_split: hdfs.serialized_split.clone().unwrap_or_default(),
-            })
+            Ok(Some(IcebergMetadataScanRange {
+                path: file.full_path.clone().unwrap_or_default(),
+                serialized_split: file.serialized_split.clone().unwrap_or_default(),
+            }))
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()
+        .map(|ranges| ranges.into_iter().flatten().collect())
 }
 
 fn metadata_output_columns(
@@ -1742,46 +1898,75 @@ mod tests {
         }
     }
 
-    fn hdfs_range() -> novarocks::ScanRange {
-        novarocks::ScanRange {
-            kind: Some(novarocks::scan_range::Kind::Hdfs(
-                novarocks::HdfsScanRange {
-                    file_format: "PARQUET".to_string(),
-                    full_path: Some("s3://bucket/warehouse/db/t/data-1.parquet".to_string()),
-                    relative_path: None,
-                    table_id: None,
-                    offset: 0,
-                    length: 10,
-                    file_length: 10,
-                    delete_files: Vec::new(),
-                    deletion_vector_descriptor: None,
-                    first_row_id: None,
-                    data_sequence_number: None,
-                    modification_time: None,
-                    datacache_options: None,
-                    included_positions: Vec::new(),
-                    serialized_split: None,
-                    use_iceberg_jni_metadata_reader: false,
-                },
-            )),
+    fn file_range() -> novarocks::ScanRangeParams {
+        novarocks::ScanRangeParams {
+            range: Some(novarocks::ScanRange {
+                kind: Some(novarocks::scan_range::Kind::File(
+                    novarocks::FileScanRange {
+                        file_format: "PARQUET".to_string(),
+                        full_path: Some("s3://bucket/warehouse/db/t/data-1.parquet".to_string()),
+                        relative_path: None,
+                        table_id: None,
+                        offset: 0,
+                        length: 10,
+                        file_length: 10,
+                        delete_files: Vec::new(),
+                        deletion_vector_descriptor: None,
+                        first_row_id: None,
+                        data_sequence_number: None,
+                        modification_time: None,
+                        datacache_options: None,
+                        included_positions: Vec::new(),
+                        serialized_split: None,
+                        use_iceberg_jni_metadata_reader: false,
+                        change_op: None,
+                        file_pruning_min_max_values: HashMap::new(),
+                    },
+                )),
+            }),
             volume_id: None,
             empty: None,
             has_more: None,
         }
     }
 
-    fn hdfs_range_with_deletion_vector() -> novarocks::ScanRange {
-        let mut range = hdfs_range();
-        let Some(novarocks::scan_range::Kind::Hdfs(hdfs)) = range.kind.as_mut() else {
-            panic!("expected HDFS range");
+    fn file_range_with_deletion_vector() -> novarocks::ScanRangeParams {
+        let mut range = file_range();
+        let Some(novarocks::scan_range::Kind::File(file)) =
+            range.range.as_mut().and_then(|range| range.kind.as_mut())
+        else {
+            panic!("expected file range");
         };
-        hdfs.deletion_vector_descriptor = Some(novarocks::DeletionVectorDescriptor {
+        file.deletion_vector_descriptor = Some(novarocks::DeletionVectorDescriptor {
             storage_type: Some("PUFFIN".to_string()),
             path_or_inline_dv: Some("s3://bucket/warehouse/db/t/delete-1.puffin".to_string()),
             offset: Some(12),
             size_in_bytes: Some(34),
             cardinality: Some(2),
         });
+        range
+    }
+
+    fn file_range_with_change_op_and_pruning() -> novarocks::ScanRangeParams {
+        let mut range = file_range();
+        let Some(novarocks::scan_range::Kind::File(file)) =
+            range.range.as_mut().and_then(|range| range.kind.as_mut())
+        else {
+            panic!("expected file range");
+        };
+        file.change_op = Some(crate::exec::change_op::CHANGE_OP_DELETE.into());
+        file.file_pruning_min_max_values = HashMap::from([(
+            0,
+            novarocks::FilePruningMinMaxValue {
+                value_kind: 2,
+                has_null: true,
+                all_null: false,
+                min_int_value: Some(10),
+                max_int_value: Some(20),
+                min_float_value: None,
+                max_float_value: None,
+            },
+        )]);
         range
     }
 
@@ -1797,7 +1982,7 @@ mod tests {
         ));
         let ctx = NodeLoweringContext::default()
             .with_connector_registry(Arc::new(ConnectorRegistry::default()))
-            .with_scan_ranges(10, vec![hdfs_range()]);
+            .with_scan_ranges(10, vec![file_range()]);
         let mut arena = ExprArena::default();
         let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
             .expect("lower native scan");
@@ -1820,7 +2005,7 @@ mod tests {
         ));
         let ctx = NodeLoweringContext::default()
             .with_connector_registry(Arc::new(ConnectorRegistry::default()))
-            .with_scan_ranges(10, vec![hdfs_range_with_deletion_vector()]);
+            .with_scan_ranges(10, vec![file_range_with_deletion_vector()]);
         let mut arena = ExprArena::default();
         let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
             .expect("lower native scan");
@@ -1841,6 +2026,116 @@ mod tests {
         );
         assert_eq!(dv.content_offset, Some(12));
         assert_eq!(dv.content_size_in_bytes, Some(34));
+    }
+
+    #[test]
+    fn lowers_iceberg_data_file_scan_change_op_and_pruning_metadata() {
+        let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
+            plan::IcebergDataFiles {
+                table: Some(table_info()),
+                files: Vec::new(),
+                cloud_properties: HashMap::new(),
+                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+            },
+        ));
+        let ctx = NodeLoweringContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_scan_ranges(10, vec![file_range_with_change_op_and_pruning()]);
+        let mut arena = ExprArena::default();
+        let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
+            .expect("lower native scan");
+        let ExecNodeKind::Scan(scan) = lowered.node.kind else {
+            panic!("expected Scan");
+        };
+        let morsels = scan.build_morsels().expect("build morsels");
+        let [
+            ScanMorsel::FileRange {
+                ivm_change_op,
+                iceberg_file_pruning,
+                ..
+            },
+        ] = morsels.morsels.as_slice()
+        else {
+            panic!("expected one file morsel, got {:?}", morsels.morsels);
+        };
+        assert_eq!(
+            *ivm_change_op,
+            Some(crate::exec::change_op::CHANGE_OP_DELETE)
+        );
+        let pruning = iceberg_file_pruning
+            .as_ref()
+            .expect("file pruning metadata");
+        let stats = pruning.columns.get("id").expect("id stats");
+        assert_eq!(stats.null_count, Some(1));
+        assert_eq!(stats.lower_bound, Some(10_i64.to_le_bytes().to_vec()));
+        assert_eq!(stats.upper_bound, Some(20_i64.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn rejects_native_file_pruning_ordinal_outside_iceberg_schema() {
+        let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
+            plan::IcebergDataFiles {
+                table: Some(table_info()),
+                files: Vec::new(),
+                cloud_properties: HashMap::new(),
+                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+            },
+        ));
+        let mut range = file_range_with_change_op_and_pruning();
+        let Some(novarocks::scan_range::Kind::File(file)) =
+            range.range.as_mut().and_then(|range| range.kind.as_mut())
+        else {
+            panic!("expected file range");
+        };
+        let value = file
+            .file_pruning_min_max_values
+            .remove(&0)
+            .expect("test pruning value");
+        file.file_pruning_min_max_values.insert(2, value);
+
+        let ctx = NodeLoweringContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_scan_ranges(10, vec![range]);
+        let mut arena = ExprArena::default();
+        let err = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
+            .expect_err("reject out-of-range file pruning ordinal");
+        assert!(
+            err.contains("file pruning ordinal 2 exceeds Iceberg schema field count 2"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_native_file_pruning_unspecified_value_kind() {
+        let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
+            plan::IcebergDataFiles {
+                table: Some(table_info()),
+                files: Vec::new(),
+                cloud_properties: HashMap::new(),
+                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+            },
+        ));
+        let mut range = file_range_with_change_op_and_pruning();
+        let Some(novarocks::scan_range::Kind::File(file)) =
+            range.range.as_mut().and_then(|range| range.kind.as_mut())
+        else {
+            panic!("expected file range");
+        };
+        file.file_pruning_min_max_values
+            .get_mut(&0)
+            .expect("test pruning value")
+            .value_kind = 0;
+
+        let ctx = NodeLoweringContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_scan_ranges(10, vec![range]);
+        let mut arena = ExprArena::default();
+        let err = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
+            .expect_err("reject unspecified file pruning value kind");
+        assert!(
+            err.contains("file pruning value_kind is unspecified"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1956,7 +2251,7 @@ mod tests {
         );
         let ctx = NodeLoweringContext::default()
             .with_connector_registry(Arc::new(ConnectorRegistry::default()))
-            .with_scan_ranges(10, vec![hdfs_range()]);
+            .with_scan_ranges(10, vec![file_range()]);
         let mut arena = ExprArena::default();
         let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
             .expect("lower native scan");
@@ -2012,7 +2307,7 @@ mod tests {
         );
         let ctx = NodeLoweringContext::default()
             .with_connector_registry(Arc::new(ConnectorRegistry::default()))
-            .with_scan_ranges(10, vec![hdfs_range()]);
+            .with_scan_ranges(10, vec![file_range()]);
         let mut arena = ExprArena::default();
         let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
             .expect("lower native scan");
@@ -2029,43 +2324,5 @@ mod tests {
             scan.output_chunk_schema().slot_ids(),
             &[SlotId::new(1), SlotId::new(2)]
         );
-    }
-
-    #[test]
-    fn rejects_internal_range_for_iceberg_data_scan() {
-        let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
-            plan::IcebergDataFiles {
-                table: Some(table_info()),
-                files: Vec::new(),
-                cloud_properties: HashMap::new(),
-                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
-            },
-        ));
-        let ctx = NodeLoweringContext::default()
-            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
-            .with_scan_ranges(
-                10,
-                vec![novarocks::ScanRange {
-                    kind: Some(novarocks::scan_range::Kind::Internal(
-                        novarocks::InternalScanRange {
-                            version: 1,
-                            tablet_id: 1,
-                            partition_id: 1,
-                            db_name: None,
-                            table_name: None,
-                            catalog_name: None,
-                            fill_data_cache: false,
-                            skip_page_cache: false,
-                            skip_disk_cache: false,
-                        },
-                    )),
-                    volume_id: None,
-                    empty: None,
-                    has_more: None,
-                }],
-            );
-        let mut arena = ExprArena::default();
-        let err = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx).unwrap_err();
-        assert!(err.contains("expected HDFS range"));
     }
 }
