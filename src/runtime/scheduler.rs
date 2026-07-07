@@ -229,7 +229,7 @@ impl FragmentScheduler {
 
             let count = if has_gather_input {
                 1
-            } else if !find_scan_plan_nodes(&fr.plan).is_empty() {
+            } else if fr.has_scan_nodes {
                 // Scan fragment: one instance per backend.
                 n
             } else {
@@ -564,14 +564,12 @@ fn select_execution_root_fragment(
     match terminal_fragments.len() {
         1 => Ok(ExecutionRootSelection {
             fragment_id: terminal_fragments[0].fragment_id,
-            force_single_instance: !fragment_sink_is_terminal_write_sink(
-                &terminal_fragments[0].output_sink,
-            ),
+            force_single_instance: !terminal_fragments[0].output_kind.is_terminal_write(),
         }),
         0 => Err("no root fragment found (every fragment has an outgoing edge)".into()),
         _ if terminal_fragments
             .iter()
-            .all(|fr| fragment_sink_is_terminal_write_sink(&fr.output_sink)) =>
+            .all(|fr| fr.output_kind.is_terminal_write()) =>
         {
             let fragment_id = terminal_fragments
                 .iter()
@@ -591,34 +589,6 @@ fn select_execution_root_fragment(
                 .collect::<Vec<_>>()
         )),
     }
-}
-
-fn fragment_sink_is_terminal_write_sink(sink: &crate::thrift::data_sinks::TDataSink) -> bool {
-    use crate::thrift::data_sinks::TDataSinkType;
-
-    matches!(
-        sink.type_,
-        TDataSinkType::ICEBERG_TABLE_SINK
-            | TDataSinkType::ICEBERG_DELETE_SINK
-            | TDataSinkType::ICEBERG_DV_SINK
-            | TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK
-            | TDataSinkType::HIVE_TABLE_SINK
-            | TDataSinkType::OLAP_TABLE_SINK
-    )
-}
-
-/// Return the plan-node ids of all scan nodes in `plan`.
-pub(crate) fn find_scan_plan_nodes(plan: &crate::thrift::plan_nodes::TPlan) -> Vec<i32> {
-    use crate::thrift::plan_nodes::TPlanNodeType;
-    plan.nodes
-        .iter()
-        .filter(|n| {
-            n.node_type == TPlanNodeType::FILE_SCAN_NODE
-                || n.node_type == TPlanNodeType::HDFS_SCAN_NODE
-                || n.node_type == TPlanNodeType::LAKE_SCAN_NODE
-        })
-        .map(|n| n.node_id)
-        .collect()
 }
 
 fn live_backend_addr(live: &[LiveBackend], backend_idx: usize) -> Result<SocketAddr, String> {
@@ -641,7 +611,7 @@ mod tests {
 
     use crate::sql::codegen::RuntimeFilterPlanResult;
     use crate::sql::codegen::{
-        FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+        FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentOutputKind, FragmentStreamKind,
     };
     use crate::sql::planner::{DataPartition, PartitionKind};
     use crate::thrift::data_sinks;
@@ -800,6 +770,8 @@ mod tests {
 
         FragmentBuildResult {
             fragment_id: fid,
+            has_scan_nodes: scan_node_id.is_some(),
+            output_kind: FragmentOutputKind::NonTerminal,
             plan: plan_nodes::TPlan { nodes },
             desc_tbl: minimal_desc_tbl(),
             exec_params: minimal_exec_params(),
@@ -822,6 +794,7 @@ mod tests {
     ) -> FragmentBuildResult {
         let mut fragment = fake_fragment(fid, scan_node_id, n_ranges);
         fragment.output_sink = minimal_write_sink();
+        fragment.output_kind = FragmentOutputKind::TerminalWrite;
         fragment
     }
 

@@ -96,7 +96,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::sql::codegen::FragmentBuildResult;
+    use crate::sql::codegen::{FragmentBuildResult, FragmentOutputKind};
     use crate::thrift::data_sinks;
     use crate::thrift::descriptors;
     use crate::thrift::partitions;
@@ -148,6 +148,8 @@ mod tests {
 
         FragmentBuildResult {
             fragment_id: 0,
+            has_scan_nodes: false,
+            output_kind: FragmentOutputKind::Result,
             plan: crate::thrift::plan_nodes::TPlan::new(vec![]),
             desc_tbl: descriptors::TDescriptorTable::new(vec![], vec![], vec![], false),
             exec_params,

@@ -1428,6 +1428,8 @@ mod tests {
     ) -> crate::sql::codegen::FragmentBuildResult {
         crate::sql::codegen::FragmentBuildResult {
             fragment_id: 0,
+            has_scan_nodes: false,
+            output_kind: crate::sql::codegen::FragmentOutputKind::Result,
             plan: crate::thrift::plan_nodes::TPlan::new(nodes),
             desc_tbl: crate::thrift::descriptors::TDescriptorTable::new(
                 Some(vec![crate::thrift::descriptors::TSlotDescriptor::new(

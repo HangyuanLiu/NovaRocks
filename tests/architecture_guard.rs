@@ -191,6 +191,126 @@ where
         .collect()
 }
 
+fn rust_production_text_without_cfg_test(text: &str) -> String {
+    let mut production = String::with_capacity(text.len());
+    let mut pending_cfg_test = false;
+    let mut skipping_cfg_item = false;
+    let mut skip_depth = 0isize;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+
+        if skip_depth > 0 {
+            skip_depth += brace_delta(line);
+            if skip_depth <= 0 {
+                skip_depth = 0;
+                skipping_cfg_item = false;
+            }
+            continue;
+        }
+
+        if skipping_cfg_item {
+            let delta = brace_delta(line);
+            if line.contains('{') {
+                skip_depth = delta.max(0);
+                skipping_cfg_item = skip_depth > 0;
+            } else if trimmed.ends_with(';') {
+                skipping_cfg_item = false;
+            }
+            continue;
+        }
+
+        if pending_cfg_test {
+            if trimmed.is_empty() || trimmed.starts_with("#[") {
+                continue;
+            }
+
+            let delta = brace_delta(line);
+            if line.contains('{') {
+                skip_depth = delta.max(0);
+                skipping_cfg_item = skip_depth > 0;
+            } else if !trimmed.ends_with(';') {
+                skipping_cfg_item = true;
+            }
+            pending_cfg_test = false;
+            continue;
+        }
+
+        if trimmed.starts_with("#[cfg(test") {
+            pending_cfg_test = true;
+            continue;
+        }
+
+        production.push_str(line);
+        production.push('\n');
+    }
+
+    production
+}
+
+fn push_forbidden_terms(
+    violations: &mut Vec<String>,
+    source: &str,
+    text: &str,
+    terms: &[&str],
+    reason: &str,
+) {
+    for term in terms {
+        if let Some((line, text)) = text
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(term))
+        {
+            violations.push(format!(
+                "{source}:{}: {reason}: `{term}` in `{}`",
+                line + 1,
+                text.trim()
+            ));
+        }
+    }
+}
+
+#[test]
+fn d3l_rust_production_text_without_cfg_test_removes_cfg_test_items() {
+    let input = r#"
+pub(crate) fn production() {
+    let keep = "TDataSink";
+}
+
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        let forbidden = "test-only TPlan)";
+    }
+}
+
+pub(crate) fn production_after_tests() {
+    let keep = "TPlan)";
+}
+
+#[cfg(test)]
+fn test_helper() {
+    let forbidden = "test-only TDataSink";
+}
+
+#[cfg(test)]
+const TEST_ONLY: &str = "test-only find_scan_plan_nodes(";
+
+pub(crate) fn production_tail() {
+    let keep = "fragment_sink_is_terminal_write_sink";
+}
+"#;
+
+    let production = rust_production_text_without_cfg_test(input);
+
+    assert!(production.contains("pub(crate) fn production()"));
+    assert!(production.contains("pub(crate) fn production_after_tests()"));
+    assert!(production.contains("pub(crate) fn production_tail()"));
+    assert!(!production.contains("test-only TPlan)"));
+    assert!(!production.contains("test-only TDataSink"));
+    assert!(!production.contains("test-only find_scan_plan_nodes("));
+}
+
 fn non_test_optimizer_refs(path: &Path) -> Vec<(usize, String)> {
     non_test_line_hits(path, |line| line.contains("crate::sql::optimizer::"))
 }
@@ -3619,6 +3739,127 @@ fn nidl_d3k_native_dynamic_sink_partition_does_not_roundtrip_thrift_partition() 
     assert!(
         violations.is_empty(),
         "D3K native dynamic sink partition guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+
+    let scheduler = fs::read_to_string(repo.join("src/runtime/scheduler.rs")).unwrap();
+    let scheduler = rust_production_text_without_cfg_test(&scheduler);
+    push_forbidden_terms(
+        &mut violations,
+        "src/runtime/scheduler.rs",
+        &scheduler,
+        &[
+            "fragment_sink_is_terminal_write_sink",
+            "find_scan_plan_nodes(",
+            "TDataSink",
+            "TPlan)",
+        ],
+        "native scheduler must use FragmentBuildResult metadata, not compat thrift structs",
+    );
+
+    let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
+    let coordinator = rust_production_text_without_cfg_test(&coordinator);
+    push_forbidden_terms(
+        &mut violations,
+        "src/runtime/coordinator.rs",
+        &coordinator,
+        &[
+            "patch_native_iceberg_delta_scan_payloads",
+            "native_data_partition_from_thrift",
+            "native_data_partition_from_thrift_with_exprs",
+            "TIcebergDeltaScanNode",
+            "TIcebergDeltaScanPlan",
+            "Vec<(FragmentId, i32, partitions::TDataPartition, Vec<i32>)>",
+        ],
+        "native coordinator must not patch native sidecars from thrift-shaped payloads",
+    );
+
+    for source in [
+        "src/lower/novarocks/fragment.rs",
+        "src/lower/novarocks/layout.rs",
+        "src/lower/novarocks/node.rs",
+        "src/lower/novarocks/scan.rs",
+        "src/lower/novarocks/sink.rs",
+    ] {
+        let text = fs::read_to_string(repo.join(source)).unwrap();
+        let text = rust_production_text_without_cfg_test(&text);
+        push_forbidden_terms(
+            &mut violations,
+            source,
+            &text,
+            &[
+                "crate::thrift",
+                "thrift::",
+                "TPlanFragment",
+                "TPlanNode",
+                "TDataSink",
+            ],
+            "native lowering must not take thrift as input contract",
+        );
+    }
+
+    for path in rs_files(&repo.join("src/sql/codegen/proto_encode")) {
+        let source = rel(&path);
+        let text = fs::read_to_string(&path).unwrap();
+        let text = rust_production_text_without_cfg_test(&text);
+        push_forbidden_terms(
+            &mut violations,
+            &source,
+            &text,
+            &[
+                "crate::thrift::partitions::TDataPartition::new",
+                "crate::thrift::data_sinks::TDataSink",
+                "crate::thrift::plan_nodes::TPlan",
+            ],
+            "native proto encoder must not construct compat thrift artifacts",
+        );
+    }
+
+    let compat_allowlist = [
+        (
+            "src/runtime/fragment_exec_params.rs",
+            &[
+                "compact_exec_params_from_parts",
+                "compact_destination_from_runtime",
+            ][..],
+        ),
+        (
+            "src/runtime/scan_range.rs",
+            &[
+                "thrift_scan_range_params_from_native",
+                "thrift_scan_range_map_from_native",
+            ][..],
+        ),
+        (
+            "src/runtime/query_options.rs",
+            &["from_thrift", "to_thrift"][..],
+        ),
+        (
+            "src/runtime/runtime_filter_params.rs",
+            &["from_thrift", "to_thrift"][..],
+        ),
+    ];
+    for (source, markers) in compat_allowlist {
+        let text = fs::read_to_string(repo.join(source)).unwrap();
+        let production_text = rust_production_text_without_cfg_test(&text);
+        for marker in markers {
+            if !production_text.contains(marker) {
+                violations.push(format!(
+                    "{source}: compat allowlist must contain `{marker}`"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "D3L native mainline thrift usage guard failed:\n{}",
         violations.join("\n")
     );
 }

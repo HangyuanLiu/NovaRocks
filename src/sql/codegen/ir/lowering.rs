@@ -39,7 +39,7 @@ use crate::sql::codegen::runtime_filter_lowering::{
 };
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
-    FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
+    FragmentBuildResult, FragmentId, FragmentOutputKind, MultiFragmentBuildResult, OutputColumn,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
@@ -125,6 +125,8 @@ pub(crate) fn lower_distributed_plan(
     for (fragment, lowered, output_sink, output_exprs, output_columns, root_node_id) in
         prepared_fragments
     {
+        let has_scan_nodes = lowered_plan_has_scan_nodes(&lowered.plan_nodes);
+        let output_kind = fragment_output_kind(&fragment.sink);
         let boundary_schemas = vec![result_root_boundary_schema_report(
             fragment.fragment_id,
             root_node_id,
@@ -133,6 +135,8 @@ pub(crate) fn lower_distributed_plan(
 
         fragment_results.push(FragmentBuildResult {
             fragment_id: fragment.fragment_id,
+            has_scan_nodes,
+            output_kind,
             plan: plan_nodes::TPlan::new(lowered.plan_nodes),
             desc_tbl: desc_tbl.clone(),
             exec_params: exec_params.clone(),
@@ -169,6 +173,28 @@ pub(crate) fn lower_distributed_plan(
             })
         },
     })
+}
+
+fn lowered_plan_has_scan_nodes(nodes: &[plan_nodes::TPlanNode]) -> bool {
+    nodes.iter().any(|node| {
+        matches!(
+            node.node_type,
+            plan_nodes::TPlanNodeType::FILE_SCAN_NODE
+                | plan_nodes::TPlanNodeType::HDFS_SCAN_NODE
+                | plan_nodes::TPlanNodeType::LAKE_SCAN_NODE
+        )
+    })
+}
+
+fn fragment_output_kind(sink: &crate::sql::planner::DataSink) -> FragmentOutputKind {
+    match sink {
+        crate::sql::planner::DataSink::Result => FragmentOutputKind::Result,
+        crate::sql::planner::DataSink::IcebergWrite(_) => FragmentOutputKind::TerminalWrite,
+        crate::sql::planner::DataSink::Noop
+        | crate::sql::planner::DataSink::IcebergChangeStreamRouter(_) => {
+            FragmentOutputKind::NonTerminal
+        }
+    }
 }
 
 pub(crate) fn refresh_distributed_plan_for_native_sidecar(
@@ -5399,8 +5425,8 @@ mod tests {
     };
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::codegen::{
-        FragmentBuildRequest, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
-        MultiFragmentBuildResult,
+        FragmentBuildRequest, FragmentEdge, FragmentEdgeKind, FragmentOutputKind,
+        FragmentStreamKind, MultiFragmentBuildResult,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
@@ -6031,6 +6057,8 @@ mod tests {
             node_types,
             vec![TPlanNodeType::PROJECT_NODE, TPlanNodeType::HDFS_SCAN_NODE]
         );
+        assert!(root.has_scan_nodes);
+        assert_eq!(root.output_kind, FragmentOutputKind::Result);
         assert!(
             root.desc_tbl.tuple_descriptors.len() >= 2,
             "project and scan tuples should be registered"
@@ -6330,6 +6358,10 @@ mod tests {
         );
         assert_eq!(root.desc_tbl, child.desc_tbl);
         assert_eq!(root.exec_params, child.exec_params);
+        assert!(!root.has_scan_nodes);
+        assert!(!child.has_scan_nodes);
+        assert_eq!(root.output_kind, FragmentOutputKind::Result);
+        assert_eq!(child.output_kind, FragmentOutputKind::NonTerminal);
         assert_eq!(result.edges.len(), 1);
         assert_eq!(result.edges[0].source_fragment_id, 0);
         assert_eq!(result.edges[0].target_fragment_id, 1);
@@ -6393,6 +6425,9 @@ mod tests {
             root.output_sink.type_,
             crate::thrift::data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
         );
+        assert!(root.has_scan_nodes);
+        assert_eq!(root.output_kind, FragmentOutputKind::TerminalWrite);
+        assert!(root.output_kind.is_terminal_write());
         assert!(root.output_sink.iceberg_table_sink.is_some());
         assert!(
             root.output_exprs
@@ -6456,6 +6491,8 @@ mod tests {
             root.output_sink.type_,
             crate::thrift::data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK
         );
+        assert_eq!(root.output_kind, FragmentOutputKind::NonTerminal);
+        assert!(!root.output_kind.is_terminal_write());
         let router = root
             .output_sink
             .iceberg_change_stream_router_sink
@@ -6504,6 +6541,8 @@ mod tests {
             .iter()
             .find(|fragment| fragment.fragment_id == edge.target_fragment_id)
             .expect("writer fragment");
+        assert_eq!(writer.output_kind, FragmentOutputKind::TerminalWrite);
+        assert!(writer.output_kind.is_terminal_write());
         assert_eq!(
             writer.output_sink.type_,
             crate::thrift::data_sinks::TDataSinkType::ICEBERG_DV_SINK
