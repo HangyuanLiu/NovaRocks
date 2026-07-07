@@ -196,6 +196,7 @@ fn encoded_node_output_columns(
                 }
                 Some(plan::plan_node::Kind::Filter(_))
                 | Some(plan::plan_node::Kind::Limit(_))
+                | Some(plan::plan_node::Kind::AssertOneRow(_))
                 | Some(plan::plan_node::Kind::Topn(_)) => {
                     encoded_unary_passthrough_output_columns(node, "native stream source")
                 }
@@ -414,14 +415,7 @@ fn project_output_columns_for_edge(
     if output_slot_ids.is_empty() {
         return Ok(columns);
     }
-    if output_slot_ids.len() != columns.len() {
-        return Err(format!(
-            "native stream edge output_slot_ids length {} does not match output columns {}",
-            output_slot_ids.len(),
-            columns.len()
-        ));
-    }
-    if source_output_columns.len() == columns.len() {
+    if !source_output_columns.is_empty() {
         let mut ordinals_by_column_id: HashMap<u32, Vec<usize>> = HashMap::new();
         for (idx, column) in source_output_columns.iter().enumerate() {
             ordinals_by_column_id
@@ -445,6 +439,10 @@ fn project_output_columns_for_edge(
                 resolved_all_by_ordinal = false;
                 break;
             };
+            if ordinal >= columns.len() {
+                resolved_all_by_ordinal = false;
+                break;
+            }
             *next += 1;
             resolved.push(columns[ordinal].clone());
         }
@@ -453,23 +451,33 @@ fn project_output_columns_for_edge(
         }
     }
     let columns_by_id = columns
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|column| (column.column_id, column))
         .collect::<HashMap<_, _>>();
-    output_slot_ids
-        .iter()
-        .copied()
-        .map(|slot_id| {
-            let column_id = u32::try_from(slot_id).map_err(|_| {
-                format!("native stream edge output slot id {slot_id} cannot convert to u32")
-            })?;
-            columns_by_id.get(&column_id).cloned().ok_or_else(|| {
-                format!(
-                    "native stream edge output slot id {slot_id} missing from source output columns"
-                )
-            })
-        })
-        .collect()
+    let mut resolved = Vec::with_capacity(output_slot_ids.len());
+    let mut missing_slot_id = None;
+    for slot_id in output_slot_ids.iter().copied() {
+        let column_id = u32::try_from(slot_id).map_err(|_| {
+            format!("native stream edge output slot id {slot_id} cannot convert to u32")
+        })?;
+        if let Some(column) = columns_by_id.get(&column_id) {
+            resolved.push(column.clone());
+        } else {
+            missing_slot_id = Some(slot_id);
+            break;
+        }
+    }
+    if missing_slot_id.is_none() {
+        return Ok(resolved);
+    }
+    if output_slot_ids.len() >= columns.len() {
+        return Ok(columns);
+    }
+    let missing_slot_id = missing_slot_id.expect("checked above");
+    Err(format!(
+        "native stream edge output slot id {missing_slot_id} missing from source output columns"
+    ))
 }
 
 fn patch_exchange_receiver_output_columns(
@@ -608,16 +616,20 @@ fn encode_fragment_execution_output_columns(
     src: &PlanFragment,
     encoded_root: &plan::DistributedNode,
 ) -> Result<Vec<common::OutputColumn>, String> {
-    if src.output_columns.is_empty() {
-        return Ok(Vec::new());
-    }
     match encoded_node_output_columns(encoded_root) {
+        Ok(root_output_columns)
+            if src.output_columns.is_empty() && matches!(src.sink, DataSink::Noop) =>
+        {
+            Ok(root_output_columns)
+        }
+        Ok(_) if src.output_columns.is_empty() => Ok(Vec::new()),
         Ok(root_output_columns) if root_output_columns.is_empty() => {
             encode_output_columns(&src.output_columns)
         }
         Ok(root_output_columns) if root_output_columns.len() == src.output_columns.len() => {
             Ok(root_output_columns)
         }
+        Ok(root_output_columns) if matches!(src.sink, DataSink::Noop) => Ok(root_output_columns),
         Ok(root_output_columns) => Err(format!(
             "native fragment {} root output column count {} does not match fragment output column count {}",
             src.fragment_id,
@@ -736,6 +748,31 @@ fn encode_node_with_context(
 }
 
 fn normalize_encoded_node_output_columns(node: &mut plan::DistributedNode) -> Result<(), String> {
+    let normalized_join_output_columns = match node.payload.as_ref() {
+        Some(plan::distributed_node::Payload::Physical(physical)) => match physical.kind.as_ref() {
+            Some(plan::plan_node::Kind::HashJoin(join)) => Some(normalize_join_output_columns(
+                join.join_type,
+                &physical.output_columns,
+                &node.children,
+                "HashJoinNode",
+            )?),
+            Some(plan::plan_node::Kind::NestLoopJoin(join)) => Some(normalize_join_output_columns(
+                join.join_type,
+                &physical.output_columns,
+                &node.children,
+                "NestLoopJoinNode",
+            )?),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(output_columns) = normalized_join_output_columns {
+        if let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut() {
+            physical.output_columns = output_columns;
+        }
+        return Ok(());
+    }
+
     let normalized_scan_columns = match node.payload.as_ref() {
         Some(plan::distributed_node::Payload::Physical(physical)) => match physical.kind.as_ref() {
             Some(plan::plan_node::Kind::Scan(scan))
@@ -828,6 +865,78 @@ fn normalize_encoded_node_output_columns(node: &mut plan::DistributedNode) -> Re
         }
     }
     Ok(())
+}
+
+fn normalize_join_output_columns(
+    join_type: i32,
+    requested: &[common::OutputColumn],
+    children: &[plan::DistributedNode],
+    node_kind: &str,
+) -> Result<Vec<common::OutputColumn>, String> {
+    let [left, right] = children else {
+        return Ok(requested.to_vec());
+    };
+    let left = encoded_node_output_columns(left)?;
+    let right = encoded_node_output_columns(right)?;
+    let derived = derive_join_output_columns(join_type, left, right, node_kind)?;
+    if requested.is_empty() || !same_output_column_ids(requested, &derived) {
+        return Ok(derived);
+    }
+    Ok(requested.to_vec())
+}
+
+fn derive_join_output_columns(
+    join_type: i32,
+    left: Vec<common::OutputColumn>,
+    right: Vec<common::OutputColumn>,
+    node_kind: &str,
+) -> Result<Vec<common::OutputColumn>, String> {
+    let join_type = plan::JoinKind::try_from(join_type)
+        .map_err(|_| format!("{node_kind} unknown join_type {join_type}"))?;
+    Ok(match join_type {
+        plan::JoinKind::Inner | plan::JoinKind::Cross => {
+            let mut out = left;
+            out.extend(right);
+            out
+        }
+        plan::JoinKind::LeftOuter => {
+            let mut out = left;
+            out.extend(nullable_output_columns(right));
+            out
+        }
+        plan::JoinKind::RightOuter => {
+            let mut out = nullable_output_columns(left);
+            out.extend(right);
+            out
+        }
+        plan::JoinKind::FullOuter => {
+            let mut out = nullable_output_columns(left);
+            out.extend(nullable_output_columns(right));
+            out
+        }
+        plan::JoinKind::LeftSemi | plan::JoinKind::LeftAnti | plan::JoinKind::NullAwareLeftAnti => {
+            left
+        }
+        plan::JoinKind::RightSemi | plan::JoinKind::RightAnti => right,
+        plan::JoinKind::Unspecified => {
+            return Err(format!("{node_kind} join_type is unspecified"));
+        }
+    })
+}
+
+fn nullable_output_columns(mut columns: Vec<common::OutputColumn>) -> Vec<common::OutputColumn> {
+    for column in &mut columns {
+        column.nullable = true;
+    }
+    columns
+}
+
+fn same_output_column_ids(left: &[common::OutputColumn], right: &[common::OutputColumn]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| left.column_id == right.column_id)
 }
 
 fn encoded_passthrough_boundary_output_columns(
@@ -1114,7 +1223,7 @@ fn encode_physical_node(
             )
         }
         PhysicalPlanKind::HashJoin(node) => (
-            Vec::new(),
+            encode_output_columns(&node.output_columns)?,
             Kind::HashJoin(plan::HashJoinNode {
                 join_type: encode_join_kind(node.join_type),
                 eq_conditions: node
@@ -1147,7 +1256,7 @@ fn encode_physical_node(
             }),
         ),
         PhysicalPlanKind::NestLoopJoin(node) => (
-            Vec::new(),
+            encode_output_columns(&node.output_columns)?,
             Kind::NestLoopJoin(plan::NestLoopJoinNode {
                 join_type: encode_join_kind(node.join_type),
                 condition: node.condition.as_ref().map(encode_expr).transpose()?,
@@ -3088,6 +3197,291 @@ mod tests {
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>(),
             vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn hash_join_root_output_columns_follow_join_schema() {
+        let output_columns = vec![
+            output_column(1, "l_k", DataType::Int64),
+            output_column(2, "r_k", DataType::Int64),
+        ];
+        let join = DistributedNode {
+            node_id: 40,
+            fragment_id: 0,
+            tuple_ids: vec![1, 2],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::HashJoin(Box::new(
+                crate::sql::planner::plan::PhysicalHashJoinNode {
+                    join_type: JoinKind::Inner,
+                    eq_conditions: Vec::new(),
+                    other_condition: None,
+                    distribution: JoinDistribution::Unknown,
+                    execution_mode: None,
+                    build_runtime_filters: Vec::new(),
+                    output_columns: output_columns.clone(),
+                },
+            ))),
+        };
+
+        let encoded = encode_node(&join).expect("encode hash join");
+
+        assert_eq!(
+            encoded_node_output_columns(&encoded)
+                .expect("hash join output columns")
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "l_k"), (2, "r_k")]
+        );
+    }
+
+    #[test]
+    fn nest_loop_join_root_output_columns_follow_join_schema() {
+        let output_columns = vec![
+            output_column(1, "l_k", DataType::Int64),
+            output_column(2, "r_k", DataType::Int64),
+        ];
+        let join = DistributedNode {
+            node_id: 41,
+            fragment_id: 0,
+            tuple_ids: vec![1, 2],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::NestLoopJoin(
+                crate::sql::planner::plan::PhysicalNestLoopJoinNode {
+                    join_type: JoinKind::Inner,
+                    condition: None,
+                    output_columns: output_columns.clone(),
+                },
+            )),
+        };
+
+        let encoded = encode_node(&join).expect("encode nest loop join");
+
+        assert_eq!(
+            encoded_node_output_columns(&encoded)
+                .expect("nest loop join output columns")
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "l_k"), (2, "r_k")]
+        );
+    }
+
+    #[test]
+    fn assert_one_row_root_output_columns_follow_child_schema() {
+        let child_column = output_column(1, "only_row", DataType::Int64);
+        let node = DistributedNode {
+            node_id: 42,
+            fragment_id: 0,
+            tuple_ids: vec![1],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: vec![DistributedNode {
+                node_id: 43,
+                fragment_id: 0,
+                tuple_ids: vec![1],
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: Vec::new(),
+                stats: stats(),
+                payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                    crate::sql::planner::plan::PlanValuesNode {
+                        rows: Vec::new(),
+                        columns: vec![child_column.clone()],
+                    },
+                )),
+            }],
+            stats: stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::AssertOneRow(
+                crate::sql::planner::plan::PlanAssertOneRowNode::global_at_most_one("select 1"),
+            )),
+        };
+
+        let encoded = encode_node(&node).expect("encode assert one row");
+
+        assert_eq!(
+            encoded_node_output_columns(&encoded)
+                .expect("assert one row output columns")
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "only_row")]
+        );
+    }
+
+    #[test]
+    fn stream_sink_projection_uses_join_child_schema_when_join_output_ids_are_stale() {
+        let actual_left = output_column(1, "l_k", DataType::Int64);
+        let actual_right = output_column(2, "r_k", DataType::Int64);
+        let stale_source_columns = vec![
+            output_column(10, "l_k", DataType::Int64),
+            output_column(11, "r_k", DataType::Int64),
+            output_column(999, "pruned", DataType::Int64),
+        ];
+        let receiver_columns = vec![
+            output_column(84, "l_k", DataType::Int64),
+            output_column(85, "r_k", DataType::Int64),
+        ];
+        let source = PlanFragment {
+            fragment_id: 1,
+            root: DistributedNode {
+                node_id: 10,
+                fragment_id: 1,
+                tuple_ids: vec![10, 11],
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: vec![
+                    DistributedNode {
+                        node_id: 11,
+                        fragment_id: 1,
+                        tuple_ids: vec![10],
+                        nullable_tuple_ids: Vec::new(),
+                        limit: -1,
+                        build_runtime_filters: Vec::new(),
+                        probe_runtime_filters: Vec::new(),
+                        children: Vec::new(),
+                        stats: stats(),
+                        payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                            crate::sql::planner::plan::PlanValuesNode {
+                                rows: Vec::new(),
+                                columns: vec![actual_left.clone()],
+                            },
+                        )),
+                    },
+                    DistributedNode {
+                        node_id: 12,
+                        fragment_id: 1,
+                        tuple_ids: vec![11],
+                        nullable_tuple_ids: Vec::new(),
+                        limit: -1,
+                        build_runtime_filters: Vec::new(),
+                        probe_runtime_filters: Vec::new(),
+                        children: Vec::new(),
+                        stats: stats(),
+                        payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                            crate::sql::planner::plan::PlanValuesNode {
+                                rows: Vec::new(),
+                                columns: vec![actual_right.clone()],
+                            },
+                        )),
+                    },
+                ],
+                stats: stats(),
+                payload: DistributedPayload::Physical(PhysicalPlanKind::HashJoin(Box::new(
+                    crate::sql::planner::plan::PhysicalHashJoinNode {
+                        join_type: JoinKind::Inner,
+                        eq_conditions: Vec::new(),
+                        other_condition: None,
+                        distribution: JoinDistribution::Unknown,
+                        execution_mode: None,
+                        build_runtime_filters: Vec::new(),
+                        output_columns: stale_source_columns.clone(),
+                    },
+                ))),
+            },
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::Noop,
+            output_exprs: None,
+            output_columns: stale_source_columns.clone(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        let target = PlanFragment {
+            fragment_id: 0,
+            root: DistributedNode {
+                node_id: 20,
+                fragment_id: 0,
+                tuple_ids: vec![20],
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: Vec::new(),
+                stats: stats(),
+                payload: DistributedPayload::Exchange(ExchangeReceiver {
+                    partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 1,
+                    output_columns: receiver_columns,
+                    output_qualifier: None,
+                    flavor: ExchangeFlavor::Distribution,
+                }),
+            },
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::Result,
+            output_exprs: None,
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        let plan = DistributedPlan {
+            fragments: vec![source, target],
+            root_fragment_id: 0,
+            edges: vec![FragmentEdge {
+                source_fragment_id: 1,
+                target_fragment_id: 0,
+                target_exchange_node_id: 20,
+                output_partition: crate::thrift::partitions::TDataPartition::new(
+                    crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                    None::<Vec<crate::thrift::exprs::TExpr>>,
+                    None::<Vec<crate::thrift::partitions::TRangePartition>>,
+                    None::<Vec<crate::thrift::partitions::TBucketProperty>>,
+                ),
+                stream_kind: FragmentStreamKind::Gather,
+                edge_kind: FragmentEdgeKind::Stream,
+                output_slot_ids: vec![84, 85, 999],
+            }],
+        };
+
+        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
+        let source = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 1)
+            .expect("source fragment");
+        let Some(plan::data_sink::Kind::DataStream(sink)) =
+            source.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+        else {
+            panic!("expected DataStream sink");
+        };
+        assert_eq!(sink.output_columns, vec![1, 2]);
+
+        let target = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 0)
+            .expect("target fragment");
+        let receiver = target.root.as_ref().expect("target root");
+        let Some(plan::distributed_node::Payload::Exchange(exchange)) = receiver.payload.as_ref()
+        else {
+            panic!("expected Exchange receiver");
+        };
+        assert_eq!(
+            exchange
+                .output_columns
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "l_k"), (2, "r_k")]
         );
     }
 
