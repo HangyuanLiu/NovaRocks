@@ -904,8 +904,10 @@ fn lower_probe_runtime_filter_specs(
             );
             continue;
         };
-        if let Some(filter_type) = desc.filter_type
-            && filter_type != runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER
+        let filter_type = desc
+            .filter_type
+            .unwrap_or(runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER);
+        if filter_type != runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER
             && filter_type != runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER
         {
             continue;
@@ -954,7 +956,7 @@ fn lower_probe_runtime_filter_specs(
                 expr_id,
                 slot_id,
                 data_type,
-                self_subtree: false,
+                self_subtree: filter_type == runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER,
             });
         }
     }
@@ -1042,5 +1044,78 @@ fn attach_probe_runtime_filter_specs_to_scan(
     }
     if let ExecNodeKind::Scan(scan) = &mut node.kind {
         scan.add_runtime_filter_specs(specs);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    use std::collections::{BTreeMap, HashMap};
+
+    fn slot_ref_expr(tuple_id: i32, slot_id: i32) -> exprs::TExpr {
+        let type_desc = crate::sql::codegen::type_infer::arrow_type_to_type_desc(&DataType::Int32)
+            .expect("int32 type desc");
+        crate::sql::codegen::expr_compiler::build_slot_ref_texpr(slot_id, tuple_id, type_desc)
+    }
+
+    fn probe_filter_desc(
+        filter_id: i32,
+        node_id: i32,
+        filter_type: runtime_filter::TRuntimeFilterBuildType,
+    ) -> runtime_filter::TRuntimeFilterDescription {
+        runtime_filter::TRuntimeFilterDescription {
+            filter_id: Some(filter_id),
+            plan_node_id_to_target_expr: Some(BTreeMap::from([(node_id, slot_ref_expr(1, 3))])),
+            filter_type: Some(filter_type),
+            ..Default::default()
+        }
+    }
+
+    fn single_slot_layout() -> Layout {
+        Layout {
+            order: vec![(1, 3)],
+            index: HashMap::from([((1, 3), 0)]),
+        }
+    }
+
+    #[test]
+    fn lower_topn_probe_runtime_filter_marks_self_subtree() {
+        let node_id = 42;
+        let mut node = crate::sql::codegen::nodes::default_plan_node();
+        node.node_id = node_id;
+        node.probe_runtime_filters = Some(vec![probe_filter_desc(
+            7,
+            node_id,
+            runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER,
+        )]);
+        let mut arena = ExprArena::default();
+
+        let specs =
+            lower_probe_runtime_filter_specs(&node, &mut arena, &single_slot_layout(), None, None);
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].filter_id, 7);
+        assert_eq!(specs[0].slot_id, SlotId::new(3));
+        assert!(specs[0].self_subtree);
+    }
+
+    #[test]
+    fn lower_join_probe_runtime_filter_keeps_blocking_mode() {
+        let node_id = 42;
+        let mut node = crate::sql::codegen::nodes::default_plan_node();
+        node.node_id = node_id;
+        node.probe_runtime_filters = Some(vec![probe_filter_desc(
+            7,
+            node_id,
+            runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER,
+        )]);
+        let mut arena = ExprArena::default();
+
+        let specs =
+            lower_probe_runtime_filter_specs(&node, &mut arena, &single_slot_layout(), None, None);
+
+        assert_eq!(specs.len(), 1);
+        assert!(!specs[0].self_subtree);
     }
 }

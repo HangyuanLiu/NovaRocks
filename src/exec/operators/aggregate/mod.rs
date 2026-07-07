@@ -1329,12 +1329,36 @@ mod tests {
 
     use arrow::array::{ArrayRef, Int32Array, ListArray};
     use arrow::buffer::OffsetBuffer;
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field, Schema};
 
     use super::{
-        is_compatible_aggregate_data_type, is_compatible_aggregate_group_data_type,
-        normalize_aggregate_group_arrays,
+        AggregateProcessorFactory, is_compatible_aggregate_data_type,
+        is_compatible_aggregate_group_data_type, normalize_aggregate_group_arrays,
     };
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::node::RuntimeFilterProbeSpec;
+    use crate::exec::node::aggregate::TopNRuntimeFilterSpec;
+    use crate::exec::pipeline::dependency::DependencyManager;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::exec::runtime_filter::RuntimeFilterType;
+    use crate::runtime::query_context::QueryId;
+    use crate::runtime::runtime_filter_hub::{AcquireProgress, AcquiredRuntimeFilters};
+    use crate::runtime::runtime_state::RuntimeState;
+
+    fn int32_chunk(values: Vec<i32>) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let array = Arc::new(Int32Array::from(values)) as ArrayRef;
+        let batch = arrow::array::RecordBatch::try_new(Arc::clone(&schema), vec![array])
+            .expect("record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
 
     #[test]
     fn aggregate_rejects_decimal_precision_drift() {
@@ -1501,5 +1525,76 @@ mod tests {
             err.contains("p5 aggregate output type mismatch"),
             "err={err}"
         );
+    }
+
+    #[test]
+    fn aggregate_topn_runtime_filter_publishes_to_self_subtree_probe() {
+        let query_id = QueryId { hi: 20_108, lo: 1 };
+        let hub = Arc::new(
+            crate::runtime::runtime_filter_hub::RuntimeFilterHub::new_for_query(
+                DependencyManager::new(),
+                query_id,
+            ),
+        );
+        hub.set_wait_timeouts(None, Some(std::time::Duration::from_secs(60)));
+
+        let mut arena = ExprArena::default();
+        let group_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let arena = Arc::new(arena);
+        hub.register_probe_specs(
+            42,
+            &[RuntimeFilterProbeSpec {
+                filter_id: 7,
+                expr_id: group_expr,
+                slot_id: SlotId::new(1),
+                data_type: DataType::Int32,
+                self_subtree: true,
+            }],
+        );
+        let probe = hub.register_probe(42);
+        match probe.poll_acquire(false) {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Complete(snapshot)) => {
+                assert!(snapshot.is_empty(), "pre-publish self-subtree snapshot");
+            }
+            other => panic!("expected ready self-subtree probe before publish, got {other:?}"),
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let output_chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("output chunk schema");
+        let factory = AggregateProcessorFactory::new(
+            7,
+            Arc::clone(&arena),
+            vec![group_expr],
+            Vec::new(),
+            false,
+            true,
+            output_chunk_schema,
+            vec![TopNRuntimeFilterSpec {
+                filter_id: 7,
+                expr_order: 0,
+                build_type: RuntimeFilterType::Int32,
+                probe_column_name: "k".to_string(),
+                limit: 2,
+                is_asc: true,
+                is_nulls_first: false,
+            }],
+            Some(Arc::clone(&hub)),
+        );
+        let mut op = factory.create(1, 0);
+        op.prepare().expect("prepare aggregate");
+        op.as_processor_mut()
+            .expect("aggregate processor")
+            .push_chunk(&RuntimeState::default(), int32_chunk((0..4096).collect()))
+            .expect("push aggregate input");
+
+        match probe.poll_acquire(false) {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Complete(snapshot)) => {
+                assert_eq!(snapshot.min_max_filters().len(), 1);
+                assert_eq!(snapshot.min_max_filters()[0].0, 7);
+            }
+            other => panic!("expected published topn min/max filter, got {other:?}"),
+        }
     }
 }
