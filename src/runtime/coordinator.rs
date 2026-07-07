@@ -47,6 +47,7 @@ use crate::sql::codegen::{
     FragmentEdge, FragmentEdgeKind, FragmentId, MultiFragmentBuildResult, RuntimeFilterPlanResult,
 };
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::{DataPartition, PartitionKind};
 use crate::thrift::data_sinks;
 use crate::thrift::partitions;
 use crate::thrift::planner;
@@ -231,7 +232,7 @@ impl ExecutionCoordinator {
                         "IcebergChangeStreamRouter"
                     }
                 },
-                e.compat_output_partition.type_,
+                partition_type_for_data_partition(&e.output_partition),
             );
         }
 
@@ -303,7 +304,7 @@ impl ExecutionCoordinator {
                         .push(CompatCteConsumer {
                             fragment_id: e.target_fragment_id,
                             exchange_node_id: e.target_exchange_node_id,
-                            partition: e.compat_output_partition.clone(),
+                            partition: tdata_partition_for_data_partition(&e.output_partition),
                             output_slot_ids: e.output_slot_ids.clone(),
                         });
                 }
@@ -466,7 +467,7 @@ impl ExecutionCoordinator {
                         .collect();
                     (
                         output_sink,
-                        edge.compat_output_partition.clone(),
+                        tdata_partition_for_data_partition(&edge.output_partition),
                         Some(exec_destinations),
                     )
                 } else if let Some((router_group_id, branch_edges)) = router_edges {
@@ -992,6 +993,23 @@ fn unpartitioned_partition() -> partitions::TDataPartition {
     )
 }
 
+fn partition_type_for_data_partition(partition: &DataPartition) -> partitions::TPartitionType {
+    match partition.kind {
+        PartitionKind::Unpartitioned => partitions::TPartitionType::UNPARTITIONED,
+        PartitionKind::Random => partitions::TPartitionType::RANDOM,
+        PartitionKind::Hash => partitions::TPartitionType::HASH_PARTITIONED,
+    }
+}
+
+fn tdata_partition_for_data_partition(partition: &DataPartition) -> partitions::TDataPartition {
+    partitions::TDataPartition::new(
+        partition_type_for_data_partition(partition),
+        None::<Vec<crate::thrift::exprs::TExpr>>,
+        None::<Vec<partitions::TRangePartition>>,
+        None::<Vec<partitions::TBucketProperty>>,
+    )
+}
+
 /// Wrap a `TDataStreamSink` in a DATA_STREAM_SINK `TDataSink`.
 fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks::TDataSink {
     data_sinks::TDataSink::new(
@@ -1018,7 +1036,7 @@ fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks
 fn build_stream_sink_for_edge(edge: &FragmentEdge) -> data_sinks::TDataStreamSink {
     data_sinks::TDataStreamSink::new(
         edge.target_exchange_node_id,
-        edge.compat_output_partition.clone(),
+        tdata_partition_for_data_partition(&edge.output_partition),
         None::<bool>,
         None::<bool>,
         None::<i32>,
@@ -1208,7 +1226,7 @@ fn wrap_iceberg_change_stream_router_sink(
 
         let mut stream_sink = template_branch.stream_sink.clone();
         stream_sink.dest_node_id = edge.target_exchange_node_id;
-        stream_sink.output_partition = edge.compat_output_partition.clone();
+        stream_sink.output_partition = tdata_partition_for_data_partition(&edge.output_partition);
         let destinations = placements
             .get(&edge.target_fragment_id)
             .ok_or_else(|| {
@@ -3330,7 +3348,6 @@ mod tests {
             target_fragment_id,
             target_exchange_node_id,
             output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            compat_output_partition: unpartitioned_partition(),
             stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
@@ -3350,7 +3367,6 @@ mod tests {
             target_fragment_id,
             target_exchange_node_id,
             output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            compat_output_partition: unpartitioned_partition(),
             stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
                 router_group_id,
@@ -3894,12 +3910,7 @@ mod tests {
         use crate::sql::common::ChangeStreamBranchKind;
 
         let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
-        edge.compat_output_partition = partitions::TDataPartition::new(
-            partitions::TPartitionType::HASH_PARTITIONED,
-            None::<Vec<crate::thrift::exprs::TExpr>>,
-            None::<Vec<partitions::TRangePartition>>,
-            None::<Vec<partitions::TBucketProperty>>,
-        );
+        edge.output_partition = DataPartition::hash(Vec::new());
         let placeholder_partition = unpartitioned_partition();
         let template_stream_sink = data_sinks::TDataStreamSink::new(
             999,
@@ -3967,12 +3978,7 @@ mod tests {
         use crate::sql::common::ChangeStreamBranchKind;
 
         let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
-        edge.compat_output_partition = partitions::TDataPartition::new(
-            partitions::TPartitionType::HASH_PARTITIONED,
-            None::<Vec<crate::thrift::exprs::TExpr>>,
-            None::<Vec<partitions::TRangePartition>>,
-            None::<Vec<partitions::TBucketProperty>>,
-        );
+        edge.output_partition = DataPartition::hash(Vec::new());
         let mut fragment = native_plan::PlanFragment {
             fragment_id: 1,
             root: None,

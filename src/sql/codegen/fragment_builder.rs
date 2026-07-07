@@ -2337,10 +2337,10 @@ mod tests {
             build.edges[0].stream_kind,
             crate::sql::codegen::FragmentStreamKind::Broadcast
         );
-        assert_eq!(
-            build.edges[0].compat_output_partition.type_,
-            crate::thrift::partitions::TPartitionType::UNPARTITIONED
-        );
+        assert!(matches!(
+            build.edges[0].output_partition.kind,
+            PartitionKind::Unpartitioned
+        ));
     }
 
     #[test]
@@ -2842,18 +2842,8 @@ mod tests {
             edge.stream_kind,
             crate::sql::codegen::FragmentStreamKind::Partitioned
         );
-        assert_eq!(
-            edge.compat_output_partition.type_,
-            crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
-        );
         assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
-        assert_eq!(
-            edge.compat_output_partition
-                .partition_exprs
-                .as_ref()
-                .map(|v| v.len()),
-            Some(1)
-        );
+        assert_eq!(edge.output_partition.exprs.len(), 1);
     }
 
     #[test]
@@ -3506,30 +3496,17 @@ mod tests {
             root.output_sink.type_,
             data_sinks::TDataSinkType::ICEBERG_DV_SINK
         );
-        let file_slot = slot_id_by_name(&root.desc_tbl, "_file");
         let edge = build.edges.first().expect("hash stream edge");
         assert_eq!(
             edge.stream_kind,
             crate::sql::codegen::FragmentStreamKind::Partitioned
         );
-        assert_eq!(
-            edge.compat_output_partition.type_,
-            crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
-        );
         assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
-        let partition_exprs = edge
-            .compat_output_partition
-            .partition_exprs
-            .as_ref()
-            .expect("partition exprs");
-        assert_eq!(partition_exprs.len(), 1);
-        let expr_node = partition_exprs[0]
-            .nodes
-            .first()
-            .expect("partition expr node");
-        assert_eq!(expr_node.node_type, exprs::TExprNodeType::SLOT_REF);
-        let slot_ref = expr_node.slot_ref.as_ref().expect("slot ref");
-        assert_eq!(slot_ref.slot_id, file_slot);
+        assert_eq!(edge.output_partition.exprs.len(), 1);
+        let ExprKind::ColumnRef { column, .. } = &edge.output_partition.exprs[0].kind else {
+            panic!("expected hash partition expr to be a column ref");
+        };
+        assert_eq!(column, "_file");
     }
 
     #[test]
@@ -3722,10 +3699,10 @@ mod tests {
                 .find(|fragment| fragment.fragment_id == writer_fragment_id)
                 .expect("writer fragment");
             assert_eq!(edge.source_fragment_id, build.root_fragment_id);
-            assert_eq!(
-                edge.compat_output_partition.type_,
-                crate::thrift::partitions::TPartitionType::UNPARTITIONED
-            );
+            assert!(matches!(
+                edge.output_partition.kind,
+                PartitionKind::Unpartitioned
+            ));
             assert_eq!(writer.plan.nodes.len(), 1);
             let exchange = writer.plan.nodes.first().expect("writer exchange");
             assert_eq!(exchange.node_type, plan_nodes::TPlanNodeType::EXCHANGE_NODE);

@@ -28,7 +28,6 @@ use arrow::datatypes::DataType;
 use crate::thrift::data_sinks;
 use crate::thrift::descriptors as thrift_descriptors;
 use crate::thrift::internal_service;
-use crate::thrift::partitions;
 use crate::thrift::plan_nodes;
 
 use super::analysis::cte::CteId;
@@ -90,11 +89,7 @@ pub(crate) struct FragmentEdge {
     pub source_fragment_id: FragmentId,
     pub target_fragment_id: FragmentId,
     pub target_exchange_node_id: i32,
-    #[allow(dead_code)]
-    // Planner-native semantics used by native fragment wire.
     pub output_partition: crate::sql::planner::DataPartition,
-    // Thrift projection used by compat sinks.
-    pub compat_output_partition: partitions::TDataPartition,
     pub stream_kind: FragmentStreamKind,
     pub edge_kind: FragmentEdgeKind,
     pub output_slot_ids: Vec<i32>,

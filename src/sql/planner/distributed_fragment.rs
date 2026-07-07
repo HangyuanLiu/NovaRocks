@@ -5,7 +5,7 @@ use crate::sql::column_id::ColumnId;
 
 use super::distributed_node::DistributedNode;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum PartitionKind {
     Unpartitioned,
     Random,
@@ -23,6 +23,20 @@ impl DataPartition {
         Self {
             kind: PartitionKind::Unpartitioned,
             exprs: Vec::new(),
+        }
+    }
+
+    pub(crate) fn random() -> Self {
+        Self {
+            kind: PartitionKind::Random,
+            exprs: Vec::new(),
+        }
+    }
+
+    pub(crate) fn hash(exprs: Vec<TypedExpr>) -> Self {
+        Self {
+            kind: PartitionKind::Hash,
+            exprs,
         }
     }
 

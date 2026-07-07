@@ -1939,8 +1939,7 @@ mod tests {
             },
             payload: crate::sql::planner::DistributedPayload::Exchange(
                 crate::sql::planner::ExchangeReceiver {
-                    partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                    partition_exprs: Vec::new(),
+                    partition: crate::sql::planner::DataPartition::unpartitioned(),
                     source_fragment_id: 0,
                     output_columns: vec![crate::sql::analysis::OutputColumn {
                         column_id: crate::sql::column_id::ColumnId::new_for_test(1),
@@ -1976,12 +1975,6 @@ mod tests {
             target_fragment_id: 1,
             target_exchange_node_id: 30,
             output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            compat_output_partition: crate::thrift::partitions::TDataPartition::new(
-                crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::thrift::exprs::TExpr>>,
-                None::<Vec<crate::thrift::partitions::TRangePartition>>,
-                None::<Vec<crate::thrift::partitions::TBucketProperty>>,
-            ),
             stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
             edge_kind: crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter {
                 router_group_id: 0,
@@ -2067,12 +2060,6 @@ mod tests {
             target_fragment_id: 1,
             target_exchange_node_id: 30,
             output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            compat_output_partition: crate::thrift::partitions::TDataPartition::new(
-                crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::thrift::exprs::TExpr>>,
-                None::<Vec<crate::thrift::partitions::TRangePartition>>,
-                None::<Vec<crate::thrift::partitions::TBucketProperty>>,
-            ),
             stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
             edge_kind: crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter {
                 router_group_id: 0,

@@ -8,7 +8,7 @@ use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_t
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed_fragment::{
-    DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment,
+    DataPartition, DataSink, DistributedPlan, PlanFragment,
 };
 use crate::sql::planner::distributed_node::{
     DistributedNode, DistributedPayload, ExchangeReceiver,
@@ -24,7 +24,6 @@ use crate::sql::planner::{
     OrderingSpec, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
     WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
 };
-use crate::thrift::partitions;
 
 pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<DistributedPlan, String> {
     let mut builder = DistributedPlanBuilder {
@@ -557,8 +556,6 @@ impl DistributedPlanBuilder {
         exchange_stats: crate::sql::planner::PhysicalPlanStats,
     ) -> Result<DistributedNode, String> {
         let parent_fragment_id = self.current_fragment_id()?;
-        let partition_type = partition_type_for_data_partition(&output_partition);
-        let partition_exprs = output_partition.exprs.clone();
         let source_output_columns = stream_exchange_source_output_columns(child_plan);
         let exchange_output_columns = if exchange_output_columns.is_empty()
             && matches!(&flavor, ExchangeFlavor::Distribution)
@@ -594,7 +591,6 @@ impl DistributedPlanBuilder {
             target_fragment_id: parent_fragment_id,
             target_exchange_node_id: exchange_node_id,
             output_partition: output_partition.clone(),
-            compat_output_partition: tdata_partition_placeholder(partition_type),
             stream_kind,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: output_slot_ids_for_exchange(&exchange_output_columns)?,
@@ -617,8 +613,7 @@ impl DistributedPlanBuilder {
             children: Vec::new(),
             stats: exchange_stats,
             payload: DistributedPayload::Exchange(ExchangeReceiver {
-                partition_type,
-                partition_exprs,
+                partition: output_partition,
                 source_fragment_id: child_fragment_id,
                 output_columns: exchange_output_columns,
                 output_qualifier,
@@ -697,9 +692,6 @@ impl DistributedPlanBuilder {
             target_fragment_id,
             target_exchange_node_id: exchange_node_id,
             output_partition: DataPartition::unpartitioned(),
-            compat_output_partition: tdata_partition_placeholder(
-                partitions::TPartitionType::UNPARTITIONED,
-            ),
             stream_kind: FragmentStreamKind::Broadcast,
             edge_kind: FragmentEdgeKind::CteMulticast {
                 cte_id: consume.cte_id,
@@ -719,8 +711,7 @@ impl DistributedPlanBuilder {
             children: Vec::new(),
             stats: synthetic_exchange_stats(&node.stats),
             payload: DistributedPayload::Exchange(ExchangeReceiver {
-                partition_type: partitions::TPartitionType::UNPARTITIONED,
-                partition_exprs: Vec::new(),
+                partition: DataPartition::unpartitioned(),
                 source_fragment_id: cte_fragment_id,
                 output_columns: consume.output_columns.clone(),
                 output_qualifier: Some(consume.alias.clone()),
@@ -1051,10 +1042,7 @@ fn data_partition_for_redistribute_mode(
             if exprs.is_empty() {
                 Ok(DataPartition::unpartitioned())
             } else {
-                Ok(DataPartition {
-                    kind: PartitionKind::Hash,
-                    exprs,
-                })
+                Ok(DataPartition::hash(exprs))
             }
         }
     }
@@ -1081,10 +1069,7 @@ fn data_partition_for_redistribute_node(
         && !redistribute.partition_exprs.is_empty()
     {
         validate_partition_exprs(cols, &redistribute.partition_exprs)?;
-        return Ok(DataPartition {
-            kind: PartitionKind::Hash,
-            exprs: redistribute.partition_exprs.clone(),
-        });
+        return Ok(DataPartition::hash(redistribute.partition_exprs.clone()));
     }
     data_partition_for_redistribute_mode(&redistribute.mode, &redistribute.output_columns)
 }
@@ -1153,25 +1138,6 @@ fn partition_exprs_for_columns(
     Err(format!(
         "build_distributed_plan: missing hash partition columns [{missing}]; available output columns [{available}]"
     ))
-}
-
-fn partition_type_for_data_partition(partition: &DataPartition) -> partitions::TPartitionType {
-    match partition.kind {
-        PartitionKind::Unpartitioned => partitions::TPartitionType::UNPARTITIONED,
-        PartitionKind::Random => partitions::TPartitionType::RANDOM,
-        PartitionKind::Hash => partitions::TPartitionType::HASH_PARTITIONED,
-    }
-}
-
-fn tdata_partition_placeholder(
-    partition_type: partitions::TPartitionType,
-) -> partitions::TDataPartition {
-    partitions::TDataPartition::new(
-        partition_type,
-        None,
-        None::<Vec<partitions::TRangePartition>>,
-        None::<Vec<partitions::TBucketProperty>>,
-    )
 }
 
 fn stream_kind_for_redistribute_mode(mode: &RedistributeMode) -> FragmentStreamKind {
@@ -1416,7 +1382,6 @@ mod tests {
         PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate, RuntimeFilterBuildIntent,
         RuntimeFilterProbeIntent, TopNPhase,
     };
-    use crate::thrift::partitions::TPartitionType;
 
     #[test]
     fn build_distributed_plan_values_shapes_root_fragment() {
@@ -2366,12 +2331,12 @@ mod tests {
         };
         assert_eq!(exchange.fragment_id, 0);
         assert_eq!(exchange_receiver.source_fragment_id, 1);
-        assert_eq!(
-            exchange_receiver.partition_type,
-            TPartitionType::HASH_PARTITIONED
-        );
-        assert_eq!(exchange_receiver.partition_exprs.len(), 1);
-        assert_column_ref(&exchange_receiver.partition_exprs[0], 1, "qualified_k");
+        assert!(matches!(
+            exchange_receiver.partition.kind,
+            PartitionKind::Hash
+        ));
+        assert_eq!(exchange_receiver.partition.exprs.len(), 1);
+        assert_column_ref(&exchange_receiver.partition.exprs[0], 1, "qualified_k");
         assert!(matches!(
             exchange_receiver.flavor,
             crate::sql::planner::plan::ExchangeFlavor::Distribution
@@ -2409,10 +2374,6 @@ mod tests {
         );
         assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
         assert_eq!(edge.output_partition.exprs.len(), 1);
-        assert_eq!(
-            edge.compat_output_partition.type_,
-            TPartitionType::HASH_PARTITIONED
-        );
         assert!(matches!(
             &child_fragment.root.payload,
             DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
@@ -2634,21 +2595,17 @@ mod tests {
             DistributedPayload::Exchange(exchange_receiver) => exchange_receiver,
             other => panic!("expected Exchange child, got {other:?}"),
         };
-        assert_eq!(
-            exchange_receiver.partition_type,
-            TPartitionType::UNPARTITIONED
-        );
-        assert!(exchange_receiver.partition_exprs.is_empty());
+        assert!(matches!(
+            exchange_receiver.partition.kind,
+            PartitionKind::Unpartitioned
+        ));
+        assert!(exchange_receiver.partition.exprs.is_empty());
         assert_eq!(dp.edges[0].stream_kind, FragmentStreamKind::Broadcast);
         assert!(matches!(dp.edges[0].edge_kind, FragmentEdgeKind::Stream));
         assert!(matches!(
             dp.edges[0].output_partition.kind,
             PartitionKind::Unpartitioned
         ));
-        assert_eq!(
-            dp.edges[0].compat_output_partition.type_,
-            TPartitionType::UNPARTITIONED
-        );
         assert_no_physical_redistribute(root);
         assert_no_physical_redistribute(&dp.fragments[0].root);
     }
@@ -2763,8 +2720,11 @@ mod tests {
             "synthetic CTE Exchange must not inherit CTEConsume cost"
         );
         assert_eq!(receiver.source_fragment_id, produce_fragment.fragment_id);
-        assert_eq!(receiver.partition_type, TPartitionType::UNPARTITIONED);
-        assert!(receiver.partition_exprs.is_empty());
+        assert!(matches!(
+            receiver.partition.kind,
+            PartitionKind::Unpartitioned
+        ));
+        assert!(receiver.partition.exprs.is_empty());
         assert_eq!(receiver.output_columns.len(), consumer_columns.len());
         assert_eq!(
             receiver.output_columns[0].column_id,
@@ -2795,10 +2755,6 @@ mod tests {
             edge.output_partition.kind,
             PartitionKind::Unpartitioned
         ));
-        assert_eq!(
-            edge.compat_output_partition.type_,
-            TPartitionType::UNPARTITIONED
-        );
         assert!(edge.output_slot_ids.is_empty());
         match &edge.edge_kind {
             FragmentEdgeKind::CteMulticast {
@@ -3045,8 +3001,11 @@ mod tests {
             exchange.stats.broadcast_decision.is_none(),
             "synthetic LimitOffset Exchange must not inherit Limit broadcast decision"
         );
-        assert_eq!(receiver.partition_type, TPartitionType::UNPARTITIONED);
-        assert!(receiver.partition_exprs.is_empty());
+        assert!(matches!(
+            receiver.partition.kind,
+            PartitionKind::Unpartitioned
+        ));
+        assert!(receiver.partition.exprs.is_empty());
         assert!(receiver.output_columns.is_empty());
         assert_eq!(receiver.output_qualifier, None);
         match &receiver.flavor {
@@ -3067,10 +3026,6 @@ mod tests {
             edge.output_partition.kind,
             PartitionKind::Unpartitioned
         ));
-        assert_eq!(
-            edge.compat_output_partition.type_,
-            TPartitionType::UNPARTITIONED
-        );
         assert!(edge.output_slot_ids.is_empty());
 
         let child_fragment = dp
@@ -3133,8 +3088,11 @@ mod tests {
             exchange.stats.broadcast_decision.is_none(),
             "synthetic TopNSplit Exchange must not inherit TopN broadcast decision"
         );
-        assert_eq!(receiver.partition_type, TPartitionType::UNPARTITIONED);
-        assert!(receiver.partition_exprs.is_empty());
+        assert!(matches!(
+            receiver.partition.kind,
+            PartitionKind::Unpartitioned
+        ));
+        assert!(receiver.partition.exprs.is_empty());
         assert!(receiver.output_columns.is_empty());
         assert_eq!(receiver.output_qualifier, None);
         match &receiver.flavor {
@@ -3163,11 +3121,6 @@ mod tests {
             edge.output_partition.kind,
             PartitionKind::Unpartitioned
         ));
-        assert_eq!(
-            edge.compat_output_partition.type_,
-            TPartitionType::UNPARTITIONED
-        );
-
         let child_fragment = dp
             .fragments
             .iter()

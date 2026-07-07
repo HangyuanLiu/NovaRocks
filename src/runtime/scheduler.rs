@@ -838,12 +838,6 @@ mod tests {
             target_fragment_id: tgt,
             target_exchange_node_id: exch_node_id,
             output_partition: native_partition_for_test(ptype),
-            compat_output_partition: partitions::TDataPartition::new(
-                ptype,
-                None::<Vec<crate::thrift::exprs::TExpr>>,
-                None::<Vec<partitions::TRangePartition>>,
-                None::<Vec<partitions::TBucketProperty>>,
-            ),
             stream_kind,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
@@ -1058,12 +1052,7 @@ mod tests {
             fake_fragment(2, None, 0),
         ];
         let mut hash_edge = fake_edge(0, 1, partitions::TPartitionType::HASH_PARTITIONED, 10);
-        hash_edge.compat_output_partition = partitions::TDataPartition::new(
-            partitions::TPartitionType::UNPARTITIONED,
-            None::<Vec<crate::thrift::exprs::TExpr>>,
-            None::<Vec<partitions::TRangePartition>>,
-            None::<Vec<partitions::TBucketProperty>>,
-        );
+        hash_edge.output_partition = DataPartition::unpartitioned();
         let edges = vec![
             hash_edge,
             fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),

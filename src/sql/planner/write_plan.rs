@@ -8,7 +8,6 @@ use crate::sql::planner::{
     IcebergWriteInputBinding, PartitionKind, PlanFragment,
     PlannedIcebergChangeStreamDistributedPlan,
 };
-use crate::thrift::partitions;
 
 pub(crate) fn with_iceberg_write_sink(
     mut plan: crate::sql::planner::DistributedPlan,
@@ -159,13 +158,12 @@ pub(crate) fn with_iceberg_change_stream_write(
         next_node_id += 1;
         let exchange_tuple_id = next_tuple_id;
         next_tuple_id += 1;
-        let partition_type = partition_type_for_ordinals(&branch.output_partition_ordinals);
         let output_partition = data_partition_for_ordinals(
             &source_fragment.output_columns,
             &branch.output_partition_ordinals,
             &format!("branch {:?} partition", branch.branch_kind),
         )?;
-        let stream_kind = stream_kind_for_partition_type(partition_type);
+        let stream_kind = stream_kind_for_data_partition(&output_partition);
 
         writer_fragments.push(PlanFragment {
             fragment_id: writer_fragment_id,
@@ -180,8 +178,7 @@ pub(crate) fn with_iceberg_change_stream_write(
                 children: Vec::new(),
                 stats: source_fragment.root.stats.clone(),
                 payload: DistributedPayload::Exchange(ExchangeReceiver {
-                    partition_type,
-                    partition_exprs: Vec::new(),
+                    partition: output_partition.clone(),
                     source_fragment_id: root_fragment_id,
                     output_columns: writer_columns.clone(),
                     output_qualifier: None,
@@ -206,7 +203,6 @@ pub(crate) fn with_iceberg_change_stream_write(
             target_fragment_id: writer_fragment_id,
             target_exchange_node_id: exchange_node_id,
             output_partition,
-            compat_output_partition: tdata_partition_placeholder(partition_type),
             stream_kind,
             edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
                 router_group_id: 0,
@@ -331,14 +327,6 @@ fn output_columns_by_ordinals(
         .collect()
 }
 
-fn partition_type_for_ordinals(ordinals: &[usize]) -> partitions::TPartitionType {
-    if ordinals.is_empty() {
-        partitions::TPartitionType::UNPARTITIONED
-    } else {
-        partitions::TPartitionType::HASH_PARTITIONED
-    }
-}
-
 fn data_partition_for_ordinals(
     output_columns: &[OutputColumn],
     ordinals: &[usize],
@@ -367,34 +355,15 @@ fn data_partition_for_ordinals(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    Ok(DataPartition {
-        kind: PartitionKind::Hash,
-        exprs,
-    })
+    Ok(DataPartition::hash(exprs))
 }
 
-fn stream_kind_for_partition_type(
-    partition_type: partitions::TPartitionType,
-) -> FragmentStreamKind {
-    match partition_type {
-        partitions::TPartitionType::HASH_PARTITIONED
-        | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
-            FragmentStreamKind::Partitioned
-        }
-        partitions::TPartitionType::UNPARTITIONED => FragmentStreamKind::Gather,
-        _ => FragmentStreamKind::Other,
+fn stream_kind_for_data_partition(partition: &DataPartition) -> FragmentStreamKind {
+    match partition.kind {
+        PartitionKind::Unpartitioned => FragmentStreamKind::Gather,
+        PartitionKind::Random => FragmentStreamKind::Other,
+        PartitionKind::Hash => FragmentStreamKind::Partitioned,
     }
-}
-
-fn tdata_partition_placeholder(
-    partition_type: partitions::TPartitionType,
-) -> partitions::TDataPartition {
-    partitions::TDataPartition::new(
-        partition_type,
-        None,
-        None::<Vec<partitions::TRangePartition>>,
-        None::<Vec<partitions::TBucketProperty>>,
-    )
 }
 
 #[cfg(test)]
@@ -522,10 +491,6 @@ mod tests {
         };
         assert_eq!(*column_id, ColumnId::new_for_test(3));
         assert_eq!(column, "delete_id");
-        assert_eq!(
-            first_edge.compat_output_partition.type_,
-            crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
-        );
         assert!(matches!(
             first_edge.edge_kind,
             crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter {

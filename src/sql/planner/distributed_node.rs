@@ -1,16 +1,14 @@
-use crate::sql::analysis::{OutputColumn, TypedExpr};
+use crate::sql::analysis::OutputColumn;
 use crate::sql::codegen::FragmentId;
-use crate::sql::planner::PhysicalPlanStats;
 use crate::sql::planner::plan::ExchangeFlavor;
 use crate::sql::planner::plan::PhysicalPlanKind;
 use crate::sql::planner::runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
-use crate::thrift::partitions::TPartitionType;
+use crate::sql::planner::{DataPartition, PhysicalPlanStats};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct ExchangeReceiver {
-    pub partition_type: TPartitionType,
-    pub partition_exprs: Vec<TypedExpr>,
+    pub partition: DataPartition,
     pub source_fragment_id: FragmentId,
     pub output_columns: Vec<OutputColumn>,
     pub output_qualifier: Option<String>,
