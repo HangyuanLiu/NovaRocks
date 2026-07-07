@@ -309,7 +309,7 @@ pub extern "C" fn novarocks_rs_transmit_chunk(
         out_resp,
         out_err,
         "transmit_chunk",
-        internal_rpc::handle_transmit_chunk,
+        internal_rpc::handle_transmit_chunk_compat,
     )
 }
 
