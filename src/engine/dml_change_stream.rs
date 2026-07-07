@@ -1520,6 +1520,7 @@ mod tests {
             fragment_results: vec![keyed_assert_fragment(nodes)],
             root_fragment_id: 0,
             edges: Vec::new(),
+            lowered_edges: Vec::new(),
             boundary_schemas: Vec::new(),
             rf_plan: None,
         }

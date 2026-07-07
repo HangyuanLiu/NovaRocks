@@ -25,7 +25,8 @@ use crate::sql::codegen::helpers::{
     typed_expr_display_name_without_qualifiers,
 };
 use crate::sql::codegen::iceberg_change_stream_router_wire::{
-    build_router_sink_thrift, native_output_partition_for_ordinals, output_slot_ids_for_ordinals,
+    build_router_sink_thrift, compat_output_partition_for_ordinals,
+    native_output_partition_for_ordinals, output_slot_ids_for_ordinals,
 };
 use crate::sql::codegen::iceberg_write_sink_wire::{
     add_iceberg_sink_target_table_to_desc_builder, build_iceberg_write_sink_thrift,
@@ -38,7 +39,8 @@ use crate::sql::codegen::runtime_filter_lowering::{
 };
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
-    FragmentBuildResult, FragmentId, FragmentOutputKind, MultiFragmentBuildResult, OutputColumn,
+    FragmentBuildResult, FragmentId, FragmentOutputKind, LoweredFragmentEdge,
+    MultiFragmentBuildResult, OutputColumn,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
@@ -73,7 +75,11 @@ pub(crate) fn lower_distributed_plan(
     state.lower_fragment_by_id(dp.root_fragment_id)?;
     state.fragment_stack.clear();
 
-    let edges = lower_fragment_edges(dp, &mut state)?;
+    let lowered_edges = lower_fragment_edges(dp, &mut state)?;
+    let edges = lowered_edges
+        .iter()
+        .map(|lowered| lowered.edge.clone())
+        .collect();
     let rf_builds = state.rf_build_targets.clone();
     let rf_probes: Vec<(i32, i32, FragmentId)> = state
         .rf_probe_targets
@@ -161,6 +167,7 @@ pub(crate) fn lower_distributed_plan(
         fragment_results,
         root_fragment_id: dp.root_fragment_id,
         edges,
+        lowered_edges,
         boundary_schemas,
         rf_plan: if state.rf_all_filters.is_empty() {
             None
@@ -730,7 +737,7 @@ fn ensure_unpartitioned(
 fn lower_fragment_edges(
     dp: &crate::sql::planner::DistributedPlan,
     state: &mut OwnedLoweringState<'_>,
-) -> Result<Vec<crate::sql::codegen::FragmentEdge>, String> {
+) -> Result<Vec<LoweredFragmentEdge>, String> {
     let fragments_by_id: BTreeMap<FragmentId, &crate::sql::planner::PlanFragment> = dp
         .fragments
         .iter()
@@ -740,6 +747,7 @@ fn lower_fragment_edges(
 
     for edge in &dp.edges {
         let mut lowered_edge = edge.clone();
+        let compat_partition;
         match edge.edge_kind {
             crate::sql::codegen::FragmentEdgeKind::Stream
             | crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. } => {
@@ -760,6 +768,11 @@ fn lower_fragment_edges(
                         )
                     })?;
                 lowered_edge.output_partition = native_exchange_output_partition(exchange)?;
+                compat_partition = lower_exchange_compat_partition(
+                    exchange,
+                    &source.scope,
+                    state.slot_allocator(),
+                )?;
                 if matches!(
                     edge.edge_kind,
                     crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }
@@ -810,6 +823,12 @@ fn lower_fragment_edges(
                     &route.output_partition_ordinals,
                     &format!("branch {:?} partition", route.branch_kind),
                 )?;
+                compat_partition = compat_output_partition_for_ordinals(
+                    &source.scope,
+                    &source_fragment.output_columns,
+                    &route.output_partition_ordinals,
+                    &format!("branch {:?} partition", route.branch_kind),
+                )?;
                 lowered_edge.output_slot_ids = output_slot_ids_for_ordinals(
                     &source.scope,
                     &source_fragment.output_columns,
@@ -824,7 +843,10 @@ fn lower_fragment_edges(
                 }
             }
         }
-        lowered_edges.push(lowered_edge);
+        lowered_edges.push(LoweredFragmentEdge {
+            edge: lowered_edge,
+            compat_partition,
+        });
     }
 
     Ok(lowered_edges)
@@ -855,6 +877,36 @@ fn exchange_partition_type(
         crate::sql::planner::PartitionKind::Random => partitions::TPartitionType::RANDOM,
         crate::sql::planner::PartitionKind::Hash => partitions::TPartitionType::HASH_PARTITIONED,
     }
+}
+
+fn lower_exchange_compat_partition(
+    exchange: &super::kind::DistributedExchangeNode,
+    source_scope: &ExprScope,
+    slot_allocator: expr_compiler::SlotAllocator,
+) -> Result<partitions::TDataPartition, String> {
+    let partition_type = exchange_partition_type(exchange);
+    if partition_type != partitions::TPartitionType::HASH_PARTITIONED {
+        return Ok(partitions::TDataPartition::new(
+            partition_type,
+            None::<Vec<exprs::TExpr>>,
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
+        ));
+    }
+    if exchange.partition.exprs.is_empty() {
+        return Err("DistributedPlan HASH Exchange has no partition expressions".to_string());
+    }
+    let mut partition_exprs = Vec::with_capacity(exchange.partition.exprs.len());
+    for expr in &exchange.partition.exprs {
+        let mut compiler = ExprCompiler::new(Rc::clone(&slot_allocator), source_scope);
+        partition_exprs.push(compiler.compile_typed(expr)?);
+    }
+    Ok(partitions::TDataPartition::new(
+        partitions::TPartitionType::HASH_PARTITIONED,
+        Some(partition_exprs),
+        None::<Vec<partitions::TRangePartition>>,
+        None::<Vec<partitions::TBucketProperty>>,
+    ))
 }
 
 fn router_route_for_edge<'a>(
@@ -5644,6 +5696,26 @@ mod tests {
         PlanFragmentBuilder::build(FragmentBuildRequest::result(&dp, catalog, connectors, None))
     }
 
+    fn assert_single_slot_ref_partition_expr_for_test(
+        partition: &crate::thrift::partitions::TDataPartition,
+    ) -> i32 {
+        assert_eq!(
+            partition.type_,
+            crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
+        );
+        let exprs = partition
+            .partition_exprs
+            .as_ref()
+            .expect("hash partition should carry partition exprs");
+        assert_eq!(exprs.len(), 1);
+        let node = exprs[0].nodes.first().expect("partition expr root");
+        assert_eq!(
+            node.node_type,
+            crate::thrift::exprs::TExprNodeType::SLOT_REF
+        );
+        node.slot_ref.as_ref().expect("slot ref").slot_id
+    }
+
     #[test]
     fn rf_probe_targets_retain_multiple_targets_per_filter_id() {
         use crate::sql::codegen::expr_compiler::int_literal_node;
@@ -6833,6 +6905,36 @@ mod tests {
     }
 
     #[test]
+    fn lower_distributed_plan_compiles_hash_exchange_partition_expr_sidecar() {
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        let mut dp = distributed_values_multi_fragment_plan();
+        let DistributedPayload::Exchange(exchange) = &mut dp.fragments[1].root.payload else {
+            panic!("root fragment should be exchange");
+        };
+        exchange.partition =
+            DataPartition::hash(vec![column_ref_expr(1, "child_k", DataType::Int64, false)]);
+
+        let result = super::lower_distributed_plan(&dp, &catalog, &connectors, None)
+            .expect("lower hash exchange plan");
+
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.lowered_edges.len(), 1);
+        assert!(matches!(
+            result.edges[0].output_partition.kind,
+            PartitionKind::Hash
+        ));
+        assert_eq!(result.edges[0].output_partition.exprs.len(), 1);
+        let slot_id = assert_single_slot_ref_partition_expr_for_test(
+            &result.lowered_edges[0].compat_partition,
+        );
+        assert!(
+            slot_id > 0,
+            "compiled hash expr should reference a materialized slot"
+        );
+    }
+
+    #[test]
     fn lower_distribution_exchange_uses_hash_join_source_outputs() {
         let catalog = DummyCatalog;
         let connectors = ConnectorRegistry::new();
@@ -6945,6 +7047,7 @@ mod tests {
 
         assert_eq!(result.fragment_results.len(), 2);
         assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.lowered_edges.len(), 1);
         let root = result
             .fragment_results
             .iter()
@@ -6994,6 +7097,12 @@ mod tests {
         };
         assert_eq!(*column_id, ColumnId(3));
         assert_eq!(column, "delete_id");
+        assert_eq!(
+            assert_single_slot_ref_partition_expr_for_test(
+                &result.lowered_edges[0].compat_partition
+            ),
+            3
+        );
 
         let writer = result
             .fragment_results

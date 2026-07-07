@@ -28,6 +28,7 @@ use arrow::datatypes::DataType;
 use crate::thrift::data_sinks;
 use crate::thrift::descriptors as thrift_descriptors;
 use crate::thrift::internal_service;
+use crate::thrift::partitions;
 use crate::thrift::plan_nodes;
 
 use super::analysis::cte::CteId;
@@ -95,6 +96,12 @@ pub(crate) struct FragmentEdge {
     pub output_slot_ids: Vec<i32>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct LoweredFragmentEdge {
+    pub edge: FragmentEdge,
+    pub compat_partition: partitions::TDataPartition,
+}
+
 pub(crate) struct MultiFragmentBuildResult {
     /// Per-fragment build results.
     pub fragment_results: Vec<FragmentBuildResult>,
@@ -102,6 +109,8 @@ pub(crate) struct MultiFragmentBuildResult {
     pub root_fragment_id: FragmentId,
     /// Fragment-to-fragment data edges.
     pub edges: Vec<FragmentEdge>,
+    /// Codegen-side lowering products for edges that still feed compat thrift runtime sinks.
+    pub lowered_edges: Vec<LoweredFragmentEdge>,
     pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
     /// Runtime filter planning result (populated for standalone mode).
     pub rf_plan: Option<RuntimeFilterPlanResult>,
