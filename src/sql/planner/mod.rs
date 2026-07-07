@@ -656,7 +656,21 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
             Ok(columns)
         }
         LogicalPlanKind::Window(node) => Ok(node.output_columns.clone()),
-        LogicalPlanKind::Repeat(_) => plan_output_columns(plan.unary_input()),
+        LogicalPlanKind::Repeat(node) => {
+            let mut columns = plan_output_columns(plan.unary_input())?;
+            columns.extend(
+                node.grouping_fn_ids
+                    .iter()
+                    .map(|(name, column_id)| OutputColumn {
+                        column_id: *column_id,
+                        name: name.clone(),
+                        data_type: arrow::datatypes::DataType::Int64,
+                        nullable: false,
+                        is_internal: true,
+                    }),
+            );
+            Ok(columns)
+        }
         LogicalPlanKind::CTEAnchor(_) => plan_output_columns(plan.child(1)),
         LogicalPlanKind::CTEProduce(node) => Ok(node.output_columns.clone()),
         LogicalPlanKind::CTEConsume(node) => Ok(node.output_columns.clone()),
@@ -1200,11 +1214,7 @@ fn prepare_repeat_input(
         let nullable = source_expr.nullable;
         let original_display = typed_expr_display_name(&source_expr);
         let materialized_column_id =
-            if let ExprKind::ColumnRef { column_id, .. } = &source_expr.kind {
-                *column_id
-            } else {
-                factory.create(None, alias_name.clone(), data_type.clone(), nullable)
-            };
+            factory.create(None, alias_name.clone(), data_type.clone(), nullable);
         if let Some((original_name, _)) = grouping_key_aliases.get(idx) {
             repeat_key_ids_by_name
                 .insert(original_name.to_ascii_lowercase(), materialized_column_id);
@@ -1212,34 +1222,17 @@ fn prepare_repeat_input(
         repeat_key_ids_by_name.insert(alias_name.to_ascii_lowercase(), materialized_column_id);
         all_rollup_column_ids.push(materialized_column_id);
 
-        // Substitute downstream references to the original expression with a
-        // ColumnRef on the alias. For the ColumnRef case the existing
-        // `repeat_group_qualifier` form keeps the column name (so
-        // visit_repeat's `add_qualified_alias(__repeat_group, k1, …)`
-        // wiring still resolves). For non-ColumnRef cases we point at the
-        // alias slot directly so the AGGREGATE above REPEAT reads the
-        // per-level nullified value, not the pre-REPEAT input.
-        let replacement = match &source_expr.kind {
-            ExprKind::ColumnRef {
-                column_id, column, ..
-            } => TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: *column_id,
-                    qualifier: Some(repeat_group_qualifier.to_string()),
-                    column: column.clone(),
-                },
-                data_type,
-                nullable,
+        // Substitute downstream grouping-key references with the materialized
+        // alias slot so Aggregate reads Repeat's nullified value rather than
+        // the pre-Repeat input column.
+        let replacement = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: materialized_column_id,
+                qualifier: Some(repeat_group_qualifier.to_string()),
+                column: alias_name.clone(),
             },
-            _ => TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: materialized_column_id,
-                    qualifier: None,
-                    column: alias_name.clone(),
-                },
-                data_type,
-                nullable,
-            },
+            data_type,
+            nullable,
         };
         substitutions.push((original_display, replacement));
 
@@ -5719,6 +5712,69 @@ mod tests {
             column_ref_id(&aggregate.group_by[0]),
             repeat_key.output_column_id,
             "Aggregate over Repeat must group by the materialized key ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_rollup_column_key_uses_distinct_repeat_materialization_id() {
+        let plan = parse_analyze_and_plan("SELECT a, count(*) FROM t GROUP BY ROLLUP(a)")
+            .expect("planner should succeed");
+        let (_project, aggregate) = root_project_over_aggregate(&plan);
+        let (repeat_plan, repeat) = first_repeat_node(&plan);
+        let LogicalPlanKind::Project(repeat_input_project) = &repeat_plan.unary_input().kind else {
+            panic!(
+                "expected Repeat input Project, got {:?}",
+                repeat_plan.unary_input()
+            );
+        };
+        let source_a = repeat_input_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "a")
+            .expect("Repeat input should preserve original source column");
+        let repeat_key = repeat_input_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__repeat_group_key_0")
+            .expect("ROLLUP key should be materialized before Repeat");
+
+        assert_ne!(
+            source_a.output_column_id, repeat_key.output_column_id,
+            "Repeat grouping key must not reuse the source ColumnId"
+        );
+        assert_eq!(
+            repeat.all_rollup_column_ids,
+            vec![repeat_key.output_column_id],
+            "Repeat metadata must point at the materialized key id"
+        );
+        assert_eq!(
+            column_ref_id(&aggregate.group_by[0]),
+            repeat_key.output_column_id,
+            "Aggregate over Repeat must group by the nullified materialized key"
+        );
+    }
+
+    #[test]
+    fn p2_repeat_output_columns_include_grouping_function_slots() {
+        let plan = parse_analyze_and_plan(
+            "SELECT grouping(a) AS g, a, count(*) FROM t GROUP BY ROLLUP(a)",
+        )
+        .expect("planner should succeed");
+        let (repeat_plan, repeat) = first_repeat_node(&plan);
+        let grouping_id = repeat
+            .grouping_fn_ids
+            .iter()
+            .find(|(name, _)| name == "__grouping_fn_0")
+            .map(|(_, id)| *id)
+            .expect("ROLLUP should produce grouping function metadata");
+
+        let repeat_outputs = plan_output_columns(repeat_plan).expect("Repeat output columns");
+
+        assert!(
+            repeat_outputs
+                .iter()
+                .any(|column| column.column_id == grouping_id && column.name == "__grouping_fn_0"),
+            "Repeat output columns must expose generated GROUPING() ColumnId"
         );
     }
 
