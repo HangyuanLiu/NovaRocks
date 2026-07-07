@@ -494,6 +494,10 @@ fn remap_plan_node_references(
     for edge in &mut build_result.edges {
         edge.target_exchange_node_id = remap_node_id(edge.target_exchange_node_id, node_id_map)?;
     }
+    for lowered_edge in &mut build_result.lowered_edges {
+        lowered_edge.edge.target_exchange_node_id =
+            remap_node_id(lowered_edge.edge.target_exchange_node_id, node_id_map)?;
+    }
     for boundary in &mut build_result.boundary_schemas {
         remap_boundary_schema_node_id(boundary, node_id_map)?;
     }
@@ -2056,7 +2060,7 @@ mod tests {
         build_result
             .fragment_results
             .push(keyed_assert_fragment(vec![exchange_plan_node(30, 30)]));
-        build_result.edges.push(crate::sql::codegen::FragmentEdge {
+        let edge = crate::sql::codegen::FragmentEdge {
             source_fragment_id: 0,
             target_fragment_id: 1,
             target_exchange_node_id: 30,
@@ -2068,7 +2072,19 @@ mod tests {
                 branch_kind: ChangeStreamBranchKind::ReuseData,
             },
             output_slot_ids: Vec::new(),
-        });
+        };
+        build_result.edges.push(edge.clone());
+        build_result
+            .lowered_edges
+            .push(crate::sql::codegen::LoweredFragmentEdge {
+                edge,
+                compat_partition: crate::thrift::partitions::TDataPartition::new(
+                    crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                    None::<Vec<crate::thrift::exprs::TExpr>>,
+                    None::<Vec<crate::thrift::partitions::TRangePartition>>,
+                    None::<Vec<crate::thrift::partitions::TBucketProperty>>,
+                ),
+            });
         let mut native_plan = native_change_event_expand_router_plan_for_test();
 
         inject_dml_pre_expand_keyed_assert(&mut build_result, Some(&keyed_assert_for_test()))
@@ -2091,6 +2107,13 @@ mod tests {
                 edge.target_fragment_id
             );
         }
+        assert_eq!(build_result.edges.len(), 1);
+        assert_eq!(build_result.lowered_edges.len(), 1);
+        assert_eq!(
+            build_result.edges[0].target_exchange_node_id,
+            build_result.lowered_edges[0].edge.target_exchange_node_id,
+            "native edge and lowered sidecar edge must stay keyed by the same exchange node"
+        );
     }
 
     #[test]
