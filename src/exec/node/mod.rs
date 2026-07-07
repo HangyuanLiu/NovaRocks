@@ -75,6 +75,7 @@ pub struct RuntimeFilterProbeSpec {
     pub expr_id: ExprId,
     pub slot_id: SlotId,
     pub data_type: arrow::datatypes::DataType,
+    pub self_subtree: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -443,6 +444,7 @@ fn push_down_local_runtime_filters_inner(
                         expr_id: spec.expr_id,
                         slot_id: spec.slot_id,
                         data_type,
+                        self_subtree: false,
                     })
                 })
                 .collect();

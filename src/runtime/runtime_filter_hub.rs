@@ -188,7 +188,7 @@ pub(crate) struct RuntimeFilterHub {
     entries: Mutex<HashMap<i32, Arc<RuntimeFilterEntry>>>,
     build_specs: Mutex<HashMap<i32, RuntimeFilterBuildSpec>>,
     probe_targets: Mutex<HashMap<i32, Vec<RuntimeFilterTarget>>>,
-    probe_specs_by_node: Mutex<HashMap<i32, HashMap<i32, SlotId>>>,
+    probe_specs_by_node: Mutex<HashMap<i32, HashMap<i32, RuntimeFilterProbeRegistration>>>,
     expected_by_node: Mutex<HashMap<i32, usize>>,
     local_deps: Mutex<HashMap<i32, DependencyHandle>>,
     published_in_filters: Mutex<HashMap<i32, RuntimeInFilter>>,
@@ -229,6 +229,12 @@ enum RuntimeFilterUpdate {
 #[derive(Clone, Debug)]
 struct RuntimeFilterBuildSpec {
     slot_id: SlotId,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeFilterProbeRegistration {
+    slot_id: SlotId,
+    self_subtree: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -313,18 +319,31 @@ impl RuntimeFilterHub {
             let mut newly_planned = Vec::new();
             for spec in specs {
                 if let Some(existing) = entry.get(&spec.filter_id) {
-                    if *existing != spec.slot_id {
+                    if existing.slot_id != spec.slot_id {
                         warn!(
                             "runtime filter probe spec mismatch: node_id={} filter_id={} existing_slot_id={:?} new_slot_id={:?}",
-                            node_id, spec.filter_id, existing, spec.slot_id
+                            node_id, spec.filter_id, existing.slot_id, spec.slot_id
+                        );
+                    }
+                    if existing.self_subtree != spec.self_subtree {
+                        warn!(
+                            "runtime filter probe self-subtree mismatch: node_id={} filter_id={} existing_self_subtree={} new_self_subtree={}",
+                            node_id, spec.filter_id, existing.self_subtree, spec.self_subtree
                         );
                     }
                     continue;
                 }
-                entry.insert(spec.filter_id, spec.slot_id);
+                entry.insert(
+                    spec.filter_id,
+                    RuntimeFilterProbeRegistration {
+                        slot_id: spec.slot_id,
+                        self_subtree: spec.self_subtree,
+                    },
+                );
                 newly_planned.push(spec.filter_id);
             }
-            (entry.len(), entry.clone(), newly_planned)
+            let expected = entry.values().filter(|spec| !spec.self_subtree).count();
+            (expected, entry.clone(), newly_planned)
         };
         if let Some(query_key) = self.query_key {
             let recorder = RuntimeFilterLifecycleRegistry::global().recorder(query_key);
@@ -345,12 +364,15 @@ impl RuntimeFilterHub {
         }
         {
             let mut targets_guard = self.probe_targets.lock().expect("runtime filter hub lock");
-            for (&filter_id, &slot_id) in snapshot.iter() {
+            for (&filter_id, spec) in snapshot.iter() {
                 let targets = targets_guard.entry(filter_id).or_default();
                 if targets.iter().any(|t| t.node_id == node_id) {
                     continue;
                 }
-                targets.push(RuntimeFilterTarget { node_id, slot_id });
+                targets.push(RuntimeFilterTarget {
+                    node_id,
+                    slot_id: spec.slot_id,
+                });
             }
         }
         {
@@ -372,7 +394,7 @@ impl RuntimeFilterHub {
             expected,
             snapshot
                 .iter()
-                .map(|(filter_id, slot_id)| (*filter_id, *slot_id))
+                .map(|(filter_id, spec)| (*filter_id, spec.slot_id, spec.self_subtree))
                 .collect::<Vec<_>>()
         );
         let entry = self.get_or_create_entry(node_id);
@@ -720,12 +742,33 @@ impl RuntimeFilterHub {
             return;
         };
         if expected == 0 {
+            // Self-subtree-only probes are ready for scan startup, but the
+            // handle must stay live for later nonblocking polls after publish.
+            entry.complete.store(true, Ordering::Release);
             entry.dep.set_ready();
             return;
         }
+        let blocking_ids = {
+            let guard = self
+                .probe_specs_by_node
+                .lock()
+                .expect("runtime filter hub lock");
+            guard.get(&node_id).map(|specs| {
+                specs
+                    .iter()
+                    .filter_map(|(&filter_id, spec)| (!spec.self_subtree).then_some(filter_id))
+                    .collect::<HashSet<_>>()
+            })
+        };
+        let Some(blocking_ids) = blocking_ids else {
+            return;
+        };
         let received = {
             let guard = entry.membership_seen.lock().expect("runtime filter lock");
-            guard.len()
+            guard
+                .iter()
+                .filter(|filter_id| blocking_ids.contains(filter_id))
+                .count()
         };
         if received < expected {
             return;
@@ -762,11 +805,11 @@ impl RuntimeFilterHub {
                 .expect("runtime filter cache lock");
             specs
                 .iter()
-                .filter_map(|(&filter_id, &slot_id)| {
+                .filter_map(|(&filter_id, spec)| {
                     guard
                         .get(&filter_id)
                         .cloned()
-                        .map(|filter| (filter_id, slot_id, filter))
+                        .map(|filter| (filter_id, spec.slot_id, filter))
                 })
                 .collect::<Vec<_>>()
         };
@@ -786,11 +829,11 @@ impl RuntimeFilterHub {
                 .expect("runtime filter cache lock");
             specs
                 .iter()
-                .filter_map(|(&filter_id, &slot_id)| {
+                .filter_map(|(&filter_id, spec)| {
                     guard
                         .get(&filter_id)
                         .cloned()
-                        .map(|filter| (filter_id, slot_id, filter))
+                        .map(|filter| (filter_id, spec.slot_id, filter))
                 })
                 .collect::<Vec<_>>()
         };
@@ -1018,6 +1061,7 @@ mod tests {
                 expr_id: ExprId(0),
                 slot_id: SlotId::new(11),
                 data_type: DataType::Int32,
+                self_subtree: false,
             }],
         );
         hub.register_probe(42)
@@ -1036,6 +1080,7 @@ mod tests {
                 expr_id: ExprId(0),
                 slot_id: SlotId::new(11),
                 data_type: DataType::Int32,
+                self_subtree: false,
             }],
         );
         hub
@@ -1087,6 +1132,7 @@ mod tests {
                 expr_id: ExprId(0),
                 slot_id: SlotId::new(11),
                 data_type: DataType::Int32,
+                self_subtree: false,
             }],
         );
 
@@ -1277,6 +1323,49 @@ mod tests {
                 assert_eq!(snapshot.membership_filters()[0].filter_id(), 7);
             }
             other => panic!("expected complete snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_self_subtree_probe_is_ready_when_blocking_filter_publishes() {
+        let hub = RuntimeFilterHub::new(DependencyManager::new());
+        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
+        hub.register_probe_specs(
+            42,
+            &[
+                RuntimeFilterProbeSpec {
+                    filter_id: 7,
+                    expr_id: ExprId(0),
+                    slot_id: SlotId::new(11),
+                    data_type: DataType::Int32,
+                    self_subtree: false,
+                },
+                RuntimeFilterProbeSpec {
+                    filter_id: 8,
+                    expr_id: ExprId(1),
+                    slot_id: SlotId::new(11),
+                    data_type: DataType::Int32,
+                    self_subtree: true,
+                },
+            ],
+        );
+        let probe = hub.register_probe(42);
+
+        match probe.poll_acquire(true) {
+            AcquireProgress::Pending(_) => {}
+            other => panic!("expected pending before blocking filter publish, got {other:?}"),
+        }
+
+        hub.publish_filters(&[], &[test_membership_filter(7)]);
+
+        match probe.poll_acquire(true) {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Complete(snapshot)) => {
+                assert_eq!(snapshot.membership_filters().len(), 1);
+                assert_eq!(snapshot.membership_filters()[0].filter_id(), 7);
+            }
+            other => {
+                panic!("expected complete snapshot after blocking filter publish, got {other:?}")
+            }
         }
     }
 }

@@ -281,12 +281,12 @@ fn acquire_runtime_filters_once(
     probe: Option<&ScanRuntimeFilterProbe>,
     expected: usize,
 ) -> Result<Option<AcquiredRuntimeFilters>, String> {
-    let Some(rf) = probe else {
-        return Ok(None);
-    };
     if expected == 0 {
         return Ok(None);
     }
+    let Some(rf) = probe else {
+        return Ok(None);
+    };
     loop {
         match rf.poll_acquire() {
             AcquireProgress::Pending(dep) => {

@@ -954,6 +954,7 @@ fn lower_probe_runtime_filter_specs(
                 expr_id,
                 slot_id,
                 data_type,
+                self_subtree: false,
             });
         }
     }

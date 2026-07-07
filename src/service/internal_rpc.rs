@@ -1129,6 +1129,7 @@ mod tests {
                 expr_id: ExprId(0),
                 slot_id: SlotId::new(11),
                 data_type: arrow::datatypes::DataType::Int32,
+                self_subtree: false,
             }],
         );
         let probe = hub.register_probe(88);
@@ -1185,6 +1186,7 @@ mod tests {
                 expr_id: ExprId(0),
                 slot_id: SlotId::new(11),
                 data_type: arrow::datatypes::DataType::Int32,
+                self_subtree: false,
             }],
         );
         let probe = hub.register_probe(88);

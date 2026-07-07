@@ -64,6 +64,7 @@ pub struct ScanSourceFactory {
     runtime_filter_specs: Vec<crate::exec::node::RuntimeFilterProbeSpec>,
     runtime_filter_exprs: HashMap<i32, ExprId>,
     runtime_filters_expected: usize,
+    runtime_filters_blocking_expected: usize,
     local_rf_waiting_set: Vec<i32>,
     runtime_filter_hub: Arc<RuntimeFilterHub>,
     arena: Arc<ExprArena>,
@@ -98,6 +99,10 @@ impl ScanSourceFactory {
             .map(|spec| (spec.filter_id, spec.expr_id))
             .collect();
         let runtime_filters_expected = runtime_filter_specs.len();
+        let runtime_filters_blocking_expected = runtime_filter_specs
+            .iter()
+            .filter(|spec| !spec.self_subtree)
+            .count();
         if runtime_filters_expected > 0 {
             if let Some(node_id) = scan.node_id() {
                 runtime_filter_hub.register_probe_specs(node_id, &runtime_filter_specs);
@@ -116,6 +121,7 @@ impl ScanSourceFactory {
             runtime_filter_specs,
             runtime_filter_exprs,
             runtime_filters_expected,
+            runtime_filters_blocking_expected,
             local_rf_waiting_set,
             runtime_filter_hub,
             arena,
@@ -178,6 +184,7 @@ impl OperatorFactory for ScanSourceFactory {
             local_rf_deps: self.local_rf_deps(),
             runtime_filter_exprs: self.runtime_filter_exprs.clone(),
             runtime_filters_expected: self.runtime_filters_expected,
+            runtime_filters_blocking_expected: self.runtime_filters_blocking_expected,
             runtime_filter_lifecycle_handles: HashMap::new(),
             arena: Arc::clone(&self.arena),
             profiles: None,
@@ -210,6 +217,7 @@ struct ScanSourceOperator {
     local_rf_deps: Vec<DependencyHandle>,
     runtime_filter_exprs: HashMap<i32, ExprId>,
     runtime_filters_expected: usize,
+    runtime_filters_blocking_expected: usize,
     runtime_filter_lifecycle_handles: HashMap<i32, RfLifecycleHandle>,
     arena: Arc<ExprArena>,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
@@ -370,7 +378,7 @@ impl ScanSourceOperator {
         if !self.scan.materialize_morsels_after_runtime_filters() {
             return true;
         }
-        if self.runtime_filters_expected == 0 {
+        if self.runtime_filters_blocking_expected == 0 {
             return true;
         }
         let Some(rf) = self.runtime_filter_probe.as_ref() else {
@@ -387,7 +395,7 @@ impl ScanSourceOperator {
         let materialize_after_runtime_filters = scan.materialize_morsels_after_runtime_filters();
         let async_state = Arc::clone(&self.async_state);
         let runtime_filter_probe = self.runtime_filter_probe.clone();
-        let runtime_filters_expected = self.runtime_filters_expected;
+        let runtime_filters_blocking_expected = self.runtime_filters_blocking_expected;
         let runtime_filter_decision = self.state.runtime_filter_decision.clone();
         let materialization_profile = self
             .profiles
@@ -401,7 +409,7 @@ impl ScanSourceOperator {
                     runtime_filter_decision.get_or_acquire(
                         async_state.as_ref(),
                         runtime_filter_probe.as_ref(),
-                        runtime_filters_expected,
+                        runtime_filters_blocking_expected,
                     )?
                 } else {
                     None
@@ -465,6 +473,7 @@ impl ScanSourceOperator {
                 self.runtime_filter_probe.clone(),
                 self.runtime_filter_exprs.clone(),
                 self.runtime_filters_expected,
+                self.runtime_filters_blocking_expected,
                 Arc::clone(&self.arena),
                 self.profiles.clone(),
                 self.driver_id,
@@ -1014,6 +1023,7 @@ mod tests {
             expr_id: ExprId(0),
             slot_id: SlotId::new(3),
             data_type: DataType::Int32,
+            self_subtree: false,
         }
     }
 

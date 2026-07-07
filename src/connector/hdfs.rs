@@ -1079,6 +1079,7 @@ mod tests {
             expr_id: ExprId(0),
             slot_id,
             data_type: DataType::Int32,
+            self_subtree: false,
         }
     }
 

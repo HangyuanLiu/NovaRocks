@@ -875,6 +875,7 @@ mod tests {
                 expr_id: expr,
                 slot_id: SlotId::new(1),
                 data_type: DataType::Int32,
+                self_subtree: false,
             }],
         );
         let probe = hub.register_probe(42);
@@ -985,6 +986,7 @@ mod tests {
                 expr_id: expr,
                 slot_id: SlotId::new(1),
                 data_type: DataType::Int32,
+                self_subtree: false,
             }],
         );
         let probe = hub.register_probe(42);
@@ -1074,6 +1076,7 @@ mod tests {
                 expr_id: expr,
                 slot_id: SlotId::new(1),
                 data_type: DataType::Int32,
+                self_subtree: false,
             }],
         );
         let probe = hub.register_probe(42);

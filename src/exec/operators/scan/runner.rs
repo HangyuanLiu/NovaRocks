@@ -131,6 +131,7 @@ pub(super) struct ScanAsyncRunner {
     runtime_filter_exprs: HashMap<i32, ExprId>,
     runtime_filter_dict_fold_cache: RuntimeFilterDictionaryFoldCache,
     runtime_filters_expected: usize,
+    runtime_filters_blocking_expected: usize,
     runtime_filter_lifecycle_handles: HashMap<i32, RfLifecycleHandle>,
     acquired: Option<AcquiredRuntimeFilters>,
     runtime_filter_ctx: Option<Arc<RuntimeFilterContext>>,
@@ -309,6 +310,7 @@ impl ScanAsyncRunner {
         runtime_filter_probe: Option<ScanRuntimeFilterProbe>,
         runtime_filter_exprs: HashMap<i32, ExprId>,
         runtime_filters_expected: usize,
+        runtime_filters_blocking_expected: usize,
         arena: Arc<ExprArena>,
         profiles: Option<crate::runtime::profile::OperatorProfiles>,
         driver_id: i32,
@@ -330,6 +332,7 @@ impl ScanAsyncRunner {
             runtime_filter_exprs,
             runtime_filter_dict_fold_cache: RuntimeFilterDictionaryFoldCache::default(),
             runtime_filters_expected,
+            runtime_filters_blocking_expected,
             runtime_filter_lifecycle_handles: HashMap::new(),
             acquired: None,
             runtime_filter_ctx: None,
@@ -431,7 +434,7 @@ impl ScanAsyncRunner {
         let acquired = self.shared_runtime_filter_decision.get_or_acquire(
             state,
             self.runtime_filter_probe.as_ref(),
-            self.runtime_filters_expected,
+            self.runtime_filters_blocking_expected,
         )?;
         if state.is_canceled() {
             return Err("scan canceled while waiting for runtime filters".to_string());
@@ -1704,6 +1707,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
+    use std::sync::mpsc;
     use std::thread;
 
     /// Helper: call the production synthesis helper from a RecordBatch fixture.
@@ -2222,6 +2226,7 @@ mod tests {
                 expr_id: expr,
                 slot_id: SlotId::new(1),
                 data_type: DataType::Int32,
+                self_subtree: false,
             }],
         );
         let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
@@ -2240,6 +2245,54 @@ mod tests {
             Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
             HashMap::from([(filter_id, expr)]),
             1,
+            1,
+            arena,
+            None,
+            0,
+        );
+        let recorder = RuntimeFilterLifecycleRegistry::global().recorder(query_key);
+        runner.set_runtime_filter_lifecycle_handles(HashMap::from([(
+            filter_id,
+            recorder.filter(filter_id),
+        )]));
+        (runner, expr)
+    }
+
+    fn scan_runtime_filter_runner_self_subtree(
+        filter_id: i32,
+        query_key: QueryKey,
+        hub: &RuntimeFilterHub,
+    ) -> (ScanAsyncRunner, crate::exec::expr::ExprId) {
+        let mut arena = ExprArena::default();
+        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let arena = Arc::new(arena);
+        hub.register_probe_specs(
+            42,
+            &[crate::exec::node::RuntimeFilterProbeSpec {
+                filter_id,
+                expr_id: expr,
+                slot_id: SlotId::new(1),
+                data_type: DataType::Int32,
+                self_subtree: true,
+            }],
+        );
+        let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let scan = ScanNode::new(Arc::new(EmptyScanOp))
+            .with_node_id(42)
+            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            Vec::new(),
+            false,
+        )));
+        let mut runner = ScanAsyncRunner::new(
+            "scan".to_string(),
+            scan,
+            dispatch,
+            SharedRuntimeFilterDecision::new(),
+            Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
+            HashMap::from([(filter_id, expr)]),
+            1,
+            0,
             arena,
             None,
             0,
@@ -2267,6 +2320,7 @@ mod tests {
                 expr_id: expr,
                 slot_id: SlotId::new(1),
                 data_type: DataType::Utf8,
+                self_subtree: false,
             }],
         );
         let scan_schema = Arc::new(Schema::new(vec![Field::new(
@@ -2288,6 +2342,7 @@ mod tests {
             SharedRuntimeFilterDecision::new(),
             Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
             HashMap::from([(filter_id, expr)]),
+            1,
             1,
             arena,
             None,
@@ -2413,6 +2468,7 @@ mod tests {
                 expr_id: expr,
                 slot_id: SlotId::new(1),
                 data_type: DataType::Int32,
+                self_subtree: false,
             }],
         );
         let probe = hub.register_probe(42);
@@ -2449,6 +2505,7 @@ mod tests {
             SharedRuntimeFilterDecision::new(),
             Some(ScanRuntimeFilterProbe::new(probe)),
             runtime_filter_exprs,
+            1,
             1,
             arena,
             Some(profiles.clone()),
@@ -2498,6 +2555,72 @@ mod tests {
     }
 
     #[test]
+    fn self_subtree_filter_does_not_block_prepare() {
+        let query_key = QueryKey::from_hi_lo(20_102, 1);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        let hub = RuntimeFilterHub::new_for_query(
+            DependencyManager::new(),
+            crate::runtime::query_context::QueryId {
+                hi: query_key.hi,
+                lo: query_key.lo,
+            },
+        );
+        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
+
+        let (mut runner, _) = scan_runtime_filter_runner_self_subtree(7, query_key, &hub);
+        let state = ScanAsyncState::new(1, "self-subtree-runtime-filter-test".to_string());
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let started = Instant::now();
+            let result = runner.prepare_runtime_filters(&state);
+            let elapsed = started.elapsed();
+            let no_blocking_filters = runner.acquired.is_none() && runner.runtime_filters_loaded;
+            tx.send((result, elapsed, no_blocking_filters))
+                .expect("send prepare result");
+        });
+
+        let (result, elapsed, no_blocking_filters) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("self-subtree runtime filter prepare should not wait for publish");
+        result.expect("prepare runtime filters");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "self-subtree prepare took {elapsed:?}"
+        );
+        assert!(
+            no_blocking_filters,
+            "self-subtree filters should not install a blocking acquired snapshot"
+        );
+
+        let probe = ScanRuntimeFilterProbe::new(hub.register_probe(42));
+        let before_publish = probe.handle_version();
+        match probe.poll_acquire_non_blocking() {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Complete(snapshot)) => {
+                assert!(snapshot.is_empty(), "pre-publish self-subtree snapshot");
+            }
+            other => panic!("expected complete empty self-subtree snapshot, got {other:?}"),
+        }
+        hub.publish_min_max_filter(
+            7,
+            RuntimeMinMaxFilter::empty_range(RuntimeFilterType::Int32)
+                .expect("empty min/max filter"),
+        );
+        assert!(
+            probe.handle_version() > before_publish,
+            "self-subtree probe handle should remain live after prepare"
+        );
+        match probe.poll_acquire_non_blocking() {
+            AcquireProgress::Resolved(AcquiredRuntimeFilters::Complete(snapshot)) => {
+                assert_eq!(snapshot.min_max_filters().len(), 1);
+            }
+            other => panic!("expected complete self-subtree snapshot after publish, got {other:?}"),
+        }
+        registry.remove_query(query_key);
+    }
+
+    #[test]
     fn probe_nonblocking_poll_and_version_track_publishes() {
         let query_key = QueryKey::from_hi_lo(20_101, 1);
         let hub = RuntimeFilterHub::new_for_query(
@@ -2518,6 +2641,7 @@ mod tests {
                 },
                 slot_id: SlotId::new(1),
                 data_type: DataType::Int32,
+                self_subtree: false,
             }],
         );
         let probe = ScanRuntimeFilterProbe::new(hub.register_probe(42));
@@ -2744,6 +2868,7 @@ mod tests {
                 expr_id: expr,
                 slot_id: SlotId::new(1),
                 data_type: DataType::Int32,
+                self_subtree: false,
             }],
         );
         let probe = hub.register_probe(42);
@@ -2779,6 +2904,7 @@ mod tests {
             SharedRuntimeFilterDecision::new(),
             Some(ScanRuntimeFilterProbe::new(probe)),
             HashMap::from([(7, expr)]),
+            1,
             1,
             arena,
             None,
@@ -2823,6 +2949,7 @@ mod tests {
                 expr_id: expr,
                 slot_id: SlotId::new(1),
                 data_type: DataType::Int32,
+                self_subtree: false,
             }],
         );
         let source_probe = ScanRuntimeFilterProbe::new(hub.register_probe(42));
@@ -2857,6 +2984,7 @@ mod tests {
             shared_decision,
             None,
             HashMap::from([(7, expr)]),
+            1,
             1,
             arena,
             None,
@@ -2950,6 +3078,7 @@ mod tests {
             None,
             HashMap::new(),
             0,
+            0,
             Arc::clone(&arena),
             None,
             0,
@@ -2963,6 +3092,7 @@ mod tests {
             SharedRuntimeFilterDecision::new(),
             None,
             HashMap::new(),
+            0,
             0,
             arena,
             None,
@@ -3025,6 +3155,7 @@ mod tests {
             SharedRuntimeFilterDecision::new(),
             None,
             HashMap::new(),
+            0,
             0,
             arena,
             None,
@@ -3143,6 +3274,7 @@ mod tests {
             SharedRuntimeFilterDecision::new(),
             None,
             HashMap::new(),
+            0,
             0,
             arena,
             None,
