@@ -252,10 +252,7 @@ fn is_cfg_test_or_compat_attr(trimmed: &str) -> bool {
     if trimmed.starts_with("#[cfg(test") {
         return true;
     }
-    if !trimmed.starts_with("#[cfg(") {
-        return false;
-    }
-    compact_line(trimmed).contains("feature=\"compat\"")
+    compact_line(trimmed) == "#[cfg(feature=\"compat\")]"
 }
 
 fn rust_production_text_without_cfg_test_or_compat(text: &str) -> String {
@@ -282,7 +279,7 @@ fn rust_production_text_without_cfg_test_or_compat(text: &str) -> String {
             if line.contains('{') {
                 skip_depth = delta.max(0);
                 skipping_cfg_item = skip_depth > 0;
-            } else if trimmed.ends_with(';') {
+            } else if trimmed.ends_with(';') || trimmed.ends_with(',') {
                 skipping_cfg_item = false;
             }
             production.push('\n');
@@ -299,7 +296,7 @@ fn rust_production_text_without_cfg_test_or_compat(text: &str) -> String {
             if line.contains('{') {
                 skip_depth = delta.max(0);
                 skipping_cfg_item = skip_depth > 0;
-            } else if !trimmed.ends_with(';') {
+            } else if !trimmed.ends_with(';') && !trimmed.ends_with(',') {
                 skipping_cfg_item = true;
             }
             pending_skip_attr = false;
@@ -5075,11 +5072,12 @@ fn nidl_d3b_proto_schema_comparator_returns_stable_sorted_deduped_violations() {
 // Goal (see specs/2026-07-07-nidl-e0-noncompat-idl-ledger-guard-design):
 // the non-compat compile graph must eventually contain zero references to
 // StarRocks IDL (`crate::thrift`, `crate::proto::starrocks`,
-// `crate::proto::staros`). This guard is a lexical scan, so it cannot see
-// `#[cfg(feature = "compat")]`. It accounts for the current production-code
-// references via a shrink-only ledger; milestones E1..E9 remove ledger entries
-// as clusters are cleaned, and E10 empties the ledger and adds the build.rs /
-// lib.rs gate assertions.
+// `crate::proto::staros`). This guard is a conservative lexical scan: it strips
+// test-only items and directly compat-only items, but keeps ambiguous cfg
+// expressions scanned. It accounts for the current production-code references
+// via a shrink-only ledger; milestones E1..E9 remove ledger entries as clusters
+// are cleaned, and E10 empties the ledger and adds the build.rs / lib.rs gate
+// assertions.
 
 #[test]
 fn nidl_e7_result_path_uses_native_result_batch_and_primitive_types() {
@@ -5199,9 +5197,10 @@ fn nidl_e0_is_in_compat_scope(rel_path: &str) -> bool {
         .any(|prefix| rel_path == *prefix || rel_path.starts_with(&format!("{prefix}/")))
 }
 
-/// Collect `.rs` files under `dir` whose production code (test modules stripped)
-/// references any StarRocks IDL term. Returned sorted; no compat-scope filtering
-/// (that is applied by `nidl_e0_current_offenders`).
+/// Collect `.rs` files under `dir` whose production code (test modules and
+/// direct compat-only items stripped) references any StarRocks IDL term. Returned
+/// sorted; no compat-scope filtering (that is applied by
+/// `nidl_e0_current_offenders`).
 fn nidl_e0_offenders_in(dir: &Path) -> Vec<PathBuf> {
     let mut offenders = Vec::new();
     for path in rs_files(dir) {
@@ -5341,6 +5340,21 @@ fn nidl_e6_ledger_detector_ignores_compat_cfg_items() {
         "fn default_build_offender() {\n    let _ = crate::thrift::types::TUniqueId::new(3, 4);\n}\n",
     )
     .unwrap();
+    fs::write(
+        dir.join("compat_not.rs"),
+        "#[cfg(not(feature = \"compat\"))]\nfn non_compat_offender() {\n    let _ = crate::thrift::types::TUniqueId::new(7, 8);\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("compat_any.rs"),
+        "#[cfg(any(feature = \"compat\", unix))]\nfn maybe_default_offender() {\n    let _ = crate::thrift::types::TUniqueId::new(9, 10);\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("comma_then_offender.rs"),
+        "enum Demo {\n    #[cfg(feature = \"compat\")]\n    CompatVariant(crate::thrift::types::TUniqueId),\n}\nfn offender_after_comma() {\n    let _ = crate::thrift::types::TUniqueId::new(5, 6);\n}\n",
+    )
+    .unwrap();
 
     let offenders = nidl_e0_offenders_in(&dir);
     let names: Vec<String> = offenders
@@ -5351,6 +5365,18 @@ fn nidl_e6_ledger_detector_ignores_compat_cfg_items() {
     assert!(
         names.iter().any(|n| n == "offender.rs"),
         "must keep default-build offenders; got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "compat_not.rs"),
+        "must keep not(feature = \"compat\") offenders; got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "compat_any.rs"),
+        "must keep ambiguous any(feature = \"compat\", ...) offenders; got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "comma_then_offender.rs"),
+        "must keep default-build offenders after compat comma items; got {names:?}"
     );
     assert!(
         !names.iter().any(|n| n == "compat_fn.rs"),
